@@ -30,6 +30,13 @@ This file only adds Iris-specific rules. The global `~/.pi/agent/AGENTS.md` alre
 - Do not use emojis in code, comments, documentation, logs, or user-facing CLI output unless explicitly requested.
 - For Agent Kernel MVP work, prioritize tests for workspace path safety, tool result/error encoding, edit behavior, approval handling, and fake-provider tool-call loops.
 
+## Git workflow
+
+- Solo trunk-based: commit small safe changes directly to `main`; use short-lived branches for risky, multi-step, or experimental work.
+- Do not rewrite or force-push `main`; if a pushed change is wrong, fix it forward or revert it.
+- Use concise conventional commit subjects such as `feat(auth): add OpenAI Codex login`.
+- Before pushing code changes, run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; docs-only changes may use lighter verification.
+
 ## Available skills
 
 - `tdd-workflow` — use for behavior changes, bug fixes, and refactors.
