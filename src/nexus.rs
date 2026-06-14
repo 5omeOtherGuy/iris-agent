@@ -99,7 +99,7 @@ impl<P: ChatProvider> Agent<P> {
             "read" => {
                 let input: ReadInput = serde_json::from_value(call.arguments.clone())
                     .context("read tool arguments must include path")?;
-                read_workspace_file(&self.workspace, &input.path)
+                read_file(&self.workspace, &input.path)
             }
             name => bail!("unknown tool: {name}"),
         }
@@ -199,7 +199,7 @@ impl Role {
     }
 }
 
-fn read_workspace_file(workspace: &Path, requested_path: &str) -> Result<String> {
+fn read_file(workspace: &Path, requested_path: &str) -> Result<String> {
     let workspace = workspace
         .canonicalize()
         .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
@@ -423,7 +423,7 @@ mod tests {
         let outside = workspace.path.parent().unwrap().join("outside.txt");
         fs::write(&outside, "secret")?;
 
-        let result = read_workspace_file(&workspace.path, "../outside.txt");
+        let result = read_file(&workspace.path, "../outside.txt");
 
         assert!(
             result
@@ -444,7 +444,7 @@ mod tests {
         fs::write(&outside, "secret")?;
         std::os::unix::fs::symlink(&outside, workspace.path.join("link.txt"))?;
 
-        let result = read_workspace_file(&workspace.path, "link.txt");
+        let result = read_file(&workspace.path, "link.txt");
 
         assert!(
             result
@@ -459,7 +459,7 @@ mod tests {
     fn read_tool_returns_missing_file_error() -> Result<()> {
         let workspace = test_workspace()?;
 
-        let result = tool_result_json(read_workspace_file(&workspace.path, "missing.txt"));
+        let result = tool_result_json(read_file(&workspace.path, "missing.txt"));
 
         assert!(result.contains("\"ok\":false"));
         assert!(result.contains("failed to resolve path"));
