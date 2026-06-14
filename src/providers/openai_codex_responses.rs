@@ -1,0 +1,250 @@
+use std::env;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use reqwest::Url;
+use reqwest::blocking::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use serde_json::{Value, json};
+
+use crate::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
+use crate::nexus::{ChatProvider, Message, Role};
+
+const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const DEFAULT_MODEL: &str = "gpt-5.5";
+
+#[derive(Debug, Clone)]
+pub(crate) struct OpenAiCodexResponsesProvider {
+    client: Client,
+    config: OpenAiCodexResponsesConfig,
+    tokens: OpenAiCodexTokenStore,
+}
+
+impl OpenAiCodexResponsesProvider {
+    pub(crate) fn from_env() -> Result<Self> {
+        Ok(Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()?,
+            config: OpenAiCodexResponsesConfig::from_env(),
+            tokens: OpenAiCodexTokenStore::from_env()?,
+        })
+    }
+}
+
+impl ChatProvider for OpenAiCodexResponsesProvider {
+    fn respond(&self, messages: &[Message]) -> Result<String> {
+        let token = self.tokens.access_token(&self.client)?;
+        let request = build_codex_request(&self.config.model, messages);
+        let response = self
+            .client
+            .post(resolve_codex_url(&self.config.base_url)?)
+            .headers(codex_headers(&token)?)
+            .json(&request)
+            .send()
+            .context("failed to send Codex request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            bail!("Codex request failed ({status}): {body}");
+        }
+
+        parse_response_json(
+            response
+                .json()
+                .context("failed to parse Codex JSON response")?,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenAiCodexResponsesConfig {
+    model: String,
+    base_url: String,
+}
+
+impl OpenAiCodexResponsesConfig {
+    fn from_env() -> Self {
+        let model = non_empty_env("IRIS_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let base_url =
+            non_empty_env("IRIS_CODEX_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        Self { model, base_url }
+    }
+}
+
+fn build_codex_request(model: &str, messages: &[Message]) -> Value {
+    let input: Vec<Value> = messages
+        .iter()
+        .map(|message| {
+            json!({
+                "type": "message",
+                "role": message.role.as_str(),
+                "content": [{ "type": message_content_type(message.role), "text": message.content }],
+            })
+        })
+        .collect();
+
+    json!({
+        "model": model,
+        "store": false,
+        "stream": false,
+        "instructions": "You are Iris, a helpful terminal coding assistant.",
+        "input": input,
+        "text": { "verbosity": "low" },
+    })
+}
+
+fn message_content_type(role: Role) -> &'static str {
+    match role {
+        Role::User => "input_text",
+        Role::Assistant => "output_text",
+    }
+}
+
+fn codex_headers(token: &AccessToken) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", token.bearer))?,
+    );
+    headers.insert(
+        "chatgpt-account-id",
+        HeaderValue::from_str(&token.account_id)?,
+    );
+    headers.insert("originator", HeaderValue::from_static("iris"));
+    headers.insert(USER_AGENT, HeaderValue::from_static("iris-agent"));
+    headers.insert(
+        "OpenAI-Beta",
+        HeaderValue::from_static("responses=experimental"),
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn resolve_codex_url(base_url: &str) -> Result<Url> {
+    let mut url =
+        Url::parse(base_url).with_context(|| format!("invalid Codex base URL: {base_url}"))?;
+    let path = url.path().trim_end_matches('/');
+    let next_path = if path.ends_with("/codex/responses") {
+        path.to_string()
+    } else if path.ends_with("/codex") {
+        format!("{path}/responses")
+    } else if path.is_empty() {
+        "/codex/responses".to_string()
+    } else {
+        format!("{path}/codex/responses")
+    };
+    url.set_path(&next_path);
+    Ok(url)
+}
+
+fn parse_response_json(value: Value) -> Result<String> {
+    let text = extract_output_text(&value);
+    if text.is_empty() {
+        bail!("Codex response did not include assistant text");
+    }
+    Ok(text)
+}
+
+fn extract_output_text(value: &Value) -> String {
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+
+    let mut output = String::new();
+    if let Some(items) = value.get("output").and_then(Value::as_array) {
+        for item in items {
+            output.push_str(&extract_output_text(item));
+        }
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        for part in content {
+            let part_type = part.get("type").and_then(Value::as_str);
+            if matches!(part_type, Some("output_text" | "text"))
+                && let Some(text) = part.get("text").and_then(Value::as_str)
+            {
+                output.push_str(text);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_codex_responses_url() -> Result<()> {
+        assert_eq!(
+            resolve_codex_url("https://chatgpt.com/backend-api")?.as_str(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_url("https://chatgpt.com/backend-api/codex")?.as_str(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_url("https://chatgpt.com/backend-api/codex/responses")?.as_str(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_codex_base_url() {
+        assert!(resolve_codex_url("not a url").is_err());
+    }
+
+    #[test]
+    fn builds_codex_request_from_conversation() {
+        let request = build_codex_request(
+            "gpt-test",
+            &[
+                Message {
+                    role: Role::User,
+                    content: "hello".to_string(),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: "hi".to_string(),
+                },
+            ],
+        );
+        assert_eq!(request["model"], "gpt-test");
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["input"].as_array().unwrap().len(), 2);
+        assert_eq!(request["input"][0]["role"], "user");
+        assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(request["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(request["input"][1]["role"], "assistant");
+        assert_eq!(request["input"][1]["content"][0]["type"], "output_text");
+    }
+
+    #[test]
+    fn parses_responses_output_text() -> Result<()> {
+        let response = json!({
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "Hello" }]
+            }]
+        });
+        assert_eq!(parse_response_json(response)?, "Hello");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_response_without_text() {
+        let response = json!({ "output": [{ "type": "message", "content": [] }] });
+        let error = parse_response_json(response).unwrap_err().to_string();
+        assert!(error.contains("did not include assistant text"));
+    }
+}
