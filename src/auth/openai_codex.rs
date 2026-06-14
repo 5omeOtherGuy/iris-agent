@@ -1,8 +1,3 @@
-use std::env;
-use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -10,41 +5,41 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
+use crate::auth::device_code::{DeviceCodePoll, poll_device_code};
+use crate::auth::storage::{AuthStore, OAuthCredentials};
+
 const AUTH_PROVIDER: &str = "openai-codex";
-const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
+const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const DEVICE_CODE_TIMEOUT_SECONDS: u64 = 15 * 60;
 const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth";
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCodexTokenStore {
-    path: PathBuf,
+    storage: AuthStore,
 }
 
 impl OpenAiCodexTokenStore {
     pub(crate) fn from_env() -> Result<Self> {
-        let home = env::var("HOME").context("HOME is not set")?;
-        let path = env::var("IRIS_AUTH_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| Path::new(&home).join(".iris/auth.json"));
-        Ok(Self { path })
+        Ok(Self {
+            storage: AuthStore::from_env()?,
+        })
     }
 
     pub(crate) fn access_token(&self, client: &Client) -> Result<AccessToken> {
-        let mut auth = AuthFile::read(&self.path)?;
-        let mut credentials = auth.openai_codex().with_context(|| {
-            format!(
-                "failed to load {AUTH_PROVIDER} credentials from {}",
-                self.path.display()
-            )
-        })?;
+        let mut credentials = self.storage.oauth_credentials(AUTH_PROVIDER)?;
 
         if credentials.expires <= now_millis() {
             credentials = refresh_access_token(client, &credentials.refresh)?;
-            auth.set_openai_codex(credentials.clone())?;
-            auth.write(&self.path)?;
+            self.storage
+                .set_oauth_credentials(AUTH_PROVIDER, credentials.clone())?;
         }
 
         let account_id = extract_account_id(&credentials.access)?;
@@ -61,72 +56,148 @@ pub(crate) struct AccessToken {
     pub(crate) account_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct OAuthCredentials {
-    access: String,
-    refresh: String,
-    expires: u128,
-    #[serde(flatten)]
-    extra: serde_json::Map<String, Value>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceCodeInfo {
+    pub(crate) user_code: String,
+    pub(crate) verification_uri: String,
+    pub(crate) interval_seconds: u64,
+    pub(crate) expires_in_seconds: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct AuthFile {
-    #[serde(flatten)]
-    providers: serde_json::Map<String, Value>,
+pub(crate) fn login_device_code(
+    client: &Client,
+    on_code: impl FnOnce(DeviceCodeInfo),
+) -> Result<()> {
+    let device = start_device_auth(client)?;
+    on_code(DeviceCodeInfo {
+        user_code: device.user_code.clone(),
+        verification_uri: DEVICE_VERIFICATION_URI.to_string(),
+        interval_seconds: device.interval_seconds,
+        expires_in_seconds: DEVICE_CODE_TIMEOUT_SECONDS,
+    });
+    let code = poll_device_auth(client, &device)?;
+    let credentials =
+        exchange_authorization_code(client, &code.authorization_code, &code.code_verifier)?;
+    AuthStore::from_env()?.set_oauth_credentials(AUTH_PROVIDER, credentials)
 }
 
-impl AuthFile {
-    fn read(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+#[derive(Debug, Clone)]
+struct DeviceAuthInfo {
+    device_auth_id: String,
+    user_code: String,
+    interval_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DeviceTokenSuccess {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+fn start_device_auth(client: &Client) -> Result<DeviceAuthInfo> {
+    let response = client
+        .post(DEVICE_USER_CODE_URL)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({ "client_id": CLIENT_ID }))
+        .send()
+        .context("failed to request OpenAI Codex device code")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!("OpenAI Codex device code request failed ({status}): {body}");
     }
 
-    fn write(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let raw = serde_json::to_string_pretty(self)?;
-        let tmp_path = path.with_extension("tmp");
-        fs::write(&tmp_path, format!("{raw}\n"))
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-        restrict_file_permissions(&tmp_path)?;
-        fs::rename(&tmp_path, path).with_context(|| format!("failed to replace {}", path.display()))
+    #[derive(Deserialize)]
+    struct DeviceAuthResponse {
+        device_auth_id: String,
+        user_code: String,
+        interval: Option<Value>,
     }
 
-    fn openai_codex(&self) -> Result<OAuthCredentials> {
-        let value = self
-            .providers
-            .get(AUTH_PROVIDER)
-            .ok_or_else(|| anyhow!("missing {AUTH_PROVIDER} credentials"))?
-            .clone();
-        if value.get("type").and_then(Value::as_str) != Some("oauth") {
-            bail!("{AUTH_PROVIDER} credentials are not OAuth credentials");
+    let body: DeviceAuthResponse = response
+        .json()
+        .context("failed to parse OpenAI Codex device code response")?;
+    let interval_seconds = parse_interval_seconds(body.interval.as_ref())?.unwrap_or(5);
+    Ok(DeviceAuthInfo {
+        device_auth_id: body.device_auth_id,
+        user_code: body.user_code,
+        interval_seconds,
+    })
+}
+
+fn poll_device_auth(client: &Client, device: &DeviceAuthInfo) -> Result<DeviceTokenSuccess> {
+    poll_device_code(
+        Some(device.interval_seconds),
+        Some(DEVICE_CODE_TIMEOUT_SECONDS),
+        || poll_device_auth_once(client, device),
+    )
+}
+
+fn poll_device_auth_once(
+    client: &Client,
+    device: &DeviceAuthInfo,
+) -> Result<DeviceCodePoll<DeviceTokenSuccess>> {
+    let response = client
+        .post(DEVICE_TOKEN_URL)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "device_auth_id": device.device_auth_id,
+            "user_code": device.user_code,
+        }))
+        .send()
+        .context("failed to poll OpenAI Codex device auth")?;
+
+    if response.status().is_success() {
+        #[derive(Deserialize)]
+        struct DeviceTokenResponse {
+            authorization_code: String,
+            code_verifier: String,
         }
-        serde_json::from_value(value).context("malformed openai-codex OAuth credentials")
+
+        let body: DeviceTokenResponse = response
+            .json()
+            .context("failed to parse OpenAI Codex device token response")?;
+        return Ok(DeviceCodePoll::Complete(DeviceTokenSuccess {
+            authorization_code: body.authorization_code,
+            code_verifier: body.code_verifier,
+        }));
     }
 
-    fn set_openai_codex(&mut self, credentials: OAuthCredentials) -> Result<()> {
-        let mut value =
-            serde_json::to_value(credentials).context("failed to serialize OAuth credentials")?;
-        if let Value::Object(object) = &mut value {
-            object.insert("type".to_string(), Value::String("oauth".to_string()));
-        }
-        self.providers.insert(AUTH_PROVIDER.to_string(), value);
-        Ok(())
+    if response.status().as_u16() == 403 || response.status().as_u16() == 404 {
+        return Ok(DeviceCodePoll::Pending);
+    }
+
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    match error_code(&body).as_deref() {
+        Some("deviceauth_authorization_pending") => Ok(DeviceCodePoll::Pending),
+        Some("slow_down") => Ok(DeviceCodePoll::SlowDown),
+        _ => Ok(DeviceCodePoll::Failed(format!(
+            "OpenAI Codex device auth failed ({status}): {body}"
+        ))),
     }
 }
 
-fn restrict_file_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to restrict permissions for {}", path.display()))?;
-    }
-    Ok(())
+fn exchange_authorization_code(
+    client: &Client,
+    code: &str,
+    code_verifier: &str,
+) -> Result<OAuthCredentials> {
+    let response = client
+        .post(TOKEN_URL)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", code),
+            ("code_verifier", code_verifier),
+            ("redirect_uri", DEVICE_REDIRECT_URI),
+        ])
+        .send()
+        .context("failed to exchange OpenAI Codex authorization code")?;
+
+    read_token_response(response, "exchange")
 }
 
 fn refresh_access_token(client: &Client, refresh_token: &str) -> Result<OAuthCredentials> {
@@ -141,10 +212,17 @@ fn refresh_access_token(client: &Client, refresh_token: &str) -> Result<OAuthCre
         .send()
         .context("failed to refresh OpenAI Codex token")?;
 
+    read_token_response(response, "refresh")
+}
+
+fn read_token_response(
+    response: reqwest::blocking::Response,
+    operation: &str,
+) -> Result<OAuthCredentials> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
-        bail!("OpenAI Codex token refresh failed ({status}): {body}");
+        bail!("OpenAI Codex token {operation} failed ({status}): {body}");
     }
 
     #[derive(Deserialize)]
@@ -156,7 +234,7 @@ fn refresh_access_token(client: &Client, refresh_token: &str) -> Result<OAuthCre
 
     let token: TokenResponse = response
         .json()
-        .context("failed to parse token refresh response")?;
+        .with_context(|| format!("failed to parse token {operation} response"))?;
     Ok(OAuthCredentials {
         access: token.access_token,
         refresh: token.refresh_token,
@@ -183,6 +261,34 @@ fn extract_account_id(token: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("OAuth access token is missing chatgpt_account_id"))
 }
 
+fn parse_interval_seconds(value: Option<&Value>) -> Result<Option<u64>> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow!("invalid OpenAI Codex device code interval")),
+        Some(Value::String(text)) => text
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .context("invalid OpenAI Codex device code interval"),
+        Some(_) => bail!("invalid OpenAI Codex device code interval"),
+        None => Ok(None),
+    }
+}
+
+fn error_code(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    match value.get("error")? {
+        Value::String(code) => Some(code.clone()),
+        Value::Object(error) => error
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -203,59 +309,23 @@ mod tests {
     }
 
     #[test]
-    fn reads_openai_codex_credentials_from_iris_auth_shape() -> Result<()> {
-        let auth: AuthFile = serde_json::from_str(&format!(
-            r#"{{"openai-codex":{{"type":"oauth","access":"{}","refresh":"r","expires":9999999999999,"accountId":"acc_test"}}}}"#,
-            jwt("acc_test")
-        ))?;
-        let credentials = auth.openai_codex()?;
-        assert_eq!(extract_account_id(&credentials.access)?, "acc_test");
-        assert_eq!(credentials.refresh, "r");
+    fn parses_string_interval() -> Result<()> {
+        assert_eq!(
+            parse_interval_seconds(Some(&Value::String("7".to_string())))?,
+            Some(7)
+        );
         Ok(())
     }
 
     #[test]
-    fn reports_malformed_openai_codex_credentials() -> Result<()> {
-        let auth: AuthFile = serde_json::from_str(
-            r#"{"openai-codex":{"type":"oauth","access":"aaa.bbb.ccc","expires":1}}"#,
-        )?;
-        let error = auth.openai_codex().unwrap_err().to_string();
-        assert!(error.contains("malformed openai-codex OAuth credentials"));
-        Ok(())
-    }
-
-    #[test]
-    fn writes_auth_file_atomically_with_restricted_permissions() -> Result<()> {
-        let dir = unique_test_dir()?;
-        let path = dir.join("auth.json");
-        let mut auth = AuthFile::default();
-        auth.set_openai_codex(OAuthCredentials {
-            access: jwt("acc_test"),
-            refresh: "refresh".to_string(),
-            expires: 9999999999999,
-            extra: serde_json::Map::new(),
-        })?;
-
-        auth.write(&path)?;
-
-        let written = fs::read_to_string(&path)?;
-        assert!(written.contains("openai-codex"));
-        assert!(!path.with_extension("tmp").exists());
-        #[cfg(unix)]
-        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
-        fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    fn unique_test_dir() -> Result<PathBuf> {
-        let path = env::temp_dir().join(format!("iris-oauth-test-{}", now_millis()));
-        fs::create_dir_all(&path)?;
-        Ok(path)
-    }
-
-    fn jwt(account_id: &str) -> String {
-        let payload =
-            format!(r#"{{"https://api.openai.com/auth":{{"chatgpt_account_id":"{account_id}"}}}}"#);
-        format!("aaa.{}.bbb", URL_SAFE_NO_PAD.encode(payload.as_bytes()))
+    fn extracts_error_code_from_string_or_object() {
+        assert_eq!(
+            error_code(r#"{"error":"slow_down"}"#).as_deref(),
+            Some("slow_down")
+        );
+        assert_eq!(
+            error_code(r#"{"error":{"code":"deviceauth_authorization_pending"}}"#).as_deref(),
+            Some("deviceauth_authorization_pending")
+        );
     }
 }
