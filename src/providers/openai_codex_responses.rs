@@ -74,6 +74,7 @@ impl OpenAiCodexResponsesConfig {
 }
 
 fn build_codex_request(model: &str, messages: &[Message]) -> Value {
+    // The Codex adapter owns conversion between Nexus messages and Responses wire JSON.
     let input: Vec<Value> = messages.iter().map(codex_input_item).collect();
 
     json!({

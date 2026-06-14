@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 const MAX_TOOL_ITERATIONS: usize = 8;
 
 pub(crate) trait ChatProvider {
+    // Providers translate their native response format into this Nexus-owned turn shape.
     fn respond(&self, messages: &[Message]) -> Result<AssistantTurn>;
 }
 
@@ -137,6 +138,7 @@ struct ReadInput {
 pub(crate) struct Message {
     pub(crate) role: Role,
     pub(crate) content: String,
+    // Tool-call and tool-result messages must carry both fields; text messages leave them empty.
     pub(crate) tool_call_id: Option<String>,
     pub(crate) tool_name: Option<String>,
 }
@@ -359,6 +361,63 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(AssistantTurn {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "unknown".to_string(),
+                    arguments: json!({}),
+                }],
+            }),
+            Ok(AssistantTurn::text("I could not use that tool.")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("use bad tool\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(errors.is_empty());
+        assert_tool_error_contains(&agent.provider.seen.borrow()[1], "unknown tool: unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(AssistantTurn {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "not_path": "note.txt" }),
+                }],
+            }),
+            Ok(AssistantTurn::text("The read call was malformed.")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with(
+            "read malformed\n/exit\n".as_bytes(),
+            &mut output,
+            &mut errors,
+        )?;
+
+        assert!(errors.is_empty());
+        assert_tool_error_contains(
+            &agent.provider.seen.borrow()[1],
+            "read tool arguments must include path",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn read_tool_rejects_paths_outside_workspace() -> Result<()> {
         let workspace = test_workspace()?;
         let outside = workspace.path.parent().unwrap().join("outside.txt");
@@ -373,6 +432,26 @@ mod tests {
                 .contains("escapes workspace")
         );
         fs::remove_file(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_tool_rejects_symlink_escape_from_workspace() -> Result<()> {
+        let workspace = test_workspace()?;
+        let outside_dir = test_workspace()?;
+        let outside = outside_dir.path.join("outside.txt");
+        fs::write(&outside, "secret")?;
+        std::os::unix::fs::symlink(&outside, workspace.path.join("link.txt"))?;
+
+        let result = read_workspace_file(&workspace.path, "link.txt");
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("escapes workspace")
+        );
         Ok(())
     }
 
@@ -395,6 +474,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn assert_tool_error_contains(messages: &[Message], expected: &str) {
+        let tool_result = messages.last().unwrap();
+        assert_eq!(tool_result.role, Role::Tool);
+        assert!(tool_result.content.contains("\"ok\":false"));
+        assert!(tool_result.content.contains(expected));
     }
 
     fn test_workspace() -> Result<TestWorkspace> {
