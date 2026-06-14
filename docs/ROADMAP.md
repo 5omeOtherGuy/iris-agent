@@ -1,8 +1,9 @@
 # Iris — Roadmap
 
-> Status (2026-06): execution plan for a pre-implementation project. This roadmap
-> defines build order and acceptance criteria. `FEATURES.md` remains the capability
-> inventory; this document says what to build first.
+> Status (2026-06-14): roadmap for an early implementation. A text-only REPL and
+> OpenAI Codex Responses provider exist, but the Agent Kernel MVP is not complete.
+> This roadmap defines build order and acceptance criteria. `FEATURES.md` remains
+> the capability inventory; this document says what to build first.
 
 This is not an implementation plan. It should define sequencing, scope boundaries,
 quality gates, and open design decisions. Detailed module structure, Rust types,
@@ -35,6 +36,27 @@ Roadmap-level boundary:
   not require rewriting the first loop.
 
 The immediate goal is much smaller: build the minimum working agent kernel.
+
+## Current implementation snapshot
+
+Implemented today:
+
+- CLI entrypoint that starts Iris from `cargo run`.
+- Text-only Nexus REPL with in-memory conversation state and `/exit` / `/quit`.
+- Provider-neutral `ChatProvider`, `Message`, and `Role` types.
+- OpenAI Codex OAuth token loading/refresh from the Iris auth-file shape.
+- OpenAI Codex Responses request/response handling.
+- Unit tests for the REPL, auth-file handling, URL/request shaping, and response
+  parsing.
+
+Not implemented yet:
+
+- Core tools: `read`, `write`, `edit`, and `bash`.
+- Tool-call execution and tool-result encoding.
+- Approval prompts and denied-call handling.
+- Workspace path-safety enforcement.
+- Streaming, transcript persistence, modes, subagents, context ledger, content
+  handles, git automation, and GitHub integration.
 
 ## Milestone 0 — Agent Kernel MVP
 

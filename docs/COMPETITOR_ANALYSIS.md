@@ -30,15 +30,16 @@
 > - **opencode split confirmed:** `opencode-ai` archived (MIT, Go); successors are
 >   **Crush** (Go, **FSL-1.1-MIT** source-available) and **sst/opencode** (TypeScript,
 >   MIT, 75+ providers reported).
-> - **Provider prompt-caching was confirmed for *no* competitor** — the one column
->   that came back open (but `unverified`, not "confirmed absent"). Possible
->   whitespace for Iris's caching feature; **verify before claiming.**
+> - **Provider prompt-caching is not open whitespace.** The verified matrix now
+>   documents prompt caching for Claude Code and Aider, and cache-adjacent Auto
+>   Compact behavior for Cline. Iris may still differentiate on transparent,
+>   cache-aware layout and measurement, but not on merely having caching.
 > - **`pi-mmr` confirmed as the Iris author's own 1-star, 16-day-old repo** —
 >   conflict of interest; not an independent competitor.
-> - **Still gaps:** Claude Code, Cursor/Cursor CLI, Cline, Aider, Hermes, and
->   "Everything Claude Code" remain unverified (the last two have real repos —
->   `NousResearch/hermes-agent`, `affaan-m/everything-claude-code` — but no
->   verified claims yet).
+> - **Still gaps:** some exact agent-mechanics cells remain unverified in the
+>   matrix, especially edit protocols, repo-map implementations, and
+>   prompt-caching details for Cursor, Hermes, Crush, sst/opencode, Codex, and
+>   the Pi rows. Do not fill those cells from impression.
 
 ## Executive summary
 

@@ -2,13 +2,15 @@
 
 **A fast, token-efficient coding agent for your terminal.**
 
-> **Status (2026-06): early-stage / pre-implementation.** This document describes
-> what Iris is being built to be — design intent and direction, not shipped
-> behavior. The project is a skeleton today. Efficiency claims (token savings,
-> cache hits, cheaper switching, compaction quality) are **design goals to be
-> backed by benchmarks** before they are used as selling points. Read every
-> capability below as *"designed to,"* not *"does."* Per-capability status and MVP
-> scope live in [`FEATURES.md`](FEATURES.md).
+> **Status (2026-06-14): early implementation.** Iris currently has a text-only
+> REPL, in-memory conversation state, OpenAI Codex OAuth auth-file support, and a
+> non-streaming OpenAI Codex Responses provider. The Agent Kernel MVP is not
+> complete: file tools, tool execution, approvals, workspace path safety, and
+> bash are still planned. Efficiency claims (token savings, cache hits, cheaper
+> switching, compaction quality) are **design goals to be backed by benchmarks**
+> before they are used as selling points. Read future capability sections below
+> as *"designed to,"* not *"does."* Per-capability status and MVP scope live in
+> [`FEATURES.md`](FEATURES.md).
 
 Iris is being built as a coding agent you run in your terminal — the tool you
 reach for to read, edit, and ship code, not a library you build other agents on
