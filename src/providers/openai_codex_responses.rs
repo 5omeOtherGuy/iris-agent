@@ -50,10 +50,10 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             bail!("Codex request failed ({status}): {body}");
         }
 
-        parse_response_json(
-            response
-                .json()
-                .context("failed to parse Codex JSON response")?,
+        parse_response_stream(
+            &response
+                .text()
+                .context("failed to read Codex stream response")?,
         )
     }
 }
@@ -88,7 +88,7 @@ fn build_codex_request(model: &str, messages: &[Message]) -> Value {
     json!({
         "model": model,
         "store": false,
-        "stream": false,
+        "stream": true,
         "instructions": "You are Iris, a helpful terminal coding assistant.",
         "input": input,
         "text": { "verbosity": "low" },
@@ -146,12 +146,93 @@ fn resolve_codex_url(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+#[cfg(test)]
 fn parse_response_json(value: Value) -> Result<String> {
     let text = extract_output_text(&value);
     if text.is_empty() {
         bail!("Codex response did not include assistant text");
     }
     Ok(text)
+}
+
+fn parse_response_stream(body: &str) -> Result<String> {
+    let mut text = String::new();
+    let mut completed_response = None;
+    let mut saw_completed = false;
+
+    for event in body.split("\n\n") {
+        let data = event_data(event);
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+
+        let value: Value = serde_json::from_str(&data).context("failed to parse Codex SSE data")?;
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
+                }
+            }
+            Some("response.output_item.done") => {
+                if text.is_empty()
+                    && let Some(item) = value.get("item")
+                {
+                    text.push_str(&extract_output_text(item));
+                }
+            }
+            Some("response.completed") => {
+                saw_completed = true;
+                completed_response = value.get("response").cloned();
+            }
+            Some("response.failed") => bail!("Codex response failed: {}", response_error(&value)),
+            Some("response.incomplete") => {
+                bail!("Codex response incomplete: {}", incomplete_reason(&value))
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_completed {
+        bail!("Codex stream closed before response.completed");
+    }
+    if text.is_empty()
+        && let Some(response) = completed_response.as_ref()
+    {
+        text.push_str(&extract_output_text(response));
+    }
+    if text.is_empty() {
+        bail!("Codex response did not include assistant text");
+    }
+    Ok(text)
+}
+
+fn event_data(event: &str) -> String {
+    event
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn response_error(value: &Value) -> String {
+    value
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("response.failed event received")
+        .to_string()
+}
+
+fn incomplete_reason(value: &Value) -> String {
+    value
+        .get("response")
+        .and_then(|response| response.get("incomplete_details"))
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn extract_output_text(value: &Value) -> String {
@@ -220,13 +301,41 @@ mod tests {
             ],
         );
         assert_eq!(request["model"], "gpt-test");
-        assert_eq!(request["stream"], false);
+        assert_eq!(request["stream"], true);
         assert_eq!(request["input"].as_array().unwrap().len(), 2);
         assert_eq!(request["input"][0]["role"], "user");
         assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(request["input"][0]["content"][0]["text"], "hello");
         assert_eq!(request["input"][1]["role"], "assistant");
         assert_eq!(request["input"][1]["content"][0]["type"], "output_text");
+    }
+
+    #[test]
+    fn parses_streamed_output_text_delta_events() -> Result<()> {
+        let stream = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+
+        assert_eq!(parse_response_stream(stream)?, "Hello");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_streamed_output_item_done_events() -> Result<()> {
+        let stream = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+
+        assert_eq!(parse_response_stream(stream)?, "Hello");
+        Ok(())
     }
 
     #[test]
