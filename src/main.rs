@@ -44,7 +44,7 @@ enum LoginMethod {
 
 fn run_agent() -> Result<()> {
     let provider = providers::openai_codex_responses::OpenAiCodexResponsesProvider::from_env()?;
-    Agent::new(provider).run()
+    Agent::new(provider, env::current_dir()?).run()
 }
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {

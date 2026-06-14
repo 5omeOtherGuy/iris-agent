@@ -8,7 +8,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_
 use serde_json::{Value, json};
 
 use crate::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
-use crate::nexus::{ChatProvider, Message, Role};
+use crate::nexus::{AssistantTurn, ChatProvider, Message, Role, ToolCall};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_MODEL: &str = "gpt-5.5";
@@ -33,7 +33,7 @@ impl OpenAiCodexResponsesProvider {
 }
 
 impl ChatProvider for OpenAiCodexResponsesProvider {
-    fn respond(&self, messages: &[Message]) -> Result<String> {
+    fn respond(&self, messages: &[Message]) -> Result<AssistantTurn> {
         let token = self.tokens.access_token(&self.client)?;
         let request = build_codex_request(&self.config.model, messages);
         let response = self
@@ -74,31 +74,60 @@ impl OpenAiCodexResponsesConfig {
 }
 
 fn build_codex_request(model: &str, messages: &[Message]) -> Value {
-    let input: Vec<Value> = messages
-        .iter()
-        .map(|message| {
-            json!({
-                "type": "message",
-                "role": message.role.as_str(),
-                "content": [{ "type": message_content_type(message.role), "text": message.content }],
-            })
-        })
-        .collect();
+    let input: Vec<Value> = messages.iter().map(codex_input_item).collect();
 
     json!({
         "model": model,
         "store": false,
         "stream": true,
-        "instructions": "You are Iris, a helpful terminal coding assistant.",
+        "instructions": "You are Iris, a helpful terminal coding assistant. Use the read tool when you need to inspect a workspace text file.",
         "input": input,
+        "tools": [{
+            "type": "function",
+            "name": "read",
+            "description": "Read a UTF-8 text file from the current workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative file path to read."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }],
         "text": { "verbosity": "low" },
     })
+}
+
+fn codex_input_item(message: &Message) -> Value {
+    match message.role {
+        Role::User | Role::Assistant => json!({
+            "type": "message",
+            "role": message.role.as_str(),
+            "content": [{ "type": message_content_type(message.role), "text": message.content }],
+        }),
+        Role::AssistantToolCall => json!({
+            "type": "function_call",
+            "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
+            "name": message.tool_name.as_deref().unwrap_or_default(),
+            "arguments": message.content,
+        }),
+        Role::Tool => json!({
+            "type": "function_call_output",
+            "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
+            "output": message.content,
+        }),
+    }
 }
 
 fn message_content_type(role: Role) -> &'static str {
     match role {
         Role::User => "input_text",
         Role::Assistant => "output_text",
+        Role::AssistantToolCall | Role::Tool => unreachable!("tool messages are not text messages"),
     }
 }
 
@@ -147,16 +176,17 @@ fn resolve_codex_url(base_url: &str) -> Result<Url> {
 }
 
 #[cfg(test)]
-fn parse_response_json(value: Value) -> Result<String> {
-    let text = extract_output_text(&value);
-    if text.is_empty() {
-        bail!("Codex response did not include assistant text");
+fn parse_response_json(value: Value) -> Result<AssistantTurn> {
+    let turn = extract_assistant_turn(&value);
+    if turn.text.as_deref().unwrap_or_default().is_empty() && turn.tool_calls.is_empty() {
+        bail!("Codex response did not include assistant text or tool calls");
     }
-    Ok(text)
+    Ok(turn)
 }
 
-fn parse_response_stream(body: &str) -> Result<String> {
+fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
     let mut completed_response = None;
     let mut saw_completed = false;
 
@@ -174,10 +204,13 @@ fn parse_response_stream(body: &str) -> Result<String> {
                 }
             }
             Some("response.output_item.done") => {
-                if text.is_empty()
-                    && let Some(item) = value.get("item")
-                {
-                    text.push_str(&extract_output_text(item));
+                if let Some(item) = value.get("item") {
+                    if text.is_empty() {
+                        text.push_str(&extract_output_text(item));
+                    }
+                    if let Some(call) = extract_tool_call(item) {
+                        tool_calls.push(call);
+                    }
                 }
             }
             Some("response.completed") => {
@@ -195,15 +228,22 @@ fn parse_response_stream(body: &str) -> Result<String> {
     if !saw_completed {
         bail!("Codex stream closed before response.completed");
     }
-    if text.is_empty()
-        && let Some(response) = completed_response.as_ref()
-    {
-        text.push_str(&extract_output_text(response));
+    if let Some(response) = completed_response.as_ref() {
+        let completed_turn = extract_assistant_turn(response);
+        if text.is_empty() {
+            text.push_str(completed_turn.text.as_deref().unwrap_or_default());
+        }
+        if tool_calls.is_empty() {
+            tool_calls = completed_turn.tool_calls;
+        }
     }
-    if text.is_empty() {
-        bail!("Codex response did not include assistant text");
+    if text.is_empty() && tool_calls.is_empty() {
+        bail!("Codex response did not include assistant text or tool calls");
     }
-    Ok(text)
+    Ok(AssistantTurn {
+        text: (!text.is_empty()).then_some(text),
+        tool_calls,
+    })
 }
 
 fn event_data(event: &str) -> String {
@@ -233,6 +273,54 @@ fn incomplete_reason(value: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn extract_assistant_turn(value: &Value) -> AssistantTurn {
+    let text = extract_output_text(value);
+    let tool_calls = extract_tool_calls(value);
+    AssistantTurn {
+        text: (!text.is_empty()).then_some(text),
+        tool_calls,
+    }
+}
+
+fn extract_tool_calls(value: &Value) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    if let Some(call) = extract_tool_call(value) {
+        calls.push(call);
+    }
+    if let Some(items) = value.get("output").and_then(Value::as_array) {
+        calls.extend(items.iter().filter_map(extract_tool_call));
+    }
+    calls
+}
+
+fn extract_tool_call(value: &Value) -> Option<ToolCall> {
+    (value.get("type").and_then(Value::as_str) == Some("function_call")).then(|| ToolCall {
+        id: value
+            .get("call_id")
+            .or_else(|| value.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        arguments: value
+            .get("arguments")
+            .and_then(parse_arguments)
+            .unwrap_or_else(|| json!({})),
+    })
+}
+
+fn parse_arguments(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) => serde_json::from_str(text).ok(),
+        object @ Value::Object(_) => Some(object.clone()),
+        _ => None,
+    }
 }
 
 fn extract_output_text(value: &Value) -> String {
@@ -289,16 +377,7 @@ mod tests {
     fn builds_codex_request_from_conversation() {
         let request = build_codex_request(
             "gpt-test",
-            &[
-                Message {
-                    role: Role::User,
-                    content: "hello".to_string(),
-                },
-                Message {
-                    role: Role::Assistant,
-                    content: "hi".to_string(),
-                },
-            ],
+            &[Message::user("hello"), Message::assistant("hi")],
         );
         assert_eq!(request["model"], "gpt-test");
         assert_eq!(request["stream"], true);
@@ -308,6 +387,40 @@ mod tests {
         assert_eq!(request["input"][0]["content"][0]["text"], "hello");
         assert_eq!(request["input"][1]["role"], "assistant");
         assert_eq!(request["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(request["tools"][0]["name"], "read");
+    }
+
+    #[test]
+    fn builds_codex_request_from_tool_messages() {
+        let request = build_codex_request(
+            "gpt-test",
+            &[
+                Message {
+                    role: Role::AssistantToolCall,
+                    content: json!({ "path": "src/main.rs" }).to_string(),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_name: Some("read".to_string()),
+                },
+                Message {
+                    role: Role::Tool,
+                    content: json!({ "ok": true, "content": "file text" }).to_string(),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_name: Some("read".to_string()),
+                },
+            ],
+        );
+
+        assert_eq!(request["input"][0]["type"], "function_call");
+        assert_eq!(request["input"][0]["call_id"], "call_1");
+        assert_eq!(request["input"][0]["name"], "read");
+        assert_eq!(request["input"][1]["type"], "function_call_output");
+        assert_eq!(request["input"][1]["call_id"], "call_1");
+        assert!(
+            request["input"][1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("file text")
+        );
     }
 
     #[test]
@@ -321,7 +434,10 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
         );
 
-        assert_eq!(parse_response_stream(stream)?, "Hello");
+        assert_eq!(
+            parse_response_stream(stream)?.text.as_deref(),
+            Some("Hello")
+        );
         Ok(())
     }
 
@@ -334,7 +450,28 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
         );
 
-        assert_eq!(parse_response_stream(stream)?, "Hello");
+        assert_eq!(
+            parse_response_stream(stream)?.text.as_deref(),
+            Some("Hello")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_streamed_tool_call() -> Result<()> {
+        let stream = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+
+        let turn = parse_response_stream(stream)?;
+
+        assert!(turn.text.is_none());
+        assert_eq!(turn.tool_calls[0].id, "call_1");
+        assert_eq!(turn.tool_calls[0].name, "read");
+        assert_eq!(turn.tool_calls[0].arguments["path"], "src/main.rs");
         Ok(())
     }
 
@@ -346,7 +483,30 @@ mod tests {
                 "content": [{ "type": "output_text", "text": "Hello" }]
             }]
         });
-        assert_eq!(parse_response_json(response)?, "Hello");
+        assert_eq!(
+            parse_response_json(response)?.text.as_deref(),
+            Some("Hello")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_responses_tool_call() -> Result<()> {
+        let response = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": { "path": "src/main.rs" }
+            }]
+        });
+
+        let turn = parse_response_json(response)?;
+
+        assert!(turn.text.is_none());
+        assert_eq!(turn.tool_calls[0].id, "call_1");
+        assert_eq!(turn.tool_calls[0].name, "read");
+        assert_eq!(turn.tool_calls[0].arguments["path"], "src/main.rs");
         Ok(())
     }
 
@@ -354,6 +514,6 @@ mod tests {
     fn rejects_response_without_text() {
         let response = json!({ "output": [{ "type": "message", "content": [] }] });
         let error = parse_response_json(response).unwrap_err().to_string();
-        assert!(error.contains("did not include assistant text"));
+        assert!(error.contains("did not include assistant text or tool calls"));
     }
 }
