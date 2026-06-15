@@ -15,15 +15,16 @@ use super::text::{
     restore_line_endings, strip_bom,
 };
 
-pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. The oldText must match a unique region; matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
+pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default oldText must match a unique region; set replaceAll=true to replace every occurrence. Matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
             "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
-            "oldText": { "type": "string", "minLength": 1, "description": "Text to find and replace (must match uniquely; matching normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace)" },
-            "newText": { "type": "string", "description": "New text to replace the old text with" }
+            "oldText": { "type": "string", "minLength": 1, "description": "Text to find and replace (must match uniquely unless replaceAll=true; matching normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace)" },
+            "newText": { "type": "string", "description": "New text to replace the old text with" },
+            "replaceAll": { "type": "boolean", "description": "Replace every occurrence of oldText instead of requiring a unique match (default: false)" }
         },
         "required": ["path", "oldText", "newText"]
     })
@@ -56,6 +57,8 @@ struct EditInput {
     path: String,
     old_text: String,
     new_text: String,
+    #[serde(default)]
+    replace_all: bool,
 }
 
 fn edit(root: &Path, input: &EditInput) -> Result<String> {
@@ -63,13 +66,19 @@ fn edit(root: &Path, input: &EditInput) -> Result<String> {
     atomic_write(&plan.resolved, plan.new_content.as_bytes())
         .with_context(|| format!("failed to write {}", input.path))?;
 
-    Ok(format!("Successfully replaced text in {}.", input.path))
+    let occurrences = plan.replaced;
+    let plural = if occurrences == 1 { "" } else { "s" };
+    Ok(format!(
+        "Successfully replaced {occurrences} occurrence{plural} in {}.",
+        input.path
+    ))
 }
 
 struct EditPlan {
     resolved: std::path::PathBuf,
     old_content: String,
     new_content: String,
+    replaced: usize,
 }
 
 fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
@@ -99,17 +108,25 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
         bail!("the old text cannot be empty");
     }
 
-    let (match_start, match_len) =
-        locate_unique_match(&normalized_content, &normalized_old, &input.path)?;
+    let ranges = locate_matches(
+        &normalized_content,
+        &normalized_old,
+        input.replace_all,
+        &input.path,
+    )?;
 
     // Build the replacement against the LF-normalized content, then restore the
-    // file's original line ending on write.
+    // file's original line ending on write. Ranges are non-overlapping and
+    // ascending, so one left-to-right pass applies every replacement.
     let normalized_new = normalize_to_lf(&input.new_text);
-    let mut new_content =
-        String::with_capacity(normalized_content.len() - match_len + normalized_new.len());
-    new_content.push_str(&normalized_content[..match_start]);
-    new_content.push_str(&normalized_new);
-    new_content.push_str(&normalized_content[match_start + match_len..]);
+    let mut new_content = String::with_capacity(normalized_content.len() + normalized_new.len());
+    let mut cursor = 0;
+    for &(start, len) in &ranges {
+        new_content.push_str(&normalized_content[cursor..start]);
+        new_content.push_str(&normalized_new);
+        cursor = start + len;
+    }
+    new_content.push_str(&normalized_content[cursor..]);
 
     if new_content == normalized_content {
         bail!(
@@ -129,19 +146,29 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
         resolved,
         old_content: raw_content,
         new_content: final_content,
+        replaced: ranges.len(),
     })
 }
 
-/// Find `needle` in `haystack`, requiring a unique match. Tries exact match
-/// first, then a whitespace/Unicode-punctuation-tolerant match (mirroring pi's
-/// edit normalization: Unicode spaces/quotes/dashes folded, trailing
-/// whitespace per line ignored). Returns the byte range in `haystack`.
-fn locate_unique_match(haystack: &str, needle: &str, path: &str) -> Result<(usize, usize)> {
-    let exact = count_and_first(haystack, needle);
-    match exact {
-        (0, _) => {}
-        (1, Some(start)) => return Ok((start, needle.len())),
-        (n, _) => bail!("found {n} occurrences of the text in {path}; it must be unique"),
+/// Locate the byte ranges in `haystack` to replace. Prefers exact matches; with
+/// none, falls back to a whitespace/Unicode-punctuation-tolerant match
+/// (mirroring pi's edit normalization: Unicode spaces/quotes/dashes folded,
+/// trailing whitespace per line ignored). Without `replace_all` the match must
+/// be unique; with it, every occurrence is returned. Ranges are non-overlapping
+/// and ascending.
+fn locate_matches(
+    haystack: &str,
+    needle: &str,
+    replace_all: bool,
+    path: &str,
+) -> Result<Vec<(usize, usize)>> {
+    let exact = find_all(haystack, needle);
+    if !exact.is_empty() {
+        let ranges = exact
+            .into_iter()
+            .map(|start| (start, needle.len()))
+            .collect();
+        return select(ranges, replace_all, path);
     }
 
     // Fuzzy fallback over normalized text with an offset map back to the
@@ -149,38 +176,65 @@ fn locate_unique_match(haystack: &str, needle: &str, path: &str) -> Result<(usiz
     let (norm_hay, map) = normalize_for_fuzzy(haystack);
     let (norm_needle, _) = normalize_for_fuzzy(needle);
     if norm_needle.is_empty() {
-        bail!("could not find the exact text in {path}; the old text must match exactly");
+        bail!("{}", not_found_message(path));
     }
-    let (count, first) = count_and_first(&norm_hay, &norm_needle);
-    match (count, first) {
-        (0, _) => bail!("could not find the exact text in {path}; the old text must match exactly"),
-        (1, Some(norm_start)) => {
-            let norm_end = norm_start + norm_needle.len();
+    let fuzzy = find_all(&norm_hay, &norm_needle);
+    if fuzzy.is_empty() {
+        bail!("{}", not_found_message(path));
+    }
+    let ranges = fuzzy
+        .into_iter()
+        .map(|norm_start| {
             let orig_start = map[norm_start];
-            let orig_end = map[norm_end];
-            Ok((orig_start, orig_end - orig_start))
-        }
-        (n, _) => bail!("found {n} occurrences of the text in {path}; it must be unique"),
+            let orig_end = map[norm_start + norm_needle.len()];
+            (orig_start, orig_end - orig_start)
+        })
+        .collect();
+    select(ranges, replace_all, path)
+}
+
+/// Apply the uniqueness policy: `replace_all` keeps every range; otherwise the
+/// match must be unique, and an ambiguous match returns an actionable error.
+fn select(
+    ranges: Vec<(usize, usize)>,
+    replace_all: bool,
+    path: &str,
+) -> Result<Vec<(usize, usize)>> {
+    if replace_all {
+        return Ok(ranges);
+    }
+    match ranges.len() {
+        1 => Ok(ranges),
+        n => bail!(
+            "found {n} occurrences of the text in {path}; pass replaceAll=true to replace all of \
+             them, or add surrounding context to oldText so it uniquely identifies one location"
+        ),
     }
 }
 
-/// Count non-overlapping occurrences and report the first byte index.
-fn count_and_first(haystack: &str, needle: &str) -> (usize, Option<usize>) {
+fn not_found_message(path: &str) -> String {
+    format!(
+        "could not find the text in {path}. oldText must match the file's current contents \
+         (line endings and Unicode spaces/quotes/dashes are normalized and trailing whitespace is \
+         ignored, but indentation and other characters must match exactly). Re-read the file and \
+         copy the exact text to replace."
+    )
+}
+
+/// All non-overlapping occurrences of `needle` in `haystack`, as ascending byte
+/// indices.
+fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
     if needle.is_empty() {
-        return (0, None);
+        return Vec::new();
     }
-    let mut count = 0;
-    let mut first = None;
-    let mut search_from = 0;
-    while let Some(rel) = haystack[search_from..].find(needle) {
-        let abs = search_from + rel;
-        if first.is_none() {
-            first = Some(abs);
-        }
-        count += 1;
-        search_from = abs + needle.len();
+    let mut positions = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let abs = from + rel;
+        positions.push(abs);
+        from = abs + needle.len();
     }
-    (count, first)
+    positions
 }
 
 /// Build a normalized string plus a map from each normalized byte offset to the
@@ -265,39 +319,78 @@ mod tests {
     use super::*;
     use crate::tools::test_support::{root_of, temp_dir};
 
+    fn run(root: &Path, path: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
+        edit(
+            root,
+            &EditInput {
+                path: path.into(),
+                old_text: old.into(),
+                new_text: new.into(),
+                replace_all,
+            },
+        )
+    }
+
     #[test]
     fn edit_replaces_unique_text() {
         let dir = temp_dir();
         let root = root_of(&dir);
         fs::write(dir.path.join("d.txt"), "one\ntwo\nthree\n").unwrap();
-        edit(
-            &root,
-            &EditInput {
-                path: "d.txt".into(),
-                old_text: "two".into(),
-                new_text: "TWO".into(),
-            },
-        )
-        .unwrap();
-        let content = fs::read_to_string(dir.path.join("d.txt")).unwrap();
-        assert_eq!(content, "one\nTWO\nthree\n");
+        let msg = run(&root, "d.txt", "two", "TWO", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path.join("d.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        assert!(msg.contains("1 occurrence"), "{msg}");
     }
 
     #[test]
-    fn edit_rejects_ambiguous_match() {
+    fn edit_rejects_ambiguous_match_and_suggests_replace_all() {
         let dir = temp_dir();
         let root = root_of(&dir);
         fs::write(dir.path.join("e.txt"), "dup\ndup\n").unwrap();
-        let err = edit(
-            &root,
-            &EditInput {
-                path: "e.txt".into(),
-                old_text: "dup".into(),
-                new_text: "x".into(),
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unique"));
+        let err = run(&root, "e.txt", "dup", "x", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("found 2 occurrences"), "{err}");
+        assert!(err.contains("replaceAll=true"), "{err}");
+    }
+
+    #[test]
+    fn edit_replace_all_replaces_every_occurrence() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("f.txt"), "dup\ndup\ndup\n").unwrap();
+        let msg = run(&root, "f.txt", "dup", "x", true).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path.join("f.txt")).unwrap(),
+            "x\nx\nx\n"
+        );
+        assert!(msg.contains("3 occurrences"), "{msg}");
+    }
+
+    #[test]
+    fn edit_replace_all_is_idempotent_single_match() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("h.txt"), "a\nb\nc\n").unwrap();
+        let msg = run(&root, "h.txt", "b", "B", true).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path.join("h.txt")).unwrap(),
+            "a\nB\nc\n"
+        );
+        assert!(msg.contains("1 occurrence"), "{msg}");
+    }
+
+    #[test]
+    fn edit_not_found_error_is_actionable() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("g.txt"), "alpha\n").unwrap();
+        let err = run(&root, "g.txt", "beta", "x", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not find the text"), "{err}");
+        assert!(err.contains("Re-read the file"), "{err}");
     }
 }
