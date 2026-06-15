@@ -41,11 +41,20 @@ impl<P: ChatProvider> Agent<P> {
         let _guard = span.enter();
 
         self.messages.push(Message::user(prompt));
+        crate::signals::reset();
         self.complete_turn(ui)
     }
 
     fn complete_turn(&mut self, ui: &mut dyn Ui) -> Result<()> {
         for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
+            if crate::signals::interrupted() {
+                tracing::info!(roundtrips = roundtrip, "turn interrupted by user");
+                ui.emit(UiEvent::Notice(
+                    "interrupted; send another message to continue.".to_string(),
+                ))?;
+                ui.emit(UiEvent::TurnComplete)?;
+                return Ok(());
+            }
             let mut sink = UiTurnSink::new(ui);
             let turn = self.provider.respond(&self.messages, &mut sink)?;
             let saw_text_delta = sink.saw_text_delta;

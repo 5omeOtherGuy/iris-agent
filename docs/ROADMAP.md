@@ -241,7 +241,10 @@ The Agent Kernel MVP is done when Iris can:
    [Implemented]
 7. Return tool errors to the model without crashing. [Implemented]
 8. Keep all file operations inside the workspace by default. [Implemented]
-9. Exit cleanly without corrupting session state or files. [Partial]
+9. Exit cleanly without corrupting session state or files. [Implemented]
+   `/exit`/`/quit` and EOF (Ctrl-D) end the loop cleanly; a graceful SIGINT
+   handler turns the first Ctrl-C into a between-round-trips turn interrupt and
+   lets a second Ctrl-C force-quit. Atomic writes guarantee no partial files.
 
 ### Remaining MVP design decisions
 
@@ -386,8 +389,8 @@ are implemented.
 
 1. Run and record the real-provider MVP smoke test: prompt → tool call → approval
    decision → tool result → final assistant response.
-2. Decide whether normal EOF/`/exit` behavior is enough for the MVP exit gate or
-   whether interrupt handling must be tightened first.
+2. Resolved: EOF/`/exit` plus a graceful two-stage SIGINT handler
+   (`src/signals.rs`) satisfy the MVP exit gate.
 3. Continue Milestone 1 UX work: streaming output and diff/tool-result
    presentation are shipped; transcript persistence and a provider/model/tool
    config file remain.

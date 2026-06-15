@@ -12,6 +12,7 @@ mod cli;
 mod errors;
 mod nexus;
 mod providers;
+mod signals;
 mod telemetry;
 mod tool_display;
 mod tools;
@@ -19,6 +20,7 @@ mod ui;
 
 fn main() -> ExitCode {
     telemetry::init();
+    signals::install();
     match dispatch() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
