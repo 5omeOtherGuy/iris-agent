@@ -12,8 +12,6 @@
 │   "I'd ship this one!"        │
 │        — Claude Code, 2026    │
 │                               │
-│   ✻ Churned for 13m 14s       │
-│                               │
 ╰───────────────────────────────╯
 ```
 
@@ -25,7 +23,7 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-15): early implementation.** The repository currently contains a text-only interactive session backed by an OpenAI Codex Responses provider, a streaming provider tool-call loop, workspace-scoped built-in tools, and terminal approval gates with diff previews. The Agent Kernel MVP is close but not complete yet: session persistence and broader tool-policy UX are still planned.
+**Status (2026-06-15): Milestone 1 complete.** The repository currently contains a text-only interactive session backed by an OpenAI Codex Responses provider, a streaming provider tool-call loop, workspace-scoped built-in tools, terminal approval gates with diff previews, provider/model settings, and best-effort JSONL transcript persistence. Persistent approval policies and broader tool-policy UX are still planned.
 
 Implemented today:
 
@@ -37,14 +35,17 @@ Implemented today:
 - Workspace-scoped built-in tools under `src/tools/`: `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. `edit` uses Claude Code's exact-string contract (`file_path`/`old_string`/`new_string`/`replace_all`).
 - Approval enforcement for `write`, `edit`, and `bash`, with diff previews for file-mutating tools and model-readable denied-call results.
 - Atomic same-directory file replacement for `write` and `edit`.
+- `bash` hardening: a Linux Landlock kernel sandbox (workspace-write, TCP-deny) with explicit fallback, persistent shell sessions, and background jobs (`src/tools/bash/`).
+- Graceful Ctrl-C handling: first press ends the turn between round-trips, a second force-quits and reaps tracked process groups (`src/signals.rs`, `src/process_group.rs`).
+- A JSON settings file for provider/model defaults (`src/config.rs`, `~/.iris/settings.json` + project `.iris/settings.json`).
+- Best-effort JSONL session transcripts (`src/session.rs`).
 - OpenAI Codex OAuth browser and device-code login plus token loading/refresh in `src/auth/`.
 - OpenAI Codex Responses request/response handling in `src/providers/openai_codex_responses.rs`, including tool schemas, retry/backoff, and streamed-response parsing.
 - Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
 
 Not implemented yet:
 
-- Persisted session transcripts.
-- Persistent approval policies, shared file-observation/stale-file guards, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
+- Persistent approval policies, session `/resume` and transcript-tree branching, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
 
 ## Running
 
@@ -80,10 +81,16 @@ Override the auth-file path with:
 IRIS_AUTH_PATH=/path/to/auth.json cargo run
 ```
 
+Provider/model defaults can also be set in a JSON settings file: `~/.iris/settings.json`
+(global) and `<cwd>/.iris/settings.json` (project, overrides global). Recognized keys:
+`defaultProvider`, `defaultModel`, `baseUrl`. Environment variables override the file.
+
 Optional environment variables:
 
 - `IRIS_MODEL` — model name; defaults to `gpt-5.5`.
 - `IRIS_CODEX_BASE_URL` — base URL; defaults to `https://chatgpt.com/backend-api`.
+- `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
+- `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
 
 Start the REPL:
 

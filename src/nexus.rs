@@ -164,7 +164,7 @@ impl<P: ChatProvider> Agent<P> {
                     // allow must not silently auto-run data-losing commands.
                     let destructive = crate::tools::is_destructive(&call.name, &call.arguments);
                     let session_allowed = self.session_allowed.contains(&call.name);
-                    let auto_approved = session_allowed && !destructive;
+                    let auto_approved = session_allowed && !destructive && call.name != "bash";
                     if auto_approved {
                         ui.emit(UiEvent::ToolAutoApproved(call.clone()))?;
                     }
@@ -195,8 +195,15 @@ impl<P: ChatProvider> Agent<P> {
                                 continue;
                             }
                             ApprovalDecision::AllowAlways => {
-                                tracing::info!(tool = %call.name, "tool always-allowed this session");
-                                self.session_allowed.insert(call.name.clone());
+                                if call.name == "bash" {
+                                    ui.emit(UiEvent::Notice(
+                                        "bash always-allow is disabled; shell commands require approval each time."
+                                            .to_string(),
+                                    ))?;
+                                } else {
+                                    tracing::info!(tool = %call.name, "tool always-allowed this session");
+                                    self.session_allowed.insert(call.name.clone());
+                                }
                             }
                             ApprovalDecision::Allow => {}
                         }

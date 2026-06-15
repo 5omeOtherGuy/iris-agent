@@ -1,9 +1,9 @@
 # Iris — Roadmap
 
-> Status (2026-06-15): roadmap for an early implementation. A text-only session
+> Status (2026-06-15): Milestone 1 is complete. Iris has a text-only session
 > loop, OpenAI Codex Responses provider, streaming tool-call loop, workspace-scoped
-> tools, and terminal approval gates with diff previews exist, but the Agent
-> Kernel MVP is not complete.
+> tools, terminal approval gates with diff previews, provider/model settings,
+> and best-effort JSONL transcript persistence.
 > This roadmap defines build order and acceptance criteria. `FEATURES.md` remains
 > the capability inventory; this document says what to build first.
 
@@ -318,7 +318,8 @@ Potential scope:
   hierarchy via per-block glyphs/color/spacing, colored unified diffs with
   fixed relative headers and minimized context, long tool results folded to a
   bounded preview with a `(+N more lines)` indicator, a session always-allow
-  approval policy enforced in Nexus, and paste-safe multi-line prompt input
+  approval policy for file tools enforced in Nexus (`bash` still prompts every
+  time), and paste-safe multi-line prompt input
   (bracketed paste + `\` continuation). All color/structure degrades to plain
   ANSI-free text on non-TTY/piped output. Deferred to a future full-TUI
   milestone (raw mode): interactive expand/collapse of folded blocks, `Alt+Enter`
@@ -345,9 +346,21 @@ Potential scope:
   cross-session approval persistence is tracked under
   [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14).]
 - Safer `bash` policy. Command classification is optional and should not block
-  the basic local coding workflow.
+  the basic local coding workflow. [Shipped, stronger than classification:
+  a Linux Landlock kernel sandbox confines every shell to workspace-write +
+  TCP-deny with an explicit non-silent fallback, plus per-group spawn/kill/reap
+  and force-quit reaping (`src/tools/bash/sandbox.rs`, `src/process_group.rs`,
+  [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3)). `bash` always
+  prompts; blanket shell-command approval is deliberately disabled.]
 - Better `edit` semantics: uniqueness checks, conflict messages, preview diff.
-  [Preview diff shipped for mutating tools; uniqueness/conflict messaging remains.]
+  [Shipped, at pi parity: exact match first, then a whitespace/Unicode-normalized
+  fuzzy fallback (`normalize_for_fuzzy`/`locate_matches`, `src/tools/edit.rs`).
+  Default match must be unique; ambiguous matches error with an occurrence count
+  and suggest `replace_all`/more context, and not-found errors tell the model to
+  re-read. This mirrors pi's `edit-diff.ts` strategy and its two error classes.
+  Preview diff shipped for mutating tools. Deferred (nice-to-have): Aider-style
+  "did you mean" near-match hints -- no source precedent in pi, and the
+  misleading-suggestion/noise risk is not justified by the match-pi baseline.]
   See the Tool quality workstream ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)).
 - Basic git diff display after file changes. [Decided 2026-06-15: keep the
   pre-apply approval preview diff as the single diff surface, matching Claude
@@ -482,13 +495,18 @@ are implemented.
    gates are now met.
 2. Resolved: EOF/`/exit` plus a graceful two-stage SIGINT handler
    (`src/signals.rs`) satisfy the MVP exit gate.
-3. Continue Milestone 1 UX work: streaming output, the diff/tool-result
-   presentation pass, and the Nexus-enforced session always-allow approval
-   policy ([#14](https://github.com/5omeOtherGuy/iris-agent/issues/14)) are
-   shipped; transcript persistence and a provider/model/tool config file remain.
-   A future full-TUI milestone would add interactive block expansion,
-   `Alt+Enter` multi-line editing, and box framing (raw-mode terminal).
-4. Implement shared tool infrastructure in dependency order: path identity and
+3. Milestone 1 is complete (2026-06-15): every scope item is shipped or
+   explicitly resolved -- terminal UX/streaming, transcript persistence,
+   provider/model config file, `edit` semantics at pi parity, the Landlock
+   `bash` sandbox, and the git-diff decision (preview is the single surface;
+   post-change display moves to Milestone 5). The acceptance signal is met:
+   Iris can make a small change in a real repo, show the diff, and explain it.
+   Deferred to a future full-TUI milestone (raw mode): interactive block
+   expansion, `Alt+Enter` multi-line editing, and box framing.
+4. Next: Milestone 2 (token-efficiency). The metadata gate is already met
+   ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) MVP), so the
+   remaining work is handle-backing large tool outputs and token accounting.
+   First implement shared tool infrastructure in dependency order: path identity and
    observation store ([#11](https://github.com/5omeOtherGuy/iris-agent/issues/11)),
    mutation preflight ([#12](https://github.com/5omeOtherGuy/iris-agent/issues/12)),
    atomic queue/refresh completion ([#13](https://github.com/5omeOtherGuy/iris-agent/issues/13)),

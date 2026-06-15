@@ -1049,6 +1049,45 @@ fn always_allow_does_not_cross_tool_boundaries() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn always_allow_does_not_auto_approve_bash() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: json!({ "command": "echo first" }),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "bash".to_string(),
+                    arguments: json!({ "command": "echo second" }),
+                },
+            ],
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    run_text_session(
+        &mut agent,
+        "run both\na\nn\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    let rendered = String::from_utf8(output)?;
+    assert!(!rendered.contains("auto-approved · bash"));
+    let seen = agent.provider.seen.borrow();
+    assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
+    Ok(())
+}
+
 struct TestWorkspace {
     path: PathBuf,
 }

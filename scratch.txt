@@ -1,4 +1,0 @@
-color=blue
-snack=apple
-snack=apple
-status=todo

@@ -42,6 +42,8 @@ mod write;
 
 pub(crate) use observe::ObservedFiles;
 
+const MAX_DIFF_PREVIEW_BYTES: usize = 1024 * 1024;
+
 /// Mutable per-agent state threaded through [`dispatch`]: observed-file tracking
 /// for read-before-write safety plus the bash tool's persistent-session
 /// registry. Owned by the `Agent` so no global mutable state is needed.
@@ -189,7 +191,13 @@ pub(super) enum Preview {
 
 fn render_preview(preview: Preview) -> Option<String> {
     match preview {
-        Preview::Available { path, old, new } => Some(unified_diff(&path, &old, &new)),
+        Preview::Available { path, old, new } => {
+            if old.len().saturating_add(new.len()) > MAX_DIFF_PREVIEW_BYTES {
+                Some("diff unavailable: preview too large".to_string())
+            } else {
+                Some(unified_diff(&path, &old, &new))
+            }
+        }
         Preview::Unavailable(reason) => Some(format!("diff unavailable: {reason}")),
         Preview::Malformed => None,
     }
@@ -367,6 +375,31 @@ mod tests {
     }
 
     #[test]
+    fn bash_definition_advertises_job_actions() {
+        let defs = tool_definitions();
+        let bash = defs.iter().find(|d| d["name"] == "bash").unwrap();
+        let action_enum = bash["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        for action in [
+            "run", "reset", "close", "start", "poll", "finalize", "cancel", "list",
+        ] {
+            assert!(
+                action_enum.contains(&json!(action)),
+                "missing bash action {action}"
+            );
+        }
+        assert!(bash["parameters"]["properties"].get("job").is_some());
+    }
+
+    #[test]
+    fn bash_definition_does_not_require_command_for_job_actions() {
+        let defs = tool_definitions();
+        let bash = defs.iter().find(|d| d["name"] == "bash").unwrap();
+        assert!(bash["parameters"].get("required").is_none());
+    }
+
+    #[test]
     fn diff_preview_renders_write_diff() {
         let dir = temp_dir();
         fs::write(dir.path.join("note.txt"), "old\n").unwrap();
@@ -382,6 +415,19 @@ mod tests {
         assert!(diff.contains("+++ b/note.txt"));
         assert!(diff.contains("-old"));
         assert!(diff.contains("+new"));
+    }
+
+    #[test]
+    fn diff_preview_refuses_huge_previews() {
+        let dir = temp_dir();
+        let diff = diff_preview(
+            &dir.path,
+            "write",
+            &json!({ "path": "huge.txt", "content": "x".repeat(2 * 1024 * 1024) }),
+        )
+        .unwrap();
+
+        assert_eq!(diff, "diff unavailable: preview too large");
     }
 
     #[test]

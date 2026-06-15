@@ -32,7 +32,7 @@ const BASH_DRAIN_TIMEOUT_SECS: u64 = 5;
 // streams.
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls; with a session, `action` may be `run` (default), `reset` (start the shell fresh), or `close` (terminate it).";
+pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -41,9 +41,9 @@ pub(super) fn parameters() -> Value {
             "command": { "type": "string", "description": "Bash command to execute" },
             "timeout": { "type": "integer", "description": "Timeout in seconds (default 120; set 0 to disable)" },
             "session": { "type": "string", "description": "Persistent shell session id; state (cd/env/vars) persists across calls with the same id" },
-            "action": { "type": "string", "enum": ["run", "reset", "close"], "description": "Session action (default run); reset starts a fresh shell, close terminates it" }
-        },
-        "required": ["command"]
+            "job": { "type": "string", "description": "Background job id for poll/finalize/cancel" },
+            "action": { "type": "string", "enum": ["run", "reset", "close", "start", "poll", "finalize", "cancel", "list"], "description": "Action (default run): run/reset/close a session, or start/poll/finalize/cancel/list background jobs" }
+        }
     })
 }
 
@@ -209,6 +209,12 @@ fn render_job_list(jobs: Vec<jobs::JobInfo>) -> String {
 /// body, sandbox notice, then a timeout/exit-status footer.
 fn render_session(outcome: session::RunOutcome, timeout_secs: u64) -> String {
     let mut out = render_output(&outcome.output);
+    if outcome.output_dropped > 0 {
+        out = format!(
+            "[output truncated: {} byte(s) dropped]\n{out}",
+            outcome.output_dropped
+        );
+    }
     if let Some(notice) = outcome.notice {
         out = format!("[{notice}]\n{out}");
     }
@@ -692,6 +698,27 @@ mod tests {
             !after.content.trim_end().ends_with("/sub"),
             "session not reset after close"
         );
+    }
+
+    #[test]
+    fn execute_session_reports_bounded_output() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+
+        let out = execute(
+            &root,
+            &json!({
+                "command": "python3 - <<'PY'\nprint('x' * (2 * 1024 * 1024))\nPY",
+                "session": "s1",
+                "timeout": 5
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(out.content.contains("output truncated"), "{}", out.content);
     }
 
     #[test]

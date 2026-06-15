@@ -33,8 +33,6 @@ const BANNER_LINES: &[&str] = &[
     "\u{2502}   \"I'd ship this one!\"        \u{2502}",
     "\u{2502}        \u{2014} Claude Code, 2026    \u{2502}",
     "\u{2502}                               \u{2502}",
-    "\u{2502}   \u{273b} Churned for 13m 14s       \u{2502}",
-    "\u{2502}                               \u{2502}",
     "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
 ];
 
@@ -461,6 +459,16 @@ mod tests {
     fn prompt_returns_single_line_with_newline() -> Result<()> {
         let mut ui = TextUi::new("hello\ny\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(ui.next_prompt()?.as_deref(), Some("hello\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_banner_has_no_fake_timing() -> Result<()> {
+        let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
+        ui.emit(UiEvent::SessionStarted)?;
+        let (_, out, _) = ui.into_parts();
+        let rendered = String::from_utf8(out)?;
+        assert!(!rendered.contains("Churned for"));
         Ok(())
     }
 

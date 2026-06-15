@@ -50,12 +50,15 @@ use super::sandbox::{self, SandboxStatus};
 /// marker) from blocking forever; the tool layer normally passes an explicit
 /// timeout well under this.
 pub(super) const SESSION_HARD_CAP: Duration = Duration::from_secs(600);
+const SESSION_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Result of running one command in a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunOutcome {
     /// Combined stdout+stderr the command produced (untruncated).
     pub(crate) output: String,
+    /// Bytes dropped from the head while bounding the session output buffer.
+    pub(crate) output_dropped: usize,
     /// Exit status, or `None` if the shell died before reporting one
     /// (e.g. the command was `exit`, or the session was killed on timeout).
     pub(crate) exit_code: Option<i32>,
@@ -137,12 +140,16 @@ impl Sessions {
 /// Outcome of scanning the shell's output stream for the completion marker.
 enum Marker {
     /// Marker found: `output` is the command's bytes, `code` its exit status.
-    Found { output: Vec<u8>, code: Option<i32> },
+    Found {
+        output: Vec<u8>,
+        dropped: usize,
+        code: Option<i32>,
+    },
     /// Deadline passed before the marker arrived; `output` is what was read.
-    TimedOut { output: Vec<u8> },
+    TimedOut { output: Vec<u8>, dropped: usize },
     /// The shell's stdout closed (it exited) before a marker; `output` is
     /// whatever it printed first.
-    Disconnected { output: Vec<u8> },
+    Disconnected { output: Vec<u8>, dropped: usize },
 }
 
 /// A single persistent shell.
@@ -226,6 +233,7 @@ impl Session {
             self.kill_and_reap();
             return RunOutcome {
                 output: String::new(),
+                output_dropped: 0,
                 exit_code: None,
                 timed_out: false,
                 notice: None,
@@ -235,25 +243,32 @@ impl Session {
             .map(|d| Instant::now() + d)
             .or_else(|| Some(Instant::now() + SESSION_HARD_CAP));
         match self.read_until_marker(deadline) {
-            Marker::Found { output, code } => RunOutcome {
+            Marker::Found {
+                output,
+                dropped,
+                code,
+            } => RunOutcome {
                 output: String::from_utf8_lossy(&output).into_owned(),
+                output_dropped: dropped,
                 exit_code: code,
                 timed_out: false,
                 notice: None,
             },
-            Marker::TimedOut { output } => {
+            Marker::TimedOut { output, dropped } => {
                 self.kill_and_reap();
                 RunOutcome {
                     output: String::from_utf8_lossy(&output).into_owned(),
+                    output_dropped: dropped,
                     exit_code: None,
                     timed_out: true,
                     notice: None,
                 }
             }
-            Marker::Disconnected { output } => {
+            Marker::Disconnected { output, dropped } => {
                 self.kill_and_reap();
                 RunOutcome {
                     output: String::from_utf8_lossy(&output).into_owned(),
+                    output_dropped: dropped,
                     exit_code: None,
                     timed_out: false,
                     notice: None,
@@ -291,6 +306,7 @@ impl Session {
         let mut buf = std::mem::take(&mut self.leftover);
         // Rescan from a point that preserves any marker split across reads.
         let mut scan_from = 0usize;
+        let mut dropped = 0usize;
 
         loop {
             if let Some(rel) = find(&buf[scan_from..], &prefix) {
@@ -302,7 +318,11 @@ impl Session {
                         .and_then(|s| s.trim().parse::<i32>().ok());
                     let output = buf[..start].to_vec();
                     self.leftover = buf[after + nl + 1..].to_vec();
-                    return Marker::Found { output, code };
+                    return Marker::Found {
+                        output,
+                        dropped,
+                        code,
+                    };
                 }
                 // Prefix seen but the exit code/newline has not fully arrived;
                 // keep this region in view and read more.
@@ -315,24 +335,44 @@ impl Session {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        return Marker::TimedOut { output: buf };
+                        return Marker::TimedOut {
+                            output: buf,
+                            dropped,
+                        };
                     }
                     match self.rx.recv_timeout(remaining) {
                         Ok(chunk) => chunk,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            return Marker::TimedOut { output: buf };
+                            return Marker::TimedOut {
+                                output: buf,
+                                dropped,
+                            };
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            return Marker::Disconnected { output: buf };
+                            return Marker::Disconnected {
+                                output: buf,
+                                dropped,
+                            };
                         }
                     }
                 }
                 None => match self.rx.recv() {
                     Ok(chunk) => chunk,
-                    Err(_) => return Marker::Disconnected { output: buf },
+                    Err(_) => {
+                        return Marker::Disconnected {
+                            output: buf,
+                            dropped,
+                        };
+                    }
                 },
             };
             buf.extend_from_slice(&chunk);
+            if buf.len() > SESSION_MAX_OUTPUT_BYTES {
+                let excess = buf.len() - SESSION_MAX_OUTPUT_BYTES;
+                buf.drain(..excess);
+                dropped += excess;
+                scan_from = scan_from.saturating_sub(excess);
+            }
         }
     }
 
@@ -481,6 +521,24 @@ mod tests {
                 .trim_end(),
             "still-alive"
         );
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn session_output_is_bounded() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        let out = s
+            .run(
+                &ws.0,
+                "a",
+                "python3 - <<'PY'\nprint('x' * (2 * 1024 * 1024))\nPY",
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+
+        assert!(out.output.len() < 2 * 1024 * 1024, "output was not bounded");
+        assert!(out.output_dropped > 0);
         s.close("a").unwrap();
     }
 
