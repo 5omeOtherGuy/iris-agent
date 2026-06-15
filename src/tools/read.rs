@@ -66,7 +66,18 @@ fn read(root: &Path, input: &ReadInput) -> Result<String> {
     }
 
     let bytes = fs::read(&resolved).with_context(|| format!("failed to read {}", input.path))?;
-    let content = String::from_utf8_lossy(&bytes);
+    if bytes.contains(&0) {
+        bail!(
+            "file appears to be binary and cannot be safely read as text: {}",
+            input.path
+        );
+    }
+    let content = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "file is not valid UTF-8 and cannot be safely read as text: {}",
+            input.path
+        )
+    })?;
 
     let mut lines: Vec<&str> = content.split('\n').collect();
     // A trailing newline produces a final empty element that is not a real line.
@@ -184,6 +195,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("escapes workspace") || err.contains("failed to resolve path"));
+    }
+
+    #[test]
+    fn read_rejects_invalid_utf8_instead_of_lossy_rendering() {
+        let dir = temp_dir();
+        fs::write(dir.path.join("binary.dat"), [b'a', 0xFF, b'b']).unwrap();
+
+        let err = read_file(&dir.path, "binary.dat").unwrap_err().to_string();
+
+        assert!(err.contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn read_rejects_nul_containing_binary_file() {
+        let dir = temp_dir();
+        fs::write(dir.path.join("nul.dat"), b"alpha\0beta").unwrap();
+
+        let err = read_file(&dir.path, "nul.dat").unwrap_err().to_string();
+
+        assert!(err.contains("binary"), "{err}");
     }
 
     #[test]
