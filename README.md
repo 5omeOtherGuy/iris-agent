@@ -31,6 +31,19 @@ Not implemented yet:
 
 ## Running
 
+### Runtime dependencies
+
+The `grep` and `find` tools shell out to external search binaries, which must be
+on `PATH`:
+
+- [`ripgrep`](https://github.com/BurntSushi/ripgrep) (`rg`) for `grep`.
+- [`fd`](https://github.com/sharkdp/fd) (`fd` or `fdfind`) for `find`.
+
+If one is missing, only that tool fails with a clear message; the rest of the
+agent works normally.
+
+### Credentials
+
 Iris expects OpenAI Codex OAuth credentials in an Iris auth file. By default it reads:
 
 ```text

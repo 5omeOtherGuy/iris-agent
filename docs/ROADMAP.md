@@ -93,7 +93,7 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 | `write` | Standard + atomic writes | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
 | `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
 | `read` | Standard text read | Claude Code (multimodal) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
-| `find` | Native (`ignore`+`globset`), no `fd` dep | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
+| `find` | Standard, wraps `fd` | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
 | `bash` | Behind | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
 
 Execution order (by impact/effort, independent of the milestone sequence):
@@ -106,14 +106,14 @@ Execution order (by impact/effort, independent of the milestone sequence):
 2. **Tier 2 — close real capability gaps.**
    - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
      background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
-   - `find`: native via `ignore` + `globset`, no longer shells out to `fd`
-     (done) — `fd` is a thin wrapper over those crates, so this dropped a
-     subprocess and the fail-when-`fd`-absent path at no quality cost.
-     `grep`: still shells out to `rg`. Going native with `grep-searcher` is
-     optional, not mandatory: `rg` is a legitimate dependency and Iris is a
-     single Rust binary regardless. Do #6 only if native is a net
-     simplification, not to chase a zero-external-tools rule —
-     [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) (done),
+   - `find`/`grep`: keep wrapping `fd`/`rg`. These are the same engines the
+     mature tools (Pi, etc.) wrap rather than reimplement; matching their
+     behavior natively means an ongoing parity burden (smart-case, glob
+     semantics, parallel walk, binary detection) for no real gain. `rg`/`fd`
+     are accepted runtime dependencies. The open work is packaging, not a
+     rewrite: a clear "not installed" error today, and optionally an on-demand
+     download manager later (Pi's approach) —
+     [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7),
      [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
 3. **Tier 3 — parity polish.** `edit` `replace_all` + helpful failure output
    ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)); `write` freshness
@@ -139,8 +139,8 @@ Shared tool infrastructure issues opened 2026-06-15:
 Status: already best-in-class on `hashline_edit`; strong-standard on the
 read/grep/edit/write/ls cluster. The honest gaps are `bash` (large), shared
 observation/preflight/result metadata (medium), persistent approval policy/risk
-labels (medium; diff preview already shipped), and native search/find packaging
-(medium).
+labels (medium; diff preview already shipped), and `rg`/`fd` packaging
+(clear missing-binary errors, optional on-demand download; small).
 
 ## Provider-specific tools
 
