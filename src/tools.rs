@@ -217,7 +217,7 @@ fn relative_display(root: &Path, path: &Path) -> String {
 // read
 // ============================================================================
 
-const READ_DESCRIPTION: &str = "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 1MB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
+const READ_DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 1MB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
 
 fn read_parameters() -> Value {
     json!({
