@@ -265,7 +265,12 @@ Before Milestone 0 is considered complete, verification should include:
 - Unit coverage for approval allow/deny paths.
 - A fake-provider integration test covering prompt → tool call → tool result →
   final assistant response.
-- A manual smoke test with one real provider.
+- A manual smoke test with one real provider. [Done 2026-06-15] Verified against
+  the OpenAI Codex Responses provider: (1) `read` tool — prompt → tool call →
+  result → final answer → clean exit; (2) `write` tool, approval allowed — diff
+  preview → `y` → executed → result → final answer; (3) `write` tool, approval
+  denied — diff preview → `n` → denied-call result returned to the model → no
+  file created. All runs exited cleanly with status 0.
 
 ## Milestone 1 — Usable Local Coding Agent
 
@@ -387,8 +392,9 @@ are implemented.
 
 ## Immediate next steps
 
-1. Run and record the real-provider MVP smoke test: prompt → tool call → approval
-   decision → tool result → final assistant response.
+1. Done (2026-06-15): real-provider MVP smoke test recorded under the MVP
+   verification gate above. All Milestone 0 acceptance criteria and verification
+   gates are now met.
 2. Resolved: EOF/`/exit` plus a graceful two-stage SIGINT handler
    (`src/signals.rs`) satisfy the MVP exit gate.
 3. Continue Milestone 1 UX work: streaming output and diff/tool-result
