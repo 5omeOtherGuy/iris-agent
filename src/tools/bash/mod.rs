@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 
+mod jobs;
 mod sandbox;
 mod session;
 
@@ -38,15 +39,18 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-/// Per-agent state for the bash tool: the registry of persistent shell sessions.
+/// Per-agent state for the bash tool: the persistent-session registry and the
+/// background-job registry.
 pub(crate) struct BashState {
     sessions: session::Sessions,
+    jobs: jobs::Jobs,
 }
 
 impl BashState {
     pub(crate) fn new() -> Self {
         Self {
             sessions: session::Sessions::new(),
+            jobs: jobs::Jobs::new(),
         }
     }
 }
@@ -58,54 +62,141 @@ pub(super) fn execute(
 ) -> Result<super::ToolOutput> {
     let parsed: BashArgs =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
-    match parsed.session.clone() {
-        Some(id) => run_session(root, &id, parsed, state),
-        None => {
-            let command = parsed
-                .command
-                .context("bash tool arguments must include command")?;
-            Ok(super::ToolOutput::text(bash(
-                root,
-                &BashInput {
-                    command,
-                    timeout: parsed.timeout,
-                },
-            )?))
+    let text = match parsed.action.as_deref().unwrap_or("run") {
+        "run" => match &parsed.session {
+            Some(id) => run_session(root, &id.clone(), parsed, state)?,
+            None => {
+                let command = parsed
+                    .command
+                    .context("bash tool arguments must include command")?;
+                bash(
+                    root,
+                    &BashInput {
+                        command,
+                        timeout: parsed.timeout,
+                    },
+                )?
+            }
+        },
+        action @ ("reset" | "close") => {
+            let id = parsed
+                .session
+                .as_deref()
+                .context("bash session action requires 'session'")?;
+            if action == "reset" {
+                state.sessions.reset(id)?;
+                format!("session '{id}' reset")
+            } else {
+                state.sessions.close(id)?;
+                format!("session '{id}' closed")
+            }
         }
-    }
-}
-
-/// Route a session-scoped call to the right lifecycle operation.
-fn run_session(
-    root: &Path,
-    id: &str,
-    parsed: BashArgs,
-    state: &mut BashState,
-) -> Result<super::ToolOutput> {
-    match parsed.action.as_deref().unwrap_or("run") {
-        "run" => {
+        "start" => {
             let command = parsed
                 .command
                 .filter(|c| !c.trim().is_empty())
-                .context("bash session run requires a command")?;
-            let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
-            let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
-            let outcome = state.sessions.run(root, id, &command, timeout)?;
-            Ok(super::ToolOutput::text(render_session(
-                outcome,
-                timeout_secs,
-            )))
+                .context("bash job start requires a command")?;
+            let id = state.jobs.start(root, &command, None)?;
+            format!("started background job '{id}'; poll it with action=poll, job='{id}'")
         }
-        "reset" => {
-            state.sessions.reset(id)?;
-            Ok(super::ToolOutput::text(format!("session '{id}' reset")))
+        "poll" => {
+            let id = parsed.job.as_deref().context("bash poll requires 'job'")?;
+            render_job(id, state.jobs.poll(id)?)
         }
-        "close" => {
-            state.sessions.close(id)?;
-            Ok(super::ToolOutput::text(format!("session '{id}' closed")))
+        "finalize" => {
+            let id = parsed
+                .job
+                .as_deref()
+                .context("bash finalize requires 'job'")?;
+            let wait = match parsed.timeout {
+                Some(0) => None,
+                Some(secs) => Some(Duration::from_secs(secs)),
+                None => Some(Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS)),
+            };
+            render_job(id, state.jobs.finalize(id, wait)?)
         }
-        other => bail!("unknown bash session action: {other}"),
+        "cancel" => {
+            let id = parsed
+                .job
+                .as_deref()
+                .context("bash cancel requires 'job'")?;
+            state.jobs.cancel(id)?;
+            format!("cancelled background job '{id}'")
+        }
+        "list" => render_job_list(state.jobs.list()),
+        other => bail!("unknown bash action: {other}"),
+    };
+    Ok(super::ToolOutput::text(text))
+}
+
+/// Route a session-scoped `run` to the session registry.
+fn run_session(root: &Path, id: &str, parsed: BashArgs, state: &mut BashState) -> Result<String> {
+    let command = parsed
+        .command
+        .filter(|c| !c.trim().is_empty())
+        .context("bash session run requires a command")?;
+    let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+    let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+    let outcome = state.sessions.run(root, id, &command, timeout)?;
+    Ok(render_session(outcome, timeout_secs))
+}
+
+/// Format a background-job update: bounded output, drop/sandbox notices, status.
+fn render_job(id: &str, update: jobs::JobUpdate) -> String {
+    let mut out = if update.output.trim().is_empty() {
+        if update.finished {
+            "(no output)".to_string()
+        } else {
+            "(no new output)".to_string()
+        }
+    } else {
+        render_output(&update.output)
+    };
+    if update.dropped > 0 {
+        out = format!(
+            "[{} byte(s) dropped from the bounded output buffer]\n{out}",
+            update.dropped
+        );
     }
+    if let Some(notice) = update.notice {
+        out = format!("[{notice}]\n{out}");
+    }
+    let status = if update.finished {
+        match update.exit_code {
+            Some(code) => format!("job '{id}' finished (exit code {code})"),
+            None => format!("job '{id}' finished (terminated)"),
+        }
+    } else {
+        format!("job '{id}' running")
+    };
+    format!("{out}\n\n{status}")
+}
+
+/// Format the job list as one line per job.
+fn render_job_list(jobs: Vec<jobs::JobInfo>) -> String {
+    if jobs.is_empty() {
+        return "(no background jobs)".to_string();
+    }
+    jobs.into_iter()
+        .map(|j| {
+            let state = if j.running {
+                "running".to_string()
+            } else {
+                match j.exit_code {
+                    Some(code) => format!("finished (exit {code})"),
+                    None => "finished (terminated)".to_string(),
+                }
+            };
+            let label = j.label.map(|l| format!(" {l}")).unwrap_or_default();
+            let dropped = if j.dropped > 0 {
+                format!(", {} dropped", j.dropped)
+            } else {
+                String::new()
+            };
+            format!("{}{label}: {state} ({} bytes{dropped})", j.id, j.produced)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Format a session command result the same way the one-shot path does: bounded
@@ -144,6 +235,8 @@ struct BashArgs {
     timeout: Option<u64>,
     #[serde(default)]
     session: Option<String>,
+    #[serde(default)]
+    job: Option<String>,
     #[serde(default)]
     action: Option<String>,
 }
@@ -337,6 +430,23 @@ pub(super) fn kill_process_group(child: &mut std::process::Child) {
 pub(super) fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
+
+/// SIGKILL a process group by id. Used by background jobs, whose `Child` is
+/// owned by a waiter thread, so the registry can only signal by pgid.
+//
+// ponytail: second killpg call site; subsystem 4 folds this and
+// `kill_process_group` into one shared process-group primitive.
+#[cfg(unix)]
+pub(super) fn kill_group(pgid: i32) {
+    // SAFETY: FFI call with no Rust memory invariants. `pgid` is the positive id
+    // of a process group we created with `process_group(0)`; `SIGKILL` is valid.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn kill_group(_pgid: i32) {}
 
 #[derive(Clone, Copy)]
 enum BashStream {
@@ -574,6 +684,51 @@ mod tests {
             !after.content.trim_end().ends_with("/sub"),
             "session not reset after close"
         );
+    }
+
+    #[test]
+    fn execute_background_job_start_poll_finalize() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+
+        let started = execute(
+            &root,
+            &json!({ "action": "start", "command": "printf go; exit 4" }),
+            &mut state,
+        )
+        .unwrap();
+        // The id is echoed as job-0 for the first job.
+        assert!(
+            started.content.contains("job-0"),
+            "start: {}",
+            started.content
+        );
+
+        let listed = execute(&root, &json!({ "action": "list" }), &mut state).unwrap();
+        assert!(listed.content.contains("job-0"));
+
+        let fin = execute(
+            &root,
+            &json!({ "action": "finalize", "job": "job-0", "timeout": 5 }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(
+            fin.content.contains("go"),
+            "finalize output: {}",
+            fin.content
+        );
+        assert!(
+            fin.content.contains("exit code 4"),
+            "finalize: {}",
+            fin.content
+        );
+
+        // Finalized jobs are gone.
+        let after = execute(&root, &json!({ "action": "list" }), &mut state).unwrap();
+        assert!(after.content.contains("no background jobs"));
     }
 
     #[test]
