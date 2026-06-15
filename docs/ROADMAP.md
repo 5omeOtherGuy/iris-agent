@@ -104,12 +104,30 @@ Execution order (by impact/effort, independent of the milestone sequence):
    tree view ([#8](https://github.com/5omeOtherGuy/iris-agent/issues/8)).
 4. **Tier 4 — extend the frontier.** Integrate + benchmark `hashline_edit`
    ([#9](https://github.com/5omeOtherGuy/iris-agent/issues/9)); then new tools
-   beyond the eight — `apply_patch` (V4A, for Codex-model routing), `ast_edit`
-   for structural moves, and an optional fast-apply path.
+   beyond the eight — `apply_patch` (V4A; tracked under provider-specific tools,
+   [#10](https://github.com/5omeOtherGuy/iris-agent/issues/10)), `ast_edit` for
+   structural moves, and an optional fast-apply path.
 
 Status: already best-in-class on `hashline_edit`; strong-standard on the
 read/grep/edit/write/ls cluster. The honest gaps are `bash` (large), two
 false-advertising bugs (small), and native search/find packaging (medium).
+
+## Provider-specific tools
+
+Complementary long-term axis to the tool-quality work above, tracked as an epic
+([#10](https://github.com/5omeOtherGuy/iris-agent/issues/10)). The eight tools
+stay provider-agnostic and remain the canonical baseline; *in addition*, when Iris
+routes a turn to a given model it should present that model the tool surface it
+was trained on, wherever a benchmark shows a win. Examples: OpenAI/Codex
+`apply_patch` (V4A), Anthropic native `text_editor`/`bash` tool types, a Gemini
+`diff-fenced` edit variant.
+
+Done incrementally — one provider-specific tool at a time, each behind a measured
+advantage and a generic fallback, never as the only path. `apply_patch` (V4A) for
+Codex routes is the first/reference instance. Requires a tool registry that can
+vary the advertised tool set by active provider/model (plugs into the Milestone 4
+routing work); result shape, path safety, and approval gates stay centralized in
+Nexus regardless of which variant runs.
 
 ## Milestone 0 — Agent Kernel MVP
 
