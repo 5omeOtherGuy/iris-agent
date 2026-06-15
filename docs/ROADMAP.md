@@ -1,7 +1,8 @@
 # Iris — Roadmap
 
-> Status (2026-06-14): roadmap for an early implementation. A text-only REPL and
-> OpenAI Codex Responses provider exist, but the Agent Kernel MVP is not complete.
+> Status (2026-06-15): roadmap for an early implementation. A text-only REPL,
+> OpenAI Codex Responses provider, tool-call loop, and workspace-scoped tools
+> exist, but the Agent Kernel MVP is not complete.
 > This roadmap defines build order and acceptance criteria. `FEATURES.md` remains
 > the capability inventory; this document says what to build first.
 
@@ -42,21 +43,73 @@ The immediate goal is much smaller: build the minimum working agent kernel.
 Implemented today:
 
 - CLI entrypoint that starts Iris from `cargo run`.
-- Text-only Nexus REPL with in-memory conversation state and `/exit` / `/quit`.
-- Provider-neutral `ChatProvider`, `Message`, and `Role` types.
+- Text-only Nexus REPL with in-memory conversation state, `/exit` / `/quit`, and
+  provider-error recovery.
+- Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and
+  `Role` types.
+- Provider tool-call loop with bounded iterations and structured tool
+  result/error messages.
+- Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,
+  `find`, `ls`, and `hashline_edit`.
+- Workspace path-safety enforcement for existing and newly written paths.
 - OpenAI Codex OAuth token loading/refresh from the Iris auth-file shape.
-- OpenAI Codex Responses request/response handling.
-- Unit tests for the REPL, auth-file handling, URL/request shaping, and response
-  parsing.
+- OpenAI Codex browser and device-code login flows.
+- OpenAI Codex Responses request/response handling, including tool schemas and
+  streamed-response parsing.
+- Unit tests for the REPL, tool loop, tool implementations, path safety,
+  auth-file handling, URL/request shaping, and response parsing.
 
 Not implemented yet:
 
-- Core tools: `read`, `write`, `edit`, and `bash`.
-- Tool-call execution and tool-result encoding.
 - Approval prompts and denied-call handling.
-- Workspace path-safety enforcement.
-- Streaming, transcript persistence, modes, subagents, context ledger, content
-  handles, git automation, and GitHub integration.
+- Incremental terminal streaming, transcript persistence, modes, subagents,
+  context ledger, content handles, git automation, and GitHub integration.
+
+## Tool quality — best-in-class on all tools
+
+Cross-cutting workstream, not a milestone. Goal: every built-in tool is at or
+above the field's best implementation. The eight tools were assessed 2026-06-15
+against Claude Code, Codex CLI, Aider, OpenHands/SWE-agent, Cline/Roo, Gemini
+CLI, and oh-my-pi (omp). Each tool has a tracking issue.
+
+| Tool | Tier today | Best-in-class holder | Issue |
+| --- | --- | --- | --- |
+| `hashline_edit` | Frontier (parity w/ omp) | omp (origin) | [#9](https://github.com/5omeOtherGuy/iris-agent/issues/9) |
+| `edit` | Strong-standard | RooCode (fuzzy) / Codex (V4A) | [#4](https://github.com/5omeOtherGuy/iris-agent/issues/4) |
+| `grep` | Standard | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
+| `write` | Standard | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
+| `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
+| `read` | Standard + false claim | Claude Code (multimodal) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
+| `find` | Standard, weak packaging | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
+| `bash` | Behind | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
+
+Execution order (by impact/effort, independent of the milestone sequence):
+
+1. **Tier 1 — correctness bugs (ship first).** Both advertise a capability the
+   code does not deliver.
+   - `read`: image attachments are described but `read()` returns
+     `from_utf8_lossy`, garbling images — [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2).
+   - `grep`: `hashline` is advertised but `GrepInput` has no such field and no
+     tags are emitted — [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
+2. **Tier 2 — close real capability gaps.**
+   - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
+     background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
+   - `find`/`grep`: go native (`ignore` + `globset`, `grep-searcher`) to drop the
+     `fd`/`rg` runtime deps and honor the single-static-binary pitch —
+     [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7), [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
+3. **Tier 3 — parity polish.** `edit` `replace_all` + helpful failure output
+   ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)); `write` freshness
+   guard ([#5](https://github.com/5omeOtherGuy/iris-agent/issues/5)); `read`
+   PDF/notebook ([#2](https://github.com/5omeOtherGuy/iris-agent/issues/2)); `ls`
+   tree view ([#8](https://github.com/5omeOtherGuy/iris-agent/issues/8)).
+4. **Tier 4 — extend the frontier.** Integrate + benchmark `hashline_edit`
+   ([#9](https://github.com/5omeOtherGuy/iris-agent/issues/9)); then new tools
+   beyond the eight — `apply_patch` (V4A, for Codex-model routing), `ast_edit`
+   for structural moves, and an optional fast-apply path.
+
+Status: already best-in-class on `hashline_edit`; strong-standard on the
+read/grep/edit/write/ls cluster. The honest gaps are `bash` (large), two
+false-advertising bugs (small), and native search/find packaging (medium).
 
 ## Milestone 0 — Agent Kernel MVP
 
@@ -135,32 +188,29 @@ These are important, but not required for the first working agent:
 
 The Agent Kernel MVP is done when Iris can:
 
-1. Start from the command line in a local repo.
-2. Complete a multi-turn conversation with one model provider.
-3. Read an existing file through the `read` tool.
-4. Create a new file through the `write` tool after confirmation.
-5. Modify an existing file through the `edit` tool after confirmation.
-6. Run a harmless shell command through the `bash` tool after confirmation.
-7. Return tool errors to the model without crashing.
-8. Keep all file operations inside the workspace by default.
-9. Exit cleanly without corrupting session state or files.
+1. Start from the command line in a local repo. [Implemented]
+2. Complete a multi-turn conversation with one model provider. [Implemented]
+3. Read an existing file through the `read` tool. [Implemented]
+4. Create a new file through the `write` tool after confirmation. [Tool
+   implemented; approval pending]
+5. Modify an existing file through the `edit` tool after confirmation. [Tool
+   implemented; approval pending]
+6. Run a harmless shell command through the `bash` tool after confirmation. [Tool
+   implemented; approval pending]
+7. Return tool errors to the model without crashing. [Implemented]
+8. Keep all file operations inside the workspace by default. [Implemented]
+9. Exit cleanly without corrupting session state or files. [Partial]
 
-### MVP design decisions to resolve before implementation
+### Remaining MVP design decisions
 
-These are required before coding the MVP, but should be specified in a focused
-implementation note rather than expanded here:
+These should be specified in focused implementation notes rather than expanded
+here:
 
-- Nexus / Iris CLI ownership boundaries.
-- Provider interface shape for one provider, without locking Nexus to that
-  provider's native payload format.
-- Provider-neutral conversation/message representation.
-- Core tool input/result/error contract.
-- Workspace path-safety policy, including absolute paths, `..`, symlinks, binary
-  files, and large files.
 - Approval policy for `write`, `edit`, and `bash`, including denied calls.
-- `bash` limits: cwd, timeout, stdout/stderr capture, output limits, exit codes,
-  and no interactive commands.
-- Minimal fake-provider test strategy for the model loop.
+- Whether destructive or externally visible `bash` commands need classification
+  beyond the baseline approval gate.
+- Whether additional file-tool policy is needed for binary files, very large
+  files, and absolute paths before marking path safety complete.
 
 ### MVP verification gate
 
@@ -185,6 +235,7 @@ Potential scope:
 - Safer `bash` policy. Command classification is optional and should not block
   the basic local coding workflow.
 - Better `edit` semantics: uniqueness checks, conflict messages, preview diff.
+  See the Tool quality workstream ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)).
 - Basic git diff display after file changes.
 - Optional self-review before final response.
 

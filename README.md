@@ -8,23 +8,21 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-14): early implementation.** The repository currently contains a text-only interactive REPL backed by an OpenAI Codex Responses provider. The Agent Kernel MVP is not complete yet: file tools, tool-call execution, approvals, workspace path safety, and bash execution are still planned.
+**Status (2026-06-15): early implementation.** The repository currently contains a text-only interactive REPL backed by an OpenAI Codex Responses provider, a provider tool-call loop, and workspace-scoped built-in tools. The Agent Kernel MVP is not complete yet: approval prompts, streaming terminal output, and session persistence are still planned.
 
 Implemented today:
 
 - CLI entrypoint in `src/main.rs`.
-- Nexus REPL loop in `src/nexus.rs` with multi-turn conversation state.
-- Provider-neutral `ChatProvider`, `Message`, and `Role` types.
-- OpenAI Codex OAuth token loading/refresh in `src/auth/openai_codex.rs`.
-- OpenAI Codex Responses request/response handling in `src/providers/openai_codex_responses.rs`.
-- Unit tests for REPL behavior, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
+- Nexus REPL loop in `src/nexus.rs` with multi-turn conversation state, tool-call execution, and tool-result/error encoding.
+- Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and `Role` types.
+- Workspace-scoped built-in tools in `src/tools.rs`: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, and `hashline_edit`.
+- OpenAI Codex OAuth browser and device-code login plus token loading/refresh in `src/auth/`.
+- OpenAI Codex Responses request/response handling in `src/providers/openai_codex_responses.rs`, including tool schemas and streamed-response parsing.
+- Unit tests for REPL behavior, tool loop behavior, workspace path safety, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
 
 Not implemented yet:
 
-- `read`, `write`, `edit`, and `bash` tools.
-- Tool-call loop and tool-result encoding.
 - Approval prompts and denial handling.
-- Workspace path-safety enforcement.
 - Streaming output.
 - Session persistence, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
 
@@ -36,7 +34,14 @@ Iris expects OpenAI Codex OAuth credentials in an Iris auth file. By default it 
 ~/.iris/auth.json
 ```
 
-Override the path with:
+Create or refresh credentials with one of the login commands:
+
+```bash
+cargo run -- login openai-codex
+cargo run -- login openai-codex --device-code
+```
+
+Override the auth-file path with:
 
 ```bash
 IRIS_AUTH_PATH=/path/to/auth.json cargo run

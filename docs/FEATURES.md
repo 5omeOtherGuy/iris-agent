@@ -1,6 +1,6 @@
 # Iris — Feature List
 
-> Status (2026-06-14): early implementation. Labels: **[Implemented]** ·
+> Status (2026-06-15): early implementation. Labels: **[Implemented]** ·
 > **[Partial]** · **[Planned · MVP]** · **[Planned]** · **[Research]**. This file is
 > a capability inventory, not a build sequence; use [`ROADMAP.md`](ROADMAP.md) for
 > milestone order.
@@ -12,8 +12,8 @@
   [Partial]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process. [Partial]
-- **Provider-neutral message shape** — `Message`, `Role`, and `ChatProvider` in
-  Nexus. [Partial]
+- **Provider-neutral turn/message shape** — `ChatProvider`, `AssistantTurn`,
+  `ToolCall`, `Message`, and `Role` in Nexus. [Partial]
 - **Provider error reporting** — provider errors print to stderr and the REPL
   continues. [Partial]
 - **Streaming responses** — incremental provider output. [Planned]
@@ -22,11 +22,14 @@
 ## Providers and auth
 
 - **OpenAI Codex Responses provider** — blocking non-streaming request/response
-  path using the ChatGPT Codex Responses endpoint. [Partial]
+  path using the ChatGPT Codex Responses endpoint, with tool schemas and streamed
+  response parsing. [Partial]
 - **OpenAI Codex OAuth auth-file support** — reads `~/.iris/auth.json` or
   `IRIS_AUTH_PATH`, refreshes expired access tokens, extracts account ID from the
   JWT payload, and rewrites refreshed credentials atomically with restricted Unix
   permissions. [Partial]
+- **OpenAI Codex login** — browser OAuth callback flow and device-code OAuth flow
+  through `iris-agent login openai-codex`. [Partial]
 - **Provider configuration** — `IRIS_MODEL` and `IRIS_CODEX_BASE_URL`. [Partial]
 - **Additional providers** — Anthropic, OpenAI API, Gemini-compatible, local, or
   OpenAI-compatible backends. [Planned]
@@ -37,26 +40,34 @@
 ## Agent Kernel MVP tools
 
 - **Tool-call loop** — send tool schemas, receive tool calls, execute tools, feed
-  tool results back to the model. [Planned · MVP]
-- **`read` tool** — read a workspace text file. [Planned · MVP]
-- **`write` tool** — create or overwrite a workspace file after approval.
-  [Planned · MVP]
-- **`edit` tool** — targeted text replacement in an existing file after approval.
-  [Planned · MVP]
-- **`bash` tool** — run a bounded shell command in the workspace after approval.
-  [Planned · MVP]
+  tool results back to the model, and stop after a bounded number of tool
+  iterations. [Partial]
+- **`read` tool** — read a workspace text file with offset/limit and hashline
+  output support. [Implemented]
+- **`write` tool** — create or overwrite a workspace file. [Implemented]
+- **`edit` tool** — targeted text replacement in an existing file, including
+  whitespace-normalized fallback matching. [Implemented]
+- **`bash` tool** — run a bounded shell command in the workspace with captured
+  output, timeout handling, and nonzero-exit reporting. [Implemented]
+- **`grep` tool** — search workspace files through `rg` when available.
+  [Implemented]
+- **`find` tool** — find workspace files through `fd`/`fdfind` when available.
+  [Implemented]
+- **`ls` tool** — list workspace directory entries. [Implemented]
+- **`hashline_edit` tool** — apply content-hash anchored line edits compatible
+  with `read` hashline output. [Implemented]
 - **Tool result/error encoding** — structured success/error responses returned to
-  the model. [Planned · MVP]
+  the model. [Implemented]
 
 ## Safety and approvals
 
 - **Workspace path safety** — keep file tools inside the workspace by default,
   including policy for absolute paths, `..`, symlinks, binary files, and large
-  files. [Planned · MVP]
+  files. [Partial]
 - **Approval gates** — explicit confirmation for `write`, `edit`, and `bash`, with
   denied-call handling. [Planned · MVP]
 - **Bash policy** — cwd, timeout, stdout/stderr capture, output limits, exit-code
-  handling, and no interactive commands. [Planned · MVP]
+  handling, and process-group cleanup. [Partial]
 - **Secret redaction** — redact secrets from stored content and summaries.
   [Planned]
 - **Subagent tool permissions** — per-worker tool allowlists. [Planned]
