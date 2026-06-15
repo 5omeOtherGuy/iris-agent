@@ -41,7 +41,7 @@ behind the `Ui` trait; the only implementation today is the text front-end.
 | `src/approval.rs` | Approval decision value and terminal decision parser shared by Nexus enforcement and the UI. `y`/`yes` allow; anything else denies. | `ApprovalDecision`, `parse_decision()` | none |
 | `src/errors.rs` | Provider-neutral typed errors carried across runtime boundaries for user-facing handling and exit codes. | `AuthError`, `UsageError`, `exit_code()` | `thiserror` |
 | `src/telemetry.rs` | Operator observability: `RUST_LOG`-driven tracing to stderr, secret-safe fingerprints, and sanitization of external response bodies before they reach logs/errors. | `init()`, `redact_secret()`, `sanitize_external_body()` | `tracing-subscriber`, `sha2`, `serde_json` |
-| `src/tools/mod.rs` | Built-in tool dispatch, JSON tool declarations, mutating-tool approval classifier, diff-preview generation, and shared external-binary lookup. | `dispatch()`, `requires_approval()`, `diff_preview()`, `tool_definitions()` | tool submodules, `anyhow`, `serde_json`, `std::process` |
+| `src/tools/mod.rs` | Built-in tool dispatch, the `ToolOutput { content, metadata }` result contract, JSON tool declarations, mutating-tool approval classifier, diff-preview generation, and shared external-binary lookup. | `dispatch()`, `ToolOutput`, `requires_approval()`, `diff_preview()`, `tool_definitions()` | tool submodules, `anyhow`, `serde_json`, `std::process` |
 | `src/tools/path.rs` | Workspace path resolution and display helpers. Canonicalizes existing paths, normalizes create targets, and rejects workspace escapes. | `workspace_root()`, `resolve_existing()`, `resolve_for_write()`, `relative_display()` | `std::path`, `anyhow` |
 | `src/tools/text.rs` | Shared text, truncation, size-limit, line-ending, and atomic-write helpers. | `atomic_write()`, `truncate_head()`, `truncate_tail()`, line-ending helpers | filesystem APIs, `rand`, `anyhow` |
 | `src/tools/read.rs` | Text-file read tool with offset/limit, line numbers, binary/NUL and invalid UTF-8 rejection. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
@@ -51,7 +51,7 @@ behind the `Ui` trait; the only implementation today is the text front-end.
 | `src/tools/bash.rs` | Shell command tool with cwd confinement, timeout, process-group kill, output drain, truncation, and nonzero-exit reporting. | `execute()` | process/filesystem APIs, `libc` on Unix, `serde` |
 | `src/tools/grep.rs` | Ripgrep-backed content search with workspace-relative output. | `execute()` | `path`, `text`, `std::process`, `serde` |
 | `src/tools/find.rs` | fd/fdfind-backed file glob search sorted newest-first. | `execute()` | `path`, `text`, filesystem/process APIs, `serde` |
-| `src/tools/ls.rs` | Directory listing tool: directories first, dotfiles, directory suffixes, optional recursive tree, and output caps. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
+| `src/tools/ls.rs` | Directory listing tool: directories first, dotfiles, directory suffixes, optional recursive tree, optional `long` mode (type marker + human-readable size), entry-count metadata, and output caps. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
 | `src/auth/mod.rs` | Auth module declaration. | `device_code`, `openai_codex`, `storage` modules | auth submodules |
 | `src/auth/storage.rs` | Provider-keyed auth-file storage for OAuth credentials. Reads missing files as empty, validates credential shape, and writes atomically with restricted Unix permissions. | `AuthStore`, `OAuthCredentials` | filesystem/env APIs, `anyhow`, `serde`, `serde_json` |
 | `src/auth/device_code.rs` | Generic polling helper for OAuth device-code flows. | `DeviceCodePoll`, `poll_device_code()` | `std::thread`, `std::time`, `anyhow` |
@@ -106,7 +106,7 @@ Unknown commands print help and exit with code `2` (`UsageError`); auth failures
 | `bash` | Run a bounded shell command in the workspace with captured stdout/stderr, timeout handling, and process-group cleanup. | Command cwd is the workspace; approval-gated. |
 | `grep` | Search workspace content through `rg` when available. | Search path resolves inside the workspace. |
 | `find` | Find workspace files through `fd`/`fdfind` when available. | Search path resolves inside the workspace. |
-| `ls` | List directory entries (directories first, optional recursive tree) with a scan limit. | Directory path resolves inside the workspace. |
+| `ls` | List directory entries (directories first, optional recursive tree, optional `long` type+size mode) with a scan limit. | Directory path resolves inside the workspace. |
 
 ## External Dependencies
 

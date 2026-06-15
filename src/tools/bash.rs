@@ -33,10 +33,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
+pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
     let input: BashInput =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
-    bash(root, &input)
+    Ok(super::ToolOutput::text(bash(root, &input)?))
 }
 
 #[derive(Debug, Deserialize)]

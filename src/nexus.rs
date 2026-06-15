@@ -142,9 +142,9 @@ impl<P: ChatProvider> Agent<P> {
                 let result = self.execute_tool(&call);
                 tracing::info!(tool = %call.name, ok = result.is_ok(), "tool executed");
                 match &result {
-                    Ok(content) => ui.emit(UiEvent::ToolResult {
+                    Ok(output) => ui.emit(UiEvent::ToolResult {
                         call: call.clone(),
-                        content: content.clone(),
+                        content: output.content.clone(),
                     })?,
                     Err(error) => ui.emit(UiEvent::ToolError {
                         call: call.clone(),
@@ -174,7 +174,7 @@ impl<P: ChatProvider> Agent<P> {
         Ok(())
     }
 
-    fn execute_tool(&mut self, call: &ToolCall) -> Result<String> {
+    fn execute_tool(&mut self, call: &ToolCall) -> Result<crate::tools::ToolOutput> {
         crate::tools::dispatch(
             &self.workspace,
             &call.name,
@@ -299,9 +299,22 @@ impl Role {
     }
 }
 
-fn tool_result_json(result: &Result<String>) -> String {
+fn tool_result_json(result: &Result<crate::tools::ToolOutput>) -> String {
     match result {
-        Ok(content) => json!({ "ok": true, "content": content }).to_string(),
+        Ok(output) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("ok".to_string(), Value::Bool(true));
+            obj.insert("content".to_string(), Value::String(output.content.clone()));
+            // Only emit the metadata object when a tool reported something
+            // structured, keeping text-only results on the wire as before.
+            if !output.metadata.is_empty() {
+                obj.insert(
+                    "metadata".to_string(),
+                    Value::Object(output.metadata.clone()),
+                );
+            }
+            Value::Object(obj).to_string()
+        }
         Err(error) => json!({ "ok": false, "error": error.to_string() }).to_string(),
     }
 }

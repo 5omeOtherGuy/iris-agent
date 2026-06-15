@@ -24,10 +24,15 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value, observed: &mut ObservedFiles) -> Result<String> {
+pub(super) fn execute(
+    root: &Path,
+    args: &Value,
+    observed: &mut ObservedFiles,
+) -> Result<super::ToolOutput> {
     let input: WriteInput = serde_json::from_value(args.clone())
         .context("write tool arguments must include path and content")?;
-    write_file(root, &input, observed)
+    let message = write_file(root, &input, observed)?;
+    Ok(super::ToolOutput::text(message).with("bytes_written", json!(input.content.len())))
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {

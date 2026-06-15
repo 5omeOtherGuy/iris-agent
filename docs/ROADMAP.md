@@ -126,7 +126,8 @@ Execution order (by impact/effort, independent of the milestone sequence):
    freshness guard ([#5](https://github.com/5omeOtherGuy/iris-agent/issues/5)) —
    shipped (read-before-mutate via the session observation store, shared with
    `edit`); `ls` metadata
-   ([#8](https://github.com/5omeOtherGuy/iris-agent/issues/8)).
+   ([#8](https://github.com/5omeOtherGuy/iris-agent/issues/8)) — shipped (opt-in
+   `long` mode: type marker + human-readable size).
    `read` multimodal support for PDF/notebook/image inputs
    ([#2](https://github.com/5omeOtherGuy/iris-agent/issues/2)) is explicitly
    deferred as a nice-to-have for much later.
@@ -143,12 +144,12 @@ Shared tool infrastructure issues opened 2026-06-15:
 | [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Done (MVP): `edit`/`write` reject mutating an existing file that was never read or changed since last read (hash-decided; mtime refreshed on benign change). New files may be created blind. |
 | [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; observation refresh now happens after each mutation; no canonical mutation queue. |
 | [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Partial: `y`/`yes` approval/deny is enforced in Nexus and file-mutating tools show a diff preview before approval; no persistent allow policies or risk labels. |
-| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Missing structured metadata; plain text results remain. |
+| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): `dispatch` returns a `ToolOutput { content, metadata }`; success results carry a per-tool `metadata` object on the wire (`read` byte/line/`truncated`, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs is the remaining Milestone 2 work. |
 
 Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
-on Claude Code's exact-string contract, and a shared read-before-mutate stale-file
-guard. The honest gaps are `bash` (large), result metadata (medium),
-persistent approval policy/risk
+on Claude Code's exact-string contract, a shared read-before-mutate stale-file
+guard, and a structured `ToolOutput` result/metadata contract. The honest gaps
+are `bash` (large), handle-backed large outputs (medium), persistent approval policy/risk
 labels (medium; diff preview already shipped), and `rg`/`fd` packaging
 (clear missing-binary errors, optional on-demand download; small).
 

@@ -16,7 +16,7 @@ use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_head};
 const DEFAULT_LS_LIMIT: usize = 500;
 const LS_SCAN_HARD_LIMIT: usize = 20_000;
 
-pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Output is truncated to 500 entries or 1MB (whichever is hit first).";
+pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Set long=true to prefix each entry with a type marker (d/f/l) and human-readable size. Output is truncated to 500 entries or 1MB (whichever is hit first).";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -25,12 +25,13 @@ pub(super) fn parameters() -> Value {
             "path": { "type": "string", "description": "Directory to list (default: current directory)" },
             "limit": { "type": "integer", "description": "Maximum number of entries to return (default: 500)" },
             "recursive": { "type": "boolean", "description": "List subdirectories as an indented tree (default: false)" },
-            "depth": { "type": "integer", "description": "Levels to descend: 1 = immediate children (default), 2 = children and grandchildren, etc. recursive=true implies at least 2." }
+            "depth": { "type": "integer", "description": "Levels to descend: 1 = immediate children (default), 2 = children and grandchildren, etc. recursive=true implies at least 2." },
+            "long": { "type": "boolean", "description": "Prefix each entry with a type marker (d/f/l) and human-readable size (default false)" }
         }
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
+pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
     let input: LsInput =
         serde_json::from_value(args.clone()).context("ls tool arguments are invalid")?;
     ls(root, &input)
@@ -46,9 +47,11 @@ struct LsInput {
     recursive: bool,
     #[serde(default)]
     depth: Option<usize>,
+    #[serde(default)]
+    long: bool,
 }
 
-fn ls(root: &Path, input: &LsInput) -> Result<String> {
+fn ls(root: &Path, input: &LsInput) -> Result<super::ToolOutput> {
     if matches!(input.limit, Some(0)) {
         bail!("`limit` must be greater than 0");
     }
@@ -75,33 +78,56 @@ fn ls(root: &Path, input: &LsInput) -> Result<String> {
         0,
         max_depth,
         cap,
+        input.long,
         &mut lines,
         &mut truncated,
     )?;
 
     if lines.is_empty() {
-        return Ok("(empty directory)".to_string());
+        return Ok(super::ToolOutput::text("(empty directory)").with("entries", json!(0)));
     }
 
+    let entries = lines.len();
     let (body, truncated_bytes, _) =
         truncate_head(&lines.join("\n"), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
     let mut out = body;
-    if truncated || truncated_bytes {
+    let truncated = truncated || truncated_bytes;
+    if truncated {
         out.push_str("\n\n[output truncated]");
     }
-    Ok(out)
+    Ok(super::ToolOutput::text(out)
+        .with("entries", json!(entries))
+        .with("truncated", json!(truncated)))
+}
+
+/// Human-readable byte size, e.g. `537 B`, `1.5 KB`, `3.4 MB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 /// Append one directory level (and, within `max_depth`, its subdirectories) to
 /// `lines`. `depth` is 0 for the listed directory's immediate children. A failed
 /// read of the top directory is an error; failures deeper in the tree are
 /// skipped so one unreadable subdirectory does not abort the whole listing.
+#[allow(clippy::too_many_arguments)]
 fn append_dir(
     dir_path: &Path,
     dir_label: &str,
     depth: usize,
     max_depth: usize,
     cap: usize,
+    long: bool,
     lines: &mut Vec<String>,
     truncated: &mut bool,
 ) -> Result<()> {
@@ -113,8 +139,8 @@ fn append_dir(
         Err(_) => return Ok(()),
     };
 
-    // (name, is_dir, is_symlink)
-    let mut entries: Vec<(String, bool, bool)> = Vec::new();
+    // (name, is_dir, is_symlink, size_bytes)
+    let mut entries: Vec<(String, bool, bool, u64)> = Vec::new();
     for entry in read {
         // Bound per-directory memory: stop scanning a pathologically large
         // directory instead of reading every entry before truncating.
@@ -129,30 +155,62 @@ fn append_dir(
         let is_symlink = file_type.is_symlink();
         let is_dir = file_type.is_dir()
             || (is_symlink && entry.metadata().map(|m| m.is_dir()).unwrap_or(false));
+        // Size is only meaningful (and only rendered) for regular files.
+        let size = if is_dir || is_symlink {
+            0
+        } else {
+            entry.metadata().map(|m| m.len()).unwrap_or(0)
+        };
         entries.push((
             entry.file_name().to_string_lossy().to_string(),
             is_dir,
             is_symlink,
+            size,
         ));
     }
 
     // Directories first, then files; case-insensitive within each group.
-    entries.sort_by_cached_key(|(name, is_dir, _)| (!is_dir, name.to_lowercase()));
+    entries.sort_by_cached_key(|(name, is_dir, _, _)| (!is_dir, name.to_lowercase()));
 
     let indent = "  ".repeat(depth);
-    for (name, is_dir, is_symlink) in entries {
+    for (name, is_dir, is_symlink, size) in entries {
         if lines.len() >= cap {
             *truncated = true;
             return Ok(());
         }
         let suffix = if is_dir { "/" } else { "" };
-        lines.push(format!("{indent}{name}{suffix}"));
+        if long {
+            let marker = if is_symlink {
+                "l"
+            } else if is_dir {
+                "d"
+            } else {
+                "f"
+            };
+            let size_col = if is_dir || is_symlink {
+                "-".to_string()
+            } else {
+                human_size(size)
+            };
+            lines.push(format!("{marker} {size_col:>8} {indent}{name}{suffix}"));
+        } else {
+            lines.push(format!("{indent}{name}{suffix}"));
+        }
 
         // Descend into real subdirectories only: never follow a symlink, so the
         // walk cannot cycle or leave the resolved root.
         if is_dir && !is_symlink && depth + 1 < max_depth {
             let child = dir_path.join(&name);
-            append_dir(&child, &name, depth + 1, max_depth, cap, lines, truncated)?;
+            append_dir(
+                &child,
+                &name,
+                depth + 1,
+                max_depth,
+                cap,
+                long,
+                lines,
+                truncated,
+            )?;
             if *truncated {
                 return Ok(());
             }
@@ -174,9 +232,64 @@ mod tests {
                 limit: None,
                 recursive,
                 depth,
+                long: false,
             },
         )
         .unwrap()
+        .content
+    }
+
+    #[test]
+    fn human_size_formats_units() {
+        assert_eq!(human_size(537), "537 B");
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn ls_long_shows_kind_and_size() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::create_dir(dir.path.join("sub")).unwrap();
+        fs::write(dir.path.join("a.txt"), "hello").unwrap();
+        let out = ls(
+            &root,
+            &LsInput {
+                path: None,
+                limit: None,
+                recursive: false,
+                depth: None,
+                long: true,
+            },
+        )
+        .unwrap()
+        .content;
+        // Directory first with a `d` marker and `-` size, then the file with an
+        // `f` marker and its byte size.
+        assert_eq!(out, "d        - sub/\nf      5 B a.txt");
+    }
+
+    #[test]
+    fn ls_reports_entry_count_metadata() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::create_dir(dir.path.join("sub")).unwrap();
+        fs::write(dir.path.join("a.txt"), "x").unwrap();
+        let output = ls(
+            &root,
+            &LsInput {
+                path: None,
+                limit: None,
+                recursive: false,
+                depth: None,
+                long: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(output.metadata.get("entries"), Some(&json!(2)));
+        assert_eq!(output.metadata.get("truncated"), Some(&json!(false)));
     }
 
     #[test]
@@ -262,6 +375,7 @@ mod tests {
                 limit: Some(0),
                 recursive: false,
                 depth: None,
+                long: false,
             },
         )
         .unwrap_err()

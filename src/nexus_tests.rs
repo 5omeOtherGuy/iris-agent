@@ -336,6 +336,9 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
     assert_eq!(tool_result.role, Role::Tool);
     assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_1"));
     assert!(tool_result.content.contains("hello from file"));
+    // #15 contract: structured metadata rides alongside the text on the wire.
+    assert!(tool_result.content.contains("\"metadata\""));
+    assert!(tool_result.content.contains("\"total_lines\":1"));
     Ok(())
 }
 
@@ -547,7 +550,9 @@ fn read_tool_rejects_symlink_escape_from_workspace() -> Result<()> {
 fn read_tool_returns_missing_file_error() -> Result<()> {
     let workspace = test_workspace()?;
 
-    let result = tool_result_json(&read_file(&workspace.path, "missing.txt"));
+    let result = tool_result_json(
+        &read_file(&workspace.path, "missing.txt").map(crate::tools::ToolOutput::text),
+    );
 
     assert!(result.contains("\"ok\":false"));
     assert!(result.contains("failed to resolve path"));

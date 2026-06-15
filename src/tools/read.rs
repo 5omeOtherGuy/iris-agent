@@ -25,7 +25,11 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value, observed: &mut ObservedFiles) -> Result<String> {
+pub(super) fn execute(
+    root: &Path,
+    args: &Value,
+    observed: &mut ObservedFiles,
+) -> Result<super::ToolOutput> {
     let input: ReadInput =
         serde_json::from_value(args.clone()).context("read tool arguments must include path")?;
     read(root, &input, observed)
@@ -40,7 +44,7 @@ struct ReadInput {
     limit: Option<i64>,
 }
 
-fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<String> {
+fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<super::ToolOutput> {
     if matches!(input.limit, Some(limit) if limit <= 0) {
         bail!("`limit` must be greater than 0");
     }
@@ -85,8 +89,13 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
         lines.pop();
     }
     let total_lines = lines.len();
+    let file_bytes = bytes.len();
     if total_lines == 0 {
-        return Ok(String::new());
+        return Ok(super::ToolOutput::text(String::new())
+            .with("bytes", json!(file_bytes))
+            .with("lines", json!(0))
+            .with("total_lines", json!(0))
+            .with("truncated", json!(false)));
     }
 
     let offset = input.offset.unwrap_or(1).max(1) as usize;
@@ -113,6 +122,8 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
         rendered.push(formatted);
     }
 
+    let lines_shown = end - start;
+    let truncated = end < total_lines;
     let mut out = rendered.join("\n");
     if end < total_lines {
         let next_offset = end + 1;
@@ -129,7 +140,11 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
             ));
         }
     }
-    Ok(out)
+    Ok(super::ToolOutput::text(out)
+        .with("bytes", json!(file_bytes))
+        .with("lines", json!(lines_shown))
+        .with("total_lines", json!(total_lines))
+        .with("truncated", json!(truncated)))
 }
 
 /// Convenience entry used by integration tests: read with default options.
@@ -145,6 +160,7 @@ pub(crate) fn read_file(workspace: &Path, path: &str) -> Result<String> {
         },
         &mut ObservedFiles::new(),
     )
+    .map(|output| output.content)
 }
 
 #[cfg(test)]
@@ -176,7 +192,8 @@ mod tests {
             },
             &mut ObservedFiles::new(),
         )
-        .unwrap();
+        .unwrap()
+        .content;
         assert!(out.contains("3\u{2192}line3"));
         assert!(out.contains("4\u{2192}line4"));
         assert!(!out.contains("line5"));

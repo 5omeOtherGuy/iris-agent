@@ -61,9 +61,12 @@
 - **`find` tool** — find workspace files through `fd`/`fdfind` when available.
   [Implemented]
 - **`ls` tool** — list workspace directory entries, directories first, with an
-  optional recursive tree. [Implemented]
+  optional recursive tree and an optional `long` mode (type marker + human-
+  readable size per entry). [Implemented]
 - **Tool result/error encoding** — structured success/error responses returned to
-  the model. [Implemented]
+  the model, including a per-tool `metadata` object on success (e.g. `read`
+  byte/line counts and `truncated`, `ls` entry count) carried in the
+  `ToolOutput` contract. [Implemented]
 
 ## Safety and approvals
 
@@ -100,7 +103,9 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 - **Content-addressed store** — stores files, command outputs, web pages, diffs,
   and summaries by hash. [Planned]
 - **Handle-returning tool outputs** — large outputs return summary, structured
-  metadata, and a handle to full content. [Planned]
+  metadata, and a handle to full content. [Planned] The `ToolOutput`
+  result/metadata contract is the seam this builds on; handles are not yet
+  implemented.
 - **Handle dereferencing** — retrieve stored content by handle on demand.
   [Planned]
 - **Micro-summary schema** — deterministic schema for counts, truncation, size,

@@ -31,7 +31,11 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value, observed: &mut ObservedFiles) -> Result<String> {
+pub(super) fn execute(
+    root: &Path,
+    args: &Value,
+    observed: &mut ObservedFiles,
+) -> Result<super::ToolOutput> {
     let input: EditInput = serde_json::from_value(args.clone())
         .context("edit tool arguments must include file_path, old_string, new_string")?;
     edit(root, &input, observed)
@@ -61,7 +65,7 @@ struct EditInput {
     replace_all: bool,
 }
 
-fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<String> {
+fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<super::ToolOutput> {
     let plan = build_edit(root, input)?;
     // `edit` only ever targets an existing file; require the agent to have seen
     // its current contents so a stale edit cannot silently clobber changes.
@@ -72,10 +76,11 @@ fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<
 
     let occurrences = plan.replaced;
     let plural = if occurrences == 1 { "" } else { "s" };
-    Ok(format!(
+    let message = format!(
         "Successfully replaced {occurrences} occurrence{plural} in {}.",
         input.file_path
-    ))
+    );
+    Ok(super::ToolOutput::text(message).with("occurrences", json!(occurrences)))
 }
 
 struct EditPlan {
@@ -341,6 +346,7 @@ mod tests {
             },
             &mut observed,
         )
+        .map(|output| output.content)
     }
 
     #[test]

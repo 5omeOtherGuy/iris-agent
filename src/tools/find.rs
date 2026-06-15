@@ -29,10 +29,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
+pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
     let input: FindInput =
         serde_json::from_value(args.clone()).context("find tool arguments must include pattern")?;
-    find(root, &input)
+    Ok(super::ToolOutput::text(find(root, &input)?))
 }
 
 #[derive(Debug, Deserialize)]

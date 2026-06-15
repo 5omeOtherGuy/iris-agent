@@ -27,7 +27,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Result, bail};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 mod bash;
 mod edit;
@@ -45,7 +45,34 @@ pub(crate) use observe::ObservedFiles;
 #[cfg(test)]
 pub(crate) use read::read_file;
 
-/// Execute a tool call by name, returning the textual tool result.
+/// Structured result of a successful tool call: the model-facing text plus
+/// optional structured metadata. The metadata object is the seam that lets
+/// large outputs become handle-backed later without changing call sites
+/// (Milestone 2 gate); tools that have nothing structured to report use
+/// [`ToolOutput::text`] and the metadata is simply omitted from the wire.
+#[derive(Debug)]
+pub(crate) struct ToolOutput {
+    pub(crate) content: String,
+    pub(crate) metadata: Map<String, Value>,
+}
+
+impl ToolOutput {
+    /// A text-only result with no structured metadata.
+    pub(crate) fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            metadata: Map::new(),
+        }
+    }
+
+    /// Attach one metadata field, builder-style.
+    pub(crate) fn with(mut self, key: &str, value: Value) -> Self {
+        self.metadata.insert(key.to_string(), value);
+        self
+    }
+}
+
+/// Execute a tool call by name, returning the structured tool result.
 ///
 /// Argument-parsing error messages are preserved where existing tests depend
 /// on them (`read tool arguments must include path`).
@@ -54,7 +81,7 @@ pub(crate) fn dispatch(
     name: &str,
     args: &Value,
     observed: &mut ObservedFiles,
-) -> Result<String> {
+) -> Result<ToolOutput> {
     let _span = tracing::debug_span!("tool_dispatch", tool = name).entered();
     let root = path::workspace_root(workspace)?;
     match name {
