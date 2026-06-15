@@ -325,7 +325,17 @@ Potential scope:
   newline editing, and full right-bordered box framing.]
 - Streaming output if not already in MVP. [Shipped: `TurnSink` deltas.]
 - Session transcript persistence.
-- Focused config file for provider/model/tool policy.
+- Focused config file for provider/model/tool policy. [Shipped (provider/model):
+  `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
+  override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project),
+  project overriding global field-by-field, mirroring pi's settings model.
+  Fields: `defaultProvider` (validated; only `openai-codex` today),
+  `defaultModel`, `baseUrl`. Precedence is `env > settings > built-in default`
+  so existing `IRIS_MODEL`/`IRIS_CODEX_BASE_URL` env vars still win; unknown
+  keys are ignored, a malformed file errors with its path. Tool/approval policy
+  is deliberately out of scope: pi's settings encode none either, and
+  cross-session approval persistence is tracked under
+  [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14).]
 - Safer `bash` policy. Command classification is optional and should not block
   the basic local coding workflow.
 - Better `edit` semantics: uniqueness checks, conflict messages, preview diff.

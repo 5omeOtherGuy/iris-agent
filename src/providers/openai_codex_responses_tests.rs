@@ -392,3 +392,19 @@ fn rejects_response_without_text() {
     let error = parse_response_json(response).unwrap_err().to_string();
     assert!(error.contains("did not include assistant text or tool calls"));
 }
+
+#[test]
+fn resolve_setting_precedence_env_then_setting_then_default() {
+    // env wins over everything
+    assert_eq!(
+        resolve_setting(Some("env".into()), Some("setting"), "default"),
+        "env"
+    );
+    // settings file used when env is absent
+    assert_eq!(resolve_setting(None, Some("setting"), "default"), "setting");
+    // built-in default when neither is set
+    assert_eq!(resolve_setting(None, None, "default"), "default");
+    // blank/whitespace-only settings value is ignored, not used to override
+    assert_eq!(resolve_setting(None, Some(""), "default"), "default");
+    assert_eq!(resolve_setting(None, Some("   "), "default"), "default");
+}

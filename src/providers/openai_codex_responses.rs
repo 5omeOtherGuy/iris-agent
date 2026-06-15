@@ -34,12 +34,15 @@ pub(crate) struct OpenAiCodexResponsesProvider {
 }
 
 impl OpenAiCodexResponsesProvider {
-    pub(crate) fn from_env() -> Result<Self> {
+    /// Build the provider, resolving model and base URL from the optional
+    /// settings values. The provider stays decoupled from the app-level config
+    /// type by taking only the strings it needs.
+    pub(crate) fn new(model: Option<&str>, base_url: Option<&str>) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
-            config: OpenAiCodexResponsesConfig::from_env(),
+            config: OpenAiCodexResponsesConfig::resolve(model, base_url),
             tokens: OpenAiCodexTokenStore::from_env()?,
         })
     }
@@ -251,12 +254,33 @@ struct OpenAiCodexResponsesConfig {
 }
 
 impl OpenAiCodexResponsesConfig {
-    fn from_env() -> Self {
-        let model = non_empty_env("IRIS_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        let base_url =
-            non_empty_env("IRIS_CODEX_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        Self { model, base_url }
+    /// Resolve each value with precedence `env > settings file > built-in
+    /// default`, so explicit runtime input always wins over persisted config.
+    fn resolve(model: Option<&str>, base_url: Option<&str>) -> Self {
+        Self {
+            model: resolve_setting(non_empty_env("IRIS_MODEL"), model, DEFAULT_MODEL),
+            base_url: resolve_setting(
+                non_empty_env("IRIS_CODEX_BASE_URL"),
+                base_url,
+                DEFAULT_BASE_URL,
+            ),
+        }
     }
+}
+
+/// Three-layer precedence helper: env override, then settings value, then the
+/// built-in default. Blank/whitespace-only settings values are ignored so an
+/// empty `"defaultModel": ""` falls back to the default instead of sending an
+/// invalid request. Pure so the precedence is unit-tested without env state.
+fn resolve_setting(env_value: Option<String>, setting: Option<&str>, default: &str) -> String {
+    env_value
+        .or_else(|| {
+            setting
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn build_codex_request(model: &str, messages: &[Message]) -> Value {

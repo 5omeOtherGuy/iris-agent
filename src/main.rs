@@ -9,6 +9,7 @@ use reqwest::blocking::Client;
 mod approval;
 mod auth;
 mod cli;
+mod config;
 mod errors;
 mod nexus;
 mod process_group;
@@ -67,9 +68,28 @@ enum LoginMethod {
     DeviceCode,
 }
 
+const SUPPORTED_PROVIDER: &str = "openai-codex";
+
 fn run_agent() -> Result<()> {
-    let provider = providers::openai_codex_responses::OpenAiCodexResponsesProvider::from_env()?;
-    let mut agent = Agent::new(provider, env::current_dir()?);
+    let cwd = env::current_dir()?;
+    let settings = config::Settings::load(&cwd)?;
+    if let Some(provider) = settings
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        && provider != SUPPORTED_PROVIDER
+    {
+        return Err(errors::UsageError::new(format!(
+            "unsupported provider '{provider}' in settings; only '{SUPPORTED_PROVIDER}' is supported"
+        ))
+        .into());
+    }
+    let provider = providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+        settings.default_model.as_deref(),
+        settings.base_url.as_deref(),
+    )?;
+    let mut agent = Agent::new(provider, cwd);
     let mut ui = ui::text::TextUi::stdio();
     cli::run_session(&mut agent, &mut ui)
 }
