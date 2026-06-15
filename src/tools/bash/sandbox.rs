@@ -154,7 +154,7 @@ pub(crate) fn apply(
 /// enforce it between `fork` and `exec`.
 #[cfg(target_os = "linux")]
 fn install(command: &mut Command, policy: &SandboxPolicy) -> anyhow::Result<()> {
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
 
     // Take ownership of the ruleset's fd directly (it is close-on-exec, which is
@@ -163,6 +163,26 @@ fn install(command: &mut Command, policy: &SandboxPolicy) -> anyhow::Result<()> 
     // domain, which should not happen once Landlock support is detected.
     let fd: OwnedFd = Option::<OwnedFd>::from(build_ruleset(policy)?)
         .context("Landlock ruleset has no enforceable domain")?;
+
+    // Defensive: if the parent had closed its own std streams, this fd could be
+    // 0/1/2. The child's stdio setup (dup2 for Stdio::null/piped) runs before
+    // pre_exec and would clobber that fd, making `landlock_restrict_self` fail
+    // with EBADF. Relocate it above the std range (keeping CLOEXEC) so only the
+    // fd number changes; the pre_exec contract stays allocation-free and
+    // async-signal-safe. No unit test: it requires the parent to close fds 0-2,
+    // which would break the test harness itself.
+    let fd: OwnedFd = if fd.as_raw_fd() <= 2 {
+        let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to relocate Landlock ruleset fd above std range");
+        }
+        // SAFETY: fcntl(F_DUPFD_CLOEXEC) returned a fresh owned fd >= 3; the
+        // original `fd` is dropped (closed) at the end of this block.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    } else {
+        fd
+    };
 
     // SAFETY: the closure runs in the forked child before `exec` and performs
     // only async-signal-safe work: two syscalls and no heap allocation, locks,

@@ -23,6 +23,14 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 // shell's process group (via setsid/double-fork) can keep the pipes open; rather
 // than block indefinitely we return whatever was captured within this window.
 const BASH_DRAIN_TIMEOUT_SECS: u64 = 5;
+// Peak-memory cap on captured output PER STREAM during a one-shot run. The pump
+// threads stop forwarding (so the channel and the accumulator Vecs stop growing)
+// once this is reached, but keep draining the pipe to EOF so a flooding child
+// (`yes`, `cat /dev/zero`) never blocks and its exit status is still collected.
+// The display window is `DEFAULT_MAX_BYTES` (1 MiB); 4 MiB per stream leaves a
+// comfortable tail for that while bounding peak capture to ~8 MiB across both
+// streams.
+const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
 pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls; with a session, `action` may be `run` (default), `reset` (start the shell fresh), or `close` (terminate it).";
 
@@ -286,7 +294,7 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
     // join()-ing forever if a process keeps a pipe open (see the drain below).
     let mut stdout = child.stdout.take().context("missing bash stdout")?;
     let mut stderr = child.stderr.take().context("missing bash stderr")?;
-    let (tx, rx) = std::sync::mpsc::channel::<(BashStream, Vec<u8>)>();
+    let (tx, rx) = std::sync::mpsc::channel::<PumpMsg>();
     let stdout_tx = tx.clone();
     std::thread::spawn(move || pump_pipe(&mut stdout, BashStream::Stdout, &stdout_tx));
     std::thread::spawn(move || pump_pipe(&mut stderr, BashStream::Stderr, &tx));
@@ -318,8 +326,19 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
     // shell exits; rather than block on it forever we return the output
     // captured so far. The streaming pump means already-written output is
     // delivered even when a later holder keeps the pipe open.
+    //
+    // ponytail: pump-thread + FD leak ceiling. If a backgrounded child uses
+    // setsid/double-fork to escape the group and holds a pipe open past the
+    // drain deadline, the detached pump thread stays blocked in `pipe.read()`
+    // and leaks one thread + FD until that child finally closes the pipe. There
+    // is no clean std-only way to interrupt a blocking pipe read: closing the
+    // fd from another thread races fd reuse and does not wake the read on Linux,
+    // and non-blocking pipes would force a busy-poll loop on every command for
+    // this rare case. Upgrade path: an interruptible reader built on
+    // poll/epoll + a self-pipe wakeup (libc) or a small poll crate.
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
+    let mut capture_truncated = false;
     let drain_deadline = Instant::now() + Duration::from_secs(BASH_DRAIN_TIMEOUT_SECS);
     loop {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
@@ -327,8 +346,9 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
             break;
         }
         match rx.recv_timeout(remaining) {
-            Ok((BashStream::Stdout, chunk)) => stdout_bytes.extend_from_slice(&chunk),
-            Ok((BashStream::Stderr, chunk)) => stderr_bytes.extend_from_slice(&chunk),
+            Ok(PumpMsg::Chunk(BashStream::Stdout, chunk)) => stdout_bytes.extend_from_slice(&chunk),
+            Ok(PumpMsg::Chunk(BashStream::Stderr, chunk)) => stderr_bytes.extend_from_slice(&chunk),
+            Ok(PumpMsg::Truncated) => capture_truncated = true,
             Err(_) => break,
         }
     }
@@ -343,6 +363,13 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
     }
 
     let mut out = render_output(&combined);
+
+    if capture_truncated {
+        out = format!(
+            "[output truncated: exceeded {} MiB capture cap per stream]\n{out}",
+            MAX_CAPTURE_BYTES / (1024 * 1024)
+        );
+    }
 
     if let Some(notice) = sandbox.notice() {
         out = format!("[{notice}]\n{out}");
@@ -414,24 +441,47 @@ enum BashStream {
     Stderr,
 }
 
+/// Message from a pump thread: a captured chunk, or a one-shot signal that the
+/// per-stream capture cap was hit and later bytes were dropped.
+enum PumpMsg {
+    Chunk(BashStream, Vec<u8>),
+    Truncated,
+}
+
 /// Stream a child pipe to the collector in chunks so already-written output is
-/// delivered even if the pipe is later held open by an escaped process. Exits
-/// on EOF, read error, or once the receiver has hung up.
-fn pump_pipe(
-    pipe: &mut impl Read,
-    stream: BashStream,
-    tx: &std::sync::mpsc::Sender<(BashStream, Vec<u8>)>,
-) {
+/// delivered even if the pipe is later held open by an escaped process. Forwards
+/// at most `MAX_CAPTURE_BYTES` to bound peak memory, then keeps reading to EOF
+/// (so the child never blocks on a full pipe) without forwarding. Exits on EOF,
+/// read error, or once the receiver has hung up.
+fn pump_pipe(pipe: &mut impl Read, stream: BashStream, tx: &std::sync::mpsc::Sender<PumpMsg>) {
     let mut buf = [0u8; 8192];
+    let mut forwarded = 0usize;
+    let mut truncated = false;
     loop {
         match pipe.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tx.send((stream, buf[..n].to_vec())).is_err() {
+                if forwarded >= MAX_CAPTURE_BYTES {
+                    // Cap reached: keep draining to EOF, stop forwarding.
+                    truncated = true;
+                    continue;
+                }
+                let take = n.min(MAX_CAPTURE_BYTES - forwarded);
+                if tx
+                    .send(PumpMsg::Chunk(stream, buf[..take].to_vec()))
+                    .is_err()
+                {
                     break;
+                }
+                forwarded += take;
+                if take < n {
+                    truncated = true;
                 }
             }
         }
+    }
+    if truncated {
+        let _ = tx.send(PumpMsg::Truncated);
     }
 }
 
@@ -689,6 +739,42 @@ mod tests {
         // Finalized jobs are gone.
         let after = execute(&root, &json!({ "action": "list" }), &mut state).unwrap();
         assert!(after.content.contains("no background jobs"));
+    }
+
+    #[test]
+    fn bash_bounds_high_volume_output() {
+        // A flooding command (20 MiB of zeros) must not be captured in full:
+        // peak memory is bounded by MAX_CAPTURE_BYTES, the user sees a
+        // truncation marker, and the exit status (0) is still reported.
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let out = bash(
+            &root,
+            &BashInput {
+                command: "head -c 20000000 /dev/zero".into(),
+                timeout: Some(30),
+            },
+        )
+        .unwrap();
+        // The capture-specific marker proves the per-stream cap fired (the pump
+        // stopped forwarding), not merely the display-tail truncation.
+        assert!(
+            out.contains("capture cap per stream"),
+            "expected a capture truncation marker, got: {}",
+            &out[..out.len().min(200)]
+        );
+        // Bounded well under the 20 MiB the command produced.
+        assert!(
+            out.len() < MAX_CAPTURE_BYTES + 64 * 1024,
+            "captured output was not bounded: {} bytes",
+            out.len()
+        );
+        // Exit code 0 -> no failure footer.
+        assert!(
+            !out.contains("Command exited with code"),
+            "unexpected nonzero exit footer: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
     }
 
     #[test]
