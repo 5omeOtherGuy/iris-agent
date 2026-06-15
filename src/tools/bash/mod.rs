@@ -70,28 +70,28 @@ pub(super) fn execute(
 ) -> Result<super::ToolOutput> {
     let parsed: BashArgs =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
-    let text = match parsed.action.as_deref().unwrap_or("run") {
-        "run" => match &parsed.session {
-            Some(id) => run_session(root, &id.clone(), parsed, state)?,
+    // Destructure into owned fields so each arm can move what it needs without
+    // cloning the session id to escape a borrow of `parsed`.
+    let BashArgs {
+        command,
+        timeout,
+        session,
+        job,
+        action,
+    } = parsed;
+    let text = match action.as_deref().unwrap_or("run") {
+        "run" => match session {
+            Some(id) => run_session(root, &id, command, timeout, state)?,
             None => {
-                let command = parsed
-                    .command
-                    .context("bash tool arguments must include command")?;
-                bash(
-                    root,
-                    &BashInput {
-                        command,
-                        timeout: parsed.timeout,
-                    },
-                )?
+                let command = command.context("bash tool arguments must include command")?;
+                bash(root, &BashInput { command, timeout })?
             }
         },
-        action @ ("reset" | "close") => {
-            let id = parsed
-                .session
+        act @ ("reset" | "close") => {
+            let id = session
                 .as_deref()
                 .context("bash session action requires 'session'")?;
-            if action == "reset" {
+            if act == "reset" {
                 state.sessions.reset(id)?;
                 format!("session '{id}' reset")
             } else {
@@ -100,23 +100,19 @@ pub(super) fn execute(
             }
         }
         "start" => {
-            let command = parsed
-                .command
+            let command = command
                 .filter(|c| !c.trim().is_empty())
                 .context("bash job start requires a command")?;
             let id = state.jobs.start(root, &command, None)?;
             format!("started background job '{id}'; poll it with action=poll, job='{id}'")
         }
         "poll" => {
-            let id = parsed.job.as_deref().context("bash poll requires 'job'")?;
+            let id = job.as_deref().context("bash poll requires 'job'")?;
             render_job(id, state.jobs.poll(id)?)
         }
         "finalize" => {
-            let id = parsed
-                .job
-                .as_deref()
-                .context("bash finalize requires 'job'")?;
-            let wait = match parsed.timeout {
+            let id = job.as_deref().context("bash finalize requires 'job'")?;
+            let wait = match timeout {
                 Some(0) => None,
                 Some(secs) => Some(Duration::from_secs(secs)),
                 None => Some(Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS)),
@@ -124,10 +120,7 @@ pub(super) fn execute(
             render_job(id, state.jobs.finalize(id, wait)?)
         }
         "cancel" => {
-            let id = parsed
-                .job
-                .as_deref()
-                .context("bash cancel requires 'job'")?;
+            let id = job.as_deref().context("bash cancel requires 'job'")?;
             state.jobs.cancel(id)?;
             format!("cancelled background job '{id}'")
         }
@@ -138,12 +131,17 @@ pub(super) fn execute(
 }
 
 /// Route a session-scoped `run` to the session registry.
-fn run_session(root: &Path, id: &str, parsed: BashArgs, state: &mut BashState) -> Result<String> {
-    let command = parsed
-        .command
+fn run_session(
+    root: &Path,
+    id: &str,
+    command: Option<String>,
+    timeout: Option<u64>,
+    state: &mut BashState,
+) -> Result<String> {
+    let command = command
         .filter(|c| !c.trim().is_empty())
         .context("bash session run requires a command")?;
-    let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+    let timeout_secs = timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
     let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
     let outcome = state.sessions.run(root, id, &command, timeout)?;
     Ok(render_session(outcome, timeout_secs))
@@ -151,7 +149,7 @@ fn run_session(root: &Path, id: &str, parsed: BashArgs, state: &mut BashState) -
 
 /// Format a background-job update: bounded output, drop/sandbox notices, status.
 fn render_job(id: &str, update: jobs::JobUpdate) -> String {
-    let mut out = if update.output.trim().is_empty() {
+    let mut out = if update.output.is_empty() {
         if update.finished {
             "(no output)".to_string()
         } else {
