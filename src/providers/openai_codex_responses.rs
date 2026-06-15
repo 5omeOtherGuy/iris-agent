@@ -1,17 +1,29 @@
 use std::env;
-use std::time::Duration;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT,
+};
 use serde_json::{Value, json};
 
 use crate::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
+use crate::errors::AuthError;
 use crate::nexus::{AssistantTurn, ChatProvider, Message, Role, ToolCall};
+use crate::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_MODEL: &str = "gpt-5.5";
+
+// Transport resilience for Codex requests. Transient failures (network, 429,
+// 5xx) are retried with exponential backoff plus jitter; a single auth
+// rejection (401/403) triggers one forced token refresh before retrying.
+const MAX_TRANSIENT_RETRIES: u32 = 3;
+const BASE_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCodexResponsesProvider {
@@ -34,28 +46,200 @@ impl OpenAiCodexResponsesProvider {
 
 impl ChatProvider for OpenAiCodexResponsesProvider {
     fn respond(&self, messages: &[Message]) -> Result<AssistantTurn> {
-        let token = self.tokens.access_token(&self.client)?;
+        let span = tracing::info_span!("codex_roundtrip", model = %self.config.model);
+        let _guard = span.enter();
+
         let request = build_codex_request(&self.config.model, messages);
-        let response = self
-            .client
-            .post(resolve_codex_url(&self.config.base_url)?)
-            .headers(codex_headers(&token)?)
-            .json(&request)
-            .send()
-            .context("failed to send Codex request")?;
+        let url = resolve_codex_url(&self.config.base_url)?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            bail!("Codex request failed ({status}): {body}");
-        }
-
-        parse_response_stream(
-            &response
-                .text()
-                .context("failed to read Codex stream response")?,
+        run_retry_loop(
+            |force_refresh| {
+                if force_refresh {
+                    self.tokens.force_refresh(&self.client)
+                } else {
+                    self.tokens.access_token(&self.client)
+                }
+            },
+            |token| {
+                let started = Instant::now();
+                let attempt = self.send_once(url.clone(), token, &request);
+                tracing::debug!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "codex attempt complete"
+                );
+                attempt
+            },
+            sleep,
         )
     }
+}
+
+/// Drive the transient-retry / one-shot-reauth state machine.
+///
+/// Pure of HTTP and timing concerns so it can be unit-tested with scripted
+/// closures: `get_token(force_refresh)` obtains a token (cached, or forcibly
+/// refreshed after an auth rejection), `send` performs one attempt, and `sleep`
+/// applies a backoff delay. Termination is guaranteed: reauth fires at most
+/// once, transient retries are bounded by `MAX_TRANSIENT_RETRIES` and are not
+/// reset by a reauth, and every other branch returns.
+fn run_retry_loop(
+    mut get_token: impl FnMut(bool) -> Result<AccessToken>,
+    mut send: impl FnMut(&AccessToken) -> Attempt,
+    mut sleep: impl FnMut(Duration),
+) -> Result<AssistantTurn> {
+    let mut transient_retries: u32 = 0;
+    let mut reauth_used = false;
+    let mut force_refresh = false;
+
+    loop {
+        let token = match get_token(force_refresh) {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "failed to obtain access token");
+                return Err(AuthError::new("authentication failed").into());
+            }
+        };
+        force_refresh = false;
+        tracing::debug!(token = %telemetry::redact_secret(&token.bearer), "using access token");
+
+        match send(&token) {
+            Attempt::Done(turn) => return Ok(turn),
+            Attempt::Reauth(error) => {
+                if reauth_used {
+                    tracing::error!(error = %format!("{error:#}"), "codex auth rejected after refresh");
+                    return Err(AuthError::new("authentication failed").into());
+                }
+                reauth_used = true;
+                force_refresh = true;
+                tracing::warn!(error = %format!("{error:#}"), "codex auth rejected; refreshing token and retrying");
+                continue;
+            }
+            Attempt::Retry(error, retry_after) => {
+                if transient_retries >= MAX_TRANSIENT_RETRIES {
+                    tracing::error!(error = %format!("{error:#}"), retries = transient_retries, "codex transient error; retries exhausted");
+                    return Err(error);
+                }
+                transient_retries += 1;
+                let delay = backoff_delay(transient_retries, retry_after, BASE_BACKOFF);
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    attempt = transient_retries,
+                    delay_ms = delay.as_millis() as u64,
+                    "codex transient error; retrying"
+                );
+                sleep(delay);
+                continue;
+            }
+            Attempt::Fatal(error) => {
+                tracing::error!(error = %format!("{error:#}"), "codex request failed");
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Outcome of a single HTTP attempt, classified for the retry loop.
+enum Attempt {
+    Done(AssistantTurn),
+    /// Auth rejected (401/403): force one token refresh, then retry.
+    Reauth(anyhow::Error),
+    /// Transient (network/429/5xx): retry with backoff; carries any server hint.
+    Retry(anyhow::Error, Option<Duration>),
+    /// Non-retryable (4xx other, malformed response): give up now.
+    Fatal(anyhow::Error),
+}
+
+impl OpenAiCodexResponsesProvider {
+    fn send_once(&self, url: Url, token: &AccessToken, request: &Value) -> Attempt {
+        let headers = match codex_headers(token) {
+            Ok(headers) => headers,
+            Err(error) => return Attempt::Fatal(error),
+        };
+        let response = match self.client.post(url).headers(headers).json(request).send() {
+            Ok(response) => response,
+            Err(error) => {
+                return Attempt::Retry(
+                    anyhow::Error::new(error).context("failed to send Codex request"),
+                    None,
+                );
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            return match response.text() {
+                Ok(body) => match parse_response_stream(&body) {
+                    Ok(turn) => Attempt::Done(turn),
+                    Err(error) => Attempt::Fatal(error),
+                },
+                // The server may already have generated (and billed) this
+                // response, so a body-read failure is not safe to retry.
+                Err(error) => Attempt::Fatal(
+                    anyhow::Error::new(error).context("failed to read Codex stream response"),
+                ),
+            };
+        }
+
+        let retry_after = parse_retry_after(response.headers());
+        let body = response.text().unwrap_or_default();
+        let error = match telemetry::sanitize_external_body(&body) {
+            Some(detail) => anyhow!("Codex request failed ({status}): {detail}"),
+            None => anyhow!("Codex request failed ({status})"),
+        };
+        match classify_http_status(status.as_u16()) {
+            HttpClass::Reauth => Attempt::Reauth(error),
+            HttpClass::Retry => Attempt::Retry(error, retry_after),
+            HttpClass::Fatal => Attempt::Fatal(error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpClass {
+    Reauth,
+    Retry,
+    Fatal,
+}
+
+/// Classify an HTTP status into a retry policy class.
+fn classify_http_status(status: u16) -> HttpClass {
+    match status {
+        401 | 403 => HttpClass::Reauth,
+        408 | 425 | 429 => HttpClass::Retry,
+        500..=599 => HttpClass::Retry,
+        _ => HttpClass::Fatal,
+    }
+}
+
+/// Compute the delay before the next transient retry.
+///
+/// Honors a server `Retry-After` hint when present (bounded against
+/// pathological values); otherwise exponential backoff from `base` doubling
+/// per retry, clamped to `MAX_BACKOFF`, plus up to 250ms of jitter.
+fn backoff_delay(retry: u32, retry_after: Option<Duration>, base: Duration) -> Duration {
+    if let Some(after) = retry_after {
+        return after.min(MAX_BACKOFF.saturating_mul(4));
+    }
+    let shift = retry.saturating_sub(1).min(10);
+    let exp = base
+        .checked_mul(1u32 << shift)
+        .unwrap_or(MAX_BACKOFF)
+        .min(MAX_BACKOFF);
+    let jitter = Duration::from_millis(rand::random::<u64>() % 250);
+    exp + jitter
+}
+
+/// Parse an integer-seconds `Retry-After` header. The HTTP-date form is
+/// uncommon for 429s and is intentionally ignored.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +520,197 @@ fn extract_output_text(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    fn fake_token() -> AccessToken {
+        AccessToken {
+            bearer: "bearer-value".to_string(),
+            account_id: "acct".to_string(),
+        }
+    }
+
+    fn is_auth_error(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<AuthError>().is_some()
+    }
+
+    #[test]
+    fn retry_loop_exhausts_transient_then_returns_error() {
+        let sends = Cell::new(0u32);
+        let sleeps = Cell::new(0u32);
+        let result = run_retry_loop(
+            |_force| Ok(fake_token()),
+            |_token| {
+                sends.set(sends.get() + 1);
+                Attempt::Retry(anyhow!("503"), None)
+            },
+            |_delay| sleeps.set(sleeps.get() + 1),
+        );
+        assert!(result.is_err());
+        assert!(!is_auth_error(&result.unwrap_err()));
+        // One initial attempt plus MAX retries, sleeping before each retry.
+        assert_eq!(sends.get(), MAX_TRANSIENT_RETRIES + 1);
+        assert_eq!(sleeps.get(), MAX_TRANSIENT_RETRIES);
+    }
+
+    #[test]
+    fn retry_loop_reauths_exactly_once_then_succeeds() {
+        let forces: Cell<Vec<bool>> = Cell::new(Vec::new());
+        let sends = Cell::new(0u32);
+        let result = run_retry_loop(
+            |force| {
+                let mut seen = forces.take();
+                seen.push(force);
+                forces.set(seen);
+                Ok(fake_token())
+            },
+            |_token| {
+                sends.set(sends.get() + 1);
+                if sends.get() == 1 {
+                    Attempt::Reauth(anyhow!("401"))
+                } else {
+                    Attempt::Done(AssistantTurn::text("ok"))
+                }
+            },
+            |_delay| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(forces.take(), vec![false, true]);
+        assert_eq!(sends.get(), 2);
+    }
+
+    #[test]
+    fn retry_loop_second_auth_rejection_returns_auth_error() {
+        let result = run_retry_loop(
+            |_force| Ok(fake_token()),
+            |_token| Attempt::Reauth(anyhow!("401")),
+            |_delay| {},
+        );
+        let error = result.unwrap_err();
+        assert!(is_auth_error(&error));
+    }
+
+    #[test]
+    fn retry_loop_force_refresh_failure_returns_auth_error() {
+        let sends = Cell::new(0u32);
+        let result = run_retry_loop(
+            |force| {
+                if force {
+                    Err(anyhow!("refresh failed"))
+                } else {
+                    Ok(fake_token())
+                }
+            },
+            |_token| {
+                sends.set(sends.get() + 1);
+                Attempt::Reauth(anyhow!("401"))
+            },
+            |_delay| {},
+        );
+        assert!(is_auth_error(&result.unwrap_err()));
+        // First attempt sent (got 401); refresh then failed before any resend.
+        assert_eq!(sends.get(), 1);
+    }
+
+    #[test]
+    fn retry_loop_reauth_does_not_reset_transient_budget() {
+        // Retry, Retry, Reauth, Retry, Retry: with the budget retained the
+        // fifth send exhausts MAX_TRANSIENT_RETRIES (=3) and returns.
+        let sends = Cell::new(0u32);
+        let result = run_retry_loop(
+            |_force| Ok(fake_token()),
+            |_token| {
+                sends.set(sends.get() + 1);
+                match sends.get() {
+                    3 => Attempt::Reauth(anyhow!("401")),
+                    _ => Attempt::Retry(anyhow!("503"), None),
+                }
+            },
+            |_delay| {},
+        );
+        assert!(result.is_err());
+        assert!(!is_auth_error(&result.unwrap_err()));
+        assert_eq!(sends.get(), 5);
+    }
+
+    #[test]
+    fn retry_loop_passes_retry_after_delay_to_sleeper() {
+        let delays: Cell<Vec<Duration>> = Cell::new(Vec::new());
+        let sends = Cell::new(0u32);
+        let _ = run_retry_loop(
+            |_force| Ok(fake_token()),
+            |_token| {
+                sends.set(sends.get() + 1);
+                if sends.get() == 1 {
+                    Attempt::Retry(anyhow!("429"), Some(Duration::from_secs(2)))
+                } else {
+                    Attempt::Done(AssistantTurn::text("ok"))
+                }
+            },
+            |delay| {
+                let mut seen = delays.take();
+                seen.push(delay);
+                delays.set(seen);
+            },
+        );
+        assert_eq!(delays.take(), vec![Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn classifies_http_status_into_retry_policy() {
+        assert_eq!(classify_http_status(401), HttpClass::Reauth);
+        assert_eq!(classify_http_status(403), HttpClass::Reauth);
+        assert_eq!(classify_http_status(429), HttpClass::Retry);
+        assert_eq!(classify_http_status(408), HttpClass::Retry);
+        assert_eq!(classify_http_status(503), HttpClass::Retry);
+        assert_eq!(classify_http_status(500), HttpClass::Retry);
+        assert_eq!(classify_http_status(400), HttpClass::Fatal);
+        assert_eq!(classify_http_status(404), HttpClass::Fatal);
+        assert_eq!(classify_http_status(422), HttpClass::Fatal);
+    }
+
+    #[test]
+    fn backoff_delay_grows_exponentially_within_jitter_bounds() {
+        let base = Duration::from_millis(500);
+        let jitter = Duration::from_millis(250);
+        // retry 1 -> base, retry 2 -> 2x base, retry 3 -> 4x base, each + jitter.
+        for (retry, expected) in [(1u32, 500u64), (2, 1000), (3, 2000)] {
+            let delay = backoff_delay(retry, None, base);
+            assert!(delay >= Duration::from_millis(expected), "retry {retry}");
+            assert!(
+                delay < Duration::from_millis(expected) + jitter,
+                "retry {retry}"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_delay_is_clamped_to_max() {
+        let delay = backoff_delay(20, None, Duration::from_millis(500));
+        assert!(delay <= MAX_BACKOFF + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn backoff_delay_honors_retry_after_hint() {
+        let delay = backoff_delay(1, Some(Duration::from_secs(2)), Duration::from_millis(500));
+        assert_eq!(delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn parse_retry_after_reads_integer_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn parse_retry_after_ignores_non_integer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
 
     #[test]
     fn resolves_codex_responses_url() -> Result<()> {

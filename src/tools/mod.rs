@@ -50,6 +50,7 @@ pub(crate) use read::read_file;
 /// Argument-parsing error messages are preserved where existing tests depend
 /// on them (`read tool arguments must include path`).
 pub(crate) fn dispatch(workspace: &Path, name: &str, args: &Value) -> Result<String> {
+    let _span = tracing::debug_span!("tool_dispatch", tool = name).entered();
     let root = path::workspace_root(workspace)?;
     match name {
         "read" => read::execute(&root, args),

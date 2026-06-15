@@ -1,17 +1,34 @@
 use std::env;
+use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use nexus::Agent;
 use reqwest::blocking::Client;
 
 mod approval;
 mod auth;
+mod errors;
 mod nexus;
 mod providers;
+mod telemetry;
 mod tools;
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    telemetry::init();
+    match dispatch() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            if error.downcast_ref::<errors::AuthError>().is_some() {
+                eprintln!("hint: run `iris-agent login openai-codex` to authenticate");
+            }
+            ExitCode::from(errors::exit_code(&error))
+        }
+    }
+}
+
+fn dispatch() -> Result<()> {
     match env::args().skip(1).collect::<Vec<_>>().as_slice() {
         [] => run_agent(),
         [command, provider] if command == "login" && provider == "openai-codex" => {
@@ -33,7 +50,7 @@ fn main() -> Result<()> {
         }
         _ => {
             print_help();
-            bail!("unknown command")
+            Err(errors::UsageError::new("unknown command").into())
         }
     }
 }
