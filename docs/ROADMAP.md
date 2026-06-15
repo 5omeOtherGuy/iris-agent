@@ -93,7 +93,7 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 | `write` | Standard + atomic writes | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
 | `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
 | `read` | Standard text read | Claude Code (multimodal) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
-| `find` | Standard, weak packaging | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
+| `find` | Native (`ignore`+`globset`), no `fd` dep | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
 | `bash` | Behind | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
 
 Execution order (by impact/effort, independent of the milestone sequence):
@@ -106,9 +106,11 @@ Execution order (by impact/effort, independent of the milestone sequence):
 2. **Tier 2 — close real capability gaps.**
    - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
      background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
-   - `find`/`grep`: go native (`ignore` + `globset`, `grep-searcher`) to drop the
-     `fd`/`rg` runtime deps and honor the single-static-binary pitch —
-     [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7), [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
+   - `find`: native via `ignore` + `globset`, no longer shells out to `fd`
+     (done). `grep`: still shells out to `rg`; go native with `grep-searcher`
+     to finish honoring the single-static-binary pitch —
+     [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) (done),
+     [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
 3. **Tier 3 — parity polish.** `edit` `replace_all` + helpful failure output
    ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)); `write` freshness
    guard ([#5](https://github.com/5omeOtherGuy/iris-agent/issues/5)); `read`
