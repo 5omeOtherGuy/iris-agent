@@ -93,7 +93,7 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 | `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
 | `read` | Standard text read | Claude Code (multimodal; deferred) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
 | `find` | Standard, wraps `fd` | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
-| `bash` | Behind | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
+| `bash` | Hardened: kernel sandbox + persistent sessions + background jobs + force-quit reaping | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
 
 Execution order (by impact/effort, independent of the milestone sequence):
 
@@ -106,12 +106,30 @@ Execution order (by impact/effort, independent of the milestone sequence):
    exact-string `edit` path; re-add only if exact-string edits prove
    unreliable in real use.
 2. **Tier 2 — close real capability gaps.**
-   - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
-     background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
-     Includes child-process-group lifecycle: a `bash` child runs in its own
-     process group, so the second-Ctrl-C force-quit (#9) currently kills the
-     agent without reaping a long-running child, orphaning it. Reaping/killpg
-     on force-quit belongs with this work.
+   - `bash`: **shipped** as four committed subsystems —
+     [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3):
+     1. Kernel sandbox (`src/tools/bash/sandbox.rs`): Landlock LSM confines
+        every shell to workspace + temp-dir writes with TCP deny-by-default;
+        ruleset built in the parent, enforced in an async-signal-safe
+        `pre_exec`; fail-open is never silent (notice + `tracing::warn`).
+        macOS Seatbelt is not implemented — Linux-only enforcement today;
+        unsupported kernels run unconfined with a surfaced notice.
+     2. Persistent sessions (`src/tools/bash/session.rs`): opt-in `session` id;
+        `cd`/env/shell vars persist via a co-process + sentinel-marker
+        protocol; lazy create, explicit `reset`/`close`, Drop closes all.
+     3. Background jobs (`src/tools/bash/jobs.rs`): `action=start/poll/`
+        `finalize/cancel/list`; bounded byte-ring per job with dropped-byte
+        accounting; one worker thread drains then reaps (condvar, no
+        busy-wait); finished-job map bounded.
+     4. Process-group reaping (`src/process_group.rs`): centralized
+        spawn/kill/registry primitive; the second-Ctrl-C force-quit
+        (#9) now SIGKILLs every tracked child group (async-signal-safe) so a
+        long-running shell, session, or job is no longer orphaned.
+     ponytail / known ceilings: TCP-only network confinement (UDP/UNIX
+     sockets need a network namespace); a `setsid`/double-fork child can
+     still escape the group; finalized job output is lossy UTF-8 at
+     poll/ring boundaries; Landlock fail-closed (`Required`) mode is the
+     documented upgrade path.
    - `find`/`grep`: keep wrapping `fd`/`rg`. These are the same engines the
      mature tools (Pi, etc.) wrap rather than reimplement; matching their
      behavior natively means an ongoing parity burden (smart-case, glob
