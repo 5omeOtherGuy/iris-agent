@@ -155,6 +155,8 @@ struct Session {
     leftover: Vec<u8>,
     alive: bool,
     status: SandboxStatus,
+    /// Registry slot so a force-quit reaps this shell; dropped when killed.
+    group: Option<crate::process_group::GroupGuard>,
 }
 
 impl Session {
@@ -167,17 +169,16 @@ impl Session {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+        crate::process_group::in_own_group(&mut command);
         let status = sandbox::confine(&mut command, &sandbox::SandboxPolicy::for_workspace(root));
         if let Some(notice) = status.notice() {
             tracing::warn!(%notice, "bash session sandbox not fully enforced");
         }
 
         let mut child = command.spawn().context("failed to spawn session shell")?;
+        let group = Some(crate::process_group::register(
+            i32::try_from(child.id()).unwrap_or(0),
+        ));
         let stdin = child.stdin.take().context("missing session stdin")?;
         let stdout = child.stdout.take().context("missing session stdout")?;
         let (tx, rx) = mpsc::channel();
@@ -191,6 +192,7 @@ impl Session {
             leftover: Vec::new(),
             alive: true,
             status,
+            group,
         };
 
         // Merge stderr so a single ordered stream carries everything, then sync
@@ -337,16 +339,14 @@ impl Session {
     /// Kill the whole process group and reap the leader so nothing is left
     /// running or zombied. Idempotent: the first call marks the session dead and
     /// later calls (including from `Drop`) are no-ops.
-    //
-    // ponytail: reuses the one-shot path's `kill_process_group`; subsystem 4
-    // extracts a shared process-group primitive and rewires both to it.
     fn kill_and_reap(&mut self) {
         if !self.alive {
             return;
         }
         self.alive = false;
-        super::kill_process_group(&mut self.child);
-        let _ = self.child.wait();
+        crate::process_group::kill_and_reap(&mut self.child);
+        // Drop the registry guard now that the group is gone.
+        self.group = None;
     }
 }
 

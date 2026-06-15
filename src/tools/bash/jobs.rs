@@ -105,11 +105,7 @@ impl Jobs {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        crate::process_group::in_own_group(&mut cmd);
         let status = sandbox::confine(&mut cmd, &sandbox::SandboxPolicy::for_workspace(root));
         if let Some(notice) = status.notice() {
             tracing::warn!(%notice, "bash job sandbox not fully enforced");
@@ -118,6 +114,9 @@ impl Jobs {
         let mut child = cmd.spawn().context("failed to spawn job shell")?;
         let pgid = i32::try_from(child.id()).context("job pid out of range")?;
         let stdout = child.stdout.take().context("missing job stdout")?;
+        // Track this group for force-quit reaping; the worker drops the guard
+        // once it has reaped the child below.
+        let group = crate::process_group::register(pgid);
 
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -136,10 +135,11 @@ impl Jobs {
         // `finished` flips, so a finalize cannot snapshot a half-drained stream.
         let worker_shared = Arc::clone(&shared);
         std::thread::spawn(move || {
+            let _group = group; // unregister once this worker reaps the child
             reader_loop(stdout, &worker_shared);
             // child.wait() reaps the process, so no zombie remains.
             let code = child.wait().ok().and_then(|s| s.code());
-            let mut inner = worker_shared.inner.lock().unwrap();
+            let mut inner = lock(&worker_shared.inner);
             inner.finished = true;
             inner.exit_code = code;
             drop(inner);
@@ -240,7 +240,7 @@ impl Jobs {
         // freeing the pgid and it setting `finished`; subsystem 4's centralized
         // process-group primitive is where to close it if it ever matters.
         if !lock(&job.shared.inner).finished {
-            super::kill_group(job.pgid);
+            crate::process_group::kill(job.pgid);
         }
         Ok(())
     }
@@ -364,7 +364,7 @@ impl Drop for Jobs {
         // children and exit. Finished jobs are already reaped.
         for job in self.map.values() {
             if !lock(&job.shared.inner).finished {
-                super::kill_group(job.pgid);
+                crate::process_group::kill(job.pgid);
             }
         }
     }

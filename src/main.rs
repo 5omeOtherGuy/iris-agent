@@ -11,6 +11,7 @@ mod auth;
 mod cli;
 mod errors;
 mod nexus;
+mod process_group;
 mod providers;
 mod signals;
 mod telemetry;

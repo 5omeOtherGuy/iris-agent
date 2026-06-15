@@ -8,10 +8,11 @@
 //! prompt. A second Ctrl-C restores the default handler and re-raises, so the
 //! user can always force-quit even while blocked.
 //!
-//! Caveat: a `bash` child runs in its own process group, so a force-quit kills
-//! the agent without reaping it and a long-running child can be orphaned.
-//! Propagating termination to the child's process group is deferred to the
-//! `bash` sandbox/session work (ROADMAP #3).
+//! Force-quit reaping: every `bash` child runs in its own process group, so a
+//! second Ctrl-C must SIGKILL those groups before re-raising, or a long-running
+//! child (timeout shell, persistent session, background job) would be orphaned.
+//! The handler calls [`crate::process_group::kill_all_from_signal`], which is
+//! async-signal-safe (atomic loads plus `killpg`, no allocation or locking).
 //!
 //! File writes are atomic (temp-file + rename), so an interrupt at any point
 //! cannot leave a partially written file.
@@ -32,10 +33,13 @@ pub(crate) fn install() {
 
 extern "C" fn handle_sigint(_signal: libc::c_int) {
     if record_interrupt(&INTERRUPTED) {
-        // Second Ctrl-C: restore the default disposition and re-raise so a
+        // Second Ctrl-C: reap every tracked child process group so no shell is
+        // orphaned, then restore the default disposition and re-raise so a
         // process blocked in a provider call or `bash` child can still be
         // force-quit.
-        // SAFETY: both calls are async-signal-safe.
+        // SAFETY: all three calls are async-signal-safe (the reap does only
+        // atomic loads and `killpg`).
+        crate::process_group::kill_all_from_signal();
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::raise(libc::SIGINT);

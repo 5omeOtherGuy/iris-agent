@@ -256,15 +256,10 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Run the shell in its own process group so a timeout can terminate the
-    // whole group (including backgrounded children that keep the output pipes
-    // open), not just the shell leader. With process_group(0) the child's PGID
-    // equals its PID.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    // Run the shell in its own process group so a timeout (or a force-quit) can
+    // terminate the whole group, including backgrounded children that keep the
+    // output pipes open, not just the shell leader.
+    crate::process_group::in_own_group(&mut command);
     // Confine the command to a kernel-enforced filesystem/network policy: write
     // access limited to the workspace, networking denied by default. The status
     // is surfaced below when the kernel could not fully enforce it (never a
@@ -274,6 +269,9 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
         tracing::warn!(%notice, "bash sandbox not fully enforced");
     }
     let mut child = command.spawn().context("failed to spawn shell")?;
+    // Track this group so a force-quit SIGINT reaps it; the guard unregisters
+    // when the command finishes below.
+    let _group = crate::process_group::register(i32::try_from(child.id()).unwrap_or(0));
 
     // Drain both pipes on dedicated threads so a full pipe buffer cannot
     // deadlock the wait loop. Each thread reports its captured bytes over a
@@ -298,8 +296,7 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
                     // Kill the whole process group so backgrounded children
                     // holding the output pipes are terminated too, which lets
                     // the reader threads observe EOF and the drain below return.
-                    kill_process_group(&mut child);
-                    let _ = child.wait();
+                    crate::process_group::kill_and_reap(&mut child);
                     timed_out = true;
                     break None;
                 }
@@ -403,50 +400,6 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
 }
-
-/// Forcefully terminate a spawned shell and the rest of its process group.
-///
-/// On Unix the child is spawned with `process_group(0)`, so its PGID equals its
-/// PID and a single `killpg` signals every process in that group (backgrounded
-/// children included). Processes that leave the group (setsid/double-fork) can
-/// still escape. On other platforms we fall back to killing the leader.
-#[cfg(unix)]
-pub(super) fn kill_process_group(child: &mut std::process::Child) {
-    let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
-        let _ = child.kill();
-        return;
-    };
-    // SAFETY: `killpg` is an FFI call with no Rust memory-safety invariants.
-    // `pgid` is the positive id of a live child we spawned into its own process
-    // group, and `SIGKILL` is a valid signal. Failures fall back to a leader
-    // kill.
-    let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    if rc == -1 {
-        let _ = child.kill();
-    }
-}
-
-#[cfg(not(unix))]
-pub(super) fn kill_process_group(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
-
-/// SIGKILL a process group by id. Used by background jobs, whose `Child` is
-/// owned by a waiter thread, so the registry can only signal by pgid.
-//
-// ponytail: second killpg call site; subsystem 4 folds this and
-// `kill_process_group` into one shared process-group primitive.
-#[cfg(unix)]
-pub(super) fn kill_group(pgid: i32) {
-    // SAFETY: FFI call with no Rust memory invariants. `pgid` is the positive id
-    // of a process group we created with `process_group(0)`; `SIGKILL` is valid.
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-pub(super) fn kill_group(_pgid: i32) {}
 
 #[derive(Clone, Copy)]
 enum BashStream {
