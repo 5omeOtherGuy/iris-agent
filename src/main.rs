@@ -8,6 +8,7 @@ use reqwest::blocking::Client;
 mod auth;
 mod nexus;
 mod providers;
+mod tools;
 
 fn main() -> Result<()> {
     match env::args().skip(1).collect::<Vec<_>>().as_slice() {

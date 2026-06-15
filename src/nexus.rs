@@ -1,8 +1,7 @@
-use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 const MAX_TOOL_ITERATIONS: usize = 8;
@@ -95,14 +94,7 @@ impl<P: ChatProvider> Agent<P> {
     }
 
     fn execute_tool(&self, call: &ToolCall) -> Result<String> {
-        match call.name.as_str() {
-            "read" => {
-                let input: ReadInput = serde_json::from_value(call.arguments.clone())
-                    .context("read tool arguments must include path")?;
-                read_file(&self.workspace, &input.path)
-            }
-            name => bail!("unknown tool: {name}"),
-        }
+        crate::tools::dispatch(&self.workspace, &call.name, &call.arguments)
     }
 }
 
@@ -127,11 +119,6 @@ pub(crate) struct ToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) arguments: Value,
-}
-
-#[derive(serde::Deserialize)]
-struct ReadInput {
-    path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,23 +186,6 @@ impl Role {
     }
 }
 
-fn read_file(workspace: &Path, requested_path: &str) -> Result<String> {
-    let workspace = workspace
-        .canonicalize()
-        .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
-    let path = workspace.join(requested_path);
-    let resolved = path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve path {requested_path}"))?;
-
-    if !resolved.starts_with(&workspace) {
-        bail!("path escapes workspace: {requested_path}");
-    }
-
-    fs::read_to_string(&resolved)
-        .with_context(|| format!("failed to read text file {}", resolved.display()))
-}
-
 fn tool_result_json(result: Result<String>) -> String {
     match result {
         Ok(content) => json!({ "ok": true, "content": content }).to_string(),
@@ -228,6 +198,8 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use std::cell::RefCell;
+    use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeProvider {
@@ -481,6 +453,10 @@ mod tests {
         assert_eq!(tool_result.role, Role::Tool);
         assert!(tool_result.content.contains("\"ok\":false"));
         assert!(tool_result.content.contains(expected));
+    }
+
+    fn read_file(workspace: &Path, path: &str) -> Result<String> {
+        crate::tools::read_file(workspace, path)
     }
 
     fn test_workspace() -> Result<TestWorkspace> {
