@@ -83,7 +83,7 @@ struct EditPlan {
 
 fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
     if input.new_string.len() > WRITE_TOOL_MAX_BYTES {
-        bail!("new text exceeds maximum allowed size");
+        bail!("new_string exceeds maximum allowed size");
     }
     let resolved = resolve_existing(root, &input.file_path)?;
     let metadata =
@@ -105,7 +105,7 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
     let normalized_old = normalize_to_lf(&input.old_string);
 
     if normalized_old.is_empty() {
-        bail!("the old text cannot be empty");
+        bail!("old_string cannot be empty");
     }
 
     let ranges = locate_matches(
