@@ -8,25 +8,26 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-15): early implementation.** The repository currently contains a text-only interactive REPL backed by an OpenAI Codex Responses provider, a provider tool-call loop, workspace-scoped built-in tools, and basic terminal approval gates. The Agent Kernel MVP is close but not complete yet: streaming terminal output, session persistence, and broader tool-policy UX are still planned.
+**Status (2026-06-15): early implementation.** The repository currently contains a text-only interactive session backed by an OpenAI Codex Responses provider, a streaming provider tool-call loop, workspace-scoped built-in tools, and terminal approval gates with diff previews. The Agent Kernel MVP is close but not complete yet: session persistence and broader tool-policy UX are still planned.
 
 Implemented today:
 
-- CLI entrypoint in `src/main.rs`.
-- Nexus REPL loop in `src/nexus.rs` with multi-turn conversation state, tool-call execution, and tool-result/error encoding.
-- Terminal approval seam in `src/approval.rs`, with `y`/`yes` allowing mutating tool calls and EOF/anything else denying safely.
-- Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and `Role` types.
+- CLI entrypoint in `src/main.rs` with typed-error exit codes (`src/errors.rs`) and `RUST_LOG` tracing setup (`src/telemetry.rs`).
+- Iris CLI session loop in `src/cli.rs` driving the agent through a `Ui` front-end seam (`src/ui/`, text implementation in `src/ui/text.rs`).
+- Nexus runtime in `src/nexus.rs` with multi-turn conversation state, streamed assistant text via `TurnSink`, tool-call execution, approval/diff-preview enforcement, and semantic `UiEvent` rendering.
+- Approval decision/parser in `src/approval.rs`, with `y`/`yes` allowing mutating tool calls and anything else denying safely.
+- Provider-neutral `ChatProvider`, `TurnSink`, `AssistantTurn`, `ToolCall`, `Message`, and `Role` types.
 - Workspace-scoped built-in tools under `src/tools/`: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, and `hashline_edit`.
-- Basic approval enforcement for `write`, `edit`, `bash`, and `hashline_edit`, including model-readable denied-call results.
+- Approval enforcement for `write`, `edit`, `bash`, and `hashline_edit`, with diff previews for file-mutating tools and model-readable denied-call results.
 - Atomic same-directory file replacement for `write`, `edit`, and `hashline_edit`.
 - OpenAI Codex OAuth browser and device-code login plus token loading/refresh in `src/auth/`.
-- OpenAI Codex Responses request/response handling in `src/providers/openai_codex_responses.rs`, including tool schemas and streamed-response parsing.
-- Unit tests for REPL behavior, tool loop behavior, approval allow/deny paths, workspace path safety, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
+- OpenAI Codex Responses request/response handling in `src/providers/openai_codex_responses.rs`, including tool schemas, retry/backoff, and streamed-response parsing.
+- Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
 
 Not implemented yet:
 
-- Streaming output and persisted session transcripts.
-- Diff previews, persistent approval policies, shared file-observation/stale-file guards, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
+- Persisted session transcripts.
+- Persistent approval policies, shared file-observation/stale-file guards, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
 
 ## Running
 
