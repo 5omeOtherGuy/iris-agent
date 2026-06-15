@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 
+mod sandbox;
+
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 // Cap on how long we wait for the output reader threads to observe EOF after the
 // shell has exited or been killed. A backgrounded process that escapes the
@@ -69,6 +71,14 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+    // Confine the command to a kernel-enforced filesystem/network policy: write
+    // access limited to the workspace, networking denied by default. The status
+    // is surfaced below when the kernel could not fully enforce it (never a
+    // silent "sandbox off").
+    let sandbox = sandbox::confine(&mut command, &sandbox::SandboxPolicy::for_workspace(root));
+    if let Some(notice) = sandbox.notice() {
+        tracing::warn!(%notice, "bash sandbox not fully enforced");
     }
     let mut child = command.spawn().context("failed to spawn shell")?;
 
@@ -152,6 +162,10 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
         out = format!(
             "[output truncated, dropped {dropped_lines} earlier line(s); full output saved to {location}]\n{out}"
         );
+    }
+
+    if let Some(notice) = sandbox.notice() {
+        out = format!("[{notice}]\n{out}");
     }
 
     if timed_out {
@@ -365,6 +379,42 @@ mod tests {
             !out.contains("Command exited with code"),
             "bashism failed under the resolved shell: {out}"
         );
+    }
+
+    #[test]
+    fn bash_sandbox_blocks_write_outside_workspace() {
+        // End-to-end: the wired-in sandbox must block a workspace escape at the
+        // kernel level. The temp dirs are writable by policy, so the escape
+        // targets $HOME. Skip if the kernel lacks Landlock or $HOME is unusable.
+        if sandbox::detect_abi_for_test().is_none() {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        if home.starts_with(std::env::temp_dir()) {
+            return;
+        }
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let outside = home.join(format!(
+            ".iris-bash-escape-{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let out = bash(
+            &root,
+            &BashInput {
+                command: format!("echo escaped > {}", outside.display()),
+                timeout: None,
+            },
+        )
+        .unwrap();
+        assert!(!outside.exists(), "sandbox did not block the escape: {out}");
+        std::fs::remove_file(&outside).ok();
     }
 
     #[test]
