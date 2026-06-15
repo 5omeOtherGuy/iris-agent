@@ -11,9 +11,6 @@ use crate::approval::{ApprovalDecision, Approver};
 // Set high so legitimate multi-step tasks complete, and enforced gracefully
 // rather than as a fatal error (see complete_turn).
 const MAX_TOOL_ROUNDTRIPS: usize = 50;
-// Display caps for tool output; presentation-only and never affect what is sent to the model.
-const MAX_DISPLAY_LINES: usize = 20;
-const MAX_DISPLAY_CHARS: usize = 2000;
 
 pub(crate) trait ChatProvider {
     // Providers translate their native response format into this Nexus-owned turn shape.
@@ -99,28 +96,45 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
             }
 
             for call in turn.tool_calls {
-                writeln!(output, "tool> {}({})", call.name, call.arguments)?;
                 self.messages.push(Message::assistant_tool_call(&call));
 
-                if crate::tools::requires_approval(&call.name)
-                    && matches!(
+                if crate::tools::requires_approval(&call.name) {
+                    // Gated: the approval prompt is the proposed display (it
+                    // carries the shared summary). No separate `tool>` line.
+                    if matches!(
                         self.approver.review(&call, input, output)?,
                         ApprovalDecision::Deny
-                    )
-                {
-                    tracing::warn!(tool = %call.name, "tool call denied by user");
-                    write_denied_outcome(output, &call)?;
-                    self.messages.push(Message::tool_result(
-                        &call.id,
-                        &call.name,
-                        &denied_tool_result_json(),
-                    ));
-                    continue;
+                    ) {
+                        tracing::warn!(tool = %call.name, "tool call denied by user");
+                        writeln!(output, "{}", crate::tool_display::denied_line(&call))?;
+                        self.messages.push(Message::tool_result(
+                            &call.id,
+                            &call.name,
+                            &denied_tool_result_json(),
+                        ));
+                        continue;
+                    }
+                    // Approved: fall through to execute. The result> / tool error>
+                    // line is the feedback; there is no separate approved line.
+                } else {
+                    // Non-gated: show the proposed summary header.
+                    writeln!(output, "{}", crate::tool_display::proposed_line(&call))?;
                 }
 
                 let result = self.execute_tool(&call);
                 tracing::info!(tool = %call.name, ok = result.is_ok(), "tool executed");
-                write_tool_outcome(output, &result)?;
+                match &result {
+                    Ok(content) => writeln!(
+                        output,
+                        "{}",
+                        crate::tool_display::result_line(&call, content)
+                    )?,
+                    Err(error) => writeln!(
+                        output,
+                        "{}",
+                        crate::tool_display::error_line(&call, &format!("{error:#}"))
+                    )?,
+                }
                 self.messages.push(Message::tool_result(
                     &call.id,
                     &call.name,
@@ -237,40 +251,6 @@ impl Role {
     }
 }
 
-// Renders a tool outcome for the user. Display only: the full result still goes to the model.
-fn write_tool_outcome<W: Write>(output: &mut W, result: &Result<String>) -> io::Result<()> {
-    match result {
-        Ok(content) => writeln!(output, "result> {}", truncate_for_display(content)),
-        Err(error) => writeln!(output, "tool error> {error:#}"),
-    }
-}
-
-fn truncate_for_display(text: &str) -> String {
-    let mut out = String::new();
-    let mut truncated = false;
-
-    for (index, line) in text.lines().enumerate() {
-        if index >= MAX_DISPLAY_LINES {
-            truncated = true;
-            break;
-        }
-        if index > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-
-    if out.chars().count() > MAX_DISPLAY_CHARS {
-        out = out.chars().take(MAX_DISPLAY_CHARS).collect();
-        truncated = true;
-    }
-
-    if truncated {
-        out.push_str("\n\u{2026} (truncated)");
-    }
-    out
-}
-
 fn tool_result_json(result: Result<String>) -> String {
     match result {
         Ok(content) => json!({ "ok": true, "content": content }).to_string(),
@@ -282,11 +262,6 @@ fn tool_result_json(result: Result<String>) -> String {
 // `Err` routed through `tool_result_json`, so the `denied` signal is preserved.
 fn denied_tool_result_json() -> String {
     json!({ "ok": false, "error": "tool call denied by user", "denied": true }).to_string()
-}
-
-// Renders a denied call for the user; sibling of `result>` / `tool error>`.
-fn write_denied_outcome<W: Write>(output: &mut W, call: &ToolCall) -> io::Result<()> {
-    writeln!(output, "denied> {}({})", call.name, call.arguments)
 }
 
 #[cfg(test)]
@@ -535,23 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_display_caps_long_output() {
-        let text = (0..100)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let shown = truncate_for_display(&text);
-        assert!(shown.contains("line 0"));
-        assert!(shown.contains("(truncated)"));
-        assert!(!shown.contains("line 99"));
-    }
-
-    #[test]
-    fn truncate_for_display_keeps_short_output() {
-        assert_eq!(truncate_for_display("short output"), "short output");
-    }
-
-    #[test]
     fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
         let workspace = test_workspace()?;
         fs::write(workspace.path.join("note.txt"), "hello from file")?;
@@ -729,6 +687,35 @@ mod tests {
     }
 
     #[test]
+    fn approved_write_renders_prompt_and_result_without_raw_json() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "write",
+                json!({ "path": "out.txt", "content": "hi" }),
+            )),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            crate::approval::TerminalApprover,
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write it\ny\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        let rendered = String::from_utf8(output)?;
+        // The approval prompt carries the summary; the result line follows it.
+        assert!(rendered.contains("approve write out.txt?"));
+        assert!(rendered.contains("result>"));
+        // No separate proposed line and no raw `name({json})` argument dump.
+        assert!(!rendered.contains("tool> write({"));
+        Ok(())
+    }
+
+    #[test]
     fn denied_write_skips_execution_and_records_denial() -> Result<()> {
         let workspace = test_workspace()?;
         let provider = FakeProvider::new(vec![
@@ -750,7 +737,10 @@ mod tests {
 
         assert!(errors.is_empty());
         assert!(!workspace.path.join("out.txt").exists());
-        assert!(String::from_utf8(output)?.contains("denied> write"));
+        let rendered = String::from_utf8(output)?;
+        assert!(rendered.contains("denied> write out.txt"));
+        // Gated calls no longer double-print a raw `tool> write({...})` line.
+        assert!(!rendered.contains("tool> write({"));
 
         let seen = agent.provider.seen.borrow();
         let denial = seen[1].last().unwrap();

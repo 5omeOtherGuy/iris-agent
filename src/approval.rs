@@ -51,7 +51,7 @@ impl Approver for TerminalApprover {
         input: &mut R,
         output: &mut W,
     ) -> Result<ApprovalDecision> {
-        write!(output, "approve {}? [y/N] ", call.name)?;
+        write!(output, "{}", crate::tool_display::approval_prompt(call))?;
         output.flush()?;
 
         let mut line = String::new();
@@ -111,7 +111,7 @@ mod tests {
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("approve write?")
+                .contains("approve write note.txt?")
         );
         Ok(())
     }

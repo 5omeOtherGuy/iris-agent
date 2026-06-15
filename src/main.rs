@@ -12,6 +12,7 @@ mod errors;
 mod nexus;
 mod providers;
 mod telemetry;
+mod tool_display;
 mod tools;
 
 fn main() -> ExitCode {
