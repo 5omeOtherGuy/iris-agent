@@ -72,13 +72,21 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
 
             self.messages.push(Message::user(prompt));
             if let Err(error) = self.complete_turn(&mut input, output) {
-                writeln!(errors, "provider error: {error:#}")?;
+                if error.downcast_ref::<crate::errors::AuthError>().is_some() {
+                    writeln!(errors, "auth error: {error:#}")?;
+                    writeln!(errors, "authentication required; re-run the login command")?;
+                } else {
+                    writeln!(errors, "provider error: {error:#}")?;
+                }
             }
         }
     }
 
     fn complete_turn<R: BufRead, W: Write>(&mut self, input: &mut R, output: &mut W) -> Result<()> {
-        for _ in 0..MAX_TOOL_ROUNDTRIPS {
+        let span = tracing::info_span!("turn");
+        let _guard = span.enter();
+
+        for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
             let turn = self.provider.respond(&self.messages)?;
             if let Some(text) = turn.text.as_deref().filter(|text| !text.is_empty()) {
                 writeln!(output, "assistant> {text}")?;
@@ -86,6 +94,7 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
             }
 
             if turn.tool_calls.is_empty() {
+                tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
                 return Ok(());
             }
 
@@ -99,6 +108,7 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
                         ApprovalDecision::Deny
                     )
                 {
+                    tracing::warn!(tool = %call.name, "tool call denied by user");
                     write_denied_outcome(output, &call)?;
                     self.messages.push(Message::tool_result(
                         &call.id,
@@ -109,6 +119,7 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
                 }
 
                 let result = self.execute_tool(&call);
+                tracing::info!(tool = %call.name, ok = result.is_ok(), "tool executed");
                 write_tool_outcome(output, &result)?;
                 self.messages.push(Message::tool_result(
                     &call.id,
@@ -118,6 +129,10 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
             }
         }
 
+        tracing::warn!(
+            cap = MAX_TOOL_ROUNDTRIPS,
+            "tool round-trip cap reached; ending turn"
+        );
         // Reached the round-trip guard while the model still wants to call
         // tools. End the turn gracefully so completed tool work and
         // conversation state are preserved and the REPL keeps running; this is
@@ -386,6 +401,29 @@ mod tests {
         assert_eq!(agent.provider.seen.borrow()[1][0].content, "hi");
         assert_eq!(agent.provider.seen.borrow()[1][1].content, "hello");
         assert_eq!(agent.provider.seen.borrow()[1][2].content, "bye");
+        Ok(())
+    }
+
+    struct AuthFailProvider;
+    impl ChatProvider for AuthFailProvider {
+        fn respond(&self, _messages: &[Message]) -> Result<AssistantTurn> {
+            Err(crate::errors::AuthError::new("token expired").into())
+        }
+    }
+
+    #[test]
+    fn repl_reports_auth_errors_with_login_hint() -> Result<()> {
+        let workspace = test_workspace()?;
+        let mut agent = Agent::new(AuthFailProvider, workspace.path.clone(), AutoAllow);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("hello\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        let rendered = String::from_utf8(errors)?;
+        assert!(rendered.contains("auth error:"));
+        assert!(rendered.contains("re-run the login command"));
+        assert!(!rendered.contains("provider error:"));
         Ok(())
     }
 

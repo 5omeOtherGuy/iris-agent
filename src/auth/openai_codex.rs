@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::device_code::{DeviceCodePoll, poll_device_code};
 use crate::auth::storage::{AuthStore, OAuthCredentials};
+use crate::telemetry;
 
 const AUTH_PROVIDER: &str = "openai-codex";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -54,6 +55,23 @@ impl OpenAiCodexTokenStore {
         let account_id = extract_account_id(&credentials.access)?;
         Ok(AccessToken {
             bearer: credentials.access,
+            account_id,
+        })
+    }
+
+    /// Refresh the access token unconditionally and persist the result.
+    ///
+    /// Used when the provider receives an auth rejection (HTTP 401/403) even
+    /// though the locally cached token had not yet expired, so a single forced
+    /// refresh can recover a server-side-invalidated token.
+    pub(crate) fn force_refresh(&self, client: &Client) -> Result<AccessToken> {
+        let credentials = self.storage.oauth_credentials(AUTH_PROVIDER)?;
+        let refreshed = refresh_access_token(client, &credentials.refresh)?;
+        self.storage
+            .set_oauth_credentials(AUTH_PROVIDER, refreshed.clone())?;
+        let account_id = extract_account_id(&refreshed.access)?;
+        Ok(AccessToken {
+            bearer: refreshed.access,
             account_id,
         })
     }
@@ -262,7 +280,10 @@ fn start_device_auth(client: &Client) -> Result<DeviceAuthInfo> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
-        bail!("OpenAI Codex device code request failed ({status}): {body}");
+        match telemetry::sanitize_external_body(&body) {
+            Some(detail) => bail!("OpenAI Codex device code request failed ({status}): {detail}"),
+            None => bail!("OpenAI Codex device code request failed ({status})"),
+        }
     }
 
     #[derive(Deserialize)]
@@ -330,9 +351,12 @@ fn poll_device_auth_once(
     match error_code(&body).as_deref() {
         Some("deviceauth_authorization_pending") => Ok(DeviceCodePoll::Pending),
         Some("slow_down") => Ok(DeviceCodePoll::SlowDown),
-        _ => Ok(DeviceCodePoll::Failed(format!(
-            "OpenAI Codex device auth failed ({status}): {body}"
-        ))),
+        _ => Ok(DeviceCodePoll::Failed(
+            match telemetry::sanitize_external_body(&body) {
+                Some(detail) => format!("OpenAI Codex device auth failed ({status}): {detail}"),
+                None => format!("OpenAI Codex device auth failed ({status})"),
+            },
+        )),
     }
 }
 
@@ -379,8 +403,9 @@ fn read_token_response(
 ) -> Result<OAuthCredentials> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
-        bail!("OpenAI Codex token {operation} failed ({status}): {body}");
+        // Token-endpoint bodies are the highest-risk surface; omit entirely.
+        let _ = response.text();
+        bail!("OpenAI Codex token {operation} failed ({status})");
     }
 
     #[derive(Deserialize)]
