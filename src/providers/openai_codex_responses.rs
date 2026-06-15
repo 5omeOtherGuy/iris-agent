@@ -215,17 +215,19 @@ fn classify_http_status(status: u16) -> HttpClass {
 ///
 /// Honors a server `Retry-After` hint when present (bounded against
 /// pathological values); otherwise exponential backoff from `base` doubling
-/// per retry, clamped to `MAX_BACKOFF`, plus up to 250ms of jitter.
+/// per retry, clamped to `MAX_BACKOFF`. Either way, up to 250ms of jitter is
+/// added so concurrent requests hitting the same rate-limit window do not
+/// retry in lockstep.
 fn backoff_delay(retry: u32, retry_after: Option<Duration>, base: Duration) -> Duration {
+    let jitter = Duration::from_millis(rand::random::<u64>() % 250);
     if let Some(after) = retry_after {
-        return after.min(MAX_BACKOFF.saturating_mul(4));
+        return after.min(MAX_BACKOFF.saturating_mul(4)) + jitter;
     }
     let shift = retry.saturating_sub(1).min(10);
     let exp = base
         .checked_mul(1u32 << shift)
         .unwrap_or(MAX_BACKOFF)
         .min(MAX_BACKOFF);
-    let jitter = Duration::from_millis(rand::random::<u64>() % 250);
     exp + jitter
 }
 
@@ -652,7 +654,11 @@ mod tests {
                 delays.set(seen);
             },
         );
-        assert_eq!(delays.take(), vec![Duration::from_secs(2)]);
+        let seen = delays.take();
+        assert_eq!(seen.len(), 1);
+        // Retry-After of 2s, plus up to 250ms of jitter.
+        assert!(seen[0] >= Duration::from_secs(2));
+        assert!(seen[0] < Duration::from_secs(2) + Duration::from_millis(250));
     }
 
     #[test]
@@ -692,7 +698,8 @@ mod tests {
     #[test]
     fn backoff_delay_honors_retry_after_hint() {
         let delay = backoff_delay(1, Some(Duration::from_secs(2)), Duration::from_millis(500));
-        assert_eq!(delay, Duration::from_secs(2));
+        assert!(delay >= Duration::from_secs(2));
+        assert!(delay < Duration::from_secs(2) + Duration::from_millis(250));
     }
 
     #[test]
