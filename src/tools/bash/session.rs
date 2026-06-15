@@ -49,7 +49,7 @@ use super::sandbox::{self, SandboxStatus};
 /// timeout. Keeps a wedged session (e.g. an unterminated here-doc swallowing the
 /// marker) from blocking forever; the tool layer normally passes an explicit
 /// timeout well under this.
-const SESSION_HARD_CAP: Duration = Duration::from_secs(600);
+pub(super) const SESSION_HARD_CAP: Duration = Duration::from_secs(600);
 
 /// Result of running one command in a session.
 #[derive(Debug, Clone, PartialEq, Eq)]

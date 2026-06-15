@@ -12,7 +12,8 @@
 //! second Ctrl-C must SIGKILL those groups before re-raising, or a long-running
 //! child (timeout shell, persistent session, background job) would be orphaned.
 //! The handler calls [`crate::process_group::kill_all_from_signal`], which is
-//! async-signal-safe (atomic loads plus `killpg`, no allocation or locking).
+//! async-signal-safe (atomic loads plus `kill(-pgid)`, no allocation or
+//! locking).
 //!
 //! File writes are atomic (temp-file + rename), so an interrupt at any point
 //! cannot leave a partially written file.
@@ -38,7 +39,7 @@ extern "C" fn handle_sigint(_signal: libc::c_int) {
         // process blocked in a provider call or `bash` child can still be
         // force-quit.
         // SAFETY: all three calls are async-signal-safe (the reap does only
-        // atomic loads and `killpg`).
+        // atomic loads and `kill(-pgid)`).
         crate::process_group::kill_all_from_signal();
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);

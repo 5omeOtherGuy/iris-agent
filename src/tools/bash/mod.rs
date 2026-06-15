@@ -207,8 +207,15 @@ fn render_session(outcome: session::RunOutcome, timeout_secs: u64) -> String {
         out = format!("[{notice}]\n{out}");
     }
     if outcome.timed_out {
+        // timeout_secs == 0 means "no per-command limit"; the session still
+        // enforces a safety hard cap, so report that bound, not 0.
+        let limit = if timeout_secs == 0 {
+            session::SESSION_HARD_CAP.as_secs()
+        } else {
+            timeout_secs
+        };
         out.push_str(&format!(
-            "\n\nCommand timed out after {timeout_secs} seconds; session terminated"
+            "\n\nCommand timed out after {limit} seconds; session terminated"
         ));
     } else if outcome.exit_code.is_none() {
         out.push_str("\n\nSession shell exited");

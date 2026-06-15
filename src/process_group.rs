@@ -108,7 +108,7 @@ impl Drop for GroupGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn tracked() -> Vec<i32> {
     GROUPS
         .iter()
@@ -117,7 +117,7 @@ fn tracked() -> Vec<i32> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -185,22 +185,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kill_all_from_signal_kills_registered_group() {
-        let mut cmd = Command::new("sleep");
-        cmd.arg("30");
-        in_own_group(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
-        let pid = child.id() as i32;
-        let guard = register(pid);
-        assert!(alive(pid));
-        kill_all_from_signal();
-        let _ = child.wait();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !alive(pid),
-            "registered group {pid} survived force-quit reap"
-        );
-        drop(guard);
-    }
+    // No direct test for `kill_all_from_signal`: it scans the global registry
+    // and SIGKILLs every tracked group, so calling it under `cargo test`'s
+    // parallel execution would kill groups other tests registered. Its body is
+    // a thin loop over the `kill` path that the targeted-kill tests above cover.
 }
