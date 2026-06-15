@@ -134,6 +134,7 @@ fn find_binary(candidates: &[&str]) -> Option<&'static str> {
 pub(crate) mod test_support {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     pub(crate) struct TestDir {
@@ -147,11 +148,15 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn temp_dir() -> TestDir {
+        // nanos alone can collide across parallel tests; a process-unique counter
+        // guarantees a distinct directory per call.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("iris-tools-test-{nanos}"));
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("iris-tools-test-{nanos}-{seq}"));
         fs::create_dir(&path).unwrap();
         TestDir { path }
     }

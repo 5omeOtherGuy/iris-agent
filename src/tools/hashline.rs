@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use xxhash_rust::xxh32::xxh32;
 
 use super::path::resolve_existing;
-use super::text::{detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom};
+use super::text::{
+    atomic_write, detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom,
+};
 
 /// Hashline encoding alphabet (16 letters, one per nibble), copied from pi.
 const NIBBLE_STR: &[u8; 16] = b"ZPMQVRWSNKTXJBYH";
@@ -250,7 +252,7 @@ fn hashline_edit(root: &Path, input: &HashlineEditInput) -> Result<String> {
     } else {
         restored
     };
-    fs::write(&resolved, final_content.as_bytes())
+    atomic_write(&resolved, final_content.as_bytes())
         .with_context(|| format!("failed to write {}", input.path))?;
 
     Ok(format!(

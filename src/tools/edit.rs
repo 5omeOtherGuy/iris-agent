@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::path::resolve_existing;
 use super::text::{
-    READ_TOOL_MAX_BYTES, WRITE_TOOL_MAX_BYTES, detect_line_ending, normalize_to_lf,
+    READ_TOOL_MAX_BYTES, WRITE_TOOL_MAX_BYTES, atomic_write, detect_line_ending, normalize_to_lf,
     restore_line_endings, strip_bom,
 };
 
@@ -94,7 +94,7 @@ fn edit(root: &Path, input: &EditInput) -> Result<String> {
     } else {
         restored
     };
-    fs::write(&resolved, final_content.as_bytes())
+    atomic_write(&resolved, final_content.as_bytes())
         .with_context(|| format!("failed to write {}", input.path))?;
 
     Ok(format!("Successfully replaced text in {}.", input.path))

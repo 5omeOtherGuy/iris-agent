@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::path::resolve_for_write;
-use super::text::WRITE_TOOL_MAX_BYTES;
+use super::text::{WRITE_TOOL_MAX_BYTES, atomic_write};
 
 pub(super) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
 
@@ -44,7 +44,7 @@ fn write_file(root: &Path, input: &WriteInput) -> Result<String> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent directories for {}", input.path))?;
     }
-    fs::write(&resolved, input.content.as_bytes())
+    atomic_write(&resolved, input.content.as_bytes())
         .with_context(|| format!("failed to write {}", input.path))?;
     Ok(format!(
         "Successfully wrote {} bytes to {}.",
