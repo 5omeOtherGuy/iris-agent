@@ -1,5 +1,22 @@
 # Iris Agent
 
+```
+╭───────────────────────────────╮
+│                               │
+│   ██       ██                 │
+│   ██ ██▄▄▖ ██ ▄████           │
+│   ██ ███▀▘ ██ ▀▀▀██           │
+│   ██ ██    ██ ▄▄▄██           │
+│   ██ ██    ██ █████           │
+│                               │
+│   "I'd ship this one!"        │
+│        — Claude Code, 2026    │
+│                               │
+│   ✻ Churned for 13m 14s       │
+│                               │
+╰───────────────────────────────╯
+```
+
 Iris is a terminal-first coding agent being built in Rust. The product is split into:
 
 - **Iris** — the coding agent and overall product.

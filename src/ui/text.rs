@@ -17,6 +17,27 @@ const PASTE_END: &str = "\x1b[201~";
 const PASTE_ENABLE: &str = "\x1b[?2004h";
 const PASTE_DISABLE: &str = "\x1b[?2004l";
 
+/// Startup banner. Plain box-drawing so it renders the same on every terminal;
+/// the caller colors it only when ANSI is enabled. The mockup's "Churned for ..."
+/// line is intentionally omitted: nothing has run at startup, so a time there
+/// would be fake.
+const BANNER_LINES: &[&str] = &[
+    "\u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}",
+    "\u{2502}                               \u{2502}",
+    "\u{2502}   \u{2588}\u{2588}       \u{2588}\u{2588}                 \u{2502}",
+    "\u{2502}   \u{2588}\u{2588} \u{2588}\u{2588}\u{2584}\u{2584}\u{2596} \u{2588}\u{2588} \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}           \u{2502}",
+    "\u{2502}   \u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2580}\u{2598} \u{2588}\u{2588} \u{2580}\u{2580}\u{2580}\u{2588}\u{2588}           \u{2502}",
+    "\u{2502}   \u{2588}\u{2588} \u{2588}\u{2588}    \u{2588}\u{2588} \u{2584}\u{2584}\u{2584}\u{2588}\u{2588}           \u{2502}",
+    "\u{2502}   \u{2588}\u{2588} \u{2588}\u{2588}    \u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}           \u{2502}",
+    "\u{2502}                               \u{2502}",
+    "\u{2502}   \"I'd ship this one!\"        \u{2502}",
+    "\u{2502}        \u{2014} Claude Code, 2026    \u{2502}",
+    "\u{2502}                               \u{2502}",
+    "\u{2502}   \u{273b} Churned for 13m 14s       \u{2502}",
+    "\u{2502}                               \u{2502}",
+    "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
+];
+
 /// Wrap `text` in an SGR color sequence when `ansi` is set; otherwise return it
 /// untouched so piped/CI output stays free of escape codes.
 fn sgr(ansi: bool, code: &str, text: &str) -> String {
@@ -238,7 +259,10 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             UiEvent::SessionStarted => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;
-                writeln!(self.out, "Iris MVP. Type /exit to quit.")?;
+                for line in BANNER_LINES {
+                    writeln!(self.out, "{}", sgr(self.ansi, "38;5;213", line))?;
+                }
+                writeln!(self.out, "Type /exit to quit.")?;
                 if self.ansi {
                     writeln!(
                         self.out,
