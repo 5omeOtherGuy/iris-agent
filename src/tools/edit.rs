@@ -8,12 +8,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::Preview;
 use super::path::resolve_existing;
 use super::text::{
     READ_TOOL_MAX_BYTES, WRITE_TOOL_MAX_BYTES, atomic_write, detect_line_ending, normalize_to_lf,
     restore_line_endings, strip_bom,
 };
+use super::{ObservedFiles, Preview};
 
 pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default old_string must match a unique region; set replace_all=true to replace every occurrence. Matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
 
@@ -31,10 +31,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
+pub(super) fn execute(root: &Path, args: &Value, observed: &mut ObservedFiles) -> Result<String> {
     let input: EditInput = serde_json::from_value(args.clone())
         .context("edit tool arguments must include file_path, old_string, new_string")?;
-    edit(root, &input)
+    edit(root, &input, observed)
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {
@@ -61,10 +61,14 @@ struct EditInput {
     replace_all: bool,
 }
 
-fn edit(root: &Path, input: &EditInput) -> Result<String> {
+fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<String> {
     let plan = build_edit(root, input)?;
+    // `edit` only ever targets an existing file; require the agent to have seen
+    // its current contents so a stale edit cannot silently clobber changes.
+    observed.ensure_fresh(&plan.resolved, plan.old_content.as_bytes())?;
     atomic_write(&plan.resolved, plan.new_content.as_bytes())
         .with_context(|| format!("failed to write {}", input.file_path))?;
+    observed.observe(&plan.resolved, plan.new_content.as_bytes());
 
     let occurrences = plan.replaced;
     let plural = if occurrences == 1 { "" } else { "s" };
@@ -321,6 +325,12 @@ mod tests {
     use crate::tools::test_support::{root_of, temp_dir};
 
     fn run(root: &Path, path: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
+        // The mechanics tests below exercise matching/replacement, not the
+        // stale-file guard, so simulate a prior read of the existing file.
+        let mut observed = ObservedFiles::new();
+        if let Ok(bytes) = fs::read(root.join(path)) {
+            observed.observe(&root.join(path), &bytes);
+        }
         edit(
             root,
             &EditInput {
@@ -329,7 +339,59 @@ mod tests {
                 new_string: new.into(),
                 replace_all,
             },
+            &mut observed,
         )
+    }
+
+    #[test]
+    fn edit_without_prior_read_is_rejected() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("d.txt"), "one\ntwo\n").unwrap();
+        let mut observed = ObservedFiles::new();
+        let err = edit(
+            &root,
+            &EditInput {
+                file_path: "d.txt".into(),
+                old_string: "two".into(),
+                new_string: "TWO".into(),
+                replace_all: false,
+            },
+            &mut observed,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has not been read this session"), "{err}");
+        // File is untouched.
+        assert_eq!(
+            fs::read_to_string(dir.path.join("d.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn edit_on_stale_file_is_rejected() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let path = dir.path.join("d.txt");
+        fs::write(&path, "one\ntwo\n").unwrap();
+        let mut observed = ObservedFiles::new();
+        observed.observe(&path, b"one\ntwo\n");
+        // The file changes on disk behind the agent's back.
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let err = edit(
+            &root,
+            &EditInput {
+                file_path: "d.txt".into(),
+                old_string: "two".into(),
+                new_string: "TWO".into(),
+                replace_all: false,
+            },
+            &mut observed,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("changed since it was last read"), "{err}");
     }
 
     #[test]

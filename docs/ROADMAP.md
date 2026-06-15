@@ -91,7 +91,7 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 | `grep` | Standard | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
 | `write` | Standard + atomic writes | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
 | `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
-| `read` | Standard text read | Claude Code (multimodal) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
+| `read` | Standard text read | Claude Code (multimodal; deferred) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
 | `find` | Standard, wraps `fd` | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
 | `bash` | Behind | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
 
@@ -122,10 +122,14 @@ Execution order (by impact/effort, independent of the milestone sequence):
      [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7),
      [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
 3. **Tier 3 — parity polish.** `edit` `replace_all` + helpful failure output
-   ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)); `write` freshness
-   guard ([#5](https://github.com/5omeOtherGuy/iris-agent/issues/5)); `read`
-   PDF/notebook ([#2](https://github.com/5omeOtherGuy/iris-agent/issues/2)); `ls`
-   tree view ([#8](https://github.com/5omeOtherGuy/iris-agent/issues/8)).
+   ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)) — shipped; `write`
+   freshness guard ([#5](https://github.com/5omeOtherGuy/iris-agent/issues/5)) —
+   shipped (read-before-mutate via the session observation store, shared with
+   `edit`); `ls` metadata
+   ([#8](https://github.com/5omeOtherGuy/iris-agent/issues/8)).
+   `read` multimodal support for PDF/notebook/image inputs
+   ([#2](https://github.com/5omeOtherGuy/iris-agent/issues/2)) is explicitly
+   deferred as a nice-to-have for much later.
 4. **Tier 4 — extend the frontier.** New tools beyond the seven —
    `apply_patch` (V4A; tracked under provider-specific tools,
    [#10](https://github.com/5omeOtherGuy/iris-agent/issues/10)), `ast_edit` for
@@ -135,15 +139,16 @@ Shared tool infrastructure issues opened 2026-06-15:
 
 | Issue | Area | Current status |
 | --- | --- | --- |
-| [#11](https://github.com/5omeOtherGuy/iris-agent/issues/11) | Path identity and file observation store | Missing beyond workspace path resolution. |
-| [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Missing; no read-before-edit or stale-file guard yet. |
-| [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; no canonical mutation queue or observation refresh. |
+| [#11](https://github.com/5omeOtherGuy/iris-agent/issues/11) | Path identity and file observation store | Done (MVP): session-scoped `ObservedFiles` records `{mtime, content_hash}` per canonical path on read/write/edit (`src/tools/observe.rs`). |
+| [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Done (MVP): `edit`/`write` reject mutating an existing file that was never read or changed since last read (hash-decided; mtime refreshed on benign change). New files may be created blind. |
+| [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; observation refresh now happens after each mutation; no canonical mutation queue. |
 | [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Partial: `y`/`yes` approval/deny is enforced in Nexus and file-mutating tools show a diff preview before approval; no persistent allow policies or risk labels. |
 | [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Missing structured metadata; plain text results remain. |
 
 Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
-on Claude Code's exact-string contract. The honest gaps are `bash` (large), shared
-observation/preflight/result metadata (medium), persistent approval policy/risk
+on Claude Code's exact-string contract, and a shared read-before-mutate stale-file
+guard. The honest gaps are `bash` (large), result metadata (medium),
+persistent approval policy/risk
 labels (medium; diff preview already shipped), and `rg`/`fd` packaging
 (clear missing-binary errors, optional on-demand download; small).
 

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::ObservedFiles;
 use super::path::resolve_existing;
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, READ_TOOL_MAX_BYTES};
 
@@ -24,10 +25,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
+pub(super) fn execute(root: &Path, args: &Value, observed: &mut ObservedFiles) -> Result<String> {
     let input: ReadInput =
         serde_json::from_value(args.clone()).context("read tool arguments must include path")?;
-    read(root, &input)
+    read(root, &input, observed)
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,7 +40,7 @@ struct ReadInput {
     limit: Option<i64>,
 }
 
-fn read(root: &Path, input: &ReadInput) -> Result<String> {
+fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<String> {
     if matches!(input.limit, Some(limit) if limit <= 0) {
         bail!("`limit` must be greater than 0");
     }
@@ -73,6 +74,10 @@ fn read(root: &Path, input: &ReadInput) -> Result<String> {
             input.path
         )
     })?;
+    // The agent now knows this file's current bytes; record it so a later
+    // edit/write can detect changes made behind its back. `read` always loads
+    // the full file even when offset/limit windows the output.
+    observed.observe(&resolved, &bytes);
 
     let mut lines: Vec<&str> = content.split('\n').collect();
     // A trailing newline produces a final empty element that is not a real line.
@@ -138,6 +143,7 @@ pub(crate) fn read_file(workspace: &Path, path: &str) -> Result<String> {
             offset: None,
             limit: None,
         },
+        &mut ObservedFiles::new(),
     )
 }
 
@@ -168,6 +174,7 @@ mod tests {
                 offset: Some(3),
                 limit: Some(2),
             },
+            &mut ObservedFiles::new(),
         )
         .unwrap();
         assert!(out.contains("3\u{2192}line3"));

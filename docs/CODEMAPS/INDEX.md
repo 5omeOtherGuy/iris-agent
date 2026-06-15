@@ -46,7 +46,8 @@ behind the `Ui` trait; the only implementation today is the text front-end.
 | `src/tools/text.rs` | Shared text, truncation, size-limit, line-ending, and atomic-write helpers. | `atomic_write()`, `truncate_head()`, `truncate_tail()`, line-ending helpers | filesystem APIs, `rand`, `anyhow` |
 | `src/tools/read.rs` | Text-file read tool with offset/limit, line numbers, binary/NUL and invalid UTF-8 rejection. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
 | `src/tools/write.rs` | Create/overwrite tool. Creates parents, writes through symlinks inside the workspace, and uses atomic replacement. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
-| `src/tools/edit.rs` | Claude-compatible exact-string replacement (`file_path`/`old_string`/`new_string`/`replace_all`) with fuzzy fallback matching, BOM/EOL preservation, no-op rejection, and atomic replacement. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
+| `src/tools/edit.rs` | Claude-compatible exact-string replacement (`file_path`/`old_string`/`new_string`/`replace_all`) with fuzzy fallback matching, BOM/EOL preservation, no-op rejection, stale-file preflight, and atomic replacement. | `execute()` | `path`, `text`, `observe`, filesystem APIs, `serde` |
+| `src/tools/observe.rs` | Session-scoped file observation store for stale-file detection: records `{mtime, content_hash}` per canonical path on read/write/edit and rejects mutating an existing file that was never read or changed since last read. | `ObservedFiles::observe()`, `ObservedFiles::ensure_fresh()` | `sha2`, filesystem APIs |
 | `src/tools/bash.rs` | Shell command tool with cwd confinement, timeout, process-group kill, output drain, truncation, and nonzero-exit reporting. | `execute()` | process/filesystem APIs, `libc` on Unix, `serde` |
 | `src/tools/grep.rs` | Ripgrep-backed content search with workspace-relative output. | `execute()` | `path`, `text`, `std::process`, `serde` |
 | `src/tools/find.rs` | fd/fdfind-backed file glob search sorted newest-first. | `execute()` | `path`, `text`, filesystem/process APIs, `serde` |
@@ -116,7 +117,7 @@ Unknown commands print help and exit with code `2` (`UsageError`); auth failures
 - `reqwest` — blocking HTTP client with JSON and rustls TLS.
 - `serde` — auth-file and request/response serialization.
 - `serde_json` — JSON request/response construction and parsing.
-- `sha2` — OAuth PKCE challenge hashing and telemetry secret fingerprints.
+- `sha2` — OAuth PKCE challenge hashing, telemetry secret fingerprints, and file-observation content hashing.
 - `similar` — diff generation for mutating-tool previews.
 - `thiserror` — typed boundary error definitions (`AuthError`, `UsageError`).
 - `tracing` / `tracing-subscriber` — structured logging to stderr, gated by `RUST_LOG`.

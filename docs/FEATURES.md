@@ -45,6 +45,9 @@
 - **`read` tool** — read a workspace text file with offset/limit; rejects
   binary/NUL-containing and invalid UTF-8 files rather than rendering lossy
   text. [Implemented]
+- **`read` multimodal inputs** — PDF, notebook, and image reading. Nice-to-have
+  explicitly deferred until after the core coding-agent workflow is solid.
+  [Planned]
 - **`write` tool** — create or overwrite a workspace file with atomic
   same-directory replacement. [Implemented]
 - **`edit` tool** — targeted exact-string replacement in an existing file
@@ -74,9 +77,11 @@
   permission preservation on overwrite. [Partial]
 - **Bash policy** — cwd, timeout, stdout/stderr capture, output limits, exit-code
   handling, and process-group cleanup. [Partial]
-- **File observation / stale mutation preflight** — require complete prior reads,
-  reject partial/stale observations, and refresh observations after Iris
-  mutations. [Planned]
+- **File observation / stale mutation preflight** — session-scoped observation
+  store records each file's `{mtime, content_hash}` on read/write/edit; `edit`
+  and `write` reject mutating an existing file that was never read or has
+  changed since last read, and refresh the observation after each mutation. New
+  files may still be created blind. [Implemented]
 - **Diff/preview approval UX** — show unified diffs or capped new-file previews
   before mutating file tools. [Planned]
 - **Secret redaction** — redact secrets from stored content and summaries.

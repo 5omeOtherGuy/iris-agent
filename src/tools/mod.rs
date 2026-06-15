@@ -34,10 +34,13 @@ mod edit;
 mod find;
 mod grep;
 mod ls;
+mod observe;
 mod path;
 mod read;
 mod text;
 mod write;
+
+pub(crate) use observe::ObservedFiles;
 
 #[cfg(test)]
 pub(crate) use read::read_file;
@@ -46,14 +49,19 @@ pub(crate) use read::read_file;
 ///
 /// Argument-parsing error messages are preserved where existing tests depend
 /// on them (`read tool arguments must include path`).
-pub(crate) fn dispatch(workspace: &Path, name: &str, args: &Value) -> Result<String> {
+pub(crate) fn dispatch(
+    workspace: &Path,
+    name: &str,
+    args: &Value,
+    observed: &mut ObservedFiles,
+) -> Result<String> {
     let _span = tracing::debug_span!("tool_dispatch", tool = name).entered();
     let root = path::workspace_root(workspace)?;
     match name {
-        "read" => read::execute(&root, args),
+        "read" => read::execute(&root, args, observed),
         "bash" => bash::execute(&root, args),
-        "edit" => edit::execute(&root, args),
-        "write" => write::execute(&root, args),
+        "edit" => edit::execute(&root, args, observed),
+        "write" => write::execute(&root, args, observed),
         "grep" => grep::execute(&root, args),
         "find" => find::execute(&root, args),
         "ls" => ls::execute(&root, args),
@@ -204,9 +212,14 @@ mod tests {
     #[test]
     fn dispatch_unknown_tool_errors() {
         let dir = temp_dir();
-        let err = dispatch(&dir.path, "nope", &json!({}))
-            .unwrap_err()
-            .to_string();
+        let err = dispatch(
+            &dir.path,
+            "nope",
+            &json!({}),
+            &mut super::ObservedFiles::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unknown tool: nope"));
     }
 

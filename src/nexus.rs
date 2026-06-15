@@ -25,6 +25,7 @@ pub(crate) struct Agent<P> {
     pub(crate) provider: P,
     pub(crate) messages: Vec<Message>,
     workspace: PathBuf,
+    observed: crate::tools::ObservedFiles,
 }
 
 impl<P: ChatProvider> Agent<P> {
@@ -33,6 +34,7 @@ impl<P: ChatProvider> Agent<P> {
             provider,
             messages: Vec::new(),
             workspace,
+            observed: crate::tools::ObservedFiles::new(),
         }
     }
 
@@ -172,8 +174,13 @@ impl<P: ChatProvider> Agent<P> {
         Ok(())
     }
 
-    fn execute_tool(&self, call: &ToolCall) -> Result<String> {
-        crate::tools::dispatch(&self.workspace, &call.name, &call.arguments)
+    fn execute_tool(&mut self, call: &ToolCall) -> Result<String> {
+        crate::tools::dispatch(
+            &self.workspace,
+            &call.name,
+            &call.arguments,
+            &mut self.observed,
+        )
     }
 }
 
@@ -430,8 +437,10 @@ mod tests {
             }
         }
 
+        // out.txt does not pre-exist: a blind create still emits a diff preview
+        // (old is empty) and is not subject to the stale-file guard, so this
+        // test stays focused on preview-before-approval ordering.
         let workspace = test_workspace()?;
-        fs::write(workspace.path.join("out.txt"), "old\n")?;
         let provider = FakeProvider::new(vec![
             Ok(single_call_turn(
                 "write",
@@ -1062,6 +1071,85 @@ mod tests {
         );
         let seen = agent.provider.seen.borrow();
         assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_then_edit_succeeds_end_to_end() -> Result<()> {
+        // Proves the session-scoped observation store persists across tool
+        // calls: the read in roundtrip 0 satisfies the edit's freshness guard
+        // in roundtrip 1.
+        let workspace = test_workspace()?;
+        fs::write(workspace.path.join("note.txt"), "original")?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+            Ok(single_call_turn(
+                "edit",
+                json!({
+                    "file_path": "note.txt",
+                    "old_string": "original",
+                    "new_string": "changed"
+                }),
+            )),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        run_text_session(
+            &mut agent,
+            "go\ny\n/exit\n".as_bytes(),
+            &mut output,
+            &mut errors,
+        )?;
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            fs::read_to_string(workspace.path.join("note.txt"))?,
+            "changed"
+        );
+        let seen = agent.provider.seen.borrow();
+        assert!(seen[2].last().unwrap().content.contains("\"ok\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn edit_without_prior_read_is_rejected_end_to_end() -> Result<()> {
+        let workspace = test_workspace()?;
+        fs::write(workspace.path.join("note.txt"), "original")?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "edit",
+                json!({
+                    "file_path": "note.txt",
+                    "old_string": "original",
+                    "new_string": "changed"
+                }),
+            )),
+            Ok(AssistantTurn::text("understood")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        run_text_session(
+            &mut agent,
+            "go\ny\n/exit\n".as_bytes(),
+            &mut output,
+            &mut errors,
+        )?;
+
+        // Approved by the user, but the freshness guard refuses the blind edit
+        // and the file is left unchanged.
+        assert_eq!(
+            fs::read_to_string(workspace.path.join("note.txt"))?,
+            "original"
+        );
+        let seen = agent.provider.seen.borrow();
+        let result = seen[1].last().unwrap();
+        assert!(result.content.contains("\"ok\":false"));
+        assert!(result.content.contains("has not been read this session"));
         Ok(())
     }
 

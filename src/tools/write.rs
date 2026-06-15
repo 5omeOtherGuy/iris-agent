@@ -7,9 +7,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::Preview;
 use super::path::resolve_for_write;
 use super::text::{WRITE_TOOL_MAX_BYTES, atomic_write};
+use super::{ObservedFiles, Preview};
 
 pub(super) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
 
@@ -24,10 +24,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
+pub(super) fn execute(root: &Path, args: &Value, observed: &mut ObservedFiles) -> Result<String> {
     let input: WriteInput = serde_json::from_value(args.clone())
         .context("write tool arguments must include path and content")?;
-    write_file(root, &input)
+    write_file(root, &input, observed)
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {
@@ -51,14 +51,21 @@ struct WriteInput {
     content: String,
 }
 
-fn write_file(root: &Path, input: &WriteInput) -> Result<String> {
-    let (_, target) = prepare_write(root, input)?;
+fn write_file(root: &Path, input: &WriteInput, observed: &mut ObservedFiles) -> Result<String> {
+    let (old, target) = prepare_write(root, input)?;
+    // Overwriting an existing file requires that the agent has seen its current
+    // contents; reject a blind clobber of changes made behind its back. A new
+    // file (did not exist) is a blind create, which is allowed.
+    if target.exists() {
+        observed.ensure_fresh(&target, old.as_bytes())?;
+    }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent directories for {}", input.path))?;
     }
     atomic_write(&target, input.content.as_bytes())
         .with_context(|| format!("failed to write {}", input.path))?;
+    observed.observe(&target, input.content.as_bytes());
     Ok(format!(
         "Successfully wrote {} bytes to {}.",
         input.content.len(),
@@ -114,6 +121,7 @@ mod tests {
                 path: "nested/dir/c.txt".into(),
                 content: "hello".into(),
             },
+            &mut ObservedFiles::new(),
         )
         .unwrap();
         let out = read_file(&dir.path, "nested/dir/c.txt").unwrap();
@@ -129,12 +137,16 @@ mod tests {
         fs::write(root.join("target.txt"), "old").unwrap();
         std::os::unix::fs::symlink(root.join("target.txt"), root.join("link.txt")).unwrap();
 
+        // Overwriting an existing target requires a prior observation.
+        let mut observed = ObservedFiles::new();
+        observed.observe(&root.join("link.txt"), b"old");
         write_file(
             &root,
             &WriteInput {
                 path: "link.txt".into(),
                 content: "new".into(),
             },
+            &mut observed,
         )
         .unwrap();
 
@@ -158,9 +170,70 @@ mod tests {
                 path: "../evil.txt".into(),
                 content: "x".into(),
             },
+            &mut ObservedFiles::new(),
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("escapes workspace"));
+    }
+
+    #[test]
+    fn write_to_unobserved_existing_file_is_rejected() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(root.join("out.txt"), "old").unwrap();
+        let err = write_file(
+            &root,
+            &WriteInput {
+                path: "out.txt".into(),
+                content: "new".into(),
+            },
+            &mut ObservedFiles::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has not been read this session"), "{err}");
+        // Blind clobber refused; file untouched.
+        assert_eq!(fs::read_to_string(root.join("out.txt")).unwrap(), "old");
+    }
+
+    #[test]
+    fn write_to_new_file_needs_no_prior_read() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        write_file(
+            &root,
+            &WriteInput {
+                path: "fresh.txt".into(),
+                content: "hi".into(),
+            },
+            &mut ObservedFiles::new(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(root.join("fresh.txt")).unwrap(), "hi");
+    }
+
+    #[test]
+    fn write_to_stale_file_is_rejected() {
+        use std::fs;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let path = root.join("out.txt");
+        fs::write(&path, "old").unwrap();
+        let mut observed = ObservedFiles::new();
+        observed.observe(&path, b"old");
+        // Changed on disk behind the agent's back.
+        fs::write(&path, "externally changed").unwrap();
+        let err = write_file(
+            &root,
+            &WriteInput {
+                path: "out.txt".into(),
+                content: "new".into(),
+            },
+            &mut observed,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("changed since it was last read"), "{err}");
     }
 }
