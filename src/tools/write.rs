@@ -40,11 +40,25 @@ fn write_file(root: &Path, input: &WriteInput) -> Result<String> {
         bail!("content exceeds maximum allowed size");
     }
     let resolved = resolve_for_write(root, &input.path)?;
-    if let Some(parent) = resolved.parent() {
+    // If the target is an existing symlink, write through to its real target
+    // (matching fs::write) instead of replacing the link with a regular file.
+    // resolve_for_write already verified the link's target is in the workspace.
+    let target = if resolved
+        .symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        resolved
+            .canonicalize()
+            .with_context(|| format!("failed to resolve path {}", input.path))?
+    } else {
+        resolved
+    };
+    if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent directories for {}", input.path))?;
     }
-    atomic_write(&resolved, input.content.as_bytes())
+    atomic_write(&target, input.content.as_bytes())
         .with_context(|| format!("failed to write {}", input.path))?;
     Ok(format!(
         "Successfully wrote {} bytes to {}.",
@@ -73,6 +87,34 @@ mod tests {
         .unwrap();
         let out = read_file(&dir.path, "nested/dir/c.txt").unwrap();
         assert!(out.contains("hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_through_symlink_updates_target_and_keeps_link() {
+        use std::fs;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(root.join("target.txt"), "old").unwrap();
+        std::os::unix::fs::symlink(root.join("target.txt"), root.join("link.txt")).unwrap();
+
+        write_file(
+            &root,
+            &WriteInput {
+                path: "link.txt".into(),
+                content: "new".into(),
+            },
+        )
+        .unwrap();
+
+        // Target was updated through the link, and the link is still a symlink.
+        assert_eq!(fs::read_to_string(root.join("target.txt")).unwrap(), "new");
+        assert!(
+            fs::symlink_metadata(root.join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

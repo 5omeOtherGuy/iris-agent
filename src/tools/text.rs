@@ -85,6 +85,9 @@ pub(super) fn restore_line_endings(text: &str, ending: &str) -> String {
 /// Atomicity relies on `rename(2)` replacing the destination in one step on the
 /// same filesystem; the temp file is a sibling of `dest`, so that holds. Windows
 /// `fs::rename` does not atomically replace an existing file (out of scope).
+///
+/// After the rename the parent directory is fsynced (best effort) so the swap
+/// itself is durable across a crash, not just the file contents.
 pub(super) fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<()> {
     let parent = match dest.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -135,6 +138,12 @@ pub(super) fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&temp_path, dest)
         .with_context(|| format!("failed to replace {}", dest.display()))?;
     guard.disarm();
+
+    // Best effort: fsync the directory so the rename is durable across a crash.
+    // Not all platforms/filesystems support directory fsync, so ignore errors.
+    if let Ok(dir) = fs::File::open(&parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
