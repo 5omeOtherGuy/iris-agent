@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 
 mod sandbox;
+mod session;
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 // Cap on how long we wait for the output reader threads to observe EOF after the
@@ -22,23 +23,110 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 // than block indefinitely we return whatever was captured within this window.
 const BASH_DRAIN_TIMEOUT_SECS: u64 = 5;
 
-pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable.";
+pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls; with a session, `action` may be `run` (default), `reset` (start the shell fresh), or `close` (terminate it).";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
             "command": { "type": "string", "description": "Bash command to execute" },
-            "timeout": { "type": "integer", "description": "Timeout in seconds (default 120; set 0 to disable)" }
+            "timeout": { "type": "integer", "description": "Timeout in seconds (default 120; set 0 to disable)" },
+            "session": { "type": "string", "description": "Persistent shell session id; state (cd/env/vars) persists across calls with the same id" },
+            "action": { "type": "string", "enum": ["run", "reset", "close"], "description": "Session action (default run); reset starts a fresh shell, close terminates it" }
         },
         "required": ["command"]
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
-    let input: BashInput =
+/// Per-agent state for the bash tool: the registry of persistent shell sessions.
+pub(crate) struct BashState {
+    sessions: session::Sessions,
+}
+
+impl BashState {
+    pub(crate) fn new() -> Self {
+        Self {
+            sessions: session::Sessions::new(),
+        }
+    }
+}
+
+pub(super) fn execute(
+    root: &Path,
+    args: &Value,
+    state: &mut BashState,
+) -> Result<super::ToolOutput> {
+    let parsed: BashArgs =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
-    Ok(super::ToolOutput::text(bash(root, &input)?))
+    match parsed.session.clone() {
+        Some(id) => run_session(root, &id, parsed, state),
+        None => {
+            let command = parsed
+                .command
+                .context("bash tool arguments must include command")?;
+            Ok(super::ToolOutput::text(bash(
+                root,
+                &BashInput {
+                    command,
+                    timeout: parsed.timeout,
+                },
+            )?))
+        }
+    }
+}
+
+/// Route a session-scoped call to the right lifecycle operation.
+fn run_session(
+    root: &Path,
+    id: &str,
+    parsed: BashArgs,
+    state: &mut BashState,
+) -> Result<super::ToolOutput> {
+    match parsed.action.as_deref().unwrap_or("run") {
+        "run" => {
+            let command = parsed
+                .command
+                .filter(|c| !c.trim().is_empty())
+                .context("bash session run requires a command")?;
+            let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+            let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+            let outcome = state.sessions.run(root, id, &command, timeout)?;
+            Ok(super::ToolOutput::text(render_session(
+                outcome,
+                timeout_secs,
+            )))
+        }
+        "reset" => {
+            state.sessions.reset(id)?;
+            Ok(super::ToolOutput::text(format!("session '{id}' reset")))
+        }
+        "close" => {
+            state.sessions.close(id)?;
+            Ok(super::ToolOutput::text(format!("session '{id}' closed")))
+        }
+        other => bail!("unknown bash session action: {other}"),
+    }
+}
+
+/// Format a session command result the same way the one-shot path does: bounded
+/// body, sandbox notice, then a timeout/exit-status footer.
+fn render_session(outcome: session::RunOutcome, timeout_secs: u64) -> String {
+    let mut out = render_output(&outcome.output);
+    if let Some(notice) = outcome.notice {
+        out = format!("[{notice}]\n{out}");
+    }
+    if outcome.timed_out {
+        out.push_str(&format!(
+            "\n\nCommand timed out after {timeout_secs} seconds; session terminated"
+        ));
+    } else if outcome.exit_code.is_none() {
+        out.push_str("\n\nSession shell exited");
+    } else if let Some(code) = outcome.exit_code
+        && code != 0
+    {
+        out.push_str(&format!("\n\nCommand exited with code {code}"));
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +134,18 @@ struct BashInput {
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BashArgs {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
 }
 
 fn bash(root: &Path, input: &BashInput) -> Result<String> {
@@ -145,24 +245,7 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
         combined.push_str(&stderr_text);
     }
 
-    let (truncated_body, truncated, dropped_lines) =
-        truncate_tail(&combined, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-
-    let mut out = if truncated_body.trim().is_empty() {
-        "(no output)".to_string()
-    } else {
-        truncated_body
-    };
-
-    if truncated {
-        let full_path = write_overflow_file(&combined);
-        let location = full_path
-            .as_ref()
-            .map_or_else(|| "(unavailable)".to_string(), |p| p.display().to_string());
-        out = format!(
-            "[output truncated, dropped {dropped_lines} earlier line(s); full output saved to {location}]\n{out}"
-        );
-    }
+    let mut out = render_output(&combined);
 
     if let Some(notice) = sandbox.notice() {
         out = format!("[{notice}]\n{out}");
@@ -183,13 +266,33 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
     Ok(out)
 }
 
+/// Apply the shared output policy: keep the bounded tail, mark `(no output)`
+/// when empty, and spill the full output to a temp file when truncated.
+fn render_output(combined: &str) -> String {
+    let (body, truncated, dropped_lines) =
+        truncate_tail(combined, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let mut out = if body.trim().is_empty() {
+        "(no output)".to_string()
+    } else {
+        body
+    };
+    if truncated {
+        let location = write_overflow_file(combined)
+            .map_or_else(|| "(unavailable)".to_string(), |p| p.display().to_string());
+        out = format!(
+            "[output truncated, dropped {dropped_lines} earlier line(s); full output saved to {location}]\n{out}"
+        );
+    }
+    out
+}
+
 /// Resolve the shell used to run commands.
 ///
 /// The tool is named `bash` and advertised as running bash, so bash-only
 /// syntax (arrays, `[[ ]]`, `set -o pipefail`) must work. Prefer `/bin/bash`,
 /// then `bash` discovered on `PATH`, and fall back to `sh` only when no bash is
 /// available so the tool still runs on minimal systems.
-fn resolve_shell() -> PathBuf {
+pub(super) fn resolve_shell() -> PathBuf {
     let direct = Path::new("/bin/bash");
     if direct.is_file() {
         return direct.to_path_buf();
@@ -215,7 +318,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// children included). Processes that leave the group (setsid/double-fork) can
 /// still escape. On other platforms we fall back to killing the leader.
 #[cfg(unix)]
-fn kill_process_group(child: &mut std::process::Child) {
+pub(super) fn kill_process_group(child: &mut std::process::Child) {
     let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
         let _ = child.kill();
         return;
@@ -231,7 +334,7 @@ fn kill_process_group(child: &mut std::process::Child) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(child: &mut std::process::Child) {
+pub(super) fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
@@ -415,6 +518,62 @@ mod tests {
         .unwrap();
         assert!(!outside.exists(), "sandbox did not block the escape: {out}");
         std::fs::remove_file(&outside).ok();
+    }
+
+    #[test]
+    fn execute_session_persists_state_and_closes() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let mut state = BashState::new();
+
+        // cd in one call is visible to the next call in the same session.
+        execute(
+            &root,
+            &json!({ "command": "cd sub", "session": "s1" }),
+            &mut state,
+        )
+        .unwrap();
+        let pwd = execute(
+            &root,
+            &json!({ "command": "pwd", "session": "s1" }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(
+            pwd.content.trim_end().ends_with("/sub"),
+            "pwd: {}",
+            pwd.content
+        );
+
+        // A different session id is isolated (fresh cwd).
+        let other = execute(
+            &root,
+            &json!({ "command": "pwd", "session": "s2" }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(!other.content.trim_end().ends_with("/sub"));
+
+        // close terminates the session; the next run starts fresh.
+        let closed = execute(
+            &root,
+            &json!({ "session": "s1", "action": "close" }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(closed.content.contains("closed"));
+        let after = execute(
+            &root,
+            &json!({ "command": "pwd", "session": "s1" }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(
+            !after.content.trim_end().ends_with("/sub"),
+            "session not reset after close"
+        );
     }
 
     #[test]

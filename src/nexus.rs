@@ -25,7 +25,7 @@ pub(crate) struct Agent<P> {
     pub(crate) provider: P,
     pub(crate) messages: Vec<Message>,
     workspace: PathBuf,
-    observed: crate::tools::ObservedFiles,
+    state: crate::tools::ToolState,
 }
 
 impl<P: ChatProvider> Agent<P> {
@@ -34,7 +34,7 @@ impl<P: ChatProvider> Agent<P> {
             provider,
             messages: Vec::new(),
             workspace,
-            observed: crate::tools::ObservedFiles::new(),
+            state: crate::tools::ToolState::new(),
         }
     }
 
@@ -179,7 +179,7 @@ impl<P: ChatProvider> Agent<P> {
             &self.workspace,
             &call.name,
             &call.arguments,
-            &mut self.observed,
+            &mut self.state,
         )
     }
 }

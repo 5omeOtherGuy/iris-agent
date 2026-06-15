@@ -1,0 +1,544 @@
+//! Persistent shell sessions for the `bash` tool.
+//!
+//! A session is a long-lived `bash` co-process. State set by one command
+//! (`cd`, `export`, shell variables) survives into later commands in the same
+//! session, unlike the one-shot path which spawns a fresh shell per call.
+//!
+//! ## Sentinel protocol
+//!
+//! The shell merges stderr into stdout (`exec 2>&1`) so a single ordered stream
+//! can be delimited. Each command is written as:
+//!
+//! ```text
+//! {
+//! <user command>
+//! } </dev/null
+//! __iris_rc=$?; printf '\n__IRIS_DONE_<nonce> %d\n' "$__iris_rc"
+//! ```
+//!
+//! The `{ ... }` group runs in the current shell (so `cd`/`export` persist),
+//! `</dev/null` stops commands like `cat`/`read` from consuming the control
+//! pipe, and the high-entropy nonce makes the completion marker
+//! collision-proof. A reader thread forwards the stream to a channel; [`run`]
+//! scans for the marker, splits off the command output, and parses the exit
+//! code.
+//!
+//! ## Lifecycle
+//!
+//! Sessions are created lazily on first [`run`], explicitly cleared with
+//! [`reset`] (drop + recreate fresh) or [`close`], and all are torn down when
+//! the registry is dropped. Each shell runs in its own process group; teardown
+//! sends `SIGKILL` to the group and reaps the child so nothing leaks.
+//!
+//! [`run`]: Sessions::run
+//! [`reset`]: Sessions::reset
+//! [`close`]: Sessions::close
+
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+
+use super::sandbox::{self, SandboxStatus};
+
+/// Upper bound on how long a single command may run when the caller passes no
+/// timeout. Keeps a wedged session (e.g. an unterminated here-doc swallowing the
+/// marker) from blocking forever; the tool layer normally passes an explicit
+/// timeout well under this.
+const SESSION_HARD_CAP: Duration = Duration::from_secs(600);
+
+/// Result of running one command in a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunOutcome {
+    /// Combined stdout+stderr the command produced (untruncated).
+    pub(crate) output: String,
+    /// Exit status, or `None` if the shell died before reporting one
+    /// (e.g. the command was `exit`, or the session was killed on timeout).
+    pub(crate) exit_code: Option<i32>,
+    /// Whether the command was cut off by the per-command timeout (the session
+    /// is killed and will be recreated on the next run).
+    pub(crate) timed_out: bool,
+    /// Sandbox status notice when the shell could not be fully confined; `None`
+    /// when fully enforced. Surfaced by the tool layer (never silently dropped).
+    pub(crate) notice: Option<String>,
+}
+
+/// Registry of named persistent shell sessions.
+pub(crate) struct Sessions {
+    sessions: HashMap<String, Session>,
+}
+
+impl Sessions {
+    pub(crate) fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+        }
+    }
+
+    /// Run `command` in session `id`, creating the session (rooted at `root`)
+    /// if it does not exist or its shell has died.
+    pub(crate) fn run(
+        &mut self,
+        root: &Path,
+        id: &str,
+        command: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RunOutcome> {
+        let fresh = match self.sessions.get(id) {
+            Some(session) => !session.alive,
+            None => true,
+        };
+        if fresh {
+            // Reap any dead shell still in the map before replacing it.
+            if let Some(mut old) = self.sessions.remove(id) {
+                old.kill_and_reap();
+            }
+            let session = Session::create(root)?;
+            self.sessions.insert(id.to_string(), session);
+        }
+
+        let session = self
+            .sessions
+            .get_mut(id)
+            .expect("session present after create");
+        let mut outcome = session.run_command(command, timeout);
+        // Never a silent "sandbox off": carry the notice for the tool layer to
+        // surface (kept out of `output` so truncation cannot drop it).
+        outcome.notice = session.status.notice();
+        Ok(outcome)
+    }
+
+    /// Drop session `id` (killing its shell) so the next [`run`] starts fresh.
+    pub(crate) fn reset(&mut self, id: &str) -> Result<()> {
+        if let Some(mut session) = self.sessions.remove(id) {
+            session.kill_and_reap();
+        }
+        Ok(())
+    }
+
+    /// Close session `id`, killing and reaping its shell. A no-op if absent.
+    pub(crate) fn close(&mut self, id: &str) -> Result<()> {
+        if let Some(mut session) = self.sessions.remove(id) {
+            session.kill_and_reap();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn child_pid(&self, id: &str) -> Option<u32> {
+        self.sessions.get(id).map(|s| s.pid())
+    }
+}
+
+/// Outcome of scanning the shell's output stream for the completion marker.
+enum Marker {
+    /// Marker found: `output` is the command's bytes, `code` its exit status.
+    Found { output: Vec<u8>, code: Option<i32> },
+    /// Deadline passed before the marker arrived; `output` is what was read.
+    TimedOut { output: Vec<u8> },
+    /// The shell's stdout closed (it exited) before a marker; `output` is
+    /// whatever it printed first.
+    Disconnected { output: Vec<u8> },
+}
+
+/// A single persistent shell.
+struct Session {
+    child: Child,
+    stdin: ChildStdin,
+    rx: Receiver<Vec<u8>>,
+    nonce: String,
+    /// Bytes read past the previous command's marker, carried into the next read.
+    leftover: Vec<u8>,
+    alive: bool,
+    status: SandboxStatus,
+}
+
+impl Session {
+    /// Spawn a confined `bash`, merge stderr into stdout, and sync to a clean
+    /// state by consuming an initial marker.
+    fn create(root: &Path) -> Result<Self> {
+        let mut command = Command::new(super::resolve_shell());
+        command
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let status = sandbox::confine(&mut command, &sandbox::SandboxPolicy::for_workspace(root));
+        if let Some(notice) = status.notice() {
+            tracing::warn!(%notice, "bash session sandbox not fully enforced");
+        }
+
+        let mut child = command.spawn().context("failed to spawn session shell")?;
+        let stdin = child.stdin.take().context("missing session stdin")?;
+        let stdout = child.stdout.take().context("missing session stdout")?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || reader_loop(stdout, &tx));
+
+        let mut session = Self {
+            child,
+            stdin,
+            rx,
+            nonce: format!("{:016x}", rand::random::<u64>()),
+            leftover: Vec::new(),
+            alive: true,
+            status,
+        };
+
+        // Merge stderr so a single ordered stream carries everything, then sync
+        // on a marker so the first user command starts from a known position.
+        session
+            .write_all(b"exec 2>&1\n")
+            .context("failed to initialize session shell")?;
+        session
+            .write_marker()
+            .context("failed to initialize session shell")?;
+        match session.read_until_marker(Some(Instant::now() + Duration::from_secs(10))) {
+            Marker::Found { .. } => Ok(session),
+            _ => {
+                session.kill_and_reap();
+                bail!("session shell did not initialize");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Run one command and return its output + exit code. Caller guarantees the
+    /// session is alive; a dead shell or timeout marks it dead for recreation.
+    fn run_command(&mut self, command: &str, timeout: Option<Duration>) -> RunOutcome {
+        if self.write_command(command).is_err() {
+            // The shell died between commands; reap it and report dead so the
+            // next run recreates it.
+            self.kill_and_reap();
+            return RunOutcome {
+                output: String::new(),
+                exit_code: None,
+                timed_out: false,
+                notice: None,
+            };
+        }
+        let deadline = timeout
+            .map(|d| Instant::now() + d)
+            .or_else(|| Some(Instant::now() + SESSION_HARD_CAP));
+        match self.read_until_marker(deadline) {
+            Marker::Found { output, code } => RunOutcome {
+                output: String::from_utf8_lossy(&output).into_owned(),
+                exit_code: code,
+                timed_out: false,
+                notice: None,
+            },
+            Marker::TimedOut { output } => {
+                self.kill_and_reap();
+                RunOutcome {
+                    output: String::from_utf8_lossy(&output).into_owned(),
+                    exit_code: None,
+                    timed_out: true,
+                    notice: None,
+                }
+            }
+            Marker::Disconnected { output } => {
+                self.kill_and_reap();
+                RunOutcome {
+                    output: String::from_utf8_lossy(&output).into_owned(),
+                    exit_code: None,
+                    timed_out: false,
+                    notice: None,
+                }
+            }
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.stdin.write_all(bytes)?;
+        self.stdin.flush()
+    }
+
+    /// Write the user command wrapped so `cd`/`export` persist in the shell and
+    /// the command cannot read the control pipe, followed by the marker.
+    fn write_command(&mut self, command: &str) -> io::Result<()> {
+        self.write_all(format!("{{\n{command}\n}} </dev/null\n").as_bytes())?;
+        self.write_marker()
+    }
+
+    /// Emit `\n__IRIS_DONE_<nonce> <exit code>\n` capturing the previous
+    /// command's status.
+    fn write_marker(&mut self) -> io::Result<()> {
+        let line = format!(
+            "__iris_rc=$?; printf '\\n__IRIS_DONE_{} %d\\n' \"$__iris_rc\"\n",
+            self.nonce
+        );
+        self.write_all(line.as_bytes())
+    }
+
+    /// Read the output stream until the completion marker, the deadline, or the
+    /// shell's stdout closing.
+    fn read_until_marker(&mut self, deadline: Option<Instant>) -> Marker {
+        let prefix = format!("\n__IRIS_DONE_{} ", self.nonce).into_bytes();
+        let mut buf = std::mem::take(&mut self.leftover);
+        // Rescan from a point that preserves any marker split across reads.
+        let mut scan_from = 0usize;
+
+        loop {
+            if let Some(rel) = find(&buf[scan_from..], &prefix) {
+                let start = scan_from + rel;
+                let after = start + prefix.len();
+                if let Some(nl) = buf[after..].iter().position(|&b| b == b'\n') {
+                    let code = std::str::from_utf8(&buf[after..after + nl])
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok());
+                    let output = buf[..start].to_vec();
+                    self.leftover = buf[after + nl + 1..].to_vec();
+                    return Marker::Found { output, code };
+                }
+                // Prefix seen but the exit code/newline has not fully arrived;
+                // keep this region in view and read more.
+                scan_from = start;
+            } else {
+                scan_from = buf.len().saturating_sub(prefix.len().saturating_sub(1));
+            }
+
+            let chunk = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Marker::TimedOut { output: buf };
+                    }
+                    match self.rx.recv_timeout(remaining) {
+                        Ok(chunk) => chunk,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            return Marker::TimedOut { output: buf };
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Marker::Disconnected { output: buf };
+                        }
+                    }
+                }
+                None => match self.rx.recv() {
+                    Ok(chunk) => chunk,
+                    Err(_) => return Marker::Disconnected { output: buf },
+                },
+            };
+            buf.extend_from_slice(&chunk);
+        }
+    }
+
+    /// Kill the whole process group and reap the leader so nothing is left
+    /// running or zombied. Idempotent: the first call marks the session dead and
+    /// later calls (including from `Drop`) are no-ops.
+    //
+    // ponytail: reuses the one-shot path's `kill_process_group`; subsystem 4
+    // extracts a shared process-group primitive and rewires both to it.
+    fn kill_and_reap(&mut self) {
+        if !self.alive {
+            return;
+        }
+        self.alive = false;
+        super::kill_process_group(&mut self.child);
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+/// Forward a child's stdout to the channel in chunks until EOF or read error.
+fn reader_loop(mut stdout: ChildStdout, tx: &mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Index of the first occurrence of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Workspace(PathBuf);
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    fn workspace() -> Workspace {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("iris-session-test-{nanos}-{seq}"));
+        std::fs::create_dir(&p).unwrap();
+        Workspace(p)
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        // kill(pid, 0): 0 if the process exists, ESRCH if not.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[test]
+    fn cd_persists_between_calls() {
+        let ws = workspace();
+        std::fs::create_dir(ws.0.join("sub")).unwrap();
+        let mut s = Sessions::new();
+        s.run(&ws.0, "a", "cd sub", None).unwrap();
+        let out = s.run(&ws.0, "a", "pwd", None).unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(
+            out.output.trim_end().ends_with("/sub"),
+            "pwd: {:?}",
+            out.output
+        );
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn env_and_shell_vars_persist_between_calls() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        s.run(&ws.0, "a", "export FOO=bar", None).unwrap();
+        s.run(&ws.0, "a", "PLAIN=42", None).unwrap();
+        let foo = s.run(&ws.0, "a", "echo $FOO", None).unwrap();
+        let plain = s.run(&ws.0, "a", "echo $PLAIN", None).unwrap();
+        assert_eq!(foo.output.trim_end(), "bar");
+        assert_eq!(plain.output.trim_end(), "42");
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn reset_clears_cwd_and_vars() {
+        let ws = workspace();
+        std::fs::create_dir(ws.0.join("sub")).unwrap();
+        let mut s = Sessions::new();
+        s.run(&ws.0, "a", "cd sub; export FOO=bar", None).unwrap();
+        s.reset("a").unwrap();
+        let pwd = s.run(&ws.0, "a", "pwd", None).unwrap();
+        let foo = s.run(&ws.0, "a", "echo \"[${FOO:-unset}]\"", None).unwrap();
+        assert!(
+            !pwd.output.trim_end().ends_with("/sub"),
+            "cwd not reset: {:?}",
+            pwd.output
+        );
+        assert_eq!(foo.output.trim_end(), "[unset]");
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn reports_exit_codes_and_output() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        let hello = s.run(&ws.0, "a", "echo hello", None).unwrap();
+        assert_eq!(hello.output.trim_end(), "hello");
+        assert_eq!(hello.exit_code, Some(0));
+        assert_eq!(s.run(&ws.0, "a", "false", None).unwrap().exit_code, Some(1));
+        // A child process exiting non-zero is reported without killing the
+        // session shell (unlike a bare `exit`, which would terminate it).
+        assert_eq!(
+            s.run(&ws.0, "a", "bash -c 'exit 7'", None)
+                .unwrap()
+                .exit_code,
+            Some(7)
+        );
+        assert_eq!(
+            s.run(&ws.0, "a", "echo still-alive", None)
+                .unwrap()
+                .output
+                .trim_end(),
+            "still-alive"
+        );
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn close_kills_and_reaps_shell() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        s.run(&ws.0, "a", "echo hi", None).unwrap();
+        let pid = s.child_pid("a").unwrap();
+        assert!(pid_alive(pid));
+        s.close("a").unwrap();
+        // Give the kernel a moment to retire the pid.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !pid_alive(pid),
+            "session shell {pid} still alive after close"
+        );
+        assert!(s.child_pid("a").is_none());
+    }
+
+    #[test]
+    fn dead_session_is_recreated_without_panic() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        s.run(&ws.0, "a", "export FOO=bar", None).unwrap();
+        // `exit` kills the shell mid-command: no marker, defined as dead.
+        let _ = s.run(&ws.0, "a", "exit", None);
+        // Next run must transparently recreate a fresh shell.
+        let out = s.run(&ws.0, "a", "echo back", None).unwrap();
+        assert_eq!(out.output.trim_end(), "back");
+        // Fresh shell, so the old var is gone.
+        let foo = s.run(&ws.0, "a", "echo \"[${FOO:-unset}]\"", None).unwrap();
+        assert_eq!(foo.output.trim_end(), "[unset]");
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn timeout_kills_session_and_next_run_recovers() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        let pid = {
+            s.run(&ws.0, "a", "echo warm", None).unwrap();
+            s.child_pid("a").unwrap()
+        };
+        let started = std::time::Instant::now();
+        let out = s
+            .run(&ws.0, "a", "sleep 30", Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(out.timed_out, "expected timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "did not return promptly"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!pid_alive(pid), "timed-out session shell still alive");
+        // Recovery: a fresh shell handles the next command.
+        let out = s.run(&ws.0, "a", "echo recovered", None).unwrap();
+        assert_eq!(out.output.trim_end(), "recovered");
+        s.close("a").unwrap();
+    }
+}

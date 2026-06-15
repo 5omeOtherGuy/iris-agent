@@ -42,6 +42,23 @@ mod write;
 
 pub(crate) use observe::ObservedFiles;
 
+/// Mutable per-agent state threaded through [`dispatch`]: observed-file tracking
+/// for read-before-write safety plus the bash tool's persistent-session
+/// registry. Owned by the `Agent` so no global mutable state is needed.
+pub(crate) struct ToolState {
+    pub(crate) observed: ObservedFiles,
+    pub(crate) bash: bash::BashState,
+}
+
+impl ToolState {
+    pub(crate) fn new() -> Self {
+        Self {
+            observed: ObservedFiles::new(),
+            bash: bash::BashState::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) use read::read_file;
 
@@ -80,15 +97,15 @@ pub(crate) fn dispatch(
     workspace: &Path,
     name: &str,
     args: &Value,
-    observed: &mut ObservedFiles,
+    state: &mut ToolState,
 ) -> Result<ToolOutput> {
     let _span = tracing::debug_span!("tool_dispatch", tool = name).entered();
     let root = path::workspace_root(workspace)?;
     match name {
-        "read" => read::execute(&root, args, observed),
-        "bash" => bash::execute(&root, args),
-        "edit" => edit::execute(&root, args, observed),
-        "write" => write::execute(&root, args, observed),
+        "read" => read::execute(&root, args, &mut state.observed),
+        "bash" => bash::execute(&root, args, &mut state.bash),
+        "edit" => edit::execute(&root, args, &mut state.observed),
+        "write" => write::execute(&root, args, &mut state.observed),
         "grep" => grep::execute(&root, args),
         "find" => find::execute(&root, args),
         "ls" => ls::execute(&root, args),
@@ -239,14 +256,9 @@ mod tests {
     #[test]
     fn dispatch_unknown_tool_errors() {
         let dir = temp_dir();
-        let err = dispatch(
-            &dir.path,
-            "nope",
-            &json!({}),
-            &mut super::ObservedFiles::new(),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = dispatch(&dir.path, "nope", &json!({}), &mut super::ToolState::new())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown tool: nope"));
     }
 
