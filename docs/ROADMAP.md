@@ -331,8 +331,27 @@ Potential scope:
 - Better `edit` semantics: uniqueness checks, conflict messages, preview diff.
   [Preview diff shipped for mutating tools; uniqueness/conflict messaging remains.]
   See the Tool quality workstream ([#4](https://github.com/5omeOtherGuy/iris-agent/issues/4)).
-- Basic git diff display after file changes.
-- Optional self-review before final response.
+- Basic git diff display after file changes. [Decided 2026-06-15: keep the
+  pre-apply approval preview diff as the single diff surface, matching Claude
+  Code and Codex CLI (verified: Codex generates one self-computed unified diff
+  shown at approval time and never runs `git diff HEAD` for tool output). A
+  prototype post-change `git diff HEAD` display was implemented and reverted: a
+  brand-new file is untracked, so `git diff HEAD` shows nothing while the
+  preview already renders it as full additions -- so for new files the git diff
+  is invisible, and for tracked edits it just double-renders the preview. The
+  apply-first, git-as-record model (Aider) is the genuinely better post-change
+  surface, but it is only safe with checkpoint/undo rollback, so it moves to
+  Milestone 5 alongside that work.]
+
+Cut from Milestone 1 (2026-06-15): "Optional self-review before final
+response." It collapsed two features of different sizes, neither M1 core. The
+cheap version (one extra model turn re-reading its own diff before answering) is
+low-value: without external feedback, intrinsic self-correction is evidence-light
+and can degrade output
+([arXiv:2310.01798](https://arxiv.org/abs/2310.01798)). The valuable version
+(run tests/lint/build, feed failures back, retry) is a real verify loop that
+depends on the safer-`bash` policy and overlaps the git workflow, so it moves to
+Milestone 5. See "Optional verification loop" there.
 
 Acceptance signal: Iris can make a small code/doc change in a real repository,
 show the diff, and explain what it changed.
@@ -412,6 +431,10 @@ Potential scope:
 - Per-hunk staging.
 - Optional auto-commit behind explicit approval.
 - Worktree support.
+- Optional verification loop (moved from Milestone 1): after a change, run the
+  project's test/lint/build command and feed failures back before the final
+  answer. External-signal driven, not an LLM self-critique pass; depends on the
+  safer-`bash` policy.
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user
