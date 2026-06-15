@@ -108,6 +108,48 @@ pub(crate) fn requires_approval(name: &str) -> bool {
     classify(name).is_mutating()
 }
 
+/// Optional pre-approval diff preview for mutating tools.
+pub(crate) fn diff_preview(workspace: &Path, name: &str, args: &Value) -> Option<String> {
+    let root = match path::workspace_root(workspace) {
+        Ok(root) => root,
+        Err(error) => return Some(format!("diff unavailable: {error:#}")),
+    };
+    match name {
+        "write" => render_preview(write::preview(&root, args)),
+        "edit" => render_preview(edit::preview(&root, args)),
+        "hashline_edit" => render_preview(hashline::preview(&root, args)),
+        "bash" => Some("diff unavailable: bash commands do not have a file diff".to_string()),
+        _ => None,
+    }
+}
+
+pub(super) enum Preview {
+    Available {
+        path: String,
+        old: String,
+        new: String,
+    },
+    Unavailable(String),
+    Malformed,
+}
+
+fn render_preview(preview: Preview) -> Option<String> {
+    match preview {
+        Preview::Available { path, old, new } => Some(unified_diff(&path, &old, &new)),
+        Preview::Unavailable(reason) => Some(format!("diff unavailable: {reason}")),
+        Preview::Malformed => None,
+    }
+}
+
+fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    let old_header = format!("a/{path}");
+    let new_header = format!("b/{path}");
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .header(&old_header, &new_header)
+        .to_string()
+}
+
 /// JSON tool declarations advertised to the provider, one per built-in tool.
 ///
 /// Names, descriptions, and parameter schemas are copied verbatim from pi.
@@ -202,8 +244,9 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::temp_dir;
-    use super::{dispatch, tool_definitions};
+    use super::{diff_preview, dispatch, tool_definitions};
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn dispatch_unknown_tool_errors() {
@@ -264,5 +307,44 @@ mod tests {
                 "hashline_edit"
             ]
         );
+    }
+
+    #[test]
+    fn diff_preview_renders_write_diff() {
+        let dir = temp_dir();
+        fs::write(dir.path.join("note.txt"), "old\n").unwrap();
+
+        let diff = diff_preview(
+            &dir.path,
+            "write",
+            &json!({ "path": "note.txt", "content": "new\n" }),
+        )
+        .unwrap();
+
+        assert!(diff.contains("--- a/note.txt"));
+        assert!(diff.contains("+++ b/note.txt"));
+        assert!(diff.contains("-old"));
+        assert!(diff.contains("+new"));
+    }
+
+    #[test]
+    fn diff_preview_skips_malformed_mutating_args() {
+        let dir = temp_dir();
+
+        assert!(diff_preview(&dir.path, "write", &json!({ "path": "note.txt" })).is_none());
+    }
+
+    #[test]
+    fn diff_preview_reports_unavailable_for_well_formed_failed_edit() {
+        let dir = temp_dir();
+
+        let preview = diff_preview(
+            &dir.path,
+            "edit",
+            &json!({ "path": "missing.txt", "oldText": "old", "newText": "new" }),
+        )
+        .unwrap();
+
+        assert!(preview.contains("diff unavailable"));
     }
 }

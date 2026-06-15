@@ -1,4 +1,5 @@
 use std::env;
+use std::io::{BufRead, BufReader};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::errors::AuthError;
-use crate::nexus::{AssistantTurn, ChatProvider, Message, Role, ToolCall};
+use crate::nexus::{AssistantTurn, ChatProvider, Message, Role, ToolCall, TurnSink};
 use crate::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -45,7 +46,7 @@ impl OpenAiCodexResponsesProvider {
 }
 
 impl ChatProvider for OpenAiCodexResponsesProvider {
-    fn respond(&self, messages: &[Message]) -> Result<AssistantTurn> {
+    fn respond(&self, messages: &[Message], sink: &mut dyn TurnSink) -> Result<AssistantTurn> {
         let span = tracing::info_span!("codex_roundtrip", model = %self.config.model);
         let _guard = span.enter();
 
@@ -62,7 +63,7 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             },
             |token| {
                 let started = Instant::now();
-                let attempt = self.send_once(url.clone(), token, &request);
+                let attempt = self.send_once(url.clone(), token, &request, sink);
                 tracing::debug!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "codex attempt complete"
@@ -150,7 +151,13 @@ enum Attempt {
 }
 
 impl OpenAiCodexResponsesProvider {
-    fn send_once(&self, url: Url, token: &AccessToken, request: &Value) -> Attempt {
+    fn send_once(
+        &self,
+        url: Url,
+        token: &AccessToken,
+        request: &Value,
+        sink: &mut dyn TurnSink,
+    ) -> Attempt {
         let headers = match codex_headers(token) {
             Ok(headers) => headers,
             Err(error) => return Attempt::Fatal(error),
@@ -167,16 +174,9 @@ impl OpenAiCodexResponsesProvider {
 
         let status = response.status();
         if status.is_success() {
-            return match response.text() {
-                Ok(body) => match parse_response_stream(&body) {
-                    Ok(turn) => Attempt::Done(turn),
-                    Err(error) => Attempt::Fatal(error),
-                },
-                // The server may already have generated (and billed) this
-                // response, so a body-read failure is not safe to retry.
-                Err(error) => Attempt::Fatal(
-                    anyhow::Error::new(error).context("failed to read Codex stream response"),
-                ),
+            return match parse_response_stream_reader(BufReader::new(response), sink) {
+                Ok(turn) => Attempt::Done(turn),
+                Err(error) => Attempt::Fatal(error),
             };
         }
 
@@ -356,38 +356,72 @@ fn parse_response_json(value: Value) -> Result<AssistantTurn> {
     Ok(turn)
 }
 
+#[cfg(test)]
 fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    let mut completed_response = None;
-    let mut saw_completed = false;
+    let mut sink = NoopSink;
+    parse_response_stream_reader(BufReader::new(body.as_bytes()), &mut sink)
+}
 
-    for event in body.split("\n\n") {
+fn parse_response_stream_reader(
+    reader: impl BufRead,
+    sink: &mut dyn TurnSink,
+) -> Result<AssistantTurn> {
+    let mut parser = ResponseStreamParser::default();
+    let mut event = String::new();
+
+    for line in reader.lines() {
+        let line = line.context("failed to read Codex stream response")?;
+        if line.trim_end_matches('\r').is_empty() {
+            parser.ingest_event(&event, sink)?;
+            event.clear();
+        } else {
+            event.push_str(&line);
+            event.push('\n');
+        }
+    }
+    if !event.is_empty() {
+        parser.ingest_event(&event, sink)?;
+    }
+
+    parser.finish()
+}
+
+#[derive(Default)]
+struct ResponseStreamParser {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    completed_response: Option<Value>,
+    saw_completed: bool,
+}
+
+impl ResponseStreamParser {
+    fn ingest_event(&mut self, event: &str, sink: &mut dyn TurnSink) -> Result<()> {
         let data = event_data(event);
         if data.is_empty() || data == "[DONE]" {
-            continue;
+            return Ok(());
         }
 
         let value: Value = serde_json::from_str(&data).context("failed to parse Codex SSE data")?;
         match value.get("type").and_then(Value::as_str) {
             Some("response.output_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                    text.push_str(delta);
+                    self.text.push_str(delta);
+                    sink.on_text_delta(delta);
                 }
             }
             Some("response.output_item.done") => {
                 if let Some(item) = value.get("item") {
-                    if text.is_empty() {
-                        text.push_str(&extract_output_text(item));
+                    if self.text.is_empty() {
+                        self.text.push_str(&extract_output_text(item));
                     }
                     if let Some(call) = extract_tool_call(item) {
-                        tool_calls.push(call);
+                        self.tool_calls.push(call);
                     }
                 }
             }
             Some("response.completed") => {
-                saw_completed = true;
-                completed_response = value.get("response").cloned();
+                self.saw_completed = true;
+                self.completed_response = value.get("response").cloned();
             }
             Some("response.failed") => bail!("Codex response failed: {}", response_error(&value)),
             Some("response.incomplete") => {
@@ -395,27 +429,39 @@ fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
             }
             _ => {}
         }
+        Ok(())
     }
 
-    if !saw_completed {
-        bail!("Codex stream closed before response.completed");
-    }
-    if let Some(response) = completed_response.as_ref() {
-        let completed_turn = extract_assistant_turn(response);
-        if text.is_empty() {
-            text.push_str(completed_turn.text.as_deref().unwrap_or_default());
+    fn finish(mut self) -> Result<AssistantTurn> {
+        if !self.saw_completed {
+            bail!("Codex stream closed before response.completed");
         }
-        if tool_calls.is_empty() {
-            tool_calls = completed_turn.tool_calls;
+        if let Some(response) = self.completed_response.as_ref() {
+            let completed_turn = extract_assistant_turn(response);
+            if self.text.is_empty() {
+                self.text
+                    .push_str(completed_turn.text.as_deref().unwrap_or_default());
+            }
+            if self.tool_calls.is_empty() {
+                self.tool_calls = completed_turn.tool_calls;
+            }
         }
+        if self.text.is_empty() && self.tool_calls.is_empty() {
+            bail!("Codex response did not include assistant text or tool calls");
+        }
+        Ok(AssistantTurn {
+            text: (!self.text.is_empty()).then_some(self.text),
+            tool_calls: self.tool_calls,
+        })
     }
-    if text.is_empty() && tool_calls.is_empty() {
-        bail!("Codex response did not include assistant text or tool calls");
-    }
-    Ok(AssistantTurn {
-        text: (!text.is_empty()).then_some(text),
-        tool_calls,
-    })
+}
+
+#[cfg(test)]
+struct NoopSink;
+
+#[cfg(test)]
+impl TurnSink for NoopSink {
+    fn on_text_delta(&mut self, _delta: &str) {}
 }
 
 fn event_data(event: &str) -> String {
@@ -528,6 +574,17 @@ mod tests {
         AccessToken {
             bearer: "bearer-value".to_string(),
             account_id: "acct".to_string(),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        deltas: Vec<String>,
+    }
+
+    impl TurnSink for RecordingSink {
+        fn on_text_delta(&mut self, delta: &str) {
+            self.deltas.push(delta.to_string());
         }
     }
 
@@ -801,12 +858,32 @@ mod tests {
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
         );
+        let mut sink = RecordingSink::default();
 
-        assert_eq!(
-            parse_response_stream(stream)?.text.as_deref(),
-            Some("Hello")
-        );
+        let turn = parse_response_stream_reader(
+            BufReader::with_capacity(1, stream.as_bytes()),
+            &mut sink,
+        )?;
+
+        assert_eq!(turn.text.as_deref(), Some("Hello"));
+        assert_eq!(sink.deltas, vec!["Hel", "lo"]);
         Ok(())
+    }
+
+    #[test]
+    fn streamed_failure_preserves_prior_deltas() {
+        let stream = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n",
+        );
+        let mut sink = RecordingSink::default();
+
+        let err = parse_response_stream_reader(stream.as_bytes(), &mut sink).unwrap_err();
+
+        assert!(err.to_string().contains("Codex response failed"));
+        assert_eq!(sink.deltas, vec!["partial"]);
     }
 
     #[test]
@@ -834,8 +911,10 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
         );
 
-        let turn = parse_response_stream(stream)?;
+        let mut sink = RecordingSink::default();
+        let turn = parse_response_stream_reader(stream.as_bytes(), &mut sink)?;
 
+        assert!(sink.deltas.is_empty());
         assert!(turn.text.is_none());
         assert_eq!(turn.tool_calls[0].id, "call_1");
         assert_eq!(turn.tool_calls[0].name, "read");

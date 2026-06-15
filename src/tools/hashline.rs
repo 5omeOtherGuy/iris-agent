@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use xxhash_rust::xxh32::xxh32;
 
+use super::Preview;
 use super::path::resolve_existing;
 use super::text::{
     atomic_write, detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom,
@@ -59,6 +60,21 @@ pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
     hashline_edit(root, &input)
 }
 
+pub(super) fn preview(root: &Path, args: &Value) -> Preview {
+    let input: HashlineEditInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(_) => return Preview::Malformed,
+    };
+    match build_hashline_edit(root, &input) {
+        Ok(plan) => Preview::Available {
+            path: input.path,
+            old: plan.old_content,
+            new: plan.new_content,
+        },
+        Err(error) => Preview::Unavailable(format!("{error:#}")),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct HashlineEditInput {
     path: String,
@@ -101,6 +117,23 @@ struct ResolvedHashlineEdit {
 }
 
 fn hashline_edit(root: &Path, input: &HashlineEditInput) -> Result<String> {
+    let plan = build_hashline_edit(root, input)?;
+    atomic_write(&plan.resolved, plan.new_content.as_bytes())
+        .with_context(|| format!("failed to write {}", input.path))?;
+
+    Ok(format!(
+        "Successfully applied hashline edits to {}.",
+        input.path
+    ))
+}
+
+struct HashlineEditPlan {
+    resolved: std::path::PathBuf,
+    old_content: String,
+    new_content: String,
+}
+
+fn build_hashline_edit(root: &Path, input: &HashlineEditInput) -> Result<HashlineEditPlan> {
     if input.edits.is_empty() {
         bail!("no edits provided");
     }
@@ -252,13 +285,12 @@ fn hashline_edit(root: &Path, input: &HashlineEditInput) -> Result<String> {
     } else {
         restored
     };
-    atomic_write(&resolved, final_content.as_bytes())
-        .with_context(|| format!("failed to write {}", input.path))?;
 
-    Ok(format!(
-        "Successfully applied hashline edits to {}.",
-        input.path
-    ))
+    Ok(HashlineEditPlan {
+        resolved,
+        old_content: raw_content,
+        new_content: final_content,
+    })
 }
 
 fn op_precedence(op: &str) -> u8 {

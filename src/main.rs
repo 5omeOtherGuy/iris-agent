@@ -8,12 +8,16 @@ use reqwest::blocking::Client;
 
 mod approval;
 mod auth;
+mod cli;
 mod errors;
 mod nexus;
+mod paths;
 mod providers;
 mod telemetry;
 mod tool_display;
 mod tools;
+mod transcript;
+mod ui;
 
 fn main() -> ExitCode {
     telemetry::init();
@@ -64,7 +68,14 @@ enum LoginMethod {
 
 fn run_agent() -> Result<()> {
     let provider = providers::openai_codex_responses::OpenAiCodexResponsesProvider::from_env()?;
-    Agent::new(provider, env::current_dir()?, approval::TerminalApprover).run()
+    let agent = Agent::new(provider, env::current_dir()?);
+    if ui::tui::should_use_tui() {
+        ui::tui::run_tui_session(agent)
+    } else {
+        let mut agent = agent;
+        let mut ui = ui::text::TextUi::stdio();
+        cli::run_session(&mut agent, &mut ui)
+    }
 }
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {

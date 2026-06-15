@@ -5,12 +5,11 @@
 //! is sent to the model. The read-only vs mutating *policy* lives in
 //! [`crate::tools`] ([`ToolClass`]); only display verb/path matching lives here.
 //!
-//! Transitional note: for the MVP, `nexus` and `TerminalApprover` call these
-//! functions directly, so the runtime still triggers user-facing rendering. This
-//! is intentionally a subset of the Codex-style per-tool cell (header + body +
-//! status keyed by `call.id`): a `&ToolCall` is threaded through `result_line` /
-//! `error_line` now so the future event/cell seam lands additively, not as a
-//! signature break.
+//! Text and TUI front-ends call these helpers after Nexus emits semantic UI
+//! events. This is intentionally a subset of the Codex-style per-tool cell
+//! (header + body + status keyed by `call.id`): a `&ToolCall` is threaded
+//! through `result_line` / `error_line` so both front-ends share summaries and
+//! truncation policy without changing model-facing tool results.
 
 use serde_json::Value;
 

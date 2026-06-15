@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::Preview;
 use super::path::resolve_for_write;
 use super::text::{WRITE_TOOL_MAX_BYTES, atomic_write};
 
@@ -29,6 +30,21 @@ pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
     write_file(root, &input)
 }
 
+pub(super) fn preview(root: &Path, args: &Value) -> Preview {
+    let input: WriteInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(_) => return Preview::Malformed,
+    };
+    match write_preview(root, &input) {
+        Ok((old, new)) => Preview::Available {
+            path: input.path,
+            old,
+            new,
+        },
+        Err(error) => Preview::Unavailable(format!("{error:#}")),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct WriteInput {
     path: String,
@@ -36,6 +52,26 @@ struct WriteInput {
 }
 
 fn write_file(root: &Path, input: &WriteInput) -> Result<String> {
+    let (_, target) = prepare_write(root, input)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directories for {}", input.path))?;
+    }
+    atomic_write(&target, input.content.as_bytes())
+        .with_context(|| format!("failed to write {}", input.path))?;
+    Ok(format!(
+        "Successfully wrote {} bytes to {}.",
+        input.content.len(),
+        input.path
+    ))
+}
+
+fn write_preview(root: &Path, input: &WriteInput) -> Result<(String, String)> {
+    let (old, _target) = prepare_write(root, input)?;
+    Ok((old, input.content.clone()))
+}
+
+fn prepare_write(root: &Path, input: &WriteInput) -> Result<(String, std::path::PathBuf)> {
     if input.content.len() > WRITE_TOOL_MAX_BYTES {
         bail!("content exceeds maximum allowed size");
     }
@@ -54,17 +90,12 @@ fn write_file(root: &Path, input: &WriteInput) -> Result<String> {
     } else {
         resolved
     };
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create parent directories for {}", input.path))?;
-    }
-    atomic_write(&target, input.content.as_bytes())
-        .with_context(|| format!("failed to write {}", input.path))?;
-    Ok(format!(
-        "Successfully wrote {} bytes to {}.",
-        input.content.len(),
-        input.path
-    ))
+    let old = if target.exists() {
+        fs::read_to_string(&target).with_context(|| format!("failed to read {}", input.path))?
+    } else {
+        String::new()
+    };
+    Ok((old, target))
 }
 
 #[cfg(test)]

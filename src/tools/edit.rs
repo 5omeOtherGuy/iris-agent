@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::Preview;
 use super::path::resolve_existing;
 use super::text::{
     READ_TOOL_MAX_BYTES, WRITE_TOOL_MAX_BYTES, atomic_write, detect_line_ending, normalize_to_lf,
@@ -34,6 +35,21 @@ pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
     edit(root, &input)
 }
 
+pub(super) fn preview(root: &Path, args: &Value) -> Preview {
+    let input: EditInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(_) => return Preview::Malformed,
+    };
+    match build_edit(root, &input) {
+        Ok(plan) => Preview::Available {
+            path: input.path,
+            old: plan.old_content,
+            new: plan.new_content,
+        },
+        Err(error) => Preview::Unavailable(format!("{error:#}")),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditInput {
@@ -43,6 +59,20 @@ struct EditInput {
 }
 
 fn edit(root: &Path, input: &EditInput) -> Result<String> {
+    let plan = build_edit(root, input)?;
+    atomic_write(&plan.resolved, plan.new_content.as_bytes())
+        .with_context(|| format!("failed to write {}", input.path))?;
+
+    Ok(format!("Successfully replaced text in {}.", input.path))
+}
+
+struct EditPlan {
+    resolved: std::path::PathBuf,
+    old_content: String,
+    new_content: String,
+}
+
+fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
     if input.new_text.len() > WRITE_TOOL_MAX_BYTES {
         bail!("new text exceeds maximum allowed size");
     }
@@ -94,10 +124,12 @@ fn edit(root: &Path, input: &EditInput) -> Result<String> {
     } else {
         restored
     };
-    atomic_write(&resolved, final_content.as_bytes())
-        .with_context(|| format!("failed to write {}", input.path))?;
 
-    Ok(format!("Successfully replaced text in {}.", input.path))
+    Ok(EditPlan {
+        resolved,
+        old_content: raw_content,
+        new_content: final_content,
+    })
 }
 
 /// Find `needle` in `haystack`, requiring a unique match. Tries exact match
