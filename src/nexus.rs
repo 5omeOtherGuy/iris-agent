@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+use crate::approval::{ApprovalDecision, Approver};
+
 const MAX_TOOL_ITERATIONS: usize = 8;
 // Display caps for tool output; presentation-only and never affect what is sent to the model.
 const MAX_DISPLAY_LINES: usize = 20;
@@ -14,18 +16,20 @@ pub(crate) trait ChatProvider {
     fn respond(&self, messages: &[Message]) -> Result<AssistantTurn>;
 }
 
-pub(crate) struct Agent<P> {
+pub(crate) struct Agent<P, A> {
     pub(crate) provider: P,
     pub(crate) messages: Vec<Message>,
     workspace: PathBuf,
+    approver: A,
 }
 
-impl<P: ChatProvider> Agent<P> {
-    pub(crate) fn new(provider: P, workspace: PathBuf) -> Self {
+impl<P: ChatProvider, A: Approver> Agent<P, A> {
+    pub(crate) fn new(provider: P, workspace: PathBuf, approver: A) -> Self {
         Self {
             provider,
             messages: Vec::new(),
             workspace,
+            approver,
         }
     }
 
@@ -63,13 +67,13 @@ impl<P: ChatProvider> Agent<P> {
             }
 
             self.messages.push(Message::user(prompt));
-            if let Err(error) = self.complete_turn(output) {
+            if let Err(error) = self.complete_turn(&mut input, output) {
                 writeln!(errors, "provider error: {error:#}")?;
             }
         }
     }
 
-    fn complete_turn<W: Write>(&mut self, output: &mut W) -> Result<()> {
+    fn complete_turn<R: BufRead, W: Write>(&mut self, input: &mut R, output: &mut W) -> Result<()> {
         for _ in 0..MAX_TOOL_ITERATIONS {
             let turn = self.provider.respond(&self.messages)?;
             if let Some(text) = turn.text.as_deref().filter(|text| !text.is_empty()) {
@@ -84,6 +88,22 @@ impl<P: ChatProvider> Agent<P> {
             for call in turn.tool_calls {
                 writeln!(output, "tool> {}({})", call.name, call.arguments)?;
                 self.messages.push(Message::assistant_tool_call(&call));
+
+                if crate::tools::requires_approval(&call.name)
+                    && matches!(
+                        self.approver.review(&call, input, output)?,
+                        ApprovalDecision::Deny
+                    )
+                {
+                    write_denied_outcome(output, &call)?;
+                    self.messages.push(Message::tool_result(
+                        &call.id,
+                        &call.name,
+                        &denied_tool_result_json(),
+                    ));
+                    continue;
+                }
+
                 let result = self.execute_tool(&call);
                 write_tool_outcome(output, &result)?;
                 self.messages.push(Message::tool_result(
@@ -231,14 +251,78 @@ fn tool_result_json(result: Result<String>) -> String {
     }
 }
 
+// Model-facing denial payload. Denial is a distinct pre-execution branch, not an
+// `Err` routed through `tool_result_json`, so the `denied` signal is preserved.
+fn denied_tool_result_json() -> String {
+    json!({ "ok": false, "error": "tool call denied by user", "denied": true }).to_string()
+}
+
+// Renders a denied call for the user; sibling of `result>` / `tool error>`.
+fn write_denied_outcome<W: Write>(output: &mut W, call: &ToolCall) -> io::Result<()> {
+    writeln!(output, "denied> {}({})", call.name, call.arguments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::Approver;
     use anyhow::anyhow;
     use std::cell::RefCell;
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Test-only approvers. They ignore the live streams; the gate only inspects
+    // the returned decision.
+    struct AutoAllow;
+    impl Approver for AutoAllow {
+        fn review<R: BufRead, W: Write>(
+            &mut self,
+            _call: &ToolCall,
+            _input: &mut R,
+            _output: &mut W,
+        ) -> Result<ApprovalDecision> {
+            Ok(ApprovalDecision::Allow)
+        }
+    }
+
+    struct AutoDeny;
+    impl Approver for AutoDeny {
+        fn review<R: BufRead, W: Write>(
+            &mut self,
+            _call: &ToolCall,
+            _input: &mut R,
+            _output: &mut W,
+        ) -> Result<ApprovalDecision> {
+            Ok(ApprovalDecision::Deny)
+        }
+    }
+
+    // Returns queued decisions in order; panics if consulted more often than
+    // scripted so over-consumption is caught.
+    struct ScriptedApprover {
+        decisions: Vec<ApprovalDecision>,
+    }
+    impl ScriptedApprover {
+        fn new(decisions: Vec<ApprovalDecision>) -> Self {
+            Self {
+                decisions: decisions.into_iter().rev().collect(),
+            }
+        }
+    }
+    impl Approver for ScriptedApprover {
+        fn review<R: BufRead, W: Write>(
+            &mut self,
+            _call: &ToolCall,
+            _input: &mut R,
+            _output: &mut W,
+        ) -> Result<ApprovalDecision> {
+            Ok(self
+                .decisions
+                .pop()
+                .expect("approver consulted more times than scripted"))
+        }
+    }
 
     struct FakeProvider {
         responses: RefCell<Vec<Result<AssistantTurn, String>>>,
@@ -278,7 +362,7 @@ mod tests {
             Ok(AssistantTurn::text("hello")),
             Ok(AssistantTurn::text("goodbye")),
         ]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -297,7 +381,7 @@ mod tests {
     fn repl_reports_provider_errors_and_continues() -> Result<()> {
         let workspace = test_workspace()?;
         let provider = FakeProvider::new(vec![Err("boom"), Ok(AssistantTurn::text("recovered"))]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -327,7 +411,7 @@ mod tests {
             }),
             Ok(AssistantTurn::text("The file says hello from file.")),
         ]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -359,7 +443,7 @@ mod tests {
             }),
             Ok(AssistantTurn::text("done")),
         ]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -386,7 +470,7 @@ mod tests {
             }),
             Ok(AssistantTurn::text("recovered")),
         ]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -433,7 +517,7 @@ mod tests {
         };
         let provider =
             FakeProvider::new((0..MAX_TOOL_ITERATIONS).map(|_| repeated_call()).collect());
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -457,7 +541,7 @@ mod tests {
             }),
             Ok(AssistantTurn::text("I could not use that tool.")),
         ]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -482,7 +566,7 @@ mod tests {
             }),
             Ok(AssistantTurn::text("The read call was malformed.")),
         ]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
@@ -546,6 +630,312 @@ mod tests {
 
         assert!(result.contains("\"ok\":false"));
         assert!(result.contains("failed to resolve path"));
+        Ok(())
+    }
+
+    fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
+        AssistantTurn {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: name.to_string(),
+                arguments,
+            }],
+        }
+    }
+
+    #[test]
+    fn approved_write_executes_and_creates_file() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "write",
+                json!({ "path": "out.txt", "content": "hi" }),
+            )),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            ScriptedApprover::new(vec![ApprovalDecision::Allow]),
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write it\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(errors.is_empty());
+        assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "hi");
+        let seen = agent.provider.seen.borrow();
+        assert!(seen[1].last().unwrap().content.contains("\"ok\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn denied_write_skips_execution_and_records_denial() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "write",
+                json!({ "path": "out.txt", "content": "hi" }),
+            )),
+            Ok(AssistantTurn::text("understood")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            ScriptedApprover::new(vec![ApprovalDecision::Deny]),
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write it\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(errors.is_empty());
+        assert!(!workspace.path.join("out.txt").exists());
+        assert!(String::from_utf8(output)?.contains("denied> write"));
+
+        let seen = agent.provider.seen.borrow();
+        let denial = seen[1].last().unwrap();
+        assert_eq!(denial.role, Role::Tool);
+        assert!(denial.content.contains("\"denied\":true"));
+        assert!(denial.content.contains("denied by user"));
+        assert_eq!(denial.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(denial.tool_name.as_deref(), Some("write"));
+
+        // Assistant-tool-call -> tool-result pairing preserved on deny.
+        let tool_call = seen[1]
+            .iter()
+            .find(|m| m.role == Role::AssistantToolCall)
+            .unwrap();
+        assert_eq!(tool_call.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_call.tool_name.as_deref(), Some("write"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_is_never_gated_even_under_auto_deny() -> Result<()> {
+        let workspace = test_workspace()?;
+        fs::write(workspace.path.join("note.txt"), "hello from file")?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoDeny);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("read note\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(errors.is_empty());
+        let seen = agent.provider.seen.borrow();
+        let tool_result = seen[1].last().unwrap();
+        assert_eq!(tool_result.role, Role::Tool);
+        assert!(tool_result.content.contains("hello from file"));
+        Ok(())
+    }
+
+    #[test]
+    fn denied_bash_does_not_run_command() -> Result<()> {
+        let workspace = test_workspace()?;
+        let marker = workspace.path.join("marker");
+        let command = format!("touch {}", marker.display());
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn("bash", json!({ "command": command }))),
+            Ok(AssistantTurn::text("ok")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoDeny);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("run it\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(!marker.exists());
+        let seen = agent.provider.seen.borrow();
+        assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn denied_edit_leaves_file_unchanged() -> Result<()> {
+        let workspace = test_workspace()?;
+        fs::write(workspace.path.join("note.txt"), "original")?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "edit",
+                json!({ "path": "note.txt", "old": "original", "new": "changed" }),
+            )),
+            Ok(AssistantTurn::text("ok")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoDeny);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("edit it\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert_eq!(
+            fs::read_to_string(workspace.path.join("note.txt"))?,
+            "original"
+        );
+        let seen = agent.provider.seen.borrow();
+        assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn denied_hashline_edit_leaves_file_unchanged() -> Result<()> {
+        let workspace = test_workspace()?;
+        fs::write(workspace.path.join("note.txt"), "original")?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "hashline_edit",
+                json!({ "path": "note.txt", "edits": [] }),
+            )),
+            Ok(AssistantTurn::text("ok")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone(), AutoDeny);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("hashline it\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert_eq!(
+            fs::read_to_string(workspace.path.join("note.txt"))?,
+            "original"
+        );
+        let seen = agent.provider.seen.borrow();
+        assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_approver_allows_write_end_to_end() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "write",
+                json!({ "path": "out.txt", "content": "hi" }),
+            )),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            crate::approval::TerminalApprover,
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write it\ny\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(errors.is_empty());
+        assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "hi");
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_approver_denies_write_end_to_end() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn(
+                "write",
+                json!({ "path": "out.txt", "content": "hi" }),
+            )),
+            Ok(AssistantTurn::text("understood")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            crate::approval::TerminalApprover,
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write it\nn\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(!workspace.path.join("out.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn allowed_malformed_args_reach_tool_validation() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
+            Ok(AssistantTurn::text("ok")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            ScriptedApprover::new(vec![ApprovalDecision::Allow]),
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write it\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        let seen = agent.provider.seen.borrow();
+        let tool_result = seen[1].last().unwrap();
+        assert!(tool_result.content.contains("\"ok\":false"));
+        assert!(!tool_result.content.contains("\"denied\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn denied_malformed_args_return_denial_without_validation() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
+            Ok(AssistantTurn::text("ok")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            ScriptedApprover::new(vec![ApprovalDecision::Deny]),
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write it\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        let seen = agent.provider.seen.borrow();
+        assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(AssistantTurn {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        name: "write".to_string(),
+                        arguments: json!({ "path": "a.txt", "content": "a" }),
+                    },
+                    ToolCall {
+                        id: "call_2".to_string(),
+                        name: "write".to_string(),
+                        arguments: json!({ "path": "b.txt", "content": "b" }),
+                    },
+                ],
+            }),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut agent = Agent::new(
+            provider,
+            workspace.path.clone(),
+            ScriptedApprover::new(vec![ApprovalDecision::Allow, ApprovalDecision::Deny]),
+        );
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("write both\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        assert!(workspace.path.join("a.txt").exists());
+        assert!(!workspace.path.join("b.txt").exists());
         Ok(())
     }
 

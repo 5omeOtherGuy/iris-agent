@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use nexus::Agent;
 use reqwest::blocking::Client;
 
+mod approval;
 mod auth;
 mod nexus;
 mod providers;
@@ -45,7 +46,7 @@ enum LoginMethod {
 
 fn run_agent() -> Result<()> {
     let provider = providers::openai_codex_responses::OpenAiCodexResponsesProvider::from_env()?;
-    Agent::new(provider, env::current_dir()?).run()
+    Agent::new(provider, env::current_dir()?, approval::TerminalApprover).run()
 }
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {

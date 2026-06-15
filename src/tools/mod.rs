@@ -64,6 +64,17 @@ pub(crate) fn dispatch(workspace: &Path, name: &str, args: &Value) -> Result<Str
     }
 }
 
+/// Nexus-owned safety policy: which built-in tools mutate the workspace and
+/// therefore require user approval before execution.
+///
+/// Kept as a small hardcoded classifier colocated with `dispatch` and
+/// `tool_definitions`; it mirrors the current hardcoded tool surface. Do not
+/// add a registry or policy object until provider-specific tools, per-session
+/// allow rules, or modes require one.
+pub(crate) fn requires_approval(name: &str) -> bool {
+    matches!(name, "write" | "edit" | "bash" | "hashline_edit")
+}
+
 /// JSON tool declarations advertised to the provider, one per built-in tool.
 ///
 /// Names, descriptions, and parameter schemas are copied verbatim from pi.
@@ -163,6 +174,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown tool: nope"));
+    }
+
+    #[test]
+    fn requires_approval_gates_only_mutating_tools() {
+        for name in ["write", "edit", "bash", "hashline_edit"] {
+            assert!(super::requires_approval(name), "{name} should be gated");
+        }
+        for name in ["read", "grep", "find", "ls"] {
+            assert!(
+                !super::requires_approval(name),
+                "{name} should not be gated"
+            );
+        }
     }
 
     #[test]

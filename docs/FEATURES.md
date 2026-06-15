@@ -64,8 +64,9 @@
 - **Workspace path safety** — keep file tools inside the workspace by default,
   including policy for absolute paths, `..`, symlinks, binary files, and large
   files. [Partial]
-- **Approval gates** — explicit confirmation for `write`, `edit`, and `bash`, with
-  denied-call handling. [Planned · MVP]
+- **Approval gates** — explicit confirmation for `write`, `edit`, `bash`, and
+  `hashline_edit` (every mutating file/shell tool), with denied-call handling.
+  [Implemented]
 - **Bash policy** — cwd, timeout, stdout/stderr capture, output limits, exit-code
   handling, and process-group cleanup. [Partial]
 - **Secret redaction** — redact secrets from stored content and summaries.

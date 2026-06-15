@@ -169,8 +169,9 @@ thesis yet, but it creates the foundation required to prove it.
 - **Basic safety**
   - Restrict file tools to the current workspace by default.
   - Show tool calls and results clearly.
-  - Require confirmation before `write`, `edit`, and `bash`, unless explicitly run
-    in an unsafe/non-interactive mode later.
+  - Require confirmation before `write`, `edit`, `bash`, and `hashline_edit`
+    (every mutating file/shell tool), unless explicitly run in an
+    unsafe/non-interactive mode later.
   - Do not run destructive git operations automatically.
   - Do not commit, push, reset, rebase, or delete files without explicit user
     instruction.
@@ -209,12 +210,11 @@ The Agent Kernel MVP is done when Iris can:
 1. Start from the command line in a local repo. [Implemented]
 2. Complete a multi-turn conversation with one model provider. [Implemented]
 3. Read an existing file through the `read` tool. [Implemented]
-4. Create a new file through the `write` tool after confirmation. [Tool
-   implemented; approval pending]
-5. Modify an existing file through the `edit` tool after confirmation. [Tool
-   implemented; approval pending]
-6. Run a harmless shell command through the `bash` tool after confirmation. [Tool
-   implemented; approval pending]
+4. Create a new file through the `write` tool after confirmation. [Implemented]
+5. Modify an existing file through the `edit` tool after confirmation.
+   [Implemented]
+6. Run a harmless shell command through the `bash` tool after confirmation.
+   [Implemented]
 7. Return tool errors to the model without crashing. [Implemented]
 8. Keep all file operations inside the workspace by default. [Implemented]
 9. Exit cleanly without corrupting session state or files. [Partial]
@@ -224,7 +224,8 @@ The Agent Kernel MVP is done when Iris can:
 These should be specified in focused implementation notes rather than expanded
 here:
 
-- Approval policy for `write`, `edit`, and `bash`, including denied calls.
+- Approval policy for `write`, `edit`, `bash`, and `hashline_edit`, including
+  denied calls. [Implemented]
 - Whether destructive or externally visible `bash` commands need classification
   beyond the baseline approval gate.
 - Whether additional file-tool policy is needed for binary files, very large
