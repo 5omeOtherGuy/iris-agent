@@ -119,7 +119,8 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
     // file's original line ending on write. Ranges are non-overlapping and
     // ascending, so one left-to-right pass applies every replacement.
     let normalized_new = normalize_to_lf(&input.new_text);
-    let mut new_content = String::with_capacity(normalized_content.len() + normalized_new.len());
+    let mut new_content =
+        String::with_capacity(normalized_content.len() + ranges.len() * normalized_new.len());
     let mut cursor = 0;
     for &(start, len) in &ranges {
         new_content.push_str(&normalized_content[cursor..start]);

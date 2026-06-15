@@ -49,6 +49,12 @@ impl<P: ChatProvider> Agent<P> {
         for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
             if crate::signals::interrupted() {
                 tracing::info!(roundtrips = roundtrip, "turn interrupted by user");
+                if roundtrip == 0 {
+                    // Nothing was produced this turn yet; drop the unanswered
+                    // prompt so the next turn does not push two consecutive
+                    // user messages (rejected by some providers).
+                    self.messages.pop();
+                }
                 ui.emit(UiEvent::Notice(
                     "interrupted; send another message to continue.".to_string(),
                 ))?;
@@ -77,6 +83,30 @@ impl<P: ChatProvider> Agent<P> {
 
             if turn.tool_calls.is_empty() {
                 tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
+                ui.emit(UiEvent::TurnComplete)?;
+                return Ok(());
+            }
+
+            if crate::signals::interrupted() {
+                // Ctrl-C arrived while the model was responding: do not run the
+                // tools it just proposed. Record each as denied so the assistant
+                // turn stays paired with tool results, then end the turn cleanly.
+                tracing::info!(
+                    roundtrips = roundtrip,
+                    "turn interrupted after model response; pending tools denied"
+                );
+                for call in &turn.tool_calls {
+                    self.messages.push(Message::assistant_tool_call(call));
+                    ui.emit(UiEvent::ToolDenied(call.clone()))?;
+                    self.messages.push(Message::tool_result(
+                        &call.id,
+                        &call.name,
+                        &denied_tool_result_json(),
+                    ));
+                }
+                ui.emit(UiEvent::Notice(
+                    "interrupted; send another message to continue.".to_string(),
+                ))?;
                 ui.emit(UiEvent::TurnComplete)?;
                 return Ok(());
             }

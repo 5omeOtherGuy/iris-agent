@@ -116,6 +116,12 @@ fn append_dir(
     // (name, is_dir, is_symlink)
     let mut entries: Vec<(String, bool, bool)> = Vec::new();
     for entry in read {
+        // Bound per-directory memory: stop scanning a pathologically large
+        // directory instead of reading every entry before truncating.
+        if entries.len() >= LS_SCAN_HARD_LIMIT {
+            *truncated = true;
+            break;
+        }
         let Ok(entry) = entry else { continue };
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -131,7 +137,7 @@ fn append_dir(
     }
 
     // Directories first, then files; case-insensitive within each group.
-    entries.sort_by_key(|(name, is_dir, _)| (!is_dir, name.to_lowercase()));
+    entries.sort_by_cached_key(|(name, is_dir, _)| (!is_dir, name.to_lowercase()));
 
     let indent = "  ".repeat(depth);
     for (name, is_dir, is_symlink) in entries {

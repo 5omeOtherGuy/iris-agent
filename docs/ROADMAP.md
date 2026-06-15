@@ -106,6 +106,10 @@ Execution order (by impact/effort, independent of the milestone sequence):
 2. **Tier 2 — close real capability gaps.**
    - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
      background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
+     Includes child-process-group lifecycle: a `bash` child runs in its own
+     process group, so the second-Ctrl-C force-quit (#9) currently kills the
+     agent without reaping a long-running child, orphaning it. Reaping/killpg
+     on force-quit belongs with this work.
    - `find`/`grep`: keep wrapping `fd`/`rg`. These are the same engines the
      mature tools (Pi, etc.) wrap rather than reimplement; matching their
      behavior natively means an ongoing parity burden (smart-case, glob

@@ -8,6 +8,11 @@
 //! prompt. A second Ctrl-C restores the default handler and re-raises, so the
 //! user can always force-quit even while blocked.
 //!
+//! Caveat: a `bash` child runs in its own process group, so a force-quit kills
+//! the agent without reaping it and a long-running child can be orphaned.
+//! Propagating termination to the child's process group is deferred to the
+//! `bash` sandbox/session work (ROADMAP #3).
+//!
 //! File writes are atomic (temp-file + rename), so an interrupt at any point
 //! cannot leave a partially written file.
 
@@ -39,18 +44,22 @@ extern "C" fn handle_sigint(_signal: libc::c_int) {
 }
 
 /// Set `flag`, returning `true` if it was already set (a repeat interrupt).
+///
+/// `Relaxed` is sufficient: the flag carries no data and synchronizes no other
+/// memory; the handler and the loop only need this single boolean to be
+/// atomic and eventually visible.
 fn record_interrupt(flag: &AtomicBool) -> bool {
-    flag.swap(true, Ordering::SeqCst)
+    flag.swap(true, Ordering::Relaxed)
 }
 
 /// Whether a Ctrl-C is pending since the last [`reset`].
 pub(crate) fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
+    INTERRUPTED.load(Ordering::Relaxed)
 }
 
 /// Clear the interrupt flag. Called at the start of each turn.
 pub(crate) fn reset() {
-    INTERRUPTED.store(false, Ordering::SeqCst);
+    INTERRUPTED.store(false, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -62,7 +71,7 @@ mod tests {
         let flag = AtomicBool::new(false);
         // First press: not a repeat, flag now set.
         assert!(!record_interrupt(&flag));
-        assert!(flag.load(Ordering::SeqCst));
+        assert!(flag.load(Ordering::Relaxed));
         // Second press: reported as a repeat, which triggers the hard exit.
         assert!(record_interrupt(&flag));
     }
