@@ -1,17 +1,22 @@
 //! `find` — file search by glob, native via the `ignore` + `globset` crates.
 //!
 //! Walks the search directory honoring `.gitignore` (and `.ignore`) rules and
-//! matches each entry's path against the requested glob. `fd` is itself a thin
-//! CLI over these same crates, so running them in-process loses no quality while
-//! dropping a subprocess: the tool no longer fails when `fd` is absent, and
-//! results come back structured instead of parsed from stdout.
+//! matches each entry's path against the requested glob. `fd` is itself a CLI
+//! over these same crates, so running them in-process drops a subprocess (and
+//! the fail-when-`fd`-absent path) and returns structured results. Glob matching
+//! mirrors `fd`'s defaults: smart-case (case-insensitive unless the pattern has
+//! an uppercase char) and `*` not crossing `/` while `**` does.
+//!
+//! ponytail: single-threaded `ignore::Walk` that scans the whole subtree before
+//! sorting/limiting. Fine for normal workspaces; switch to `WalkParallel` +
+//! early-stop if find ever runs hot on very large trees.
 
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
-use globset::Glob;
+use globset::GlobBuilder;
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,7 +71,14 @@ fn find(root: &Path, input: &FindInput) -> Result<String> {
     } else {
         format!("**/{}", input.pattern)
     };
-    let matcher = Glob::new(&normalized)
+    // Smart-case like `fd`: case-insensitive unless the pattern has an uppercase
+    // character. `literal_separator(true)` keeps `*` from crossing `/` (only
+    // `**` does), matching standard glob and the documented examples.
+    let smart_case = !input.pattern.chars().any(|c| c.is_uppercase());
+    let matcher = GlobBuilder::new(&normalized)
+        .case_insensitive(smart_case)
+        .literal_separator(true)
+        .build()
         .with_context(|| format!("invalid glob pattern: {}", input.pattern))?
         .compile_matcher();
 
@@ -215,6 +227,39 @@ mod tests {
         assert_eq!(out.lines().count(), 2, "{out}");
         assert!(out.contains("a.rs") && out.contains("b.rs"), "{out}");
         assert!(!out.contains("c.rs"), "{out}");
+    }
+
+    #[test]
+    fn find_glob_is_smart_case() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("lower.rs"), "x").unwrap();
+        fs::write(dir.path.join("UPPER.RS"), "x").unwrap();
+        // All-lowercase pattern is case-insensitive (matches fd's smart-case).
+        let any = find(&root, &input("*.rs", None)).unwrap();
+        assert!(
+            any.contains("lower.rs") && any.contains("UPPER.RS"),
+            "{any}"
+        );
+        // A pattern with an uppercase char is case-sensitive.
+        let exact = find(&root, &input("*.RS", None)).unwrap();
+        assert!(
+            exact.contains("UPPER.RS") && !exact.contains("lower.rs"),
+            "{exact}"
+        );
+    }
+
+    #[test]
+    fn find_star_does_not_cross_directories() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::create_dir_all(dir.path.join("src/deep")).unwrap();
+        fs::write(dir.path.join("src/top.rs"), "x").unwrap();
+        fs::write(dir.path.join("src/deep/low.rs"), "x").unwrap();
+        // `*` must not cross `/`: src/*.rs matches src/top.rs but not src/deep/low.rs.
+        let out = find(&root, &input("src/*.rs", None)).unwrap();
+        assert!(out.contains("src/top.rs"), "{out}");
+        assert!(!out.contains("src/deep/low.rs"), "{out}");
     }
 
     #[test]
