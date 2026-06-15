@@ -36,7 +36,7 @@ impl<P: ChatProvider> Agent<P> {
         }
     }
 
-    pub(crate) fn submit_turn(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+    pub(crate) fn submit_turn(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<()> {
         let span = tracing::info_span!("turn");
         let _guard = span.enter();
 
@@ -44,7 +44,7 @@ impl<P: ChatProvider> Agent<P> {
         self.complete_turn(ui)
     }
 
-    fn complete_turn(&mut self, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+    fn complete_turn(&mut self, ui: &mut dyn Ui) -> Result<()> {
         for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
             let mut sink = UiTurnSink::new(ui);
             let turn = self.provider.respond(&self.messages, &mut sink)?;
@@ -69,7 +69,7 @@ impl<P: ChatProvider> Agent<P> {
             if turn.tool_calls.is_empty() {
                 tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
                 ui.emit(UiEvent::TurnComplete)?;
-                return Ok(TurnOutcome::Complete);
+                return Ok(());
             }
 
             for call in turn.tool_calls {
@@ -130,7 +130,7 @@ impl<P: ChatProvider> Agent<P> {
             "stopped after {MAX_TOOL_ROUNDTRIPS} tool round-trips; send another message to continue."
         )))?;
         ui.emit(UiEvent::TurnComplete)?;
-        Ok(TurnOutcome::Complete)
+        Ok(())
     }
 
     fn execute_tool(&self, call: &ToolCall) -> Result<String> {
@@ -163,11 +163,6 @@ impl TurnSink for UiTurnSink<'_> {
             self.error = Some(error);
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TurnOutcome {
-    Complete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

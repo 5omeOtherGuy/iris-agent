@@ -4,7 +4,6 @@ use crate::approval::ApprovalDecision;
 use crate::nexus::ToolCall;
 
 pub(crate) mod text;
-pub(crate) mod tui;
 
 /// Front-end seam between Nexus and the terminal UI.
 ///

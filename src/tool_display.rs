@@ -3,13 +3,9 @@
 //! Boundary (AGENTS.md): this is the Iris CLI presentation layer. Every function
 //! returns an owned `String` and performs no IO, no color, and never alters what
 //! is sent to the model. The read-only vs mutating *policy* lives in
-//! [`crate::tools`] ([`ToolClass`]); only display verb/path matching lives here.
+//! [`crate::tools`]; only display verb/path matching lives here.
 //!
-//! Text and TUI front-ends call these helpers after Nexus emits semantic UI
-//! events. This is intentionally a subset of the Codex-style per-tool cell
-//! (header + body + status keyed by `call.id`): a `&ToolCall` is threaded
-//! through `result_line` / `error_line` so both front-ends share summaries and
-//! truncation policy without changing model-facing tool results.
+//! The text front-end calls these helpers after Nexus emits semantic UI events.
 
 use serde_json::Value;
 
@@ -57,18 +53,14 @@ pub(crate) fn denied_line(call: &ToolCall) -> String {
     format!("{DENIED} {}", summarize(call))
 }
 
-/// Success result line. Takes the originating `call` so the seam carries per-tool
-/// identity; `call` is the hook a future `call.id`-keyed cell binds to. Body is
-/// truncated for display here so all display caps live with the formatter.
-pub(crate) fn result_line(call: &ToolCall, content: &str) -> String {
-    let _ = call; // reserved: identity hook for the future per-tool cell.
+/// Success result line. Body is truncated for display here so all display caps
+/// live with the formatter.
+pub(crate) fn result_line(content: &str) -> String {
     format!("{RESULT} {}", truncate_body(content))
 }
 
-/// Tool-error line (the caller formats the anyhow chain as `{err:#}`). Takes
-/// `call` for the same forward-compat reason as [`result_line`].
-pub(crate) fn error_line(call: &ToolCall, message: &str) -> String {
-    let _ = call;
+/// Tool-error line (the caller formats the anyhow chain as `{err:#}`).
+pub(crate) fn error_line(message: &str) -> String {
     format!("{ERROR} {message}")
 }
 
@@ -338,12 +330,11 @@ mod tests {
 
     #[test]
     fn result_line_prefixes_and_caps_long_output() {
-        let c = call("read", json!({ "path": "a.rs" }));
         let text = (0..100)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let rendered = result_line(&c, &text);
+        let rendered = result_line(&text);
         assert!(rendered.starts_with("result> "));
         assert!(rendered.contains("line 0"));
         assert!(rendered.contains("(truncated)"));
@@ -352,24 +343,21 @@ mod tests {
 
     #[test]
     fn result_line_keeps_short_output() {
-        let c = call("read", json!({ "path": "a.rs" }));
-        assert_eq!(result_line(&c, "short output"), "result> short output");
+        assert_eq!(result_line("short output"), "result> short output");
     }
 
     #[test]
     fn result_line_truncates_over_char_cap() {
-        let c = call("read", json!({ "path": "a.rs" }));
         let body = "a".repeat(MAX_DISPLAY_CHARS + 500);
-        let rendered = result_line(&c, &body);
+        let rendered = result_line(&body);
         assert!(rendered.contains("(truncated)"));
         assert!(rendered.chars().count() < body.chars().count());
     }
 
     #[test]
     fn error_line_prefixes_and_preserves_message() {
-        let c = call("unknown", json!({}));
         assert_eq!(
-            error_line(&c, "unknown tool: unknown"),
+            error_line("unknown tool: unknown"),
             "tool error> unknown tool: unknown"
         );
     }

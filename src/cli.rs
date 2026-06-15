@@ -4,15 +4,6 @@ use crate::nexus::{Agent, ChatProvider};
 use crate::ui::{Ui, UiEvent, is_exit_command};
 
 pub(crate) fn run_session<P: ChatProvider>(agent: &mut Agent<P>, ui: &mut dyn Ui) -> Result<()> {
-    if let Some(mut log) = crate::transcript::TranscriptLog::open_if_enabled()? {
-        let mut ui = crate::transcript::TranscriptUi::new(ui, &mut log);
-        run_session_inner(agent, &mut ui)
-    } else {
-        run_session_inner(agent, ui)
-    }
-}
-
-fn run_session_inner<P: ChatProvider>(agent: &mut Agent<P>, ui: &mut dyn Ui) -> Result<()> {
     ui.emit(UiEvent::SessionStarted)?;
 
     while let Some(prompt) = ui.next_prompt()? {

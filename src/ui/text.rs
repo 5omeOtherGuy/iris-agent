@@ -93,21 +93,13 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 self.finish_assistant_stream()?;
                 writeln!(self.out, "{}", crate::tool_display::denied_line(&call))?;
             }
-            UiEvent::ToolResult { call, content } => {
+            UiEvent::ToolResult { call: _, content } => {
                 self.finish_assistant_stream()?;
-                writeln!(
-                    self.out,
-                    "{}",
-                    crate::tool_display::result_line(&call, &content)
-                )?;
+                writeln!(self.out, "{}", crate::tool_display::result_line(&content))?;
             }
-            UiEvent::ToolError { call, message } => {
+            UiEvent::ToolError { call: _, message } => {
                 self.finish_assistant_stream()?;
-                writeln!(
-                    self.out,
-                    "{}",
-                    crate::tool_display::error_line(&call, &message)
-                )?;
+                writeln!(self.out, "{}", crate::tool_display::error_line(&message))?;
             }
             UiEvent::Notice(message) => {
                 self.finish_assistant_stream()?;

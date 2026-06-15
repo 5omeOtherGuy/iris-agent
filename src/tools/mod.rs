@@ -65,47 +65,10 @@ pub(crate) fn dispatch(workspace: &Path, name: &str, args: &Value) -> Result<Str
     }
 }
 
-/// Policy taxonomy for a built-in tool, single-sourcing the read-only vs
-/// mutating split that drives both approval and (later) display grouping.
-///
-/// This is a *policy* taxonomy (approval + future read-only grouping). Display
-/// verb/path matching stays local to `tool_display`, so the two concerns can
-/// diverge without churning this enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolClass {
-    /// read, grep, find, ls — no approval; future Codex-style "exploring" set.
-    ReadOnly,
-    /// write, edit, hashline_edit — mutating, summarized by path.
-    MutatingFile,
-    /// bash — mutating, summarized by command.
-    Bash,
-    /// unknown / future tools.
-    Other,
-}
-
-impl ToolClass {
-    pub(crate) fn is_mutating(self) -> bool {
-        matches!(self, ToolClass::MutatingFile | ToolClass::Bash)
-    }
-}
-
-/// Classify a tool by name into its policy [`ToolClass`].
-pub(crate) fn classify(name: &str) -> ToolClass {
-    match name {
-        "read" | "grep" | "find" | "ls" => ToolClass::ReadOnly,
-        "write" | "edit" | "hashline_edit" => ToolClass::MutatingFile,
-        "bash" => ToolClass::Bash,
-        _ => ToolClass::Other,
-    }
-}
-
 /// Nexus-owned safety policy: which built-in tools mutate the workspace and
 /// therefore require user approval before execution.
-///
-/// Derived from [`classify`] so the read-only vs mutating split has a single
-/// home and cannot drift when a tool is added.
 pub(crate) fn requires_approval(name: &str) -> bool {
-    classify(name).is_mutating()
+    matches!(name, "write" | "edit" | "hashline_edit" | "bash")
 }
 
 /// Optional pre-approval diff preview for mutating tools.
@@ -255,26 +218,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown tool: nope"));
-    }
-
-    #[test]
-    fn classify_maps_tools_to_policy_class() {
-        use super::ToolClass;
-        for name in ["read", "grep", "find", "ls"] {
-            assert_eq!(super::classify(name), ToolClass::ReadOnly, "{name}");
-        }
-        for name in ["write", "edit", "hashline_edit"] {
-            assert_eq!(super::classify(name), ToolClass::MutatingFile, "{name}");
-        }
-        assert_eq!(super::classify("bash"), ToolClass::Bash);
-        assert_eq!(super::classify("nope"), ToolClass::Other);
-        // is_mutating matches the requires_approval set exactly.
-        for name in ["write", "edit", "bash", "hashline_edit"] {
-            assert!(super::classify(name).is_mutating(), "{name}");
-        }
-        for name in ["read", "grep", "find", "ls", "nope"] {
-            assert!(!super::classify(name).is_mutating(), "{name}");
-        }
     }
 
     #[test]
