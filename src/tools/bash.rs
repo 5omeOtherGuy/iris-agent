@@ -53,7 +53,7 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
     let timeout_secs = input.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
     let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
 
-    let mut command = Command::new("sh");
+    let mut command = Command::new(resolve_shell());
     command
         .arg("-c")
         .arg(&input.command)
@@ -167,6 +167,31 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
     }
 
     Ok(out)
+}
+
+/// Resolve the shell used to run commands.
+///
+/// The tool is named `bash` and advertised as running bash, so bash-only
+/// syntax (arrays, `[[ ]]`, `set -o pipefail`) must work. Prefer `/bin/bash`,
+/// then `bash` discovered on `PATH`, and fall back to `sh` only when no bash is
+/// available so the tool still runs on minimal systems.
+fn resolve_shell() -> PathBuf {
+    let direct = Path::new("/bin/bash");
+    if direct.is_file() {
+        return direct.to_path_buf();
+    }
+    if let Some(found) = find_on_path("bash") {
+        return found;
+    }
+    PathBuf::from("sh")
+}
+
+/// Locate an executable by name in the directories listed in `PATH`.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Forcefully terminate a spawned shell and the rest of its process group.
@@ -318,6 +343,28 @@ mod tests {
             "bash blocked on a backgrounded pipe holder"
         );
         assert!(out.contains("done"));
+    }
+
+    #[test]
+    fn bash_runs_bashisms_like_pipefail() {
+        // The tool is named `bash` and advertised as running bash, so
+        // bash-only syntax (here `set -o pipefail`) must work rather than fail
+        // under POSIX `sh`/dash with "Illegal option -o pipefail".
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let out = bash(
+            &root,
+            &BashInput {
+                command: "set -o pipefail; echo ok | cat".into(),
+                timeout: None,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("ok"), "expected bashism to run, got: {out}");
+        assert!(
+            !out.contains("Command exited with code"),
+            "bashism failed under the resolved shell: {out}"
+        );
     }
 
     #[test]
