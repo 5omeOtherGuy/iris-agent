@@ -107,8 +107,12 @@ Execution order (by impact/effort, independent of the milestone sequence):
    - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
      background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
    - `find`: native via `ignore` + `globset`, no longer shells out to `fd`
-     (done). `grep`: still shells out to `rg`; go native with `grep-searcher`
-     to finish honoring the single-static-binary pitch —
+     (done) — `fd` is a thin wrapper over those crates, so this dropped a
+     subprocess and the fail-when-`fd`-absent path at no quality cost.
+     `grep`: still shells out to `rg`. Going native with `grep-searcher` is
+     optional, not mandatory: `rg` is a legitimate dependency and Iris is a
+     single Rust binary regardless. Do #6 only if native is a net
+     simplification, not to chase a zero-external-tools rule —
      [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) (done),
      [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
 3. **Tier 3 — parity polish.** `edit` `replace_all` + helpful failure output

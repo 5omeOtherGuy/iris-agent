@@ -1,9 +1,10 @@
 //! `find` — file search by glob, native via the `ignore` + `globset` crates.
 //!
 //! Walks the search directory honoring `.gitignore` (and `.ignore`) rules and
-//! matches each entry's path against the requested glob. Running natively
-//! instead of shelling out to `fd` keeps Iris a single static binary and means
-//! the tool works even when no external search binary is installed.
+//! matches each entry's path against the requested glob. `fd` is itself a thin
+//! CLI over these same crates, so running them in-process loses no quality while
+//! dropping a subprocess: the tool no longer fails when `fd` is absent, and
+//! results come back structured instead of parsed from stdout.
 
 use std::fs;
 use std::path::Path;
