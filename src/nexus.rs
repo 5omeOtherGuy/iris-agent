@@ -1,12 +1,16 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::approval::{ApprovalDecision, Approver};
 
-const MAX_TOOL_ITERATIONS: usize = 8;
+// Safety valve against a runaway tool loop. Each round-trip is one model
+// response; the loop normally ends earlier when the model stops calling tools.
+// Set high so legitimate multi-step tasks complete, and enforced gracefully
+// rather than as a fatal error (see complete_turn).
+const MAX_TOOL_ROUNDTRIPS: usize = 50;
 // Display caps for tool output; presentation-only and never affect what is sent to the model.
 const MAX_DISPLAY_LINES: usize = 20;
 const MAX_DISPLAY_CHARS: usize = 2000;
@@ -74,7 +78,7 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
     }
 
     fn complete_turn<R: BufRead, W: Write>(&mut self, input: &mut R, output: &mut W) -> Result<()> {
-        for _ in 0..MAX_TOOL_ITERATIONS {
+        for _ in 0..MAX_TOOL_ROUNDTRIPS {
             let turn = self.provider.respond(&self.messages)?;
             if let Some(text) = turn.text.as_deref().filter(|text| !text.is_empty()) {
                 writeln!(output, "assistant> {text}")?;
@@ -114,7 +118,15 @@ impl<P: ChatProvider, A: Approver> Agent<P, A> {
             }
         }
 
-        bail!("tool loop exceeded {MAX_TOOL_ITERATIONS} iterations")
+        // Reached the round-trip guard while the model still wants to call
+        // tools. End the turn gracefully so completed tool work and
+        // conversation state are preserved and the REPL keeps running; this is
+        // a soft limit, not a provider failure.
+        writeln!(
+            output,
+            "note: stopped after {MAX_TOOL_ROUNDTRIPS} tool round-trips; send another message to continue."
+        )?;
+        Ok(())
     }
 
     fn execute_tool(&self, call: &ToolCall) -> Result<String> {
@@ -502,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_loop_stops_after_too_many_tool_calls() -> Result<()> {
+    fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
         let workspace = test_workspace()?;
         fs::write(workspace.path.join("note.txt"), "hello from file")?;
         let repeated_call = || {
@@ -516,14 +528,21 @@ mod tests {
             })
         };
         let provider =
-            FakeProvider::new((0..MAX_TOOL_ITERATIONS).map(|_| repeated_call()).collect());
+            FakeProvider::new((0..MAX_TOOL_ROUNDTRIPS).map(|_| repeated_call()).collect());
         let mut agent = Agent::new(provider, workspace.path.clone(), AutoAllow);
         let mut output = Vec::new();
         let mut errors = Vec::new();
 
         agent.run_with("read forever\n/exit\n".as_bytes(), &mut output, &mut errors)?;
 
-        assert!(String::from_utf8(errors)?.contains("tool loop exceeded"));
+        // Hitting the guard ends the turn gracefully: a user-visible notice,
+        // no provider error, and the REPL keeps running (it consumes /exit).
+        let rendered = String::from_utf8(output)?;
+        assert!(rendered.contains("stopped after"));
+        assert!(errors.is_empty());
+        // The provider is consulted exactly the capped number of times, then
+        // the loop stops without one extra round-trip.
+        assert_eq!(agent.provider.seen.borrow().len(), MAX_TOOL_ROUNDTRIPS);
         Ok(())
     }
 
