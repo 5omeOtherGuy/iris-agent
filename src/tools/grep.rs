@@ -64,8 +64,11 @@ fn grep(root: &Path, input: &GrepInput) -> Result<String> {
     if matches!(input.limit, Some(0)) {
         bail!("`limit` must be greater than 0");
     }
-    let rg = find_binary(&["rg", "ripgrep"])
-        .context("ripgrep (rg) is not available (please install ripgrep)")?;
+    let rg = find_binary(&["rg", "ripgrep"]).context(
+        "the `grep` tool requires ripgrep (`rg`), which was not found on PATH. \
+         Install it: Debian/Ubuntu `apt install ripgrep`, macOS `brew install ripgrep`, \
+         Arch `pacman -S ripgrep`, or see https://github.com/BurntSushi/ripgrep#installation",
+    )?;
 
     let search = input.path.as_deref().unwrap_or(".");
     let search_path = resolve_existing(root, search)?;

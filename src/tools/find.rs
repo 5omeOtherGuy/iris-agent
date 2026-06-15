@@ -48,8 +48,11 @@ fn find(root: &Path, input: &FindInput) -> Result<String> {
     if matches!(input.limit, Some(0)) {
         bail!("`limit` must be greater than 0");
     }
-    let fd = find_binary(&["fd", "fdfind"])
-        .context("fd is not available (please install fd-find or fd)")?;
+    let fd = find_binary(&["fd", "fdfind"]).context(
+        "the `find` tool requires fd (`fd` or `fdfind`), which was not found on PATH. \
+         Install it: Debian/Ubuntu `apt install fd-find` (binary is `fdfind`), macOS \
+         `brew install fd`, Arch `pacman -S fd`, or see https://github.com/sharkdp/fd#installation",
+    )?;
 
     let search = input.path.as_deref().unwrap_or(".");
     let search_path = resolve_existing(root, search)?;
