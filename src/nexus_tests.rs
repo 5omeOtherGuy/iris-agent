@@ -1080,3 +1080,28 @@ fn test_workspace() -> Result<TestWorkspace> {
     fs::create_dir(&path)?;
     Ok(TestWorkspace { path })
 }
+
+#[test]
+fn turn_persists_transcript_when_log_attached() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?; // separate temp dir as the session root
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
+    let mut agent = Agent::new(provider, workspace.path.clone());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    agent.attach_session_log(log);
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    run_text_session(&mut agent, b"hello\n/exit\n", &mut out, &mut err)?;
+
+    let lines: Vec<String> = fs::read_to_string(&log_path)?
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 3, "header + user + assistant"); // {lines:?}
+    assert!(lines[0].contains("\"type\":\"session\""));
+    assert!(lines[1].contains("\"role\":\"user\"") && lines[1].contains("hello"));
+    assert!(lines[2].contains("\"role\":\"assistant\"") && lines[2].contains("done"));
+    Ok(())
+}

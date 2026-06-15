@@ -14,6 +14,7 @@ mod errors;
 mod nexus;
 mod process_group;
 mod providers;
+mod session;
 mod signals;
 mod telemetry;
 mod tool_display;
@@ -89,7 +90,18 @@ fn run_agent() -> Result<()> {
         settings.default_model.as_deref(),
         settings.base_url.as_deref(),
     )?;
-    let mut agent = Agent::new(provider, cwd);
+    let mut agent = Agent::new(provider, cwd.clone());
+    // Transcript persistence is best-effort: if the log cannot be opened (e.g.
+    // no writable session dir), warn and continue in-memory rather than fail.
+    match session::SessionLog::create(&cwd) {
+        Ok(log) => {
+            tracing::info!(path = %log.path().display(), "session transcript");
+            agent.attach_session_log(log);
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "session persistence disabled");
+        }
+    }
     let mut ui = ui::text::TextUi::stdio();
     cli::run_session(&mut agent, &mut ui)
 }

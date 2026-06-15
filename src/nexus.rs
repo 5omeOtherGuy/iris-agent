@@ -34,6 +34,12 @@ pub(crate) struct Agent<P> {
     // later shell command this session. Upgrade path = per-exact-command keys
     // (e.g. `bash:<cmd>`) once a real audit trail exists (roadmap #14).
     session_allowed: HashSet<String>,
+    // Optional transcript persistence. When attached, messages are appended to
+    // the JSONL log at the end of each turn (`persisted` tracks how many of
+    // `messages` are already on disk). None in tests and when no log could be
+    // opened, so the agent runs fully in-memory.
+    session: Option<crate::session::SessionLog>,
+    persisted: usize,
 }
 
 impl<P: ChatProvider> Agent<P> {
@@ -44,7 +50,14 @@ impl<P: ChatProvider> Agent<P> {
             workspace,
             state: crate::tools::ToolState::new(),
             session_allowed: HashSet::new(),
+            session: None,
+            persisted: 0,
         }
+    }
+
+    /// Attach a transcript log; subsequent turns persist their messages.
+    pub(crate) fn attach_session_log(&mut self, log: crate::session::SessionLog) {
+        self.session = Some(log);
     }
 
     pub(crate) fn submit_turn(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<()> {
@@ -53,7 +66,27 @@ impl<P: ChatProvider> Agent<P> {
 
         self.messages.push(Message::user(prompt));
         crate::signals::reset();
-        self.complete_turn(ui)
+        let result = self.complete_turn(ui);
+        // Persist whatever the turn produced even when it ended in an error, so
+        // the transcript records the user prompt and any tool work. Persistence
+        // is best-effort: a write failure is logged, never fatal to the session.
+        self.persist_new_messages();
+        result
+    }
+
+    /// Append messages not yet written to the transcript log, advancing the
+    /// persisted cursor. No-op when no log is attached.
+    fn persist_new_messages(&mut self) {
+        let Some(log) = self.session.as_mut() else {
+            return;
+        };
+        while self.persisted < self.messages.len() {
+            if let Err(error) = log.append(&self.messages[self.persisted]) {
+                tracing::warn!(error = %format!("{error:#}"), "failed to persist session message");
+                return;
+            }
+            self.persisted += 1;
+        }
     }
 
     fn complete_turn(&mut self, ui: &mut dyn Ui) -> Result<()> {
@@ -285,7 +318,7 @@ impl Message {
         Self::new(Role::Assistant, content)
     }
 
-    fn assistant_tool_call(call: &ToolCall) -> Self {
+    pub(crate) fn assistant_tool_call(call: &ToolCall) -> Self {
         Self {
             role: Role::AssistantToolCall,
             content: call.arguments.to_string(),

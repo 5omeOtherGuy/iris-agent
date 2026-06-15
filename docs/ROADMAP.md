@@ -324,7 +324,15 @@ Potential scope:
   milestone (raw mode): interactive expand/collapse of folded blocks, `Alt+Enter`
   newline editing, and full right-bordered box framing.]
 - Streaming output if not already in MVP. [Shipped: `TurnSink` deltas.]
-- Session transcript persistence.
+- Session transcript persistence. [Shipped (linear transcript): `src/session.rs`
+  writes a JSONL transcript -- a `session` header line plus one `message` line
+  per entry -- to `<root>/<cwd-slug>/<unix-ms>_<id>.jsonl`, where `<root>` is
+  `IRIS_SESSION_DIR` or `~/.iris/sessions`. The `Agent` appends new messages
+  after each turn (best-effort: a write failure warns, never crashes the
+  session; flushed per line so a crash leaves a valid prefix). Mirrors pi's
+  session format at the MVP level. Deferred (later milestones): pi's tree/
+  branch structure, compaction entries, labels, and `/resume` loading -- this
+  ships write-only persistence, not session resume.]
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
   override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project),
