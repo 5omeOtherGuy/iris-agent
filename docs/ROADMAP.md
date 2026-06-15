@@ -161,7 +161,7 @@ Shared tool infrastructure issues opened 2026-06-15:
 | [#11](https://github.com/5omeOtherGuy/iris-agent/issues/11) | Path identity and file observation store | Done (MVP): session-scoped `ObservedFiles` records `{mtime, content_hash}` per canonical path on read/write/edit (`src/tools/observe.rs`). |
 | [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Done (MVP): `edit`/`write` reject mutating an existing file that was never read or changed since last read (hash-decided; mtime refreshed on benign change). New files may be created blind. |
 | [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; observation refresh now happens after each mutation; no canonical mutation queue. |
-| [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Partial: `y`/`yes` approval/deny is enforced in Nexus and file-mutating tools show a diff preview before approval; no persistent allow policies or risk labels. |
+| [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Done (MVP): Nexus enforces a session allow-policy. Approval offers `[y] once` / `[a] always this session` / `[N] deny`; `always` records the tool name in a Nexus-owned `session_allowed` set so later same-tool calls auto-approve (emitted as `ToolAutoApproved`, never inferred by the UI). Deny stays safe-by-default (empty/invalid/EOF). Diff previews now render colored +/- with relative headers (the `a//abs` double-slash and write-vs-edit path inconsistency are fixed). Remaining: cross-session persistence, risk labels, and per-exact-command bash granularity (`always` on `bash` currently authorizes any later shell command this session). |
 | [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): `dispatch` returns a `ToolOutput { content, metadata }`; success results carry a per-tool `metadata` object on the wire (`read` byte/line/`truncated`, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs is the remaining Milestone 2 work. |
 
 Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
@@ -313,7 +313,16 @@ Before Milestone 0 is considered complete, verification should include:
 
 Potential scope:
 
-- Better terminal UX for tool approvals and results.
+- Better terminal UX for tool approvals and results. [Shipped: streamed-text
+  presentation pass in `src/ui/text.rs` + `src/tool_display.rs` — visual
+  hierarchy via per-block glyphs/color/spacing, colored unified diffs with
+  fixed relative headers and minimized context, long tool results folded to a
+  bounded preview with a `(+N more lines)` indicator, a session always-allow
+  approval policy enforced in Nexus, and paste-safe multi-line prompt input
+  (bracketed paste + `\` continuation). All color/structure degrades to plain
+  ANSI-free text on non-TTY/piped output. Deferred to a future full-TUI
+  milestone (raw mode): interactive expand/collapse of folded blocks, `Alt+Enter`
+  newline editing, and full right-bordered box framing.]
 - Streaming output if not already in MVP. [Shipped: `TurnSink` deltas.]
 - Session transcript persistence.
 - Focused config file for provider/model/tool policy.
@@ -432,9 +441,12 @@ are implemented.
    gates are now met.
 2. Resolved: EOF/`/exit` plus a graceful two-stage SIGINT handler
    (`src/signals.rs`) satisfy the MVP exit gate.
-3. Continue Milestone 1 UX work: streaming output and diff/tool-result
-   presentation are shipped; transcript persistence and a provider/model/tool
-   config file remain.
+3. Continue Milestone 1 UX work: streaming output, the diff/tool-result
+   presentation pass, and the Nexus-enforced session always-allow approval
+   policy ([#14](https://github.com/5omeOtherGuy/iris-agent/issues/14)) are
+   shipped; transcript persistence and a provider/model/tool config file remain.
+   A future full-TUI milestone would add interactive block expansion,
+   `Alt+Enter` multi-line editing, and box framing (raw-mode terminal).
 4. Implement shared tool infrastructure in dependency order: path identity and
    observation store ([#11](https://github.com/5omeOtherGuy/iris-agent/issues/11)),
    mutation preflight ([#12](https://github.com/5omeOtherGuy/iris-agent/issues/12)),

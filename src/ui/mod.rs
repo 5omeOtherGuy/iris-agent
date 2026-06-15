@@ -18,6 +18,12 @@ pub(crate) trait Ui {
 
     /// Block for the user's decision on a gated tool call.
     fn request_approval(&mut self, call: &ToolCall) -> Result<ApprovalDecision>;
+
+    /// Release any terminal state acquired for the session (e.g. bracketed
+    /// paste). Called once when the session loop ends. Default: no-op.
+    fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +33,10 @@ pub(crate) enum UiEvent {
     AssistantTextDelta(String),
     AssistantTextEnd(String),
     ToolProposed(ToolCall),
+    /// A gated tool was auto-approved by the session allow-policy (the user
+    /// chose "always" for this tool earlier). Emitted by Nexus, never inferred
+    /// by the UI, so the policy stays Nexus-owned.
+    ToolAutoApproved(ToolCall),
     DiffPreview {
         call: ToolCall,
         diff: String,

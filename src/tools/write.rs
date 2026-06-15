@@ -41,11 +41,10 @@ pub(super) fn preview(root: &Path, args: &Value) -> Preview {
         Err(_) => return Preview::Malformed,
     };
     match write_preview(root, &input) {
-        Ok((old, new)) => Preview::Available {
-            path: input.path,
-            old,
-            new,
-        },
+        // Use the workspace-relative resolved path for the diff header so an
+        // absolute `path` arg cannot produce `--- a//home/...` and write/edit
+        // headers stay consistent (both relative).
+        Ok((path, old, new)) => Preview::Available { path, old, new },
         Err(error) => Preview::Unavailable(format!("{error:#}")),
     }
 }
@@ -78,9 +77,10 @@ fn write_file(root: &Path, input: &WriteInput, observed: &mut ObservedFiles) -> 
     ))
 }
 
-fn write_preview(root: &Path, input: &WriteInput) -> Result<(String, String)> {
-    let (old, _target) = prepare_write(root, input)?;
-    Ok((old, input.content.clone()))
+fn write_preview(root: &Path, input: &WriteInput) -> Result<(String, String, String)> {
+    let (old, target) = prepare_write(root, input)?;
+    let path = super::path::relative_display(root, &target);
+    Ok((path, old, input.content.clone()))
 }
 
 fn prepare_write(root: &Path, input: &WriteInput) -> Result<(String, std::path::PathBuf)> {

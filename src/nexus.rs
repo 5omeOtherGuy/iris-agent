@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -26,6 +27,13 @@ pub(crate) struct Agent<P> {
     pub(crate) messages: Vec<Message>,
     workspace: PathBuf,
     state: crate::tools::ToolState,
+    // Session approval policy: tool names the user chose to "always" allow.
+    // Owned and enforced here in Nexus, not in the UI, so a front-end can never
+    // silently widen what runs without approval. Granularity is per tool name.
+    // ponytail: per-tool-name always-allow; an "always" on `bash` authorizes any
+    // later shell command this session. Upgrade path = per-exact-command keys
+    // (e.g. `bash:<cmd>`) once a real audit trail exists (roadmap #14).
+    session_allowed: HashSet<String>,
 }
 
 impl<P: ChatProvider> Agent<P> {
@@ -35,6 +43,7 @@ impl<P: ChatProvider> Agent<P> {
             messages: Vec::new(),
             workspace,
             state: crate::tools::ToolState::new(),
+            session_allowed: HashSet::new(),
         }
     }
 
@@ -117,6 +126,10 @@ impl<P: ChatProvider> Agent<P> {
                 self.messages.push(Message::assistant_tool_call(&call));
 
                 if crate::tools::requires_approval(&call.name) {
+                    let auto_approved = self.session_allowed.contains(&call.name);
+                    if auto_approved {
+                        ui.emit(UiEvent::ToolAutoApproved(call.clone()))?;
+                    }
                     if let Some(diff) =
                         crate::tools::diff_preview(&self.workspace, &call.name, &call.arguments)
                     {
@@ -125,15 +138,24 @@ impl<P: ChatProvider> Agent<P> {
                             diff,
                         })?;
                     }
-                    if matches!(ui.request_approval(&call)?, ApprovalDecision::Deny) {
-                        tracing::warn!(tool = %call.name, "tool call denied by user");
-                        ui.emit(UiEvent::ToolDenied(call.clone()))?;
-                        self.messages.push(Message::tool_result(
-                            &call.id,
-                            &call.name,
-                            &denied_tool_result_json(),
-                        ));
-                        continue;
+                    if !auto_approved {
+                        match ui.request_approval(&call)? {
+                            ApprovalDecision::Deny => {
+                                tracing::warn!(tool = %call.name, "tool call denied by user");
+                                ui.emit(UiEvent::ToolDenied(call.clone()))?;
+                                self.messages.push(Message::tool_result(
+                                    &call.id,
+                                    &call.name,
+                                    &denied_tool_result_json(),
+                                ));
+                                continue;
+                            }
+                            ApprovalDecision::AllowAlways => {
+                                tracing::info!(tool = %call.name, "tool always-allowed this session");
+                                self.session_allowed.insert(call.name.clone());
+                            }
+                            ApprovalDecision::Allow => {}
+                        }
                     }
                 } else {
                     ui.emit(UiEvent::ToolProposed(call.clone()))?;

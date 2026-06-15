@@ -304,6 +304,55 @@ mod tests {
     }
 
     #[test]
+    fn diff_preview_absolute_write_path_has_no_double_slash() {
+        let dir = temp_dir();
+        let root = super::path::workspace_root(&dir.path).unwrap();
+        let abs = root.join("note.txt");
+        fs::write(&abs, "old\n").unwrap();
+
+        let diff = diff_preview(
+            &dir.path,
+            "write",
+            &json!({ "path": abs.to_string_lossy(), "content": "new\n" }),
+        )
+        .unwrap();
+
+        assert!(!diff.contains("a//"), "double slash in header: {diff}");
+        assert!(
+            diff.contains("--- a/note.txt"),
+            "header not relative: {diff}"
+        );
+        assert!(diff.contains("+++ b/note.txt"));
+    }
+
+    #[test]
+    fn diff_preview_absolute_edit_path_matches_relative_write_header() {
+        let dir = temp_dir();
+        let root = super::path::workspace_root(&dir.path).unwrap();
+        let abs = root.join("note.txt");
+        fs::write(&abs, "old\n").unwrap();
+
+        // `edit`'s schema takes an absolute `file_path`; the rendered header must
+        // be the same workspace-relative path `write` produces, not `a//abs`.
+        let diff = diff_preview(
+            &dir.path,
+            "edit",
+            &json!({
+                "file_path": abs.to_string_lossy(),
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        )
+        .unwrap();
+
+        assert!(!diff.contains("a//"), "double slash in header: {diff}");
+        assert!(
+            diff.contains("--- a/note.txt"),
+            "header not relative: {diff}"
+        );
+    }
+
+    #[test]
     fn diff_preview_skips_malformed_mutating_args() {
         let dir = temp_dir();
 

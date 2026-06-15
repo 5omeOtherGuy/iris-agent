@@ -1,27 +1,36 @@
 //! Shared, presentation-only formatter for tool-call display.
 //!
 //! Boundary (AGENTS.md): this is the Iris CLI presentation layer. Every function
-//! returns an owned `String` and performs no IO, no color, and never alters what
-//! is sent to the model. The read-only vs mutating *policy* lives in
-//! [`crate::tools`]; only display verb/path matching lives here.
+//! returns an owned `String`, never colors, and never alters what is sent to the
+//! model. The read-only vs mutating *policy* lives in [`crate::tools`]; only
+//! display verb/path matching lives here. Color and layout (frames, glyphs) live
+//! one layer up in [`crate::ui::text`]. The one IO exception is [`display_path`],
+//! which reads the working directory to render tool paths consistently.
 //!
 //! The text front-end calls these helpers after Nexus emits semantic UI events.
+
+use std::path::Path;
 
 use serde_json::Value;
 
 use crate::nexus::ToolCall;
 
-// Single-sourced lifecycle labels (kept aligned with `iris>` / `assistant>`).
-const PROPOSED: &str = "tool>";
-const DENIED: &str = "denied>";
-const RESULT: &str = "result>";
-const ERROR: &str = "tool error>";
-
-// Display caps for tool output bodies; presentation-only, never affect the model.
-const MAX_DISPLAY_LINES: usize = 20;
+// Display caps for folded tool output bodies; presentation-only, never affect
+// the model (the full output still flows to the provider independently).
+const MAX_DISPLAY_LINES: usize = 12;
 const MAX_DISPLAY_CHARS: usize = 2000;
 // Cap for one-line command/arg summaries.
 const MAX_SUMMARY_CHARS: usize = 100;
+
+/// A long tool-output body folded to a bounded preview. `hidden_lines` is the
+/// number of trailing source lines omitted from `preview`; zero means the whole
+/// body is shown. The caller renders the "(+N more lines)" affordance so the
+/// indicator can be colored without baking ANSI into this layer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Folded {
+    pub(crate) preview: String,
+    pub(crate) hidden_lines: usize,
+}
 
 /// Core shared piece: a one-line, per-tool summary of a proposed call.
 ///
@@ -38,30 +47,56 @@ pub(crate) fn summarize(call: &ToolCall) -> String {
     }
 }
 
-/// Proposed-call line for the non-gated path (read/grep/find/ls/etc.).
-pub(crate) fn proposed_line(call: &ToolCall) -> String {
-    format!("{PROPOSED} {}", summarize(call))
+/// Fold a tool-output body to a bounded preview plus a hidden-line count.
+///
+/// Line-bounded first (keep at most [`MAX_DISPLAY_LINES`] source lines), then a
+/// char cap as a second guard against a single huge line. The full output is
+/// never altered for the model; this only governs what the terminal shows.
+pub(crate) fn fold(content: &str) -> Folded {
+    let total = content.lines().count();
+    let mut preview = String::new();
+    let mut shown = 0;
+    for line in content.lines().take(MAX_DISPLAY_LINES) {
+        if shown > 0 {
+            preview.push('\n');
+        }
+        preview.push_str(line);
+        shown += 1;
+    }
+    let mut hidden = total.saturating_sub(shown);
+
+    if preview.chars().count() > MAX_DISPLAY_CHARS {
+        preview = preview.chars().take(MAX_DISPLAY_CHARS).collect();
+        // A char-capped preview may cut mid-line, so anything not fully shown is
+        // hidden; report at least one hidden line so the affordance appears.
+        hidden = hidden.max(1);
+    }
+
+    Folded {
+        preview,
+        hidden_lines: hidden,
+    }
 }
 
-/// Approval prompt body (the approver appends the y/N read on the same line).
-pub(crate) fn approval_prompt(call: &ToolCall) -> String {
-    format!("approve {}? [y/N] ", summarize(call))
-}
-
-/// Denied-call line.
-pub(crate) fn denied_line(call: &ToolCall) -> String {
-    format!("{DENIED} {}", summarize(call))
-}
-
-/// Success result line. Body is truncated for display here so all display caps
-/// live with the formatter.
-pub(crate) fn result_line(content: &str) -> String {
-    format!("{RESULT} {}", truncate_body(content))
-}
-
-/// Tool-error line (the caller formats the anyhow chain as `{err:#}`).
-pub(crate) fn error_line(message: &str) -> String {
-    format!("{ERROR} {message}")
+/// Normalize a tool path for display so `write`/`edit`/`read` render the same
+/// way regardless of whether the model passed a relative or an absolute path
+/// (`edit`'s schema asks for an absolute path, the others relative). An
+/// absolute path under the working directory becomes workspace-relative; a
+/// leading `./` is trimmed. Presentation-only; the model still sees the raw
+/// path it sent.
+///
+/// ponytail: anchored on `current_dir()` because Iris always runs with
+/// workspace == cwd (see `main::run_agent`). If that ever diverges, thread the
+/// real workspace root through instead.
+fn display_path(raw: &str) -> String {
+    let path = Path::new(raw);
+    if path.is_absolute()
+        && let Ok(cwd) = std::env::current_dir()
+        && let Ok(rel) = path.strip_prefix(&cwd)
+    {
+        return rel.to_string_lossy().into_owned();
+    }
+    raw.strip_prefix("./").unwrap_or(raw).to_string()
 }
 
 /// File tools: `"{name} {path}"`. Falls back to a redacted compact-arg summary if
@@ -75,7 +110,7 @@ fn file_summary(call: &ToolCall) -> String {
         .or_else(|| call.arguments.get("path"))
         .and_then(Value::as_str);
     match path {
-        Some(path) => format!("{} {}", call.name, path),
+        Some(path) => format!("{} {}", call.name, display_path(path)),
         None => redacted_fallback(call),
     }
 }
@@ -120,7 +155,7 @@ fn grep_summary(call: &ToolCall) -> String {
     format!(
         "grep {} in {}{}",
         truncate_inline(pattern, MAX_SUMMARY_CHARS),
-        path,
+        display_path(path),
         glob
     )
 }
@@ -139,7 +174,7 @@ fn find_summary(call: &ToolCall) -> String {
     format!(
         "find {} in {}",
         truncate_inline(pattern, MAX_SUMMARY_CHARS),
-        path
+        display_path(path)
     )
 }
 
@@ -149,7 +184,7 @@ fn ls_summary(call: &ToolCall) -> String {
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or(".");
-    format!("ls {path}")
+    format!("ls {}", display_path(path))
 }
 
 /// Fallback for unknown tools: `"{name} {compact_args}"`, the args serialized
@@ -183,34 +218,6 @@ fn redacted_fallback(call: &ToolCall) -> String {
     )
 }
 
-/// Line- and char-bounded body truncation for the result line. Keeps the full
-/// output for the model untouched (that flows independently).
-fn truncate_body(text: &str) -> String {
-    let mut out = String::new();
-    let mut truncated = false;
-
-    for (index, line) in text.lines().enumerate() {
-        if index >= MAX_DISPLAY_LINES {
-            truncated = true;
-            break;
-        }
-        if index > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-
-    if out.chars().count() > MAX_DISPLAY_CHARS {
-        out = out.chars().take(MAX_DISPLAY_CHARS).collect();
-        truncated = true;
-    }
-
-    if truncated {
-        out.push_str("\n\u{2026} (truncated)");
-    }
-    out
-}
-
 /// Single-line char truncation with a trailing ellipsis on a char boundary.
 /// `truncate_body` is line-oriented and appends a newline marker, which is wrong
 /// for an inline summary; this is the inline analog.
@@ -234,6 +241,24 @@ mod tests {
             name: name.to_string(),
             arguments,
         }
+    }
+
+    #[test]
+    fn display_path_makes_write_and_edit_paths_consistent() {
+        // The model passes `edit` an absolute path and `write` a relative one;
+        // both must render the same workspace-relative path.
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("tmp_x/subdir/sample.txt");
+        let edit = summarize(&call(
+            "edit",
+            json!({ "file_path": abs.to_string_lossy(), "old_string": "a", "new_string": "b" }),
+        ));
+        let write = summarize(&call(
+            "write",
+            json!({ "path": "./tmp_x/subdir/sample.txt", "content": "hi" }),
+        ));
+        assert_eq!(edit, "edit tmp_x/subdir/sample.txt");
+        assert_eq!(write, "write tmp_x/subdir/sample.txt");
     }
 
     #[test]
@@ -315,49 +340,30 @@ mod tests {
     }
 
     #[test]
-    fn proposed_and_denied_lines_carry_summary() {
-        let c = call("read", json!({ "path": "a.rs" }));
-        assert_eq!(proposed_line(&c), "tool> read a.rs");
-        assert_eq!(denied_line(&c), "denied> read a.rs");
+    fn fold_keeps_short_output_whole() {
+        let folded = fold("line a\nline b");
+        assert_eq!(folded.preview, "line a\nline b");
+        assert_eq!(folded.hidden_lines, 0);
     }
 
     #[test]
-    fn approval_prompt_wraps_summary() {
-        let c = call("write", json!({ "path": "note.txt", "content": "hi" }));
-        assert_eq!(approval_prompt(&c), "approve write note.txt? [y/N] ");
-    }
-
-    #[test]
-    fn result_line_prefixes_and_caps_long_output() {
+    fn fold_bounds_long_output_and_counts_hidden_lines() {
         let text = (0..100)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let rendered = result_line(&text);
-        assert!(rendered.starts_with("result> "));
-        assert!(rendered.contains("line 0"));
-        assert!(rendered.contains("(truncated)"));
-        assert!(!rendered.contains("line 99"));
+        let folded = fold(&text);
+        assert_eq!(folded.preview.lines().count(), MAX_DISPLAY_LINES);
+        assert!(folded.preview.contains("line 0"));
+        assert!(!folded.preview.contains("line 99"));
+        assert_eq!(folded.hidden_lines, 100 - MAX_DISPLAY_LINES);
     }
 
     #[test]
-    fn result_line_keeps_short_output() {
-        assert_eq!(result_line("short output"), "result> short output");
-    }
-
-    #[test]
-    fn result_line_truncates_over_char_cap() {
+    fn fold_char_cap_marks_hidden_for_one_huge_line() {
         let body = "a".repeat(MAX_DISPLAY_CHARS + 500);
-        let rendered = result_line(&body);
-        assert!(rendered.contains("(truncated)"));
-        assert!(rendered.chars().count() < body.chars().count());
-    }
-
-    #[test]
-    fn error_line_prefixes_and_preserves_message() {
-        assert_eq!(
-            error_line("unknown tool: unknown"),
-            "tool error> unknown tool: unknown"
-        );
+        let folded = fold(&body);
+        assert!(folded.preview.chars().count() <= MAX_DISPLAY_CHARS);
+        assert!(folded.hidden_lines >= 1);
     }
 }

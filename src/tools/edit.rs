@@ -47,8 +47,11 @@ pub(super) fn preview(root: &Path, args: &Value) -> Preview {
         Err(_) => return Preview::Malformed,
     };
     match build_edit(root, &input) {
+        // Header uses the workspace-relative resolved path (not the raw,
+        // possibly-absolute `file_path` arg) so it matches `write` and never
+        // produces a `a//home/...` double slash.
         Ok(plan) => Preview::Available {
-            path: input.file_path,
+            path: super::path::relative_display(root, &plan.resolved),
             old: plan.old_content,
             new: plan.new_content,
         },

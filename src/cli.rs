@@ -20,6 +20,7 @@ pub(crate) fn run_session<P: ChatProvider>(agent: &mut Agent<P>, ui: &mut dyn Ui
         }
     }
 
+    ui.shutdown()?;
     Ok(())
 }
 

@@ -369,7 +369,8 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
     )?;
 
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("result>"));
+    // Result row carries the tool summary and a line count, then the body.
+    assert!(rendered.contains("\u{2713} read note.txt"));
     assert!(rendered.contains("hello from file"));
     assert!(errors.is_empty());
     Ok(())
@@ -401,8 +402,8 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
     )?;
 
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("tool error>"));
-    assert!(rendered.contains("unknown tool: unknown"));
+    assert!(rendered.contains("\u{2717} unknown"));
+    assert!(rendered.contains("error: unknown tool: unknown"));
     assert!(rendered.contains("assistant> recovered"));
     assert!(errors.is_empty());
     Ok(())
@@ -620,9 +621,9 @@ fn approved_write_renders_prompt_and_result_without_raw_json() -> Result<()> {
     )?;
 
     let rendered = String::from_utf8(output)?;
-    // The approval prompt carries the summary; the result line follows it.
+    // The approval prompt carries the summary; the result row follows it.
     assert!(rendered.contains("approve write out.txt?"));
-    assert!(rendered.contains("result>"));
+    assert!(rendered.contains("\u{2713} write out.txt"));
     // No separate proposed line and no raw `name({json})` argument dump.
     assert!(!rendered.contains("tool> write({"));
     Ok(())
@@ -652,7 +653,7 @@ fn denied_write_skips_execution_and_records_denial() -> Result<()> {
     assert!(errors.is_empty());
     assert!(!workspace.path.join("out.txt").exists());
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("denied> write out.txt"));
+    assert!(rendered.contains("\u{2717} denied \u{b7} write out.txt"));
     // Gated calls no longer double-print a raw `tool> write({...})` line.
     assert!(!rendered.contains("tool> write({"));
 
@@ -970,6 +971,80 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
 
     assert!(workspace.path.join("a.txt").exists());
     assert!(!workspace.path.join("b.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": "a.txt", "content": "a" }),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": "b.txt", "content": "b" }),
+                },
+            ],
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    // A single "always" decision must satisfy both write calls. Only one
+    // decision line is supplied; the second call must not read input. If the
+    // policy were not enforced in Nexus, the second write would consume
+    // "/exit" as its decision and b.txt would never be written.
+    run_text_session(
+        &mut agent,
+        "write both\na\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    assert!(workspace.path.join("a.txt").exists());
+    assert!(workspace.path.join("b.txt").exists());
+    let rendered = String::from_utf8(output)?;
+    assert!(rendered.contains("auto-approved \u{b7} write b.txt \u{b7} session"));
+    Ok(())
+}
+
+#[test]
+fn always_allow_does_not_cross_tool_boundaries() -> Result<()> {
+    // "always" on write must not silently auto-approve a later bash call.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "a.txt", "content": "a" }),
+        )),
+        Ok(single_call_turn("bash", json!({ "command": "echo hi" }))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    // write -> always (a); bash -> denied (n). bash must still prompt.
+    run_text_session(
+        &mut agent,
+        "go\na\nn\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    assert!(workspace.path.join("a.txt").exists());
+    let seen = agent.provider.seen.borrow();
+    let bash_result = seen[2].last().unwrap();
+    assert!(bash_result.content.contains("\"denied\":true"));
     Ok(())
 }
 
