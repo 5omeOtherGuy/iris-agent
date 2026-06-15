@@ -17,9 +17,9 @@ Implemented today:
 - Nexus runtime in `src/nexus.rs` with multi-turn conversation state, streamed assistant text via `TurnSink`, tool-call execution, approval/diff-preview enforcement, and semantic `UiEvent` rendering.
 - Approval decision/parser in `src/approval.rs`, with `y`/`yes` allowing mutating tool calls and anything else denying safely.
 - Provider-neutral `ChatProvider`, `TurnSink`, `AssistantTurn`, `ToolCall`, `Message`, and `Role` types.
-- Workspace-scoped built-in tools under `src/tools/`: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, and `hashline_edit`.
-- Approval enforcement for `write`, `edit`, `bash`, and `hashline_edit`, with diff previews for file-mutating tools and model-readable denied-call results.
-- Atomic same-directory file replacement for `write`, `edit`, and `hashline_edit`.
+- Workspace-scoped built-in tools under `src/tools/`: `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. `edit` uses Claude Code's exact-string contract (`file_path`/`old_string`/`new_string`/`replace_all`).
+- Approval enforcement for `write`, `edit`, and `bash`, with diff previews for file-mutating tools and model-readable denied-call results.
+- Atomic same-directory file replacement for `write` and `edit`.
 - OpenAI Codex OAuth browser and device-code login plus token loading/refresh in `src/auth/`.
 - OpenAI Codex Responses request/response handling in `src/providers/openai_codex_responses.rs`, including tool schemas, retry/backoff, and streamed-response parsing.
 - Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.

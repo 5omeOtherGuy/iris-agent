@@ -56,14 +56,14 @@ Implemented today:
 - Typed boundary errors with process exit codes (`src/errors.rs`) and `RUST_LOG`
   tracing to stderr (`src/telemetry.rs`).
 - Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,
-  `find`, `ls`, and `hashline_edit`.
+  `find`, and `ls`. `edit` follows Claude Code's exact-string contract
+  (`file_path`/`old_string`/`new_string`/`replace_all`).
 - Workspace path-safety enforcement for existing and newly written paths.
 - Terminal approval prompts with diff previews for file-mutating tools, and
-  denied-call handling for `write`, `edit`, `bash`, and `hashline_edit`.
-- Atomic same-directory file replacement helper used by `write`, `edit`, and
-  `hashline_edit`.
+  denied-call handling for `write`, `edit`, and `bash`.
+- Atomic same-directory file replacement helper used by `write` and `edit`.
 - Text-only `read` rejects binary/NUL-containing and invalid UTF-8 files instead
-  of rendering lossy text; `grep hashline=true` emits compatible hashline tags.
+  of rendering lossy text.
 - OpenAI Codex OAuth token loading/refresh from the Iris auth-file shape.
 - OpenAI Codex browser and device-code login flows.
 - OpenAI Codex Responses request/response handling, including tool schemas and
@@ -81,15 +81,14 @@ Not implemented yet:
 ## Tool quality — best-in-class on all tools
 
 Cross-cutting workstream, not a milestone. Goal: every built-in tool is at or
-above the field's best implementation. The eight tools were assessed 2026-06-15
+above the field's best implementation. The seven tools were assessed 2026-06-15
 against Claude Code, Codex CLI, Aider, OpenHands/SWE-agent, Cline/Roo, Gemini
 CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 
 | Tool | Tier today | Best-in-class holder | Issue |
 | --- | --- | --- | --- |
-| `hashline_edit` | Frontier (parity w/ omp) | omp (origin) | [#9](https://github.com/5omeOtherGuy/iris-agent/issues/9) |
-| `edit` | Strong-standard + atomic writes | RooCode (fuzzy) / Codex (V4A) | [#4](https://github.com/5omeOtherGuy/iris-agent/issues/4) |
-| `grep` | Standard + hashline tags | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
+| `edit` | Claude-compatible exact-string + replace_all + atomic writes | RooCode (fuzzy) / Codex (V4A) | [#4](https://github.com/5omeOtherGuy/iris-agent/issues/4) |
+| `grep` | Standard | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
 | `write` | Standard + atomic writes | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
 | `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
 | `read` | Standard text read | Claude Code (multimodal) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
@@ -99,10 +98,13 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 Execution order (by impact/effort, independent of the milestone sequence):
 
 1. **Tier 1 — keep the honesty fixes shipped.** The earlier false-advertising
-   bugs are fixed in code: `read` no longer renders invalid UTF-8 as lossy text,
-   and `grep hashline=true` emits tags. Keep docs/issues aligned as behavior
-   changes — [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2),
-   [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
+   bug is fixed in code: `read` no longer renders invalid UTF-8 as lossy text.
+   Keep docs/issues aligned as behavior changes —
+   [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2).
+   The content-hash anchored `hashline_edit` tool and the `read`/`grep`
+   `hashline` option were removed in favor of a single Claude-compatible
+   exact-string `edit` path; re-add only if exact-string edits prove
+   unreliable in real use.
 2. **Tier 2 — close real capability gaps.**
    - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
      background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
@@ -124,9 +126,8 @@ Execution order (by impact/effort, independent of the milestone sequence):
    guard ([#5](https://github.com/5omeOtherGuy/iris-agent/issues/5)); `read`
    PDF/notebook ([#2](https://github.com/5omeOtherGuy/iris-agent/issues/2)); `ls`
    tree view ([#8](https://github.com/5omeOtherGuy/iris-agent/issues/8)).
-4. **Tier 4 — extend the frontier.** Integrate + benchmark `hashline_edit`
-   ([#9](https://github.com/5omeOtherGuy/iris-agent/issues/9)); then new tools
-   beyond the eight — `apply_patch` (V4A; tracked under provider-specific tools,
+4. **Tier 4 — extend the frontier.** New tools beyond the seven —
+   `apply_patch` (V4A; tracked under provider-specific tools,
    [#10](https://github.com/5omeOtherGuy/iris-agent/issues/10)), `ast_edit` for
    structural moves, and an optional fast-apply path.
 
@@ -135,13 +136,13 @@ Shared tool infrastructure issues opened 2026-06-15:
 | Issue | Area | Current status |
 | --- | --- | --- |
 | [#11](https://github.com/5omeOtherGuy/iris-agent/issues/11) | Path identity and file observation store | Missing beyond workspace path resolution. |
-| [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Missing except hashline anchor validation. |
+| [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Missing; no read-before-edit or stale-file guard yet. |
 | [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; no canonical mutation queue or observation refresh. |
 | [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Partial: `y`/`yes` approval/deny is enforced in Nexus and file-mutating tools show a diff preview before approval; no persistent allow policies or risk labels. |
 | [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Missing structured metadata; plain text results remain. |
 
-Status: already best-in-class on `hashline_edit`; strong-standard on the
-read/grep/edit/write/ls cluster. The honest gaps are `bash` (large), shared
+Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
+on Claude Code's exact-string contract. The honest gaps are `bash` (large), shared
 observation/preflight/result metadata (medium), persistent approval policy/risk
 labels (medium; diff preview already shipped), and `rg`/`fd` packaging
 (clear missing-binary errors, optional on-demand download; small).
@@ -149,7 +150,7 @@ labels (medium; diff preview already shipped), and `rg`/`fd` packaging
 ## Provider-specific tools
 
 Complementary long-term axis to the tool-quality work above, tracked as an epic
-([#10](https://github.com/5omeOtherGuy/iris-agent/issues/10)). The eight tools
+([#10](https://github.com/5omeOtherGuy/iris-agent/issues/10)). The seven tools
 stay provider-agnostic and remain the canonical baseline; *in addition*, when Iris
 routes a turn to a given model it should present that model the tool surface it
 was trained on, wherever a benchmark shows a win. Examples: OpenAI/Codex
@@ -203,7 +204,7 @@ thesis yet, but it creates the foundation required to prove it.
 - **Basic safety**
   - Restrict file tools to the current workspace by default.
   - Show tool calls and results clearly.
-  - Require confirmation before `write`, `edit`, `bash`, and `hashline_edit`
+  - Require confirmation before `write`, `edit`, and `bash`
     (every mutating file/shell tool), unless explicitly run in an
     unsafe/non-interactive mode later.
   - Do not run destructive git operations automatically.

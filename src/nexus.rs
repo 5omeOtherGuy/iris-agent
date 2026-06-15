@@ -1066,37 +1066,6 @@ mod tests {
     }
 
     #[test]
-    fn denied_hashline_edit_leaves_file_unchanged() -> Result<()> {
-        let workspace = test_workspace()?;
-        fs::write(workspace.path.join("note.txt"), "original")?;
-        let provider = FakeProvider::new(vec![
-            Ok(single_call_turn(
-                "hashline_edit",
-                json!({ "path": "note.txt", "edits": [] }),
-            )),
-            Ok(AssistantTurn::text("ok")),
-        ]);
-        let mut agent = Agent::new(provider, workspace.path.clone());
-        let mut output = Vec::new();
-        let mut errors = Vec::new();
-
-        run_text_session(
-            &mut agent,
-            "hashline it\n/exit\n".as_bytes(),
-            &mut output,
-            &mut errors,
-        )?;
-
-        assert_eq!(
-            fs::read_to_string(workspace.path.join("note.txt"))?,
-            "original"
-        );
-        let seen = agent.provider.seen.borrow();
-        assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
-        Ok(())
-    }
-
-    #[test]
     fn terminal_approver_allows_write_end_to_end() -> Result<()> {
         let workspace = test_workspace()?;
         let provider = FakeProvider::new(vec![
@@ -1254,8 +1223,12 @@ mod tests {
     }
 
     fn test_workspace() -> Result<TestWorkspace> {
+        // nanos alone collide across parallel tests; a process-unique counter
+        // guarantees a distinct directory per call.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = std::env::temp_dir().join(format!("iris-agent-test-{nanos}"));
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("iris-agent-test-{nanos}-{seq}"));
         fs::create_dir(&path)?;
         Ok(TestWorkspace { path })
     }

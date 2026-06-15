@@ -29,7 +29,7 @@ const MAX_SUMMARY_CHARS: usize = 100;
 /// summary is single-sourced (Codex parallel: `exec_snippet`).
 pub(crate) fn summarize(call: &ToolCall) -> String {
     match call.name.as_str() {
-        "read" | "write" | "edit" | "hashline_edit" => file_summary(call),
+        "read" | "write" | "edit" => file_summary(call),
         "bash" => bash_summary(call),
         "grep" => grep_summary(call),
         "find" => find_summary(call),
@@ -68,7 +68,13 @@ pub(crate) fn error_line(message: &str) -> String {
 /// `path` is absent or non-string, so malformed calls never echo a large or
 /// sensitive `content` field.
 fn file_summary(call: &ToolCall) -> String {
-    match call.arguments.get("path").and_then(Value::as_str) {
+    // `edit` uses Claude's `file_path`; `read`/`write` use `path`.
+    let path = call
+        .arguments
+        .get("file_path")
+        .or_else(|| call.arguments.get("path"))
+        .and_then(Value::as_str);
+    match path {
         Some(path) => format!("{} {}", call.name, path),
         None => redacted_fallback(call),
     }
@@ -239,7 +245,7 @@ mod tests {
         assert_eq!(
             summarize(&call(
                 "edit",
-                json!({ "path": "src/x.rs", "old": "a", "new": "b" })
+                json!({ "file_path": "src/x.rs", "old_string": "a", "new_string": "b" })
             )),
             "edit src/x.rs"
         );
@@ -249,13 +255,6 @@ mod tests {
                 json!({ "path": "out.txt", "content": "hi" })
             )),
             "write out.txt"
-        );
-        assert_eq!(
-            summarize(&call(
-                "hashline_edit",
-                json!({ "path": "h.rs", "edits": [] })
-            )),
-            "hashline_edit h.rs"
         );
     }
 

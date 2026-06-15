@@ -15,24 +15,25 @@ use super::text::{
     restore_line_endings, strip_bom,
 };
 
-pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default oldText must match a unique region; set replaceAll=true to replace every occurrence. Matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
+pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default old_string must match a unique region; set replace_all=true to replace every occurrence. Matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
-            "oldText": { "type": "string", "minLength": 1, "description": "Text to find and replace (must match uniquely unless replaceAll=true; matching normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace)" },
-            "newText": { "type": "string", "description": "New text to replace the old text with" },
-            "replaceAll": { "type": "boolean", "description": "Replace every occurrence of oldText instead of requiring a unique match (default: false)" }
+            "file_path": { "type": "string", "description": "The absolute path to the file to modify" },
+            "old_string": { "type": "string", "description": "The text to replace" },
+            "new_string": { "type": "string", "description": "The text to replace it with (must be different from old_string)" },
+            "replace_all": { "type": "boolean", "description": "Replace all occurrences of old_string (default false)" }
         },
-        "required": ["path", "oldText", "newText"]
+        "required": ["file_path", "old_string", "new_string"],
+        "additionalProperties": false
     })
 }
 
 pub(super) fn execute(root: &Path, args: &Value) -> Result<String> {
     let input: EditInput = serde_json::from_value(args.clone())
-        .context("edit tool arguments must include path, oldText, newText")?;
+        .context("edit tool arguments must include file_path, old_string, new_string")?;
     edit(root, &input)
 }
 
@@ -43,7 +44,7 @@ pub(super) fn preview(root: &Path, args: &Value) -> Preview {
     };
     match build_edit(root, &input) {
         Ok(plan) => Preview::Available {
-            path: input.path,
+            path: input.file_path,
             old: plan.old_content,
             new: plan.new_content,
         },
@@ -52,11 +53,10 @@ pub(super) fn preview(root: &Path, args: &Value) -> Preview {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct EditInput {
-    path: String,
-    old_text: String,
-    new_text: String,
+    file_path: String,
+    old_string: String,
+    new_string: String,
     #[serde(default)]
     replace_all: bool,
 }
@@ -64,13 +64,13 @@ struct EditInput {
 fn edit(root: &Path, input: &EditInput) -> Result<String> {
     let plan = build_edit(root, input)?;
     atomic_write(&plan.resolved, plan.new_content.as_bytes())
-        .with_context(|| format!("failed to write {}", input.path))?;
+        .with_context(|| format!("failed to write {}", input.file_path))?;
 
     let occurrences = plan.replaced;
     let plural = if occurrences == 1 { "" } else { "s" };
     Ok(format!(
         "Successfully replaced {occurrences} occurrence{plural} in {}.",
-        input.path
+        input.file_path
     ))
 }
 
@@ -82,27 +82,27 @@ struct EditPlan {
 }
 
 fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
-    if input.new_text.len() > WRITE_TOOL_MAX_BYTES {
+    if input.new_string.len() > WRITE_TOOL_MAX_BYTES {
         bail!("new text exceeds maximum allowed size");
     }
-    let resolved = resolve_existing(root, &input.path)?;
+    let resolved = resolve_existing(root, &input.file_path)?;
     let metadata =
-        fs::metadata(&resolved).with_context(|| format!("file not found: {}", input.path))?;
+        fs::metadata(&resolved).with_context(|| format!("file not found: {}", input.file_path))?;
     if !metadata.is_file() {
-        bail!("path {} is not a regular file", input.path);
+        bail!("path {} is not a regular file", input.file_path);
     }
     if metadata.len() > READ_TOOL_MAX_BYTES {
         bail!("file is too large to edit");
     }
 
-    let raw = fs::read(&resolved).with_context(|| format!("failed to read {}", input.path))?;
+    let raw = fs::read(&resolved).with_context(|| format!("failed to read {}", input.file_path))?;
     let raw_content = String::from_utf8(raw)
         .context("file contains invalid UTF-8 and cannot be safely edited as text")?;
 
     let (content_no_bom, had_bom) = strip_bom(&raw_content);
     let original_ending = detect_line_ending(content_no_bom);
     let normalized_content = normalize_to_lf(content_no_bom);
-    let normalized_old = normalize_to_lf(&input.old_text);
+    let normalized_old = normalize_to_lf(&input.old_string);
 
     if normalized_old.is_empty() {
         bail!("the old text cannot be empty");
@@ -112,13 +112,13 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
         &normalized_content,
         &normalized_old,
         input.replace_all,
-        &input.path,
+        &input.file_path,
     )?;
 
     // Build the replacement against the LF-normalized content, then restore the
     // file's original line ending on write. Ranges are non-overlapping and
     // ascending, so one left-to-right pass applies every replacement.
-    let normalized_new = normalize_to_lf(&input.new_text);
+    let normalized_new = normalize_to_lf(&input.new_string);
     let mut new_content =
         String::with_capacity(normalized_content.len() + ranges.len() * normalized_new.len());
     let mut cursor = 0;
@@ -132,7 +132,7 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
     if new_content == normalized_content {
         bail!(
             "no changes made to {}; replacement produced identical content",
-            input.path
+            input.file_path
         );
     }
 
@@ -207,15 +207,15 @@ fn select(
     match ranges.len() {
         1 => Ok(ranges),
         n => bail!(
-            "found {n} occurrences of the text in {path}; pass replaceAll=true to replace all of \
-             them, or add surrounding context to oldText so it uniquely identifies one location"
+            "found {n} occurrences of the text in {path}; pass replace_all=true to replace all of \
+             them, or add surrounding context to old_string so it uniquely identifies one location"
         ),
     }
 }
 
 fn not_found_message(path: &str) -> String {
     format!(
-        "could not find the text in {path}. oldText must match the file's current contents \
+        "could not find the text in {path}. old_string must match the file's current contents \
          (line endings and Unicode spaces/quotes/dashes are normalized and trailing whitespace is \
          ignored, but indentation and other characters must match exactly). Re-read the file and \
          copy the exact text to replace."
@@ -324,9 +324,9 @@ mod tests {
         edit(
             root,
             &EditInput {
-                path: path.into(),
-                old_text: old.into(),
-                new_text: new.into(),
+                file_path: path.into(),
+                old_string: old.into(),
+                new_string: new.into(),
                 replace_all,
             },
         )
@@ -354,7 +354,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("found 2 occurrences"), "{err}");
-        assert!(err.contains("replaceAll=true"), "{err}");
+        assert!(err.contains("replace_all=true"), "{err}");
     }
 
     #[test]

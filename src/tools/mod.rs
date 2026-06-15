@@ -1,8 +1,8 @@
 //! Native built-in tool implementations.
 //!
-//! These are workspace-scoped, synchronous ports of the eight built-in tools
+//! These are workspace-scoped, synchronous ports of the seven built-in tools
 //! that pi_agent_rust exposes from its own `src/tools.rs`:
-//! `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and `hashline_edit`.
+//! `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`.
 //!
 //! Fidelity notes:
 //! - The model-facing contract (tool name, description, and JSON Schema) is
@@ -11,9 +11,8 @@
 //!   than pi's async runtime. `grep` shells out to `ripgrep` (`rg`) and `find`
 //!   shells out to `fd`/`fdfind`, exactly like pi, and report the same
 //!   "not available" guidance when those binaries are missing.
-//! - `hashline_edit` and `read`'s `hashline` option reproduce pi's content-hash
-//!   tag algorithm (xxh32 over the whitespace-stripped line, encoded with the
-//!   `NIBBLE_STR` alphabet) so tags round-trip between the two tools.
+//! - `edit` follows Claude Code's exact-string contract
+//!   (`file_path`/`old_string`/`new_string`/`replace_all`).
 //!
 //! Nexus owns workspace-path enforcement: every tool resolves the requested
 //! path against the canonicalized workspace root and refuses to escape it
@@ -21,8 +20,7 @@
 //!
 //! Module layout:
 //! - [`path`], [`text`]: shared path-resolution and text/I/O-size helpers.
-//! - [`hashline`]: content-hash tags plus the `hashline_edit` tool.
-//! - One module per remaining tool: [`read`], [`bash`], [`edit`], [`write`],
+//! - One module per tool: [`read`], [`bash`], [`edit`], [`write`],
 //!   [`grep`], [`find`], [`ls`].
 
 use std::path::Path;
@@ -35,7 +33,6 @@ mod bash;
 mod edit;
 mod find;
 mod grep;
-mod hashline;
 mod ls;
 mod path;
 mod read;
@@ -60,7 +57,6 @@ pub(crate) fn dispatch(workspace: &Path, name: &str, args: &Value) -> Result<Str
         "grep" => grep::execute(&root, args),
         "find" => find::execute(&root, args),
         "ls" => ls::execute(&root, args),
-        "hashline_edit" => hashline::execute(&root, args),
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -68,7 +64,7 @@ pub(crate) fn dispatch(workspace: &Path, name: &str, args: &Value) -> Result<Str
 /// Nexus-owned safety policy: which built-in tools mutate the workspace and
 /// therefore require user approval before execution.
 pub(crate) fn requires_approval(name: &str) -> bool {
-    matches!(name, "write" | "edit" | "hashline_edit" | "bash")
+    matches!(name, "write" | "edit" | "bash")
 }
 
 /// Optional pre-approval diff preview for mutating tools.
@@ -80,7 +76,6 @@ pub(crate) fn diff_preview(workspace: &Path, name: &str, args: &Value) -> Option
     match name {
         "write" => render_preview(write::preview(&root, args)),
         "edit" => render_preview(edit::preview(&root, args)),
-        "hashline_edit" => render_preview(hashline::preview(&root, args)),
         "bash" => None,
         _ => None,
     }
@@ -125,11 +120,6 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         ("grep", grep::DESCRIPTION, grep::parameters()),
         ("find", find::DESCRIPTION, find::parameters()),
         ("ls", ls::DESCRIPTION, ls::parameters()),
-        (
-            "hashline_edit",
-            hashline::DESCRIPTION,
-            hashline::parameters(),
-        ),
     ]
     .into_iter()
     .map(|(name, description, parameters)| {
@@ -222,7 +212,7 @@ mod tests {
 
     #[test]
     fn requires_approval_gates_only_mutating_tools() {
-        for name in ["write", "edit", "bash", "hashline_edit"] {
+        for name in ["write", "edit", "bash"] {
             assert!(super::requires_approval(name), "{name} should be gated");
         }
         for name in ["read", "grep", "find", "ls"] {
@@ -234,21 +224,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_cover_all_eight() {
+    fn tool_definitions_cover_all_seven() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            vec![
-                "read",
-                "bash",
-                "edit",
-                "write",
-                "grep",
-                "find",
-                "ls",
-                "hashline_edit"
-            ]
+            vec!["read", "bash", "edit", "write", "grep", "find", "ls"]
         );
     }
 
@@ -284,7 +265,7 @@ mod tests {
         let preview = diff_preview(
             &dir.path,
             "edit",
-            &json!({ "path": "missing.txt", "oldText": "old", "newText": "new" }),
+            &json!({ "file_path": "missing.txt", "old_string": "old", "new_string": "new" }),
         )
         .unwrap();
 

@@ -267,7 +267,7 @@ fn build_codex_request(model: &str, messages: &[Message]) -> Value {
         "model": model,
         "store": false,
         "stream": true,
-        "instructions": "You are Iris, a helpful terminal coding assistant. You have file and shell tools: read, bash, edit, write, grep, find, ls, and hashline_edit. Use them to inspect and modify the current workspace.",
+        "instructions": "You are Iris, a helpful terminal coding assistant. You have file and shell tools: read, bash, edit, write, grep, find, and ls. Use them to inspect and modify the current workspace.",
         "input": input,
         "tools": crate::tools::tool_definitions(),
         "text": { "verbosity": "low" },

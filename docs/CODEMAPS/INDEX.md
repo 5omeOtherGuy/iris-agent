@@ -44,14 +44,13 @@ behind the `Ui` trait; the only implementation today is the text front-end.
 | `src/tools/mod.rs` | Built-in tool dispatch, JSON tool declarations, mutating-tool approval classifier, diff-preview generation, and shared external-binary lookup. | `dispatch()`, `requires_approval()`, `diff_preview()`, `tool_definitions()` | tool submodules, `anyhow`, `serde_json`, `std::process` |
 | `src/tools/path.rs` | Workspace path resolution and display helpers. Canonicalizes existing paths, normalizes create targets, and rejects workspace escapes. | `workspace_root()`, `resolve_existing()`, `resolve_for_write()`, `relative_display()` | `std::path`, `anyhow` |
 | `src/tools/text.rs` | Shared text, truncation, size-limit, line-ending, and atomic-write helpers. | `atomic_write()`, `truncate_head()`, `truncate_tail()`, line-ending helpers | filesystem APIs, `rand`, `anyhow` |
-| `src/tools/read.rs` | Text-file read tool with offset/limit, line numbers, hashline rendering, binary/NUL and invalid UTF-8 rejection. | `execute()` | `path`, `text`, `hashline`, filesystem APIs, `serde` |
+| `src/tools/read.rs` | Text-file read tool with offset/limit, line numbers, binary/NUL and invalid UTF-8 rejection. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
 | `src/tools/write.rs` | Create/overwrite tool. Creates parents, writes through symlinks inside the workspace, and uses atomic replacement. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
-| `src/tools/edit.rs` | Targeted text replacement with exact/fuzzy unique matching, BOM/EOL preservation, no-op rejection, and atomic replacement. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
-| `src/tools/hashline.rs` | Hashline tag algorithm plus hash-anchored edit tool. Validates anchors, applies edits bottom-up, preserves BOM/EOL, and writes atomically. | `execute()`, `format_hashline_tag()` | `path`, `text`, `xxhash-rust`, filesystem APIs, `serde` |
+| `src/tools/edit.rs` | Claude-compatible exact-string replacement (`file_path`/`old_string`/`new_string`/`replace_all`) with fuzzy fallback matching, BOM/EOL preservation, no-op rejection, and atomic replacement. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
 | `src/tools/bash.rs` | Shell command tool with cwd confinement, timeout, process-group kill, output drain, truncation, and nonzero-exit reporting. | `execute()` | process/filesystem APIs, `libc` on Unix, `serde` |
-| `src/tools/grep.rs` | Ripgrep-backed content search with workspace-relative output and optional hashline tags for match/context lines. | `execute()` | `path`, `text`, `hashline`, `std::process`, `serde` |
+| `src/tools/grep.rs` | Ripgrep-backed content search with workspace-relative output. | `execute()` | `path`, `text`, `std::process`, `serde` |
 | `src/tools/find.rs` | fd/fdfind-backed file glob search sorted newest-first. | `execute()` | `path`, `text`, filesystem/process APIs, `serde` |
-| `src/tools/ls.rs` | Directory listing tool with sorted entries, dotfiles, directory suffixes, and output caps. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
+| `src/tools/ls.rs` | Directory listing tool: directories first, dotfiles, directory suffixes, optional recursive tree, and output caps. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
 | `src/auth/mod.rs` | Auth module declaration. | `device_code`, `openai_codex`, `storage` modules | auth submodules |
 | `src/auth/storage.rs` | Provider-keyed auth-file storage for OAuth credentials. Reads missing files as empty, validates credential shape, and writes atomically with restricted Unix permissions. | `AuthStore`, `OAuthCredentials` | filesystem/env APIs, `anyhow`, `serde`, `serde_json` |
 | `src/auth/device_code.rs` | Generic polling helper for OAuth device-code flows. | `DeviceCodePoll`, `poll_device_code()` | `std::thread`, `std::time`, `anyhow` |
@@ -100,14 +99,13 @@ Unknown commands print help and exit with code `2` (`UsageError`); auth failures
 
 | Tool | Purpose | Safety boundary |
 |---|---|---|
-| `read` | Read text files with truncation, offset/limit, optional hashline tags, and invalid UTF-8/binary rejection. | Existing path must resolve inside the workspace. |
+| `read` | Read text files with truncation, offset/limit, and invalid UTF-8/binary rejection. | Existing path must resolve inside the workspace. |
 | `write` | Create or overwrite files, creating parent directories as needed and writing atomically. | Target path and existing ancestors must remain inside the workspace; approval-gated with diff preview. |
-| `edit` | Replace a unique text match, with whitespace-normalized fallback matching and atomic writes. | Existing path must resolve inside the workspace; approval-gated with diff preview. |
+| `edit` | Replace a unique exact-string match (Claude-compatible schema; `replace_all` for every occurrence), with whitespace-normalized fallback matching and atomic writes. | Existing path must resolve inside the workspace; approval-gated with diff preview. |
 | `bash` | Run a bounded shell command in the workspace with captured stdout/stderr, timeout handling, and process-group cleanup. | Command cwd is the workspace; approval-gated. |
-| `grep` | Search workspace content through `rg` when available, with optional hashline tags. | Search path resolves inside the workspace. |
+| `grep` | Search workspace content through `rg` when available. | Search path resolves inside the workspace. |
 | `find` | Find workspace files through `fd`/`fdfind` when available. | Search path resolves inside the workspace. |
-| `ls` | List directory entries with a scan limit. | Directory path resolves inside the workspace. |
-| `hashline_edit` | Apply content-hash anchored line edits using `read`/`grep` hashline tags and atomic writes. | Existing path must resolve inside the workspace; approval-gated with diff preview. |
+| `ls` | List directory entries (directories first, optional recursive tree) with a scan limit. | Directory path resolves inside the workspace. |
 
 ## External Dependencies
 
@@ -122,7 +120,6 @@ Unknown commands print help and exit with code `2` (`UsageError`); auth failures
 - `similar` — diff generation for mutating-tool previews.
 - `thiserror` — typed boundary error definitions (`AuthError`, `UsageError`).
 - `tracing` / `tracing-subscriber` — structured logging to stderr, gated by `RUST_LOG`.
-- `xxhash-rust` — hashline tag generation and validation.
 
 ## Tests
 
@@ -134,7 +131,7 @@ Current unit tests cover:
 - Typed-error exit-code classification (including through `context` wrapping) in `src/errors.rs`.
 - Secret redaction and external-body sanitization in `src/telemetry.rs`.
 - Tool-call display formatting in `src/tool_display.rs`.
-- Built-in tool behavior under `src/tools/`, including read/write/edit, hashline edits, atomic writes, `ls`, optional `grep`/`find` integration, bash output/timeout/process-group handling, diff previews, and dispatch/tool-definition coverage.
+- Built-in tool behavior under `src/tools/`, including read/write/edit, atomic writes, `ls`, optional `grep`/`find` integration, bash output/timeout/process-group handling, diff previews, and dispatch/tool-definition coverage.
 - Auth storage parsing and atomic restricted writes in `src/auth/storage.rs`.
 - Device-code polling behavior in `src/auth/device_code.rs`.
 - JWT account extraction, browser OAuth URL/callback parsing, device-code interval parsing, and device-auth error parsing in `src/auth/openai_codex.rs`.

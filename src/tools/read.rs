@@ -1,5 +1,4 @@
-//! `read` — line-numbered file reads with offset/limit windowing and an
-//! optional hashline-tagged rendering for use with `hashline_edit`.
+//! `read` — line-numbered file reads with offset/limit windowing.
 
 use std::fs;
 use std::path::Path;
@@ -8,7 +7,6 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::hashline::format_hashline_tag;
 use super::path::resolve_existing;
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, READ_TOOL_MAX_BYTES};
 
@@ -20,8 +18,7 @@ pub(super) fn parameters() -> Value {
         "properties": {
             "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
             "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
-            "limit": { "type": "integer", "description": "Maximum number of lines to read" },
-            "hashline": { "type": "boolean", "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits." }
+            "limit": { "type": "integer", "description": "Maximum number of lines to read" }
         },
         "required": ["path"]
     })
@@ -40,8 +37,6 @@ struct ReadInput {
     offset: Option<i64>,
     #[serde(default)]
     limit: Option<i64>,
-    #[serde(default)]
-    hashline: bool,
 }
 
 fn read(root: &Path, input: &ReadInput) -> Result<String> {
@@ -103,11 +98,7 @@ fn read(root: &Path, input: &ReadInput) -> Result<String> {
     let mut byte_capped = false;
     for (offset_in_window, idx) in (start..end).enumerate() {
         let line = lines[idx].strip_suffix('\r').unwrap_or(lines[idx]);
-        let formatted = if input.hashline {
-            format!("{}:{line}", format_hashline_tag(idx, line))
-        } else {
-            format!("{:>width$}\u{2192}{line}", idx + 1)
-        };
+        let formatted = format!("{:>width$}\u{2192}{line}", idx + 1);
         byte_count += formatted.len() + 1;
         if byte_count > DEFAULT_MAX_BYTES && offset_in_window > 0 {
             end = idx;
@@ -146,7 +137,6 @@ pub(crate) fn read_file(workspace: &Path, path: &str) -> Result<String> {
             path: path.to_string(),
             offset: None,
             limit: None,
-            hashline: false,
         },
     )
 }
@@ -154,7 +144,6 @@ pub(crate) fn read_file(workspace: &Path, path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::hashline::validate_line_ref;
     use crate::tools::test_support::{root_of, temp_dir};
 
     #[test]
@@ -178,7 +167,6 @@ mod tests {
                 path: "b.txt".into(),
                 offset: Some(3),
                 limit: Some(2),
-                hashline: false,
             },
         )
         .unwrap();
@@ -215,27 +203,5 @@ mod tests {
         let err = read_file(&dir.path, "nul.dat").unwrap_err().to_string();
 
         assert!(err.contains("binary"), "{err}");
-    }
-
-    #[test]
-    fn hashline_tag_roundtrips_through_read_and_validation() {
-        let dir = temp_dir();
-        let root = root_of(&dir);
-        fs::write(dir.path.join("h.txt"), "alpha\nbeta\ngamma\n").unwrap();
-        let rendered = read(
-            &root,
-            &ReadInput {
-                path: "h.txt".into(),
-                offset: None,
-                limit: None,
-                hashline: true,
-            },
-        )
-        .unwrap();
-        // First rendered line is `1#XY:alpha`; parse its tag and validate it.
-        let first = rendered.lines().next().unwrap();
-        let tag = first.split(':').next().unwrap();
-        let lines = vec!["alpha", "beta", "gamma", ""];
-        assert_eq!(validate_line_ref(tag, &lines, false).unwrap(), 0);
     }
 }

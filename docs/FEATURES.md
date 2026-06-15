@@ -42,23 +42,23 @@
 - **Tool-call loop** — send tool schemas, receive tool calls, execute tools, feed
   tool results back to the model, and stop after a bounded number of tool
   iterations. [Partial]
-- **`read` tool** — read a workspace text file with offset/limit and hashline
-  output support; rejects binary/NUL-containing and invalid UTF-8 files rather
-  than rendering lossy text. [Implemented]
+- **`read` tool** — read a workspace text file with offset/limit; rejects
+  binary/NUL-containing and invalid UTF-8 files rather than rendering lossy
+  text. [Implemented]
 - **`write` tool** — create or overwrite a workspace file with atomic
   same-directory replacement. [Implemented]
-- **`edit` tool** — targeted text replacement in an existing file, including
-  whitespace-normalized fallback matching and atomic replacement. [Implemented]
+- **`edit` tool** — targeted exact-string replacement in an existing file
+  (Claude Code-compatible `file_path`/`old_string`/`new_string`/`replace_all`),
+  including whitespace-normalized fallback matching and atomic replacement.
+  [Implemented]
 - **`bash` tool** — run a bounded shell command in the workspace with captured
   output, timeout handling, and nonzero-exit reporting. [Implemented]
-- **`grep` tool** — search workspace files through `rg` when available,
-  including `hashline=true` line tags compatible with `hashline_edit`.
+- **`grep` tool** — search workspace files through `rg` when available.
   [Implemented]
 - **`find` tool** — find workspace files through `fd`/`fdfind` when available.
   [Implemented]
-- **`ls` tool** — list workspace directory entries. [Implemented]
-- **`hashline_edit` tool** — apply content-hash anchored line edits compatible
-  with `read`/`grep` hashline output and write changes atomically. [Implemented]
+- **`ls` tool** — list workspace directory entries, directories first, with an
+  optional recursive tree. [Implemented]
 - **Tool result/error encoding** — structured success/error responses returned to
   the model. [Implemented]
 
@@ -67,12 +67,11 @@
 - **Workspace path safety** — keep file tools inside the workspace by default,
   including policy for absolute paths, `..`, symlinks, binary files, and large
   files. [Partial]
-- **Approval gates** — explicit confirmation for `write`, `edit`, `bash`, and
-  `hashline_edit` (every mutating file/shell tool), with denied-call handling.
-  [Implemented]
-- **Atomic file replacement** — `write`, `edit`, and `hashline_edit` write
-  through a same-directory temp file, fsync, rename, cleanup-on-error path, and
-  Unix permission preservation on overwrite. [Partial]
+- **Approval gates** — explicit confirmation for `write`, `edit`, and `bash`
+  (every mutating file/shell tool), with denied-call handling. [Implemented]
+- **Atomic file replacement** — `write` and `edit` write through a
+  same-directory temp file, fsync, rename, cleanup-on-error path, and Unix
+  permission preservation on overwrite. [Partial]
 - **Bash policy** — cwd, timeout, stdout/stderr capture, output limits, exit-code
   handling, and process-group cleanup. [Partial]
 - **File observation / stale mutation preflight** — require complete prior reads,
