@@ -43,19 +43,22 @@
   tool results back to the model, and stop after a bounded number of tool
   iterations. [Partial]
 - **`read` tool** — read a workspace text file with offset/limit and hashline
-  output support. [Implemented]
-- **`write` tool** — create or overwrite a workspace file. [Implemented]
+  output support; rejects binary/NUL-containing and invalid UTF-8 files rather
+  than rendering lossy text. [Implemented]
+- **`write` tool** — create or overwrite a workspace file with atomic
+  same-directory replacement. [Implemented]
 - **`edit` tool** — targeted text replacement in an existing file, including
-  whitespace-normalized fallback matching. [Implemented]
+  whitespace-normalized fallback matching and atomic replacement. [Implemented]
 - **`bash` tool** — run a bounded shell command in the workspace with captured
   output, timeout handling, and nonzero-exit reporting. [Implemented]
-- **`grep` tool** — search workspace files through `rg` when available.
+- **`grep` tool** — search workspace files through `rg` when available,
+  including `hashline=true` line tags compatible with `hashline_edit`.
   [Implemented]
 - **`find` tool** — find workspace files through `fd`/`fdfind` when available.
   [Implemented]
 - **`ls` tool** — list workspace directory entries. [Implemented]
 - **`hashline_edit` tool** — apply content-hash anchored line edits compatible
-  with `read` hashline output. [Implemented]
+  with `read`/`grep` hashline output and write changes atomically. [Implemented]
 - **Tool result/error encoding** — structured success/error responses returned to
   the model. [Implemented]
 
@@ -67,8 +70,16 @@
 - **Approval gates** — explicit confirmation for `write`, `edit`, `bash`, and
   `hashline_edit` (every mutating file/shell tool), with denied-call handling.
   [Implemented]
+- **Atomic file replacement** — `write`, `edit`, and `hashline_edit` write
+  through a same-directory temp file, fsync, rename, cleanup-on-error path, and
+  Unix permission preservation on overwrite. [Partial]
 - **Bash policy** — cwd, timeout, stdout/stderr capture, output limits, exit-code
   handling, and process-group cleanup. [Partial]
+- **File observation / stale mutation preflight** — require complete prior reads,
+  reject partial/stale observations, and refresh observations after Iris
+  mutations. [Planned]
+- **Diff/preview approval UX** — show unified diffs or capped new-file previews
+  before mutating file tools. [Planned]
 - **Secret redaction** — redact secrets from stored content and summaries.
   [Planned]
 - **Subagent tool permissions** — per-worker tool allowlists. [Planned]

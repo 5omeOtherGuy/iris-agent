@@ -1,8 +1,8 @@
 # Iris — Roadmap
 
 > Status (2026-06-15): roadmap for an early implementation. A text-only REPL,
-> OpenAI Codex Responses provider, tool-call loop, and workspace-scoped tools
-> exist, but the Agent Kernel MVP is not complete.
+> OpenAI Codex Responses provider, tool-call loop, workspace-scoped tools, and
+> basic terminal approval gates exist, but the Agent Kernel MVP is not complete.
 > This roadmap defines build order and acceptance criteria. `FEATURES.md` remains
 > the capability inventory; this document says what to build first.
 
@@ -52,18 +52,26 @@ Implemented today:
 - Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,
   `find`, `ls`, and `hashline_edit`.
 - Workspace path-safety enforcement for existing and newly written paths.
+- Basic terminal approval prompts and denied-call handling for `write`, `edit`,
+  `bash`, and `hashline_edit`.
+- Atomic same-directory file replacement helper used by `write`, `edit`, and
+  `hashline_edit`.
+- Text-only `read` rejects binary/NUL-containing and invalid UTF-8 files instead
+  of rendering lossy text; `grep hashline=true` emits compatible hashline tags.
 - OpenAI Codex OAuth token loading/refresh from the Iris auth-file shape.
 - OpenAI Codex browser and device-code login flows.
 - OpenAI Codex Responses request/response handling, including tool schemas and
   streamed-response parsing.
-- Unit tests for the REPL, tool loop, tool implementations, path safety,
-  auth-file handling, URL/request shaping, and response parsing.
+- Unit tests for the REPL, tool loop, approvals, tool implementations, path
+  safety, atomic writes, auth-file handling, URL/request shaping, and response
+  parsing.
 
 Not implemented yet:
 
-- Approval prompts and denied-call handling.
-- Incremental terminal streaming, transcript persistence, modes, subagents,
-  context ledger, content handles, git automation, and GitHub integration.
+- Incremental terminal streaming, transcript persistence, diff previews,
+  persistent approval policies, shared file-observation/stale-file guards, modes,
+  subagents, context ledger, content handles, git automation, and GitHub
+  integration.
 
 ## Tool quality — best-in-class on all tools
 
@@ -75,22 +83,21 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 | Tool | Tier today | Best-in-class holder | Issue |
 | --- | --- | --- | --- |
 | `hashline_edit` | Frontier (parity w/ omp) | omp (origin) | [#9](https://github.com/5omeOtherGuy/iris-agent/issues/9) |
-| `edit` | Strong-standard | RooCode (fuzzy) / Codex (V4A) | [#4](https://github.com/5omeOtherGuy/iris-agent/issues/4) |
-| `grep` | Standard | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
-| `write` | Standard | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
+| `edit` | Strong-standard + atomic writes | RooCode (fuzzy) / Codex (V4A) | [#4](https://github.com/5omeOtherGuy/iris-agent/issues/4) |
+| `grep` | Standard + hashline tags | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
+| `write` | Standard + atomic writes | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
 | `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
-| `read` | Standard + false claim | Claude Code (multimodal) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
+| `read` | Standard text read | Claude Code (multimodal) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
 | `find` | Standard, weak packaging | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
 | `bash` | Behind | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
 
 Execution order (by impact/effort, independent of the milestone sequence):
 
-1. **Tier 1 — correctness bugs (ship first).** Both advertise a capability the
-   code does not deliver.
-   - `read`: image attachments are described but `read()` returns
-     `from_utf8_lossy`, garbling images — [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2).
-   - `grep`: `hashline` is advertised but `GrepInput` has no such field and no
-     tags are emitted — [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
+1. **Tier 1 — keep the honesty fixes shipped.** The earlier false-advertising
+   bugs are fixed in code: `read` no longer renders invalid UTF-8 as lossy text,
+   and `grep hashline=true` emits tags. Keep docs/issues aligned as behavior
+   changes — [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2),
+   [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
 2. **Tier 2 — close real capability gaps.**
    - `bash`: kernel sandbox (Landlock/Seatbelt) + persistent session +
      background jobs — the single largest gap — [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3).
@@ -108,9 +115,20 @@ Execution order (by impact/effort, independent of the milestone sequence):
    [#10](https://github.com/5omeOtherGuy/iris-agent/issues/10)), `ast_edit` for
    structural moves, and an optional fast-apply path.
 
+Shared tool infrastructure issues opened 2026-06-15:
+
+| Issue | Area | Current status |
+| --- | --- | --- |
+| [#11](https://github.com/5omeOtherGuy/iris-agent/issues/11) | Path identity and file observation store | Missing beyond workspace path resolution. |
+| [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Missing except hashline anchor validation. |
+| [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; no canonical mutation queue or observation refresh. |
+| [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Partial: basic `y`/`yes` approval/deny is enforced in Nexus; no diff preview, allow policies, or risk labels. |
+| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Missing structured metadata; plain text results remain. |
+
 Status: already best-in-class on `hashline_edit`; strong-standard on the
-read/grep/edit/write/ls cluster. The honest gaps are `bash` (large), two
-false-advertising bugs (small), and native search/find packaging (medium).
+read/grep/edit/write/ls cluster. The honest gaps are `bash` (large), shared
+observation/preflight/result metadata (medium), diff/approval UX (medium), and
+native search/find packaging (medium).
 
 ## Provider-specific tools
 
@@ -224,10 +242,8 @@ The Agent Kernel MVP is done when Iris can:
 These should be specified in focused implementation notes rather than expanded
 here:
 
-- Approval policy for `write`, `edit`, `bash`, and `hashline_edit`, including
-  denied calls. [Implemented]
 - Whether destructive or externally visible `bash` commands need classification
-  beyond the baseline approval gate.
+  beyond the implemented baseline approval gate.
 - Whether additional file-tool policy is needed for binary files, very large
   files, and absolute paths before marking path safety complete.
 
@@ -237,6 +253,7 @@ Before Milestone 0 is considered complete, verification should include:
 
 - Unit coverage for workspace path safety and edit behavior.
 - Unit coverage for tool result/error encoding.
+- Unit coverage for approval allow/deny paths.
 - A fake-provider integration test covering prompt → tool call → tool result →
   final assistant response.
 - A manual smoke test with one real provider.
@@ -360,12 +377,18 @@ are implemented.
 
 ## Immediate next steps
 
-1. Implement the Agent Kernel MVP.
-2. Keep provider support to one provider until the loop and tools are reliable.
-3. Define the exact tool schemas before coding the model loop.
-4. Define workspace path-safety rules before enabling `write`, `edit`, or `bash`.
-5. Add the first end-to-end smoke test: prompt → tool call → tool result → final
-   assistant response.
+1. Run and record the real-provider MVP smoke test: prompt → tool call → approval
+   decision → tool result → final assistant response.
+2. Decide whether normal EOF/`/exit` behavior is enough for the MVP exit gate or
+   whether interrupt handling must be tightened first.
+3. Start Milestone 1 UX work: streaming output, transcript persistence, and
+   diff/tool-result presentation.
+4. Implement shared tool infrastructure in dependency order: path identity and
+   observation store ([#11](https://github.com/5omeOtherGuy/iris-agent/issues/11)),
+   mutation preflight ([#12](https://github.com/5omeOtherGuy/iris-agent/issues/12)),
+   atomic queue/refresh completion ([#13](https://github.com/5omeOtherGuy/iris-agent/issues/13)),
+   approval/diff UX ([#14](https://github.com/5omeOtherGuy/iris-agent/issues/14)),
+   and result metadata ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15)).
 
 ## Implementation notes backlog
 

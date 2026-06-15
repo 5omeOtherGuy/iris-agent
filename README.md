@@ -8,23 +8,25 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-15): early implementation.** The repository currently contains a text-only interactive REPL backed by an OpenAI Codex Responses provider, a provider tool-call loop, and workspace-scoped built-in tools. The Agent Kernel MVP is not complete yet: approval prompts, streaming terminal output, and session persistence are still planned.
+**Status (2026-06-15): early implementation.** The repository currently contains a text-only interactive REPL backed by an OpenAI Codex Responses provider, a provider tool-call loop, workspace-scoped built-in tools, and basic terminal approval gates. The Agent Kernel MVP is close but not complete yet: streaming terminal output, session persistence, and broader tool-policy UX are still planned.
 
 Implemented today:
 
 - CLI entrypoint in `src/main.rs`.
 - Nexus REPL loop in `src/nexus.rs` with multi-turn conversation state, tool-call execution, and tool-result/error encoding.
+- Terminal approval seam in `src/approval.rs`, with `y`/`yes` allowing mutating tool calls and EOF/anything else denying safely.
 - Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and `Role` types.
-- Workspace-scoped built-in tools in `src/tools.rs`: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, and `hashline_edit`.
+- Workspace-scoped built-in tools under `src/tools/`: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, and `hashline_edit`.
+- Basic approval enforcement for `write`, `edit`, `bash`, and `hashline_edit`, including model-readable denied-call results.
+- Atomic same-directory file replacement for `write`, `edit`, and `hashline_edit`.
 - OpenAI Codex OAuth browser and device-code login plus token loading/refresh in `src/auth/`.
 - OpenAI Codex Responses request/response handling in `src/providers/openai_codex_responses.rs`, including tool schemas and streamed-response parsing.
-- Unit tests for REPL behavior, tool loop behavior, workspace path safety, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
+- Unit tests for REPL behavior, tool loop behavior, approval allow/deny paths, workspace path safety, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
 
 Not implemented yet:
 
-- Approval prompts and denial handling.
-- Streaming output.
-- Session persistence, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
+- Streaming output and persisted session transcripts.
+- Diff previews, persistent approval policies, shared file-observation/stale-file guards, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
 
 ## Running
 
