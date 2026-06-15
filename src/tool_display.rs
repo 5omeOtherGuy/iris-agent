@@ -35,7 +35,10 @@ pub(crate) fn summarize(call: &ToolCall) -> String {
     match call.name.as_str() {
         "read" | "write" | "edit" | "hashline_edit" => file_summary(call),
         "bash" => bash_summary(call),
-        _ => fallback_summary(call), // grep, find, ls, unknown
+        "grep" => grep_summary(call),
+        "find" => find_summary(call),
+        "ls" => ls_summary(call),
+        _ => fallback_summary(call),
     }
 }
 
@@ -99,8 +102,60 @@ fn bash_summary(call: &ToolCall) -> String {
     summary
 }
 
-/// Fallback for read-only tools without a `path` key (grep/find/ls) and unknown
-/// tools: `"{name} {compact_args}"`, the args serialized to one line and capped.
+fn grep_summary(call: &ToolCall) -> String {
+    let pattern = call
+        .arguments
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing pattern>");
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let glob = call
+        .arguments
+        .get("glob")
+        .and_then(Value::as_str)
+        .map(|glob| format!(" ({glob})"))
+        .unwrap_or_default();
+    format!(
+        "grep {} in {}{}",
+        truncate_inline(pattern, MAX_SUMMARY_CHARS),
+        path,
+        glob
+    )
+}
+
+fn find_summary(call: &ToolCall) -> String {
+    let pattern = call
+        .arguments
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing pattern>");
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    format!(
+        "find {} in {}",
+        truncate_inline(pattern, MAX_SUMMARY_CHARS),
+        path
+    )
+}
+
+fn ls_summary(call: &ToolCall) -> String {
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    format!("ls {path}")
+}
+
+/// Fallback for unknown tools: `"{name} {compact_args}"`, the args serialized
+/// to one line and capped.
 fn fallback_summary(call: &ToolCall) -> String {
     let compact = serde_json::to_string(&call.arguments).unwrap_or_default();
     format!(
@@ -252,10 +307,20 @@ mod tests {
     }
 
     #[test]
-    fn summarize_fallback_compact_no_pretty_newlines() {
-        let summary = summarize(&call("grep", json!({ "pattern": "x" })));
-        assert!(summary.starts_with("grep "));
-        assert!(!summary.contains('\n'));
+    fn summarize_search_tools_without_raw_json() {
+        assert_eq!(
+            summarize(&call(
+                "grep",
+                json!({ "pattern": "delta", "path": "tmp", "glob": "*.txt" })
+            )),
+            "grep delta in tmp (*.txt)"
+        );
+        assert_eq!(
+            summarize(&call("find", json!({ "pattern": "*.rs", "path": "src" }))),
+            "find *.rs in src"
+        );
+        assert_eq!(summarize(&call("ls", json!({ "path": "src" }))), "ls src");
+        assert!(!summarize(&call("grep", json!({ "pattern": "x" }))).contains('{'));
     }
 
     #[test]

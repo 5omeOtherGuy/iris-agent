@@ -299,11 +299,7 @@ impl TuiState {
 pub(crate) fn render_frame(frame: &mut Frame<'_>, state: &TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(frame.area());
 
     let mut transcript = state.transcript.join("\n");
@@ -325,8 +321,10 @@ pub(crate) fn render_frame(frame: &mut Frame<'_>, state: &TuiState) {
 
     let input_title = if state.approval.is_some() {
         "Approval"
-    } else {
+    } else if state.status.is_empty() {
         "Prompt"
+    } else {
+        state.status.as_str()
     };
     let input_text = if let Some(pending) = &state.approval {
         format!(
@@ -340,8 +338,6 @@ pub(crate) fn render_frame(frame: &mut Frame<'_>, state: &TuiState) {
         .block(Block::default().title(input_title).borders(Borders::ALL))
         .wrap(Wrap { trim: false });
     frame.render_widget(input, chunks[1]);
-
-    frame.render_widget(Paragraph::new(state.status.clone()), chunks[2]);
 }
 
 fn wrapped_line_count(text: &str, width: usize) -> usize {

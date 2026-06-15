@@ -118,7 +118,7 @@ pub(crate) fn diff_preview(workspace: &Path, name: &str, args: &Value) -> Option
         "write" => render_preview(write::preview(&root, args)),
         "edit" => render_preview(edit::preview(&root, args)),
         "hashline_edit" => render_preview(hashline::preview(&root, args)),
-        "bash" => Some("diff unavailable: bash commands do not have a file diff".to_string()),
+        "bash" => None,
         _ => None,
     }
 }
