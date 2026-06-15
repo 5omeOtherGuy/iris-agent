@@ -5,6 +5,9 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 const MAX_TOOL_ITERATIONS: usize = 8;
+// Display caps for tool output; presentation-only and never affect what is sent to the model.
+const MAX_DISPLAY_LINES: usize = 20;
+const MAX_DISPLAY_CHARS: usize = 2000;
 
 pub(crate) trait ChatProvider {
     // Providers translate their native response format into this Nexus-owned turn shape.
@@ -82,6 +85,7 @@ impl<P: ChatProvider> Agent<P> {
                 writeln!(output, "tool> {}({})", call.name, call.arguments)?;
                 self.messages.push(Message::assistant_tool_call(&call));
                 let result = self.execute_tool(&call);
+                write_tool_outcome(output, &result)?;
                 self.messages.push(Message::tool_result(
                     &call.id,
                     &call.name,
@@ -184,6 +188,40 @@ impl Role {
             Self::Tool => "tool",
         }
     }
+}
+
+// Renders a tool outcome for the user. Display only: the full result still goes to the model.
+fn write_tool_outcome<W: Write>(output: &mut W, result: &Result<String>) -> io::Result<()> {
+    match result {
+        Ok(content) => writeln!(output, "result> {}", truncate_for_display(content)),
+        Err(error) => writeln!(output, "tool error> {error:#}"),
+    }
+}
+
+fn truncate_for_display(text: &str) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+
+    for (index, line) in text.lines().enumerate() {
+        if index >= MAX_DISPLAY_LINES {
+            truncated = true;
+            break;
+        }
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+
+    if out.chars().count() > MAX_DISPLAY_CHARS {
+        out = out.chars().take(MAX_DISPLAY_CHARS).collect();
+        truncated = true;
+    }
+
+    if truncated {
+        out.push_str("\n\u{2026} (truncated)");
+    }
+    out
 }
 
 fn tool_result_json(result: Result<String>) -> String {
@@ -304,6 +342,79 @@ mod tests {
         assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_1"));
         assert!(tool_result.content.contains("hello from file"));
         Ok(())
+    }
+
+    #[test]
+    fn tool_result_is_displayed_to_user() -> Result<()> {
+        let workspace = test_workspace()?;
+        fs::write(workspace.path.join("note.txt"), "hello from file")?;
+        let provider = FakeProvider::new(vec![
+            Ok(AssistantTurn {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "note.txt" }),
+                }],
+            }),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("read note\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        let rendered = String::from_utf8(output)?;
+        assert!(rendered.contains("result>"));
+        assert!(rendered.contains("hello from file"));
+        assert!(errors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(AssistantTurn {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "unknown".to_string(),
+                    arguments: json!({}),
+                }],
+            }),
+            Ok(AssistantTurn::text("recovered")),
+        ]);
+        let mut agent = Agent::new(provider, workspace.path.clone());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+
+        agent.run_with("use bad tool\n/exit\n".as_bytes(), &mut output, &mut errors)?;
+
+        let rendered = String::from_utf8(output)?;
+        assert!(rendered.contains("tool error>"));
+        assert!(rendered.contains("unknown tool: unknown"));
+        assert!(rendered.contains("assistant> recovered"));
+        assert!(errors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_for_display_caps_long_output() {
+        let text = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shown = truncate_for_display(&text);
+        assert!(shown.contains("line 0"));
+        assert!(shown.contains("(truncated)"));
+        assert!(!shown.contains("line 99"));
+    }
+
+    #[test]
+    fn truncate_for_display_keeps_short_output() {
+        assert_eq!(truncate_for_display("short output"), "short output");
     }
 
     #[test]
