@@ -115,7 +115,11 @@ fn file_summary(call: &ToolCall) -> String {
     }
 }
 
-/// Bash: `"bash {cmd}"` where `cmd` is the first line of `command`, truncated to
+/// Bash: `"bash {cmd}"` where `cmd` is the first *meaningful* line of the script.
+/// Shell setup lines (`set ...`, comments/shebangs, a bare `cd ...`) are skipped
+/// so an approval never shows a no-op prefix like `set -e` in place of the real
+/// command. When the script has more than one non-blank line, a `(+N more lines)`
+/// hint is appended so the reviewer knows code is hidden. Truncated to
 /// `MAX_SUMMARY_CHARS`. Appends the timeout only when explicitly provided:
 /// `Some(0)` -> ` (no timeout)`, `Some(n)` -> ` (timeout {n}s)`, `None` -> nothing.
 /// cwd is omitted (bash has no `cwd` arg and runs at the workspace root); the slot
@@ -125,14 +129,50 @@ fn bash_summary(call: &ToolCall) -> String {
     let Some(command) = command else {
         return fallback_summary(call);
     };
-    let first_line = command.lines().next().unwrap_or("");
-    let mut summary = format!("bash {}", truncate_inline(first_line, MAX_SUMMARY_CHARS));
+    let (line, hidden) = bash_display_line(command);
+    let mut summary = format!("bash {}", truncate_inline(line, MAX_SUMMARY_CHARS));
+    if hidden > 0 {
+        let plural = if hidden == 1 { "" } else { "s" };
+        summary.push_str(&format!(" (+{hidden} more line{plural})"));
+    }
     match call.arguments.get("timeout").and_then(Value::as_u64) {
         Some(0) => summary.push_str(" (no timeout)"),
         Some(n) => summary.push_str(&format!(" (timeout {n}s)")),
         None => {}
     }
     summary
+}
+
+/// Choose the first meaningful (already-trimmed) line of a bash script and count
+/// the other non-blank lines hidden from the one-line summary. Skipping shell
+/// setup keeps the approval honest: the reviewer sees the command that does the
+/// work, not a leading `set -e`/comment/`cd`.
+fn bash_display_line(command: &str) -> (&str, usize) {
+    let nonblank: Vec<&str> = command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let line = nonblank
+        .iter()
+        .copied()
+        .find(|line| !is_bash_setup_line(line))
+        .or_else(|| nonblank.first().copied())
+        .unwrap_or("");
+    (line, nonblank.len().saturating_sub(1))
+}
+
+/// Shell setup that should not stand in for the real command in a summary:
+/// comments/shebangs, `set ...` option lines, and a standalone `cd ...` that does
+/// not chain another command.
+fn is_bash_setup_line(line: &str) -> bool {
+    line.starts_with('#')
+        || line == "set"
+        || line.starts_with("set ")
+        || (line.starts_with("cd ")
+            && !line.contains("&&")
+            && !line.contains(';')
+            && !line.contains('|'))
 }
 
 fn grep_summary(call: &ToolCall) -> String {
@@ -319,7 +359,22 @@ mod tests {
         assert!(summary.starts_with("bash first "));
         assert!(!summary.contains('\n'));
         assert!(!summary.contains("second line"));
-        assert!(summary.ends_with('\u{2026}'));
+        // First line is truncated (ellipsis) and the hidden second line is counted.
+        assert!(summary.contains('\u{2026}'));
+        assert!(summary.ends_with("(+1 more line)"));
+    }
+
+    #[test]
+    fn summarize_bash_skips_setup_line_and_counts_hidden() {
+        let command = "set -e\nmkdir -p out\npwd";
+        let summary = summarize(&call("bash", json!({ "command": command, "timeout": 120 })));
+        assert_eq!(summary, "bash mkdir -p out (+2 more lines) (timeout 120s)");
+    }
+
+    #[test]
+    fn summarize_bash_standalone_cd_is_skipped() {
+        let summary = summarize(&call("bash", json!({ "command": "cd src\ncargo build" })));
+        assert_eq!(summary, "bash cargo build (+1 more line)");
     }
 
     #[test]

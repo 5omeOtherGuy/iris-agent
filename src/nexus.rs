@@ -126,7 +126,12 @@ impl<P: ChatProvider> Agent<P> {
                 self.messages.push(Message::assistant_tool_call(&call));
 
                 if crate::tools::requires_approval(&call.name) {
-                    let auto_approved = self.session_allowed.contains(&call.name);
+                    // A destructive call (e.g. `rm`) always re-prompts, even when
+                    // its tool was "always allowed" this session: a blanket bash
+                    // allow must not silently auto-run data-losing commands.
+                    let destructive = crate::tools::is_destructive(&call.name, &call.arguments);
+                    let session_allowed = self.session_allowed.contains(&call.name);
+                    let auto_approved = session_allowed && !destructive;
                     if auto_approved {
                         ui.emit(UiEvent::ToolAutoApproved(call.clone()))?;
                     }
@@ -139,6 +144,12 @@ impl<P: ChatProvider> Agent<P> {
                         })?;
                     }
                     if !auto_approved {
+                        if destructive && session_allowed {
+                            ui.emit(UiEvent::Notice(
+                                "destructive command: approval required even though this tool is allow-always"
+                                    .to_string(),
+                            ))?;
+                        }
                         match ui.request_approval(&call)? {
                             ApprovalDecision::Deny => {
                                 tracing::warn!(tool = %call.name, "tool call denied by user");

@@ -119,6 +119,50 @@ pub(crate) fn requires_approval(name: &str) -> bool {
     matches!(name, "write" | "edit" | "bash")
 }
 
+/// Nexus-owned safety policy: whether a tool call performs a destructive,
+/// data-losing operation that must be re-approved every time, even when the tool
+/// was "always allowed" this session. Currently only `bash` scripts are
+/// classified. The check is deliberately conservative and biased toward
+/// flagging: a false positive costs one extra prompt, a false negative could
+/// auto-run an `rm`.
+pub(crate) fn is_destructive(name: &str, args: &Value) -> bool {
+    match name {
+        "bash" => bash_command_is_destructive(args),
+        _ => false,
+    }
+}
+
+fn bash_command_is_destructive(args: &Value) -> bool {
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let lower = command.to_ascii_lowercase();
+    // Whole-word commands that destroy files/filesystems/devices.
+    const DANGER_TOKENS: &[&str] = &[
+        "rm", "rmdir", "shred", "mkfs", "dd", "truncate", "fdisk", "mkswap", "wipefs",
+    ];
+    let token_danger = lower
+        .split(|c: char| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '(' | ')' | '`'))
+        .any(|token| DANGER_TOKENS.contains(&token));
+    if token_danger {
+        return true;
+    }
+    // Multi-word / flag patterns a single-token scan cannot catch.
+    const DANGER_PHRASES: &[&str] = &[
+        "-delete",
+        "git reset --hard",
+        "git clean",
+        "git push --force",
+        "git push -f",
+        "chmod -r",
+        "chown -r",
+        ":(){",
+        "of=/dev/",
+        "> /dev/sd",
+    ];
+    DANGER_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
 /// Optional pre-approval diff preview for mutating tools.
 pub(crate) fn diff_preview(workspace: &Path, name: &str, args: &Value) -> Option<String> {
     let root = match path::workspace_root(workspace) {
@@ -273,6 +317,43 @@ mod tests {
                 "{name} should not be gated"
             );
         }
+    }
+
+    #[test]
+    fn is_destructive_flags_dangerous_bash() {
+        for cmd in [
+            "rm -rf foo",
+            "mkdir x && rm x",
+            "find . -delete",
+            "git reset --hard",
+            "sudo rmdir d",
+            "echo x | dd of=/dev/sda",
+        ] {
+            assert!(
+                super::is_destructive("bash", &json!({ "command": cmd })),
+                "{cmd} should be destructive"
+            );
+        }
+    }
+
+    #[test]
+    fn is_destructive_allows_benign_bash_and_other_tools() {
+        for cmd in [
+            "echo hi",
+            "ls -la",
+            "mkdir -p out",
+            "pwd && date",
+            "cat file.txt",
+        ] {
+            assert!(
+                !super::is_destructive("bash", &json!({ "command": cmd })),
+                "{cmd} should be benign"
+            );
+        }
+        assert!(!super::is_destructive(
+            "write",
+            &json!({ "path": "a", "content": "x" })
+        ));
     }
 
     #[test]
