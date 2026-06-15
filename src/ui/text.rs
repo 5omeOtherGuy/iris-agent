@@ -129,16 +129,26 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
 
     fn request_approval(&mut self, call: &ToolCall) -> Result<ApprovalDecision> {
         self.finish_assistant_stream()?;
-        write!(self.out, "{}", crate::tool_display::approval_prompt(call))?;
-        self.out.flush()?;
+        loop {
+            write!(self.out, "{}", crate::tool_display::approval_prompt(call))?;
+            self.out.flush()?;
 
-        let mut line = String::new();
-        if self.input.read_line(&mut line)? == 0 {
-            writeln!(self.out)?;
-            return Ok(ApprovalDecision::Deny);
+            let mut line = String::new();
+            if self.input.read_line(&mut line)? == 0 {
+                writeln!(self.out)?;
+                return Ok(ApprovalDecision::Deny);
+            }
+
+            let trimmed = line.trim();
+            if matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "" | "y" | "yes" | "n" | "no"
+            ) {
+                return Ok(parse_decision(&line));
+            }
+
+            writeln!(self.out, "please answer y or n")?;
         }
-
-        Ok(parse_decision(&line))
     }
 }
 
@@ -176,6 +186,26 @@ mod tests {
         let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
 
         assert_eq!(ui.request_approval(&call("write"))?, ApprovalDecision::Deny);
+        Ok(())
+    }
+
+    #[test]
+    fn approval_reprompts_after_pasted_prompt_lines() -> Result<()> {
+        let mut ui = TextUi::new(
+            "leftover prompt line\ny\n".as_bytes(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            ui.request_approval(&call("write"))?,
+            ApprovalDecision::Allow
+        );
+
+        let (_, out, _) = ui.into_parts();
+        let rendered = String::from_utf8(out)?;
+        assert!(rendered.contains("please answer y or n"));
+        assert_eq!(rendered.matches("approve write note.txt?").count(), 2);
         Ok(())
     }
 
