@@ -4,9 +4,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::approval::ApprovalDecision;
-use crate::ui::{Ui, UiEvent};
-
 // Safety valve against a runaway tool loop. Each round-trip is one model
 // response; the loop normally ends earlier when the model stops calling tools.
 // Set high so legitimate multi-step tasks complete, and enforced gracefully
@@ -15,6 +12,63 @@ const MAX_TOOL_ROUNDTRIPS: usize = 50;
 
 pub(crate) trait TurnSink {
     fn on_text_delta(&mut self, delta: &str);
+}
+
+/// Outcome of an approval review for a single tool call. Provider/UI-neutral so
+/// the core loop owns the approval policy without depending on any front-end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalDecision {
+    /// Allow this one call.
+    Allow,
+    /// Allow this call and auto-approve later calls of the same tool for the
+    /// rest of the session. Nexus owns and enforces that session policy.
+    AllowAlways,
+    /// Refuse this call. Default for empty/invalid/EOF input (safe-by-default).
+    Deny,
+}
+
+/// The semantic events the loop emits during a turn. Provider- and UI-neutral:
+/// a front-end maps these onto its own rendering. Mirrors pi's `AgentEvent`
+/// union (`packages/agent/src/types.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentEvent {
+    AssistantText(String),
+    AssistantTextDelta(String),
+    AssistantTextEnd(String),
+    ToolProposed(ToolCall),
+    /// A gated tool was auto-approved by the session allow-policy. Emitted by
+    /// Nexus, never inferred by a front-end, so the policy stays Nexus-owned.
+    ToolAutoApproved(ToolCall),
+    DiffPreview {
+        call: ToolCall,
+        diff: String,
+    },
+    ToolDenied(ToolCall),
+    ToolResult {
+        call: ToolCall,
+        content: String,
+    },
+    ToolError {
+        call: ToolCall,
+        message: String,
+    },
+    Notice(String),
+    TurnComplete,
+}
+
+/// Fire-and-forget event sink the loop emits to. `&self` with no control-flow
+/// return; errors only propagate. Mirrors pi's standalone `AgentEventSink`
+/// passed as a separate argument, not a config field.
+pub(crate) trait AgentObserver {
+    fn on_event(&self, event: AgentEvent) -> Result<()>;
+}
+
+/// Request/response approval gate. `&self`; the loop branches on the returned
+/// decision to control execution. Mirrors pi's `beforeToolCall` config hook,
+/// which the loop inspects via `{ block }` -- a seam distinct from the event
+/// sink.
+pub(crate) trait ApprovalGate {
+    fn review(&self, call: &ToolCall) -> Result<ApprovalDecision>;
 }
 
 pub(crate) trait ChatProvider {
@@ -30,9 +84,10 @@ pub(crate) struct Agent<P> {
     // Session approval policy: tool names the user chose to "always" allow.
     // Owned and enforced here in Nexus, not in the UI, so a front-end can never
     // silently widen what runs without approval. Granularity is per tool name.
-    // ponytail: per-tool-name always-allow; an "always" on `bash` authorizes any
-    // later shell command this session. Upgrade path = per-exact-command keys
-    // (e.g. `bash:<cmd>`) once a real audit trail exists (roadmap #14).
+    // ponytail: per-tool-name always-allow. `bash` is excluded on purpose -- an
+    // "always" on bash never sticks, so every shell command re-prompts. Upgrade
+    // path = per-exact-command keys (e.g. `bash:<cmd>`) once a real audit trail
+    // exists (roadmap #14).
     session_allowed: HashSet<String>,
     // Optional transcript persistence. When attached, messages are appended to
     // the JSONL log at the end of each turn (`persisted` tracks how many of
@@ -60,13 +115,18 @@ impl<P: ChatProvider> Agent<P> {
         self.session = Some(log);
     }
 
-    pub(crate) fn submit_turn(&mut self, prompt: &str, ui: &mut dyn Ui) -> Result<()> {
+    pub(crate) fn submit_turn(
+        &mut self,
+        prompt: &str,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+    ) -> Result<()> {
         let span = tracing::info_span!("turn");
         let _guard = span.enter();
 
         self.messages.push(Message::user(prompt));
         crate::signals::reset();
-        let result = self.complete_turn(ui);
+        let result = self.complete_turn(obs, gate);
         // Persist whatever the turn produced even when it ended in an error, so
         // the transcript records the user prompt and any tool work. Persistence
         // is best-effort: a write failure is logged, never fatal to the session.
@@ -89,7 +149,7 @@ impl<P: ChatProvider> Agent<P> {
         }
     }
 
-    fn complete_turn(&mut self, ui: &mut dyn Ui) -> Result<()> {
+    fn complete_turn(&mut self, obs: &dyn AgentObserver, gate: &dyn ApprovalGate) -> Result<()> {
         for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
             if crate::signals::interrupted() {
                 tracing::info!(roundtrips = roundtrip, "turn interrupted by user");
@@ -99,13 +159,13 @@ impl<P: ChatProvider> Agent<P> {
                     // user messages (rejected by some providers).
                     self.messages.pop();
                 }
-                ui.emit(UiEvent::Notice(
+                obs.on_event(AgentEvent::Notice(
                     "interrupted; send another message to continue.".to_string(),
                 ))?;
-                ui.emit(UiEvent::TurnComplete)?;
+                obs.on_event(AgentEvent::TurnComplete)?;
                 return Ok(());
             }
-            let mut sink = UiTurnSink::new(ui);
+            let mut sink = ObserverTurnSink::new(obs);
             let turn = self.provider.respond(&self.messages, &mut sink)?;
             let saw_text_delta = sink.saw_text_delta;
             let stream_error = sink.error.take();
@@ -116,18 +176,18 @@ impl<P: ChatProvider> Agent<P> {
 
             if let Some(text) = turn.text.as_deref().filter(|text| !text.is_empty()) {
                 if saw_text_delta {
-                    ui.emit(UiEvent::AssistantTextEnd(text.to_string()))?;
+                    obs.on_event(AgentEvent::AssistantTextEnd(text.to_string()))?;
                 } else {
-                    ui.emit(UiEvent::AssistantText(text.to_string()))?;
+                    obs.on_event(AgentEvent::AssistantText(text.to_string()))?;
                 }
                 self.messages.push(Message::assistant(text));
             } else if saw_text_delta {
-                ui.emit(UiEvent::AssistantTextEnd(String::new()))?;
+                obs.on_event(AgentEvent::AssistantTextEnd(String::new()))?;
             }
 
             if turn.tool_calls.is_empty() {
                 tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
-                ui.emit(UiEvent::TurnComplete)?;
+                obs.on_event(AgentEvent::TurnComplete)?;
                 return Ok(());
             }
 
@@ -141,17 +201,17 @@ impl<P: ChatProvider> Agent<P> {
                 );
                 for call in &turn.tool_calls {
                     self.messages.push(Message::assistant_tool_call(call));
-                    ui.emit(UiEvent::ToolDenied(call.clone()))?;
+                    obs.on_event(AgentEvent::ToolDenied(call.clone()))?;
                     self.messages.push(Message::tool_result(
                         &call.id,
                         &call.name,
                         &denied_tool_result_json(),
                     ));
                 }
-                ui.emit(UiEvent::Notice(
+                obs.on_event(AgentEvent::Notice(
                     "interrupted; send another message to continue.".to_string(),
                 ))?;
-                ui.emit(UiEvent::TurnComplete)?;
+                obs.on_event(AgentEvent::TurnComplete)?;
                 return Ok(());
             }
 
@@ -166,27 +226,27 @@ impl<P: ChatProvider> Agent<P> {
                     let session_allowed = self.session_allowed.contains(&call.name);
                     let auto_approved = session_allowed && !destructive && call.name != "bash";
                     if auto_approved {
-                        ui.emit(UiEvent::ToolAutoApproved(call.clone()))?;
+                        obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
                     }
                     if let Some(diff) =
                         crate::tools::diff_preview(&self.workspace, &call.name, &call.arguments)
                     {
-                        ui.emit(UiEvent::DiffPreview {
+                        obs.on_event(AgentEvent::DiffPreview {
                             call: call.clone(),
                             diff,
                         })?;
                     }
                     if !auto_approved {
                         if destructive && session_allowed {
-                            ui.emit(UiEvent::Notice(
+                            obs.on_event(AgentEvent::Notice(
                                 "destructive command: approval required even though this tool is allow-always"
                                     .to_string(),
                             ))?;
                         }
-                        match ui.request_approval(&call)? {
+                        match gate.review(&call)? {
                             ApprovalDecision::Deny => {
                                 tracing::warn!(tool = %call.name, "tool call denied by user");
-                                ui.emit(UiEvent::ToolDenied(call.clone()))?;
+                                obs.on_event(AgentEvent::ToolDenied(call.clone()))?;
                                 self.messages.push(Message::tool_result(
                                     &call.id,
                                     &call.name,
@@ -196,7 +256,7 @@ impl<P: ChatProvider> Agent<P> {
                             }
                             ApprovalDecision::AllowAlways => {
                                 if call.name == "bash" {
-                                    ui.emit(UiEvent::Notice(
+                                    obs.on_event(AgentEvent::Notice(
                                         "bash always-allow is disabled; shell commands require approval each time."
                                             .to_string(),
                                     ))?;
@@ -209,17 +269,17 @@ impl<P: ChatProvider> Agent<P> {
                         }
                     }
                 } else {
-                    ui.emit(UiEvent::ToolProposed(call.clone()))?;
+                    obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
                 }
 
                 let result = self.execute_tool(&call);
                 tracing::info!(tool = %call.name, ok = result.is_ok(), "tool executed");
                 match &result {
-                    Ok(output) => ui.emit(UiEvent::ToolResult {
+                    Ok(output) => obs.on_event(AgentEvent::ToolResult {
                         call: call.clone(),
                         content: output.content.clone(),
                     })?,
-                    Err(error) => ui.emit(UiEvent::ToolError {
+                    Err(error) => obs.on_event(AgentEvent::ToolError {
                         call: call.clone(),
                         message: format!("{error:#}"),
                     })?,
@@ -240,10 +300,10 @@ impl<P: ChatProvider> Agent<P> {
         // tools. End the turn gracefully so completed tool work and
         // conversation state are preserved and the REPL keeps running; this is
         // a soft limit, not a provider failure.
-        ui.emit(UiEvent::Notice(format!(
+        obs.on_event(AgentEvent::Notice(format!(
             "stopped after {MAX_TOOL_ROUNDTRIPS} tool round-trips; send another message to continue."
         )))?;
-        ui.emit(UiEvent::TurnComplete)?;
+        obs.on_event(AgentEvent::TurnComplete)?;
         Ok(())
     }
 
@@ -257,27 +317,32 @@ impl<P: ChatProvider> Agent<P> {
     }
 }
 
-struct UiTurnSink<'a> {
-    ui: &'a mut dyn Ui,
+/// Forwards provider text deltas to the observer as `AssistantTextDelta`.
+/// Stashes the first emit error and stops emitting, so a front-end failure
+/// surfaces once without aborting the provider stream mid-flight.
+struct ObserverTurnSink<'a> {
+    obs: &'a dyn AgentObserver,
     saw_text_delta: bool,
     error: Option<anyhow::Error>,
 }
 
-impl<'a> UiTurnSink<'a> {
-    fn new(ui: &'a mut dyn Ui) -> Self {
+impl<'a> ObserverTurnSink<'a> {
+    fn new(obs: &'a dyn AgentObserver) -> Self {
         Self {
-            ui,
+            obs,
             saw_text_delta: false,
             error: None,
         }
     }
 }
 
-impl TurnSink for UiTurnSink<'_> {
+impl TurnSink for ObserverTurnSink<'_> {
     fn on_text_delta(&mut self, delta: &str) {
         self.saw_text_delta = true;
         if self.error.is_none()
-            && let Err(error) = self.ui.emit(UiEvent::AssistantTextDelta(delta.to_string()))
+            && let Err(error) = self
+                .obs
+                .on_event(AgentEvent::AssistantTextDelta(delta.to_string()))
         {
             self.error = Some(error);
         }

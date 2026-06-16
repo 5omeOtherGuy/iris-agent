@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::nexus::{Agent, ChatProvider};
-use crate::ui::{Ui, UiEvent, is_exit_command};
+use crate::ui::{Ui, UiBridge, UiEvent, is_exit_command};
 
 pub(crate) fn run_session<P: ChatProvider>(agent: &mut Agent<P>, ui: &mut dyn Ui) -> Result<()> {
     ui.emit(UiEvent::SessionStarted)?;
@@ -15,7 +15,14 @@ pub(crate) fn run_session<P: ChatProvider>(agent: &mut Agent<P>, ui: &mut dyn Ui
             break;
         }
 
-        if let Err(error) = agent.submit_turn(prompt, ui) {
+        // One bridge per turn backs both Nexus seams (observer + approval gate)
+        // from two shared borrows; it drops here so `ui` is free for the
+        // session-driver events below.
+        let result = {
+            let bridge = UiBridge::new(ui);
+            agent.submit_turn(prompt, &bridge, &bridge)
+        };
+        if let Err(error) = result {
             ui.emit(UiEvent::from_turn_error(&error))?;
         }
     }

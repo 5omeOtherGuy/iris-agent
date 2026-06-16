@@ -1,16 +1,8 @@
-//! Approval decision values shared between Nexus enforcement and UI front-ends.
+//! Terminal-input parsing for approval decisions (Tier 3). The decision enum
+//! itself lives in Nexus (`crate::nexus::ApprovalDecision`), the enforcement
+//! point; this module only translates a typed line into that decision.
 
-/// Outcome of an approval review for a single tool call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApprovalDecision {
-    /// Allow this one call.
-    Allow,
-    /// Allow this call and auto-approve later calls of the same tool for the
-    /// rest of the session. Nexus owns and enforces that session policy.
-    AllowAlways,
-    /// Refuse this call. Default for empty/invalid/EOF input (safe-by-default).
-    Deny,
-}
+use crate::nexus::ApprovalDecision;
 
 /// Parse a terminal decision line. `y`/`yes` allow once; `a`/`always` allow for
 /// the session; any other input (including empty/EOF) denies (safe-by-default).

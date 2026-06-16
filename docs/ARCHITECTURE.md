@@ -50,10 +50,10 @@ tools and approval plug into.
 | Model loop (turn → provider → tool → repeat, bounded round-trips) | `nexus.rs` |
 | Provider contract `ChatProvider` | `nexus.rs` |
 | Message contracts: `Message`, `Role`, `ToolCall`, `AssistantTurn` | `nexus.rs` |
-| Event stream sink (text deltas today; full agent-event stream is the target) | `nexus.rs` (`TurnSink`) |
+| Agent-event stream + sink (`AgentEvent`, `AgentObserver`, `TurnSink` for deltas) | `nexus.rs` |
 | `Tool` trait (the contract — not the implementations) | _target: new in core_ |
 | `ToolRegistry` / `ToolPolicy` (registration, dispatch order, identity, approval enforcement) | _target: new in core_ |
-| `BeforeToolCall` approval-gate hook (the contract — not the UX) | _target: new in core_ |
+| `ApprovalGate` approval hook + `ApprovalDecision` (the contract — not the UX) | `nexus.rs` |
 | Boundary errors, exit codes, tracing | `errors.rs`, `telemetry.rs` |
 
 Must **not** import: anything in Tier 2 or Tier 3 (no `ui`, no `approval` UX, no
@@ -93,7 +93,7 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 |---|---|
 | CLI entrypoint, command dispatch, session driver | `main.rs`, `cli.rs` |
 | Terminal I/O behind the `Ui` trait | `ui/`, `tool_display.rs` |
-| Approval prompt UX (the `BeforeToolCall` impl) | `approval.rs` |
+| Approval prompt UX + `ApprovalGate`/`AgentObserver` adapter (`UiBridge`); decision parsing | `ui/` (`UiBridge`, `request_approval`), `approval.rs` (`parse_decision`) |
 | Tool implementations: `read` `write` `edit` `bash` `grep` `find` `ls` | `tools/*` (impls) |
 | Plugin runtime + registration, if a plugin system is ever added: executor (WASM/Extism or subprocess), manifest parsing, registry wiring | _exploratory (issue #18)_ |
 | Trusted approval-preview diff rendering | `tools/mod.rs` (`diff_preview`) → Tier 3 |
@@ -107,15 +107,17 @@ provider-abstraction the adapters implement against).
 
 ## Current vs target
 
-The tiers above are an ownership target. Today the loop in `nexus.rs` points
-*outward*: it imports `crate::ui`, `crate::approval::ApprovalDecision`, and
-calls `crate::tools::{dispatch, requires_approval, is_destructive,
-diff_preview}` directly. Four cuts invert those dependencies to reach the split:
+The tiers above are an ownership target. The loop in `nexus.rs` no longer
+imports `crate::ui` or `crate::approval` (Step A, done), but it still calls
+`crate::tools::{dispatch, requires_approval, is_destructive, diff_preview}`
+directly. Four cuts invert those dependencies to reach the split:
 
-1. **Loop emits events, not UI calls.** Generalize `TurnSink` into the full
-   agent-event stream; remove `use crate::ui` from the loop. The CLI subscribes.
-2. **Approval becomes a hook.** Define a `BeforeToolCall` gate trait in core; the
-   CLI supplies the prompting implementation. The loop only calls the gate.
+1. **Loop emits events, not UI calls.** _(done)_ The loop emits a Tier-1
+   `AgentEvent` stream to an `AgentObserver`; `crate::ui` is gone from the loop.
+   Tier 3 maps `AgentEvent` to `UiEvent` in `UiBridge`.
+2. **Approval becomes a hook.** _(done)_ The `ApprovalGate` trait lives in core;
+   the CLI supplies the prompting implementation via `UiBridge`. The loop only
+   calls `gate.review(...)`, and the approval policy stays Nexus-owned.
 3. **Tools become injected.** Define a `Tool` trait and a `ToolRegistry` in
    core; build the registry at Tier 3 and inject it into the agent instead of
    the hardcoded `crate::tools::dispatch` name-match. Tool impls move to Tier 3.

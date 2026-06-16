@@ -1,14 +1,18 @@
+use std::cell::RefCell;
+
 use anyhow::Result;
 
-use crate::approval::ApprovalDecision;
-use crate::nexus::ToolCall;
+use crate::nexus::{AgentEvent, AgentObserver, ApprovalDecision, ApprovalGate, ToolCall};
 
 pub(crate) mod text;
 
-/// Front-end seam between Nexus and the terminal UI.
+/// Terminal front-end seam (Tier 3). Implementations own all terminal I/O.
 ///
-/// Implementations own all terminal I/O. Nexus drives turns and approval policy,
-/// but reads prompts and requests approval only through this trait.
+/// Nexus does not depend on this trait: it emits `AgentEvent`s to an
+/// `AgentObserver` and consults an `ApprovalGate`. `UiBridge` adapts a `Ui`
+/// onto those two Nexus seams. The CLI session driver still reads prompts and
+/// renders session-driver events (`SessionStarted`/`TurnError`) through `Ui`
+/// directly.
 pub(crate) trait Ui {
     /// Return the next user prompt, or `None` for EOF/end of session.
     fn next_prompt(&mut self) -> Result<Option<String>>;
@@ -80,4 +84,47 @@ impl UiEvent {
 
 pub(crate) fn is_exit_command(prompt: &str) -> bool {
     matches!(prompt.trim(), "/exit" | "/quit")
+}
+
+/// Tier-3 adapter that backs both Nexus front-end seams with a single `Ui`.
+///
+/// Nexus takes `AgentObserver` and `ApprovalGate` as two independent `&self`
+/// seams; the terminal `Ui` needs `&mut self`. `RefCell` carries that
+/// mutability so one `Ui` can serve both seams from two shared borrows without
+/// aliasing -- the Rust analogue of pi's shared captured closure state.
+pub(crate) struct UiBridge<'a> {
+    ui: RefCell<&'a mut dyn Ui>,
+}
+
+impl<'a> UiBridge<'a> {
+    pub(crate) fn new(ui: &'a mut dyn Ui) -> Self {
+        Self {
+            ui: RefCell::new(ui),
+        }
+    }
+}
+
+impl AgentObserver for UiBridge<'_> {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        let event = match event {
+            AgentEvent::AssistantText(text) => UiEvent::AssistantText(text),
+            AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
+            AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),
+            AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
+            AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),
+            AgentEvent::DiffPreview { call, diff } => UiEvent::DiffPreview { call, diff },
+            AgentEvent::ToolDenied(call) => UiEvent::ToolDenied(call),
+            AgentEvent::ToolResult { call, content } => UiEvent::ToolResult { call, content },
+            AgentEvent::ToolError { call, message } => UiEvent::ToolError { call, message },
+            AgentEvent::Notice(message) => UiEvent::Notice(message),
+            AgentEvent::TurnComplete => UiEvent::TurnComplete,
+        };
+        self.ui.borrow_mut().emit(event)
+    }
+}
+
+impl ApprovalGate for UiBridge<'_> {
+    fn review(&self, call: &ToolCall) -> Result<ApprovalDecision> {
+        self.ui.borrow_mut().request_approval(call)
+    }
 }
