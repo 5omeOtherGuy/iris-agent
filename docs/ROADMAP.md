@@ -88,11 +88,11 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 | Tool | Tier today | Best-in-class holder | Issue |
 | --- | --- | --- | --- |
 | `edit` | Claude-compatible exact-string + replace_all + atomic writes | RooCode (fuzzy) / Codex (V4A) | [#4](https://github.com/5omeOtherGuy/iris-agent/issues/4) |
-| `grep` | Standard | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
+| `grep` | Native: ripgrep library, no `rg` binary | Claude Code / omp | [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6) |
 | `write` | Standard + atomic writes | Claude Code | [#5](https://github.com/5omeOtherGuy/iris-agent/issues/5) |
 | `ls` | Standard | commoditized | [#8](https://github.com/5omeOtherGuy/iris-agent/issues/8) |
 | `read` | Standard text read | Claude Code (multimodal; deferred) | [#2](https://github.com/5omeOtherGuy/iris-agent/issues/2) |
-| `find` | Standard, wraps `fd` | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
+| `find` | Native: `ignore` + `globset`, no `fd` binary | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
 | `bash` | Hardened: kernel sandbox + persistent sessions + background jobs + force-quit reaping | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
 
 Execution order (by impact/effort, independent of the milestone sequence):
@@ -130,13 +130,12 @@ Execution order (by impact/effort, independent of the milestone sequence):
      still escape the group; finalized job output is lossy UTF-8 at
      poll/ring boundaries; Landlock fail-closed (`Required`) mode is the
      documented upgrade path.
-   - `find`/`grep`: keep wrapping `fd`/`rg`. These are the same engines the
-     mature tools (Pi, etc.) wrap rather than reimplement; matching their
-     behavior natively means an ongoing parity burden (smart-case, glob
-     semantics, parallel walk, binary detection) for no real gain. `rg`/`fd`
-     are accepted runtime dependencies. The open work is packaging, not a
-     rewrite: a clear "not installed" error today, and optionally an on-demand
-     download manager later (Pi's approach) —
+   - `find`/`grep`: **shipped native** (PR #19). `grep` searches through the
+     ripgrep library and `find` walks via `ignore` + `globset`, dropping the
+     `rg`/`fd` binary dependencies and the missing-binary failure mode. This
+     reverses the earlier "keep wrapping `fd`/`rg`" call: going native removed
+     the runtime-dependency/packaging problem outright rather than taking on a
+     parity burden, and reuses the same upstream engines as libraries —
      [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7),
      [#6](https://github.com/5omeOtherGuy/iris-agent/issues/6).
 3. **Tier 3 — parity polish.** `edit` `replace_all` + helpful failure output
@@ -168,8 +167,8 @@ Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
 on Claude Code's exact-string contract, a shared read-before-mutate stale-file
 guard, and a structured `ToolOutput` result/metadata contract. The honest gaps
 are `bash` (large), handle-backed large outputs (medium), persistent approval policy/risk
-labels (medium; diff preview already shipped), and `rg`/`fd` packaging
-(clear missing-binary errors, optional on-demand download; small).
+labels (medium; diff preview already shipped). The `rg`/`fd` packaging gap is
+closed: `grep`/`find` are now native libraries with no external binary.
 
 ## Provider-specific tools
 
