@@ -8,9 +8,9 @@
 //! - The model-facing contract (tool name, description, and JSON Schema) is
 //!   copied verbatim from pi so the wire surface matches.
 //! - Behavior is reimplemented for Iris's synchronous, std-only runtime rather
-//!   than pi's async runtime. `grep` shells out to `ripgrep` (`rg`) and `find`
-//!   shells out to `fd`/`fdfind`, exactly like pi, and report the same
-//!   "not available" guidance when those binaries are missing.
+//!   than pi's async runtime. `grep` searches via the ripgrep library crates
+//!   (`grep`/`ignore`), so it needs no external binary; `find` still shells out
+//!   to `fd`/`fdfind` and reports "not available" guidance when it is missing.
 //! - `edit` follows Claude Code's exact-string contract
 //!   (`file_path`/`old_string`/`new_string`/`replace_all`).
 //!
