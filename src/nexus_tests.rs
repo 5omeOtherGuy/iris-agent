@@ -1,10 +1,12 @@
 use super::*;
 use crate::cli::run_session;
+use crate::tools::ToolState;
 use crate::ui::text::TextUi;
+use crate::wayland::Harness;
 use anyhow::anyhow;
 use std::cell::{Cell, RefCell};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct FakeProvider {
@@ -44,17 +46,28 @@ impl ChatProvider for FakeProvider {
 }
 
 fn run_text_session<P: ChatProvider>(
-    agent: &mut Agent<P>,
+    harness: &mut Harness<P>,
     input: &[u8],
     output: &mut Vec<u8>,
     errors: &mut Vec<u8>,
 ) -> Result<()> {
     let mut ui = TextUi::new(input, Vec::new(), Vec::new());
-    run_session(agent, &mut ui)?;
+    run_session(harness, &mut ui)?;
     let (_, out, err) = ui.into_parts();
     *output = out;
     *errors = err;
     Ok(())
+}
+
+/// Wrap a bare agent in a Tier-2 harness over `workspace` with no transcript
+/// log -- the in-memory setup the loop/approval/tool tests run against.
+fn test_harness<P: ChatProvider>(provider: P, workspace: &Path, tools: Tools) -> Harness<P> {
+    Harness::new(
+        Agent::new(provider, tools),
+        workspace.to_path_buf(),
+        ToolState::new(),
+        None,
+    )
 }
 
 /// Front-end stub backing both Nexus seams: records every `AgentEvent` and
@@ -103,14 +116,10 @@ fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
         Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
-    agent.submit_turn("read note", &frontend, &frontend)?;
+    harness.submit_turn("read note", &frontend, &frontend)?;
 
     let events = frontend.events.borrow();
     assert!(matches!(events[0], AgentEvent::ToolProposed(_)));
@@ -135,14 +144,10 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
-    agent.submit_turn("write it", &frontend, &frontend)?;
+    harness.submit_turn("write it", &frontend, &frontend)?;
 
     // The diff preview is emitted before the gate is consulted.
     let at_review = frontend.events_at_review.borrow();
@@ -168,14 +173,10 @@ fn malformed_denial_skips_diff_preview() -> Result<()> {
         Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
-    agent.submit_turn("write it", &frontend, &frontend)?;
+    harness.submit_turn("write it", &frontend, &frontend)?;
 
     let events = frontend.events.borrow();
     assert!(
@@ -203,16 +204,12 @@ fn repl_keeps_conversation_across_turns() -> Result<()> {
         Ok(AssistantTurn::text("hello")),
         Ok(AssistantTurn::text("goodbye")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "hi\nbye\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -220,10 +217,10 @@ fn repl_keeps_conversation_across_turns() -> Result<()> {
 
     assert!(String::from_utf8(output)?.contains("assistant> hello"));
     assert!(errors.is_empty());
-    assert_eq!(agent.provider.seen.borrow().len(), 2);
-    assert_eq!(agent.provider.seen.borrow()[1][0].content, "hi");
-    assert_eq!(agent.provider.seen.borrow()[1][1].content, "hello");
-    assert_eq!(agent.provider.seen.borrow()[1][2].content, "bye");
+    assert_eq!(harness.agent.provider.seen.borrow().len(), 2);
+    assert_eq!(harness.agent.provider.seen.borrow()[1][0].content, "hi");
+    assert_eq!(harness.agent.provider.seen.borrow()[1][1].content, "hello");
+    assert_eq!(harness.agent.provider.seen.borrow()[1][2].content, "bye");
     Ok(())
 }
 
@@ -256,16 +253,16 @@ impl ChatProvider for DeltaProvider {
 #[test]
 fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
     let workspace = test_workspace()?;
-    let mut agent = Agent::new(
+    let mut harness = test_harness(
         DeltaProvider,
-        workspace.path.clone(),
+        &workspace.path,
         crate::tools::built_in_tools(),
     );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "hello\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -277,24 +274,24 @@ fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
         String::from_utf8(output)?.ends_with("Type /exit to quit.\niris> assistant> Hello\niris> ")
     );
     assert!(errors.is_empty());
-    assert_eq!(agent.messages.len(), 2);
-    assert_eq!(agent.messages[1], Message::assistant("Hello"));
+    assert_eq!(harness.agent.messages.len(), 2);
+    assert_eq!(harness.agent.messages[1], Message::assistant("Hello"));
     Ok(())
 }
 
 #[test]
 fn repl_reports_auth_errors_with_login_hint() -> Result<()> {
     let workspace = test_workspace()?;
-    let mut agent = Agent::new(
+    let mut harness = test_harness(
         AuthFailProvider,
-        workspace.path.clone(),
+        &workspace.path,
         crate::tools::built_in_tools(),
     );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "hello\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -311,16 +308,12 @@ fn repl_reports_auth_errors_with_login_hint() -> Result<()> {
 fn repl_reports_provider_errors_and_continues() -> Result<()> {
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![Err("boom"), Ok(AssistantTurn::text("recovered"))]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "fail\nagain\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -328,10 +321,10 @@ fn repl_reports_provider_errors_and_continues() -> Result<()> {
 
     assert!(String::from_utf8(errors)?.contains("provider error: boom"));
     assert!(String::from_utf8(output)?.contains("assistant> recovered"));
-    assert_eq!(agent.messages.len(), 3);
-    assert_eq!(agent.messages[0].content, "fail");
-    assert_eq!(agent.messages[1].content, "again");
-    assert_eq!(agent.messages[2].content, "recovered");
+    assert_eq!(harness.agent.messages.len(), 3);
+    assert_eq!(harness.agent.messages[0].content, "fail");
+    assert_eq!(harness.agent.messages[1].content, "again");
+    assert_eq!(harness.agent.messages[2].content, "recovered");
     Ok(())
 }
 
@@ -350,16 +343,12 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
         }),
         Ok(AssistantTurn::text("The file says hello from file.")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "read note\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -367,7 +356,7 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
 
     assert!(errors.is_empty());
     assert!(String::from_utf8(output)?.contains("assistant> The file says hello from file."));
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     assert_eq!(seen.len(), 2);
     let tool_result = seen[1].last().unwrap();
     assert_eq!(tool_result.role, Role::Tool);
@@ -394,16 +383,12 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "read note\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -431,16 +416,12 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
         }),
         Ok(AssistantTurn::text("recovered")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "use bad tool\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -469,16 +450,12 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
         })
     };
     let provider = FakeProvider::new((0..MAX_TOOL_ROUNDTRIPS).map(|_| repeated_call()).collect());
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "read forever\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -491,7 +468,10 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
     assert!(errors.is_empty());
     // The provider is consulted exactly the capped number of times, then
     // the loop stops without one extra round-trip.
-    assert_eq!(agent.provider.seen.borrow().len(), MAX_TOOL_ROUNDTRIPS);
+    assert_eq!(
+        harness.agent.provider.seen.borrow().len(),
+        MAX_TOOL_ROUNDTRIPS
+    );
     Ok(())
 }
 
@@ -509,23 +489,22 @@ fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
         }),
         Ok(AssistantTurn::text("I could not use that tool.")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "use bad tool\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
     assert!(errors.is_empty());
-    assert_tool_error_contains(&agent.provider.seen.borrow()[1], "unknown tool: unknown");
+    assert_tool_error_contains(
+        &harness.agent.provider.seen.borrow()[1],
+        "unknown tool: unknown",
+    );
     Ok(())
 }
 
@@ -540,22 +519,21 @@ fn unknown_tool_resolution_yields_unknown_tool_error() -> Result<()> {
         Ok(single_call_turn("ghost", json!({}))),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "use ghost\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
-    assert_tool_error_contains(&agent.provider.seen.borrow()[1], "unknown tool: ghost");
+    assert_tool_error_contains(
+        &harness.agent.provider.seen.borrow()[1],
+        "unknown tool: ghost",
+    );
     Ok(())
 }
 
@@ -585,23 +563,23 @@ fn injected_custom_tool_is_resolved_and_executed() -> Result<()> {
         Ok(single_call_turn("marker", json!({}))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
+    let mut harness = test_harness(
         provider,
-        workspace.path.clone(),
+        &workspace.path,
         Tools::new(vec![Box::new(MarkerTool)]),
     );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "use marker\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
     assert!(errors.is_empty());
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     let tool_result = seen[1].last().unwrap();
     assert_eq!(tool_result.role, Role::Tool);
     assert!(tool_result.content.contains("marker-tool-ran"));
@@ -622,16 +600,12 @@ fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
         }),
         Ok(AssistantTurn::text("The read call was malformed.")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "read malformed\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -639,7 +613,7 @@ fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
 
     assert!(errors.is_empty());
     assert_tool_error_contains(
-        &agent.provider.seen.borrow()[1],
+        &harness.agent.provider.seen.borrow()[1],
         "read tool arguments must include path",
     );
     Ok(())
@@ -717,16 +691,12 @@ fn approved_write_executes_and_creates_file() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write it\ny\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -734,7 +704,7 @@ fn approved_write_executes_and_creates_file() -> Result<()> {
 
     assert!(errors.is_empty());
     assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "hi");
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     assert!(seen[1].last().unwrap().content.contains("\"ok\":true"));
     Ok(())
 }
@@ -749,16 +719,12 @@ fn approved_write_renders_prompt_and_result_without_raw_json() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write it\ny\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -783,16 +749,12 @@ fn denied_write_skips_execution_and_records_denial() -> Result<()> {
         )),
         Ok(AssistantTurn::text("understood")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write it\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -805,7 +767,7 @@ fn denied_write_skips_execution_and_records_denial() -> Result<()> {
     // Gated calls no longer double-print a raw `tool> write({...})` line.
     assert!(!rendered.contains("tool> write({"));
 
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     let denial = seen[1].last().unwrap();
     assert_eq!(denial.role, Role::Tool);
     assert!(denial.content.contains("\"denied\":true"));
@@ -831,23 +793,19 @@ fn read_is_never_gated_even_under_auto_deny() -> Result<()> {
         Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "read note\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
     assert!(errors.is_empty());
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     let tool_result = seen[1].last().unwrap();
     assert_eq!(tool_result.role, Role::Tool);
     assert!(tool_result.content.contains("hello from file"));
@@ -863,23 +821,19 @@ fn denied_bash_does_not_run_command() -> Result<()> {
         Ok(single_call_turn("bash", json!({ "command": command }))),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "run it\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
     assert!(!marker.exists());
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
     Ok(())
 }
@@ -895,16 +849,12 @@ fn denied_edit_leaves_file_unchanged() -> Result<()> {
         )),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "edit it\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -914,7 +864,7 @@ fn denied_edit_leaves_file_unchanged() -> Result<()> {
         fs::read_to_string(workspace.path.join("note.txt"))?,
         "original"
     );
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
     Ok(())
 }
@@ -938,16 +888,12 @@ fn read_then_edit_succeeds_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "go\ny\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -958,7 +904,7 @@ fn read_then_edit_succeeds_end_to_end() -> Result<()> {
         fs::read_to_string(workspace.path.join("note.txt"))?,
         "changed"
     );
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     assert!(seen[2].last().unwrap().content.contains("\"ok\":true"));
     Ok(())
 }
@@ -978,16 +924,12 @@ fn edit_without_prior_read_is_rejected_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("understood")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "go\ny\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -999,7 +941,7 @@ fn edit_without_prior_read_is_rejected_end_to_end() -> Result<()> {
         fs::read_to_string(workspace.path.join("note.txt"))?,
         "original"
     );
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     let result = seen[1].last().unwrap();
     assert!(result.content.contains("\"ok\":false"));
     assert!(result.content.contains("has not been read this session"));
@@ -1016,16 +958,12 @@ fn terminal_approver_allows_write_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write it\ny\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -1046,16 +984,12 @@ fn terminal_approver_denies_write_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("understood")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write it\nn\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -1072,22 +1006,18 @@ fn allowed_malformed_args_reach_tool_validation() -> Result<()> {
         Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write it\ny\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     let tool_result = seen[1].last().unwrap();
     assert!(tool_result.content.contains("\"ok\":false"));
     assert!(!tool_result.content.contains("\"denied\":true"));
@@ -1101,22 +1031,18 @@ fn denied_malformed_args_return_denial_without_validation() -> Result<()> {
         Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write it\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
     Ok(())
 }
@@ -1142,16 +1068,12 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write both\ny\nn\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -1183,11 +1105,7 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -1196,7 +1114,7 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
     // policy were not enforced in Nexus, the second write would consume
     // "/exit" as its decision and b.txt would never be written.
     run_text_session(
-        &mut agent,
+        &mut harness,
         "write both\na\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -1221,24 +1139,20 @@ fn always_allow_does_not_cross_tool_boundaries() -> Result<()> {
         Ok(single_call_turn("bash", json!({ "command": "echo hi" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     // write -> always (a); bash -> denied (n). bash must still prompt.
     run_text_session(
-        &mut agent,
+        &mut harness,
         "go\na\nn\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
     assert!(workspace.path.join("a.txt").exists());
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     let bash_result = seen[2].last().unwrap();
     assert!(bash_result.content.contains("\"denied\":true"));
     Ok(())
@@ -1265,16 +1179,12 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
     run_text_session(
-        &mut agent,
+        &mut harness,
         "run both\na\nn\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
@@ -1282,7 +1192,7 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
 
     let rendered = String::from_utf8(output)?;
     assert!(!rendered.contains("auto-approved · bash"));
-    let seen = agent.provider.seen.borrow();
+    let seen = harness.agent.provider.seen.borrow();
     assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
     Ok(())
 }
@@ -1324,18 +1234,15 @@ fn turn_persists_transcript_when_log_attached() -> Result<()> {
     let workspace = test_workspace()?;
     let root = test_workspace()?; // separate temp dir as the session root
     let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
-    let mut agent = Agent::new(
-        provider,
-        workspace.path.clone(),
-        crate::tools::built_in_tools(),
-    );
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let log_path = log.path().to_path_buf();
-    agent.attach_session_log(log);
+    // Persistence is a harness concern: construct it with the log attached.
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
 
     let mut out = Vec::new();
     let mut err = Vec::new();
-    run_text_session(&mut agent, b"hello\n/exit\n", &mut out, &mut err)?;
+    run_text_session(&mut harness, b"hello\n/exit\n", &mut out, &mut err)?;
 
     let lines: Vec<String> = fs::read_to_string(&log_path)?
         .lines()

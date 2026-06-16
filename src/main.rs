@@ -20,6 +20,7 @@ mod telemetry;
 mod tool_display;
 mod tools;
 mod ui;
+mod wayland;
 
 fn main() -> ExitCode {
     telemetry::init();
@@ -91,20 +92,24 @@ fn run_agent() -> Result<()> {
         settings.base_url.as_deref(),
         &cwd,
     )?;
-    let mut agent = Agent::new(provider, cwd.clone(), tools::built_in_tools());
+    let agent = Agent::new(provider, tools::built_in_tools());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
-    match session::SessionLog::create(&cwd) {
+    let session = match session::SessionLog::create(&cwd) {
         Ok(log) => {
             tracing::info!(path = %log.path().display(), "session transcript");
-            agent.attach_session_log(log);
+            Some(log)
         }
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "session persistence disabled");
+            None
         }
-    }
+    };
+    // The Tier-2 harness owns the execution surface (workspace + tool state) and
+    // persistence, wrapping the bare in-memory agent.
+    let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
     let mut ui = ui::text::TextUi::stdio();
-    cli::run_session(&mut agent, &mut ui)
+    cli::run_session(&mut harness, &mut ui)
 }
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {
