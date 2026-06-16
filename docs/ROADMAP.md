@@ -475,6 +475,45 @@ Gate before Git automation: dirty-tree behavior, rollback semantics, and approva
 requirements must be specified before auto-commit, worktree, GitHub, or CI features
 are implemented.
 
+## Architecture work — Tier-Boundary Enforcement
+
+**Goal:** make the code match the three-tier ownership split in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) — Nexus (core) / Wayland (harness) / Iris
+(CLI) — by inverting the outward dependencies in `src/nexus.rs` so the core loop
+imports nothing from the tiers above it. This is enabling refactor work, not a
+feature milestone; it unblocks clean subagent/mode seams in Milestone 4 and a
+later crate split.
+
+Scope is the four cuts. Each is a behavior-preserving refactor and must keep the
+Milestone 0/1 verification gates green.
+
+1. **Loop emits events, not UI calls.** Generalize the core sink (today
+   `TurnSink`) into the full agent-event stream and remove `use crate::ui` from
+   `nexus.rs`. The CLI subscribes and renders. Moves: every `ui.emit(UiEvent::..)`
+   in the loop and `UiTurnSink` to Tier 3 (Iris).
+2. **Approval becomes a hook.** Define a `BeforeToolCall` gate trait in core; the
+   CLI supplies the prompting implementation. The loop calls the gate and keeps
+   enforcing policy (`session_allowed`, destructive re-prompt, bash-never-always);
+   only `ui.request_approval` and `ApprovalDecision` import move to Tier 3.
+3. **Tools become injected.** Define a `Tool` trait and a core `ToolRegistry`;
+   build the registry at Tier 3 and inject it into the agent instead of calling
+   `crate::tools::{dispatch, ToolState}` directly. Tool impls plus
+   `diff_preview`/`requires_approval`/`is_destructive` move to Tier 3; tool
+   metadata becomes `Tool`-trait methods on the contract. This is the same
+   registry the WASM plugin work needs, so it is delivered together with issue
+   [#18](https://github.com/5omeOtherGuy/iris-agent/issues/18).
+4. **Persistence is harness-tier.** Move `SessionLog`, `attach_session_log`,
+   `persist_new_messages`, and the `workspace` execution surface out of the bare
+   core loop into Wayland (Tier 2), or behind a Tier 1 event subscriber.
+
+Acceptance signal: `src/nexus.rs` imports nothing from `crate::ui`,
+`crate::approval`, `crate::session`, or concrete `crate::tools::*` impls, and the
+existing tests plus the MVP smoke test still pass.
+
+Gate: keep these as in-crate module boundaries (per `AGENTS.md`); do not split
+into separate crates until a second front-end or published Nexus runtime
+justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
+
 ## Roadmap principles
 
 - Build the smallest working layer before adding the next one.
@@ -503,7 +542,11 @@ are implemented.
    Iris can make a small change in a real repo, show the diff, and explain it.
    Deferred to a future full-TUI milestone (raw mode): interactive block
    expansion, `Alt+Enter` multi-line editing, and box framing.
-4. Next: Milestone 2 (token-efficiency). The metadata gate is already met
+4. Architecture: enforce the tier-boundary cuts (see "Architecture work" above)
+   that invert `src/nexus.rs`'s outward dependencies onto Wayland/Iris. Do cut 1
+   (event stream) first; it is behavior-preserving and unblocks the approval and
+   tool-injection cuts. Run alongside or before Milestone 2 tool infrastructure.
+5. Next: Milestone 2 (token-efficiency). The metadata gate is already met
    ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) MVP), so the
    remaining work is handle-backing large tool outputs and token accounting.
    First implement shared tool infrastructure in dependency order: path identity and
@@ -519,7 +562,9 @@ These topics are intentionally not specified in this roadmap, but should be
 resolved in focused implementation notes before the relevant milestone starts:
 
 - `NEXUS_MVP_DESIGN.md` — Nexus/Iris CLI boundaries, provider-neutral messages,
-  provider interface, tool registry, and approval policy.
+  provider interface, tool registry, and approval policy. The three-tier
+  ownership target and the four dependency-inversion cuts are specified in
+  [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - `TOOL_CONTRACTS.md` — input schemas, result/error format, and per-tool behavior
   for `read`, `write`, `edit`, and `bash`.
 - `SAFETY_MODEL.md` — workspace path safety, shell limits, approval gates,

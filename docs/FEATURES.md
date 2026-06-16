@@ -196,25 +196,33 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 Third-party/custom tools via WASM, tracked in issue #18 (Extism on Wasmtime).
 Built-in tools stay native and trusted; plugins add or, with explicit opt-in,
 shadow them. First pass excludes raw Wasmtime Component Model/WIT, plugin
-signing, and network/shell capabilities.
+signing, and network/shell capabilities. Ownership follows the three-tier split
+in [`ARCHITECTURE.md`](ARCHITECTURE.md): the `Tool` contract, registry, and
+approval policy are Nexus (Tier 1); the workspace sandbox and host capabilities
+are Wayland (Tier 2); built-in impls, the Extism executor, and trusted diff
+rendering are Iris (Tier 3).
 
 - **WASM plugin tools** — load third-party tools from a plugin manifest
   (`id` + `.wasm` + tool defs) executed through Extism on Wasmtime. [Planned]
-- **Nexus `ToolRegistry`** — Nexus-owned registry owning tool definitions,
-  identity, dispatch order (approved override > built-in > plugin tool >
-  unknown-tool error), and policy; registers built-ins first, then plugin
-  manifests, and rejects duplicate names unless an override is approved.
+- **`ToolRegistry` (Nexus, Tier 1)** — core-owned registry abstraction holding
+  tool identity, dispatch order (approved override > built-in > plugin tool >
+  unknown-tool error), and approval-policy enforcement. The registry is built
+  and injected at Tier 3 (built-ins first, then plugin manifests) and rejects
+  duplicate names unless an override is approved; core names no concrete tool.
   [Planned]
 - **Identity-based approval** — approval keyed on tool identity
   (`builtin:write`, `plugin:<id>:<sha256>:<name>`) instead of bare name;
   plugin tools and built-in overrides require approval, and mutating plugin
   tools require approval every call. [Planned]
-- **Sandboxed capabilities** — plugins get no raw workspace WASI access;
-  they call explicit host functions (`host_read`, `host_ls`) that reuse Nexus
-  path-safety checks. [Planned]
+- **Sandboxed capabilities (Wayland, Tier 2)** — plugins get no raw workspace
+  WASI access; they call explicit host functions (`host_read`, `host_ls`) on the
+  harness execution surface that reuse the workspace path-safety checks.
+  [Planned]
 - **Plan-based plugin mutations** — mutating overrides return a proposed
-  mutation (`host_write_plan`, `host_edit_plan`); Nexus renders/applies diffs
-  with existing trusted logic rather than plugin-provided previews. [Planned]
+  mutation (`host_write_plan`, `host_edit_plan`); the trusted host renders and
+  applies diffs with existing logic rather than plugin-provided previews. The
+  preview renderer is host code (Iris, Tier 3), trusted relative to any plugin.
+  [Planned]
 
 ## Repo awareness
 
