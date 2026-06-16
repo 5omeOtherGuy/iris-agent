@@ -191,6 +191,31 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   [Planned]
 - **Stacked PRs** — dependent PR stacks. [Planned]
 
+## Plugins
+
+Third-party/custom tools via WASM, tracked in issue #18 (Extism on Wasmtime).
+Built-in tools stay native and trusted; plugins add or, with explicit opt-in,
+shadow them. First pass excludes raw Wasmtime Component Model/WIT, plugin
+signing, and network/shell capabilities.
+
+- **WASM plugin tools** — load third-party tools from a plugin manifest
+  (`id` + `.wasm` + tool defs) executed through Extism on Wasmtime. [Planned]
+- **Nexus `ToolRegistry`** — Nexus-owned registry owning tool definitions,
+  identity, dispatch order (approved override > built-in > plugin tool >
+  unknown-tool error), and policy; registers built-ins first, then plugin
+  manifests, and rejects duplicate names unless an override is approved.
+  [Planned]
+- **Identity-based approval** — approval keyed on tool identity
+  (`builtin:write`, `plugin:<id>:<sha256>:<name>`) instead of bare name;
+  plugin tools and built-in overrides require approval, and mutating plugin
+  tools require approval every call. [Planned]
+- **Sandboxed capabilities** — plugins get no raw workspace WASI access;
+  they call explicit host functions (`host_read`, `host_ls`) that reuse Nexus
+  path-safety checks. [Planned]
+- **Plan-based plugin mutations** — mutating overrides return a proposed
+  mutation (`host_write_plan`, `host_edit_plan`); Nexus renders/applies diffs
+  with existing trusted logic rather than plugin-provided previews. [Planned]
+
 ## Repo awareness
 
 - **Current codemap** — source-grounded module map in `docs/CODEMAPS/INDEX.md`.

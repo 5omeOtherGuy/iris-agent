@@ -46,6 +46,7 @@ Implemented today:
 Not implemented yet:
 
 - Persistent approval policies, session `/resume` and transcript-tree branching, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
+- WASM plugin tools (Extism on Wasmtime) with a Nexus `ToolRegistry`, identity-based approval, and sandboxed host capabilities — planned, tracked in issue #18.
 
 ## Running
 
