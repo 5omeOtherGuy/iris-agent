@@ -69,6 +69,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 
 | Owns | Today's file(s) |
 |---|---|
+| Harness wrapping the bare agent: owns the execution env + session, injects `ToolEnv`, persists the transcript post-turn | `wayland.rs` (`Harness`) |
 | Session transcript persistence | `session.rs` |
 | Settings / configuration loading | `config.rs` |
 | Workspace path safety (the FS/Shell sandbox surface) | `tools/path.rs`, `tools/bash/sandbox.rs` |
@@ -77,7 +78,9 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Context compaction | _planned_ |
 | Skills / system-prompt assembly | _planned_ |
 
-Depends on Tier 1 only.
+Depends on Tier 1 only. The `Harness` is the analogue of pi's `AgentHarness`
+(`agent-harness.ts`): it owns `env`/`session`, passes `env` into the run, and
+appends transcript messages itself.
 
 pi equivalent: `src/harness/` — `agent-harness.ts`, `session/`, `compaction/`,
 `skills.ts`, `system-prompt.ts`, `env/nodejs.ts` (`ExecutionEnv` = `FileSystem`
@@ -107,12 +110,14 @@ provider-abstraction the adapters implement against).
 
 ## Current vs target
 
-The tiers above are an ownership target. The loop in `nexus.rs` no longer
-imports `crate::ui`/`crate::approval` (Step A) and no longer resolves tools by
-name-match (Step B); it talks only to the `AgentObserver`, `ApprovalGate`, and
-`Tool` contracts. The one remaining outward reference is `crate::tools::ToolState`
-(carried in `ToolEnv`), relocated to the harness in Step C. Four cuts invert
-those dependencies to reach the split:
+The four cuts are done: the bare `Agent` in `nexus.rs` is a provider-, UI-,
+persistence-, and workspace-neutral in-memory engine. It imports no `crate::ui`/
+`crate::approval` (Step A), resolves tools by name over an injected set (Step B),
+and owns no filesystem or session store (Step C) -- the Tier-2 `Harness`
+(`wayland.rs`) owns the execution env and persistence and injects a `&mut ToolEnv`
+into each turn. The only `crate::tools` reference left in core is the `ToolState`
+type borrowed through `ToolEnv` (the type stays in `crate::tools`; the harness
+owns the instance). The cuts that reached this split:
 
 1. **Loop emits events, not UI calls.** _(done)_ The loop emits a Tier-1
    `AgentEvent` stream to an `AgentObserver`; `crate::ui` is gone from the loop.
@@ -129,8 +134,13 @@ those dependencies to reach the split:
    lookup is justified by modes, subagents, and provider-specific tools; a plugin
    system (issue #18) would be one optional consumer, not the reason for it.
    Relocating `ToolState` to the harness is Step C. See "Tools across the tiers".
-4. **Persistence is harness-tier.** Keep `SessionLog` out of the bare core loop;
-   it belongs to the Tier 2 harness (or a Tier 1 event subscriber).
+4. **Persistence + execution surface are harness-tier.** _(done)_ The bare
+   `Agent` holds no `workspace`, `ToolState`, or `SessionLog`. The Tier-2
+   `Harness` (`wayland.rs`) wraps the agent, owns the workspace + `ToolState`
+   (injected per turn as `ToolEnv`) and the optional `SessionLog`, and persists
+   the transcript by diffing `agent.messages()` after each turn -- mirroring
+   pi's `AgentHarness` owning `ExecutionEnv` + session and appending messages
+   itself, never in the core loop.
 
 ## Tools across the tiers
 

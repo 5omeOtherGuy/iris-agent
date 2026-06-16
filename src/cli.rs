@@ -1,9 +1,13 @@
 use anyhow::Result;
 
-use crate::nexus::{Agent, ChatProvider};
+use crate::nexus::ChatProvider;
 use crate::ui::{Ui, UiBridge, UiEvent, is_exit_command};
+use crate::wayland::Harness;
 
-pub(crate) fn run_session<P: ChatProvider>(agent: &mut Agent<P>, ui: &mut dyn Ui) -> Result<()> {
+pub(crate) fn run_session<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    ui: &mut dyn Ui,
+) -> Result<()> {
     ui.emit(UiEvent::SessionStarted)?;
 
     while let Some(prompt) = ui.next_prompt()? {
@@ -20,7 +24,7 @@ pub(crate) fn run_session<P: ChatProvider>(agent: &mut Agent<P>, ui: &mut dyn Ui
         // session-driver events below.
         let result = {
             let bridge = UiBridge::new(ui);
-            agent.submit_turn(prompt, &bridge, &bridge)
+            harness.submit_turn(prompt, &bridge, &bridge)
         };
         if let Err(error) = result {
             ui.emit(UiEvent::from_turn_error(&error))?;
@@ -37,8 +41,9 @@ mod tests {
     use anyhow::{Result, anyhow};
     use std::cell::RefCell;
 
-    use crate::nexus::{AssistantTurn, Message, Tools, TurnSink};
+    use crate::nexus::{Agent, AssistantTurn, Message, Tools, TurnSink};
     use crate::ui::text::TextUi;
+    use crate::wayland::Harness;
 
     struct FakeProvider {
         responses: RefCell<Vec<Result<AssistantTurn, String>>>,
@@ -77,10 +82,16 @@ mod tests {
     fn provider_error_is_rendered_and_session_continues() -> Result<()> {
         let provider = FakeProvider::new(vec![Err("boom"), Ok(AssistantTurn::text("ok"))]);
         let dir = crate::tools::test_support::temp_dir();
-        let mut agent = Agent::new(provider, dir.path.clone(), crate::tools::built_in_tools());
+        let agent = Agent::new(provider, crate::tools::built_in_tools());
+        let mut harness = Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            None,
+        );
         let mut ui = TextUi::new("bad\nagain\n/exit\n".as_bytes(), Vec::new(), Vec::new());
 
-        run_session(&mut agent, &mut ui)?;
+        run_session(&mut harness, &mut ui)?;
 
         let (_, out, err) = ui.into_parts();
         assert!(String::from_utf8(out)?.contains("assistant> ok"));

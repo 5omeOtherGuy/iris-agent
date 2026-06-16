@@ -1,0 +1,90 @@
+//! Tier-2 Wayland harness.
+//!
+//! Owns the execution surface (workspace + [`ToolState`]) and session
+//! persistence, wrapping the bare in-memory [`Agent`]. Mirrors pi's
+//! `AgentHarness` (`packages/agent/src/harness/agent-harness.ts`), which owns
+//! the `ExecutionEnv` and the session store, feeds the env into each run, and
+//! appends transcript messages itself -- the bare agent stays persistence- and
+//! filesystem-free.
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+
+use crate::nexus::{Agent, AgentObserver, ApprovalGate, ChatProvider, ToolEnv};
+use crate::session::SessionLog;
+use crate::tools::ToolState;
+
+/// Wraps a bare [`Agent`] with the execution env it runs against and the
+/// optional transcript log it persists to.
+pub(crate) struct Harness<P> {
+    pub(crate) agent: Agent<P>,
+    workspace: PathBuf,
+    state: ToolState,
+    // Optional transcript persistence. When present, new messages are appended
+    // to the JSONL log after each turn (`persisted` tracks how many of the
+    // agent's messages are already on disk). None when no log could be opened,
+    // so the harness runs the agent fully in-memory.
+    session: Option<SessionLog>,
+    persisted: usize,
+}
+
+impl<P: ChatProvider> Harness<P> {
+    /// Wrap a bare agent with its execution surface and optional transcript log.
+    pub(crate) fn new(
+        agent: Agent<P>,
+        workspace: PathBuf,
+        state: ToolState,
+        session: Option<SessionLog>,
+    ) -> Self {
+        Self {
+            agent,
+            workspace,
+            state,
+            session,
+            persisted: 0,
+        }
+    }
+
+    /// Run one turn against the owned execution env, then persist any new
+    /// transcript messages. The env is injected into the bare loop (mirroring
+    /// `AgentHarness` passing `env` into the run); persistence lives here, not
+    /// in the loop.
+    pub(crate) fn submit_turn(
+        &mut self,
+        prompt: &str,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+    ) -> Result<()> {
+        // The turn span covers both the loop and persistence; the bare agent's
+        // tracing events record under it via this guard.
+        let span = tracing::info_span!("turn");
+        let _guard = span.enter();
+        let mut env = ToolEnv {
+            workspace: &self.workspace,
+            state: &mut self.state,
+        };
+        let result = self.agent.submit_turn(prompt, obs, gate, &mut env);
+        // Persist whatever the turn produced even when it ended in an error, so
+        // the transcript records the user prompt and any tool work. Best-effort:
+        // a write failure is logged, never fatal to the session.
+        self.persist_new_messages();
+        result
+    }
+
+    /// Append messages not yet written to the transcript log, advancing the
+    /// persisted cursor. No-op when no log is attached.
+    fn persist_new_messages(&mut self) {
+        let Some(log) = self.session.as_mut() else {
+            return;
+        };
+        let messages = self.agent.messages();
+        while self.persisted < messages.len() {
+            if let Err(error) = log.append(&messages[self.persisted]) {
+                tracing::warn!(error = %format!("{error:#}"), "failed to persist session message");
+                return;
+            }
+            self.persisted += 1;
+        }
+    }
+}

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -98,9 +98,10 @@ impl ToolOutput {
 }
 
 /// Execution environment handed to a tool: the workspace root plus the mutable
-/// per-session tool state (observed files, bash sessions). The Agent assembles
-/// this per call. `ToolState` still lives in `crate::tools` for now; Step C
-/// relocates it (and this env's guts) to the Wayland harness tier.
+/// per-session tool state (observed files, bash sessions). Owned by the Tier-2
+/// Wayland harness and injected into each turn, mirroring how pi's
+/// `AgentHarness` feeds its `ExecutionEnv` into the loop rather than the bare
+/// agent owning the filesystem surface. `ToolState` is defined in `crate::tools`.
 pub(crate) struct ToolEnv<'a> {
     pub(crate) workspace: &'a Path,
     pub(crate) state: &'a mut crate::tools::ToolState,
@@ -177,9 +178,7 @@ pub(crate) trait ChatProvider {
 
 pub(crate) struct Agent<P> {
     pub(crate) provider: P,
-    pub(crate) messages: Vec<Message>,
-    workspace: PathBuf,
-    state: crate::tools::ToolState,
+    messages: Vec<Message>,
     // Injected tool set, constructed at Tier 3 and resolved by name in the loop.
     // Core names no concrete tool; it only holds the `Tool` contract.
     tools: Tools,
@@ -191,31 +190,26 @@ pub(crate) struct Agent<P> {
     // path = per-exact-command keys (e.g. `bash:<cmd>`) once a real audit trail
     // exists (roadmap #14).
     session_allowed: HashSet<String>,
-    // Optional transcript persistence. When attached, messages are appended to
-    // the JSONL log at the end of each turn (`persisted` tracks how many of
-    // `messages` are already on disk). None in tests and when no log could be
-    // opened, so the agent runs fully in-memory.
-    session: Option<crate::session::SessionLog>,
-    persisted: usize,
 }
 
 impl<P: ChatProvider> Agent<P> {
-    pub(crate) fn new(provider: P, workspace: PathBuf, tools: Tools) -> Self {
+    /// A bare, in-memory agent: it owns the provider, conversation, injected
+    /// tools, and approval policy, but no filesystem or persistence. Mirrors
+    /// pi's bare `Agent`; the Tier-2 Wayland harness wraps it with the execution
+    /// env and session store.
+    pub(crate) fn new(provider: P, tools: Tools) -> Self {
         Self {
             provider,
             messages: Vec::new(),
-            workspace,
-            state: crate::tools::ToolState::new(),
             tools,
             session_allowed: HashSet::new(),
-            session: None,
-            persisted: 0,
         }
     }
 
-    /// Attach a transcript log; subsequent turns persist their messages.
-    pub(crate) fn attach_session_log(&mut self, log: crate::session::SessionLog) {
-        self.session = Some(log);
+    /// Read access to the in-memory transcript so the harness can persist it
+    /// without the core loop owning a session store.
+    pub(crate) fn messages(&self) -> &[Message] {
+        &self.messages
     }
 
     pub(crate) fn submit_turn(
@@ -223,36 +217,23 @@ impl<P: ChatProvider> Agent<P> {
         prompt: &str,
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
+        env: &mut ToolEnv,
     ) -> Result<()> {
-        let span = tracing::info_span!("turn");
-        let _guard = span.enter();
-
+        // The `turn` span is owned by the harness so it also covers persistence;
+        // it is the current span here via the harness's guard.
         self.messages.push(Message::user(prompt));
         crate::signals::reset();
-        let result = self.complete_turn(obs, gate);
-        // Persist whatever the turn produced even when it ended in an error, so
-        // the transcript records the user prompt and any tool work. Persistence
-        // is best-effort: a write failure is logged, never fatal to the session.
-        self.persist_new_messages();
-        result
+        // The bare agent does no persistence: the harness diffs `messages()`
+        // onto its session store after the turn returns (even on error).
+        self.complete_turn(obs, gate, env)
     }
 
-    /// Append messages not yet written to the transcript log, advancing the
-    /// persisted cursor. No-op when no log is attached.
-    fn persist_new_messages(&mut self) {
-        let Some(log) = self.session.as_mut() else {
-            return;
-        };
-        while self.persisted < self.messages.len() {
-            if let Err(error) = log.append(&self.messages[self.persisted]) {
-                tracing::warn!(error = %format!("{error:#}"), "failed to persist session message");
-                return;
-            }
-            self.persisted += 1;
-        }
-    }
-
-    fn complete_turn(&mut self, obs: &dyn AgentObserver, gate: &dyn ApprovalGate) -> Result<()> {
+    fn complete_turn(
+        &mut self,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+        env: &mut ToolEnv,
+    ) -> Result<()> {
         for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
             if crate::signals::interrupted() {
                 tracing::info!(roundtrips = roundtrip, "turn interrupted by user");
@@ -337,7 +318,7 @@ impl<P: ChatProvider> Agent<P> {
                     if auto_approved {
                         obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
                     }
-                    if let Some(diff) = tool.diff_preview(&self.workspace, &call.arguments) {
+                    if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
                         obs.on_event(AgentEvent::DiffPreview {
                             call: call.clone(),
                             diff,
@@ -382,13 +363,7 @@ impl<P: ChatProvider> Agent<P> {
                 // Run the resolved tool with the assembled env; an unknown tool
                 // yields the same `unknown tool: <name>` result as before.
                 let result = match tool {
-                    Some(tool) => {
-                        let mut env = ToolEnv {
-                            workspace: &self.workspace,
-                            state: &mut self.state,
-                        };
-                        tool.execute(&call.arguments, &mut env)
-                    }
+                    Some(tool) => tool.execute(&call.arguments, env),
                     None => Err(anyhow::anyhow!("unknown tool: {}", call.name)),
                 };
                 tracing::info!(tool = %call.name, ok = result.is_ok(), "tool executed");
