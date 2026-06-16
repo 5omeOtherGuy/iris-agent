@@ -52,17 +52,19 @@ Pi/pi-mmr lineage (badlogic/pi-mono, earendil-works/pi, oh-my-pi/omp) define the
 table-stakes bar: provider-agnostic cores (10–40+ providers), automatic context
 compaction, git integration, and codebase mapping.
 
-The strongest validation of Iris's thesis is **`pi_agent_rust`** — an authorized
-zero-unsafe Rust port of Pi that already ships a single binary, sub-100ms
-startup, 10 native provider modules, and turn-boundary compaction. That means
-**"Rust + lean + token-efficient" alone is not a USP.** Iris's most defensible
-differentiation lies in **pi-mmr-inspired mode-based workflows + subagents-as-
-tools with multi-model routing**, combined with token-efficiency techniques like
-content-hash anchored edits — *executed on a runtime Iris owns* — rather than in
-raw Rust speed or basic compaction. The academic taxonomy (arXiv 2604.03515)
-confirms compaction is an architectural requirement and a live design frontier,
-so Iris should treat micro-compaction as **table-stakes-done-better, not a novel
-selling point.**
+The strongest validation of Iris's product thesis is **`pi_agent_rust`** — an
+authorized zero-unsafe Rust port of Pi that already ships a single binary,
+sub-100ms startup, 10 native provider modules, and turn-boundary compaction. That
+means **"Rust + lean + token-efficient" alone is not a USP.** For the *runtime
+implementation*, however, the stronger Rust reference is **Codex CLI**: mature
+Tokio streams, cancellation tokens, stream/tool cancellation races, and guarded
+parallel tool execution. Iris's most defensible differentiation lies in
+**pi-mmr-inspired mode-based workflows + subagents-as-tools with multi-model
+routing**, combined with token-efficiency techniques — *executed on a runtime
+Iris owns* — rather than in raw Rust speed or basic compaction. The academic
+taxonomy (arXiv 2604.03515) confirms compaction is an architectural requirement
+and a live design frontier, so Iris should treat micro-compaction as
+**table-stakes-done-better, not a novel selling point.**
 
 **The headline finding is a refutation:** the comforting assumption that a
 from-scratch Rust harness has essentially no Rust-native competition (except
@@ -221,8 +223,11 @@ clone already has most of these:
   session JSONL (clean, inspectable).
 
 ## 5. What to learn from each
+- **Codex CLI:** use as the primary Rust reference for finishing Nexus's async
+  runtime: Tokio provider streams, cancellation tokens, child cancellation, and
+  guarded parallel tools.
 - **`pi_agent_rust`:** the performance pitch is already matched — don't lead with
-  it.
+  it, and do not copy its bespoke runtime or monolithic structure.
 - **mini-claude-code / Claurst:** the Rust-clone niche is real and crowded;
   differentiate on design, not language.
 - **arXiv 2604.03515:** compaction is a *live frontier* (7 distinct strategies) —

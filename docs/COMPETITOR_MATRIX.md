@@ -64,8 +64,9 @@
 - **`pi-mmr`** — closest on the **routing/orchestration axis**: 5-mode multi-model
   routing + subagent/worker fleet with background execution. *The author's own
   16-day-old, 1-star project.*
-- **Codex CLI** — closest **mature** Rust single-binary harness, but single-vendor
-  (OpenAI) and not token-efficiency-positioned.
+- **Codex CLI** — closest **mature** Rust single-binary harness and the primary
+  Rust reference for Iris's next async-runtime work, but single-vendor (OpenAI)
+  and not token-efficiency-positioned.
 - **Crush / sst/opencode / Hermes** — closest **mature multi-provider or
   tool-rich harnesses**, but Go, TypeScript, and Python respectively, not Rust.
 - **Claude Code / Cline / Cursor** — strongest incumbents on UX, ecosystem, and
@@ -75,6 +76,8 @@
 1. **Rust + single binary is table-stakes, now even at the incumbent tier.** Codex
    CLI is 96% Rust and explicitly "going native" (zero-dependency binary). Do not
    sell "Rust."
+   For implementation, still study Codex: its mature Tokio stream/cancellation
+   runtime is a better Nexus reference than `pi_agent_rust`'s bespoke runtime.
 2. **Content-hash anchored edits are not a differentiator** — `pi_agent_rust`
    (the closest competitor) already ships `hashline_edit`. Treat as parity, not
    novelty.

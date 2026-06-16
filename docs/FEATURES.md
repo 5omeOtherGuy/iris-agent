@@ -1,6 +1,6 @@
 # Iris — Feature List
 
-> Status (2026-06-15): early implementation. Labels: **[Implemented]** ·
+> Status (2026-06-17): Milestone 1 implementation. Labels: **[Implemented]** ·
 > **[Partial]** · **[Planned · MVP]** · **[Planned]** · **[Research]**. This file is
 > a capability inventory, not a build sequence; use [`ROADMAP.md`](ROADMAP.md) for
 > milestone order.
@@ -9,21 +9,31 @@
 
 - **CLI entrypoint** — `cargo run` starts Iris. [Implemented]
 - **Interactive terminal session** — REPL-style loop with `/exit` and `/quit`.
-  [Partial]
+  [Implemented]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process. [Partial]
 - **Provider-neutral turn/message shape** — `ChatProvider`, `AssistantTurn`,
   `ToolCall`, `Message`, and `Role` in Nexus. [Partial]
 - **Provider error reporting** — provider errors print to stderr and the REPL
   continues. [Partial]
-- **Streaming responses** — incremental provider output. [Planned]
-- **Session transcript persistence** — save/reload conversations. [Planned]
+- **Streaming responses** — incremental assistant text output via the current
+  provider parser and `TurnSink`; async-hard provider streams are planned next
+  under runtime completion. [Partial]
+- **Runtime-hard cancellation** — turn-level cancellation token, provider
+  stream-vs-cancel race, tool-vs-cancel race, child cancellation per tool, and
+  valid transcript data on abort. [Planned]
+- **Safe parallel tool execution** — sequential by default; explicitly
+  concurrency-safe/read-only tools may overlap while unsafe tools stay exclusive.
+  [Planned]
+- **Session transcript persistence** — best-effort JSONL write-only transcripts;
+  reload/resume and tree branching are planned later. [Partial]
 
 ## Providers and auth
 
-- **OpenAI Codex Responses provider** — blocking non-streaming request/response
-  path using the ChatGPT Codex Responses endpoint, with tool schemas and streamed
-  response parsing. [Partial]
+- **OpenAI Codex Responses provider** — currently uses the ChatGPT Codex
+  Responses endpoint with tool schemas, retry/backoff, and streamed response
+  parsing; the next runtime step is an async streaming `ChatProvider` contract
+  rather than a blocking whole-turn provider call. [Partial]
 - **OpenAI Codex OAuth auth-file support** — reads `~/.iris/auth.json` or
   `IRIS_AUTH_PATH`, refreshes expired access tokens, extracts account ID from the
   JWT payload, and rewrites refreshed credentials atomically with restricted Unix
@@ -41,7 +51,8 @@
 
 - **Tool-call loop** — send tool schemas, receive tool calls, execute tools, feed
   tool results back to the model, and stop after a bounded number of tool
-  iterations. [Partial]
+  iterations. Runtime-hard async cancellation and safe parallel execution are
+  planned next. [Partial]
 - **`read` tool** — read a workspace text file with offset/limit; rejects
   binary/NUL-containing and invalid UTF-8 files rather than rendering lossy
   text. [Implemented]
@@ -86,7 +97,7 @@
   changed since last read, and refresh the observation after each mutation. New
   files may still be created blind. [Implemented]
 - **Diff/preview approval UX** — show unified diffs or capped new-file previews
-  before mutating file tools. [Planned]
+  before mutating file tools. [Implemented]
 - **Secret redaction** — redact secrets from stored content and summaries.
   [Planned]
 - **Subagent tool permissions** — per-worker tool allowlists. [Planned]

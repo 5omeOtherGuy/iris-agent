@@ -1,8 +1,8 @@
 # Iris — Architecture: Three-Tier Split
 
-> Status (2026-06-16): target architecture. Iris ships today as one binary with
-> the tier boundaries only partially enforced (see "Current vs target"). This
-> document defines the ownership tiers Iris is converging on, modeled on pi's
+> Status (2026-06-17): target architecture plus runtime direction. Iris ships
+> today as one binary with the tier boundaries enforced in-module. This document
+> defines the ownership tiers Iris is converging on, modeled on pi's
 > `packages/agent` (core) / harness / `packages/coding-agent` layering. It is a
 > design target, not an implementation snapshot; see
 > [`CODEMAPS/INDEX.md`](CODEMAPS/INDEX.md) for what exists now and
@@ -16,6 +16,25 @@ contracts. Everything else is a consequence of this rule.
 
 This mirrors pi's `@earendil-works/pi-agent-core`, which has zero UI dependency
 and ships no tool implementations of its own — it is the engine, not the car.
+
+Runtime hardness does **not** change this rule. The next agent-loop work should
+make Nexus async-hard while preserving the same dependency direction: provider
+stream reads and tool futures are raced against cancellation inside Nexus;
+terminal Ctrl-C and approval UX remain outside Nexus and enter through contracts.
+
+Reference split:
+
+- `~/vendor/pi-mono` is the contract/layering reference. pi-mono is already
+  async TypeScript, but its loop is intentionally linear and easy to reason
+  about.
+- `~/vendor/codex` is the primary Rust runtime reference. Copy the boring core
+  ideas: Tokio streams, `CancellationToken`, `tokio::select!`, child tool
+  cancellation, and safe-parallel/exclusive tool execution.
+- `~/vendor/claude-code` validates product edge cases such as synthetic tool
+  results after abort and concurrency-safe batching; do not port its TypeScript
+  structure.
+- `~/vendor/pi_agent_rust` is a secondary sketch only. Do not adopt `asupersync`,
+  a custom runtime, or a monolithic agent file.
 
 ## The three tiers
 
@@ -47,12 +66,12 @@ tools and approval plug into.
 
 | Owns | Today's file(s) |
 |---|---|
-| Model loop (turn → provider → tool → repeat, bounded round-trips) | `nexus.rs` |
+| Model loop (turn → provider → tool → repeat, bounded round-trips; next: async stream/cancel runtime) | `nexus.rs` |
 | Provider contract `ChatProvider` | `nexus.rs` |
 | Message contracts: `Message`, `Role`, `ToolCall`, `AssistantTurn` | `nexus.rs` |
 | Agent-event stream + sink (`AgentEvent`, `AgentObserver`, `TurnSink` for deltas) | `nexus.rs` |
 | `Tool` trait + `ToolOutput`/`ToolEnv` contracts (not the implementations) | `nexus.rs` |
-| Injected tool set + name lookup (`Tools::by_name`); approval-policy enforcement in the loop | `nexus.rs` |
+| Injected tool set + name lookup (`Tools::by_name`); approval-policy enforcement in the loop; next: sequential-default / safe-parallel tool scheduling | `nexus.rs` |
 | `ApprovalGate` approval hook + `ApprovalDecision` (the contract — not the UX) | `nexus.rs` |
 | Boundary errors, exit codes, tracing | `errors.rs`, `telemetry.rs` |
 
@@ -155,6 +174,12 @@ for it.
 | `Tool` trait, `ToolOutput`, `ToolRegistry`, `ToolPolicy`, identity keys, dispatch order, approval **enforcement** | 1 Nexus | Core names no concrete tool and knows nothing about any plugin runtime. Tools classify themselves (`mutates()`, `classify(args)`); core enforces. |
 | Workspace path safety, `ToolState`, host capabilities (`host_read`/`host_ls`) | 2 Wayland | The execution surface (`env`) passed to `Tool::execute`. Plugins get host functions, never raw WASI. |
 | Built-in impls (`read`..`ls`), registry construction, trusted diff rendering, and — only if a plugin system is added — a plugin executor + manifest parsing | 3 Iris | Concrete impls + wiring. The diff renderer is host-side and trusted relative to any plugin. |
+
+Runtime completion adds one more tool contract without changing ownership:
+tools may declare whether a call is concurrency-safe. The default is exclusive.
+Nexus enforces the scheduling rule; each concrete tool owns its classification.
+File-mutating tools and shell commands stay exclusive unless a future measured
+case proves a narrower safe mode.
 
 Two boundaries are orthogonal and must not be conflated:
 

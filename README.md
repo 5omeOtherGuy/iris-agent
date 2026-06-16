@@ -23,7 +23,7 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-15): Milestone 1 complete.** The repository currently contains a text-only interactive session backed by an OpenAI Codex Responses provider, a streaming provider tool-call loop, workspace-scoped built-in tools, terminal approval gates with diff previews, provider/model settings, and best-effort JSONL transcript persistence. Persistent approval policies and broader tool-policy UX are still planned.
+**Status (2026-06-17): Milestone 1 complete.** The repository currently contains a text-only interactive session backed by an OpenAI Codex Responses provider, streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, provider/model settings, and best-effort JSONL transcript persistence. The next runtime work is to make Nexus async-hard: provider stream cancellation, async tools, child cancellation per tool, and safe parallel execution for explicitly concurrency-safe tools.
 
 Implemented today:
 
@@ -46,6 +46,7 @@ Implemented today:
 Not implemented yet:
 
 - Persistent approval policies, session `/resume` and transcript-tree branching, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
+- Runtime-hard async provider/tool contracts, turn-level cancellation tokens, stream/tool cancellation races, and safe parallel tool execution.
 - A possible plugin system for third-party extensions (WASM/Extism is one candidate backend, a subprocess protocol another) — exploratory only, tracked in issue #18; Iris is not being built around it.
 
 ## Running

@@ -1,6 +1,6 @@
 # Iris Current Codemap
 
-**Last Updated:** 2026-06-15
+**Last Updated:** 2026-06-17
 **Entry Points:** `src/main.rs`
 
 This codemap describes implemented code only. Planned capabilities live in [`../ROADMAP.md`](../ROADMAP.md) and [`../FEATURES.md`](../FEATURES.md).
@@ -26,7 +26,10 @@ This codemap describes implemented code only. Planned capabilities live in [`../
 
 Nexus is provider- and UI-neutral: it drives turns and approval policy, streams
 text through a `TurnSink`, and renders nothing itself. All terminal I/O lives
-behind the `Ui` trait; the only implementation today is the text front-end.
+behind the `Ui` trait; the only implementation today is the text front-end. The
+next planned runtime change is documented in [`../ROADMAP.md`](../ROADMAP.md):
+replace the current blocking provider/tool seams with an async stream/cancel
+runtime while preserving this ownership split.
 
 ## Key Modules
 
@@ -158,7 +161,14 @@ Current unit tests cover:
 
 ## Known Gaps
 
-The Agent Kernel MVP is not complete. Implemented since the prior codemap: a JSON settings file (`config.rs`), best-effort JSONL transcript persistence (`session.rs`), graceful/force-quit SIGINT handling (`signals.rs`, `process_group.rs`), and bash hardening (Landlock sandbox, persistent sessions, background jobs). Still missing: persistent approval policies, shared file-observation/stale-mutation preflight, structured tool-result metadata, session `/resume` and transcript-tree branching, and the later roadmap systems listed in `ROADMAP.md`.
+Milestone 1 is complete, but the runtime is not finished. The important next gap
+is runtime hardness: `ChatProvider` is not yet an async streaming contract,
+active turns do not yet own a real cancellation token, provider reads and tool
+futures are not raced against cancellation, tools do not yet receive child
+cancellation tokens, and concurrency-safe tools do not yet run in parallel under
+Nexus scheduling. Also still missing: persistent approval policies, session
+`/resume` and transcript-tree branching, and the later roadmap systems listed in
+[`../ROADMAP.md`](../ROADMAP.md).
 
 ## Related Areas
 

@@ -2,12 +2,14 @@
 
 **A fast, token-efficient coding agent for your terminal.**
 
-> **Status (2026-06-14): early implementation.** Iris currently has a text-only
-> REPL, in-memory conversation state, OpenAI Codex OAuth auth-file support, and a
-> non-streaming OpenAI Codex Responses provider. The Agent Kernel MVP is not
-> complete: file tools, tool execution, approvals, workspace path safety, and
-> bash are still planned. Efficiency claims (token savings, cache hits, cheaper
-> switching, compaction quality) are **design goals to be backed by benchmarks**
+> **Status (2026-06-17): Milestone 1 complete.** Iris currently has a text-only
+> REPL, OpenAI Codex OAuth/login support, an OpenAI Codex Responses provider with
+> streamed response parsing, workspace-scoped built-in tools, approval gates with
+> diff previews, provider/model settings, and best-effort JSONL transcripts. The
+> next runtime work is to make Nexus async-hard — async provider streams,
+> cancellation tokens, child cancellation per tool, and safe parallel execution.
+> Efficiency claims (token savings, cache hits, cheaper switching, compaction
+> quality) are **design goals to be backed by benchmarks**
 > before they are used as selling points. Read future capability sections below
 > as *"designed to,"* not *"does."* Per-capability status and MVP scope live in
 > [`FEATURES.md`](FEATURES.md).

@@ -1,9 +1,10 @@
 # Iris — Roadmap
 
-> Status (2026-06-15): Milestone 1 is complete. Iris has a text-only session
-> loop, OpenAI Codex Responses provider, streaming tool-call loop, workspace-scoped
-> tools, terminal approval gates with diff previews, provider/model settings,
-> and best-effort JSONL transcript persistence.
+> Status (2026-06-17): Milestone 1 is complete. Iris has a text-only session
+> loop, OpenAI Codex Responses provider, streamed response parsing, workspace-
+> scoped tools, terminal approval gates with diff previews, provider/model
+> settings, and best-effort JSONL transcript persistence. The next runtime work
+> is to finish Nexus's async-hard agent loop before token/context milestones.
 > This roadmap defines build order and acceptance criteria. `FEATURES.md` remains
 > the capability inventory; this document says what to build first.
 
@@ -37,7 +38,8 @@ Roadmap-level boundary:
 - Provider and tool details should sit behind explicit seams so later milestones do
   not require rewriting the first loop.
 
-The immediate goal is much smaller: build the minimum working agent kernel.
+The immediate post-Milestone-1 goal is to finish the agent runtime loop before
+building token/context systems on top of it.
 
 ## Current implementation snapshot
 
@@ -74,9 +76,97 @@ Implemented today:
 
 Not implemented yet:
 
-- Transcript persistence, persistent approval policies, shared
-  file-observation/stale-file guards, modes, subagents, context ledger, content
-  handles, git automation, and GitHub integration.
+- Runtime-hard async provider/tool contracts, turn-level cancellation tokens,
+  stream/tool cancellation races, child cancellation per tool, and safe parallel
+  tool execution.
+- Persistent approval policies, session `/resume` and transcript-tree branching,
+  modes, subagents, context ledger, content handles, git automation, and GitHub
+  integration.
+
+## Runtime completion — finish Nexus before Milestone 2
+
+**Goal:** finish the agent runtime, not just the feature checklist. Nexus should
+keep pi-mono's clean contracts-in/events-out shape while adopting the mature
+Rust async mechanics used by Codex CLI.
+
+This work is the next sequencing gate before Milestone 2. The current loop is
+clear and already parses provider streams, but the provider/tool seams are still
+too blocking for a terminal agent: cancellation is observed between steps rather
+than raced against in-flight provider reads and long-running tools.
+
+### Reference split
+
+- **Use `~/vendor/pi-mono` for shape.** pi-mono is already async TypeScript, but
+  deliberately linear: `packages/agent/src/agent-loop.ts` shows the simple
+  `runLoop`, `streamAssistantResponse`, `beforeToolCall`, `prepareNextTurn`,
+  `transformContext`, and `convertToLlm` seams. Keep this clarity.
+- **Use `~/vendor/codex` for Rust runtime mechanics.** Codex CLI is the primary
+  Rust reference for Tokio streams, `CancellationToken`, `tokio::select!` /
+  cancellation races, bounded channels, child cancellation per tool, and
+  safe-parallel/exclusive tool execution. Start with
+  `codex-rs/core/src/client.rs`, `codex-rs/core/src/session/turn.rs`,
+  `codex-rs/core/src/tools/parallel.rs`, and
+  `codex-rs/core/src/stream_events_utils.rs`.
+- **Use `~/vendor/claude-code` only for product edge cases.** It validates the
+  same pattern with `AbortController`, async generators, synthetic cancelled tool
+  results, and concurrency-safe batching. It is not a Rust architecture source.
+- **Use `~/vendor/pi_agent_rust` only as a secondary sketch.** Do not adopt
+  `asupersync`, a bespoke runtime, or a monolithic `agent.rs` structure.
+
+### Required runtime behavior
+
+1. `ChatProvider` becomes async streaming, yielding typed provider-neutral events
+   instead of one blocking whole-turn result.
+2. Each submitted turn owns a real cancellation token. Ctrl-C or equivalent
+   cancellation cancels that token.
+3. The turn loop races provider stream reads against cancellation.
+4. `Tool::execute` is async and receives a child cancellation token.
+5. Tool execution races the tool future against cancellation.
+6. Tool calls are sequential by default.
+7. Only tools explicitly marked concurrency-safe/read-only may overlap; unsafe
+   tools run exclusively and preserve transcript order.
+8. Provider/tool errors and cancellations are represented as turn/tool data when
+   possible, not panics.
+9. If cancellation happens after the model has emitted tool calls, the transcript
+   remains valid by recording either real tool results or synthetic cancelled
+   tool-result data for every emitted call.
+
+### Acceptance criteria
+
+Runtime completion is done only when tests prove:
+
+1. A fake streaming provider emits multiple events in order and the observer sees
+   them in order.
+2. Cancelling while a fake provider stream is pending exits promptly and leaves
+   valid turn state.
+3. Async tools are awaited and their results feed a follow-up model turn.
+4. Cancelling while a fake tool is pending exits promptly and records a valid
+   cancelled/error tool result.
+5. Two unsafe tools do not overlap.
+6. Two explicitly safe tools do overlap, while their recorded results remain
+   deterministic.
+7. Safe tools do not cross an unsafe tool in a way that changes effects or
+   transcript order.
+8. Pending approval, if any, unblocks on cancellation.
+9. Existing observer, approval, provider, tool, path-safety, and transcript tests
+   remain green.
+
+Verification gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+and `cargo test`. If any check cannot run or fails for a pre-existing reason,
+the implementation report must include the exact command output and the smallest
+follow-up needed.
+
+### Explicit non-goals
+
+- No custom runtime.
+- No `asupersync`.
+- No giant all-purpose `agent.rs`.
+- No Codex WebSocket reuse or transport fallback machinery unless a real Iris
+  provider bug requires it.
+- No Claude Code full streaming-tool executor unless the simple safe/unsafe
+  batching rule is proven insufficient.
+- No context compaction, subagents, provider routing, or steering UX before the
+  async runtime seam exists.
 
 ## Tool quality — best-in-class on all tools
 
@@ -544,11 +634,14 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    Iris can make a small change in a real repo, show the diff, and explain it.
    Deferred to a future full-TUI milestone (raw mode): interactive block
    expansion, `Alt+Enter` multi-line editing, and box framing.
-4. Architecture: enforce the tier-boundary cuts (see "Architecture work" above)
-   that invert `src/nexus.rs`'s outward dependencies onto Wayland/Iris. Do cut 1
-   (event stream) first; it is behavior-preserving and unblocks the approval and
-   tool-injection cuts. Run alongside or before Milestone 2 tool infrastructure.
-5. Next: Milestone 2 (token-efficiency). The metadata gate is already met
+4. Done: the tier-boundary cuts are shipped (see [`ARCHITECTURE.md`](ARCHITECTURE.md)).
+   Protect that split during runtime work: Nexus stays the bare runtime, Wayland
+   stays the harness, and Iris CLI stays terminal I/O/adapters.
+5. Next: Runtime completion (the section above). Convert the provider/tool loop
+   to the Codex-style async stream/cancel/tool runtime while preserving pi-mono's
+   clean contract shape. This gates Milestone 2 because context/token work should
+   build on the finished loop, not on the current between-step cancellation model.
+6. After runtime completion: Milestone 2 (token-efficiency). The metadata gate is already met
    ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) MVP), so the
    remaining work is handle-backing large tool outputs and token accounting.
    First implement shared tool infrastructure in dependency order: path identity and
