@@ -14,19 +14,14 @@
 //! - `edit` follows Claude Code's exact-string contract
 //!   (`file_path`/`old_string`/`new_string`/`replace_all`).
 //!
-//! Nexus owns workspace-path enforcement: every tool resolves the requested
-//! path against the canonicalized workspace root and refuses to escape it
-//! (including via `..` and symlinks). See [`path`].
+//! Workspace-path enforcement: every tool resolves the requested path against
+//! the canonicalized workspace root and refuses to escape it (including via
+//! `..` and symlinks). See [`path`].
 //!
 //! Module layout:
 //! - [`path`], [`text`]: shared path-resolution and text/I/O-size helpers.
 //! - One module per tool: [`read`], [`bash`], [`edit`], [`write`],
 //!   [`grep`], [`find`], [`ls`].
-
-use std::path::Path;
-
-use anyhow::{Result, bail};
-use serde_json::{Map, Value, json};
 
 mod bash;
 mod edit;
@@ -36,16 +31,22 @@ mod ls;
 mod observe;
 mod path;
 mod read;
+mod registry;
 mod text;
 mod write;
 
+// The result contract lives in Tier-1 Nexus; tools produce it and re-export it
+// here so the per-tool modules can keep referring to `super::ToolOutput`.
+pub(crate) use crate::nexus::ToolOutput;
 pub(crate) use observe::ObservedFiles;
+pub(crate) use registry::built_in_tools;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 1024 * 1024;
 
-/// Mutable per-agent state threaded through [`dispatch`]: observed-file tracking
-/// for read-before-write safety plus the bash tool's persistent-session
-/// registry. Owned by the `Agent` so no global mutable state is needed.
+/// Mutable per-agent state threaded into tools via [`crate::nexus::ToolEnv`]:
+/// observed-file tracking for read-before-write safety plus the bash tool's
+/// persistent-session registry. Owned by the `Agent` so no global mutable state
+/// is needed (relocated to the harness tier in Step C).
 pub(crate) struct ToolState {
     pub(crate) observed: ObservedFiles,
     pub(crate) bash: bash::BashState,
@@ -62,121 +63,6 @@ impl ToolState {
 
 #[cfg(test)]
 pub(crate) use read::read_file;
-
-/// Structured result of a successful tool call: the model-facing text plus
-/// optional structured metadata. The metadata object is the seam that lets
-/// large outputs become handle-backed later without changing call sites
-/// (Milestone 2 gate); tools that have nothing structured to report use
-/// [`ToolOutput::text`] and the metadata is simply omitted from the wire.
-#[derive(Debug)]
-pub(crate) struct ToolOutput {
-    pub(crate) content: String,
-    pub(crate) metadata: Map<String, Value>,
-}
-
-impl ToolOutput {
-    /// A text-only result with no structured metadata.
-    pub(crate) fn text(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            metadata: Map::new(),
-        }
-    }
-
-    /// Attach one metadata field, builder-style.
-    pub(crate) fn with(mut self, key: &str, value: Value) -> Self {
-        self.metadata.insert(key.to_string(), value);
-        self
-    }
-}
-
-/// Execute a tool call by name, returning the structured tool result.
-///
-/// Argument-parsing error messages are preserved where existing tests depend
-/// on them (`read tool arguments must include path`).
-pub(crate) fn dispatch(
-    workspace: &Path,
-    name: &str,
-    args: &Value,
-    state: &mut ToolState,
-) -> Result<ToolOutput> {
-    let _span = tracing::debug_span!("tool_dispatch", tool = name).entered();
-    let root = path::workspace_root(workspace)?;
-    match name {
-        "read" => read::execute(&root, args, &mut state.observed),
-        "bash" => bash::execute(&root, args, &mut state.bash),
-        "edit" => edit::execute(&root, args, &mut state.observed),
-        "write" => write::execute(&root, args, &mut state.observed),
-        "grep" => grep::execute(&root, args),
-        "find" => find::execute(&root, args),
-        "ls" => ls::execute(&root, args),
-        other => bail!("unknown tool: {other}"),
-    }
-}
-
-/// Nexus-owned safety policy: which built-in tools mutate the workspace and
-/// therefore require user approval before execution.
-pub(crate) fn requires_approval(name: &str) -> bool {
-    matches!(name, "write" | "edit" | "bash")
-}
-
-/// Nexus-owned safety policy: whether a tool call performs a destructive,
-/// data-losing operation that must be re-approved every time, even when the tool
-/// was "always allowed" this session. Currently only `bash` scripts are
-/// classified. The check is deliberately conservative and biased toward
-/// flagging: a false positive costs one extra prompt, a false negative could
-/// auto-run an `rm`.
-pub(crate) fn is_destructive(name: &str, args: &Value) -> bool {
-    match name {
-        "bash" => bash_command_is_destructive(args),
-        _ => false,
-    }
-}
-
-fn bash_command_is_destructive(args: &Value) -> bool {
-    let Some(command) = args.get("command").and_then(Value::as_str) else {
-        return false;
-    };
-    let lower = command.to_ascii_lowercase();
-    // Whole-word commands that destroy files/filesystems/devices.
-    const DANGER_TOKENS: &[&str] = &[
-        "rm", "rmdir", "shred", "mkfs", "dd", "truncate", "fdisk", "mkswap", "wipefs",
-    ];
-    let token_danger = lower
-        .split(|c: char| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '(' | ')' | '`'))
-        .any(|token| DANGER_TOKENS.contains(&token));
-    if token_danger {
-        return true;
-    }
-    // Multi-word / flag patterns a single-token scan cannot catch.
-    const DANGER_PHRASES: &[&str] = &[
-        "-delete",
-        "git reset --hard",
-        "git clean",
-        "git push --force",
-        "git push -f",
-        "chmod -r",
-        "chown -r",
-        ":(){",
-        "of=/dev/",
-        "> /dev/sd",
-    ];
-    DANGER_PHRASES.iter().any(|phrase| lower.contains(phrase))
-}
-
-/// Optional pre-approval diff preview for mutating tools.
-pub(crate) fn diff_preview(workspace: &Path, name: &str, args: &Value) -> Option<String> {
-    let root = match path::workspace_root(workspace) {
-        Ok(root) => root,
-        Err(error) => return Some(format!("diff unavailable: {error:#}")),
-    };
-    match name {
-        "write" => render_preview(write::preview(&root, args)),
-        "edit" => render_preview(edit::preview(&root, args)),
-        "bash" => None,
-        _ => None,
-    }
-}
 
 pub(super) enum Preview {
     Available {
@@ -209,31 +95,6 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
         .unified_diff()
         .header(&old_header, &new_header)
         .to_string()
-}
-
-/// JSON tool declarations advertised to the provider, one per built-in tool.
-///
-/// Names, descriptions, and parameter schemas are copied verbatim from pi.
-pub(crate) fn tool_definitions() -> Vec<Value> {
-    [
-        ("read", read::DESCRIPTION, read::parameters()),
-        ("bash", bash::DESCRIPTION, bash::parameters()),
-        ("edit", edit::DESCRIPTION, edit::parameters()),
-        ("write", write::DESCRIPTION, write::parameters()),
-        ("grep", grep::DESCRIPTION, grep::parameters()),
-        ("find", find::DESCRIPTION, find::parameters()),
-        ("ls", ls::DESCRIPTION, ls::parameters()),
-    ]
-    .into_iter()
-    .map(|(name, description, parameters)| {
-        json!({
-            "type": "function",
-            "name": name,
-            "description": description,
-            "parameters": parameters,
-        })
-    })
-    .collect()
 }
 
 #[cfg(test)]
@@ -274,28 +135,30 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::temp_dir;
-    use super::{diff_preview, dispatch, tool_definitions};
-    use serde_json::json;
+    use super::built_in_tools;
+    use super::test_support::{TestDir, temp_dir};
+    use serde_json::{Value, json};
     use std::fs;
 
     #[test]
-    fn dispatch_unknown_tool_errors() {
-        let dir = temp_dir();
-        let err = dispatch(&dir.path, "nope", &json!({}), &mut super::ToolState::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unknown tool: nope"));
+    fn unknown_tool_is_absent_from_the_built_in_set() {
+        // The `unknown tool: <name>` error is produced by the loop's resolution
+        // path (see nexus tests); the set itself simply has no such tool.
+        assert!(built_in_tools().by_name("nope").is_none());
     }
 
     #[test]
     fn requires_approval_gates_only_mutating_tools() {
+        let tools = built_in_tools();
         for name in ["write", "edit", "bash"] {
-            assert!(super::requires_approval(name), "{name} should be gated");
+            assert!(
+                tools.by_name(name).unwrap().requires_approval(),
+                "{name} should be gated"
+            );
         }
         for name in ["read", "grep", "find", "ls"] {
             assert!(
-                !super::requires_approval(name),
+                !tools.by_name(name).unwrap().requires_approval(),
                 "{name} should not be gated"
             );
         }
@@ -303,6 +166,8 @@ mod tests {
 
     #[test]
     fn is_destructive_flags_dangerous_bash() {
+        let tools = built_in_tools();
+        let bash = tools.by_name("bash").unwrap();
         for cmd in [
             "rm -rf foo",
             "mkdir x && rm x",
@@ -312,7 +177,7 @@ mod tests {
             "echo x | dd of=/dev/sda",
         ] {
             assert!(
-                super::is_destructive("bash", &json!({ "command": cmd })),
+                bash.is_destructive(&json!({ "command": cmd })),
                 "{cmd} should be destructive"
             );
         }
@@ -320,6 +185,8 @@ mod tests {
 
     #[test]
     fn is_destructive_allows_benign_bash_and_other_tools() {
+        let tools = built_in_tools();
+        let bash = tools.by_name("bash").unwrap();
         for cmd in [
             "echo hi",
             "ls -la",
@@ -328,20 +195,22 @@ mod tests {
             "cat file.txt",
         ] {
             assert!(
-                !super::is_destructive("bash", &json!({ "command": cmd })),
+                !bash.is_destructive(&json!({ "command": cmd })),
                 "{cmd} should be benign"
             );
         }
-        assert!(!super::is_destructive(
-            "write",
-            &json!({ "path": "a", "content": "x" })
-        ));
+        assert!(
+            !tools
+                .by_name("write")
+                .unwrap()
+                .is_destructive(&json!({ "path": "a", "content": "x" }))
+        );
     }
 
     #[test]
-    fn tool_definitions_cover_all_seven() {
-        let defs = tool_definitions();
-        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+    fn built_in_tools_cover_all_seven_in_order() {
+        let tools = built_in_tools();
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
         assert_eq!(
             names,
             vec!["read", "bash", "edit", "write", "grep", "find", "ls"]
@@ -350,11 +219,9 @@ mod tests {
 
     #[test]
     fn bash_definition_advertises_job_actions() {
-        let defs = tool_definitions();
-        let bash = defs.iter().find(|d| d["name"] == "bash").unwrap();
-        let action_enum = bash["parameters"]["properties"]["action"]["enum"]
-            .as_array()
-            .unwrap();
+        let tools = built_in_tools();
+        let params = tools.by_name("bash").unwrap().parameters();
+        let action_enum = params["properties"]["action"]["enum"].as_array().unwrap();
         for action in [
             "run", "reset", "close", "start", "poll", "finalize", "cancel", "list",
         ] {
@@ -363,14 +230,22 @@ mod tests {
                 "missing bash action {action}"
             );
         }
-        assert!(bash["parameters"]["properties"].get("job").is_some());
+        assert!(params["properties"].get("job").is_some());
     }
 
     #[test]
     fn bash_definition_does_not_require_command_for_job_actions() {
-        let defs = tool_definitions();
-        let bash = defs.iter().find(|d| d["name"] == "bash").unwrap();
-        assert!(bash["parameters"].get("required").is_none());
+        let tools = built_in_tools();
+        let params = tools.by_name("bash").unwrap().parameters();
+        assert!(params.get("required").is_none());
+    }
+
+    /// Resolve a built-in tool and render its diff preview against `dir`.
+    fn preview(dir: &TestDir, name: &str, args: Value) -> Option<String> {
+        built_in_tools()
+            .by_name(name)
+            .unwrap()
+            .diff_preview(&dir.path, &args)
     }
 
     #[test]
@@ -378,10 +253,10 @@ mod tests {
         let dir = temp_dir();
         fs::write(dir.path.join("note.txt"), "old\n").unwrap();
 
-        let diff = diff_preview(
-            &dir.path,
+        let diff = preview(
+            &dir,
             "write",
-            &json!({ "path": "note.txt", "content": "new\n" }),
+            json!({ "path": "note.txt", "content": "new\n" }),
         )
         .unwrap();
 
@@ -394,10 +269,10 @@ mod tests {
     #[test]
     fn diff_preview_refuses_huge_previews() {
         let dir = temp_dir();
-        let diff = diff_preview(
-            &dir.path,
+        let diff = preview(
+            &dir,
             "write",
-            &json!({ "path": "huge.txt", "content": "x".repeat(2 * 1024 * 1024) }),
+            json!({ "path": "huge.txt", "content": "x".repeat(2 * 1024 * 1024) }),
         )
         .unwrap();
 
@@ -411,10 +286,10 @@ mod tests {
         let abs = root.join("note.txt");
         fs::write(&abs, "old\n").unwrap();
 
-        let diff = diff_preview(
-            &dir.path,
+        let diff = preview(
+            &dir,
             "write",
-            &json!({ "path": abs.to_string_lossy(), "content": "new\n" }),
+            json!({ "path": abs.to_string_lossy(), "content": "new\n" }),
         )
         .unwrap();
 
@@ -435,10 +310,10 @@ mod tests {
 
         // `edit`'s schema takes an absolute `file_path`; the rendered header must
         // be the same workspace-relative path `write` produces, not `a//abs`.
-        let diff = diff_preview(
-            &dir.path,
+        let diff = preview(
+            &dir,
             "edit",
-            &json!({
+            json!({
                 "file_path": abs.to_string_lossy(),
                 "old_string": "old",
                 "new_string": "new"
@@ -457,17 +332,17 @@ mod tests {
     fn diff_preview_skips_malformed_mutating_args() {
         let dir = temp_dir();
 
-        assert!(diff_preview(&dir.path, "write", &json!({ "path": "note.txt" })).is_none());
+        assert!(preview(&dir, "write", json!({ "path": "note.txt" })).is_none());
     }
 
     #[test]
     fn diff_preview_reports_unavailable_for_well_formed_failed_edit() {
         let dir = temp_dir();
 
-        let preview = diff_preview(
-            &dir.path,
+        let preview = preview(
+            &dir,
             "edit",
-            &json!({ "file_path": "missing.txt", "old_string": "old", "new_string": "new" }),
+            json!({ "file_path": "missing.txt", "old_string": "old", "new_string": "new" }),
         )
         .unwrap();
 

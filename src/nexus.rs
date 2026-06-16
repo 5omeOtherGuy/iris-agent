@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -71,9 +71,108 @@ pub(crate) trait ApprovalGate {
     fn review(&self, call: &ToolCall) -> Result<ApprovalDecision>;
 }
 
+/// Structured result of a successful tool call: the model-facing text plus
+/// optional structured metadata. Tier-1 result contract (the analogue of pi's
+/// `AgentToolResult`); tools with nothing structured to report use
+/// [`ToolOutput::text`] and the metadata is omitted from the wire.
+#[derive(Debug)]
+pub(crate) struct ToolOutput {
+    pub(crate) content: String,
+    pub(crate) metadata: serde_json::Map<String, Value>,
+}
+
+impl ToolOutput {
+    /// A text-only result with no structured metadata.
+    pub(crate) fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    /// Attach one metadata field, builder-style.
+    pub(crate) fn with(mut self, key: &str, value: Value) -> Self {
+        self.metadata.insert(key.to_string(), value);
+        self
+    }
+}
+
+/// Execution environment handed to a tool: the workspace root plus the mutable
+/// per-session tool state (observed files, bash sessions). The Agent assembles
+/// this per call. `ToolState` still lives in `crate::tools` for now; Step C
+/// relocates it (and this env's guts) to the Wayland harness tier.
+pub(crate) struct ToolEnv<'a> {
+    pub(crate) workspace: &'a Path,
+    pub(crate) state: &'a mut crate::tools::ToolState,
+}
+
+/// A tool the agent can invoke. Mirrors pi-ai's `Tool`
+/// (`name`/`description`/`parameters`) plus pi-agent's `AgentTool` (the tool
+/// runs itself via `execute`). Nexus enforces the approval policy, but each tool
+/// *classifies* itself, so the core loop never matches on tool names.
+pub(crate) trait Tool {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    /// JSON Schema for the arguments, used to build provider tool declarations.
+    fn parameters(&self) -> Value;
+    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput>;
+
+    /// Whether a call to this tool must be approved before it runs.
+    fn requires_approval(&self) -> bool {
+        false
+    }
+    /// Whether these arguments perform a destructive, data-losing operation that
+    /// must be re-approved every time, even when the tool is "always allowed".
+    fn is_destructive(&self, _args: &Value) -> bool {
+        false
+    }
+    /// Whether an "always allow" decision may persist for this tool. Tools that
+    /// authorize arbitrary later effects (e.g. shell) opt out, so the loop keeps
+    /// prompting each call instead of name-matching `"bash"` in core.
+    fn supports_allow_always(&self) -> bool {
+        true
+    }
+    /// Optional pre-approval diff preview (Tier-3 presentation). `None` when the
+    /// tool has no preview or the arguments are malformed.
+    fn diff_preview(&self, _workspace: &Path, _args: &Value) -> Option<String> {
+        None
+    }
+}
+
+/// Injected collection the agent resolves tool calls against. A thin name lookup
+/// over a `Vec<Box<dyn Tool>>` -- no identity keys, override, or dispatch-order
+/// machinery (that is issue #18, out of scope). Mirrors pi's `context.tools`
+/// resolved with `tools.find(t => t.name === toolCall.name)`.
+pub(crate) struct Tools(Vec<Box<dyn Tool>>);
+
+impl Tools {
+    pub(crate) fn new(tools: Vec<Box<dyn Tool>>) -> Self {
+        Self(tools)
+    }
+
+    /// Resolve a call by exact tool name. `None` for an unknown tool.
+    pub(crate) fn by_name(&self, name: &str) -> Option<&dyn Tool> {
+        self.0
+            .iter()
+            .map(|tool| &**tool)
+            .find(|tool| tool.name() == name)
+    }
+
+    /// Iterate the tools in declaration order (for provider tool schemas).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &dyn Tool> {
+        self.0.iter().map(|tool| &**tool)
+    }
+}
+
 pub(crate) trait ChatProvider {
     // Providers translate their native response format into this Nexus-owned turn shape.
-    fn respond(&self, messages: &[Message], sink: &mut dyn TurnSink) -> Result<AssistantTurn>;
+    // `tools` is the injected set the provider advertises as callable declarations.
+    fn respond(
+        &self,
+        messages: &[Message],
+        tools: &Tools,
+        sink: &mut dyn TurnSink,
+    ) -> Result<AssistantTurn>;
 }
 
 pub(crate) struct Agent<P> {
@@ -81,6 +180,9 @@ pub(crate) struct Agent<P> {
     pub(crate) messages: Vec<Message>,
     workspace: PathBuf,
     state: crate::tools::ToolState,
+    // Injected tool set, constructed at Tier 3 and resolved by name in the loop.
+    // Core names no concrete tool; it only holds the `Tool` contract.
+    tools: Tools,
     // Session approval policy: tool names the user chose to "always" allow.
     // Owned and enforced here in Nexus, not in the UI, so a front-end can never
     // silently widen what runs without approval. Granularity is per tool name.
@@ -98,12 +200,13 @@ pub(crate) struct Agent<P> {
 }
 
 impl<P: ChatProvider> Agent<P> {
-    pub(crate) fn new(provider: P, workspace: PathBuf) -> Self {
+    pub(crate) fn new(provider: P, workspace: PathBuf, tools: Tools) -> Self {
         Self {
             provider,
             messages: Vec::new(),
             workspace,
             state: crate::tools::ToolState::new(),
+            tools,
             session_allowed: HashSet::new(),
             session: None,
             persisted: 0,
@@ -166,7 +269,9 @@ impl<P: ChatProvider> Agent<P> {
                 return Ok(());
             }
             let mut sink = ObserverTurnSink::new(obs);
-            let turn = self.provider.respond(&self.messages, &mut sink)?;
+            let turn = self
+                .provider
+                .respond(&self.messages, &self.tools, &mut sink)?;
             let saw_text_delta = sink.saw_text_delta;
             let stream_error = sink.error.take();
             drop(sink);
@@ -218,19 +323,21 @@ impl<P: ChatProvider> Agent<P> {
             for call in turn.tool_calls {
                 self.messages.push(Message::assistant_tool_call(&call));
 
-                if crate::tools::requires_approval(&call.name) {
+                // Resolve the call against the injected set by name (pi's
+                // `tools.find(t => t.name === name)`); `None` is an unknown tool.
+                let tool = self.tools.by_name(&call.name);
+                if let Some(tool) = tool.filter(|tool| tool.requires_approval()) {
                     // A destructive call (e.g. `rm`) always re-prompts, even when
                     // its tool was "always allowed" this session: a blanket bash
                     // allow must not silently auto-run data-losing commands.
-                    let destructive = crate::tools::is_destructive(&call.name, &call.arguments);
+                    let destructive = tool.is_destructive(&call.arguments);
                     let session_allowed = self.session_allowed.contains(&call.name);
-                    let auto_approved = session_allowed && !destructive && call.name != "bash";
+                    let auto_approved =
+                        session_allowed && !destructive && tool.supports_allow_always();
                     if auto_approved {
                         obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
                     }
-                    if let Some(diff) =
-                        crate::tools::diff_preview(&self.workspace, &call.name, &call.arguments)
-                    {
+                    if let Some(diff) = tool.diff_preview(&self.workspace, &call.arguments) {
                         obs.on_event(AgentEvent::DiffPreview {
                             call: call.clone(),
                             diff,
@@ -255,14 +362,14 @@ impl<P: ChatProvider> Agent<P> {
                                 continue;
                             }
                             ApprovalDecision::AllowAlways => {
-                                if call.name == "bash" {
+                                if tool.supports_allow_always() {
+                                    tracing::info!(tool = %call.name, "tool always-allowed this session");
+                                    self.session_allowed.insert(call.name.clone());
+                                } else {
                                     obs.on_event(AgentEvent::Notice(
                                         "bash always-allow is disabled; shell commands require approval each time."
                                             .to_string(),
                                     ))?;
-                                } else {
-                                    tracing::info!(tool = %call.name, "tool always-allowed this session");
-                                    self.session_allowed.insert(call.name.clone());
                                 }
                             }
                             ApprovalDecision::Allow => {}
@@ -272,7 +379,18 @@ impl<P: ChatProvider> Agent<P> {
                     obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
                 }
 
-                let result = self.execute_tool(&call);
+                // Run the resolved tool with the assembled env; an unknown tool
+                // yields the same `unknown tool: <name>` result as before.
+                let result = match tool {
+                    Some(tool) => {
+                        let mut env = ToolEnv {
+                            workspace: &self.workspace,
+                            state: &mut self.state,
+                        };
+                        tool.execute(&call.arguments, &mut env)
+                    }
+                    None => Err(anyhow::anyhow!("unknown tool: {}", call.name)),
+                };
                 tracing::info!(tool = %call.name, ok = result.is_ok(), "tool executed");
                 match &result {
                     Ok(output) => obs.on_event(AgentEvent::ToolResult {
@@ -305,15 +423,6 @@ impl<P: ChatProvider> Agent<P> {
         )))?;
         obs.on_event(AgentEvent::TurnComplete)?;
         Ok(())
-    }
-
-    fn execute_tool(&mut self, call: &ToolCall) -> Result<crate::tools::ToolOutput> {
-        crate::tools::dispatch(
-            &self.workspace,
-            &call.name,
-            &call.arguments,
-            &mut self.state,
-        )
     }
 }
 
@@ -437,7 +546,7 @@ impl Role {
     }
 }
 
-fn tool_result_json(result: &Result<crate::tools::ToolOutput>) -> String {
+fn tool_result_json(result: &Result<ToolOutput>) -> String {
     match result {
         Ok(output) => {
             let mut obj = serde_json::Map::new();

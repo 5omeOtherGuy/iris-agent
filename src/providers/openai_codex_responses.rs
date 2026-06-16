@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::errors::AuthError;
-use crate::nexus::{AssistantTurn, ChatProvider, Message, Role, ToolCall, TurnSink};
+use crate::nexus::{AssistantTurn, ChatProvider, Message, Role, ToolCall, Tools, TurnSink};
 use crate::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -56,11 +56,16 @@ impl OpenAiCodexResponsesProvider {
 }
 
 impl ChatProvider for OpenAiCodexResponsesProvider {
-    fn respond(&self, messages: &[Message], sink: &mut dyn TurnSink) -> Result<AssistantTurn> {
+    fn respond(
+        &self,
+        messages: &[Message],
+        tools: &Tools,
+        sink: &mut dyn TurnSink,
+    ) -> Result<AssistantTurn> {
         let span = tracing::info_span!("codex_roundtrip", model = %self.config.model);
         let _guard = span.enter();
 
-        let request = build_codex_request(&self.config.model, &self.system_prompt, messages);
+        let request = build_codex_request(&self.config.model, &self.system_prompt, messages, tools);
         let url = resolve_codex_url(&self.config.base_url)?;
 
         run_retry_loop(
@@ -315,7 +320,12 @@ Current working directory: {prompt_cwd}"
     )
 }
 
-fn build_codex_request(model: &str, instructions: &str, messages: &[Message]) -> Value {
+fn build_codex_request(
+    model: &str,
+    instructions: &str,
+    messages: &[Message],
+    tools: &Tools,
+) -> Value {
     // The Codex adapter owns conversion between Nexus messages and Responses wire JSON.
     let input: Vec<Value> = messages.iter().map(codex_input_item).collect();
 
@@ -325,9 +335,27 @@ fn build_codex_request(model: &str, instructions: &str, messages: &[Message]) ->
         "stream": true,
         "instructions": instructions,
         "input": input,
-        "tools": crate::tools::tool_definitions(),
+        "tools": tool_declarations(tools),
         "text": { "verbosity": "low" },
     })
+}
+
+/// Build the Codex `tools` declaration array from the injected tool set: one
+/// `{type, name, description, parameters}` entry per tool, in declaration order.
+/// Mirrors how pi builds provider declarations from `tool.name/description/
+/// parameters` (see anthropic.ts / amazon-bedrock.ts).
+fn tool_declarations(tools: &Tools) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.name(),
+                "description": tool.description(),
+                "parameters": tool.parameters(),
+            })
+        })
+        .collect()
 }
 
 fn codex_input_item(message: &Message) -> Value {

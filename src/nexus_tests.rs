@@ -28,7 +28,12 @@ impl FakeProvider {
 }
 
 impl ChatProvider for FakeProvider {
-    fn respond(&self, messages: &[Message], _sink: &mut dyn TurnSink) -> Result<AssistantTurn> {
+    fn respond(
+        &self,
+        messages: &[Message],
+        _tools: &Tools,
+        _sink: &mut dyn TurnSink,
+    ) -> Result<AssistantTurn> {
         self.seen.borrow_mut().push(messages.to_vec());
         match self.responses.borrow_mut().pop() {
             Some(Ok(turn)) => Ok(turn),
@@ -98,7 +103,11 @@ fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
         Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     agent.submit_turn("read note", &frontend, &frontend)?;
@@ -126,7 +135,11 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
     agent.submit_turn("write it", &frontend, &frontend)?;
@@ -155,7 +168,11 @@ fn malformed_denial_skips_diff_preview() -> Result<()> {
         Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     agent.submit_turn("write it", &frontend, &frontend)?;
@@ -186,7 +203,11 @@ fn repl_keeps_conversation_across_turns() -> Result<()> {
         Ok(AssistantTurn::text("hello")),
         Ok(AssistantTurn::text("goodbye")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -208,14 +229,24 @@ fn repl_keeps_conversation_across_turns() -> Result<()> {
 
 struct AuthFailProvider;
 impl ChatProvider for AuthFailProvider {
-    fn respond(&self, _messages: &[Message], _sink: &mut dyn TurnSink) -> Result<AssistantTurn> {
+    fn respond(
+        &self,
+        _messages: &[Message],
+        _tools: &Tools,
+        _sink: &mut dyn TurnSink,
+    ) -> Result<AssistantTurn> {
         Err(crate::errors::AuthError::new("token expired").into())
     }
 }
 
 struct DeltaProvider;
 impl ChatProvider for DeltaProvider {
-    fn respond(&self, _messages: &[Message], sink: &mut dyn TurnSink) -> Result<AssistantTurn> {
+    fn respond(
+        &self,
+        _messages: &[Message],
+        _tools: &Tools,
+        sink: &mut dyn TurnSink,
+    ) -> Result<AssistantTurn> {
         sink.on_text_delta("Hel");
         sink.on_text_delta("lo");
         Ok(AssistantTurn::text("Hello"))
@@ -225,7 +256,11 @@ impl ChatProvider for DeltaProvider {
 #[test]
 fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
     let workspace = test_workspace()?;
-    let mut agent = Agent::new(DeltaProvider, workspace.path.clone());
+    let mut agent = Agent::new(
+        DeltaProvider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -250,7 +285,11 @@ fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
 #[test]
 fn repl_reports_auth_errors_with_login_hint() -> Result<()> {
     let workspace = test_workspace()?;
-    let mut agent = Agent::new(AuthFailProvider, workspace.path.clone());
+    let mut agent = Agent::new(
+        AuthFailProvider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -272,7 +311,11 @@ fn repl_reports_auth_errors_with_login_hint() -> Result<()> {
 fn repl_reports_provider_errors_and_continues() -> Result<()> {
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![Err("boom"), Ok(AssistantTurn::text("recovered"))]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -307,7 +350,11 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
         }),
         Ok(AssistantTurn::text("The file says hello from file.")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -347,7 +394,11 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -380,7 +431,11 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
         }),
         Ok(AssistantTurn::text("recovered")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -414,7 +469,11 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
         })
     };
     let provider = FakeProvider::new((0..MAX_TOOL_ROUNDTRIPS).map(|_| repeated_call()).collect());
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -450,7 +509,11 @@ fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
         }),
         Ok(AssistantTurn::text("I could not use that tool.")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -463,6 +526,85 @@ fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
 
     assert!(errors.is_empty());
     assert_tool_error_contains(&agent.provider.seen.borrow()[1], "unknown tool: unknown");
+    Ok(())
+}
+
+#[test]
+fn unknown_tool_resolution_yields_unknown_tool_error() -> Result<()> {
+    // After Step B the loop resolves calls by name over the injected set (pi's
+    // `tools.find(t => t.name === name)`); an unresolved name must still surface
+    // `unknown tool: <name>` (the analogue of pi's `Tool <name> not found`) as
+    // the tool result fed back to the model.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("ghost", json!({}))),
+        Ok(AssistantTurn::text("ok")),
+    ]);
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    run_text_session(
+        &mut agent,
+        "use ghost\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    assert_tool_error_contains(&agent.provider.seen.borrow()[1], "unknown tool: ghost");
+    Ok(())
+}
+
+#[test]
+fn injected_custom_tool_is_resolved_and_executed() -> Result<()> {
+    // Tools are injected and resolved by name over the provided set: a tool that
+    // is NOT a built-in still runs, proving the loop cannot have regressed to a
+    // hardcoded built-in dispatch.
+    struct MarkerTool;
+    impl Tool for MarkerTool {
+        fn name(&self) -> &str {
+            "marker"
+        }
+        fn description(&self) -> &str {
+            "test marker tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute(&self, _args: &Value, _env: &mut ToolEnv) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("marker-tool-ran"))
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("marker", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        Tools::new(vec![Box::new(MarkerTool)]),
+    );
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    run_text_session(
+        &mut agent,
+        "use marker\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    assert!(errors.is_empty());
+    let seen = agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert_eq!(tool_result.role, Role::Tool);
+    assert!(tool_result.content.contains("marker-tool-ran"));
     Ok(())
 }
 
@@ -480,7 +622,11 @@ fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
         }),
         Ok(AssistantTurn::text("The read call was malformed.")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -571,7 +717,11 @@ fn approved_write_executes_and_creates_file() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -599,7 +749,11 @@ fn approved_write_renders_prompt_and_result_without_raw_json() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -629,7 +783,11 @@ fn denied_write_skips_execution_and_records_denial() -> Result<()> {
         )),
         Ok(AssistantTurn::text("understood")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -673,7 +831,11 @@ fn read_is_never_gated_even_under_auto_deny() -> Result<()> {
         Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -701,7 +863,11 @@ fn denied_bash_does_not_run_command() -> Result<()> {
         Ok(single_call_turn("bash", json!({ "command": command }))),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -729,7 +895,11 @@ fn denied_edit_leaves_file_unchanged() -> Result<()> {
         )),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -768,7 +938,11 @@ fn read_then_edit_succeeds_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -804,7 +978,11 @@ fn edit_without_prior_read_is_rejected_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("understood")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -838,7 +1016,11 @@ fn terminal_approver_allows_write_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -864,7 +1046,11 @@ fn terminal_approver_denies_write_end_to_end() -> Result<()> {
         )),
         Ok(AssistantTurn::text("understood")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -886,7 +1072,11 @@ fn allowed_malformed_args_reach_tool_validation() -> Result<()> {
         Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -911,7 +1101,11 @@ fn denied_malformed_args_return_denial_without_validation() -> Result<()> {
         Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
         Ok(AssistantTurn::text("ok")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -948,7 +1142,11 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -985,7 +1183,11 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -1019,7 +1221,11 @@ fn always_allow_does_not_cross_tool_boundaries() -> Result<()> {
         Ok(single_call_turn("bash", json!({ "command": "echo hi" }))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -1059,7 +1265,11 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
@@ -1114,7 +1324,11 @@ fn turn_persists_transcript_when_log_attached() -> Result<()> {
     let workspace = test_workspace()?;
     let root = test_workspace()?; // separate temp dir as the session root
     let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
-    let mut agent = Agent::new(provider, workspace.path.clone());
+    let mut agent = Agent::new(
+        provider,
+        workspace.path.clone(),
+        crate::tools::built_in_tools(),
+    );
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let log_path = log.path().to_path_buf();
     agent.attach_session_log(log);
