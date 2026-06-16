@@ -499,9 +499,12 @@ Milestone 0/1 verification gates green.
    build the registry at Tier 3 and inject it into the agent instead of calling
    `crate::tools::{dispatch, ToolState}` directly. Tool impls plus
    `diff_preview`/`requires_approval`/`is_destructive` move to Tier 3; tool
-   metadata becomes `Tool`-trait methods on the contract. This is the same
-   registry the WASM plugin work needs, so it is delivered together with issue
-   [#18](https://github.com/5omeOtherGuy/iris-agent/issues/18).
+   metadata becomes `Tool`-trait methods on the contract. This registry is
+   needed for modes, subagents, and provider-specific tool routing regardless;
+   a possible plugin system (issue
+   [#18](https://github.com/5omeOtherGuy/iris-agent/issues/18)) would be one
+   optional consumer of the same seam, not a reason to build it and not a
+   dependency of this refactor.
 4. **Persistence is harness-tier.** Move `SessionLog`, `attach_session_log`,
    `persist_new_messages`, and the `workspace` execution surface out of the bare
    core loop into Wayland (Tier 2), or behind a Tier 1 event subscriber.

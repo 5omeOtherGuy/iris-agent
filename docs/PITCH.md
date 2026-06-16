@@ -109,25 +109,19 @@ simpler and more centrally controlled. The point isn't startup speed (negligible
 next to model latency) — it's the capabilities the shared runtime is meant to
 unlock.
 
-## Extensible through sandboxed plugins
+## Keeping the door open for plugins
 
-Iris's built-in tools stay native and trusted, but the tool surface is designed
-to open up safely: third-party and custom tools load as **WASM plugins** running
-on Extism over Wasmtime. A Nexus-owned **`ToolRegistry`** owns every tool's
-definition, identity, and dispatch order, so a plugin can add a new tool or —
-only with an explicit user-approved override — shadow a built-in, with duplicate
-names rejected by default rather than silently winning.
-
-Safety is the point, not an afterthought. Approval is keyed on tool **identity**
-(`plugin:<id>:<sha256>:<name>`), not a bare name, so a renamed or swapped plugin
-can't inherit a previous trust decision. Plugins get **no raw workspace access**;
-they call explicit host functions (`host_read`, `host_ls`) that reuse the same
-path-safety checks as the core, and mutating overrides return a proposed change
-for Nexus to render and apply with its own trusted diff logic rather than letting
-plugin code touch the filesystem. The first pass deliberately leaves out the raw
-Wasmtime Component Model, plugin signing, and network/shell capabilities —
-extensibility that earns trust before it widens it. (Planned; tracked in issue
-#18.)
+Iris's built-in tools stay native and trusted, and the product is **not** being
+built around a plugin system. But the tool surface is designed so one could be
+added later without re-plumbing the core: the Nexus-owned `ToolRegistry` and
+`Tool` contract — needed anyway for modes, subagents, and provider-specific
+tools — is the natural seam a plugin would plug into. If third-party extensions
+ever earn their keep, the likely shape is sandboxed plugins with no raw workspace
+access, explicit host capabilities that reuse the core's path-safety, and
+approval keyed on plugin identity. WASM (Extism on Wasmtime) is one candidate
+backend and a subprocess protocol is another; the choice is open. This is a
+possibility we are deliberately keeping open, tracked in issue #18 — not a
+commitment, and nothing the rest of the build depends on.
 
 ## Edits that don't waste output tokens
 

@@ -73,7 +73,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Settings / configuration loading | `config.rs` |
 | Workspace path safety (the FS/Shell sandbox surface) | `tools/path.rs`, `tools/bash/sandbox.rs` |
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
-| Host capabilities for plugins (`host_read`, `host_ls`, later `host_*_plan`) | _planned (issue #18)_ |
+| Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Context compaction | _planned_ |
 | Skills / system-prompt assembly | _planned_ |
 
@@ -95,7 +95,7 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 | Terminal I/O behind the `Ui` trait | `ui/`, `tool_display.rs` |
 | Approval prompt UX (the `BeforeToolCall` impl) | `approval.rs` |
 | Tool implementations: `read` `write` `edit` `bash` `grep` `find` `ls` | `tools/*` (impls) |
-| Plugin runtime + registration: Extism executor, manifest parsing, registry construction/injection | _planned (issue #18)_ |
+| Plugin runtime + registration, if a plugin system is ever added: executor (WASM/Extism or subprocess), manifest parsing, registry wiring | _exploratory (issue #18)_ |
 | Trusted approval-preview diff rendering | `tools/mod.rs` (`diff_preview`) → Tier 3 |
 | Provider adapter (translates Codex Responses → contracts) | `providers/*` |
 | Auth flows + token store | `auth/*` |
@@ -119,21 +119,25 @@ diff_preview}` directly. Four cuts invert those dependencies to reach the split:
 3. **Tools become injected.** Define a `Tool` trait and a `ToolRegistry` in
    core; build the registry at Tier 3 and inject it into the agent instead of
    the hardcoded `crate::tools::dispatch` name-match. Tool impls move to Tier 3.
-   See "Tools across the tiers" below and issue #18.
+   This registry is justified by modes, subagents, and provider-specific tools on
+   its own; a plugin system (issue #18) would be one optional consumer of the
+   same seam, not the reason for it. See "Tools across the tiers" below.
 4. **Persistence is harness-tier.** Keep `SessionLog` out of the bare core loop;
    it belongs to the Tier 2 harness (or a Tier 1 event subscriber).
 
 ## Tools across the tiers
 
 Tools are not one tier. Today `src/tools/` is a cross-tier bundle; the split
-slices it three ways. The plugin/registry work (issue #18) is the concrete
-implementation of this slicing.
+slices it three ways. The registry refactor that implements this slicing is
+driven by modes, subagents, and provider-specific tools; a plugin system
+(issue #18) is only an optional future consumer of the same seam, not the reason
+for it.
 
 | Concern | Tier | Notes |
 |---|---|---|
-| `Tool` trait, `ToolOutput`, `ToolRegistry`, `ToolPolicy`, identity keys, dispatch order, approval **enforcement** | 1 Nexus | Core names no concrete tool and does not know Extism exists. Tools classify themselves (`mutates()`, `classify(args)`); core enforces. |
+| `Tool` trait, `ToolOutput`, `ToolRegistry`, `ToolPolicy`, identity keys, dispatch order, approval **enforcement** | 1 Nexus | Core names no concrete tool and knows nothing about any plugin runtime. Tools classify themselves (`mutates()`, `classify(args)`); core enforces. |
 | Workspace path safety, `ToolState`, host capabilities (`host_read`/`host_ls`) | 2 Wayland | The execution surface (`env`) passed to `Tool::execute`. Plugins get host functions, never raw WASI. |
-| Built-in impls (`read`..`ls`), Extism executor, manifest parsing, registry construction, trusted diff rendering | 3 Iris | Concrete plug-ins + wiring. The diff renderer is host-side and trusted relative to any plugin. |
+| Built-in impls (`read`..`ls`), registry construction, trusted diff rendering, and — only if a plugin system is added — a plugin executor + manifest parsing | 3 Iris | Concrete impls + wiring. The diff renderer is host-side and trusted relative to any plugin. |
 
 Two boundaries are orthogonal and must not be conflated:
 

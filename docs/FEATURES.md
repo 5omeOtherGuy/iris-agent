@@ -193,36 +193,31 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 ## Plugins
 
-Third-party/custom tools via WASM, tracked in issue #18 (Extism on Wasmtime).
-Built-in tools stay native and trusted; plugins add or, with explicit opt-in,
-shadow them. First pass excludes raw Wasmtime Component Model/WIT, plugin
-signing, and network/shell capabilities. Ownership follows the three-tier split
-in [`ARCHITECTURE.md`](ARCHITECTURE.md): the `Tool` contract, registry, and
-approval policy are Nexus (Tier 1); the workspace sandbox and host capabilities
-are Wayland (Tier 2); built-in impls, the Extism executor, and trusted diff
-rendering are Iris (Tier 3).
+> Exploratory, not a committed direction. A plugin system is a possibility we
+> are keeping open — for tools, and potentially for other extension points — but
+> Iris is **not** being built around it. WASM (Extism on Wasmtime) is one
+> candidate backend, tracked in issue #18; a subprocess/stdio plugin protocol is
+> another. Nothing here is scheduled, and the core does not depend on it.
 
-- **WASM plugin tools** — load third-party tools from a plugin manifest
-  (`id` + `.wasm` + tool defs) executed through Extism on Wasmtime. [Planned]
-- **`ToolRegistry` (Nexus, Tier 1)** — core-owned registry abstraction holding
-  tool identity, dispatch order (approved override > built-in > plugin tool >
-  unknown-tool error), and approval-policy enforcement. The registry is built
-  and injected at Tier 3 (built-ins first, then plugin manifests) and rejects
-  duplicate names unless an override is approved; core names no concrete tool.
-  [Planned]
-- **Identity-based approval** — approval keyed on tool identity
-  (`builtin:write`, `plugin:<id>:<sha256>:<name>`) instead of bare name;
-  plugin tools and built-in overrides require approval, and mutating plugin
-  tools require approval every call. [Planned]
-- **Sandboxed capabilities (Wayland, Tier 2)** — plugins get no raw workspace
-  WASI access; they call explicit host functions (`host_read`, `host_ls`) on the
-  harness execution surface that reuse the workspace path-safety checks.
-  [Planned]
-- **Plan-based plugin mutations** — mutating overrides return a proposed
-  mutation (`host_write_plan`, `host_edit_plan`); the trusted host renders and
-  applies diffs with existing logic rather than plugin-provided previews. The
-  preview renderer is host code (Iris, Tier 3), trusted relative to any plugin.
-  [Planned]
+If a plugin system is ever added, the likely shape is: built-in tools stay native
+and trusted; plugins add new tools (or, with explicit opt-in, shadow a built-in),
+run sandboxed with no raw workspace access, and reach the filesystem only through
+explicit host capabilities that reuse the existing path-safety checks. It would
+plug into the same core `ToolRegistry`/`Tool`-trait seam that modes, subagents,
+and provider-specific tools need anyway (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md)), so that registry work is justified
+independently of whether plugins ever ship.
+
+- **Plugin system (tools and beyond)** — load third-party/custom extensions from
+  a manifest. WASM/Extism and a subprocess protocol are both candidate backends;
+  the choice is undecided. [Research]
+- **Sandboxed plugin capabilities** — if plugins land, they get no raw workspace
+  access and reach the filesystem only via explicit host functions that reuse
+  Nexus path-safety; mutations would be plan-based and host-applied so plugin
+  code never touches the filesystem or renders its own diffs. [Research]
+- **Identity-based approval** — if plugins land, approval keys on tool identity
+  (`plugin:<id>:<sha256>:<name>`) rather than bare name, so overrides and
+  untrusted code cannot inherit a prior trust decision. [Research]
 
 ## Repo awareness
 
