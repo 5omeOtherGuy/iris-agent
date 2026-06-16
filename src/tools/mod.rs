@@ -8,9 +8,9 @@
 //! - The model-facing contract (tool name, description, and JSON Schema) is
 //!   copied verbatim from pi so the wire surface matches.
 //! - Behavior is reimplemented for Iris's synchronous, std-only runtime rather
-//!   than pi's async runtime. `grep` shells out to `ripgrep` (`rg`) and `find`
-//!   shells out to `fd`/`fdfind`, exactly like pi, and report the same
-//!   "not available" guidance when those binaries are missing.
+//!   than pi's async runtime. `grep` and `find` search via the ripgrep library
+//!   crates (`grep`/`ignore`/`globset`), so neither needs an external binary on
+//!   PATH.
 //! - `edit` follows Claude Code's exact-string contract
 //!   (`file_path`/`old_string`/`new_string`/`replace_all`).
 //!
@@ -24,7 +24,6 @@
 //!   [`grep`], [`find`], [`ls`].
 
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
@@ -235,31 +234,6 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         })
     })
     .collect()
-}
-
-/// Locate the first available external binary from `candidates`, returning a
-/// `'static` name suitable for `Command::new`. Shared by `grep` and `find`.
-fn find_binary(candidates: &[&str]) -> Option<&'static str> {
-    for &name in candidates {
-        if Command::new(name)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            // Return a 'static str matching the candidate.
-            return match name {
-                "rg" => Some("rg"),
-                "ripgrep" => Some("ripgrep"),
-                "fd" => Some("fd"),
-                "fdfind" => Some("fdfind"),
-                _ => None,
-            };
-        }
-    }
-    None
 }
 
 #[cfg(test)]
