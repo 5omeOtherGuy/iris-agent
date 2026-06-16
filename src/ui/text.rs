@@ -2,8 +2,8 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Stderr, Stdin, Stdout, Write
 
 use anyhow::Result;
 
-use crate::approval::{ApprovalDecision, parse_decision};
-use crate::nexus::ToolCall;
+use crate::approval::parse_decision;
+use crate::nexus::{ApprovalDecision, ToolCall};
 use crate::tool_display::{fold, summarize};
 use crate::ui::{TurnErrorKind, Ui, UiEvent};
 

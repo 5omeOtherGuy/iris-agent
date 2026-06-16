@@ -2,7 +2,7 @@ use super::*;
 use crate::cli::run_session;
 use crate::ui::text::TextUi;
 use anyhow::anyhow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,29 +52,46 @@ fn run_text_session<P: ChatProvider>(
     Ok(())
 }
 
+/// Front-end stub backing both Nexus seams: records every `AgentEvent` and
+/// answers each approval review with a canned decision (`&self` + interior
+/// mutability, like the real `UiBridge`). `review` snapshots the events seen so
+/// far the first time it is called, so a test can assert emit/approval ordering
+/// -- the checks the old in-`request_approval` asserts used to make.
+struct RecordingFrontend {
+    events: RefCell<Vec<AgentEvent>>,
+    decision: Cell<ApprovalDecision>,
+    events_at_review: RefCell<Option<Vec<AgentEvent>>>,
+}
+
+impl RecordingFrontend {
+    fn new(decision: ApprovalDecision) -> Self {
+        Self {
+            events: RefCell::new(Vec::new()),
+            decision: Cell::new(decision),
+            events_at_review: RefCell::new(None),
+        }
+    }
+}
+
+impl AgentObserver for RecordingFrontend {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        self.events.borrow_mut().push(event);
+        Ok(())
+    }
+}
+
+impl ApprovalGate for RecordingFrontend {
+    fn review(&self, _call: &ToolCall) -> Result<ApprovalDecision> {
+        let mut snapshot = self.events_at_review.borrow_mut();
+        if snapshot.is_none() {
+            *snapshot = Some(self.events.borrow().clone());
+        }
+        Ok(self.decision.get())
+    }
+}
+
 #[test]
 fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
-    use crate::ui::{Ui, UiEvent};
-
-    struct EventUi {
-        events: Vec<UiEvent>,
-    }
-
-    impl Ui for EventUi {
-        fn next_prompt(&mut self) -> Result<Option<String>> {
-            Ok(None)
-        }
-
-        fn emit(&mut self, event: UiEvent) -> Result<()> {
-            self.events.push(event);
-            Ok(())
-        }
-
-        fn request_approval(&mut self, _call: &ToolCall) -> Result<ApprovalDecision> {
-            panic!("read should not request approval")
-        }
-    }
-
     let workspace = test_workspace()?;
     fs::write(workspace.path.join("note.txt"), "hello")?;
     let provider = FakeProvider::new(vec![
@@ -82,45 +99,22 @@ fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
         Ok(AssistantTurn::text("done")),
     ]);
     let mut agent = Agent::new(provider, workspace.path.clone());
-    let mut ui = EventUi { events: Vec::new() };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
-    agent.submit_turn("read note", &mut ui)?;
+    agent.submit_turn("read note", &frontend, &frontend)?;
 
-    assert!(matches!(ui.events[0], UiEvent::ToolProposed(_)));
-    assert!(matches!(ui.events[1], UiEvent::ToolResult { .. }));
-    assert!(matches!(ui.events[2], UiEvent::AssistantText(_)));
-    assert!(matches!(ui.events[3], UiEvent::TurnComplete));
+    let events = frontend.events.borrow();
+    assert!(matches!(events[0], AgentEvent::ToolProposed(_)));
+    assert!(matches!(events[1], AgentEvent::ToolResult { .. }));
+    assert!(matches!(events[2], AgentEvent::AssistantText(_)));
+    assert!(matches!(events[3], AgentEvent::TurnComplete));
+    // read is never gated: the approval gate must not be consulted.
+    assert!(frontend.events_at_review.borrow().is_none());
     Ok(())
 }
 
 #[test]
 fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
-    use crate::ui::{Ui, UiEvent};
-
-    struct EventUi {
-        events: Vec<UiEvent>,
-        decision: ApprovalDecision,
-    }
-
-    impl Ui for EventUi {
-        fn next_prompt(&mut self) -> Result<Option<String>> {
-            Ok(None)
-        }
-
-        fn emit(&mut self, event: UiEvent) -> Result<()> {
-            self.events.push(event);
-            Ok(())
-        }
-
-        fn request_approval(&mut self, _call: &ToolCall) -> Result<ApprovalDecision> {
-            assert!(matches!(
-                self.events.last(),
-                Some(UiEvent::DiffPreview { .. })
-            ));
-            Ok(self.decision)
-        }
-    }
-
     // out.txt does not pre-exist: a blind create still emits a diff preview
     // (old is empty) and is not subject to the stale-file guard, so this
     // test stays focused on preview-before-approval ordering.
@@ -133,59 +127,54 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
         Ok(AssistantTurn::text("done")),
     ]);
     let mut agent = Agent::new(provider, workspace.path.clone());
-    let mut ui = EventUi {
-        events: Vec::new(),
-        decision: ApprovalDecision::Allow,
-    };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
-    agent.submit_turn("write it", &mut ui)?;
+    agent.submit_turn("write it", &frontend, &frontend)?;
 
-    assert!(matches!(ui.events[0], UiEvent::DiffPreview { .. }));
-    assert!(matches!(ui.events[1], UiEvent::ToolResult { .. }));
+    // The diff preview is emitted before the gate is consulted.
+    let at_review = frontend.events_at_review.borrow();
+    let at_review = at_review
+        .as_ref()
+        .expect("write is gated; the gate must be consulted");
+    assert!(matches!(
+        at_review.last(),
+        Some(AgentEvent::DiffPreview { .. })
+    ));
+
+    let events = frontend.events.borrow();
+    assert!(matches!(events[0], AgentEvent::DiffPreview { .. }));
+    assert!(matches!(events[1], AgentEvent::ToolResult { .. }));
     assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "new\n");
     Ok(())
 }
 
 #[test]
 fn malformed_denial_skips_diff_preview() -> Result<()> {
-    use crate::ui::{Ui, UiEvent};
-
-    struct EventUi {
-        events: Vec<UiEvent>,
-    }
-
-    impl Ui for EventUi {
-        fn next_prompt(&mut self) -> Result<Option<String>> {
-            Ok(None)
-        }
-
-        fn emit(&mut self, event: UiEvent) -> Result<()> {
-            self.events.push(event);
-            Ok(())
-        }
-
-        fn request_approval(&mut self, _call: &ToolCall) -> Result<ApprovalDecision> {
-            assert!(self.events.is_empty(), "malformed args must not preflight");
-            Ok(ApprovalDecision::Deny)
-        }
-    }
-
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![
         Ok(single_call_turn("write", json!({ "path": "out.txt" }))),
         Ok(AssistantTurn::text("done")),
     ]);
     let mut agent = Agent::new(provider, workspace.path.clone());
-    let mut ui = EventUi { events: Vec::new() };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
-    agent.submit_turn("write it", &mut ui)?;
+    agent.submit_turn("write it", &frontend, &frontend)?;
 
+    let events = frontend.events.borrow();
     assert!(
-        ui.events
+        events
             .iter()
-            .all(|event| !matches!(event, UiEvent::DiffPreview { .. }))
+            .all(|event| !matches!(event, AgentEvent::DiffPreview { .. }))
     );
-    assert!(matches!(ui.events[0], UiEvent::ToolDenied(_)));
+    assert!(matches!(events[0], AgentEvent::ToolDenied(_)));
+    // Malformed args must not preflight: the gate saw no events before deciding.
+    assert!(
+        frontend
+            .events_at_review
+            .borrow()
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+    );
     assert!(!workspace.path.join("out.txt").exists());
     Ok(())
 }
