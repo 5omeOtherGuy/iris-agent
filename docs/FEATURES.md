@@ -56,10 +56,10 @@
   [Implemented]
 - **`bash` tool** — run a bounded shell command in the workspace with captured
   output, timeout handling, and nonzero-exit reporting. [Implemented]
-- **`grep` tool** — search workspace files through `rg` when available.
-  [Implemented]
-- **`find` tool** — find workspace files through `fd`/`fdfind` when available.
-  [Implemented]
+- **`grep` tool** — search workspace file contents in-process via the ripgrep
+  library crates (no `rg` binary required). [Implemented]
+- **`find` tool** — find workspace files in-process via `ignore` + `globset`
+  (no `fd` binary required). [Implemented]
 - **`ls` tool** — list workspace directory entries, directories first, with an
   optional recursive tree and an optional `long` mode (type marker + human-
   readable size per entry). [Implemented]

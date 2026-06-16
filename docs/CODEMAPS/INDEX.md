@@ -56,8 +56,8 @@ behind the `Ui` trait; the only implementation today is the text front-end.
 | `src/tools/bash/sandbox.rs` | Kernel sandbox (Linux Landlock LSM): confines each shell to write only the workspace (plus `/dev/null`) and denies TCP networking, enforced in the child via `pre_exec`. Explicit non-silent fallback with a surfaced notice when Landlock is unavailable. | `confine()`, `SandboxStatus` | `landlock`, `libc`, `std::os::unix` |
 | `src/tools/bash/session.rs` | Persistent shell sessions: a long-lived `bash` co-process where `cd`/`export`/vars survive across calls, delimited by a high-entropy sentinel-marker protocol with exit-code parsing. | `Sessions`, `run`/`reset`/`close` | `process_group`, `sandbox`, process/thread APIs |
 | `src/tools/bash/jobs.rs` | Background jobs: start a detached confined command, poll new output from a bounded byte ring addressed by absolute cursor, finalize (bounded wait) for the exit code, list, and cancel. | `Jobs`, `start`/`poll`/`finalize`/`list`/`cancel` | `process_group`, `sandbox`, threads/condvar |
-| `src/tools/grep.rs` | Ripgrep-backed content search with workspace-relative output. | `execute()` | `path`, `text`, `std::process`, `serde` |
-| `src/tools/find.rs` | fd/fdfind-backed file glob search sorted newest-first. | `execute()` | `path`, `text`, filesystem/process APIs, `serde` |
+| `src/tools/grep.rs` | Library-backed (grep/ignore) content search, grouped by file with context. | `execute()` | `path`, `text`, `grep`, `ignore`, `serde` |
+| `src/tools/find.rs` | Native (ignore + globset) file glob search sorted newest-first. | `execute()` | `path`, `text`, `ignore`, `globset`, `serde` |
 | `src/tools/ls.rs` | Directory listing tool: directories first, dotfiles, directory suffixes, optional recursive tree, optional `long` mode (type marker + human-readable size), entry-count metadata, and output caps. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
 | `src/auth/mod.rs` | Auth module declaration. | `device_code`, `openai_codex`, `storage` modules | auth submodules |
 | `src/auth/storage.rs` | Provider-keyed auth-file storage for OAuth credentials. Reads missing files as empty, validates credential shape, and writes atomically with restricted Unix permissions. | `AuthStore`, `OAuthCredentials` | filesystem/env APIs, `anyhow`, `serde`, `serde_json` |
@@ -115,8 +115,8 @@ Unknown commands print help and exit with code `2` (`UsageError`); auth failures
 | `write` | Create or overwrite files, creating parent directories as needed and writing atomically. | Target path and existing ancestors must remain inside the workspace; approval-gated with diff preview. |
 | `edit` | Replace a unique exact-string match (Claude-compatible schema; `replace_all` for every occurrence), with whitespace-normalized fallback matching and atomic writes. | Existing path must resolve inside the workspace; approval-gated with diff preview. |
 | `bash` | Run a shell command in the workspace with captured stdout/stderr, timeout handling, and process-group cleanup. Supports one-shot runs, persistent sessions (`session`/`action`, state carries across calls), and background jobs (start/poll/finalize/list/cancel). | Command cwd is the workspace; kernel-confined via Landlock (workspace-write, TCP-deny) where available; approval-gated. |
-| `grep` | Search workspace content through `rg` when available. | Search path resolves inside the workspace. |
-| `find` | Find workspace files through `fd`/`fdfind` when available. | Search path resolves inside the workspace. |
+| `grep` | Search workspace content in-process via the ripgrep library crates. | Search path resolves inside the workspace. |
+| `find` | Find workspace files in-process via `ignore` + `globset`. | Search path resolves inside the workspace. |
 | `ls` | List directory entries (directories first, optional recursive tree, optional `long` type+size mode) with a scan limit. | Directory path resolves inside the workspace. |
 
 ## External Dependencies

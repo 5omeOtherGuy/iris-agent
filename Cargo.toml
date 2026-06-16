@@ -9,6 +9,7 @@ base64 = "0.22"
 # ripgrep as a library: content search without requiring the `rg` binary on
 # PATH. `grep` re-exports the matcher/searcher crates; `ignore` provides the
 # .gitignore-aware directory walk and glob overrides.
+globset = "0.4"
 grep = "0.3"
 ignore = "0.4"
 # Kernel sandbox for the bash tool. Used instead of hand-rolling Landlock LSM
