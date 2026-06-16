@@ -91,7 +91,7 @@ fn run_agent() -> Result<()> {
         settings.base_url.as_deref(),
         &cwd,
     )?;
-    let mut agent = Agent::new(provider, cwd.clone());
+    let mut agent = Agent::new(provider, cwd.clone(), tools::built_in_tools());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
     match session::SessionLog::create(&cwd) {

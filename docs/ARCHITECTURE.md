@@ -51,8 +51,8 @@ tools and approval plug into.
 | Provider contract `ChatProvider` | `nexus.rs` |
 | Message contracts: `Message`, `Role`, `ToolCall`, `AssistantTurn` | `nexus.rs` |
 | Agent-event stream + sink (`AgentEvent`, `AgentObserver`, `TurnSink` for deltas) | `nexus.rs` |
-| `Tool` trait (the contract — not the implementations) | _target: new in core_ |
-| `ToolRegistry` / `ToolPolicy` (registration, dispatch order, identity, approval enforcement) | _target: new in core_ |
+| `Tool` trait + `ToolOutput`/`ToolEnv` contracts (not the implementations) | `nexus.rs` |
+| Injected tool set + name lookup (`Tools::by_name`); approval-policy enforcement in the loop | `nexus.rs` |
 | `ApprovalGate` approval hook + `ApprovalDecision` (the contract — not the UX) | `nexus.rs` |
 | Boundary errors, exit codes, tracing | `errors.rs`, `telemetry.rs` |
 
@@ -108,9 +108,11 @@ provider-abstraction the adapters implement against).
 ## Current vs target
 
 The tiers above are an ownership target. The loop in `nexus.rs` no longer
-imports `crate::ui` or `crate::approval` (Step A, done), but it still calls
-`crate::tools::{dispatch, requires_approval, is_destructive, diff_preview}`
-directly. Four cuts invert those dependencies to reach the split:
+imports `crate::ui`/`crate::approval` (Step A) and no longer resolves tools by
+name-match (Step B); it talks only to the `AgentObserver`, `ApprovalGate`, and
+`Tool` contracts. The one remaining outward reference is `crate::tools::ToolState`
+(carried in `ToolEnv`), relocated to the harness in Step C. Four cuts invert
+those dependencies to reach the split:
 
 1. **Loop emits events, not UI calls.** _(done)_ The loop emits a Tier-1
    `AgentEvent` stream to an `AgentObserver`; `crate::ui` is gone from the loop.
@@ -118,12 +120,15 @@ directly. Four cuts invert those dependencies to reach the split:
 2. **Approval becomes a hook.** _(done)_ The `ApprovalGate` trait lives in core;
    the CLI supplies the prompting implementation via `UiBridge`. The loop only
    calls `gate.review(...)`, and the approval policy stays Nexus-owned.
-3. **Tools become injected.** Define a `Tool` trait and a `ToolRegistry` in
-   core; build the registry at Tier 3 and inject it into the agent instead of
-   the hardcoded `crate::tools::dispatch` name-match. Tool impls move to Tier 3.
-   This registry is justified by modes, subagents, and provider-specific tools on
-   its own; a plugin system (issue #18) would be one optional consumer of the
-   same seam, not the reason for it. See "Tools across the tiers" below.
+3. **Tools become injected.** _(done)_ A `Tool` trait lives in core; Tier 3
+   builds the set (`built_in_tools()`) and injects it into the agent, which
+   resolves calls by name lookup over the injected `Tools` (no
+   `crate::tools::dispatch` name-match). Tool impls and self-classification
+   (`requires_approval`/`is_destructive`/`diff_preview`/`supports_allow_always`)
+   live in Tier 3; the loop still enforces the approval policy. The thin `Tools`
+   lookup is justified by modes, subagents, and provider-specific tools; a plugin
+   system (issue #18) would be one optional consumer, not the reason for it.
+   Relocating `ToolState` to the harness is Step C. See "Tools across the tiers".
 4. **Persistence is harness-tier.** Keep `SessionLog` out of the bare core loop;
    it belongs to the Tier 2 harness (or a Tier 1 event subscriber).
 

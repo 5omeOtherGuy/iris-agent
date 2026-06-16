@@ -37,7 +37,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use std::cell::RefCell;
 
-    use crate::nexus::{AssistantTurn, Message, TurnSink};
+    use crate::nexus::{AssistantTurn, Message, Tools, TurnSink};
     use crate::ui::text::TextUi;
 
     struct FakeProvider {
@@ -62,6 +62,7 @@ mod tests {
         fn respond(
             &self,
             _messages: &[Message],
+            _tools: &Tools,
             _sink: &mut dyn TurnSink,
         ) -> Result<AssistantTurn> {
             match self.responses.borrow_mut().pop() {
@@ -76,7 +77,7 @@ mod tests {
     fn provider_error_is_rendered_and_session_continues() -> Result<()> {
         let provider = FakeProvider::new(vec![Err("boom"), Ok(AssistantTurn::text("ok"))]);
         let dir = crate::tools::test_support::temp_dir();
-        let mut agent = Agent::new(provider, dir.path.clone());
+        let mut agent = Agent::new(provider, dir.path.clone(), crate::tools::built_in_tools());
         let mut ui = TextUi::new("bad\nagain\n/exit\n".as_bytes(), Vec::new(), Vec::new());
 
         run_session(&mut agent, &mut ui)?;

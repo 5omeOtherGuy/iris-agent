@@ -241,6 +241,7 @@ fn builds_codex_request_from_conversation() {
         "gpt-test",
         &instructions,
         &[Message::user("hello"), Message::assistant("hi")],
+        &crate::tools::built_in_tools(),
     );
     assert_eq!(request["model"], "gpt-test");
     assert_eq!(request["stream"], true);
@@ -279,6 +280,7 @@ fn builds_codex_request_from_tool_messages() {
                 tool_name: Some("read".to_string()),
             },
         ],
+        &crate::tools::built_in_tools(),
     );
 
     assert_eq!(request["input"][0]["type"], "function_call");
