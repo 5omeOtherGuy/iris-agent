@@ -89,6 +89,7 @@ fn run_agent() -> Result<()> {
     let provider = providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
         settings.default_model.as_deref(),
         settings.base_url.as_deref(),
+        &cwd,
     )?;
     let mut agent = Agent::new(provider, cwd.clone());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.

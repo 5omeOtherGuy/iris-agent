@@ -1,5 +1,6 @@
 use std::env;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(8);
 pub(crate) struct OpenAiCodexResponsesProvider {
     client: Client,
     config: OpenAiCodexResponsesConfig,
+    system_prompt: String,
     tokens: OpenAiCodexTokenStore,
 }
 
@@ -37,12 +39,17 @@ impl OpenAiCodexResponsesProvider {
     /// Build the provider, resolving model and base URL from the optional
     /// settings values. The provider stays decoupled from the app-level config
     /// type by taking only the strings it needs.
-    pub(crate) fn new(model: Option<&str>, base_url: Option<&str>) -> Result<Self> {
+    pub(crate) fn new(
+        model: Option<&str>,
+        base_url: Option<&str>,
+        workspace: &Path,
+    ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
             config: OpenAiCodexResponsesConfig::resolve(model, base_url),
+            system_prompt: build_iris_system_prompt(workspace),
             tokens: OpenAiCodexTokenStore::from_env()?,
         })
     }
@@ -53,7 +60,7 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
         let span = tracing::info_span!("codex_roundtrip", model = %self.config.model);
         let _guard = span.enter();
 
-        let request = build_codex_request(&self.config.model, messages);
+        let request = build_codex_request(&self.config.model, &self.system_prompt, messages);
         let url = resolve_codex_url(&self.config.base_url)?;
 
         run_retry_loop(
@@ -283,7 +290,32 @@ fn resolve_setting(env_value: Option<String>, setting: Option<&str>, default: &s
         .unwrap_or_else(|| default.to_string())
 }
 
-fn build_codex_request(model: &str, messages: &[Message]) -> Value {
+fn build_iris_system_prompt(workspace: &Path) -> String {
+    let prompt_cwd = workspace.display().to_string().replace('\\', "/");
+    let tools = [
+        "- read: Read the contents of a file by path, with optional line offset and limit.",
+        "- bash: Execute a bash command in the current workspace.",
+        "- edit: Edit an existing file by replacing text.",
+        "- write: Create or overwrite a file, creating parent directories as needed.",
+        "- grep: Search files for a regex or literal pattern.",
+        "- find: Find files by glob pattern.",
+        "- ls: List directory entries.",
+    ]
+    .join("\n");
+
+    format!(
+        "You are an expert coding assistant operating inside Iris, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\n\
+Available tools:\n{tools}\n\n\
+No other tools are available. Do not assume Codex CLI/native agent tools, multi_tool wrappers, subagents, or hidden parallel tool APIs exist.\n\n\
+Guidelines:\n\
+- Prefer read, grep, find, and ls for file inspection; use bash for shell commands and verification.\n\
+- Be concise in your responses.\n\
+- Show file paths clearly when working with files.\n\n\
+Current working directory: {prompt_cwd}"
+    )
+}
+
+fn build_codex_request(model: &str, instructions: &str, messages: &[Message]) -> Value {
     // The Codex adapter owns conversion between Nexus messages and Responses wire JSON.
     let input: Vec<Value> = messages.iter().map(codex_input_item).collect();
 
@@ -291,7 +323,7 @@ fn build_codex_request(model: &str, messages: &[Message]) -> Value {
         "model": model,
         "store": false,
         "stream": true,
-        "instructions": "You are Iris, a helpful terminal coding assistant. You have file and shell tools: read, bash, edit, write, grep, find, and ls. Use them to inspect and modify the current workspace.",
+        "instructions": instructions,
         "input": input,
         "tools": crate::tools::tool_definitions(),
         "text": { "verbosity": "low" },

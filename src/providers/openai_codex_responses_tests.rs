@@ -1,5 +1,6 @@
 use super::*;
 use std::cell::Cell;
+use std::path::Path;
 
 fn fake_token() -> AccessToken {
     AccessToken {
@@ -21,6 +22,10 @@ impl TurnSink for RecordingSink {
 
 fn is_auth_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<AuthError>().is_some()
+}
+
+fn test_system_prompt() -> String {
+    build_iris_system_prompt(Path::new("/tmp/iris"))
 }
 
 #[test]
@@ -231,12 +236,20 @@ fn rejects_invalid_codex_base_url() {
 
 #[test]
 fn builds_codex_request_from_conversation() {
+    let instructions = test_system_prompt();
     let request = build_codex_request(
         "gpt-test",
+        &instructions,
         &[Message::user("hello"), Message::assistant("hi")],
     );
     assert_eq!(request["model"], "gpt-test");
     assert_eq!(request["stream"], true);
+    let instructions = request["instructions"].as_str().unwrap();
+    assert!(instructions.contains("You are an expert coding assistant operating inside Iris"));
+    assert!(instructions.contains("- read:"));
+    assert!(instructions.contains("- ls:"));
+    assert!(instructions.contains("No other tools are available"));
+    assert!(instructions.contains("Current working directory: /tmp/iris"));
     assert_eq!(request["input"].as_array().unwrap().len(), 2);
     assert_eq!(request["input"][0]["role"], "user");
     assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
@@ -248,8 +261,10 @@ fn builds_codex_request_from_conversation() {
 
 #[test]
 fn builds_codex_request_from_tool_messages() {
+    let instructions = test_system_prompt();
     let request = build_codex_request(
         "gpt-test",
+        &instructions,
         &[
             Message {
                 role: Role::AssistantToolCall,
