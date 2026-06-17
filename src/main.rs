@@ -102,11 +102,16 @@ fn configured_provider() -> String {
 fn run_agent() -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    // Harness-owned assembly: base instructions + runtime context + project
-    // instructions (root AGENTS.md). Fresh and resume call the same function.
-    let system_prompt = wayland::system_prompt::assemble(&cwd);
+    // Materialize the shipped fragment defaults into ~/.iris/fragments (if
+    // absent) so users can edit/reorder them on disk; best-effort.
+    wayland::system_prompt::ensure_default_fragments();
+    // Harness-owned assembly: the fragment/slot baukasten composes the prompt
+    // from fragment files plus dynamic context (project docs, date, cwd) and the
+    // live tool registry. Fresh and resume call the same function.
+    let tools = tools::built_in_tools();
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
-    let agent = Agent::new(provider, tools::built_in_tools());
+    let agent = Agent::new(provider, tools);
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
     let session = match session::SessionLog::create(&cwd) {
@@ -155,12 +160,13 @@ fn resume_agent(session_id: &str) -> Result<()> {
 
     let settings = config::Settings::load(&cwd)?;
     let budget = Some(settings.context_token_budget());
-    // Resume assembles instructions through the same harness-owned path as a
-    // fresh session, so a resumed turn gets identical base/runtime/project
-    // instructions.
-    let system_prompt = wayland::system_prompt::assemble(&cwd);
+    // Resume assembles instructions through the same harness-owned baukasten as
+    // a fresh session, so a resumed turn gets identical fragment/context output.
+    wayland::system_prompt::ensure_default_fragments();
+    let tools = tools::built_in_tools();
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
-    let agent = Agent::resumed(provider, tools::built_in_tools(), stored.messages);
+    let agent = Agent::resumed(provider, tools, stored.messages);
 
     // Reopen the same transcript for append so continued turns extend it rather
     // than starting a new file. Best-effort, like new-session persistence: if
