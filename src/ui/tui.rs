@@ -1,28 +1,27 @@
-//! Full-screen terminal front-end (Tier 3) built on ratatui.
+//! Full-screen terminal front-end state and rendering (Tier 3) built on ratatui.
 //!
-//! Layering (see the renderer design notes): ratatui owns the cell buffer, the
-//! frame diff, and width-aware layout; it re-exports crossterm (raw mode,
-//! alternate screen, key/resize/paste events) which provides the raw terminal
-//! plumbing. This module is the thin layer on top: [`Screen`] holds the UI state
-//! and renders it into a frame, and [`TuiUi`] drives the terminal lifecycle and
-//! the input loop, adapting both onto the [`Ui`] seam.
+//! Layering: ratatui owns the cell buffer, the frame diff, and width-aware
+//! layout; `ratatui-textarea` owns the editor buffer (multiline + undo/redo +
+//! kill-ring + word-nav) over that same buffer; this module is the thin layer on
+//! top. [`Screen`] holds the UI state (transcript, editor, spinner, slash
+//! palette) and renders it into a frame; [`TuiUi`] owns the terminal lifecycle
+//! (one persistent alternate-screen + raw-mode session). The async input/render
+//! loop that drives them lives in [`crate::ui::tui_loop`].
 //!
-//! Concurrency / cancellation: the session loop is blocking and single-threaded.
-//! Raw mode is enabled only while reading input ([`next_prompt`] /
-//! [`request_approval`]) via [`RawGuard`]; during the turn's compute the terminal
-//! is in cooked mode, so a Ctrl-C still raises SIGINT and the existing per-turn
-//! watcher cancels the token. While raw mode is active, Ctrl-C is delivered as a
-//! key event instead, so the read loop calls [`crate::signals::interrupt_from_terminal`].
+//! Concurrency / cancellation: raw mode is entered ONCE for the whole session,
+//! so Ctrl-C arrives as a key event, never SIGINT; the loop (not this module)
+//! reads keys and cancels the turn token. This module performs no terminal
+//! reads and holds no channels, so its state transitions and frame output are
+//! unit-testable via ratatui's `TestBackend` without a TTY.
 
-use std::io::{self, IsTerminal, Stdout};
+use std::io::{self, Stdout};
 
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -31,19 +30,33 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::approval::parse_decision;
-use crate::nexus::{ApprovalDecision, ToolCall};
+use crate::nexus::ToolCall;
 use crate::tool_display::{fold, summarize};
-use crate::ui::text::TextUi;
-use crate::ui::{TurnErrorKind, Ui, UiEvent};
-
-/// Editor prompt label. Empty for now: the bottom input row is enough chrome.
-const PROMPT: &str = "";
+use crate::ui::slash::{self, Palette, SlashCommand};
+use crate::ui::{TurnErrorKind, UiEvent};
 
 const BANNER_LINES: &[&str] = &["iris", "terminal-first coding agent", "Type /exit to quit."];
+
+/// Idle status-row hint: discoverability without a help screen.
+const IDLE_HINT: &str = "enter send \u{b7} alt+enter newline \u{b7} / commands \u{b7} ctrl-c quit";
+
+/// Editor box grows with content up to this many text rows, then scrolls
+/// internally (keeps the transcript from being squeezed by a huge paste).
+const MAX_EDITOR_ROWS: u16 = 10;
+
+/// Slash popup height cap (including its border).
+const MAX_PALETTE_ROWS: u16 = 8;
+
+/// Braille spinner frames; cycled by the render tick while a turn computes.
+/// Not emojis: single-cell Unicode glyphs that render on any UTF-8 terminal.
+const SPINNER_FRAMES: &[&str] = &[
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
 
 fn assistant_style() -> Style {
     Style::default()
@@ -69,8 +82,8 @@ fn banner_style() -> Style {
     Style::default().fg(Color::Magenta)
 }
 
-/// Display width of a string as the terminal renders it, reused for word-wrap
-/// and editor-cursor math. Control chars count as zero (they are not emitted).
+/// Display width of a string as the terminal renders it, reused for word-wrap.
+/// Control chars count as zero (they are not emitted).
 fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
@@ -90,19 +103,71 @@ struct Row {
     style: Style,
 }
 
-/// UI state plus its rendering. Holds no terminal handle, so its behavior is
-/// unit-testable without a TTY and its frame output is testable via ratatui's
-/// `TestBackend`.
+/// Animated turn-progress spinner. Advances only while `active`, so an idle
+/// session redraws nothing on a tick (no flicker, no busy CPU).
+#[derive(Default)]
+struct Spinner {
+    active: bool,
+    frame: usize,
+}
+
+impl Spinner {
+    fn start(&mut self) {
+        self.active = true;
+        self.frame = 0;
+    }
+
+    fn stop(&mut self) {
+        self.active = false;
+    }
+
+    /// Advance one frame; a no-op when idle so ticks cause no redraw at rest.
+    fn tick(&mut self) -> bool {
+        if self.active {
+            self.frame = (self.frame + 1) % SPINNER_FRAMES.len();
+        }
+        self.active
+    }
+
+    fn glyph(&self) -> &'static str {
+        SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()]
+    }
+}
+
+/// Build a styled, empty editor: bordered box, dim placeholder, a reversed
+/// block cursor the widget draws itself (no hardware cursor needed).
+fn fresh_editor() -> TextArea<'static> {
+    let mut editor = TextArea::default();
+    editor.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(dim_style())
+            .title(Span::styled(" message ", dim_style())),
+    );
+    editor.set_cursor_line_style(Style::default());
+    editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    editor.set_placeholder_text("Type a message, / for commands, Enter to send");
+    editor
+}
+
+/// UI state plus its rendering. Holds no terminal handle and no channels, so its
+/// behavior is unit-testable without a TTY and its frame output is testable via
+/// ratatui's `TestBackend`.
 pub(crate) struct Screen {
     transcript: Vec<Row>,
-    input: String,
-    /// Byte offset of the caret into `input`; always on a char boundary.
-    cursor: usize,
+    /// Multiline editor buffer (undo/redo, kill-ring, word-nav) owned by
+    /// `ratatui-textarea`; the loop drives it from Iris's own keymap.
+    pub(crate) editor: TextArea<'static>,
+    /// Slash-command palette selection state, synced after every edit.
+    pub(crate) palette: Palette,
+    spinner: Spinner,
+    /// Short status-row hint while a gated tool awaits the user's decision.
+    approval_hint: Option<String>,
     /// Live assistant text being streamed; shown below the transcript and
     /// committed into it once the stream ends.
     streaming: Option<String>,
-    /// Number of physical rows above the bottom of the transcript to keep in
-    /// view. Zero means follow the latest output.
+    /// Physical rows above the bottom of the transcript to keep in view. Zero
+    /// means follow the latest output.
     scrollback: u16,
 }
 
@@ -110,16 +175,19 @@ impl Screen {
     pub(crate) fn new() -> Self {
         Self {
             transcript: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            editor: fresh_editor(),
+            palette: Palette::default(),
+            spinner: Spinner::default(),
+            approval_hint: None,
             streaming: None,
             scrollback: 0,
         }
     }
 
+    // --- transcript ---
+
     /// Append a blank separator row before a new top-level block, unless the
-    /// transcript is empty or already ends in a blank row. Keeps consecutive
-    /// event blocks visually distinct without stacking multiple blank lines.
+    /// transcript is empty or already ends in a blank row.
     fn push_blank(&mut self) {
         match self.transcript.last() {
             None => {}
@@ -153,6 +221,16 @@ impl Screen {
             && !text.is_empty()
         {
             self.push(&text, assistant_style());
+        }
+    }
+
+    /// Apply one semantic event, preserving follow-to-bottom when the user has
+    /// not scrolled away. The loop calls this for every Nexus event.
+    pub(crate) fn apply_event(&mut self, event: UiEvent) {
+        let was_following = self.scrollback == 0;
+        self.apply(event);
+        if was_following {
+            self.follow_bottom();
         }
     }
 
@@ -266,35 +344,26 @@ impl Screen {
         }
     }
 
-    /// Transcript plus any live streamed assistant text, wrapped to `width` so
-    /// each returned `Line` is exactly one physical terminal row. Rendering with
-    /// one row per line keeps the scroll-to-bottom math exact (no divergence
-    /// from a word-wrapping widget).
-    fn follow_bottom(&mut self) {
+    /// Commit a submitted prompt into the transcript as a user line.
+    pub(crate) fn commit_user(&mut self, text: &str) {
+        self.push_blank();
+        for line in text.split('\n') {
+            self.push(&format!("> {line}"), user_style());
+        }
+    }
+
+    // --- scrollback ---
+
+    pub(crate) fn follow_bottom(&mut self) {
         self.scrollback = 0;
     }
 
-    fn scroll_up(&mut self, rows: u16) {
+    pub(crate) fn scroll_up(&mut self, rows: u16) {
         self.scrollback = self.scrollback.saturating_add(rows);
     }
 
-    fn scroll_down(&mut self, rows: u16) {
+    pub(crate) fn scroll_down(&mut self, rows: u16) {
         self.scrollback = self.scrollback.saturating_sub(rows);
-    }
-
-    fn scroll_to_top(&mut self, width: u16, transcript_height: u16) {
-        self.scrollback = self.max_scrollback(width, transcript_height);
-    }
-
-    fn clamp_scrollback(&mut self, width: u16, transcript_height: u16) {
-        self.scrollback = self
-            .scrollback
-            .min(self.max_scrollback(width, transcript_height));
-    }
-
-    fn max_scrollback(&self, width: u16, transcript_height: u16) -> u16 {
-        let rows = u16::try_from(self.wrapped_lines(width).len()).unwrap_or(u16::MAX);
-        rows.saturating_sub(transcript_height)
     }
 
     fn wrapped_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -316,101 +385,111 @@ impl Screen {
         rows
     }
 
-    // --- editor operations (char-boundary safe) ---
+    // --- editor ---
 
-    fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+    /// Whole editor text with logical newlines.
+    pub(crate) fn editor_text(&self) -> String {
+        self.editor.lines().join("\n")
     }
 
-    fn insert_str(&mut self, s: &str) {
-        self.input.insert_str(self.cursor, s);
-        self.cursor += s.len();
+    /// True when the editor holds nothing (one empty line).
+    pub(crate) fn editor_is_empty(&self) -> bool {
+        let lines = self.editor.lines();
+        lines.len() == 1 && lines[0].is_empty()
     }
 
-    fn backspace(&mut self) {
-        if let Some(prev) = self.input[..self.cursor].chars().next_back() {
-            let len = prev.len_utf8();
-            self.cursor -= len;
-            self.input.remove(self.cursor);
+    /// Re-sync the palette open-state/selection after the editor changed.
+    pub(crate) fn sync_palette(&mut self) {
+        let text = self.editor_text();
+        self.palette.sync(&text);
+    }
+
+    /// Take the current editor text and reset to a fresh empty editor.
+    pub(crate) fn submit(&mut self) -> String {
+        let text = self.editor_text();
+        self.editor = fresh_editor();
+        self.palette.sync("");
+        text
+    }
+
+    /// Clear the editor without submitting (Ctrl-U / Ctrl-C on non-empty input).
+    pub(crate) fn clear_editor(&mut self) {
+        self.editor = fresh_editor();
+        self.palette.sync("");
+    }
+
+    /// Replace the editor contents with `text` (palette command completion).
+    pub(crate) fn set_editor(&mut self, text: &str) {
+        let mut editor = fresh_editor();
+        editor.insert_str(text);
+        self.editor = editor;
+        self.sync_palette();
+    }
+
+    // --- spinner / turn state ---
+
+    pub(crate) fn start_turn(&mut self) {
+        self.spinner.start();
+        self.approval_hint = None;
+    }
+
+    pub(crate) fn end_turn(&mut self) {
+        self.spinner.stop();
+        self.approval_hint = None;
+    }
+
+    /// Advance the spinner one frame. Returns whether anything animated (so the
+    /// loop only redraws on a tick while a turn is running). While an approval is
+    /// shown the spinner is hidden behind the hint, so a tick changes nothing and
+    /// requests no redraw -- the loop stays CPU-idle waiting on the decision.
+    pub(crate) fn tick(&mut self) -> bool {
+        if self.approval_hint.is_some() {
+            return false;
         }
+        self.spinner.tick()
     }
 
-    fn move_left(&mut self) {
-        if let Some(prev) = self.input[..self.cursor].chars().next_back() {
-            self.cursor -= prev.len_utf8();
+    // --- approval ---
+
+    /// Show a gated tool's approval prompt: a transcript line for history plus a
+    /// short status-row hint. The loop captures the decision from a keypress.
+    pub(crate) fn show_approval(&mut self, call: &ToolCall, allow_always: bool) {
+        self.begin_block();
+        let options = if allow_always {
+            "[y] once  [a] always  [N] deny"
+        } else {
+            "[y] once  [N] deny"
+        };
+        self.push(
+            &format!("approve {}?  {options}", summarize(call)),
+            prompt_style(),
+        );
+        self.approval_hint = Some(format!("awaiting approval  {options}"));
+        self.follow_bottom();
+    }
+
+    pub(crate) fn clear_approval(&mut self) {
+        self.approval_hint = None;
+    }
+
+    /// Status row content: approval hint > spinner > idle hint.
+    fn status_line(&self) -> Line<'static> {
+        if let Some(hint) = &self.approval_hint {
+            Line::from(Span::styled(hint.clone(), prompt_style()))
+        } else if self.spinner.active {
+            Line::from(vec![
+                Span::styled(format!("{} ", self.spinner.glyph()), prompt_style()),
+                Span::styled("working", dim_style()),
+            ])
+        } else {
+            Line::from(Span::styled(IDLE_HINT, dim_style()))
         }
-    }
-
-    fn move_right(&mut self) {
-        if let Some(next) = self.input[self.cursor..].chars().next() {
-            self.cursor += next.len_utf8();
-        }
-    }
-
-    fn home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn end(&mut self) {
-        self.cursor = self.input.len();
-    }
-
-    fn clear_input(&mut self) {
-        self.input.clear();
-        self.cursor = 0;
-    }
-
-    /// Take the current input, clearing the editor.
-    fn submit(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.input)
-    }
-
-    /// Commit a submitted prompt into the transcript as a user line.
-    fn commit_user(&mut self, text: &str) {
-        self.push_blank();
-        for line in text.split('\n') {
-            self.push(&format!("> {line}"), user_style());
-        }
-    }
-
-    /// Visible editor input plus caret column. The editor is deliberately one
-    /// terminal row for the first cut; when it overflows, keep the caret visible
-    /// by showing the tail before the cursor rather than doing fragile wrapping.
-    fn editor_view(&self, width: u16) -> (String, u16) {
-        let width = usize::from(width.max(1));
-        let prompt_cols = display_width(PROMPT).min(width.saturating_sub(1));
-        let available = width.saturating_sub(prompt_cols).max(1);
-        let before_cursor = &self.input[..self.cursor];
-        let before_width = display_width(before_cursor);
-        if before_width < available {
-            return (
-                self.input.clone(),
-                (prompt_cols + before_width).min(width - 1) as u16,
-            );
-        }
-
-        let mut start = self.cursor;
-        let mut cols = 0;
-        for (idx, ch) in before_cursor.char_indices().rev() {
-            let w = display_width(&ch.to_string()).max(1);
-            if cols + w >= available {
-                break;
-            }
-            start = idx;
-            cols += w;
-        }
-        (
-            self.input[start..].to_string(),
-            (prompt_cols + cols).min(width - 1) as u16,
-        )
     }
 }
 
-/// Colorize a unified diff into styled transcript rows. Mirrors the text UI:
-/// the two file headers before the first hunk are dropped, hunk headers cyan,
-/// additions green, removals red, context dimmed.
+/// Colorize a unified diff into styled transcript rows. The two file headers
+/// before the first hunk are dropped, hunk headers cyan, additions green,
+/// removals red, context dimmed.
 fn diff_rows(diff: &str) -> Vec<(String, Style)> {
     let mut seen_hunk = false;
     let mut out = Vec::new();
@@ -445,14 +524,12 @@ fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     let mut cur_w = 0;
     for (i, word) in text.split(' ').enumerate() {
         let word_w = display_width(word);
-        // Keep the word on the current row with its leading space if it fits.
         if i > 0 && !cur.is_empty() && cur_w + 1 + word_w <= width {
             cur.push(' ');
             cur.push_str(word);
             cur_w += 1 + word_w;
             continue;
         }
-        // Otherwise wrap: the trailing space stays off the wrapped row.
         if !cur.is_empty() {
             rows.push(std::mem::take(&mut cur));
             cur_w = 0;
@@ -476,91 +553,129 @@ fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// Render the whole UI: scrollback area on top, a rule, then the bottom editor.
-/// Free function so it can be exercised with any ratatui backend in tests.
-fn render(frame: &mut Frame, screen: &Screen, show_cursor: bool) {
+/// Render the slash popup: a bordered list with the selected row highlighted.
+fn render_palette(frame: &mut Frame, area: Rect, matches: &[&SlashCommand], selected: usize) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dim_style())
+        .title(Span::styled(" commands ", dim_style()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut rows = Vec::new();
+    for (i, cmd) in matches.iter().enumerate() {
+        let name_style = if i == selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!(" {} ", cmd.name), name_style),
+            Span::raw(" "),
+            Span::styled(cmd.description, dim_style()),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(Text::from(rows)), inner);
+}
+
+/// Render the whole UI: transcript on top, a status/spinner row, an optional
+/// slash popup, then the bordered editor at the bottom. Takes `&mut Screen` so
+/// scrollback can be clamped against the real transcript height computed here.
+fn render(frame: &mut Frame, screen: &mut Screen) {
     let area = frame.area();
-    if area.height < 2 || area.width < 1 {
+    if area.height < 4 || area.width < 1 {
         return;
     }
-    let width = area.width;
-    let editor_h = 2; // separator + one-line editor
 
-    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(editor_h)]).split(area);
+    let editor_rows = (screen.editor.lines().len() as u16).clamp(1, MAX_EDITOR_ROWS);
+    let editor_h = editor_rows + 2; // top + bottom border
+    let input_text = screen.editor_text();
+    let palette_active = screen.palette.is_active(&input_text);
+    let palette_matches: Vec<&SlashCommand> = if palette_active {
+        slash::matches(&input_text)
+    } else {
+        Vec::new()
+    };
+    let palette_h = if palette_active {
+        (palette_matches.len() as u16 + 2).min(MAX_PALETTE_ROWS)
+    } else {
+        0
+    };
+
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(palette_h),
+        Constraint::Length(editor_h),
+    ])
+    .split(area);
     let transcript_area = chunks[0];
-    let editor_area = chunks[1];
+    let status_area = chunks[1];
+    let palette_area = chunks[2];
+    let editor_area = chunks[3];
 
-    // Scrollback: lines are pre-wrapped to exactly one physical row each, so the
+    // Transcript: lines pre-wrapped to exactly one physical row each, so the
     // scroll-to-bottom offset is exact and never diverges from the renderer.
+    // Wrap once per frame, then clamp scrollback against that same count.
     let lines = screen.wrapped_lines(transcript_area.width);
     let total_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let bottom = total_rows.saturating_sub(transcript_area.height);
-    let scroll = bottom.saturating_sub(screen.scrollback);
+    let max_scroll = total_rows.saturating_sub(transcript_area.height);
+    screen.scrollback = screen.scrollback.min(max_scroll);
+    let scroll = max_scroll.saturating_sub(screen.scrollback);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
         transcript_area,
     );
 
-    // Separator rule.
-    let rule = Line::from("-".repeat(editor_area.width as usize)).style(dim_style());
-    frame.render_widget(
-        Paragraph::new(rule),
-        Rect::new(editor_area.x, editor_area.y, editor_area.width, 1),
-    );
+    frame.render_widget(Paragraph::new(screen.status_line()), status_area);
 
-    // Editor input line(s).
-    let input_rect = Rect::new(editor_area.x, editor_area.y + 1, editor_area.width, 1);
-    let (visible_input, cursor_col) = screen.editor_view(width);
-    let editor_line = Line::from(vec![
-        Span::styled(
-            PROMPT,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(visible_input),
-    ]);
-    frame.render_widget(Paragraph::new(editor_line), input_rect);
-
-    if show_cursor {
-        frame.set_cursor_position((input_rect.x + cursor_col, input_rect.y));
+    if palette_h > 0 {
+        render_palette(
+            frame,
+            palette_area,
+            &palette_matches,
+            screen.palette.selected(),
+        );
     }
+
+    // The TextArea draws its own border (set in `fresh_editor`) and cursor.
+    frame.render_widget(&screen.editor, editor_area);
 }
 
-/// Enables raw mode + bracketed paste for the lifetime of an input read, and
-/// restores cooked mode on drop (including on panic / early return).
-struct RawGuard;
-
-impl RawGuard {
-    fn new() -> Result<Self> {
-        enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture) {
-            let _ = disable_raw_mode();
-            return Err(error.into());
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
-        let _ = disable_raw_mode();
-    }
-}
-
-/// Terminal driver: owns the ratatui terminal and the alternate-screen
-/// lifecycle, and runs the blocking input loop.
+/// Terminal driver: owns the ratatui terminal and the persistent
+/// alternate-screen + raw-mode lifecycle for the whole interactive session.
+/// Reads no input itself; [`crate::ui::tui_loop`] feeds it events and calls
+/// [`TuiUi::draw`].
 pub(crate) struct TuiUi {
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    screen: Screen,
+    pub(crate) screen: Screen,
     active: bool,
 }
 
 impl TuiUi {
+    /// Enter raw mode + the alternate screen ONCE and enable bracketed paste and
+    /// scroll-wheel reporting for the session. Restored on `drop`/`shutdown`,
+    /// and by the signal handler's emergency escape on a force-quit.
     pub(crate) fn new() -> Result<Self> {
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        let terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        ) {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
         crate::signals::enable_terminal_restore_on_force_quit();
         Ok(Self {
             terminal,
@@ -569,13 +684,9 @@ impl TuiUi {
         })
     }
 
-    fn draw(&mut self, show_cursor: bool) -> Result<()> {
-        let area = self.terminal.size()?;
-        self.screen
-            .clamp_scrollback(area.width, area.height.saturating_sub(2));
-        let screen = &self.screen;
-        self.terminal
-            .draw(|frame| render(frame, screen, show_cursor))?;
+    pub(crate) fn draw(&mut self) -> Result<()> {
+        let screen = &mut self.screen;
+        self.terminal.draw(|frame| render(frame, screen))?;
         Ok(())
     }
 
@@ -589,157 +700,16 @@ impl TuiUi {
             self.active = false;
         }
     }
+
+    pub(crate) fn shutdown(&mut self) {
+        self.restore();
+    }
 }
 
 impl Drop for TuiUi {
     fn drop(&mut self) {
         self.restore();
     }
-}
-
-impl Ui for TuiUi {
-    fn next_prompt(&mut self) -> Result<Option<String>> {
-        let _guard = RawGuard::new()?;
-        loop {
-            self.draw(true)?;
-            let key = match event::read()? {
-                Event::Key(key) => key,
-                Event::Paste(text) => {
-                    let flattened: String = text
-                        .chars()
-                        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
-                        .collect();
-                    self.screen.insert_str(&flattened);
-                    continue;
-                }
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => self.screen.scroll_up(3),
-                        MouseEventKind::ScrollDown => self.screen.scroll_down(3),
-                        _ => {}
-                    }
-                    continue;
-                }
-                _ => continue, // resize repaints on the next loop; others ignored
-            };
-            if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
-                continue;
-            }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            match key.code {
-                KeyCode::Char('c') if ctrl => {
-                    if self.screen.input.is_empty() {
-                        return Ok(None);
-                    }
-                    self.screen.clear_input();
-                }
-                KeyCode::Char('d') if ctrl => {
-                    if self.screen.input.is_empty() {
-                        return Ok(None);
-                    }
-                }
-                KeyCode::Char('u') if ctrl => self.screen.clear_input(),
-                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.screen.insert_char(c);
-                }
-                KeyCode::Backspace => self.screen.backspace(),
-                KeyCode::Left => self.screen.move_left(),
-                KeyCode::Right => self.screen.move_right(),
-                KeyCode::PageUp => self.screen.scroll_up(10),
-                KeyCode::PageDown => self.screen.scroll_down(10),
-                KeyCode::Home if ctrl => {
-                    let area = self.terminal.size()?;
-                    self.screen
-                        .scroll_to_top(area.width, area.height.saturating_sub(2));
-                }
-                KeyCode::End if ctrl => self.screen.follow_bottom(),
-                KeyCode::Home => self.screen.home(),
-                KeyCode::End => self.screen.end(),
-                KeyCode::Enter => {
-                    let text = self.screen.submit();
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    self.screen.commit_user(&text);
-                    self.screen.follow_bottom();
-                    return Ok(Some(text));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn emit(&mut self, event: UiEvent) -> Result<()> {
-        let was_following = self.screen.scrollback == 0;
-        self.screen.apply(event);
-        if was_following {
-            self.screen.follow_bottom();
-        }
-        self.draw(false)
-    }
-
-    fn request_approval(
-        &mut self,
-        call: &ToolCall,
-        allow_always: bool,
-    ) -> Result<ApprovalDecision> {
-        self.screen.begin_block();
-        let options = if allow_always {
-            "[y] once  [a] always  [N] deny"
-        } else {
-            "[y] once  [N] deny"
-        };
-        self.screen.push(
-            &format!("approve {}?  {options}", summarize(call)),
-            prompt_style(),
-        );
-        let _guard = RawGuard::new()?;
-        loop {
-            self.draw(false)?;
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
-                continue;
-            }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            if ctrl && matches!(key.code, KeyCode::Char('c')) {
-                // Raw mode swallows SIGINT; signal the watcher to cancel the turn.
-                crate::signals::interrupt_from_terminal();
-                return Ok(ApprovalDecision::Deny);
-            }
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(ApprovalDecision::Allow),
-                KeyCode::Char('a') | KeyCode::Char('A') if allow_always => {
-                    return Ok(ApprovalDecision::AllowAlways);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter | KeyCode::Esc => {
-                    return Ok(parse_decision("n"));
-                }
-                KeyCode::Char('d') if ctrl => return Ok(ApprovalDecision::Deny),
-                _ => {}
-            }
-        }
-    }
-
-    fn shutdown(&mut self) -> Result<()> {
-        self.restore();
-        Ok(())
-    }
-}
-
-/// Build the interactive front-end: the ratatui full-screen UI when stdin and
-/// stdout are both a terminal, otherwise the plain text UI (pipes, CI, tests).
-pub(crate) fn stdio() -> Box<dyn Ui> {
-    if io::stdout().is_terminal() && io::stdin().is_terminal() {
-        match TuiUi::new() {
-            Ok(ui) => return Box::new(ui),
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "TUI unavailable; using text UI");
-            }
-        }
-    }
-    Box::new(TextUi::stdio())
 }
 
 #[cfg(test)]
@@ -765,7 +735,6 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta("Hel".to_string()));
         screen.apply(UiEvent::AssistantTextDelta("lo".to_string()));
-        // Mid-stream the live text shows but is not yet in the transcript.
         assert_eq!(screen.transcript.len(), 0);
         assert_eq!(screen.wrapped_lines(80).len(), 1);
         screen.apply(UiEvent::AssistantTextEnd("Hello".to_string()));
@@ -775,17 +744,14 @@ mod tests {
 
     #[test]
     fn wrap_breaks_long_line_at_spaces_and_hard_breaks_long_words() {
-        // Word wrap at spaces.
         assert_eq!(
             wrap_to_width("alpha beta gamma", 11),
             vec!["alpha beta".to_string(), "gamma".to_string()]
         );
-        // A word longer than the width is hard-broken.
         assert_eq!(
             wrap_to_width("abcdefgh", 3),
             vec!["abc".to_string(), "def".to_string(), "gh".to_string()]
         );
-        // Fits in one row -> unchanged.
         assert_eq!(wrap_to_width("short", 80), vec!["short".to_string()]);
     }
 
@@ -793,7 +759,6 @@ mod tests {
     fn long_transcript_line_wraps_to_multiple_rows() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("alpha beta gamma delta".to_string()));
-        // One logical line, but several physical rows at a narrow width.
         assert_eq!(screen.transcript.len(), 1);
         assert!(screen.wrapped_lines(12).len() >= 2);
     }
@@ -817,7 +782,6 @@ mod tests {
         screen.apply(UiEvent::AssistantText("hi".to_string()));
         screen.apply(UiEvent::Notice("note".to_string()));
         let texts: Vec<String> = screen.transcript.iter().map(row_text).collect();
-        // A single blank row separates the two blocks; no leading or double blank.
         assert_eq!(
             texts,
             vec!["hi".to_string(), String::new(), "note: note".to_string()]
@@ -838,45 +802,56 @@ mod tests {
     }
 
     #[test]
-    fn scroll_to_top_clamps_to_real_top() {
+    fn scroll_up_clamps_to_real_top_on_render() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(20, 8))?;
         let mut screen = Screen::new();
         for i in 0..20 {
             screen.push(&format!("line {i}"), assistant_style());
         }
-
-        screen.scroll_to_top(20, 4);
-
+        // Scroll past the top; render clamps to the real maximum. Layout: 8 rows
+        // minus status(1) and the editor box(1 + 2 border) leaves a 4-row
+        // transcript, so max scrollback is 20 - 4 = 16.
+        screen.scroll_up(u16::MAX);
+        terminal.draw(|f| render(f, &mut screen))?;
         assert_eq!(screen.scrollback, 16);
         screen.scroll_down(10);
         assert_eq!(screen.scrollback, 6);
+        Ok(())
     }
 
     #[test]
-    fn editor_insert_and_view_tracks_cursor() {
+    fn editor_submit_clears_and_reports_text() {
         let mut screen = Screen::new();
-        screen.insert_char('h');
-        screen.insert_char('i');
-        assert_eq!(screen.input, "hi");
-        let (_, col) = screen.editor_view(20);
-        assert_eq!(col, 2);
-        screen.move_left();
-        let (_, col) = screen.editor_view(20);
-        assert_eq!(col, 1);
-        screen.backspace();
-        assert_eq!(screen.input, "i");
-    }
-
-    #[test]
-    fn submit_clears_input_and_commits_user_line() {
-        let mut screen = Screen::new();
-        screen.insert_str("hello");
+        assert!(screen.editor_is_empty());
+        screen.editor.insert_str("hello");
+        assert_eq!(screen.editor_text(), "hello");
+        assert!(!screen.editor_is_empty());
         let text = screen.submit();
         assert_eq!(text, "hello");
-        assert_eq!(screen.input, "");
-        assert_eq!(screen.cursor, 0);
-        screen.commit_user(&text);
-        let last = row_text(screen.transcript.last().unwrap());
-        assert_eq!(last, "> hello");
+        assert!(screen.editor_is_empty());
+    }
+
+    #[test]
+    fn editor_multiline_undo_and_kill_via_textarea() {
+        let mut screen = Screen::new();
+        screen.editor.insert_str("alpha");
+        screen.editor.insert_newline();
+        screen.editor.insert_str("beta");
+        assert_eq!(screen.editor_text(), "alpha\nbeta");
+        // Kill-word removes the last word.
+        screen.editor.delete_word();
+        assert_eq!(screen.editor_text(), "alpha\n");
+        // Yank restores it from the kill-ring.
+        screen.editor.paste();
+        assert_eq!(screen.editor_text(), "alpha\nbeta");
+        // Undo walks back the yank then the kill.
+        screen.editor.undo();
+        assert_eq!(screen.editor_text(), "alpha\n");
+        screen.editor.undo();
+        assert_eq!(screen.editor_text(), "alpha\nbeta");
+        // Redo replays forward.
+        screen.editor.redo();
+        assert_eq!(screen.editor_text(), "alpha\n");
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -893,19 +868,62 @@ mod tests {
     }
 
     #[test]
-    fn frame_pins_editor_at_bottom_below_transcript() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(24, 6))?;
+    fn frame_pins_editor_box_below_transcript() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("hello world".to_string()));
-        screen.insert_str("hi");
-        terminal.draw(|f| render(f, &screen, true))?;
+        screen.editor.insert_str("hi");
+        terminal.draw(|f| render(f, &mut screen))?;
 
         let rendered = buffer_text(&terminal);
-        let rows: Vec<&str> = rendered.lines().collect();
-        // Editor text is on the last row; transcript text is above it.
-        assert!(!rows.last().unwrap().contains("iris>"));
-        assert!(rows.last().unwrap().contains("hi"));
         assert!(rendered.contains("hello world"));
+        // The editor text sits inside the bordered box near the bottom.
+        assert!(rendered.contains("hi"));
+        // Idle status hint is shown when no turn runs (the long hint is
+        // truncated at this narrow test width, so assert its leading words).
+        assert!(rendered.contains("enter send"));
+        Ok(())
+    }
+
+    #[test]
+    fn frame_shows_spinner_while_turn_active() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
+        let mut screen = Screen::new();
+        screen.start_turn();
+        terminal.draw(|f| render(f, &mut screen))?;
+        let before = buffer_text(&terminal);
+        assert!(before.contains("working"));
+
+        // A tick advances the spinner glyph (animation), idle does not.
+        let glyph0 = SPINNER_FRAMES[0];
+        assert!(before.contains(glyph0));
+        assert!(screen.tick());
+        terminal.draw(|f| render(f, &mut screen))?;
+        let after = buffer_text(&terminal);
+        assert!(after.contains(SPINNER_FRAMES[1]));
+
+        screen.end_turn();
+        assert!(!screen.tick());
+        terminal.draw(|f| render(f, &mut screen))?;
+        let idle = buffer_text(&terminal);
+        assert!(
+            idle.contains("enter send"),
+            "idle hint replaces the spinner"
+        );
+        assert!(!idle.contains("working"), "spinner cleared on turn end");
+        Ok(())
+    }
+
+    #[test]
+    fn frame_shows_slash_palette_when_typing_command() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(40, 10))?;
+        let mut screen = Screen::new();
+        screen.editor.insert_str("/e");
+        screen.sync_palette();
+        terminal.draw(|f| render(f, &mut screen))?;
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("/exit"));
+        assert!(!rendered.contains("/quit"), "filtered to /exit only");
         Ok(())
     }
 }
