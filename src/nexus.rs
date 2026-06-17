@@ -201,28 +201,95 @@ pub(crate) trait Tool {
     }
 }
 
+/// Provider/model capability snapshot the tool-surface planner reads to decide
+/// which built-in tools are *model-visible*. Provider-neutral (Tier 1): each
+/// provider reports its own via [`ChatProvider::capabilities`], and the planner
+/// ([`Tools::plan_surface`]) maps it to the advertised tool set. The default
+/// exposes the full built-in surface, so every provider that does not override
+/// keeps today's exact behavior.
+///
+/// This narrows only what the model *sees*; execution lookup ([`Tools::by_name`])
+/// is unaffected, so a hidden tool a resumed transcript still references stays
+/// runnable. Conceptually mirrors Codex's split between a tool registry
+/// (execution) and `model_visible_specs` (declarations) without porting its
+/// planner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProviderCapabilities {
+    /// The provider/model carries a native code-edit affordance (e.g. Codex
+    /// `apply_patch`, V4A) that supersedes the generic `edit` tool, so `edit` is
+    /// dropped from the model-visible surface. The native replacement tool is a
+    /// later slice (ROADMAP #10 provider-specific tools); no provider sets this
+    /// today, so the surface is unchanged.
+    pub(crate) native_edit: bool,
+}
+
+impl ProviderCapabilities {
+    /// Whether a tool with this name is advertised to the model under these
+    /// capabilities. The single rule today: a provider with a native edit
+    /// affordance hides the generic `edit` tool. Any other name is exposed
+    /// (fail-open), so missing or partial capability data falls back to today's
+    /// full surface.
+    fn exposes(&self, tool_name: &str) -> bool {
+        !(self.native_edit && tool_name == "edit")
+    }
+}
+
 /// Injected collection the agent resolves tool calls against. A thin name lookup
 /// over a `Vec<Box<dyn Tool>>` -- no identity keys, override, or dispatch-order
 /// machinery (that is issue #18, out of scope). Mirrors pi's `context.tools`
 /// resolved with `tools.find(t => t.name === toolCall.name)`.
-pub(crate) struct Tools(Vec<Box<dyn Tool>>);
+///
+/// The set distinguishes the *model-visible* surface ([`iter`](Self::iter), used
+/// to build provider declarations) from the full *execution* registry
+/// ([`by_name`](Self::by_name)). They are deliberately separate: the planner can
+/// hide a tool from the model while keeping it runnable, the seam
+/// provider-specific tool surfaces (ROADMAP #10) build on.
+pub(crate) struct Tools {
+    tools: Vec<Box<dyn Tool>>,
+    /// Capabilities of the provider/model this set is advertised to.
+    /// [`iter`](Self::iter) (model-visible declarations) filters by this;
+    /// [`by_name`](Self::by_name) (execution) ignores it. Defaults to full
+    /// exposure, so a freshly built set advertises every tool until a planner
+    /// narrows it.
+    caps: ProviderCapabilities,
+}
 
 impl Tools {
     pub(crate) fn new(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self(tools)
+        Self {
+            tools,
+            caps: ProviderCapabilities::default(),
+        }
     }
 
-    /// Resolve a call by exact tool name. `None` for an unknown tool.
+    /// Resolve a call by exact tool name over the *full* registry. `None` for an
+    /// unknown tool. Independent of the model-visible plan: a tool hidden by
+    /// [`plan_surface`](Self::plan_surface) still resolves here, so execution,
+    /// approval, and cancellation behavior never depends on visibility.
     pub(crate) fn by_name(&self, name: &str) -> Option<&dyn Tool> {
-        self.0
+        self.tools
             .iter()
             .map(|tool| &**tool)
             .find(|tool| tool.name() == name)
     }
 
-    /// Iterate the tools in declaration order (for provider tool schemas).
+    /// Iterate the *model-visible* tools in declaration order (for provider tool
+    /// schemas). Reflects the planned surface, not the full registry.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &dyn Tool> {
-        self.0.iter().map(|tool| &**tool)
+        self.tools
+            .iter()
+            .map(|tool| &**tool)
+            .filter(|tool| self.caps.exposes(tool.name()))
+    }
+
+    /// Plan the model-visible surface for a provider/model with these
+    /// capabilities. The registry (every tool) is untouched, so [`by_name`](Self::by_name)
+    /// still resolves hidden tools for execution; only the advertised
+    /// [`iter`](Self::iter) surface shrinks. This is the planner seam: it records
+    /// the capabilities the surface is planned against, never branching inside
+    /// tool execution.
+    fn plan_surface(&mut self, caps: &ProviderCapabilities) {
+        self.caps = *caps;
     }
 }
 
@@ -241,6 +308,14 @@ pub(crate) trait ChatProvider {
         tools: &'a Tools,
         cancel: &'a CancellationToken,
     ) -> Result<ProviderStream<'a>>;
+
+    /// The provider/model capabilities the tool-surface planner reads to decide
+    /// the model-visible tool set. Default: the full built-in surface (today's
+    /// behavior). A provider overrides this only to vary which tools the model
+    /// sees; tool execution is never affected.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
 }
 
 /// Forward the contract through a boxed provider so the front-end can select
@@ -254,6 +329,10 @@ impl ChatProvider for Box<dyn ChatProvider> {
         cancel: &'a CancellationToken,
     ) -> Result<ProviderStream<'a>> {
         (**self).respond_stream(messages, tools, cancel)
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        (**self).capabilities()
     }
 }
 
@@ -310,7 +389,11 @@ impl<P: ChatProvider> Agent<P> {
     /// tools, and approval policy, but no filesystem or persistence. Mirrors
     /// pi's bare `Agent`; the Tier-2 Wayland harness wraps it with the execution
     /// env and session store.
-    pub(crate) fn new(provider: P, tools: Tools) -> Self {
+    pub(crate) fn new(provider: P, mut tools: Tools) -> Self {
+        // Plan the model-visible surface once, from the provider's declared
+        // capabilities. Default capabilities expose the full built-in set, so
+        // every provider keeps today's surface unless it opts to vary it.
+        tools.plan_surface(&provider.capabilities());
         Self {
             provider,
             messages: Vec::new(),
@@ -324,8 +407,9 @@ impl<P: ChatProvider> Agent<P> {
     /// next turn; the approval policy starts fresh (allow-always is per-process,
     /// not persisted). Mirrors pi's harness loading session entries and
     /// rebuilding context before continuing the conversation.
-    pub(crate) fn resumed(provider: P, tools: Tools, mut messages: Vec<Message>) -> Self {
+    pub(crate) fn resumed(provider: P, mut tools: Tools, mut messages: Vec<Message>) -> Self {
         repair_dangling_tool_call(&mut messages);
+        tools.plan_surface(&provider.capabilities());
         Self {
             provider,
             messages,
