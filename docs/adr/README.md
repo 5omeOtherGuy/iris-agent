@@ -13,3 +13,6 @@
 | [0009](0009-persist-compaction-as-a-session-entry-and-rebuild-context-through-the-summary.md) | Persist compaction as a session entry and rebuild context through the summary | accepted | 2026-06-17 |
 | [0010](0010-mutating-and-effectful-tools-opt-out-of-persistent-allow-always.md) | Mutating and effectful tools opt out of persistent allow-always | accepted | 2026-06-17 |
 | [0011](0011-store-oversized-tool-outputs-behind-session-scoped-handles.md) | Store oversized tool outputs behind session-scoped handles | accepted | 2026-06-17 |
+| [0012](0012-harness-owned-fragment-slot-system-prompt-assembly.md) | Harness-owned fragment/slot system-prompt assembly | accepted | 2026-06-18 |
+| [0013](0013-shared-selector-schema-for-dynamic-prompt-and-tool-assembly.md) | Shared selector schema for dynamic system-prompt and tool-surface assembly | proposed | 2026-06-18 |
+| [0014](0014-tool-visibility-is-not-authorization.md) | Tool visibility is not authorization | accepted | 2026-06-18 |
