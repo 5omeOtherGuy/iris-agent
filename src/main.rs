@@ -95,7 +95,7 @@ fn run_agent() -> Result<()> {
     // no writable session dir), warn and continue in-memory rather than fail.
     let session = match session::SessionLog::create(&cwd) {
         Ok(log) => {
-            tracing::info!(path = %log.path().display(), "session transcript");
+            tracing::info!(id = %log.id(), path = %log.path().display(), "session transcript");
             Some(log)
         }
         Err(error) => {
@@ -103,11 +103,56 @@ fn run_agent() -> Result<()> {
             None
         }
     };
+    // Resume foundation: surface prior persisted sessions for this workspace.
+    // The /resume UI is a later milestone; this only proves the store reads
+    // back and signals that persistence is durable and resumable.
+    log_resumable_sessions(&cwd);
     // The Tier-2 harness owns the execution surface (workspace + tool state) and
     // persistence, wrapping the bare in-memory agent.
     let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
     let mut ui = ui::tui::stdio();
     cli::run_session(&mut harness, ui.as_mut())
+}
+
+/// Log the most recent prior session for `cwd` (if any) via the read side of
+/// the session store. Best-effort and invisible by default: a read failure is
+/// debug-logged, never fatal. This is the seam the future `/resume` command
+/// will build on.
+fn log_resumable_sessions(cwd: &Path) {
+    let store = match session::SessionStore::open_default() {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::debug!(error = %format!("{error:#}"), "session store unavailable");
+            return;
+        }
+    };
+    let metas = match store.list() {
+        Ok(metas) => metas,
+        Err(error) => {
+            tracing::debug!(error = %format!("{error:#}"), "could not list prior sessions");
+            return;
+        }
+    };
+    let cwd_str = cwd.to_string_lossy();
+    // list() is newest-first, so the first match is the latest session here.
+    let mut here = metas.into_iter().filter(|meta| meta.cwd == cwd_str);
+    let Some(latest) = here.next() else {
+        return;
+    };
+    let also = here.count();
+    match store.open(&latest) {
+        Ok(prior) => tracing::info!(
+            id = %prior.meta.id,
+            created_ms = prior.meta.created_ms,
+            updated_ms = prior.meta.updated_ms,
+            messages = prior.messages.len(),
+            also_resumable = also,
+            "prior session available for this workspace"
+        ),
+        Err(error) => {
+            tracing::debug!(error = %format!("{error:#}"), "could not read latest prior session")
+        }
+    }
 }
 
 /// Build the configured provider as a boxed trait object so a single

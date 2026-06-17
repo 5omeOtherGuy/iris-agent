@@ -811,6 +811,19 @@ impl Role {
             Self::Tool => "tool",
         }
     }
+
+    /// Inverse of [`as_str`](Self::as_str): parse a persisted role string back
+    /// into a `Role`. Used by the session store to reconstruct messages when
+    /// reading a transcript. `None` for an unknown role.
+    pub(crate) fn from_wire(role: &str) -> Option<Self> {
+        match role {
+            "user" => Some(Self::User),
+            "assistant" => Some(Self::Assistant),
+            "assistant_tool_call" => Some(Self::AssistantToolCall),
+            "tool" => Some(Self::Tool),
+            _ => None,
+        }
+    }
 }
 
 fn tool_result_json(result: &Result<ToolOutput>) -> String {
