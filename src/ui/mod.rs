@@ -131,10 +131,16 @@ impl AgentObserver for UiBridge<'_> {
 impl ApprovalGate for UiBridge<'_> {
     fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a> {
         Box::pin(async move { self.ui.borrow_mut().request_approval(call, allow_always) })
-        // ponytail: the terminal prompt is a blocking stdin read, so this future
-        // runs the read inline; the first Ctrl-C does not interrupt a pending
-        // prompt (the loop races this against cancellation, but the read holds
-        // the executor until a second Ctrl-C force-quits). A non-blocking TUI
-        // prompt would let the first Ctrl-C cancel a pending approval too.
+        // The interactive production front-end is the raw-mode TUI
+        // (`ui::tui::TuiUi`): it reads Ctrl-C at an approval as a key event,
+        // calls `signals::interrupt_from_terminal()` (which trips the per-turn
+        // watcher's `CancellationToken`) and returns Deny, so the FIRST Ctrl-C
+        // abandons a pending approval. This inline call only blocks the executor
+        // when the front-end is the non-interactive `TextUi` fallback (pipes/CI,
+        // or a TTY where the TUI failed to start): there a blocking stdin read
+        // holds the thread, so the loop's cancellation race only lands once
+        // input arrives, with a second Ctrl-C as the force-quit backstop. Either
+        // way, Nexus's post-review `token.is_cancelled()` check keeps a late
+        // decision from running the tool or mutating the session allow-policy.
     }
 }

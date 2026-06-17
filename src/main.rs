@@ -31,7 +31,10 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("error: {error:#}");
             if error.downcast_ref::<errors::AuthError>().is_some() {
-                eprintln!("hint: run `iris-agent login openai-codex` to authenticate");
+                eprintln!(
+                    "hint: run `iris-agent login {}` to authenticate",
+                    configured_provider()
+                );
             }
             ExitCode::from(errors::exit_code(&error))
         }
@@ -80,6 +83,20 @@ enum LoginMethod {
 /// backward compatibility; `anthropic` and `antigravity` are opt-in via
 /// `defaultProvider` in settings.
 const DEFAULT_PROVIDER: &str = "openai-codex";
+
+/// Best-effort provider id for the auth re-login hint, so an Anthropic or
+/// Antigravity auth failure does not tell the user to log into OpenAI. Reads
+/// `defaultProvider` from settings; falls back to the default when settings
+/// cannot be read (the hint is advisory, never fatal).
+fn configured_provider() -> String {
+    env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())
+        .and_then(|settings| settings.default_provider)
+        .map(|provider| provider.trim().to_string())
+        .filter(|provider| !provider.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
+}
 
 fn run_agent() -> Result<()> {
     let cwd = env::current_dir()?;

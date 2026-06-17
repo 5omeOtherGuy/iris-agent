@@ -266,10 +266,12 @@ pub(crate) struct Agent<P> {
     // Session approval policy: tool names the user chose to "always" allow.
     // Owned and enforced here in Nexus, not in the UI, so a front-end can never
     // silently widen what runs without approval. Granularity is per tool name.
-    // ponytail: per-tool-name always-allow. `bash` is excluded on purpose -- an
-    // "always" on bash never sticks, so every shell command re-prompts. Upgrade
-    // path = per-exact-command keys (e.g. `bash:<cmd>`) once a real audit trail
-    // exists (roadmap #14).
+    // ponytail: per-tool-name always-allow. The mutating tools (`bash`, `write`,
+    // `edit`) opt out (`supports_allow_always() == false`), so an "always" on
+    // them never sticks and every call re-prompts -- a blanket allow would
+    // authorize arbitrary later effects. Upgrade path = per-exact-command/path
+    // keys (e.g. `bash:<cmd>`, `write:<path>`) once a real audit trail exists
+    // (roadmap #14).
     session_allowed: HashSet<String>,
 }
 
@@ -604,10 +606,10 @@ impl<P: ChatProvider> Agent<P> {
                             tracing::info!(tool = %call.name, "tool always-allowed this session");
                             self.session_allowed.insert(call.name.clone());
                         } else {
-                            obs.on_event(AgentEvent::Notice(
-                                "bash always-allow is disabled; shell commands require approval each time."
-                                    .to_string(),
-                            ))?;
+                            obs.on_event(AgentEvent::Notice(format!(
+                                "always-allow is disabled for `{}`; it requires approval each time.",
+                                call.name
+                            )))?;
                         }
                     }
                     ApprovalDecision::Allow => {}
@@ -692,55 +694,62 @@ fn record_call(
     call: &ToolCall,
     outcome: ToolOutcome,
 ) -> Result<()> {
+    // Append the assistant tool call and its paired result together, BEFORE
+    // emitting the observer event. An observer error must not early-return
+    // between the two pushes: Wayland persists the transcript even on a turn
+    // error, so a dangling assistant-tool-call with no matching tool-result
+    // would be flushed to disk and rejected by the next provider request.
     messages.push(Message::assistant_tool_call(call));
-    match outcome {
+    let event = match outcome {
         ToolOutcome::Ok(output) => {
             tracing::info!(tool = %call.name, ok = true, "tool executed");
-            obs.on_event(AgentEvent::ToolResult {
-                call: call.clone(),
-                content: output.content.clone(),
-            })?;
+            let content = output.content.clone();
             messages.push(Message::tool_result(
                 &call.id,
                 &call.name,
                 &tool_result_json(&Ok(output)),
             ));
+            AgentEvent::ToolResult {
+                call: call.clone(),
+                content,
+            }
         }
         ToolOutcome::Err(error) => {
             tracing::info!(tool = %call.name, ok = false, "tool executed");
-            obs.on_event(AgentEvent::ToolError {
-                call: call.clone(),
-                message: format!("{error:#}"),
-            })?;
+            let message = format!("{error:#}");
             messages.push(Message::tool_result(
                 &call.id,
                 &call.name,
                 &tool_result_json(&Err(error)),
             ));
+            AgentEvent::ToolError {
+                call: call.clone(),
+                message,
+            }
         }
         ToolOutcome::Cancelled => {
             tracing::info!(tool = %call.name, "tool cancelled");
-            obs.on_event(AgentEvent::ToolError {
-                call: call.clone(),
-                message: "cancelled".to_string(),
-            })?;
             messages.push(Message::tool_result(
                 &call.id,
                 &call.name,
                 &cancelled_tool_result_json(),
             ));
+            AgentEvent::ToolError {
+                call: call.clone(),
+                message: "cancelled".to_string(),
+            }
         }
         ToolOutcome::Denied => {
             tracing::warn!(tool = %call.name, "tool call denied");
-            obs.on_event(AgentEvent::ToolDenied(call.clone()))?;
             messages.push(Message::tool_result(
                 &call.id,
                 &call.name,
                 &denied_tool_result_json(),
             ));
+            AgentEvent::ToolDenied(call.clone())
         }
-    }
-    Ok(())
+    };
+    obs.on_event(event)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

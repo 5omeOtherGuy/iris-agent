@@ -33,7 +33,7 @@
 //! `<cwd-slug>` is the working directory with path separators flattened.
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -80,7 +80,15 @@ impl SessionLog {
             .with_context(|| format!("failed to create session dir {}", dir.display()))?;
         let id = format!("{:08x}", rand::random::<u32>());
         let path = dir.join(format!("{}_{}.jsonl", now_ms(), id));
-        let mut file = File::create(&path)
+        // Create exclusively (`create_new`) so a same-millisecond id collision
+        // surfaces as an error instead of silently truncating an existing
+        // transcript. A collision needs the same `u32` drawn in the same
+        // millisecond (~1 in 4e9); persistence is best-effort, so erroring out
+        // on that negligible chance is fine -- no retry loop needed.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
             .with_context(|| format!("failed to create session file {}", path.display()))?;
         let header = json!({
             "type": "session",
