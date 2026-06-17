@@ -352,6 +352,13 @@ vary the advertised tool set by active provider/model (plugs into the Milestone 
 routing work); result shape, path safety, and approval gates stay centralized in
 Nexus regardless of which variant runs.
 
+The planner seam exists ([#60](https://github.com/5omeOtherGuy/iris-agent/issues/60)):
+`ProviderCapabilities` (reported by each provider) drives `Tools::plan_surface`,
+which narrows the *model-visible* surface (`Tools::iter`) while leaving execution
+lookup (`Tools::by_name`) over the full registry untouched. Default capabilities
+advertise the full built-in surface, so every provider is unchanged today; the
+native-edit replacement tool itself is still future work.
+
 ## Milestone 0 — Agent Kernel MVP
 
 **Goal:** a developer can run Iris in a terminal, ask it to inspect or modify a

@@ -2208,3 +2208,173 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
     assert_eq!(reopened.messages[idx + 1].role, Role::Tool);
     Ok(())
 }
+
+// --- Provider-specific tool surface planner (issue #60) ---------------------
+
+/// Provider that reports configurable [`ProviderCapabilities`] and records the
+/// model-visible tool names it is asked to advertise each turn, then returns
+/// scripted turns. Proves `Agent::new` applies the surface plan (so providers
+/// advertise the planned set) and that hidden tools stay executable.
+struct SurfaceProbe {
+    caps: ProviderCapabilities,
+    advertised: RefCell<Vec<Vec<String>>>,
+    responses: RefCell<Vec<Result<AssistantTurn, String>>>,
+}
+
+impl SurfaceProbe {
+    fn new(caps: ProviderCapabilities, responses: Vec<Result<AssistantTurn, &str>>) -> Self {
+        Self {
+            caps,
+            advertised: RefCell::new(Vec::new()),
+            responses: RefCell::new(
+                responses
+                    .into_iter()
+                    .map(|result| result.map_err(str::to_string))
+                    .rev()
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl ChatProvider for SurfaceProbe {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        self.advertised
+            .borrow_mut()
+            .push(tools.iter().map(|tool| tool.name().to_string()).collect());
+        let item = match self.responses.borrow_mut().pop() {
+            Some(Ok(turn)) => Ok(turn),
+            Some(Err(error)) => Err(error),
+            None => Err("unexpected call".to_string()),
+        };
+        Ok(turn_stream(item))
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.caps
+    }
+}
+
+const FULL_SURFACE: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+#[test]
+fn surface_plan_defaults_to_full_built_in_surface() {
+    // Default capabilities leave the model-visible surface identical to the
+    // built-in declaration order -- the parity every existing provider relies on.
+    let mut tools = crate::tools::built_in_tools();
+    tools.plan_surface(&ProviderCapabilities::default());
+    let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(visible, FULL_SURFACE);
+}
+
+#[test]
+fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
+    let mut tools = crate::tools::built_in_tools();
+    tools.plan_surface(&ProviderCapabilities { native_edit: true });
+
+    let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(visible, ["read", "bash", "write", "grep", "find", "ls"]);
+    assert!(
+        !visible.contains(&"edit"),
+        "edit must be hidden from the model"
+    );
+    // Safety invariant: hidden from declarations, still resolvable for execution.
+    assert!(
+        tools.by_name("edit").is_some(),
+        "hidden tool must stay in the execution registry"
+    );
+}
+
+#[test]
+fn default_provider_is_advertised_the_full_surface() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = SurfaceProbe::new(
+        ProviderCapabilities::default(),
+        vec![Ok(AssistantTurn::text("done"))],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let advertised = harness.agent.provider.advertised.borrow();
+    assert_eq!(advertised[0], FULL_SURFACE);
+    Ok(())
+}
+
+#[test]
+fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = SurfaceProbe::new(
+        ProviderCapabilities { native_edit: true },
+        vec![Ok(AssistantTurn::text("done"))],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let advertised = harness.agent.provider.advertised.borrow();
+    assert_eq!(
+        advertised[0],
+        ["read", "bash", "write", "grep", "find", "ls"]
+    );
+    assert!(!advertised[0].iter().any(|name| name == "edit"));
+    Ok(())
+}
+
+#[test]
+fn hidden_edit_tool_still_executes_when_the_model_calls_it() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "old\n")?;
+    // The provider hides `edit` from its advertised surface, but the model calls
+    // it anyway (e.g. a resumed transcript). Execution resolves by name over the
+    // full registry, so the call runs and is gated normally rather than failing
+    // as an unknown tool -- approval/execution stay decoupled from visibility.
+    let provider = SurfaceProbe::new(
+        ProviderCapabilities { native_edit: true },
+        vec![
+            Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+            Ok(single_call_turn(
+                "edit",
+                json!({ "file_path": "note.txt", "old_string": "old", "new_string": "new" }),
+            )),
+            Ok(AssistantTurn::text("done")),
+        ],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("fix it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolError { message, .. } if message.contains("unknown tool")
+        )),
+        "hidden edit must not be reported as an unknown tool"
+    );
+    // The edit ran and mutated the file, and the gate was consulted (gated path).
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("note.txt"))?,
+        "new\n"
+    );
+    assert!(frontend.events_at_review.borrow().is_some());
+    // Every advertised surface this turn still omitted edit.
+    assert!(
+        harness
+            .agent
+            .provider
+            .advertised
+            .borrow()
+            .iter()
+            .all(|surface| !surface.iter().any(|name| name == "edit"))
+    );
+    Ok(())
+}
