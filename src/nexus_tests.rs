@@ -716,6 +716,82 @@ fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
 }
 
 #[test]
+fn observer_error_on_tool_result_still_records_paired_transcript() -> Result<()> {
+    // A front-end that fails while rendering a ToolResult must not leave a
+    // dangling assistant-tool-call in the transcript. `record_call` appends both
+    // the assistant call and its paired tool-result BEFORE emitting the observer
+    // event, so even when the observer errors the persisted transcript stays a
+    // valid call/result pair the next provider request can accept.
+    struct FailOnToolResult;
+    impl AgentObserver for FailOnToolResult {
+        fn on_event(&self, event: AgentEvent) -> Result<()> {
+            match event {
+                AgentEvent::ToolResult { .. } => Err(anyhow!("render failed")),
+                _ => Ok(()),
+            }
+        }
+    }
+    impl ApprovalGate for FailOnToolResult {
+        fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+            Box::pin(async move { Ok(ApprovalDecision::Allow) })
+        }
+    }
+
+    struct MarkerTool;
+    impl Tool for MarkerTool {
+        fn name(&self) -> &str {
+            "marker"
+        }
+        fn description(&self) -> &str {
+            "test marker tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("marker-ran")) })
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(single_call_turn("marker", json!({})))]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(MarkerTool)]),
+    );
+    let frontend = FailOnToolResult;
+
+    let result = block_on(harness.submit_turn(
+        "use marker",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ));
+    assert!(
+        result.is_err(),
+        "observer error should surface as a turn error"
+    );
+
+    // Transcript: user, assistant-tool-call, tool-result. The pair is complete
+    // despite the observer failing on the result event (the pre-fix bug skipped
+    // the tool-result push, leaving only 2 messages and a dangling call).
+    let messages = &harness.agent.messages;
+    assert_eq!(messages.len(), 3, "expected user + tool-call + tool-result");
+    assert_eq!(messages[1].role, Role::AssistantToolCall);
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages[2].role, Role::Tool);
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    assert!(messages[2].content.contains("marker-ran"));
+    Ok(())
+}
+
+#[test]
 fn approved_write_executes_and_creates_file() -> Result<()> {
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![
@@ -1120,6 +1196,38 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
 
 #[test]
 fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
+    // The Nexus session allow-policy: one "always" decision auto-approves later
+    // calls to the SAME tool. Exercised with a custom approval-requiring tool
+    // that opts into allow-always; the built-in mutating tools (write/edit/bash)
+    // deliberately opt OUT (see registry.rs), so the policy mechanism is tested
+    // through a tool that participates in it. Only one decision line is
+    // supplied; if the policy were not enforced in Nexus, the second call would
+    // consume "/exit" as its decision.
+    struct ApprovableTool;
+    impl Tool for ApprovableTool {
+        fn name(&self) -> &str {
+            "approvable"
+        }
+        fn description(&self) -> &str {
+            "approval-requiring tool that supports allow-always"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("ran")) })
+        }
+        fn requires_approval(&self) -> bool {
+            true
+        }
+        // supports_allow_always defaults to true: this tool participates.
+    }
+
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
@@ -1127,57 +1235,130 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
-                    name: "write".to_string(),
-                    arguments: json!({ "path": "a.txt", "content": "a" }),
+                    name: "approvable".to_string(),
+                    arguments: json!({}),
                 },
                 ToolCall {
                     id: "call_2".to_string(),
-                    name: "write".to_string(),
-                    arguments: json!({ "path": "b.txt", "content": "b" }),
+                    name: "approvable".to_string(),
+                    arguments: json!({}),
                 },
             ],
         }),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(ApprovableTool)]),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
-    // A single "always" decision must satisfy both write calls. Only one
-    // decision line is supplied; the second call must not read input. If the
-    // policy were not enforced in Nexus, the second write would consume
-    // "/exit" as its decision and b.txt would never be written.
     run_text_session(
         &mut harness,
-        "write both\na\n/exit\n".as_bytes(),
+        "do both\na\n/exit\n".as_bytes(),
         &mut output,
         &mut errors,
     )?;
 
-    assert!(workspace.path.join("a.txt").exists());
-    assert!(workspace.path.join("b.txt").exists());
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("auto-approved \u{b7} write b.txt \u{b7} session"));
+    assert!(rendered.contains("auto-approved"));
+    // Both calls ran: the next provider request carries two ok tool results.
+    let seen = harness.agent.provider.seen.borrow();
+    let results: Vec<_> = seen[1].iter().filter(|m| m.role == Role::Tool).collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|m| m.content.contains("\"ok\":true")));
     Ok(())
 }
 
 #[test]
+fn mutating_builtins_opt_out_of_allow_always() {
+    // Fix: the mutating built-ins gate on approval but opt OUT of allow-always,
+    // so a single "always" can never authorize arbitrary later effects. The UI
+    // reads this classification to omit the "always" choice (tested in
+    // ui::text); here we pin the registry classification itself.
+    let tools = crate::tools::built_in_tools();
+    for name in ["write", "edit", "bash"] {
+        let tool = tools
+            .by_name(name)
+            .unwrap_or_else(|| panic!("{name} should be a built-in tool"));
+        assert!(tool.requires_approval(), "{name} should require approval");
+        assert!(
+            !tool.supports_allow_always(),
+            "{name} must opt out of allow-always so a session grant cannot authorize later effects"
+        );
+    }
+}
+
+#[test]
 fn always_allow_does_not_cross_tool_boundaries() -> Result<()> {
-    // "always" on write must not silently auto-approve a later bash call.
+    // "always" on one tool must not silently auto-approve a different tool. The
+    // built-in mutating tools now opt out of allow-always (so none of them can
+    // be the always-allowed example), so this uses two custom approval-requiring
+    // tools: `alpha` participates in allow-always, `beta` must still prompt.
+    struct AllowAlwaysTool;
+    impl Tool for AllowAlwaysTool {
+        fn name(&self) -> &str {
+            "alpha"
+        }
+        fn description(&self) -> &str {
+            "allow-always-capable tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("alpha-ran")) })
+        }
+        fn requires_approval(&self) -> bool {
+            true
+        }
+    }
+    struct GatedTool;
+    impl Tool for GatedTool {
+        fn name(&self) -> &str {
+            "beta"
+        }
+        fn description(&self) -> &str {
+            "approval-requiring tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("beta-ran")) })
+        }
+        fn requires_approval(&self) -> bool {
+            true
+        }
+    }
+
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![
-        Ok(single_call_turn(
-            "write",
-            json!({ "path": "a.txt", "content": "a" }),
-        )),
-        Ok(single_call_turn("bash", json!({ "command": "echo hi" }))),
+        Ok(single_call_turn("alpha", json!({}))),
+        Ok(single_call_turn("beta", json!({}))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(AllowAlwaysTool), Box::new(GatedTool)]),
+    );
     let mut output = Vec::new();
     let mut errors = Vec::new();
 
-    // write -> always (a); bash -> denied (n). bash must still prompt.
+    // alpha -> always (a); beta -> denied (n). beta must still prompt.
     run_text_session(
         &mut harness,
         "go\na\nn\n/exit\n".as_bytes(),
@@ -1185,10 +1366,9 @@ fn always_allow_does_not_cross_tool_boundaries() -> Result<()> {
         &mut errors,
     )?;
 
-    assert!(workspace.path.join("a.txt").exists());
     let seen = harness.agent.provider.seen.borrow();
-    let bash_result = seen[2].last().unwrap();
-    assert!(bash_result.content.contains("\"denied\":true"));
+    let beta_result = seen[2].last().unwrap();
+    assert!(beta_result.content.contains("\"denied\":true"));
     Ok(())
 }
 

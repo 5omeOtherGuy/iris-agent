@@ -183,6 +183,12 @@ impl Tool for EditTool {
     fn requires_approval(&self) -> bool {
         true
     }
+    fn supports_allow_always(&self) -> bool {
+        // A blanket "always" on edit would authorize arbitrary later edits to
+        // any workspace file; edits stay approval-per-call until policy is
+        // path/exact-call scoped (roadmap #14).
+        false
+    }
     fn diff_preview(&self, workspace: &Path, args: &Value) -> Option<String> {
         render(workspace, |root| edit::preview(root, args))
     }
@@ -213,6 +219,12 @@ impl Tool for WriteTool {
     }
     fn requires_approval(&self) -> bool {
         true
+    }
+    fn supports_allow_always(&self) -> bool {
+        // A blanket "always" on write would authorize arbitrary later writes to
+        // any workspace file; writes stay approval-per-call until policy is
+        // path/exact-call scoped (roadmap #14).
+        false
     }
     fn diff_preview(&self, workspace: &Path, args: &Value) -> Option<String> {
         render(workspace, |root| write::preview(root, args))
