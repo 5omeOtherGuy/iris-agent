@@ -1871,3 +1871,160 @@ fn loop_cancels_a_pending_approval_with_a_cancellable_gate() -> Result<()> {
     );
     Ok(())
 }
+
+/// A provider that echoes the first message it is given, so a test can prove
+/// which conversation context reached the model. On a fresh session the first
+/// message is the new prompt; on a resumed session it is the loaded history.
+struct EchoFirstMessageProvider;
+
+impl ChatProvider for EchoFirstMessageProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let first = messages
+            .first()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        Ok(turn_stream(Ok(AssistantTurn::text(&first))))
+    }
+}
+
+/// Resume end-to-end: a prior session is loaded from the store, its messages
+/// seed the agent, and the next turn must see that prior context. The echo
+/// provider returns the first message it received, so the resumed user fact
+/// must come back out -- this fails if the loaded history was dropped. The
+/// continued turns are also appended to the same log without duplicating the
+/// loaded entries.
+#[test]
+fn resumed_session_feeds_prior_context_into_next_turn() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+
+    // A prior session with a memorable fact, then drop the live handle.
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    log.append(&Message::user("the codeword is ostrich"))?;
+    log.append(&Message::assistant("understood"))?;
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    // Resume: load the transcript and rebuild provider-visible context.
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session id present in store");
+    let stored = store.open(&meta)?;
+    let resumed = stored.messages.len();
+    assert_eq!(resumed, 2, "history reconstructed from the store");
+
+    let agent = Agent::resumed(
+        EchoFirstMessageProvider,
+        crate::tools::built_in_tools(),
+        stored.messages,
+    );
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        resumed,
+    );
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    run_text_session(
+        &mut harness,
+        b"what is the codeword?\n/exit\n",
+        &mut out,
+        &mut err,
+    )?;
+
+    // The echoed first message is the resumed fact, not the new prompt -- proof
+    // the prior context reached the next model turn.
+    let rendered = String::from_utf8(out)?;
+    assert!(
+        rendered.contains("the codeword is ostrich"),
+        "resumed context did not reach the provider; got: {rendered}"
+    );
+
+    // The continued turn was appended to the same log, not a new file, and the
+    // loaded history was not rewritten: 2 loaded + new user + new assistant.
+    let reopened = store.open(&meta)?;
+    assert_eq!(reopened.messages.len(), 4);
+    assert_eq!(reopened.messages[0].content, "the codeword is ostrich");
+    assert_eq!(reopened.messages[2].content, "what is the codeword?");
+    assert_eq!(reopened.messages[2].role, Role::User);
+    Ok(())
+}
+
+/// A session whose last persisted entry is an unanswered tool call (a prior
+/// crash between the call and its result) must resume into a provider-valid
+/// sequence: the dangling call is paired with a synthetic result before the new
+/// user prompt, and that repair is persisted to the same log.
+#[test]
+fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    log.append(&Message::user("run the tool"))?;
+    let call = ToolCall {
+        id: "call_1".to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": "a.txt" }),
+    };
+    log.append(&Message::assistant_tool_call(&call))?; // dangling: no Tool result
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present");
+    let stored = store.open(&meta)?;
+    let on_disk = stored.messages.len();
+    assert_eq!(on_disk, 2, "user + dangling tool call");
+
+    // Capture exactly what the provider receives on the next turn.
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
+    let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        on_disk,
+    );
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    run_text_session(&mut harness, b"continue\n/exit\n", &mut out, &mut err)?;
+
+    // The reconstructed history pairs the dangling call with a Tool result, so
+    // the provider never sees an unanswered tool call followed by a user turn.
+    let seen = harness.agent.provider.seen.borrow();
+    let first = seen.first().expect("provider was called");
+    let call_idx = first
+        .iter()
+        .position(|m| m.role == Role::AssistantToolCall)
+        .expect("tool call present");
+    assert_eq!(
+        first[call_idx + 1].role,
+        Role::Tool,
+        "dangling tool call must be answered before the next message"
+    );
+
+    // The synthetic result was persisted to the same log: reading it back also
+    // yields a valid call/result pairing.
+    let reopened = store.open(&meta)?;
+    let idx = reopened
+        .messages
+        .iter()
+        .position(|m| m.role == Role::AssistantToolCall)
+        .unwrap();
+    assert_eq!(reopened.messages[idx + 1].role, Role::Tool);
+    Ok(())
+}

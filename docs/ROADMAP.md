@@ -506,11 +506,22 @@ Potential scope:
   newest-first) by reading only each header line + mtime, and `open(id)` reads
   a session back with its messages in order (skipping a truncated trailing
   fragment). Tests cover create/open/list/read/append/parent-linkage.
-  Deferred (later milestones, intentionally outside this slice): the `/resume`
-  UI command and context reconstruction, surfacing entry ids/`parentId` on read
-  for branching/tree navigation, compaction/branch-summary entries, labels,
-  fork, and token accounting. This ships the durable, resumable-ready store,
-  not session resume itself.]
+  Deferred (later milestones, intentionally outside this slice): surfacing
+  entry ids/`parentId` on read for branching/tree navigation,
+  compaction/branch-summary entries, labels, fork, and token accounting. This
+  ships the durable, resumable-ready store. Session Resume MVP
+  ([#47](https://github.com/5omeOtherGuy/iris-agent/issues/47), shipped
+  2026-06-17) builds on it: `iris-agent resume <session-id>` finds the session
+  via `SessionStore::find`, reconstructs the prior provider-visible messages
+  (`Agent::resumed` seeds the loaded transcript), reopens the same JSONL file
+  for append (`SessionLog::resume` restores the leaf link + id counter), and
+  the harness continues appending future turns to that same log (a `persisted`
+  cursor past the loaded history avoids rewriting it). Errors clearly on an
+  unknown id. A focused test
+  (`resumed_session_feeds_prior_context_into_next_turn`) proves the loaded fact
+  reaches the next model turn and that continuation does not duplicate history.
+  Still deferred (outside #47): the in-session `/resume` picker UI, branching,
+  rollback, compaction/summaries, and session search.]
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
   override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project).
