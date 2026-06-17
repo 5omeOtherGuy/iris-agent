@@ -83,6 +83,13 @@ Implemented today:
 - OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini Code Assist
   request/response handling, including tool schemas and streamed-response
   parsing.
+- Harness-owned system-prompt / project-instruction assembly
+  ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56)): the Tier-2
+  Wayland `system_prompt::assemble` builds base instructions + runtime context +
+  the workspace-root `AGENTS.md` (path-safe, missing-file tolerant) in one place;
+  fresh and resumed sessions feed the same assembled string through the existing
+  provider request path. Nested/ancestor/global `AGENTS.md`, skills, and prompt
+  templates are deferred (skills/templates are issue #57).
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.

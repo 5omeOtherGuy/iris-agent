@@ -29,7 +29,7 @@ mod find;
 mod grep;
 mod ls;
 mod observe;
-mod path;
+pub(crate) mod path;
 mod read;
 mod registry;
 mod text;

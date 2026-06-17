@@ -8,7 +8,6 @@
 //! or extended-thinking replay only if a real need shows up.
 
 use std::io::BufReader;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -18,7 +17,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
-use super::build_iris_system_prompt;
 use super::transport::{
     Attempt, HttpClass, TurnSink, classify_http_status, for_each_sse_event, run_with_reauth,
     spawn_stream,
@@ -46,10 +44,12 @@ pub(crate) struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// `system_prompt` is the harness-assembled instruction string; the provider
+    /// prepends the required Claude Code identity block and forwards the rest.
     pub(crate) fn new(
         model: Option<&str>,
         base_url: Option<&str>,
-        workspace: &Path,
+        system_prompt: &str,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
@@ -65,7 +65,7 @@ impl AnthropicProvider {
                 .filter(|b| !b.is_empty())
                 .unwrap_or(DEFAULT_BASE_URL)
                 .to_string(),
-            system_prompt: build_iris_system_prompt(workspace),
+            system_prompt: system_prompt.to_string(),
             tokens: AnthropicTokenStore::from_env()?,
         })
     }

@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-pub(super) fn workspace_root(workspace: &Path) -> Result<PathBuf> {
+pub(crate) fn workspace_root(workspace: &Path) -> Result<PathBuf> {
     workspace
         .canonicalize()
         .with_context(|| format!("failed to resolve workspace {}", workspace.display()))
@@ -38,7 +38,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 /// Resolve a path that must already exist, confined to the workspace.
-pub(super) fn resolve_existing(root: &Path, requested: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_existing(root: &Path, requested: &str) -> Result<PathBuf> {
     let candidate = lexical_normalize(&join_request(root, requested));
     let resolved = candidate
         .canonicalize()
