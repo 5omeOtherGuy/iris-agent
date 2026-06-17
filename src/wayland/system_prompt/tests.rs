@@ -109,6 +109,22 @@ fn unparsable_slot_is_treated_as_unslotted() {
 }
 
 #[test]
+fn slot_zero_parses_as_some_zero() {
+    // The off switch is a real slot value, not a parse failure.
+    let f = parse_fragment("stem", Source::Repo, "---\nname: x\nslot: 0\n---\nb");
+    assert_eq!(f.slot, Some(0));
+}
+
+#[test]
+fn description_frontmatter_is_ignored_and_kept_out_of_the_body() {
+    // A description line is metadata: it must not bleed into the rendered body.
+    let raw = "---\nname: custom\nslot: 1\ndescription: why this exists\n---\nactual body";
+    let f = parse_fragment("file", Source::Repo, raw);
+    assert_eq!(f.body, "actual body");
+    assert_eq!(f.name, "custom");
+}
+
+#[test]
 fn body_preserves_internal_blank_lines() {
     let f = parse_fragment(
         "stem",
@@ -194,15 +210,65 @@ fn identity_is_first_and_tool_tail_order_is_fixed() {
 #[test]
 fn anchors_cannot_be_repositioned_by_a_slot() {
     // identity carries a high slot and tool_use a low one; anchoring ignores
-    // both, keeping identity first and tool_use in the tail.
+    // both, keeping identity first and tool_use in the tail. (slot 1 not 0:
+    // slot 0 would disable the fragment entirely -- see slot_zero tests.)
     let frags = vec![
-        frag("tool_use", Some(0), Source::Global, "tail prose"),
+        frag("tool_use", Some(1), Source::Global, "tail prose"),
         frag("identity", Some(99), Source::Global, "head"),
         frag("middle", Some(50), Source::Global, "mid"),
     ];
     let prompt = build_with(frags, &[]);
     assert!(at(&prompt, "identity") < at(&prompt, "middle"));
     assert!(at(&prompt, "middle") < at(&prompt, "tool_use"));
+}
+
+#[test]
+fn slot_zero_disables_a_middle_fragment() {
+    let frags = vec![
+        frag("identity", None, Source::Global, "id"),
+        frag("off", Some(0), Source::Global, "SHOULD NOT APPEAR"),
+        frag("on", Some(1), Source::Global, "present"),
+    ];
+    let prompt = build_with(frags, &[]);
+    assert!(
+        !prompt.contains("<off>"),
+        "slot 0 must disable the fragment"
+    );
+    assert!(!prompt.contains("SHOULD NOT APPEAR"));
+    assert!(prompt.contains("<on>"));
+}
+
+#[test]
+fn slot_zero_disables_even_an_anchor() {
+    // "Not active at all" applies uniformly: a disabled anchor emits nothing.
+    let frags = vec![
+        frag("identity", Some(0), Source::Global, "DISABLED IDENTITY"),
+        frag("tool_use", Some(0), Source::Global, "DISABLED TAIL"),
+        frag("kept", Some(1), Source::Global, "kept body"),
+    ];
+    let prompt = build_with(frags, &[]);
+    assert!(!prompt.contains("<identity>"));
+    assert!(!prompt.contains("DISABLED IDENTITY"));
+    assert!(!prompt.contains("<tool_use>"));
+    assert!(!prompt.contains("DISABLED TAIL"));
+    assert!(prompt.contains("<kept>"));
+    // Generated tool list is independent of the authored tool_use anchor.
+    assert!(prompt.contains("<available_tools>"));
+}
+
+#[test]
+fn description_is_never_rendered_into_the_prompt() {
+    let f = parse_fragment(
+        "file",
+        Source::Repo,
+        "---\nname: custom\nslot: 1\ndescription: SECRET INTENT NOTE\n---\nvisible body",
+    );
+    let prompt = build_with(vec![frag("identity", None, Source::Global, "id"), f], &[]);
+    assert!(prompt.contains("visible body"));
+    assert!(
+        !prompt.contains("SECRET INTENT NOTE"),
+        "description is metadata and must not leak into the prompt"
+    );
 }
 
 #[test]
@@ -479,6 +545,31 @@ fn load_dir_rejects_a_symlinked_fragment_file() {
     symlink(&secret, dir.path.join("evil.md")).unwrap();
     let frags = load_dir(&dir.path, Source::Repo);
     assert!(frags.iter().all(|f| !f.body.contains("TOP SECRET")));
+}
+
+#[test]
+fn every_shipped_default_has_a_description() {
+    assert!(
+        DEFAULTS.iter().all(|d| !d.description.trim().is_empty()),
+        "each shipped default must document its intent"
+    );
+}
+
+#[test]
+fn materialized_default_files_carry_a_description_kept_out_of_the_body() {
+    let dir = temp_dir();
+    let frag_dir = dir.path.join("fragments");
+    materialize_defaults(&frag_dir).unwrap();
+
+    let identity = fs::read_to_string(frag_dir.join("identity.md")).unwrap();
+    assert!(
+        identity.contains("description: Who iris is"),
+        "materialized frontmatter carries the description"
+    );
+    // Reloading keeps the description (metadata) out of the rendered body.
+    let loaded = load_dir(&frag_dir, Source::Global);
+    let id = loaded.iter().find(|f| f.name == "identity").unwrap();
+    assert!(!id.body.contains("description:"));
 }
 
 #[test]

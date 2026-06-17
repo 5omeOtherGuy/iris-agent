@@ -29,6 +29,15 @@
 //!
 //! Any fragment whose body is empty/whitespace emits nothing (no tag). `slot`
 //! is a sort key, not a uniqueness constraint: two fragments may share a slot.
+//! `slot: 0` is the off switch: a fragment opts out entirely by setting it, so
+//! it is dropped before anchoring/ordering -- anchors included.
+//!
+//! ## Frontmatter keys
+//!
+//! `name` is the xml tag and `slot` the ordering key (`0` = disabled). Every
+//! other key -- including `description`, the one-line intent the shipped
+//! defaults carry for humans/agents reading the file -- is metadata only: it is
+//! ignored by the parser and never rendered into the prompt (forward-compat).
 //!
 //! ## Purity
 //!
@@ -98,8 +107,9 @@ fn source_rank(source: Source) -> u8 {
     }
 }
 
-/// One parsed fragment: `name` (the xml tag), an optional `slot` sort key, the
-/// source it came from, and the body (surrounding whitespace trimmed).
+/// One parsed fragment: `name` (the xml tag), an optional `slot` sort key
+/// (`Some(0)` disables the fragment), the source it came from, and the body
+/// (surrounding whitespace trimmed).
 #[derive(Debug, Clone)]
 struct Fragment {
     name: String,
@@ -182,6 +192,9 @@ fn build_prompt(
     docs: &[(String, String)],
     date: &str,
 ) -> String {
+    // slot 0 means "not active at all": drop opted-out fragments up front so the
+    // rule applies uniformly to anchors and middles alike.
+    fragments.retain(|f| f.slot != Some(0));
     // Anchored authored blocks are consumed by name; the generated tool blocks
     // are never loaded from files, so a user-authored copy is dropped.
     let identity = take_anchor(&mut fragments, ANCHOR_IDENTITY);
@@ -400,10 +413,12 @@ fn load_dir(dir: &Path, source: Source) -> Vec<Fragment> {
     out
 }
 
-/// Parse one fragment file: optional leading `---` frontmatter (`name`, `slot`;
-/// unknown keys ignored for forward-compat) followed by the body. `name`
-/// defaults to the file stem when frontmatter omits it. The body is everything
-/// after the closing `---`, surrounding whitespace trimmed.
+/// Parse one fragment file: optional leading `---` frontmatter followed by the
+/// body. Only `name` (the xml tag) and `slot` (ordering key) are read; every
+/// other key -- `description` and any future key -- is metadata, ignored here so
+/// it never reaches the rendered prompt. `name` defaults to the file stem when
+/// frontmatter omits it. The body is everything after the closing `---`,
+/// surrounding whitespace trimmed.
 fn parse_fragment(stem: &str, source: Source, raw: &str) -> Fragment {
     // Tolerate a leading UTF-8 BOM (some editors prepend one); otherwise the
     // frontmatter fence would not match and the whole file, frontmatter
@@ -422,7 +437,9 @@ fn parse_fragment(stem: &str, source: Source, raw: &str) -> Fragment {
                 match key.trim() {
                     "name" if !value.is_empty() => name = value.to_string(),
                     "slot" => slot = value.parse::<u32>().ok(),
-                    _ => {} // ignore unknown keys (forward-compat for model/mode/...)
+                    // Everything else (description, future model/mode/... keys)
+                    // is metadata: ignored so it never reaches the prompt body.
+                    _ => {}
                 }
             }
             rest
@@ -559,9 +576,14 @@ fn materialize_defaults(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Render a shipped default to its on-disk `.md` form: `---` frontmatter
-/// (`name`, optional `slot`) then the body.
+/// (`name`, `description`, optional `slot`) then the body. The `description`
+/// makes each materialized file self-documenting without leaking into the
+/// prompt.
 fn default_file_contents(default: &Default) -> String {
-    let mut out = format!("---\nname: {}\n", default.name);
+    let mut out = format!(
+        "---\nname: {}\ndescription: {}\n",
+        default.name, default.description
+    );
     if let Some(slot) = default.slot {
         out.push_str(&format!("slot: {slot}\n"));
     }
