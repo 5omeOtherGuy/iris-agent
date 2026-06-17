@@ -13,8 +13,8 @@ use reqwest::header::{
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::errors::AuthError;
+use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ProviderEvent, ProviderStream, Role, ToolCall, Tools,
 };

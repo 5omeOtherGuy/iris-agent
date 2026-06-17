@@ -16,24 +16,27 @@
   `ToolCall`, `Message`, and `Role` in Nexus. [Partial]
 - **Provider error reporting** — provider errors print to stderr and the REPL
   continues. [Partial]
-- **Streaming responses** — incremental assistant text output via the current
-  provider parser and `TurnSink`; async-hard provider streams are planned next
-  under runtime completion. [Partial]
-- **Runtime-hard cancellation** — turn-level cancellation token, provider
-  stream-vs-cancel race, tool-vs-cancel race, child cancellation per tool, and
-  valid transcript data on abort. [Planned]
-- **Safe parallel tool execution** — sequential by default; explicitly
-  concurrency-safe/read-only tools may overlap while unsafe tools stay exclusive.
-  [Planned]
+- **Streaming responses** — incremental assistant text output via the async
+  `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, consumed by
+  the tokio agent loop and rendered as `UiEvent` deltas. [Implemented]
+- **Runtime-hard cancellation** — per-turn `CancellationToken`, provider
+  stream-vs-cancel race, tool-vs-cancel race, child cancellation per tool, and a
+  real-or-synthetic cancelled tool result for every emitted call so the
+  transcript stays valid on abort. (Caveat: a blocking terminal approval prompt
+  is not preempted until the second Ctrl-C.) [Implemented]
+- **Safe parallel tool execution** — sequential by default; consecutive
+  concurrency-safe, ungated tools (`grep`/`find`/`ls`) run in parallel via
+  `join_all` while unsafe/mutating tools stay exclusive. [Implemented]
 - **Session transcript persistence** — best-effort JSONL write-only transcripts;
   reload/resume and tree branching are planned later. [Partial]
 
 ## Providers and auth
 
-- **OpenAI Codex Responses provider** — currently uses the ChatGPT Codex
-  Responses endpoint with tool schemas, retry/backoff, and streamed response
-  parsing; the next runtime step is an async streaming `ChatProvider` contract
-  rather than a blocking whole-turn provider call. [Partial]
+- **OpenAI Codex Responses provider** — uses the ChatGPT Codex Responses endpoint
+  with tool schemas, retry/backoff, and streamed response parsing, exposed as the
+  async streaming `ChatProvider::respond_stream` contract (blocking reqwest/SSE
+  code runs on `spawn_blocking` and forwards `ProviderEvent`s over a channel,
+  cancellation-aware across attempts/backoff/SSE lines). [Partial]
 - **OpenAI Codex OAuth auth-file support** — reads `~/.iris/auth.json` or
   `IRIS_AUTH_PATH`, refreshes expired access tokens, extracts account ID from the
   JWT payload, and rewrites refreshed credentials atomically with restricted Unix
@@ -49,10 +52,10 @@
 
 ## Agent Kernel MVP tools
 
-- **Tool-call loop** — send tool schemas, receive tool calls, execute tools, feed
-  tool results back to the model, and stop after a bounded number of tool
-  iterations. Runtime-hard async cancellation and safe parallel execution are
-  planned next. [Partial]
+- **Tool-call loop** — send tool schemas, receive tool calls, execute async tools,
+  feed tool results back to the model, and stop after a bounded number of tool
+  iterations. Runs on the tokio loop with per-turn/per-tool cancellation and
+  safe-parallel batching of concurrency-safe calls. [Implemented]
 - **`read` tool** — read a workspace text file with offset/limit; rejects
   binary/NUL-containing and invalid UTF-8 files rather than rendering lossy
   text. [Implemented]

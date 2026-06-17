@@ -7,13 +7,12 @@ use nexus::Agent;
 use reqwest::blocking::Client;
 
 mod approval;
-mod auth;
 mod cli;
 mod config;
 mod errors;
+mod mimir;
 mod nexus;
 mod process_group;
-mod providers;
 mod session;
 mod signals;
 mod telemetry;
@@ -87,7 +86,7 @@ fn run_agent() -> Result<()> {
         ))
         .into());
     }
-    let provider = providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+    let provider = mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
         settings.default_model.as_deref(),
         settings.base_url.as_deref(),
         &cwd,
@@ -118,12 +117,12 @@ fn login_openai_codex(method: LoginMethod) -> Result<()> {
         .build()?;
 
     match method {
-        LoginMethod::Browser => auth::openai_codex::login_browser(&client, |auth| {
+        LoginMethod::Browser => mimir::auth::openai_codex::login_browser(&client, |auth| {
             println!("OpenAI Codex browser login");
             println!("Open: {}", auth.url);
             println!("Waiting for callback at {} ...", auth.redirect_uri);
         })?,
-        LoginMethod::DeviceCode => auth::openai_codex::login_device_code(&client, |code| {
+        LoginMethod::DeviceCode => mimir::auth::openai_codex::login_device_code(&client, |code| {
             println!("OpenAI Codex device-code login");
             println!("Open: {}", code.verification_uri);
             println!("Code: {}", code.user_code);
