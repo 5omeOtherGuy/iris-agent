@@ -103,7 +103,7 @@ fn bom_prefixed_fragment_still_parses_frontmatter() {
 }
 
 #[test]
-fn unparseable_slot_is_treated_as_unslotted() {
+fn unparsable_slot_is_treated_as_unslotted() {
     let f = parse_fragment("stem", Source::Repo, "---\nname: x\nslot: high\n---\nb");
     assert_eq!(f.slot, None);
 }
