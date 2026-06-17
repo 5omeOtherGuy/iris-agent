@@ -298,10 +298,14 @@ impl SessionStore {
     /// [`list`](Self::list) (which carries the id) and passing it here, so
     /// opening costs one read, not a second directory scan.
     pub(crate) fn open(&self, meta: &SessionMeta) -> Result<StoredSession> {
-        let messages = read_messages(&meta.path)?;
+        let RebuiltContext {
+            messages,
+            context_tokens,
+        } = read_messages(&meta.path)?;
         Ok(StoredSession {
             meta: meta.clone(),
             messages,
+            context_tokens,
         })
     }
 }
@@ -330,10 +334,19 @@ pub(crate) struct SessionMeta {
 pub(crate) struct StoredSession {
     pub(crate) meta: SessionMeta,
     pub(crate) messages: Vec<Message>,
+    /// Estimated token total of the rebuilt provider-visible context, summed
+    /// from the persisted per-message [`estimate_tokens`] (recomputed from
+    /// content for legacy entries). Deterministic from the on-disk transcript,
+    /// so reopening a session reports the same total every time. The foundation
+    /// the next slice (auto-compaction budgeting) reads instead of recomputing.
+    pub(crate) context_tokens: u64,
 }
 
 /// Serialize one message into its session entry value, with a stable id and a
-/// `parentId` link to the previous leaf (`null` for the first entry).
+/// `parentId` link to the previous leaf (`null` for the first entry). Each
+/// entry also records a `tokenEstimate` -- the per-turn token accounting this
+/// foundation persists so a resumed session can report a stable context total
+/// without replaying the model.
 fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value {
     let mut inner = json!({
         "role": message.role.as_str(),
@@ -350,8 +363,26 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
         "id": id,
         "parentId": parent_id,
         "timestamp": now_ms(),
+        // Durable per-entry token accounting. Today this is a content-derived
+        // estimate (providers do not surface usage through the stream yet); the
+        // read path prefers this persisted value, so swapping in real provider
+        // usage later means writing the real number here without touching
+        // rebuild. See `estimate_tokens`.
+        "tokenEstimate": estimate_tokens(&message.content),
         "message": inner,
     })
+}
+
+/// Conservative content-based token estimate for one message body.
+//
+// ponytail: ~4 chars/token is the standard rough heuristic, rounded up so even
+// a short non-empty body counts as >= 1 token (never under-count for a budget).
+// It ignores role/tool framing overhead and provider-specific tokenization on
+// purpose -- this foundation only needs a stable, deterministic number. Upgrade
+// path = record real provider usage per turn in `tokenEstimate` and prefer it
+// (the read path already does).
+pub(crate) fn estimate_tokens(content: &str) -> u64 {
+    (content.chars().count() as u64).div_ceil(4)
 }
 
 /// What [`SessionLog::resume`] needs to continue an existing transcript.
@@ -461,8 +492,9 @@ fn read_meta(path: &Path) -> Result<SessionMeta> {
 /// Read a full session's conversation messages in order. The header is parsed
 /// and validated, then each `message` entry is reconstructed; non-message and
 /// malformed lines (e.g. a truncated trailing fragment from a partial write)
-/// are skipped rather than failing the whole open.
-fn read_messages(path: &Path) -> Result<Vec<Message>> {
+/// are skipped rather than failing the whole open. Also returns the rebuilt
+/// context's estimated token total ([`RebuiltContext`]).
+fn read_messages(path: &Path) -> Result<RebuiltContext> {
     // Read raw bytes and split on '\n' so a truncated trailing fragment that
     // splits a multibyte UTF-8 char is discarded as one bad line, rather than
     // failing the whole read -- which `read_to_string` would, since invalid
@@ -486,7 +518,7 @@ fn read_messages(path: &Path) -> Result<Vec<Message>> {
     // and compaction entries separately, then rebuild: covered ranges are
     // replaced by their summary so the resumed context carries the summary
     // instead of the original turns.
-    let mut entries: Vec<(Option<String>, Message)> = Vec::new();
+    let mut entries: Vec<MessageEntry> = Vec::new();
     let mut compactions: Vec<Compaction> = Vec::new();
     for line in lines {
         let Ok(text) = line else {
@@ -501,7 +533,18 @@ fn read_messages(path: &Path) -> Result<Vec<Message>> {
             Some("message") => {
                 let id = value.get("id").and_then(Value::as_str).map(String::from);
                 if let Some(message) = value.get("message").and_then(parse_message) {
-                    entries.push((id, message));
+                    // Prefer the persisted estimate; recompute from content for
+                    // older (v1/v2-pre-token) entries that lack it, so the total
+                    // is stable for both new and legacy sessions.
+                    let tokens = value
+                        .get("tokenEstimate")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| estimate_tokens(&message.content));
+                    entries.push(MessageEntry {
+                        id,
+                        message,
+                        tokens,
+                    });
                 }
             }
             Some("compaction") => match parse_compaction(&value) {
@@ -516,14 +559,25 @@ fn read_messages(path: &Path) -> Result<Vec<Message>> {
     rebuild_with_compactions(path, entries, compactions)
 }
 
+/// A message entry rebuilt from disk: its durable id (for compaction coverage
+/// lookup), the reconstructed message, and the token estimate (persisted, or
+/// recomputed from content for legacy entries).
+struct MessageEntry {
+    id: Option<String>,
+    message: Message,
+    tokens: u64,
+}
+
 /// A persisted compaction entry's rebuild-relevant fields: the inclusive range
-/// of covered `message` entry ids and the summary that replaces them. Other
-/// persisted metadata (`createdAt`, `tokenEstimate`) is durable but not needed
-/// to rebuild context, so it is not read here.
+/// of covered `message` entry ids, the summary that replaces them, and its
+/// persisted token estimate (the summary stands in for the covered turns in the
+/// context total). Other persisted metadata (`createdAt`) is durable but not
+/// needed to rebuild context, so it is not read here.
 struct Compaction {
     covered_from: String,
     covered_to: String,
     summary: String,
+    token_estimate: Option<u64>,
 }
 
 /// Parse a `compaction` entry's rebuild fields. `None` (skipped as malformed)
@@ -537,6 +591,7 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
             .to_string(),
         covered_to: value.get("coveredTo").and_then(Value::as_str)?.to_string(),
         summary: value.get("summary").and_then(Value::as_str)?.to_string(),
+        token_estimate: value.get("tokenEstimate").and_then(Value::as_u64),
     })
 }
 
@@ -557,11 +612,21 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
 // validation when an automatic summarizer picks ranges without that care.
 fn rebuild_with_compactions(
     path: &Path,
-    entries: Vec<(Option<String>, Message)>,
+    entries: Vec<MessageEntry>,
     compactions: Vec<Compaction>,
-) -> Result<Vec<Message>> {
+) -> Result<RebuiltContext> {
     if compactions.is_empty() {
-        return Ok(entries.into_iter().map(|(_, message)| message).collect());
+        // saturating: tokenEstimate is read from disk; a corrupted/edited file
+        // must not panic (debug) or wrap (release) the read, matching the rest
+        // of this module's never-crash-on-bad-data stance.
+        let context_tokens = entries
+            .iter()
+            .fold(0u64, |acc, e| acc.saturating_add(e.tokens));
+        let messages = entries.into_iter().map(|e| e.message).collect();
+        return Ok(RebuiltContext {
+            messages,
+            context_tokens,
+        });
     }
     // Owned-key map (ids are tiny) so `entries` can be consumed below without a
     // lingering borrow. Ids are unique per session by construction, so there is
@@ -569,12 +634,13 @@ fn rebuild_with_compactions(
     let index_of: HashMap<String, usize> = entries
         .iter()
         .enumerate()
-        .filter_map(|(i, (id, _))| id.clone().map(|id| (id, i)))
+        .filter_map(|(i, e)| e.id.clone().map(|id| (id, i)))
         .collect();
 
     let mut covered = vec![false; entries.len()];
-    // Summary to emit at the position of each range's first covered message.
-    let mut summary_at: Vec<Option<String>> = vec![None; entries.len()];
+    // Summary (and its token estimate) to emit at the position of each range's
+    // first covered message.
+    let mut summary_at: Vec<Option<(String, u64)>> = vec![None; entries.len()];
     for compaction in compactions {
         let from = lookup_covered(&index_of, &compaction.covered_from, path)?;
         let to = lookup_covered(&index_of, &compaction.covered_to, path)?;
@@ -597,24 +663,45 @@ fn rebuild_with_compactions(
             }
             *slot = true;
         }
-        summary_at[from] = Some(compaction.summary);
+        // Prefer the compaction's persisted estimate; recompute from the summary
+        // text when absent, so the summary contributes its own tokens to the
+        // total instead of the covered turns it replaced.
+        let summary_tokens = compaction
+            .token_estimate
+            .unwrap_or_else(|| estimate_tokens(&compaction.summary));
+        summary_at[from] = Some((compaction.summary, summary_tokens));
     }
 
     let mut messages = Vec::new();
-    for (i, (_, message)) in entries.into_iter().enumerate() {
-        if let Some(summary) = summary_at[i].take() {
+    let mut context_tokens = 0u64;
+    for (i, entry) in entries.into_iter().enumerate() {
+        if let Some((summary, summary_tokens)) = summary_at[i].take() {
             // The summary stands in for the covered turns as a single user-role
             // message; providers accept it verbatim and resume continues from
             // it. The role/text choice lives only here, so swapping in a
             // provider/local summarizer later changes how the text is produced,
             // not how storage or rebuild work.
             messages.push(Message::user(&summary));
+            // saturating: see the empty-compactions path above.
+            context_tokens = context_tokens.saturating_add(summary_tokens);
         }
         if !covered[i] {
-            messages.push(message);
+            context_tokens = context_tokens.saturating_add(entry.tokens);
+            messages.push(entry.message);
         }
     }
-    Ok(messages)
+    Ok(RebuiltContext {
+        messages,
+        context_tokens,
+    })
+}
+
+/// The provider-visible context rebuilt from a transcript: the message list plus
+/// its estimated token total. Both come from the same pass so the total always
+/// matches the messages it summed.
+struct RebuiltContext {
+    messages: Vec<Message>,
+    context_tokens: u64,
 }
 
 /// Resolve a compaction coverage endpoint id to its message index, erroring
@@ -1059,6 +1146,13 @@ mod tests {
         session.messages.iter().map(|m| m.content.clone()).collect()
     }
 
+    /// Expected context total for a message list, summed with the same
+    /// per-message convention the read path persists and rebuilds with
+    /// ([`estimate_tokens`]). The live-side comparison for resume stability.
+    fn total(messages: &[Message]) -> u64 {
+        messages.iter().map(|m| estimate_tokens(&m.content)).sum()
+    }
+
     #[test]
     fn append_compaction_writes_a_compaction_entry_with_durable_metadata() {
         let dir = temp_dir();
@@ -1192,5 +1286,106 @@ mod tests {
         // And the rebuilt context is summary + the post-compaction turn.
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
         assert_eq!(contents(&session), ["SUM", "c"]);
+    }
+
+    #[test]
+    fn estimate_tokens_is_conservative_and_nonzero_for_short_content() {
+        assert_eq!(estimate_tokens(""), 0);
+        // Rounds up: 1..=4 chars -> 1 token, never truncating to 0.
+        assert_eq!(estimate_tokens("a"), 1);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn append_persists_a_per_message_token_estimate() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::user("hello")).unwrap();
+        let entry = &lines(log.path())[1];
+        // The persisted per-turn token accounting the foundation records.
+        assert_eq!(entry["tokenEstimate"], json!(estimate_tokens("hello")));
+    }
+
+    #[test]
+    fn rebuilt_context_reports_the_same_token_total_across_resume() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let messages = [
+            Message::user("explain the build"),
+            Message::assistant("it runs cargo build then the gate"),
+            Message::user("and the tests?"),
+        ];
+        for message in &messages {
+            log.append(message).unwrap();
+        }
+        drop(log);
+
+        // "before": the live in-session total computed from the same messages.
+        let live_total = total(&messages);
+        assert!(live_total > 0, "non-empty context must count > 0 tokens");
+
+        // "after": reopen the persisted session and read the rebuilt total.
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(
+            session.context_tokens, live_total,
+            "reopened context token total must match the live total"
+        );
+
+        // Stable on a second reopen too (deterministic, not order/time sensitive).
+        let reopened = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(reopened.context_tokens, session.context_tokens);
+    }
+
+    #[test]
+    fn compacted_total_counts_the_summary_not_the_covered_turns() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log
+            .append(&Message::user("a very long original first turn"))
+            .unwrap();
+        let to = log
+            .append(&Message::assistant("an equally long original reply"))
+            .unwrap();
+        let tail = Message::user("short tail");
+        log.append(&tail).unwrap();
+        log.append_compaction(&from, &to, "sum", None).unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        // The rebuilt context is [summary, tail]; its total is exactly the sum
+        // of those two, not the covered originals.
+        let expected = total(&[Message::user("sum"), tail]);
+        assert_eq!(session.context_tokens, expected);
+        assert_eq!(session.context_tokens, total(&session.messages));
+    }
+
+    #[test]
+    fn legacy_v1_session_without_token_estimates_still_reports_a_total() {
+        // A pre-foundation transcript: no per-entry tokenEstimate field. The
+        // read path must recompute from content so old sessions still report a
+        // stable, non-zero total instead of breaking or reading as 0.
+        let dir = temp_dir();
+        let cwd_dir = dir.path.join("w");
+        fs::create_dir(&cwd_dir).unwrap();
+        let path = cwd_dir.join("v1.jsonl");
+        let v1 = concat!(
+            r#"{"type":"session","version":1,"id":"abcd1234","timestamp":1700000000000,"cwd":"/w"}"#,
+            "\n",
+            r#"{"type":"message","timestamp":1700000000001,"message":{"role":"user","content":"hello"}}"#,
+            "\n",
+            r#"{"type":"message","timestamp":1700000000002,"message":{"role":"assistant","content":"hi there"}}"#,
+            "\n",
+        );
+        fs::write(&path, v1).unwrap();
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let meta = store.find("abcd1234").unwrap().unwrap();
+        let session = store.open(&meta).unwrap();
+        let expected = total(&[Message::user("hello"), Message::assistant("hi there")]);
+        assert_eq!(session.context_tokens, expected);
+        assert!(session.context_tokens > 0);
     }
 }
