@@ -521,7 +521,28 @@ Potential scope:
   (`resumed_session_feeds_prior_context_into_next_turn`) proves the loaded fact
   reaches the next model turn and that continuation does not duplicate history.
   Still deferred (outside #47): the in-session `/resume` picker UI, branching,
-  rollback, compaction/summaries, and session search.]
+  rollback, and session search. Context Compaction Foundation
+  ([#49](https://github.com/5omeOtherGuy/iris-agent/issues/49), shipped
+  2026-06-17) adds the first compaction slice on top of the resume path: a
+  durable `compaction` JSONL entry records an inclusive range of covered
+  `message` entry ids, the `summary` that replaces them, a `createdAt`
+  timestamp, and a `tokenEstimate` placeholder (`null` until a token convention
+  exists). A manual/internal append path (`SessionLog::append_compaction`,
+  which returns the assigned entry id, as `append` now does) writes one;
+  `read_messages` rebuilds context by replacing each covered range with its
+  summary in place, so a resumed session sees the summary instead of replaying
+  the covered turns, without duplicating them. Coverage is keyed on durable
+  entry ids (not array positions); multiple non-overlapping compactions apply
+  deterministically, and an overlapping/missing-id range is rejected as invalid
+  session data. `resume` treats a compaction entry as the leaf so a continued
+  session chains and counts past it. Tests cover the compacted rebuild, the
+  unchanged uncompacted resume, multiple compactions, overlap/missing-id
+  rejection, and resume-after-compaction. The summary's production is kept
+  swappable: storage and rebuild are independent of how the text was made
+  (manual now; a provider/local/remote summarizer later), and the role/text of
+  the rebuilt summary message lives in one place. Deferred (outside #49,
+  intentionally): auto-compaction thresholds, full token-budget policy, branch
+  summaries, rollback, and a TUI/CLI compaction command.]
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
   override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project).
