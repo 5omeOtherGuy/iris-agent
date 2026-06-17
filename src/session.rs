@@ -135,18 +135,12 @@ impl SessionLog {
     /// messages are replaced by a single summary message, so a resumed session
     /// rebuilds context through the summary instead of replaying the range.
     ///
-    /// This is the manual/internal append path: the summary text is produced by
-    /// the caller, so the entry is independent of *how* it was summarized
-    /// (manual now; a provider/local/remote summarizer later). `token_estimate`
-    /// is an upgrade-safe placeholder -- `None` until a token-accounting
-    /// convention exists, `Some(n)` once one does, without changing the kind.
-    //
-    // ponytail: the write side has no production trigger in this foundation
-    // slice -- auto-compaction is deferred (issue #49) and a CLI/TUI command is
-    // explicitly out of scope, so the manual path is exercised by tests until a
-    // trigger lands. `allow(dead_code)` marks that intent rather than adding an
-    // out-of-scope command just to satisfy the no-warnings gate.
-    #[allow(dead_code)]
+    /// The summary text is produced by the caller, so the entry is independent
+    /// of *how* it was summarized (a deterministic internal summarizer today; a
+    /// provider/local/remote summarizer later). `token_estimate` records the
+    /// summary's own token estimate so the rebuild counts it instead of the
+    /// covered turns. The Tier-2 harness's auto-compaction policy is the
+    /// production trigger (issue #55).
     pub(crate) fn append_compaction(
         &mut self,
         covered_from: &str,

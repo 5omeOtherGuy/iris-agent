@@ -42,10 +42,10 @@ pub(crate) struct Settings {
     pub(crate) default_model: Option<String>,
     /// Base URL override for the active provider's API endpoint.
     pub(crate) base_url: Option<String>,
-    /// Context token budget threshold. Stored and read only in this slice; the
-    /// next slice (auto-compaction) reads it to decide when to compact. Parsing
-    /// it now keeps the on-disk config forward-compatible without changing
-    /// runtime behavior. Absent -> [`Settings::context_token_budget`] default.
+    /// Context token budget threshold. The Tier-2 harness reads it to decide
+    /// when to auto-compact: when the rebuilt/current context token total
+    /// exceeds this, the harness compacts at a safe turn boundary. Absent ->
+    /// [`Settings::context_token_budget`] default.
     pub(crate) context_token_budget: Option<u64>,
 }
 
@@ -89,13 +89,8 @@ impl Settings {
     }
 
     /// Configured context token budget, or the built-in default when unset. The
-    /// foundation value the next slice's auto-compaction policy reads; nothing
-    /// triggers on it yet.
-    //
-    // ponytail: read-only foundation. `allow(dead_code)` until the
-    // auto-compaction slice consumes it -- the field is parsed/defaulted now so
-    // the config format is stable, but adding a trigger here is out of scope.
-    #[allow(dead_code)]
+    /// harness compares the current context token total against this and
+    /// auto-compacts when it is exceeded.
     pub(crate) fn context_token_budget(&self) -> u64 {
         self.context_token_budget
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
