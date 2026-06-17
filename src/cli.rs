@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
 use crate::nexus::ChatProvider;
@@ -20,6 +20,18 @@ pub(crate) fn run_session<P: ChatProvider>(
     ui: &mut dyn Ui,
 ) -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
+    let result = run_session_inner(harness, ui, &runtime);
+    // Bound shutdown so an orphaned blocking provider request (the loop dropped
+    // its stream on cancel) cannot hang process exit, including early error exits.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+fn run_session_inner<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    ui: &mut dyn Ui,
+    runtime: &Runtime,
+) -> Result<()> {
     ui.emit(UiEvent::SessionStarted)?;
 
     while let Some(prompt) = ui.next_prompt()? {
@@ -60,9 +72,6 @@ pub(crate) fn run_session<P: ChatProvider>(
     }
 
     ui.shutdown()?;
-    // Bound shutdown so an orphaned blocking provider request (the loop dropped
-    // its stream on cancel) cannot hang process exit.
-    runtime.shutdown_timeout(Duration::from_secs(1));
     Ok(())
 }
 

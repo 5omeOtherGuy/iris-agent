@@ -7,7 +7,6 @@ use std::pin::Pin;
 use anyhow::{Result, bail};
 use futures::Stream;
 use futures::StreamExt;
-use futures::future::join_all;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +15,10 @@ use tokio_util::sync::CancellationToken;
 // Set high so legitimate multi-step tasks complete, and enforced gracefully
 // rather than as a fatal error (see complete_turn).
 const MAX_TOOL_ROUNDTRIPS: usize = 50;
+
+// ponytail: small fixed cap. If tool batches need more throughput, make this a
+// runtime setting after measuring disk/blocking-pool pressure.
+const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 
 // Shared between every cancellation exit path so the front-end renders one
 // consistent message whether the interrupt landed before, during, or after the
@@ -597,32 +600,37 @@ impl<P: ChatProvider> Agent<P> {
     }
 }
 
-/// Run a batch of concurrency-safe calls concurrently, returning outcomes in the
-/// same order as `calls`. Each call gets its own child cancellation token. Uses
-/// `join_all` (not `tokio::spawn`) so the `!Send` borrowed futures run on the
-/// loop's executor.
+/// Run a bounded batch of concurrency-safe calls concurrently, returning outcomes
+/// in the same order as `calls`. Each call gets its own child cancellation token.
+/// Uses ordered buffering (not `tokio::spawn`) so the `!Send` borrowed futures run
+/// on the loop's executor without queuing unbounded blocking work.
 async fn run_parallel(
     tools: &Tools,
     calls: &[ToolCall],
     env: &ToolEnv<'_>,
     token: &CancellationToken,
 ) -> Vec<ToolOutcome> {
-    let futures = calls.iter().map(|call| {
-        let cancel = token.child_token();
-        async move {
-            match tools.by_name(&call.name) {
-                Some(tool) => run_tool(tool, &call.arguments, env, cancel).await,
-                None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
+    futures::stream::iter(calls.iter())
+        .map(|call| {
+            let cancel = token.child_token();
+            async move {
+                match tools.by_name(&call.name) {
+                    Some(tool) => run_tool(tool, &call.arguments, env, cancel).await,
+                    None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
+                }
             }
-        }
-    });
-    join_all(futures).await
+        })
+        .buffered(MAX_PARALLEL_TOOL_CALLS)
+        .collect()
+        .await
 }
 
 /// Run one tool, racing its future against the (child) cancellation token. The
 /// pre-check matters: a synchronous tool body would otherwise run to completion
 /// on the first poll even when already cancelled (the select is `biased` toward
-/// the tool so a cooperative tool's own result wins over the synthetic one).
+/// the tool so a cooperative tool's own result wins over the synthetic one). The
+/// post-check maps sync tools that observe cancellation internally to the same
+/// transcript-valid cancelled outcome.
 async fn run_tool<'a>(
     tool: &'a dyn Tool,
     args: &'a Value,
@@ -635,6 +643,7 @@ async fn run_tool<'a>(
     tokio::select! {
         biased;
         result = tool.execute(args, env, cancel.clone()) => match result {
+            _ if cancel.is_cancelled() => ToolOutcome::Cancelled,
             Ok(output) => ToolOutcome::Ok(output),
             Err(error) => ToolOutcome::Err(error),
         },

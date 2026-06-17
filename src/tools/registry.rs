@@ -78,7 +78,7 @@ fn run_off_thread(
         let root = root?;
         match tokio::task::spawn_blocking(move || body(&root, &args)).await {
             Ok(result) => result,
-            Err(join_err) => Err(anyhow!("{label} tool task failed: {join_err}")),
+            Err(join_err) => Err(anyhow!("{} tool task failed: {}", label, join_err)),
         }
     })
 }

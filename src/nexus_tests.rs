@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 /// Drive a single async future to completion on a current-thread runtime. The
@@ -1586,6 +1586,45 @@ fn cancellation_during_tool_aborts_and_records_valid_result() -> Result<()> {
 }
 
 #[test]
+fn cancelled_bash_records_cancelled_result_not_success() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(single_call_turn(
+        "bash",
+        json!({ "command": "sleep 30", "timeout": 30 }),
+    ))]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let token = CancellationToken::new();
+    let trip = token.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        trip.cancel();
+    });
+
+    block_on(harness.submit_turn("run", &frontend, &frontend, &token))?;
+    canceller.join().unwrap();
+
+    let tool_result = harness
+        .agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .unwrap();
+    assert!(
+        tool_result.content.contains("\"cancelled\":true"),
+        "expected cancelled payload, got: {}",
+        tool_result.content
+    );
+    assert!(
+        !tool_result.content.contains("\"ok\":true"),
+        "cancelled bash must not be recorded as success: {}",
+        tool_result.content
+    );
+    Ok(())
+}
+
+#[test]
 fn unsafe_tools_run_sequentially() -> Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -1670,6 +1709,50 @@ fn safe_tools_run_in_parallel_with_ordered_results() -> Result<()> {
     assert!(
         results[1].contains("probe:b"),
         "second result out of order: {results:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn safe_tool_parallelism_is_bounded() -> Result<()> {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let workspace = test_workspace()?;
+    let tool_calls = (0..MAX_PARALLEL_TOOL_CALLS + 2)
+        .map(|idx| {
+            call(
+                &format!("c{idx}"),
+                "probe",
+                json!({ "tag": idx.to_string() }),
+            )
+        })
+        .collect();
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            tool_calls,
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(ProbeTool {
+            tool_name: "probe".to_string(),
+            safe: true,
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        })]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let peak = peak.load(AtomicOrdering::SeqCst);
+    assert!(peak > 1, "safe calls should still overlap");
+    assert!(
+        peak <= MAX_PARALLEL_TOOL_CALLS,
+        "parallel batch exceeded cap: {peak}"
     );
     Ok(())
 }
