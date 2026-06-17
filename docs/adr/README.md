@@ -12,3 +12,4 @@
 | [0008](0008-harden-bash-with-process-groups-persistent-sessions-and-landlock.md) | Harden bash with process groups, persistent sessions, and Landlock | accepted | 2026-06-17 |
 | [0009](0009-persist-compaction-as-a-session-entry-and-rebuild-context-through-the-summary.md) | Persist compaction as a session entry and rebuild context through the summary | accepted | 2026-06-17 |
 | [0010](0010-mutating-and-effectful-tools-opt-out-of-persistent-allow-always.md) | Mutating and effectful tools opt out of persistent allow-always | accepted | 2026-06-17 |
+| [0011](0011-store-oversized-tool-outputs-behind-session-scoped-handles.md) | Store oversized tool outputs behind session-scoped handles | accepted | 2026-06-17 |

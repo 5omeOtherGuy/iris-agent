@@ -20,7 +20,7 @@ core is a binding-point, not a character.
 | Name | Layer | Origin | Why it fits | Code today |
 |---|---|---|---|---|
 | **Iris** | Product + CLI tier (Tier 3) | Greek | Rainbow-messenger between gods and mortals; faces the user and paints the screen | `main.rs`, `cli.rs`, `ui/`, `tool_display.rs` |
-| **Wayland** | Harness (Tier 2) | Germanic | Master smith who forges gear for heroes; equips the engine with sessions, config, execution env | `wayland.rs` |
+| **Wayland** | Harness (Tier 2) | Germanic | Master smith who forges gear for heroes; equips the engine with sessions, config, execution env | `wayland/` |
 | **Nexus** | Core (Tier 1) | Latin (non-myth, intentional) | "Binding"; the still center all dependencies point inward to | `nexus.rs` |
 | **Mimir** | AI/provider package | Norse | Keeper of the well of wisdom Odin consults; the layer you query for answers (the pi-ai equivalent) | `mimir/` (`providers/`, `auth/`) |
 

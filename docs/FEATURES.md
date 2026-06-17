@@ -1,17 +1,20 @@
 # Iris — Feature List
 
-> Status (2026-06-17): Milestone 1 implementation. Labels: **[Implemented]** ·
-> **[Partial]** · **[Planned · MVP]** · **[Planned]** · **[Research]**. This file is
+> Status (2026-06-17): Milestone 2 foundations in progress. Labels:
+> **[Implemented]** · **[Partial]** · **[Planned · MVP]** · **[Planned]** ·
+> **[Research]**. This file is
 > a capability inventory, not a build sequence; use [`ROADMAP.md`](ROADMAP.md) for
 > milestone order.
 
 ## Core CLI and agent loop
 
 - **CLI entrypoint** — `cargo run` starts Iris. [Implemented]
-- **Interactive terminal session** — REPL-style loop with `/exit` and `/quit`.
-  [Implemented]
+- **Interactive terminal session** — persistent full-screen TUI on real TTYs,
+  with transcript, textarea editor, spinner, slash palette, `/exit` and `/quit`;
+  text REPL fallback for pipes/CI or TUI startup failure. [Implemented]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
-  current process. [Partial]
+  current process, plus linear session resume from persisted transcripts.
+  [Partial]
 - **Provider-neutral turn/message shape** — `ChatProvider`, `AssistantTurn`,
   `ToolCall`, `Message`, and `Role` in Nexus. [Partial]
 - **Provider error reporting** — provider errors print to stderr and the REPL
@@ -25,13 +28,15 @@
   transcript stays valid on abort. (Caveat: a blocking terminal approval prompt
   is not preempted until the second Ctrl-C.) [Implemented]
 - **Safe parallel tool execution** — sequential by default; consecutive
-  concurrency-safe, ungated tools (`grep`/`find`/`ls`) run in parallel via
-  `join_all` while unsafe/mutating tools stay exclusive. [Implemented]
-- **Session transcript persistence** — best-effort JSONL read/write store
-  foundation: `SessionLog` appends v2 transcript entries with stable ids and
-  `parentId`, while `SessionStore` can list sessions and open one back in
-  message order. `/resume`, context reconstruction, and tree branching are
-  planned later. [Partial]
+  concurrency-safe, ungated tools (`grep`/`find`/`ls`) run in parallel with
+  bounded ordered buffering while unsafe/mutating tools stay exclusive.
+  [Implemented]
+- **Session transcript persistence** — best-effort JSONL read/write store:
+  `SessionLog` appends v2 transcript entries with stable ids, `parentId`, and
+  token estimates; `SessionStore` lists/finds/opens sessions, rebuilds context
+  through compaction summaries, and `iris-agent resume <id>` continues the same
+  log. Branching/rollback and an in-session resume picker are planned later.
+  [Partial]
 
 ## Providers and auth
 
@@ -67,7 +72,8 @@
   `antigravity`. Project-local settings may override only `defaultModel`; global
   settings own provider/base-url so a cloned repo cannot redirect bearer tokens.
   OpenAI Codex additionally supports `IRIS_MODEL` and `IRIS_CODEX_BASE_URL` env
-  overrides. [Partial]
+  overrides. `contextTokenBudget` configures the auto-compaction threshold.
+  [Partial]
 - **Additional providers** — OpenAI API, local, or OpenAI-compatible backends.
   [Planned]
 - **Provider capability matrix** — per-model context window, cache support,
@@ -103,8 +109,9 @@
   readable size per entry). [Implemented]
 - **Tool result/error encoding** — structured success/error responses returned to
   the model, including a per-tool `metadata` object on success (e.g. `read`
-  byte/line counts and `truncated`, `ls` entry count) carried in the
-  `ToolOutput` contract. [Implemented]
+  byte/line counts and `truncated`, `ls` entry count). Successful outputs over
+  16 KiB are stored out of context behind an `outputHandle` when a session store
+  is attached. [Implemented]
 
 ## Safety and approvals
 
@@ -116,8 +123,9 @@
 - **Atomic file replacement** — `write` and `edit` write through a
   same-directory temp file, fsync, rename, cleanup-on-error path, and Unix
   permission preservation on overwrite. [Partial]
-- **Bash policy** — cwd, timeout, stdout/stderr capture, output limits, exit-code
-  handling, and process-group cleanup. [Partial]
+- **Bash policy** — cwd, timeout, stdout/stderr capture, output limits,
+  nonzero-exit handling, process-group cleanup, persistent sessions, background
+  jobs, and Linux Landlock confinement where available. [Partial]
 - **File observation / stale mutation preflight** — session-scoped observation
   store records each file's `{mtime, content_hash}` on read/write/edit; `edit`
   and `write` reject mutating an existing file that was never read or has
@@ -134,16 +142,20 @@
 These are core to the long-term Iris thesis, but they are not part of the first
 Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
+- **Context token estimates and budget trigger** — session entries persist
+  conservative token estimates, reopened sessions report rebuilt context tokens,
+  and `contextTokenBudget` triggers turn-boundary auto-compaction. [Partial]
 - **Token budget planner** — allocates context across system prompt, tools,
   history, files, summaries, and current task. [Planned]
 - **Context ledger** — records why each context item is included and supports
   reason-based eviction. [Planned]
-- **Content-addressed store** — stores files, command outputs, web pages, diffs,
-  and summaries by hash. [Planned]
-- **Handle-returning tool outputs** — large outputs return summary, structured
-  metadata, and a handle to full content. [Planned] The `ToolOutput`
-  result/metadata contract is the seam this builds on; handles are not yet
-  implemented.
+- **Session-scoped content-addressed output store** — oversized tool outputs are
+  stored beside the session transcript in `<session>.outputs/` by stable
+  truncated SHA-256 handle. Files/web pages/diffs/summaries are not yet covered.
+  [Partial]
+- **Handle-returning tool outputs** — large successful tool outputs return a
+  compact head/tail preview, structured `outputHandle` metadata, and a handle to
+  full content. [Partial]
 - **Handle dereferencing** — retrieve stored content by handle on demand.
   [Planned]
 - **Micro-summary schema** — deterministic schema for counts, truncation, size,
@@ -156,13 +168,22 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   provider and report cache hit/miss where APIs expose it. [Planned]
 - **Diff-aware file context** — prioritize git diff, touched files, nearby symbols,
   and recent edits over whole files. [Planned]
-- **Dynamic tool surface** — expose only tools relevant to the current mode/task.
-  [Planned]
+- **Provider-specific tool surface planner** — Nexus separates the
+  model-visible tool surface from the execution registry; providers can hide a
+  built-in from declarations while keeping it runnable for existing transcript
+  references. Mode/task-specific planning remains planned. [Partial]
 - **Compressed tool schemas** — minimal, strict, provider-compatible tool schemas.
   [Planned]
 
 ## Compaction
 
+- **Durable compaction entries** — JSONL `compaction` entries replace covered
+  message-id ranges with summary messages during read/resume rebuild. [Partial]
+- **Auto-compaction** — when context estimates exceed `contextTokenBudget`, the
+  Wayland harness compacts at safe turn boundaries with a deterministic bounded
+  excerpt summary, retaining recent context and preserving tool-call/result
+  pairs. Provider-quality summaries, manual `/compact`, and branch-aware
+  compaction are planned later. [Partial]
 - **Hierarchical compaction** — layered raw turns, compacted older turns, task
   facts, file-change facts, decisions/blockers, and project memory. [Research]
 - **Freshness rules** — mark summaries stale when underlying files change.

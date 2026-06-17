@@ -50,7 +50,7 @@ Reference split:
                                 ▼
 ╭──────────────────────────────────────────────────────────────────────╮
 │ TIER 2 — Wayland (harness)          (pi: packages/agent/src/harness/)  │
-│   sessions, config, workspace/path safety, (later) compaction, skills  │
+│   sessions, config, path safety, output handles, compaction, skills     │
 ╰───────────────────────────────┬──────────────────────────────────────╯
                                 │ depends on
                                 ▼
@@ -91,13 +91,14 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 
 | Owns | Today's file(s) |
 |---|---|
-| Harness wrapping the bare agent: owns the execution env + session, injects `ToolEnv`, persists the transcript post-turn | `wayland.rs` (`Harness`) |
+| Harness wrapping the bare agent: owns the execution env + session, injects `ToolEnv`, persists the transcript post-turn | `wayland/mod.rs` (`Harness`) |
 | Session transcript persistence/read store | `session.rs` |
 | Settings / configuration loading | `config.rs` |
 | Workspace path safety (the FS/Shell sandbox surface) | `tools/path.rs`, `tools/bash/sandbox.rs` |
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
-| Context compaction | _planned_ |
+| Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
+| Context compaction | `wayland/mod.rs`, `session.rs` |
 | System-prompt / project-instruction assembly (base + runtime context + root `AGENTS.md`) | `wayland/system_prompt.rs` |
 | Skills | _planned_ |
 
@@ -137,8 +138,8 @@ The four cuts are done: the bare `Agent` in `nexus.rs` is a provider-, UI-,
 persistence-, and workspace-neutral in-memory engine. It imports no `crate::ui`/
 `crate::approval` (Step A), resolves tools by name over an injected set (Step B),
 and owns no filesystem or session store (Step C) -- the Tier-2 `Harness`
-(`wayland.rs`) owns the execution env and live persistence, while `session.rs`
-also owns the read-side `SessionStore`; Wayland injects a `&mut ToolEnv`
+(`wayland/mod.rs`) owns the execution env and live persistence, while `session.rs`
+also owns the read-side `SessionStore`; Wayland injects a `&ToolEnv`
 into each turn. The only `crate::tools` reference left in core is the `ToolState`
 type borrowed through `ToolEnv` (the type stays in `crate::tools`; the harness
 owns the instance). The cuts that reached this split:
@@ -160,11 +161,12 @@ owns the instance). The cuts that reached this split:
    Relocating `ToolState` to the harness is Step C. See "Tools across the tiers".
 4. **Persistence + execution surface are harness-tier.** _(done)_ The bare
    `Agent` holds no `workspace`, `ToolState`, `SessionLog`, or `SessionStore`. The Tier-2
-   `Harness` (`wayland.rs`) wraps the agent, owns the workspace + `ToolState`
+   `Harness` (`wayland/mod.rs`) wraps the agent, owns the workspace + `ToolState`
    (injected per turn as `ToolEnv`) and the optional `SessionLog`, and persists
    the transcript by diffing `agent.messages()` after each turn. The read-side
-   `SessionStore` lists/opens persisted transcripts for future `/resume`, still
-   outside the core loop -- mirroring pi's `AgentHarness` owning `ExecutionEnv`
+   `SessionStore` lists/opens persisted transcripts for `resume <id>` and
+   compaction-aware context rebuild, still outside the core loop -- mirroring
+   pi's `AgentHarness` owning `ExecutionEnv`
    + session and appending messages itself, never in Nexus.
 
 ## Tools across the tiers
@@ -177,8 +179,8 @@ for it.
 
 | Concern | Tier | Notes |
 |---|---|---|
-| `Tool` trait, `ToolOutput`, `ToolRegistry`, `ToolPolicy`, identity keys, dispatch order, approval **enforcement** | 1 Nexus | Core names no concrete tool and knows nothing about any plugin runtime. Tools classify themselves (`mutates()`, `classify(args)`); core enforces. |
-| Workspace path safety, `ToolState`, host capabilities (`host_read`/`host_ls`) | 2 Wayland | The execution surface (`env`) passed to `Tool::execute`. Plugins get host functions, never raw WASI. |
+| `Tool` trait, `ToolOutput`, `ToolOutputStore`, `Tools` registry/surface planner, approval **enforcement** | 1 Nexus | Core names no concrete tool and knows nothing about any plugin runtime. Tools classify themselves (`requires_approval`, `is_destructive`, `supports_allow_always`, `is_concurrency_safe`); core enforces. |
+| Workspace path safety, `ToolState`, session-scoped `HandleStore`, host capabilities (`host_read`/`host_ls`) | 2 Wayland | The execution surface (`env`) passed to `Tool::execute`. Plugins get host functions, never raw WASI. |
 | Built-in impls (`read`..`ls`), registry construction, trusted diff rendering, and — only if a plugin system is added — a plugin executor + manifest parsing | 3 Iris | Concrete impls + wiring. The diff renderer is host-side and trusted relative to any plugin. |
 
 Runtime completion added one more tool contract without changing ownership:
