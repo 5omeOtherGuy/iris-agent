@@ -365,11 +365,18 @@ impl Session {
                 scan_from = buf.len().saturating_sub(prefix.len().saturating_sub(1));
             }
 
+            if cancel.is_cancelled() {
+                return Marker::Cancelled {
+                    output: buf,
+                    dropped,
+                };
+            }
+
             // Wait for the next chunk, but never longer than one cancel-poll
-            // slice so a turn-level Ctrl-C is observed promptly; a slice timeout
-            // (not the deadline) just re-checks cancellation and loops. The full
-            // deadline is still enforced via the zero-remaining check above each
-            // wait.
+            // slice so a turn-level Ctrl-C is observed promptly even when output
+            // is quiet; the explicit check above handles noisy commands that keep
+            // delivering chunks faster than the slice timeout. The full deadline
+            // is still enforced via the zero-remaining check above each wait.
             let wait = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -746,6 +753,52 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(!pid_alive(pid), "cancelled session shell still alive");
         // The killed session is transparently recreated on the next run.
+        let out = s
+            .run(
+                &ws.0,
+                "a",
+                "echo recovered",
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(out.output.trim_end(), "recovered");
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn cancellation_stops_a_noisy_session_run_promptly() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        let pid = {
+            s.run(&ws.0, "a", "echo warm", None, &CancellationToken::new())
+                .unwrap();
+            s.child_pid("a").unwrap()
+        };
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trip.cancel();
+        });
+        let started = Instant::now();
+        let out = s
+            .run(
+                &ws.0,
+                "a",
+                "python3 - <<'PY'\nimport sys, time\nwhile True:\n    print('x')\n    sys.stdout.flush()\n    time.sleep(0.005)\nPY",
+                Some(Duration::from_secs(2)),
+                &cancel,
+            )
+            .unwrap();
+        assert!(out.cancelled, "expected cancellation, got: {out:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "noisy cancelled run waited for timeout: {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!pid_alive(pid), "cancelled noisy session shell still alive");
         let out = s
             .run(
                 &ws.0,
