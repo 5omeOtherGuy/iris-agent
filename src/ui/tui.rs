@@ -659,6 +659,9 @@ impl TuiUi {
     /// scroll-wheel reporting for the session. Restored on `drop`/`shutdown`,
     /// and by the signal handler's emergency escape on a force-quit.
     pub(crate) fn new() -> Result<Self> {
+        // Capture cooked-mode termios before raw mode so the force-quit signal
+        // handler can restore the tty even though Drop will not run then.
+        crate::signals::save_termios_for_force_quit();
         enable_raw_mode()?;
         let terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
             Ok(terminal) => terminal,
@@ -673,6 +676,10 @@ impl TuiUi {
             EnableBracketedPaste,
             EnableMouseCapture
         ) {
+            // The combined `execute!` may have partially applied before failing,
+            // so best-effort undo every mode rather than only raw mode.
+            let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error.into());
         }

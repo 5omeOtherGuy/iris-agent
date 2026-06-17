@@ -180,6 +180,9 @@ async fn run_turn<P: ChatProvider>(
     *current_turn.lock().expect("turn token lock poisoned") = Some(token.clone());
 
     let mut pending: Option<PendingApproval> = None;
+    // Cleared once terminal input reaches EOF so the closed channel is no longer
+    // polled (a closed `recv()` is always ready and would otherwise busy-loop).
+    let mut input_open = true;
 
     let result = {
         let mut turn = std::pin::pin!(harness.submit_turn(prompt, &bridge, &bridge, &token));
@@ -205,9 +208,32 @@ async fn run_turn<P: ChatProvider>(
                     });
                     tui.draw()?;
                 }
-                Some(event) = input_rx.recv() => {
-                    if handle_running_event(&mut tui.screen, event, &mut pending) {
-                        tui.draw()?;
+                maybe = input_rx.recv(), if input_open => {
+                    match maybe {
+                        Some(event) => {
+                            // Authoritatively cancel here too: a Ctrl-C delivered
+                            // in the submit/arm gap is read by the input thread
+                            // while `current_turn` is None, so it never cancels.
+                            // The event is still queued here, and a turn always
+                            // opens with a cancel-biased, *yielding* provider
+                            // stream before any executor-blocking tool (see
+                            // nexus stream_turn), so this arm runs and cancels
+                            // the token before bash can start. Cancel is
+                            // idempotent with the input thread's own cancel.
+                            if is_ctrl_c(&event) {
+                                token.cancel();
+                            }
+                            if handle_running_event(&mut tui.screen, event, &mut pending) {
+                                tui.draw()?;
+                            }
+                        }
+                        None => {
+                            // Terminal input ended (EOF): stop polling the closed
+                            // channel and unblock the turn so it can complete
+                            // instead of awaiting an answer that can never come.
+                            input_open = false;
+                            resolve_input_eof(&mut tui.screen, &mut pending, &token);
+                        }
                     }
                 }
                 _ = tick.tick() => {
@@ -429,6 +455,21 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
 fn dispatch_action(action: SlashAction) -> IdleKey {
     match action {
         SlashAction::Exit => IdleKey::Exit,
+    }
+}
+
+/// Terminal input reached EOF while a turn is running: cancel the turn and
+/// release any pending approval as Deny, so a turn awaiting an answer that can
+/// no longer come still completes instead of spinning on the tick forever.
+fn resolve_input_eof(
+    screen: &mut Screen,
+    pending: &mut Option<PendingApproval>,
+    token: &CancellationToken,
+) {
+    token.cancel();
+    if let Some(p) = pending.take() {
+        let _ = p.reply.send(ApprovalDecision::Deny);
+        screen.clear_approval();
     }
 }
 
@@ -757,5 +798,55 @@ mod tests {
             &mut pending
         ));
         assert!(pending.is_some(), "scrolling does not answer the approval");
+    }
+
+    #[test]
+    fn input_eof_cancels_turn_and_denies_pending() {
+        let mut screen = Screen::new();
+        let token = CancellationToken::new();
+        let (tx, rx) = oneshot::channel();
+        let mut pending = Some(PendingApproval {
+            reply: tx,
+            allow_always: true,
+        });
+        resolve_input_eof(&mut screen, &mut pending, &token);
+        assert!(token.is_cancelled(), "EOF cancels the turn token");
+        assert!(pending.is_none(), "EOF takes the pending approval");
+        assert_eq!(
+            rx.blocking_recv().unwrap(),
+            ApprovalDecision::Deny,
+            "EOF resolves the pending approval as Deny"
+        );
+    }
+
+    #[test]
+    fn input_eof_without_pending_just_cancels() {
+        let mut screen = Screen::new();
+        let token = CancellationToken::new();
+        let mut pending: Option<PendingApproval> = None;
+        resolve_input_eof(&mut screen, &mut pending, &token);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn is_ctrl_c_matches_press_and_repeat_only() {
+        use ratatui::crossterm::event::KeyEvent;
+        let press = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(is_ctrl_c(&press));
+        let upper = Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL));
+        assert!(is_ctrl_c(&upper));
+        // Plain 'c' and Ctrl with another key are not Ctrl-C.
+        assert!(!is_ctrl_c(&Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        ))));
+        assert!(!is_ctrl_c(&Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL
+        ))));
+        // A key Release is not an interrupt.
+        let mut release = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        release.kind = KeyEventKind::Release;
+        assert!(!is_ctrl_c(&Event::Key(release)));
     }
 }
