@@ -122,8 +122,7 @@ fn run_agent() -> Result<()> {
     // The Tier-2 harness owns the execution surface (workspace + tool state) and
     // persistence, wrapping the bare in-memory agent.
     let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
-    let mut ui = ui::tui::stdio();
-    cli::run_session(&mut harness, ui.as_mut())
+    cli::run_interactive(&mut harness)
 }
 
 /// Resume an existing session by id: load its transcript from the store,
@@ -169,8 +168,7 @@ fn resume_agent(session_id: &str) -> Result<()> {
         session,
         resumed,
     );
-    let mut ui = ui::tui::stdio();
-    cli::run_session(&mut harness, ui.as_mut())
+    cli::run_interactive(&mut harness)
 }
 
 /// Resolve the configured provider id from settings, falling back to the

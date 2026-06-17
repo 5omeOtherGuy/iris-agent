@@ -6,8 +6,10 @@ use crate::nexus::{
     AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ToolCall,
 };
 
+pub(crate) mod slash;
 pub(crate) mod text;
 pub(crate) mod tui;
+pub(crate) mod tui_loop;
 
 /// Terminal front-end seam (Tier 3). Implementations own all terminal I/O.
 ///
@@ -74,6 +76,24 @@ pub(crate) enum TurnErrorKind {
 }
 
 impl UiEvent {
+    /// Map one Nexus `AgentEvent` onto its presentation event. Single-sourced so
+    /// both the blocking text bridge and the async loop bridge agree.
+    pub(crate) fn from_agent_event(event: AgentEvent) -> Self {
+        match event {
+            AgentEvent::AssistantText(text) => UiEvent::AssistantText(text),
+            AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
+            AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),
+            AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
+            AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),
+            AgentEvent::DiffPreview { call, diff } => UiEvent::DiffPreview { call, diff },
+            AgentEvent::ToolDenied(call) => UiEvent::ToolDenied(call),
+            AgentEvent::ToolResult { call, content } => UiEvent::ToolResult { call, content },
+            AgentEvent::ToolError { call, message } => UiEvent::ToolError { call, message },
+            AgentEvent::Notice(message) => UiEvent::Notice(message),
+            AgentEvent::TurnComplete => UiEvent::TurnComplete,
+        }
+    }
+
     pub(crate) fn from_turn_error(error: &anyhow::Error) -> Self {
         let kind = if error.downcast_ref::<crate::errors::AuthError>().is_some() {
             TurnErrorKind::Auth
@@ -85,10 +105,6 @@ impl UiEvent {
             message: format!("{error:#}"),
         }
     }
-}
-
-pub(crate) fn is_exit_command(prompt: &str) -> bool {
-    matches!(prompt.trim(), "/exit" | "/quit")
 }
 
 /// Tier-3 adapter that backs both Nexus front-end seams with a single `Ui`.
@@ -111,20 +127,7 @@ impl<'a> UiBridge<'a> {
 
 impl AgentObserver for UiBridge<'_> {
     fn on_event(&self, event: AgentEvent) -> Result<()> {
-        let event = match event {
-            AgentEvent::AssistantText(text) => UiEvent::AssistantText(text),
-            AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
-            AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),
-            AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
-            AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),
-            AgentEvent::DiffPreview { call, diff } => UiEvent::DiffPreview { call, diff },
-            AgentEvent::ToolDenied(call) => UiEvent::ToolDenied(call),
-            AgentEvent::ToolResult { call, content } => UiEvent::ToolResult { call, content },
-            AgentEvent::ToolError { call, message } => UiEvent::ToolError { call, message },
-            AgentEvent::Notice(message) => UiEvent::Notice(message),
-            AgentEvent::TurnComplete => UiEvent::TurnComplete,
-        };
-        self.ui.borrow_mut().emit(event)
+        self.ui.borrow_mut().emit(UiEvent::from_agent_event(event))
     }
 }
 
