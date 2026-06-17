@@ -4,7 +4,8 @@
 > done. Iris has a text-only session loop, selectable Mimir providers
 > (`openai-codex`, `anthropic`, and `antigravity`), streamed response parsing,
 > workspace-scoped tools, terminal approval gates with diff previews,
-> provider/model settings, and best-effort JSONL transcript persistence. Nexus
+> provider/model settings, and a best-effort JSONL read/write session-store
+> foundation. Nexus
 > now runs a tokio async loop with turn-level cancellation:
 > the provider is an async stream raced against cancellation, tools are async
 > with child tokens, concurrency-safe tools run in parallel while everything else
@@ -776,9 +777,9 @@ Milestone 0/1 verification gates green.
    [#18](https://github.com/5omeOtherGuy/iris-agent/issues/18)) would be one
    optional consumer of the same seam, not a reason to build it and not a
    dependency of this refactor.
-4. **Persistence is harness-tier.** Move `SessionLog`, `attach_session_log`,
-   `persist_new_messages`, and the `workspace` execution surface out of the bare
-   core loop into Wayland (Tier 2), or behind a Tier 1 event subscriber.
+4. **Persistence is harness-tier.** Keep `SessionLog`/`SessionStore`, transcript
+   append/read-back, and the `workspace` execution surface out of the bare core
+   loop in Wayland (Tier 2), or behind a Tier 1 event subscriber.
 
 Acceptance signal: `src/nexus.rs` imports nothing from `crate::ui`,
 `crate::approval`, `crate::session`, or concrete `crate::tools::*` impls, and the

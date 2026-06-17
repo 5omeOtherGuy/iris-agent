@@ -27,8 +27,11 @@
 - **Safe parallel tool execution** — sequential by default; consecutive
   concurrency-safe, ungated tools (`grep`/`find`/`ls`) run in parallel via
   `join_all` while unsafe/mutating tools stay exclusive. [Implemented]
-- **Session transcript persistence** — best-effort JSONL write-only transcripts;
-  reload/resume and tree branching are planned later. [Partial]
+- **Session transcript persistence** — best-effort JSONL read/write store
+  foundation: `SessionLog` appends v2 transcript entries with stable ids and
+  `parentId`, while `SessionStore` can list sessions and open one back in
+  message order. `/resume`, context reconstruction, and tree branching are
+  planned later. [Partial]
 
 ## Providers and auth
 
