@@ -2,14 +2,16 @@
 
 **A fast, token-efficient coding agent for your terminal.**
 
-> **Status (2026-06-17): Milestone 1 and the async-hard runtime complete.** Iris
-> currently has a text-only REPL, selectable Mimir providers (`openai-codex`,
-> `anthropic`, `antigravity`), streamed response parsing, workspace-scoped
-> built-in tools, approval gates with diff previews, provider/model settings, and
-> best-effort JSONL transcripts. Nexus runs a tokio async loop with turn-level
-> cancellation: async provider streams, per-tool child cancellation, and
-> safe-parallel execution of concurrency-safe tools. The next runtime work is
-> Milestone 2 (token/context).
+> **Status (2026-06-17): Milestone 2 foundations in progress.** Iris currently
+> has a persistent full-screen TUI with text fallback, selectable Mimir providers
+> (`openai-codex`, `anthropic`, `antigravity`), streamed response parsing,
+> workspace-scoped built-in tools, approval gates with diff previews,
+> provider/model/context-budget settings, linear session resume, best-effort
+> JSONL transcripts, session-scoped large-output handles, and turn-boundary
+> auto-compaction. Nexus runs a tokio async loop with turn-level cancellation:
+> async provider streams, per-tool child cancellation, and safe-parallel
+> execution of concurrency-safe tools. The next runtime work is proving the
+> Milestone 2 token/context foundations with measurement.
 > Efficiency claims (token savings, cache hits, cheaper switching, compaction
 > quality) are **design goals to be backed by benchmarks**
 > before they are used as selling points. Read future capability sections below
@@ -51,14 +53,15 @@ records *why* each piece is present (your request, the active file, a recent too
 result, a compacted summary, pinned memory), so inclusion is auditable and
 evictable by reason rather than guesswork.
 
-Large content is designed not to be copied around blindly. A **content-addressed
-store** keeps files, command outputs, web pages, and diffs by hash, and the agent
-passes stable **handles** instead of re-pasting text. Big tool outputs are meant to
-collapse into a three-part artifact — a short model-visible summary, structured
-metadata, and the full content behind a handle — so the model sees a summary and
-pulls the full bytes only when it actually needs to reason over them. For coding
-work, context is intended to be **diff-aware**: git diffs, touched files, nearby
-symbols, and recent edits over whole-file dumps.
+Large content is designed not to be copied around blindly. The first slice is
+implemented for oversized tool outputs: successful results over the inline
+threshold are stored beside the session transcript behind stable handles, while
+the model sees a compact preview plus structured metadata. The broader
+**content-addressed store** direction still includes files, web pages, diffs, and
+summaries by hash, with the model dereferencing full bytes only when it actually
+needs to reason over them. For coding work, context is intended to be
+**diff-aware**: git diffs, touched files, nearby symbols, and recent edits over
+whole-file dumps.
 
 Prompts are to be assembled from **reusable segments** — base instructions, tool
 descriptions, repo context, mode rules, provider hints — laid out **cache-aware**
@@ -66,7 +69,9 @@ so the stable parts line up with what each provider rewards for cache hits, with
 hit/miss and cost-avoided surfaced so the savings are visible. When context must
 shrink, the aim is to do it well: layered compaction with **freshness rules** so a
 summary made before a file changed isn't trusted blindly, and **verification
-probes so compaction quality can be measured rather than asserted.**
+probes so compaction quality can be measured rather than asserted.** The current
+runtime has a deterministic turn-boundary auto-compaction foundation; quality
+summaries and compaction benchmarks are still future work.
 
 ## Modes that switch cheaply
 
@@ -153,8 +158,9 @@ is proven, not before.
 
 Iris is being built provider-agnostic from the core, with provider-specific
 optimizations where they matter — cache layout, tool-call formats, reasoning
-controls. The MVP targets Anthropic and OpenAI, then Gemini-compatible backends,
-with the capability matrix making each backend a first-class citizen rather than a
+controls. Today it ships OpenAI Codex Responses, Anthropic Messages on the Claude
+Code OAuth lane, and Antigravity/Gemini Code Assist. The capability matrix is
+still planned so each backend can become a first-class citizen rather than a
 lowest-common-denominator adapter.
 
 ## Why Iris, and what it is not

@@ -119,7 +119,7 @@ and a Ctrl-C watcher thread bridges the async-signal-safe SIGINT atomic onto the
 token (the two-stage force-quit/reap handler is untouched). Tools are async
 (`Tool::execute` returns a boxed future) and classify themselves via
 `is_concurrency_safe`; the loop runs consecutive concurrency-safe, ungated calls
-in parallel (`join_all`, in-order result assembly) and everything else
+in parallel with bounded ordered buffering and everything else
 exclusively. The concurrency-safe built-ins (`grep`/`find`/`ls`) run their
 blocking body on `spawn_blocking` and await the handle, so a parallel batch is
 genuinely concurrent and the future yields for the cancellation race; `read`
@@ -499,10 +499,11 @@ Potential scope:
   bounded preview with a `(+N more lines)` indicator, a session always-allow
   approval policy for file tools enforced in Nexus (`bash` still prompts every
   time), and paste-safe multi-line prompt input
-  (bracketed paste + `\` continuation). All color/structure degrades to plain
-  ANSI-free text on non-TTY/piped output. Deferred to a future full-TUI
-  milestone (raw mode): interactive expand/collapse of folded blocks, `Alt+Enter`
-  newline editing, and full right-bordered box framing.]
+  (bracketed paste + `\` continuation). Full-screen TUI shipped later on top
+  of this: raw-mode alternate screen, persistent transcript, textarea editor,
+  spinner, slash palette, and Ctrl-C/input edge-case handling, with text UI as
+  the non-TTY/piped fallback. Still deferred: interactive expand/collapse of
+  folded blocks and full right-bordered box framing.]
 - Streaming output if not already in MVP. [Shipped: `TurnSink` deltas.]
 - Session transcript persistence. [Shipped, now a read/write store foundation:
   `src/session.rs` writes a JSONL transcript -- a `session` header line plus one
@@ -815,8 +816,9 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    `bash` sandbox, and the git-diff decision (preview is the single surface;
    post-change display moves to Milestone 5). The acceptance signal is met:
    Iris can make a small change in a real repo, show the diff, and explain it.
-   Deferred to a future full-TUI milestone (raw mode): interactive block
-   expansion, `Alt+Enter` multi-line editing, and box framing.
+   Full-screen TUI now covers raw-mode interaction, textarea editing, spinner,
+   slash palette, and transcript rendering; interactive block expansion and full
+   box framing remain deferred.
 4. Done: the tier-boundary cuts are shipped (see [`ARCHITECTURE.md`](ARCHITECTURE.md)).
    Protect that split during runtime work: Nexus stays the bare runtime, Wayland
    stays the harness, and Iris CLI stays terminal I/O/adapters.
@@ -824,16 +826,13 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    loop is now the Codex-style async stream/cancel/tool runtime, preserving
    pi-mono's clean contract shape, with all nine acceptance tests green. This
    unblocks Milestone 2.
-6. Next: Milestone 2 (token-efficiency). The metadata gate is already met
-   ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) MVP), so the
-   remaining work is token accounting (handle-backing large tool outputs shipped
-   in [#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)).
-   First implement shared tool infrastructure in dependency order: path identity and
-   observation store ([#11](https://github.com/5omeOtherGuy/iris-agent/issues/11)),
-   mutation preflight ([#12](https://github.com/5omeOtherGuy/iris-agent/issues/12)),
-   atomic queue/refresh completion ([#13](https://github.com/5omeOtherGuy/iris-agent/issues/13)),
-   approval/diff UX ([#14](https://github.com/5omeOtherGuy/iris-agent/issues/14)),
-   and result metadata ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15)).
+6. Done (2026-06-17): Milestone 2 foundations are in place -- result metadata,
+   token estimates and `contextTokenBudget` ([#54](https://github.com/5omeOtherGuy/iris-agent/issues/54)),
+   handle-backed large tool outputs ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)),
+   and turn-boundary auto-compaction ([#55](https://github.com/5omeOtherGuy/iris-agent/issues/55)).
+   Next: prove the token-efficiency thesis with benchmark evidence, then add the
+   missing consumer slices: selective handle dereferencing, richer micro-summary
+   schema, and provider-quality compaction summaries.
 
 ## Implementation notes backlog
 

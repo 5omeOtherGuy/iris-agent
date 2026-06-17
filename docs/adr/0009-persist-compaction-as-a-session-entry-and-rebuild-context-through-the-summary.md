@@ -1,16 +1,20 @@
 # ADR-0009: Persist compaction as a session entry and rebuild context through the summary
 
 **Date**: 2026-06-17
-**Status**: accepted
+**Status**: accepted; implemented in issues #49 and #55
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context
 
-The JSONL session store (ADR-0004) and linear resume now exist. Issue #49 needs the first context-compaction slice: a resumed session should be able to rebuild provider context through a persisted summary instead of replaying every covered turn. It must not break the existing JSONL format or normal resume, and it must leave room for later auto-thresholds, token budgets, branch summaries, and alternate summarizers without rewriting stored sessions.
+The JSONL session store (ADR-0004) and linear resume now exist. Issue #49 needs the first context-compaction slice: a resumed session should be able to rebuild provider context through a persisted summary instead of replaying every covered turn. It must not break the existing JSONL format or normal resume, and it must leave room for later branch summaries and alternate summarizers without rewriting stored sessions.
+
+Issue #55 adds the first production trigger on that storage shape: the Wayland harness reads the configured context token budget and compacts at safe turn boundaries before the next provider request.
 
 ## Decision
 
-Compaction is a durable `compaction` entry in the same JSONL transcript. The entry records an inclusive range of covered `message` entry ids (`coveredFrom`/`coveredTo`), the `summary` text, a `createdAt` timestamp, and a `tokenEstimate` placeholder. During read/resume rebuild, each covered range is replaced in place by a single summary message; the original covered turns are not replayed alongside it. Storage and rebuild are independent of how the summary text is produced (a manual/internal append path now; a provider/local/remote summarizer later), so the summarizer is the only swappable part. Overlapping or missing-id coverage is rejected as invalid session data; the auto-trigger is deferred.
+Compaction is a durable `compaction` entry in the same JSONL transcript. The entry records an inclusive range of covered `message` entry ids (`coveredFrom`/`coveredTo`), the `summary` text, a `createdAt` timestamp, and a `tokenEstimate`. During read/resume rebuild, each covered range is replaced in place by a single summary message; the original covered turns are not replayed alongside it. Storage and rebuild are independent of how the summary text is produced (a deterministic internal summarizer now; a provider/local/remote summarizer later), so the summarizer is the only swappable part. Overlapping or missing-id coverage is rejected as invalid session data.
+
+The first auto-trigger lives in the Wayland harness. Before a provider request, it compares the current context estimate to `contextTokenBudget`; if over budget, it selects an older persisted/id-bearing range, keeps a recent tail under a low-water target, avoids splitting tool-call/tool-result pairs, appends the compaction entry, and replaces live context with `summary + retained tail` so live and resumed context agree.
 
 ## Alternatives Considered
 
@@ -37,14 +41,14 @@ Compaction is a durable `compaction` entry in the same JSONL transcript. The ent
 ## Consequences
 
 ### Positive
-- Auto-compaction thresholds, token-budget policy, branch summaries, and alternate summarizers can attach without rewriting existing entries.
+- Auto-compaction thresholds and token-budget policy attach without rewriting existing entries.
 - Resume rebuilds context through the summary; covered turns are never duplicated.
 - Reuses the existing JSONL store, ids, and `parentId` chain (ADR-0004); no new dependency.
 
 ### Negative
-- Only a manual/internal trigger exists this slice, so the write path has no production caller yet (one scoped `allow(dead_code)`).
-- A `tokenEstimate` placeholder is stored before any token convention exists.
+- The current summarizer is deterministic bounded excerpts, not a provider-quality summary.
+- Already-loaded resumed history is tracked id-less in the harness, so only post-resume turns are re-coverable until the read path surfaces per-message entry ids.
 
 ### Risks
-- A covered range that splits a tool-call/tool-result pair could leave a dangling half; today the manual path chooses clean boundaries, and a future automatic summarizer must add pair-aware range validation.
-- Invalid coverage (overlap/missing id) fails the read; mitigated by rejecting it deterministically and testing compacted rebuild, multiple compactions, overlap, missing-id, and resume-after-compaction.
+- A covered range that splits a tool-call/tool-result pair could leave a dangling half; mitigate by keeping range choice pair-aware in the harness and adding the same validation to any future manual/provider compaction entry point.
+- Invalid coverage (overlap/missing id) fails the read; mitigated by rejecting it deterministically and testing compacted rebuild, multiple compactions, overlap, missing-id, resume-after-compaction, and auto-compaction at turn boundaries.

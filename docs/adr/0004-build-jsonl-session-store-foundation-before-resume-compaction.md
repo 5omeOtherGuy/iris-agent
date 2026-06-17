@@ -8,7 +8,7 @@
 
 At decision time, Iris had best-effort write-only JSONL transcript logging. The harness capability matrix found session persistence was the next major gap versus pi-mono and Codex. Issue #42 defined the smallest useful slice: a JSONL-backed session store with ids, parent links, read/open/list support, and tests.
 
-Outcome: implemented as a v2 JSONL store. `SessionLog` remains the live append handle; `SessionStore` lists sessions and opens one back in message order. `/resume`, branching/tree APIs, compaction, labels, fork/rollback, and token accounting remain intentionally deferred.
+Outcome: implemented as a v2 JSONL store. `SessionLog` remains the live append handle; `SessionStore` lists sessions and opens one back in message order. Resume, token accounting, compaction entries, and auto-compaction now build on this foundation; branching/tree APIs, labels, fork/rollback, and the in-session resume picker remain deferred.
 
 ## Decision
 
@@ -39,7 +39,7 @@ We build a minimal JSONL Session Store Foundation before implementing `/resume`,
 ## Consequences
 
 ### Positive
-- Unlocks future `/resume`, branching, compaction, token accounting, and context reconstruction.
+- Unlocked resume, token accounting, compaction entries, auto-compaction, and context reconstruction; still leaves room for branching and rollback.
 - Keeps local session data simple and human-inspectable.
 - Provides a testable contract before adding UI behavior.
 
@@ -54,4 +54,5 @@ We build a minimal JSONL Session Store Foundation before implementing `/resume`,
 ## Follow-ups (built on this foundation)
 
 - **Resume MVP (#47/#48).** `iris-agent resume <id>` rebuilds provider context by replaying `StoredSession.messages`, reopens the same JSONL for append with a persisted cursor (continuing the log rather than rewriting it), repairs a dangling trailing tool call with a synthetic result so a crash-truncated session resumes into a provider-valid sequence, and runs in the current cwd (intentional MVP behavior, not the session's stored cwd). This is the execution of this ADR, not a new decision.
-- **Compaction foundation (#49).** The `compaction` entry and context rebuild are recorded separately in ADR-0009.
+- **Compaction foundation and auto-trigger (#49/#55).** The `compaction` entry, context rebuild, and budget-triggered harness compaction are recorded separately in ADR-0009.
+- **Large-output handles (#61).** Session-scoped output sidecars are recorded separately in ADR-0011.
