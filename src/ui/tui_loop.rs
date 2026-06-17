@@ -79,6 +79,7 @@ enum IdleKey {
 /// A gated tool waiting for the user's decision: the reply channel back into the
 /// turn future plus whether "always" is on offer.
 struct PendingApproval {
+    call: ToolCall,
     reply: oneshot::Sender<ApprovalDecision>,
     allow_always: bool,
 }
@@ -203,6 +204,7 @@ async fn run_turn<P: ChatProvider>(
                 Some(request) = appr_rx.recv() => {
                     tui.screen.show_approval(&request.call, request.allow_always);
                     pending = Some(PendingApproval {
+                        call: request.call.clone(),
                         reply: request.reply,
                         allow_always: request.allow_always,
                     });
@@ -539,6 +541,7 @@ fn handle_running_event(
                 };
                 if let Some(decision) = decision {
                     let p = pending.take().expect("pending approval present");
+                    screen.record_approval(&p.call, decision);
                     let _ = p.reply.send(decision);
                     screen.clear_approval();
                     return true;
@@ -601,6 +604,14 @@ mod tests {
 
     fn key_mod(code: KeyCode, mods: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, mods))
+    }
+
+    fn call() -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": "echo hi" }),
+        }
     }
 
     #[test]
@@ -714,6 +725,7 @@ mod tests {
         // Allow.
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            call: call(),
             reply: tx,
             allow_always: true,
         });
@@ -728,6 +740,7 @@ mod tests {
         // Deny via 'n'.
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            call: call(),
             reply: tx,
             allow_always: false,
         });
@@ -737,6 +750,7 @@ mod tests {
         // 'a' is ignored when always is not on offer.
         let (tx, mut rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            call: call(),
             reply: tx,
             allow_always: false,
         });
@@ -754,6 +768,7 @@ mod tests {
         let mut screen = Screen::new();
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            call: call(),
             reply: tx,
             allow_always: true,
         });
@@ -788,6 +803,7 @@ mod tests {
         let mut screen = Screen::new();
         let (tx, _rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            call: call(),
             reply: tx,
             allow_always: true,
         });
@@ -806,6 +822,7 @@ mod tests {
         let token = CancellationToken::new();
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            call: call(),
             reply: tx,
             allow_always: true,
         });
