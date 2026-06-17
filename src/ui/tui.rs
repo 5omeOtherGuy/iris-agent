@@ -31,7 +31,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::nexus::ToolCall;
@@ -94,108 +94,52 @@ fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0).max(1)
 }
 
-/// One styled logical line of transcript. Kept as plain text + style so it can
-/// be wrapped to the current width at render time (one logical line may render
-/// as several physical rows).
+/// One styled logical transcript row. Kept as plain text + style so it can be
+/// rendered from the current width into physical terminal rows.
 #[derive(Clone)]
-struct Row {
+struct TranscriptRow {
     text: String,
     style: Style,
 }
 
-/// Animated turn-progress spinner. Advances only while `active`, so an idle
-/// session redraws nothing on a tick (no flicker, no busy CPU).
-#[derive(Default)]
-struct Spinner {
-    active: bool,
-    frame: usize,
-}
-
-impl Spinner {
-    fn start(&mut self) {
-        self.active = true;
-        self.frame = 0;
-    }
-
-    fn stop(&mut self) {
-        self.active = false;
-    }
-
-    /// Advance one frame; a no-op when idle so ticks cause no redraw at rest.
-    fn tick(&mut self) -> bool {
-        if self.active {
-            self.frame = (self.frame + 1) % SPINNER_FRAMES.len();
-        }
-        self.active
-    }
-
-    fn glyph(&self) -> &'static str {
-        SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()]
-    }
-}
-
-/// Build a styled, empty editor: bordered box, dim placeholder, a reversed
-/// block cursor the widget draws itself (no hardware cursor needed).
-fn fresh_editor() -> TextArea<'static> {
-    let mut editor = TextArea::default();
-    editor.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(dim_style())
-            .title(Span::styled(" message ", dim_style())),
-    );
-    editor.set_cursor_line_style(Style::default());
-    editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
-    editor.set_placeholder_text("Type a message, / for commands, Enter to send");
-    editor
-}
-
-/// UI state plus its rendering. Holds no terminal handle and no channels, so its
-/// behavior is unit-testable without a TTY and its frame output is testable via
-/// ratatui's `TestBackend`.
-pub(crate) struct Screen {
-    transcript: Vec<Row>,
-    /// Multiline editor buffer (undo/redo, kill-ring, word-nav) owned by
-    /// `ratatui-textarea`; the loop drives it from Iris's own keymap.
-    pub(crate) editor: TextArea<'static>,
-    /// Slash-command palette selection state, synced after every edit.
-    pub(crate) palette: Palette,
-    spinner: Spinner,
-    /// Short status-row hint while a gated tool awaits the user's decision.
-    approval_hint: Option<String>,
-    /// Live assistant text being streamed; shown below the transcript and
-    /// committed into it once the stream ends.
-    streaming: Option<String>,
-    /// Physical rows above the bottom of the transcript to keep in view. Zero
-    /// means follow the latest output.
-    scrollback: u16,
-}
-
-impl Screen {
-    pub(crate) fn new() -> Self {
+impl TranscriptRow {
+    fn new(text: impl Into<String>, style: Style) -> Self {
         Self {
-            transcript: Vec::new(),
-            editor: fresh_editor(),
-            palette: Palette::default(),
-            spinner: Spinner::default(),
-            approval_hint: None,
-            streaming: None,
-            scrollback: 0,
+            text: text.into(),
+            style,
         }
     }
 
-    // --- transcript ---
+    fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
+        push_wrapped_row(&self.text, self.style, width, out);
+    }
+}
 
+fn push_wrapped_row(text: &str, style: Style, width: usize, out: &mut Vec<Line<'static>>) {
+    for physical in wrap_to_width(text, width) {
+        out.push(Line::from(Span::styled(physical, style)));
+    }
+}
+
+/// Transcript state and width-aware rendering, separate from editor/spinner UI.
+#[derive(Default)]
+struct Transcript {
+    rows: Vec<TranscriptRow>,
+    /// Live assistant text being streamed; rendered after committed rows and
+    /// committed exactly once on `AssistantTextEnd`.
+    streaming: Option<String>,
+}
+
+impl Transcript {
     /// Append a blank separator row before a new top-level block, unless the
     /// transcript is empty or already ends in a blank row.
     fn push_blank(&mut self) {
-        match self.transcript.last() {
+        match self.rows.last() {
             None => {}
             Some(last) if last.text.is_empty() => {}
-            _ => self.transcript.push(Row {
-                text: String::new(),
-                style: Style::default(),
-            }),
+            _ => self
+                .rows
+                .push(TranscriptRow::new(String::new(), Style::default())),
         }
     }
 
@@ -208,10 +152,7 @@ impl Screen {
     /// Push each line of `text` into the transcript with one style.
     fn push(&mut self, text: &str, style: Style) {
         for line in text.split('\n') {
-            self.transcript.push(Row {
-                text: line.to_string(),
-                style,
-            });
+            self.rows.push(TranscriptRow::new(line, style));
         }
     }
 
@@ -224,18 +165,8 @@ impl Screen {
         }
     }
 
-    /// Apply one semantic event, preserving follow-to-bottom when the user has
-    /// not scrolled away. The loop calls this for every Nexus event.
-    pub(crate) fn apply_event(&mut self, event: UiEvent) {
-        let was_following = self.scrollback == 0;
-        self.apply(event);
-        if was_following {
-            self.follow_bottom();
-        }
-    }
-
-    /// Apply one semantic event to the transcript.
-    pub(crate) fn apply(&mut self, event: UiEvent) {
+    /// Apply one semantic event to the transcript rows.
+    fn apply(&mut self, event: UiEvent) {
         match event {
             UiEvent::AssistantTextDelta(delta) => {
                 if self.streaming.is_none() {
@@ -281,9 +212,7 @@ impl Screen {
             UiEvent::DiffPreview { call, diff } => {
                 self.begin_block();
                 self.push(&format!("diff - {}", summarize(&call)), dim_style());
-                for (text, style) in diff_rows(&diff) {
-                    self.transcript.push(Row { text, style });
-                }
+                self.rows.extend(diff_rows(&diff));
             }
             UiEvent::ToolDenied(call) => {
                 self.begin_block();
@@ -345,11 +274,136 @@ impl Screen {
     }
 
     /// Commit a submitted prompt into the transcript as a user line.
-    pub(crate) fn commit_user(&mut self, text: &str) {
+    fn commit_user(&mut self, text: &str) {
         self.push_blank();
         for line in text.split('\n') {
             self.push(&format!("> {line}"), user_style());
         }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let mut rows = Vec::new();
+        for row in &self.rows {
+            row.render(width, &mut rows);
+        }
+        if let Some(text) = &self.streaming {
+            for line in text.split('\n') {
+                push_wrapped_row(line, assistant_style(), width, &mut rows);
+            }
+        }
+        rows
+    }
+}
+
+/// Animated turn-progress spinner. Advances only while `active`, so an idle
+/// session redraws nothing on a tick (no flicker, no busy CPU).
+#[derive(Default)]
+struct Spinner {
+    active: bool,
+    frame: usize,
+}
+
+impl Spinner {
+    fn start(&mut self) {
+        self.active = true;
+        self.frame = 0;
+    }
+
+    fn stop(&mut self) {
+        self.active = false;
+    }
+
+    /// Advance one frame; a no-op when idle so ticks cause no redraw at rest.
+    fn tick(&mut self) -> bool {
+        if self.active {
+            self.frame = (self.frame + 1) % SPINNER_FRAMES.len();
+        }
+        self.active
+    }
+
+    fn glyph(&self) -> &'static str {
+        SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()]
+    }
+}
+
+/// Build a styled, empty editor: bordered box, dim placeholder, a reversed
+/// block cursor the widget draws itself (no hardware cursor needed).
+fn fresh_editor() -> TextArea<'static> {
+    let mut editor = TextArea::default();
+    editor.set_wrap_mode(WrapMode::WordOrGlyph);
+    editor.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(dim_style())
+            .title(Span::styled(" message ", dim_style())),
+    );
+    editor.set_cursor_line_style(Style::default());
+    editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    editor.set_placeholder_text("Type a message, / for commands, Enter to send");
+    editor
+}
+
+fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
+    let inner_width = usize::from(width.saturating_sub(2).max(1)); // editor borders
+    editor
+        .lines()
+        .iter()
+        .map(|line| u16::try_from(wrap_to_width(line, inner_width).len()).unwrap_or(u16::MAX))
+        .sum::<u16>()
+        .clamp(1, MAX_EDITOR_ROWS)
+}
+
+/// UI state plus its rendering. Holds no terminal handle and no channels, so its
+/// behavior is unit-testable without a TTY and its frame output is testable via
+/// ratatui's `TestBackend`.
+pub(crate) struct Screen {
+    transcript: Transcript,
+    /// Multiline editor buffer (undo/redo, kill-ring, word-nav) owned by
+    /// `ratatui-textarea`; the loop drives it from Iris's own keymap.
+    pub(crate) editor: TextArea<'static>,
+    /// Slash-command palette selection state, synced after every edit.
+    pub(crate) palette: Palette,
+    spinner: Spinner,
+    /// Short status-row hint while a gated tool awaits the user's decision.
+    approval_hint: Option<String>,
+    /// Physical rows above the bottom of the transcript to keep in view. Zero
+    /// means follow the latest output.
+    scrollback: u16,
+}
+
+impl Screen {
+    pub(crate) fn new() -> Self {
+        Self {
+            transcript: Transcript::default(),
+            editor: fresh_editor(),
+            palette: Palette::default(),
+            spinner: Spinner::default(),
+            approval_hint: None,
+            scrollback: 0,
+        }
+    }
+
+    // --- transcript ---
+
+    /// Apply one semantic event, preserving follow-to-bottom when the user has
+    /// not scrolled away. The loop calls this for every Nexus event.
+    pub(crate) fn apply_event(&mut self, event: UiEvent) {
+        let was_following = self.scrollback == 0;
+        self.apply(event);
+        if was_following {
+            self.follow_bottom();
+        }
+    }
+
+    /// Apply one semantic event to the transcript.
+    pub(crate) fn apply(&mut self, event: UiEvent) {
+        self.transcript.apply(event);
+    }
+
+    /// Commit a submitted prompt into the transcript as a user line.
+    pub(crate) fn commit_user(&mut self, text: &str) {
+        self.transcript.commit_user(text);
     }
 
     // --- scrollback ---
@@ -367,22 +421,7 @@ impl Screen {
     }
 
     fn wrapped_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let width = usize::from(width);
-        let mut rows = Vec::new();
-        let wrap_into = |text: &str, style: Style, rows: &mut Vec<Line<'static>>| {
-            for physical in wrap_to_width(text, width) {
-                rows.push(Line::from(Span::styled(physical, style)));
-            }
-        };
-        for row in &self.transcript {
-            wrap_into(&row.text, row.style, &mut rows);
-        }
-        if let Some(text) = &self.streaming {
-            for line in text.split('\n') {
-                wrap_into(line, assistant_style(), &mut rows);
-            }
-        }
-        rows
+        self.transcript.render(width)
     }
 
     // --- editor ---
@@ -454,13 +493,13 @@ impl Screen {
     /// Show a gated tool's approval prompt: a transcript line for history plus a
     /// short status-row hint. The loop captures the decision from a keypress.
     pub(crate) fn show_approval(&mut self, call: &ToolCall, allow_always: bool) {
-        self.begin_block();
+        self.transcript.begin_block();
         let options = if allow_always {
             "[y] once  [a] always  [N] deny"
         } else {
             "[y] once  [N] deny"
         };
-        self.push(
+        self.transcript.push(
             &format!("approve {}?  {options}", summarize(call)),
             prompt_style(),
         );
@@ -490,7 +529,7 @@ impl Screen {
 /// Colorize a unified diff into styled transcript rows. The two file headers
 /// before the first hunk are dropped, hunk headers cyan, additions green,
 /// removals red, context dimmed.
-fn diff_rows(diff: &str) -> Vec<(String, Style)> {
+fn diff_rows(diff: &str) -> Vec<TranscriptRow> {
     let mut seen_hunk = false;
     let mut out = Vec::new();
     for line in diff.lines() {
@@ -507,7 +546,7 @@ fn diff_rows(diff: &str) -> Vec<(String, Style)> {
                 _ => dim_style(),
             }
         };
-        out.push((line.to_string(), style));
+        out.push(TranscriptRow::new(line, style));
     }
     out
 }
@@ -589,7 +628,7 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
         return;
     }
 
-    let editor_rows = (screen.editor.lines().len() as u16).clamp(1, MAX_EDITOR_ROWS);
+    let editor_rows = editor_visual_rows(&screen.editor, area.width);
     let editor_h = editor_rows + 2; // top + bottom border
     let input_text = screen.editor_text();
     let palette_active = screen.palette.is_active(&input_text);
@@ -733,7 +772,7 @@ mod tests {
         }
     }
 
-    fn row_text(row: &Row) -> String {
+    fn row_text(row: &TranscriptRow) -> String {
         row.text.clone()
     }
 
@@ -742,10 +781,10 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta("Hel".to_string()));
         screen.apply(UiEvent::AssistantTextDelta("lo".to_string()));
-        assert_eq!(screen.transcript.len(), 0);
+        assert_eq!(screen.transcript.rows.len(), 0);
         assert_eq!(screen.wrapped_lines(80).len(), 1);
         screen.apply(UiEvent::AssistantTextEnd("Hello".to_string()));
-        let texts: Vec<String> = screen.transcript.iter().map(row_text).collect();
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["Hello".to_string()]);
     }
 
@@ -766,7 +805,7 @@ mod tests {
     fn long_transcript_line_wraps_to_multiple_rows() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("alpha beta gamma delta".to_string()));
-        assert_eq!(screen.transcript.len(), 1);
+        assert_eq!(screen.transcript.rows.len(), 1);
         assert!(screen.wrapped_lines(12).len() >= 2);
     }
 
@@ -777,7 +816,7 @@ mod tests {
             call: call("read"),
             content: "a\nb\n".to_string(),
         });
-        let texts: Vec<String> = screen.transcript.iter().map(row_text).collect();
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(texts.iter().any(|t| t == "[ok] read note.txt - 2 lines"));
         assert!(texts.iter().any(|t| t == "  a"));
         assert!(texts.iter().any(|t| t == "  b"));
@@ -788,7 +827,7 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("hi".to_string()));
         screen.apply(UiEvent::Notice("note".to_string()));
-        let texts: Vec<String> = screen.transcript.iter().map(row_text).collect();
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert_eq!(
             texts,
             vec!["hi".to_string(), String::new(), "note: note".to_string()]
@@ -802,10 +841,24 @@ mod tests {
             call: call("edit"),
             diff: "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
         });
-        let texts: Vec<String> = screen.transcript.iter().map(row_text).collect();
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(!texts.iter().any(|t| t.contains("--- a/note.txt")));
         assert!(texts.iter().any(|t| t == "+new"));
         assert!(texts.iter().any(|t| t == "-old"));
+        let add = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|row| row.text == "+new")
+            .expect("addition row");
+        let remove = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|row| row.text == "-old")
+            .expect("removal row");
+        assert_eq!(add.style, Style::default().fg(Color::Green));
+        assert_eq!(remove.style, Style::default().fg(Color::Red));
     }
 
     #[test]
@@ -813,7 +866,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 8))?;
         let mut screen = Screen::new();
         for i in 0..20 {
-            screen.push(&format!("line {i}"), assistant_style());
+            screen
+                .transcript
+                .push(&format!("line {i}"), assistant_style());
         }
         // Scroll past the top; render clamps to the real maximum. Layout: 8 rows
         // minus status(1) and the editor box(1 + 2 border) leaves a 4-row
@@ -889,6 +944,22 @@ mod tests {
         // Idle status hint is shown when no turn runs (the long hint is
         // truncated at this narrow test width, so assert its leading words).
         assert!(rendered.contains("enter send"));
+        Ok(())
+    }
+
+    #[test]
+    fn long_editor_line_wraps_instead_of_scrolling_right() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(18, 8))?;
+        let mut screen = Screen::new();
+        screen.editor.insert_str("abcdefghijklmnopqrst");
+        terminal.draw(|f| render(f, &mut screen))?;
+
+        let rendered = buffer_text(&terminal);
+        // The editor inner width is 16 cells (18-wide frame minus borders), so
+        // a 20-cell word should use two visible rows instead of horizontally
+        // scrolling to the tail of the line.
+        assert!(rendered.contains("abcdefghijklmnop"));
+        assert!(rendered.contains("qrst"));
         Ok(())
     }
 
