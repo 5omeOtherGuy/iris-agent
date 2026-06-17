@@ -26,10 +26,13 @@ fn is_auth_error(error: &anyhow::Error) -> bool {
 }
 
 fn test_system_prompt() -> String {
-    // The harness-owned assembly is the single source of the instruction string
-    // providers forward; an empty/nonexistent workspace yields base instructions
-    // only (no AGENTS.md), which is all this request-shaping test needs.
-    crate::wayland::system_prompt::assemble(Path::new("/tmp/iris"))
+    // The harness-owned baukasten is the single source of the instruction string
+    // providers forward. Use the hermetic in-memory-defaults assembler (no HOME,
+    // no disk, no project docs), which is all this request-shaping test needs.
+    crate::wayland::system_prompt::assemble_defaults(
+        Path::new("/tmp/iris"),
+        &crate::tools::built_in_tools(),
+    )
 }
 
 #[test]
@@ -274,7 +277,7 @@ fn builds_codex_request_from_conversation() {
     assert_eq!(request["model"], "gpt-test");
     assert_eq!(request["stream"], true);
     let instructions = request["instructions"].as_str().unwrap();
-    assert!(instructions.contains("You are an expert coding assistant operating inside Iris"));
+    assert!(instructions.contains("You are iris, a coding assistant"));
     assert!(instructions.contains("- read:"));
     assert!(instructions.contains("- ls:"));
     assert!(instructions.contains("No other tools are available"));
