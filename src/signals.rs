@@ -21,6 +21,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static RESTORE_TERMINAL_ON_FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+
+// Async-signal-safe terminal cleanup for a TUI force-quit path: show cursor,
+// disable common mouse/bracketed-paste modes, and leave the alternate screen.
+// This is deliberately raw ANSI bytes so the signal handler can use `write(2)`
+// instead of running crossterm/Drop code.
+const TUI_FORCE_QUIT_RESTORE: &[u8] =
+    b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l";
 
 /// Install the SIGINT handler. Call once at startup.
 pub(crate) fn install() {
@@ -40,6 +48,7 @@ extern "C" fn handle_sigint(_signal: libc::c_int) {
         // force-quit.
         // SAFETY: all three calls are async-signal-safe (the reap does only
         // atomic loads and `kill(-pgid)`).
+        restore_terminal_from_signal();
         crate::process_group::kill_all_from_signal();
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -55,6 +64,30 @@ extern "C" fn handle_sigint(_signal: libc::c_int) {
 /// atomic and eventually visible.
 fn record_interrupt(flag: &AtomicBool) -> bool {
     flag.swap(true, Ordering::Relaxed)
+}
+
+fn restore_terminal_from_signal() {
+    if RESTORE_TERMINAL_ON_FORCE_QUIT.load(Ordering::Relaxed) {
+        // SAFETY: `write` is async-signal-safe; pointer/length come from a
+        // static byte string.
+        let _ = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                TUI_FORCE_QUIT_RESTORE.as_ptr().cast(),
+                TUI_FORCE_QUIT_RESTORE.len(),
+            )
+        };
+    }
+}
+
+/// Enable emergency terminal escape cleanup before a repeat Ctrl-C re-raises.
+pub(crate) fn enable_terminal_restore_on_force_quit() {
+    RESTORE_TERMINAL_ON_FORCE_QUIT.store(true, Ordering::Relaxed);
+}
+
+/// Disable emergency terminal cleanup once the TUI has restored normally.
+pub(crate) fn disable_terminal_restore_on_force_quit() {
+    RESTORE_TERMINAL_ON_FORCE_QUIT.store(false, Ordering::Relaxed);
 }
 
 /// Record a terminal-driver Ctrl-C. Raw mode delivers Ctrl-C as a key event
@@ -81,6 +114,15 @@ pub(crate) fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_force_quit_restore_flag_toggles() {
+        disable_terminal_restore_on_force_quit();
+        assert!(!RESTORE_TERMINAL_ON_FORCE_QUIT.load(Ordering::Relaxed));
+        enable_terminal_restore_on_force_quit();
+        assert!(RESTORE_TERMINAL_ON_FORCE_QUIT.load(Ordering::Relaxed));
+        disable_terminal_restore_on_force_quit();
+    }
 
     #[test]
     fn record_interrupt_flags_first_press_and_detects_repeat() {

@@ -16,15 +16,13 @@
 
 use std::io::{self, IsTerminal, Stdout};
 
-#[cfg(unix)]
-use std::mem::MaybeUninit;
-
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -98,6 +96,9 @@ pub(crate) struct Screen {
     /// Live assistant text being streamed; shown below the transcript and
     /// committed into it once the stream ends.
     streaming: Option<String>,
+    /// Number of physical rows above the bottom of the transcript to keep in
+    /// view. Zero means follow the latest output.
+    scrollback: u16,
 }
 
 impl Screen {
@@ -107,6 +108,7 @@ impl Screen {
             input: String::new(),
             cursor: 0,
             streaming: None,
+            scrollback: 0,
         }
     }
 
@@ -238,6 +240,33 @@ impl Screen {
     /// each returned `Line` is exactly one physical terminal row. Rendering with
     /// one row per line keeps the scroll-to-bottom math exact (no divergence
     /// from a word-wrapping widget).
+    fn follow_bottom(&mut self) {
+        self.scrollback = 0;
+    }
+
+    fn scroll_up(&mut self, rows: u16) {
+        self.scrollback = self.scrollback.saturating_add(rows);
+    }
+
+    fn scroll_down(&mut self, rows: u16) {
+        self.scrollback = self.scrollback.saturating_sub(rows);
+    }
+
+    fn scroll_to_top(&mut self, width: u16, transcript_height: u16) {
+        self.scrollback = self.max_scrollback(width, transcript_height);
+    }
+
+    fn clamp_scrollback(&mut self, width: u16, transcript_height: u16) {
+        self.scrollback = self
+            .scrollback
+            .min(self.max_scrollback(width, transcript_height));
+    }
+
+    fn max_scrollback(&self, width: u16, transcript_height: u16) -> u16 {
+        let rows = u16::try_from(self.wrapped_lines(width).len()).unwrap_or(u16::MAX);
+        rows.saturating_sub(transcript_height)
+    }
+
     fn wrapped_lines(&self, width: u16) -> Vec<Line<'static>> {
         let width = usize::from(width);
         let mut rows = Vec::new();
@@ -433,7 +462,9 @@ fn render(frame: &mut Frame, screen: &Screen, show_cursor: bool) {
     // Scrollback: lines are pre-wrapped to exactly one physical row each, so the
     // scroll-to-bottom offset is exact and never diverges from the renderer.
     let lines = screen.wrapped_lines(transcript_area.width);
-    let scroll = (lines.len() as u16).saturating_sub(transcript_area.height);
+    let total_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let bottom = total_rows.saturating_sub(transcript_area.height);
+    let scroll = bottom.saturating_sub(screen.scrollback);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
         transcript_area,
@@ -465,65 +496,6 @@ fn render(frame: &mut Frame, screen: &Screen, show_cursor: bool) {
     }
 }
 
-/// Restores the terminal's original line discipline after the full-screen UI
-/// exits. While the alternate screen is active we keep cooked mode's SIGINT
-/// behavior, but disable ECHO so type-ahead during model/tool work cannot smear
-/// the ratatui frame.
-#[cfg(unix)]
-struct EchoRestore {
-    original: Option<libc::termios>,
-}
-
-#[cfg(unix)]
-impl EchoRestore {
-    fn capture_and_disable() -> Result<Self> {
-        let mut original = MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: `tcgetattr` initializes `original` on success.
-        let rc = unsafe { libc::tcgetattr(libc::STDIN_FILENO, original.as_mut_ptr()) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: success above initialized the termios struct.
-        let original = unsafe { original.assume_init() };
-        let mut muted = original;
-        muted.c_lflag &= !(libc::ECHO | libc::ECHONL);
-        // SAFETY: `muted` is a valid termios captured from this fd.
-        let rc = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &muted) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok(Self {
-            original: Some(original),
-        })
-    }
-
-    fn restore(&mut self) {
-        if let Some(original) = self.original.take() {
-            // SAFETY: `original` was captured from this fd at startup.
-            let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for EchoRestore {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
-#[cfg(not(unix))]
-struct EchoRestore;
-
-#[cfg(not(unix))]
-impl EchoRestore {
-    fn capture_and_disable() -> Result<Self> {
-        Ok(Self)
-    }
-
-    fn restore(&mut self) {}
-}
-
 /// Enables raw mode + bracketed paste for the lifetime of an input read, and
 /// restores cooked mode on drop (including on panic / early return).
 struct RawGuard;
@@ -531,7 +503,7 @@ struct RawGuard;
 impl RawGuard {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -541,7 +513,7 @@ impl RawGuard {
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         let _ = disable_raw_mode();
     }
 }
@@ -551,24 +523,25 @@ impl Drop for RawGuard {
 pub(crate) struct TuiUi {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     screen: Screen,
-    echo: EchoRestore,
     active: bool,
 }
 
 impl TuiUi {
     pub(crate) fn new() -> Result<Self> {
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        let echo = EchoRestore::capture_and_disable()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
+        crate::signals::enable_terminal_restore_on_force_quit();
         Ok(Self {
             terminal,
             screen: Screen::new(),
-            echo,
             active: true,
         })
     }
 
     fn draw(&mut self, show_cursor: bool) -> Result<()> {
+        let area = self.terminal.size()?;
+        self.screen
+            .clamp_scrollback(area.width, area.height.saturating_sub(2));
         let screen = &self.screen;
         self.terminal
             .draw(|frame| render(frame, screen, show_cursor))?;
@@ -578,10 +551,10 @@ impl TuiUi {
     fn restore(&mut self) {
         if self.active {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste);
+            let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
             let _ = self.terminal.show_cursor();
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
-            self.echo.restore();
+            crate::signals::disable_terminal_restore_on_force_quit();
             self.active = false;
         }
     }
@@ -606,6 +579,14 @@ impl Ui for TuiUi {
                         .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
                         .collect();
                     self.screen.insert_str(&flattened);
+                    continue;
+                }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => self.screen.scroll_up(3),
+                        MouseEventKind::ScrollDown => self.screen.scroll_down(3),
+                        _ => {}
+                    }
                     continue;
                 }
                 _ => continue, // resize repaints on the next loop; others ignored
@@ -633,6 +614,14 @@ impl Ui for TuiUi {
                 KeyCode::Backspace => self.screen.backspace(),
                 KeyCode::Left => self.screen.move_left(),
                 KeyCode::Right => self.screen.move_right(),
+                KeyCode::PageUp => self.screen.scroll_up(10),
+                KeyCode::PageDown => self.screen.scroll_down(10),
+                KeyCode::Home if ctrl => {
+                    let area = self.terminal.size()?;
+                    self.screen
+                        .scroll_to_top(area.width, area.height.saturating_sub(2));
+                }
+                KeyCode::End if ctrl => self.screen.follow_bottom(),
                 KeyCode::Home => self.screen.home(),
                 KeyCode::End => self.screen.end(),
                 KeyCode::Enter => {
@@ -641,6 +630,7 @@ impl Ui for TuiUi {
                         continue;
                     }
                     self.screen.commit_user(&text);
+                    self.screen.follow_bottom();
                     return Ok(Some(text));
                 }
                 _ => {}
@@ -649,7 +639,11 @@ impl Ui for TuiUi {
     }
 
     fn emit(&mut self, event: UiEvent) -> Result<()> {
+        let was_following = self.screen.scrollback == 0;
         self.screen.apply(event);
+        if was_following {
+            self.screen.follow_bottom();
+        }
         self.draw(false)
     }
 
@@ -791,6 +785,20 @@ mod tests {
         assert!(!texts.iter().any(|t| t.contains("--- a/note.txt")));
         assert!(texts.iter().any(|t| t == "+new"));
         assert!(texts.iter().any(|t| t == "-old"));
+    }
+
+    #[test]
+    fn scroll_to_top_clamps_to_real_top() {
+        let mut screen = Screen::new();
+        for i in 0..20 {
+            screen.push(&format!("line {i}"), assistant_style());
+        }
+
+        screen.scroll_to_top(20, 4);
+
+        assert_eq!(screen.scrollback, 16);
+        screen.scroll_down(10);
+        assert_eq!(screen.scrollback, 6);
     }
 
     #[test]
