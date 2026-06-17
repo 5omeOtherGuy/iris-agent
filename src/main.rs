@@ -107,8 +107,8 @@ fn run_agent() -> Result<()> {
     // The Tier-2 harness owns the execution surface (workspace + tool state) and
     // persistence, wrapping the bare in-memory agent.
     let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
-    let mut ui = ui::text::TextUi::stdio();
-    cli::run_session(&mut harness, &mut ui)
+    let mut ui = ui::tui::stdio();
+    cli::run_session(&mut harness, ui.as_mut())
 }
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {

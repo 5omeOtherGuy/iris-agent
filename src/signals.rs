@@ -57,6 +57,17 @@ fn record_interrupt(flag: &AtomicBool) -> bool {
     flag.swap(true, Ordering::Relaxed)
 }
 
+/// Record a terminal-driver Ctrl-C. Raw mode delivers Ctrl-C as a key event
+/// rather than raising SIGINT, so the TUI read loop calls this to set the same
+/// interrupt flag the per-turn watcher polls. A repeat reaps tracked child
+/// process groups (matching the SIGINT handler) but does not re-raise, since the
+/// read loop, not a signal, is in control.
+pub(crate) fn interrupt_from_terminal() {
+    if record_interrupt(&INTERRUPTED) {
+        crate::process_group::kill_all_from_signal();
+    }
+}
+
 /// Whether a Ctrl-C is pending since the last [`reset`].
 pub(crate) fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
