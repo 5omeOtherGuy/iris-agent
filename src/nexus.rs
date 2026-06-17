@@ -20,6 +20,27 @@ const MAX_TOOL_ROUNDTRIPS: usize = 50;
 // runtime setting after measuring disk/blocking-pool pressure.
 const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 
+// Oversized-tool-output policy (issue #61). A successful tool result whose text
+// exceeds this many bytes is stored out of context behind a handle and replaced
+// in the transcript by a compact head+tail preview, so a large output is not
+// reinserted into provider context on every round-trip. Outputs at or below the
+// threshold stay inline exactly as before.
+//
+// ponytail: fixed default, ~4k tokens at 4 chars/token. Covers ordinary tool
+// output (file reads, small greps) inline and catches genuinely large logs.
+// Upgrade path = a `Settings` knob threaded through `ToolEnv` (kept a constant
+// here to avoid a config field that triggers nothing, like `contextTokenBudget`
+// already is). Bytes, not lines: context cost tracks bytes/tokens, not line
+// count.
+const MAX_INLINE_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
+
+// Head/tail kept in the compact preview of an offloaded output. Their sum is
+// well under MAX_INLINE_TOOL_OUTPUT_BYTES, so an offloaded result is always
+// smaller than the threshold it crossed, and head/tail never overlap (offloaded
+// content is strictly larger than head+tail).
+const PREVIEW_HEAD_BYTES: usize = 4 * 1024;
+const PREVIEW_TAIL_BYTES: usize = 2 * 1024;
+
 // Shared between every cancellation exit path so the front-end renders one
 // consistent message whether the interrupt landed before, during, or after the
 // provider stream.
@@ -100,6 +121,18 @@ pub(crate) trait AgentObserver {
     fn on_event(&self, event: AgentEvent) -> Result<()>;
 }
 
+/// Persists oversized tool output outside provider context so the transcript
+/// carries a compact handle instead of the full payload (issue #61). The Tier-2
+/// Wayland harness implements it over local session storage; Nexus owns only
+/// this contract and the threshold/compaction policy and never touches the
+/// filesystem itself, mirroring [`ApprovalGate`]/[`ChatProvider`].
+pub(crate) trait ToolOutputStore {
+    /// Persist the full output text and return a stable handle id. The id must
+    /// be stable for identical content so a resumed transcript keeps pointing at
+    /// the same stored output (the harness impl is content-addressed).
+    fn put(&self, content: &str) -> Result<String>;
+}
+
 /// Request/response approval gate. Async so the loop can race a pending approval
 /// against cancellation (`tokio::select!`); the loop branches on the returned
 /// decision to control execution. Mirrors pi's `beforeToolCall` config hook,
@@ -149,6 +182,10 @@ impl ToolOutput {
 pub(crate) struct ToolEnv<'a> {
     pub(crate) workspace: &'a Path,
     pub(crate) state: &'a RefCell<crate::tools::ToolState>,
+    /// Optional out-of-context store for oversized tool outputs (issue #61).
+    /// `None` keeps every output inline (no durable session storage available),
+    /// preserving the original in-memory behavior. Harness-owned, injected here.
+    pub(crate) output_store: Option<&'a dyn ToolOutputStore>,
 }
 
 /// A tool the agent can invoke. Mirrors pi-ai's `Tool`
@@ -573,6 +610,7 @@ impl<P: ChatProvider> Agent<P> {
         env: &ToolEnv<'_>,
         token: &CancellationToken,
     ) -> Result<ToolsPhase> {
+        let store = env.output_store;
         let mut idx = 0;
         while idx < calls.len() {
             if token.is_cancelled() {
@@ -581,7 +619,7 @@ impl<P: ChatProvider> Agent<P> {
                     "turn interrupted during tools; remaining calls cancelled"
                 );
                 for call in &calls[idx..] {
-                    record_call(&mut self.messages, obs, call, ToolOutcome::Cancelled)?;
+                    record_call(&mut self.messages, obs, store, call, ToolOutcome::Cancelled)?;
                 }
                 self.emit_interrupted(obs)?;
                 return Ok(ToolsPhase::Ended);
@@ -599,14 +637,14 @@ impl<P: ChatProvider> Agent<P> {
                 // transcript pushes below.
                 let outcomes = run_parallel(&self.tools, &calls[idx..end], env, token).await;
                 for (call, outcome) in calls[idx..end].iter().zip(outcomes) {
-                    record_call(&mut self.messages, obs, call, outcome)?;
+                    record_call(&mut self.messages, obs, store, call, outcome)?;
                 }
                 idx = end;
             } else {
                 let outcome = self
                     .run_gated_single(&calls[idx], obs, gate, env, token)
                     .await?;
-                record_call(&mut self.messages, obs, &calls[idx], outcome)?;
+                record_call(&mut self.messages, obs, store, &calls[idx], outcome)?;
                 idx += 1;
             }
         }
@@ -775,6 +813,7 @@ async fn run_tool<'a>(
 fn record_call(
     messages: &mut Vec<Message>,
     obs: &dyn AgentObserver,
+    store: Option<&dyn ToolOutputStore>,
     call: &ToolCall,
     outcome: ToolOutcome,
 ) -> Result<()> {
@@ -787,11 +826,14 @@ fn record_call(
     let event = match outcome {
         ToolOutcome::Ok(output) => {
             tracing::info!(tool = %call.name, ok = true, "tool executed");
+            // The observer still receives the full output: offloading only keeps
+            // the oversized payload out of provider context, never out of the
+            // user-facing display (which folds it to a preview itself).
             let content = output.content.clone();
             messages.push(Message::tool_result(
                 &call.id,
                 &call.name,
-                &tool_result_json(&Ok(output)),
+                &success_tool_result_json(store, output),
             ));
             AgentEvent::ToolResult {
                 call: call.clone(),
@@ -958,6 +1000,74 @@ fn repair_dangling_tool_call(messages: &mut Vec<Message>) {
         &name,
         &cancelled_tool_result_json(),
     ));
+}
+
+/// Build the model-facing JSON for a successful tool result, offloading the
+/// content behind a handle when it is oversized and a store is available
+/// (issue #61). Small outputs, and the fallback when no store exists or the
+/// store write fails, are byte-identical to the original inline encoding -- the
+/// full output is never truncated and discarded.
+fn success_tool_result_json(store: Option<&dyn ToolOutputStore>, mut output: ToolOutput) -> String {
+    if output.content.len() <= MAX_INLINE_TOOL_OUTPUT_BYTES {
+        return tool_result_json(&Ok(output));
+    }
+    let Some(store) = store else {
+        // No durable store (e.g. in-memory session): keep the full output inline
+        // rather than lose it. Larger context, but never data loss.
+        return tool_result_json(&Ok(output));
+    };
+    match store.put(&output.content) {
+        Ok(handle_id) => {
+            // Swap the oversized content for a compact preview and record the
+            // handle pointer in metadata, then serialize through the same
+            // `tool_result_json` envelope as an inline result -- one
+            // serialization path, so the offloaded and inline shapes cannot
+            // drift apart.
+            let total_bytes = output.content.len();
+            let total_lines = output.content.lines().count();
+            output.content = compact_preview(&output.content, &handle_id, total_bytes, total_lines);
+            output.metadata.insert(
+                "outputHandle".to_string(),
+                json!({ "id": handle_id, "bytes": total_bytes, "lines": total_lines }),
+            );
+            tool_result_json(&Ok(output))
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "tool output handle store failed; inlining full output"
+            );
+            tool_result_json(&Ok(output))
+        }
+    }
+}
+
+// `compact_preview` is only reached for offloaded outputs, which by construction
+// exceed MAX_INLINE_TOOL_OUTPUT_BYTES. This compile-time assert ties that to the
+// preview sizing, so head and tail never overlap and `len - PREVIEW_TAIL_BYTES`
+// never underflows -- tuning a constant that breaks the invariant fails the
+// build instead of producing a malformed preview at runtime.
+const _: () = assert!(MAX_INLINE_TOOL_OUTPUT_BYTES > PREVIEW_HEAD_BYTES + PREVIEW_TAIL_BYTES);
+
+/// Head + tail of an oversized output with a middle-elision notice naming the
+/// handle. Slices land on UTF-8 char boundaries via the stdlib boundary helpers;
+/// head and tail are disjoint and the tail offset cannot underflow because an
+/// offloaded output is strictly larger than `PREVIEW_HEAD_BYTES +
+/// PREVIEW_TAIL_BYTES` (the const assert above).
+fn compact_preview(
+    content: &str,
+    handle_id: &str,
+    total_bytes: usize,
+    total_lines: usize,
+) -> String {
+    let head = &content[..content.floor_char_boundary(PREVIEW_HEAD_BYTES)];
+    let tail = &content[content.ceil_char_boundary(content.len() - PREVIEW_TAIL_BYTES)..];
+    let omitted = total_bytes.saturating_sub(head.len() + tail.len());
+    let notice = format!(
+        "\n... [iris stored the full {total_bytes}-byte ({total_lines}-line) tool output out of \
+         context; {omitted} bytes omitted here. retrieve via output handle {handle_id}] ...\n"
+    );
+    format!("{head}{notice}{tail}")
 }
 
 fn tool_result_json(result: &Result<ToolOutput>) -> String {

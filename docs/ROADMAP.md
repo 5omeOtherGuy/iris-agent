@@ -326,12 +326,12 @@ Shared tool infrastructure issues opened 2026-06-15:
 | [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Done (MVP): `edit`/`write` reject mutating an existing file that was never read or changed since last read (hash-decided; mtime refreshed on benign change). New files may be created blind. |
 | [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; observation refresh now happens after each mutation; no canonical mutation queue. |
 | [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Done (MVP): Nexus enforces a session allow-policy. Approval offers `[y] once` / `[a] always this session` / `[N] deny`; `always` records the tool name in a Nexus-owned `session_allowed` set so later same-tool calls auto-approve (emitted as `ToolAutoApproved`, never inferred by the UI). Deny stays safe-by-default (empty/invalid/EOF). Diff previews now render colored +/- with relative headers (the `a//abs` double-slash and write-vs-edit path inconsistency are fixed). Remaining: cross-session persistence, risk labels, and per-exact-command bash granularity (`always` on `bash` currently authorizes any later shell command this session). |
-| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): `dispatch` returns a `ToolOutput { content, metadata }`; success results carry a per-tool `metadata` object on the wire (`read` byte/line/`truncated`, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs is the remaining Milestone 2 work. |
+| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): `dispatch` returns a `ToolOutput { content, metadata }`; success results carry a per-tool `metadata` object on the wire (`read` byte/line/`truncated`, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs shipped ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): oversized results are offloaded out of context behind a stable handle with a compact preview + `outputHandle` metadata. |
 
 Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
 on Claude Code's exact-string contract, a shared read-before-mutate stale-file
 guard, and a structured `ToolOutput` result/metadata contract. The honest gaps
-are `bash` (large), handle-backed large outputs (medium), persistent approval policy/risk
+are `bash` (large), persistent approval policy/risk
 labels (medium; diff preview already shipped). The `rg`/`fd` packaging gap is
 closed: `grep`/`find` are now native libraries with no external binary.
 
@@ -614,8 +614,25 @@ large outputs can later become handle-backed without changing every caller.
 
 Potential scope:
 
-- Content-addressed store.
-- Handle-returning large tool outputs.
+- Content-addressed store. [Foundation shipped as part of
+  [#61](https://github.com/5omeOtherGuy/iris-agent/issues/61): oversized tool
+  outputs are stored content-addressed (`sha256[..16]`) in a session-sibling
+  `<session>.outputs/` directory (`src/handles.rs`).]
+- Handle-returning large tool outputs. [Foundation shipped
+  ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): a successful
+  tool result over a 16 KiB threshold is persisted out of provider context
+  behind a stable handle, and the transcript carries a compact head+tail preview
+  plus an `outputHandle` metadata pointer (`id`/`bytes`/`lines`) instead of the
+  full payload. Nexus owns the threshold/offload policy and a Tier-1
+  `ToolOutputStore` contract; the Wayland harness implements it over local
+  session storage and injects it via `ToolEnv`. Small outputs keep their exact
+  inline encoding; with no durable store (in-memory session) or on a store-write
+  failure the full output stays inline rather than being truncated/discarded.
+  Because the substitution happens before the message enters context, resume
+  rebuilds the compact form for free and never re-inlines the payload. Deferred
+  (outside #61): a model-facing dereference tool / TUI attachment browser
+  (`HandleStore::get` is the retrieval seam), binary artifacts, and
+  search/indexing.]
 - Micro-summary schema for large results.
 - Selective handle dereferencing.
 - Token accounting per turn. [Foundation shipped
@@ -782,7 +799,8 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    unblocks Milestone 2.
 6. Next: Milestone 2 (token-efficiency). The metadata gate is already met
    ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) MVP), so the
-   remaining work is handle-backing large tool outputs and token accounting.
+   remaining work is token accounting (handle-backing large tool outputs shipped
+   in [#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)).
    First implement shared tool infrastructure in dependency order: path identity and
    observation store ([#11](https://github.com/5omeOtherGuy/iris-agent/issues/11)),
    mutation preflight ([#12](https://github.com/5omeOtherGuy/iris-agent/issues/12)),
