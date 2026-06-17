@@ -489,15 +489,28 @@ Potential scope:
   milestone (raw mode): interactive expand/collapse of folded blocks, `Alt+Enter`
   newline editing, and full right-bordered box framing.]
 - Streaming output if not already in MVP. [Shipped: `TurnSink` deltas.]
-- Session transcript persistence. [Shipped (linear transcript): `src/session.rs`
-  writes a JSONL transcript -- a `session` header line plus one `message` line
-  per entry -- to `<root>/<cwd-slug>/<unix-ms>_<id>.jsonl`, where `<root>` is
-  `IRIS_SESSION_DIR` or `~/.iris/sessions`. The `Agent` appends new messages
-  after each turn (best-effort: a write failure warns, never crashes the
-  session; flushed per line so a crash leaves a valid prefix). Mirrors pi's
-  session format at the MVP level. Deferred (later milestones): pi's tree/
-  branch structure, compaction entries, labels, and `/resume` loading -- this
-  ships write-only persistence, not session resume.]
+- Session transcript persistence. [Shipped, now a read/write store foundation:
+  `src/session.rs` writes a JSONL transcript -- a `session` header line plus one
+  `message` line per entry -- to `<root>/<cwd-slug>/<unix-ms>_<id>.jsonl`, where
+  `<root>` is `IRIS_SESSION_DIR` or `~/.iris/sessions`. The harness appends new
+  messages after each turn (best-effort: a write failure warns, never crashes
+  the session; flushed per line so a crash leaves a valid prefix). Mirrors
+  pi-mono's session store at the smallest useful level. Session Store
+  Foundation ([#42](https://github.com/5omeOtherGuy/iris-agent/issues/42),
+  shipped 2026-06-17) added the tree-ready/read pieces on top of the original
+  write-only log: stable session ids (header `id`) and per-entry ids, a
+  `parentId` link on every entry (the previous leaf, `null` for the first) so
+  future branching can attach to any entry, format version bumped v1 -> v2
+  (the reader still accepts v1), and a `SessionStore` read side --
+  `list()` returns per-session metadata (id, path, cwd, created/updated ms,
+  newest-first) by reading only each header line + mtime, and `open(id)` reads
+  a session back with its messages in order (skipping a truncated trailing
+  fragment). Tests cover create/open/list/read/append/parent-linkage.
+  Deferred (later milestones, intentionally outside this slice): the `/resume`
+  UI command and context reconstruction, surfacing entry ids/`parentId` on read
+  for branching/tree navigation, compaction/branch-summary entries, labels,
+  fork, and token accounting. This ships the durable, resumable-ready store,
+  not session resume itself.]
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
   override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project).
