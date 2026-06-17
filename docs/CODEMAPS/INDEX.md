@@ -8,20 +8,21 @@ This codemap describes implemented code only. Planned capabilities live in [`../
 ## Architecture
 
 ╭──────────────╮   ╭──────────────╮   ╭──────────────╮   ╭────────────────────────────╮
-│ Iris CLI     │──▶│ cli.rs       │──▶│ Nexus Agent  │──▶│ OpenAI Codex Responses     │
-│ main.rs      │   │ run_session  │   │ nexus.rs     │   │ provider                   │
+│ Iris CLI     │──▶│ cli.rs       │──▶│ Nexus Agent  │──▶│ Mimir provider adapter     │
+│ main.rs      │   │ run_session  │   │ nexus.rs     │   │ chosen at startup          │
 ╰──────┬───────╯   ╰──────┬───────╯   ╰──────┬───────╯   ╰─────────────┬──────────────╯
        │                  │ Ui trait         │ UiEvent /                │
        │                  ▼ (events)          │ ProviderEvent           ▼
        │           ╭──────────────╮   ╭───────┴────────╮     ╭────────────────────────────╮
-       │           │ ui/ (TextUi) │   ▼                ▼     │ OpenAI Codex OAuth auth    │
-       │           │ tool_display │  ╭──────────────╮ ╭─────╮│ token store / refresh      │
-       │           ╰──────────────╯  │ Built-in     │ │ diff│╰────────────────────────────╯
-       │                             │ tools/       │ │ prev│
+       │           │ ui/ (TextUi) │   ▼                ▼     │ auth store / refresh       │
+       │           │ tool_display │  ╭──────────────╮ ╭─────╮│ OpenAI / Anthropic /       │
+       │           ╰──────────────╯  │ Built-in     │ │ diff││ Antigravity                │
+       │                             │ tools/       │ │ prev│╰────────────────────────────╯
        ▼                             ╰──────────────╯ ╰─────╯
-╭────────────────────────────╮
-│ OpenAI Codex login flows   │
-│ browser / device code      │
+╭────────────────────────────╮        ╭────────────────────────────╮
+│ login commands             │        │ provider implementations    │
+│ openai / anthropic /       │        │ Codex / Messages / Gemini   │
+│ antigravity                │        ╰────────────────────────────╯
 ╰────────────────────────────╯
 
 Nexus is provider- and UI-neutral: it drives turns and approval policy, consumes
@@ -35,7 +36,7 @@ raced against cancellation via `tokio::select!`. All terminal I/O lives behind t
 
 | Module | Purpose | Public/internal API | Dependencies |
 |---|---|---|---|
-| `src/main.rs` | CLI entrypoint. Initializes telemetry, parses args, constructs the bare agent + provider + tools, wraps them in a Tier-2 `wayland::Harness` (with optional session log), runs the session or OpenAI Codex login commands, and maps typed errors to process exit codes. | `main()`, `dispatch()` | `cli`, `nexus::Agent`, `wayland::Harness`, `ui::text::TextUi`, `OpenAiCodexResponsesProvider`, `mimir::auth::openai_codex`, `telemetry`, `errors` |
+| `src/main.rs` | CLI entrypoint. Initializes telemetry, parses args, constructs the bare agent + startup-selected Mimir provider + tools, wraps them in a Tier-2 `wayland::Harness` (with optional session log), runs the session or provider login commands, and maps typed errors to process exit codes. `defaultProvider` supports `openai-codex`, `anthropic`, and `antigravity`; unset defaults to `openai-codex`. | `main()`, `dispatch()` | `cli`, `nexus::Agent`, `wayland::Harness`, `ui::text::TextUi`, Mimir provider/auth modules, `telemetry`, `errors` |
 | `src/cli.rs` | Iris CLI session loop (Tier 3). Owns the tokio current-thread runtime and `block_on`s each turn; reads prompts through the `Ui` seam, skips blanks, exits on `/exit`/`/quit`, arms a per-turn `CancellationToken` with a background Ctrl-C watcher thread, and submits each turn on the `wayland::Harness` via a per-turn `UiBridge` that backs both Nexus seams. | `run_session()` | `tokio`, `tokio_util::CancellationToken`, `wayland::Harness`, `nexus::ChatProvider`, `ui::{Ui, UiBridge, UiEvent, is_exit_command}` |
 | `src/nexus.rs` | Runtime core (Tier 1). A provider-, UI-, persistence-, and workspace-neutral async in-memory engine: owns conversation state + the injected `Tools` + approval policy, consumes the provider's `Stream<ProviderEvent>`, enforces approval before gated tools, executes async tools against an injected `&mut ToolEnv` (consecutive concurrency-safe ungated calls run in parallel via `join_all`; everything else exclusively), and emits `AgentEvent`s to an `AgentObserver`; gates tools via `ApprovalGate`. Every emitted tool call gets a real or synthetic cancelled/denied result so the transcript stays valid on abort. Holds no filesystem or session store. Bounds the tool loop and ends gracefully at the cap. | `ChatProvider` (`respond_stream`), `ProviderEvent`, `ProviderStream`, `Agent`, `Agent::submit_turn()`, `Agent::messages()`, `Tool` (async `execute`, `is_concurrency_safe`), `Tools`, `ToolEnv`, `ToolFuture`, `ToolOutput`, `AgentEvent`, `AgentObserver`, `ApprovalGate`, `ApprovalDecision`, `AssistantTurn`, `ToolCall`, `Message`, `Role` | `anyhow`, `serde_json`, `tracing`, `tokio`, `tokio_util::CancellationToken`, `futures`, `crate::tools` |
 | `src/wayland.rs` | Tier-2 harness. Wraps the bare `nexus::Agent`, owns the execution surface (workspace + `tools::ToolState`) and the optional `session::SessionLog`, injects a `ToolEnv` into each turn, and persists new transcript messages post-turn (best-effort, diffing `agent.messages()`). Mirrors pi's `AgentHarness`. | `Harness`, `Harness::new()`, `Harness::submit_turn()` | `anyhow`, `tracing`, `crate::{nexus, session, tools}` |
@@ -45,7 +46,7 @@ raced against cancellation via `tokio::select!`. All terminal I/O lives behind t
 | `src/approval.rs` | Terminal decision parser (Tier 3). Translates a typed line into the Tier-1 `crate::nexus::ApprovalDecision`: `y`/`yes` allow, `a`/`always` allow-session, anything else denies. | `parse_decision()` | `crate::nexus` |
 | `src/errors.rs` | Provider-neutral typed errors carried across runtime boundaries for user-facing handling and exit codes. | `AuthError`, `UsageError`, `exit_code()` | `thiserror` |
 | `src/telemetry.rs` | Operator observability: `RUST_LOG`-driven tracing to stderr, secret-safe fingerprints, and sanitization of external response bodies before they reach logs/errors. | `init()`, `redact_secret()`, `sanitize_external_body()` | `tracing-subscriber`, `sha2`, `serde_json` |
-| `src/config.rs` | Iris settings file loader. Reads `~/.iris/settings.json` (global) and `<cwd>/.iris/settings.json` (project), merges field-by-field with project winning, ignores unknown keys, and errors loudly on malformed JSON. Provides provider/model/base-url defaults; env still overrides via the provider. | `Settings`, `Settings::load()` | `serde`, `serde_json`, `anyhow`, env/filesystem APIs |
+| `src/config.rs` | Iris settings file loader. Reads `~/.iris/settings.json` (global) and `<cwd>/.iris/settings.json` (project). Project config may override only `defaultModel`; global/user config owns `defaultProvider` and `baseUrl` so repo-local settings cannot redirect bearer tokens. Unknown keys are ignored; malformed JSON errors loudly. | `Settings`, `Settings::load()` | `serde`, `serde_json`, `anyhow`, env/filesystem APIs |
 | `src/session.rs` | Best-effort JSONL transcript persistence. Writes a `session` header then appends one `message` line per conversation entry, flushing each write so a crash leaves a valid prefix. Linear transcript only (no tree/branching/compaction). | `SessionLog`, `SessionLog::create()`, `SessionLog::append()`, `SessionLog::path()` | `serde_json`, `anyhow`, `rand`, filesystem/time APIs, `crate::nexus::Message` |
 | `src/signals.rs` | Graceful SIGINT handling for the REPL. First Ctrl-C sets an interrupt flag the tool loop checks between round-trips (ends the turn cleanly); a second reaps tracked process groups via `process_group`, restores the default handler, and re-raises to force-quit. | `install()`, `interrupted()`, `reset()` | `libc`, `crate::process_group`, atomics |
 | `src/process_group.rs` | Single owner of process-group spawn/kill/reap policy for `bash` shells. Puts commands in their own group, kills+reaps groups, and keeps a lock-free registry so the force-quit SIGINT handler can SIGKILL every live group with only async-signal-safe ops. | `in_own_group()`, `kill()`, `kill_and_reap()`, `register()`, `kill_all_from_signal()`, `GroupGuard` | `libc`, atomics, `std::process` |
@@ -65,21 +66,26 @@ raced against cancellation via `tokio::select!`. All terminal I/O lives behind t
 | `src/tools/find.rs` | Native (ignore + globset) file glob search sorted newest-first. | `execute()` | `path`, `text`, `ignore`, `globset`, `serde` |
 | `src/tools/ls.rs` | Directory listing tool: directories first, dotfiles, directory suffixes, optional recursive tree, optional `long` mode (type marker + human-readable size), entry-count metadata, and output caps. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
 | `src/mimir/mod.rs` | Mimir module declaration: Iris's AI/provider package (the pi-ai equivalent), housing the provider adapters + auth. The `ChatProvider` contract stays in `nexus`. See [`../NAMING.md`](../NAMING.md). | `auth`, `providers` modules | mimir submodules |
-| `src/mimir/auth/mod.rs` | Auth module declaration. | `device_code`, `openai_codex`, `storage` modules | auth submodules |
+| `src/mimir/auth/mod.rs` | Auth module declaration. | `anthropic`, `antigravity`, `device_code`, `openai_codex`, `storage` modules | auth submodules |
 | `src/mimir/auth/storage.rs` | Provider-keyed auth-file storage for OAuth credentials. Reads missing files as empty, validates credential shape, and writes atomically with restricted Unix permissions. | `AuthStore`, `OAuthCredentials` | filesystem/env APIs, `anyhow`, `serde`, `serde_json` |
 | `src/mimir/auth/device_code.rs` | Generic polling helper for OAuth device-code flows. | `DeviceCodePoll`, `poll_device_code()` | `std::thread`, `std::time`, `anyhow` |
 | `src/mimir/auth/openai_codex.rs` | OpenAI Codex OAuth integration. Supports browser callback login, device-code login, token exchange/refresh, and account ID extraction from JWT payloads. | `OpenAiCodexTokenStore`, `AccessToken`, `login_browser()`, `login_device_code()` | `AuthStore`, `poll_device_code`, `base64`, `rand`, `reqwest`, `sha2`, `serde`, `serde_json`, TCP/filesystem/time APIs |
-| `src/mimir/providers/mod.rs` | Provider module declaration. | `openai_codex_responses` module | `src/mimir/providers/openai_codex_responses.rs` |
-| `src/mimir/providers/openai_codex_responses.rs` | Implements `ChatProvider::respond_stream` for the ChatGPT Codex Responses endpoint. Runs the existing blocking reqwest/SSE code on `spawn_blocking`, forwarding text deltas and the final turn onto a `futures` channel as `ProviderEvent`s (a provider-internal `TurnSink` adapts the SSE parser onto the channel). Builds request JSON/headers/URL, advertises tools, retries with backoff, and is cancellation-aware (checks the turn token before each attempt, across backoff, and between SSE lines). | `OpenAiCodexResponsesProvider` | `OpenAiCodexTokenStore`, `ChatProvider`, `ProviderEvent`, `ProviderStream`, Nexus message/turn types, `crate::{tools, errors, telemetry}`, `reqwest`, `futures`, `tokio`, `serde_json`, `tracing` |
+| `src/mimir/auth/anthropic.rs` | Anthropic Claude Code subscription OAuth reuse. Loads credentials from the Iris auth store or bootstraps from Claude Code's `.credentials.json`, refreshes via Anthropic OAuth, and writes rotated tokens back to the same source without reshaping/dropping sibling keys. | `AnthropicTokenStore`, `AUTH_PROVIDER` | `AuthStore`, filesystem/env APIs, `reqwest`, `serde_json`, `anyhow` |
+| `src/mimir/auth/antigravity.rs` | Antigravity Google OAuth integration. Runs browser PKCE login on `127.0.0.1:51121`, requires env-only `ANTIGRAVITY_CLIENT_SECRET` for login/refresh, decodes the public installed-app client ID at runtime, refreshes tokens, and discovers/persists `projectId` via Code Assist (`ANTIGRAVITY_PROJECT_ID` wins over persisted ids; no hard-coded fallback is persisted on discovery failure). | `AntigravityTokenStore`, `login_browser()`, `AUTH_PROVIDER` | `AuthStore`, `base64`, `rand`, `reqwest`, `sha2`, `serde_json`, TCP/filesystem/time APIs |
+| `src/mimir/providers/mod.rs` | Provider module declaration plus shared Iris system-prompt builder. | `anthropic_messages`, `antigravity`, `openai_codex_responses` modules | provider submodules |
+| `src/mimir/providers/transport.rs` | Shared blocking-provider glue: spawns reqwest/SSE work on `spawn_blocking`, forwards events over a channel, classifies HTTP status, performs exactly-once reauth, and parses SSE event framing. | `TurnSink`, `ChannelSink`, `spawn_stream()`, `run_with_reauth()`, `for_each_sse_event()`, `classify_http_status()` | `futures`, `tokio`, `tokio_util`, `reqwest`, `anyhow`, Nexus turn/event types |
+| `src/mimir/providers/openai_codex_responses.rs` | Implements `ChatProvider::respond_stream` for the ChatGPT Codex Responses endpoint. Runs blocking reqwest/SSE code through the shared transport, forwards text deltas and the final turn as `ProviderEvent`s, builds request JSON/headers/URL, advertises tools, retries with backoff, and is cancellation-aware. | `OpenAiCodexResponsesProvider` | `OpenAiCodexTokenStore`, shared transport, `ChatProvider`, Nexus message/turn types, `crate::{tools, errors, telemetry}`, `reqwest`, `serde_json`, `tracing` |
+| `src/mimir/providers/anthropic_messages.rs` | Implements `ChatProvider::respond_stream` for Anthropic Messages on the Claude Code OAuth lane. Builds Claude Code identity/system blocks, enforces user/assistant role alternation, advertises tools, parses Anthropic SSE text/tool-call blocks, and reauths once on auth rejection. | `AnthropicProvider` | `AnthropicTokenStore`, shared transport, `ChatProvider`, Nexus message/turn types, `reqwest`, `serde_json`, `tracing` |
+| `src/mimir/providers/antigravity.rs` | Implements `ChatProvider::respond_stream` for Antigravity/Gemini Code Assist (`v1internal:streamGenerateContent?alt=sse`). Builds the project/model/request envelope, maps Nexus messages/tools to Gemini contents/function declarations, parses SSE response chunks/text/function calls, and reauths once on auth rejection. | `AntigravityProvider` | `AntigravityTokenStore`, shared transport, `ChatProvider`, Nexus message/turn types, `reqwest`, `serde_json`, `tracing` |
 
 ## Data Flow
 
 1. `main()` calls `telemetry::init()`, installs the SIGINT handler via `signals::install()`, and runs `dispatch()`.
-2. For the default command, `run_agent()` loads `config::Settings` for the cwd (rejecting an unsupported `default_provider`), builds `OpenAiCodexResponsesProvider::new()` from the settings model/base-url, creates an `Agent` rooted at the current dir, attaches a best-effort `session::SessionLog` (warns and continues in-memory if it cannot be opened), and a stdio `TextUi`, then calls `cli::run_session()`.
+2. For the default command, `run_agent()` loads `config::Settings` for the cwd, resolves `defaultProvider` from global/user config (unset/blank → `openai-codex`; supported: `openai-codex`, `anthropic`, `antigravity`), builds the selected Mimir provider from settings model/base-url, creates an `Agent` rooted at the current dir, attaches a best-effort `session::SessionLog` (warns and continues in-memory if it cannot be opened), and a stdio `TextUi`, then calls `cli::run_session()`.
 3. `run_session()` creates the tokio current-thread runtime, emits `SessionStarted`, then loops: read a prompt through `Ui::next_prompt()`, skip blanks, break on `/exit`/`/quit`, arm a per-turn `CancellationToken` plus a Ctrl-C watcher thread, and `block_on(Harness::submit_turn(prompt, observer, gate, token))`.
 4. `submit_turn()` appends `Message::user(prompt)` and runs `complete_turn()`.
 5. `complete_turn()` calls `ChatProvider::respond_stream(messages, tools, token)`, which returns a `Stream<Result<ProviderEvent>>`; the loop races each stream read against the turn token via `tokio::select!`.
-6. The OpenAI Codex provider runs its blocking work on `spawn_blocking`: it reads or refreshes OAuth credentials, converts Nexus messages to Codex Responses request JSON (with tool definitions advertised per turn), sends a cancellation-aware request with retry/backoff, and forwards parsed events onto a `futures` channel as `ProviderEvent::TextDelta` / `ProviderEvent::Completed`.
+6. The selected Mimir provider runs blocking HTTP/SSE work on `spawn_blocking` through `transport.rs`: it reads or refreshes provider credentials, converts Nexus messages/tools to that provider's wire JSON, sends a cancellation-aware request (with retry/backoff or one-shot reauth where implemented), and forwards parsed events onto a `futures` channel as `ProviderEvent::TextDelta` / `ProviderEvent::Completed`.
 7. Nexus emits `AssistantText`/`AssistantTextEnd` for deltas/final text and appends the final assistant turn to conversation state.
 8. With no tool calls, Nexus emits `TurnComplete` and returns.
 9. Tool calls run via `run_tools()`: consecutive concurrency-safe, ungated calls form a parallel batch (`join_all`, in-order results); every other call runs exclusively. For each call Nexus records the assistant tool call. Gated tools (`Tool::requires_approval()`) emit a `DiffPreview` when `Tool::diff_preview()` returns one, then `ApprovalGate::review()` collects a decision (raced against cancellation); denial emits `ToolDenied` and records `{ ok: false, denied: true }`. Ungated tools emit `ToolProposed`.
@@ -92,12 +98,15 @@ raced against cancellation via `tokio::select!`. All terminal I/O lives behind t
 
 | Input | Default | Used by |
 |---|---|---|
-| `~/.iris/settings.json`, `<cwd>/.iris/settings.json` | absent (built-in defaults) | `config::Settings::load()` (project overrides global field-by-field) |
-| `IRIS_AUTH_PATH` | `~/.iris/auth.json` | `OpenAiCodexTokenStore::from_env()` |
+| `~/.iris/settings.json`, `<cwd>/.iris/settings.json` | absent (built-in defaults) | `config::Settings::load()` (project overrides only `defaultModel`; global owns provider/base-url) |
+| `IRIS_AUTH_PATH` | `~/.iris/auth.json` | Mimir token stores (`AuthStore::from_env()`) |
 | `IRIS_CONFIG_PATH` | `~/.iris/settings.json` | global settings path override (`config::Settings`) |
 | `IRIS_SESSION_DIR` | `~/.iris/sessions` | transcript root (`session::SessionLog`) |
-| `IRIS_MODEL` | `gpt-5.5` | `OpenAiCodexResponsesConfig::resolve()` (env > settings > default) |
-| `IRIS_CODEX_BASE_URL` | `https://chatgpt.com/backend-api` | `OpenAiCodexResponsesConfig::resolve()` (env > settings > default) |
+| `IRIS_MODEL` | `gpt-5.5` | OpenAI Codex model override (`env > settings > default`) |
+| `IRIS_CODEX_BASE_URL` | `https://chatgpt.com/backend-api` | OpenAI Codex base-url override (`env > settings > default`) |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Anthropic credential bootstrap path (`CLAUDE_CONFIG_DIR/.credentials.json`) |
+| `ANTIGRAVITY_CLIENT_SECRET` | none (required for login/refresh) | Antigravity Google OAuth token exchange/refresh |
+| `ANTIGRAVITY_PROJECT_ID` | discovered project | Antigravity project-id override (wins over stored `projectId`) before `loadCodeAssist` discovery |
 | `RUST_LOG` | `warn` | `telemetry::init()` tracing filter |
 | `HOME` | required when the matching path override is unset | auth/settings/session path resolution |
 
@@ -109,6 +118,8 @@ raced against cancellation via `tokio::select!`. All terminal I/O lives behind t
 | `iris-agent login openai-codex` | Run browser OAuth login using a local callback server. |
 | `iris-agent login openai-codex --browser` | Explicit browser OAuth login. |
 | `iris-agent login openai-codex --device-code` | Run device-code OAuth login. |
+| `iris-agent login anthropic` | Print instructions for signing in with Claude Code; Iris then reuses that OAuth token. |
+| `iris-agent login antigravity` | Run Google browser PKCE OAuth login (requires `ANTIGRAVITY_CLIENT_SECRET`; Antigravity runs also need it available when refresh is required). |
 | `iris-agent help` / `--help` / `-h` | Print command help. |
 
 Unknown commands print help and exit with code `2` (`UsageError`); auth failures exit `3` (`AuthError`); other errors exit `1`.
@@ -128,7 +139,7 @@ Unknown commands print help and exit with code `2` (`UsageError`); auth failures
 ## External Dependencies
 
 - `anyhow` — error propagation and context.
-- `base64` — base64url JWT payload decoding.
+- `base64` — base64url JWT payload decoding, OAuth PKCE/client-id decoding, and auth-file secret encoding.
 - `futures` — `Stream` trait and the unbounded channel bridging the provider's `spawn_blocking` task to the async loop.
 - `tokio` — current-thread async runtime, `spawn_blocking`, and `tokio::select!` cancellation races.
 - `tokio-util` — `CancellationToken` for per-turn and per-tool cancellation.
@@ -162,6 +173,9 @@ Current unit tests cover:
 - Auth storage parsing and atomic restricted writes in `src/mimir/auth/storage.rs`.
 - Device-code polling behavior in `src/mimir/auth/device_code.rs`.
 - JWT account extraction, browser OAuth URL/callback parsing, device-code interval parsing, and device-auth error parsing in `src/mimir/auth/openai_codex.rs`.
+- Anthropic Claude Code credential parsing/write-back, refresh response parsing, role alternation, request construction, and Anthropic SSE text/tool-call parsing.
+- Antigravity PKCE URL/callback parsing, env-only client secret validation, project-id discovery helpers, request construction, tool schema sanitization, and Gemini SSE text/tool-call parsing.
+- Shared provider transport behavior: SSE framing, exactly-once reauth, HTTP-status classification, and dropped-stream handling.
 - Codex URL resolution, request JSON construction, streamed text/delta parsing, tool-call parsing, and missing-output errors in `src/mimir/providers/openai_codex_responses.rs`.
 
 ## Known Gaps
@@ -181,4 +195,4 @@ context, modes, subagents, git/GitHub).
 
 - [`../ROADMAP.md`](../ROADMAP.md) — milestone sequencing and acceptance criteria.
 - [`../FEATURES.md`](../FEATURES.md) — implemented/planned capability inventory.
-- [`../../AGENTS.md`](../../AGENTS.md) — project-specific agent ground rules.
+- Project agent guidelines — local agent operating rules (not tracked as a repository doc).

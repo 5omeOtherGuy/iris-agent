@@ -24,7 +24,7 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-17): Milestone 1 and the async-hard runtime are complete.** The repository currently contains a text-only interactive session backed by an OpenAI Codex Responses provider, streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, provider/model settings, and best-effort JSONL transcript persistence. Nexus now runs a tokio async loop with turn-level cancellation: the provider is an async event stream raced against cancellation, tools are async with per-call child tokens, concurrency-safe tools run in parallel while everything else stays exclusive, and the transcript stays valid on abort. The next runtime work is Milestone 2 (token/context).
+**Status (2026-06-17): Milestone 1 and the async-hard runtime are complete.** The repository currently contains a text-only interactive session backed by selectable Mimir providers (`openai-codex`, `anthropic`, or `antigravity`), streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, provider/model settings, and best-effort JSONL transcript persistence. Nexus now runs a tokio async loop with turn-level cancellation: the provider is an async event stream raced against cancellation, tools are async with per-call child tokens, concurrency-safe tools run in parallel while everything else stays exclusive, and the transcript stays valid on abort. The next runtime work is Milestone 2 (token/context).
 
 Implemented today:
 
@@ -41,8 +41,8 @@ Implemented today:
 - Graceful Ctrl-C handling: first press ends the turn between round-trips, a second force-quits and reaps tracked process groups (`src/signals.rs`, `src/process_group.rs`).
 - A JSON settings file for provider/model defaults (`src/config.rs`, `~/.iris/settings.json` + project `.iris/settings.json`).
 - Best-effort JSONL session transcripts (`src/session.rs`).
-- OpenAI Codex OAuth browser and device-code login plus token loading/refresh in the Mimir provider package (`src/mimir/auth/`).
-- OpenAI Codex Responses request/response handling in `src/mimir/providers/openai_codex_responses.rs`, including tool schemas, retry/backoff, and streamed-response parsing.
+- Mimir auth flows and token loading/refresh under `src/mimir/auth/`: OpenAI Codex browser/device-code OAuth, Anthropic Claude Code OAuth reuse, and Antigravity Google PKCE OAuth (with env-only client secret).
+- Mimir providers under `src/mimir/providers/`: OpenAI Codex Responses, Anthropic Messages (Claude Code subscription lane), and Antigravity/Gemini Code Assist streaming, all translated into Nexus's `ChatProvider` contract.
 - Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
 
 Not implemented yet:
@@ -58,20 +58,28 @@ None beyond the binary itself. The `grep` and `find` tools search in-process via
 the ripgrep library crates (`grep`, `ignore`, `globset`), so no `rg` or `fd`
 binary needs to be on `PATH`.
 
-### Credentials
+### Credentials and provider selection
 
-Iris expects OpenAI Codex OAuth credentials in an Iris auth file. By default it reads:
+Iris stores OAuth credentials in an Iris auth file. By default it reads:
 
 ```text
 ~/.iris/auth.json
 ```
 
-Create or refresh credentials with one of the login commands:
+Create or refresh credentials for the provider you want to use:
 
 ```bash
 cargo run -- login openai-codex
 cargo run -- login openai-codex --device-code
+cargo run -- login anthropic
+ANTIGRAVITY_CLIENT_SECRET=... cargo run -- login antigravity
 ```
+
+Provider notes:
+
+- `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the default provider if no setting is present.
+- `anthropic` uses an existing Claude Code OAuth login. `cargo run -- login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
+- `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is **not shipped in source** and must be available as `ANTIGRAVITY_CLIENT_SECRET` for `login antigravity` and later Antigravity runs that refresh the token.
 
 Override the auth-file path with:
 
@@ -79,16 +87,34 @@ Override the auth-file path with:
 IRIS_AUTH_PATH=/path/to/auth.json cargo run
 ```
 
-Provider/model defaults can also be set in a JSON settings file: `~/.iris/settings.json`
-(global) and `<cwd>/.iris/settings.json` (project, overrides global). Recognized keys:
-`defaultProvider`, `defaultModel`, `baseUrl`. Environment variables override the file.
+Choose the provider for a run with `defaultProvider` in the global JSON settings
+file (`~/.iris/settings.json`, or `IRIS_CONFIG_PATH`). Example:
 
-Optional environment variables:
+```json
+{
+  "defaultProvider": "antigravity",
+  "defaultModel": "gemini-3.5-flash"
+}
+```
 
-- `IRIS_MODEL` — model name; defaults to `gpt-5.5`.
-- `IRIS_CODEX_BASE_URL` — base URL; defaults to `https://chatgpt.com/backend-api`.
+Supported provider ids are `openai-codex`, `anthropic`, and `antigravity`.
+Iris reads the setting once at startup; there is no in-session provider switch.
+Recognized settings keys are `defaultProvider`, `defaultModel`, and `baseUrl`.
+
+Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
+`defaultModel`; a cloned repo cannot choose your provider or redirect OAuth
+bearer tokens with `baseUrl`.
+
+Environment variables:
+
+- `IRIS_AUTH_PATH` — auth-file path; defaults to `~/.iris/auth.json`.
+- `IRIS_MODEL` — OpenAI Codex model override; defaults to `gpt-5.5`.
+- `IRIS_CODEX_BASE_URL` — OpenAI Codex base URL; defaults to `https://chatgpt.com/backend-api`.
 - `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
 - `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
+- `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
+- `ANTIGRAVITY_CLIENT_SECRET` — required for `login antigravity` and any Antigravity run that may refresh an expired/rejected token; not stored in source.
+- `ANTIGRAVITY_PROJECT_ID` — optional Antigravity project-id override; when set it wins over any persisted project id, otherwise Iris discovers/persists one from `loadCodeAssist` and errors if discovery fails.
 
 Start the REPL:
 

@@ -37,15 +37,36 @@
   async streaming `ChatProvider::respond_stream` contract (blocking reqwest/SSE
   code runs on `spawn_blocking` and forwards `ProviderEvent`s over a channel,
   cancellation-aware across attempts/backoff/SSE lines). [Partial]
+- **Anthropic Messages provider** — uses the Claude Code subscription OAuth lane
+  (bearer token, no `x-api-key`), Anthropic Messages SSE, Claude Code identity
+  system block, tool schemas, streamed text, and tool-call assembly. Credentials
+  come from the Iris auth store or an existing Claude Code login. [Partial]
+- **Antigravity provider** — uses Google OAuth for Gemini Code Assist
+  (`v1internal:streamGenerateContent?alt=sse`), project-id discovery/persistence,
+  Gemini content/tool mapping, streamed text, and tool-call assembly. The public
+  installed-app client ID is decoded at runtime; `ANTIGRAVITY_CLIENT_SECRET` is
+  env-only and required for login/refresh. [Partial]
 - **OpenAI Codex OAuth auth-file support** — reads `~/.iris/auth.json` or
   `IRIS_AUTH_PATH`, refreshes expired access tokens, extracts account ID from the
   JWT payload, and rewrites refreshed credentials atomically with restricted Unix
   permissions. [Partial]
+- **Anthropic Claude Code credential reuse** — reads `~/.claude/.credentials.json`
+  (or `CLAUDE_CONFIG_DIR/.credentials.json`) when the Iris auth store does not
+  already hold Anthropic credentials, and writes rotated tokens back to the same
+  source without reshaping or dropping sibling keys. [Partial]
+- **Antigravity Google OAuth login** — browser PKCE OAuth callback flow through
+  `iris-agent login antigravity`; requires `ANTIGRAVITY_CLIENT_SECRET` at login
+  time and during later token refreshes. [Partial]
 - **OpenAI Codex login** — browser OAuth callback flow and device-code OAuth flow
   through `iris-agent login openai-codex`. [Partial]
-- **Provider configuration** — `IRIS_MODEL` and `IRIS_CODEX_BASE_URL`. [Partial]
-- **Additional providers** — Anthropic, OpenAI API, Gemini-compatible, local, or
-  OpenAI-compatible backends. [Planned]
+- **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
+  settings; supported provider ids are `openai-codex`, `anthropic`, and
+  `antigravity`. Project-local settings may override only `defaultModel`; global
+  settings own provider/base-url so a cloned repo cannot redirect bearer tokens.
+  OpenAI Codex additionally supports `IRIS_MODEL` and `IRIS_CODEX_BASE_URL` env
+  overrides. [Partial]
+- **Additional providers** — OpenAI API, local, or OpenAI-compatible backends.
+  [Planned]
 - **Provider capability matrix** — per-model context window, cache support,
   tool-call format, reasoning controls, JSON reliability, and image support.
   [Planned]
