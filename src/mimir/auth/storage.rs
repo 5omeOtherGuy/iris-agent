@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -76,10 +77,8 @@ impl AuthFile {
         }
 
         let raw = serde_json::to_string_pretty(self)?;
-        let tmp_path = path.with_extension("tmp");
-        fs::write(&tmp_path, format!("{raw}\n"))
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-        restrict_file_permissions(&tmp_path)?;
+        let tmp_path = unique_tmp_path(path);
+        write_secret_file(&tmp_path, &format!("{raw}\n"))?;
         fs::rename(&tmp_path, path).with_context(|| format!("failed to replace {}", path.display()))
     }
 
@@ -111,13 +110,24 @@ impl AuthFile {
     }
 }
 
-fn restrict_file_permissions(path: &Path) -> Result<()> {
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "tmp-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ))
+}
+
+fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to restrict permissions for {}", path.display()))?;
-    }
-    Ok(())
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -125,6 +135,8 @@ mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -149,6 +161,19 @@ mod tests {
             .to_string();
         assert!(error.contains("malformed openai-codex OAuth credentials"));
         Ok(())
+    }
+
+    #[test]
+    fn unique_tmp_path_is_not_the_static_tmp_sibling() {
+        let path = Path::new("/tmp/auth.json");
+        let tmp = unique_tmp_path(path);
+        assert_ne!(tmp, path.with_extension("tmp"));
+        assert!(
+            tmp.extension()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("tmp-")
+        );
     }
 
     #[test]

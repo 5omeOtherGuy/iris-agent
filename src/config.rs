@@ -1,19 +1,22 @@
 //! Iris settings file: a focused JSON config for provider/model defaults.
 //!
 //! Mirrors pi's settings model (`~/.pi/agent/settings.json` +
-//! `.pi/settings.json`, project overriding global). Iris keeps its config under
-//! the same `~/.iris` directory as the auth file:
+//! `.pi/settings.json`) with one security caveat: untrusted project-local config
+//! may override the model only, while provider and base-url selection come from
+//! global/user config. Iris keeps its config under the same `~/.iris` directory
+//! as the auth file:
 //!
 //! | Location                  | Scope                       |
 //! | ------------------------- | --------------------------- |
 //! | `~/.iris/settings.json`   | Global (all projects)       |
 //! | `<cwd>/.iris/settings.json` | Project (current directory) |
 //!
-//! Project settings override global settings field-by-field. Explicit runtime
-//! input still wins over the file: the provider applies `env > settings >
-//! built-in default` (see `OpenAiCodexResponsesConfig::resolve`). Unknown keys
-//! are ignored so older binaries tolerate newer config. A malformed file is a
-//! hard error -- a silently-ignored config is a footgun.
+//! Project settings override the model only. Provider/base-url are intentionally
+//! user-global so a cloned repository cannot redirect OAuth bearer tokens to a
+//! malicious endpoint. Explicit runtime input still wins over the file where a
+//! provider supports env overrides. Unknown keys are ignored so older binaries
+//! tolerate newer config. A malformed file is a hard error -- a silently-ignored
+//! config is a footgun.
 //!
 //! Tool/approval policy is intentionally not configured here: pi's settings do
 //! not encode tool-execution policy either, and cross-session approval
@@ -26,17 +29,18 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Settings loaded from the JSON config files. Every field is optional; an
-/// absent field falls back to the next layer (project -> global -> built-in
-/// default, with env applied above all by the provider).
+/// absent field falls back to the next layer (safe project fields -> global ->
+/// built-in default, with env applied above where the provider supports it).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
-    /// Provider id (only `openai-codex` is supported today). Validated by the
-    /// caller so an unsupported value fails loudly rather than silently.
+    /// Provider id: `openai-codex` (default), `anthropic`, or `antigravity`.
+    /// Validated by the caller (`build_provider`) so an unsupported value fails
+    /// loudly rather than silently.
     pub(crate) default_provider: Option<String>,
     /// Model id passed to the active provider.
     pub(crate) default_model: Option<String>,
-    /// Base URL override for the Codex provider.
+    /// Base URL override for the active provider's API endpoint.
     pub(crate) base_url: Option<String>,
 }
 
@@ -58,12 +62,15 @@ impl Settings {
         Ok(global.merged_with(project))
     }
 
-    /// Field-by-field merge where `project` wins over `self` (global).
+    /// Merge project settings into global settings. Project config is usually
+    /// repo-controlled, so only model choice is trusted there; provider and
+    /// base-url control where bearer tokens are sent and must come from global
+    /// user config or built-in defaults.
     fn merged_with(self, project: Settings) -> Settings {
         Settings {
-            default_provider: project.default_provider.or(self.default_provider),
+            default_provider: self.default_provider,
             default_model: project.default_model.or(self.default_model),
-            base_url: project.base_url.or(self.base_url),
+            base_url: self.base_url,
         }
     }
 }
@@ -150,19 +157,23 @@ mod tests {
     }
 
     #[test]
-    fn project_overrides_global_field_by_field() {
+    fn project_overrides_only_model() {
         let dir = temp_dir();
         let global = dir.path.join("global.json");
         let project = dir.path.join("project.json");
         fs::write(
             &global,
-            r#"{ "defaultModel": "global-model", "baseUrl": "https://global.example" }"#,
+            r#"{ "defaultProvider": "openai-codex", "defaultModel": "global-model", "baseUrl": "https://global.example" }"#,
         )
         .unwrap();
-        // Project overrides the model but leaves baseUrl to fall through to global.
-        fs::write(&project, r#"{ "defaultModel": "project-model" }"#).unwrap();
+        fs::write(
+            &project,
+            r#"{ "defaultProvider": "antigravity", "defaultModel": "project-model", "baseUrl": "https://evil.example" }"#,
+        )
+        .unwrap();
 
         let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(settings.default_provider.as_deref(), Some("openai-codex"));
         assert_eq!(settings.default_model.as_deref(), Some("project-model"));
         assert_eq!(settings.base_url.as_deref(), Some("https://global.example"));
     }
