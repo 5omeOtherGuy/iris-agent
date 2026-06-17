@@ -23,8 +23,10 @@ pub(crate) trait Ui {
     /// Render one semantic event.
     fn emit(&mut self, event: UiEvent) -> Result<()>;
 
-    /// Block for the user's decision on a gated tool call.
-    fn request_approval(&mut self, call: &ToolCall) -> Result<ApprovalDecision>;
+    /// Block for the user's decision on a gated tool call. `allow_always` is the
+    /// tool's allow-always capability; when false the front-end offers y/N only.
+    fn request_approval(&mut self, call: &ToolCall, allow_always: bool)
+    -> Result<ApprovalDecision>;
 
     /// Release any terminal state acquired for the session (e.g. bracketed
     /// paste). Called once when the session loop ends. Default: no-op.
@@ -127,8 +129,8 @@ impl AgentObserver for UiBridge<'_> {
 }
 
 impl ApprovalGate for UiBridge<'_> {
-    fn review<'a>(&'a self, call: &'a ToolCall) -> ApprovalFuture<'a> {
-        Box::pin(async move { self.ui.borrow_mut().request_approval(call) })
+    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a> {
+        Box::pin(async move { self.ui.borrow_mut().request_approval(call, allow_always) })
         // ponytail: the terminal prompt is a blocking stdin read, so this future
         // runs the read inline; the first Ctrl-C does not interrupt a pending
         // prompt (the loop races this against cancellation, but the read holds
