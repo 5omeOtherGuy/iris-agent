@@ -12,6 +12,7 @@ mod approval;
 mod cli;
 mod config;
 mod errors;
+mod handles;
 mod mimir;
 mod nexus;
 mod process_group;
