@@ -1,8 +1,15 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use futures::Stream;
+use futures::StreamExt;
+use futures::future::join_all;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 // Safety valve against a runaway tool loop. Each round-trip is one model
 // response; the loop normally ends earlier when the model stops calling tools.
@@ -10,9 +17,10 @@ use serde_json::{Value, json};
 // rather than as a fatal error (see complete_turn).
 const MAX_TOOL_ROUNDTRIPS: usize = 50;
 
-pub(crate) trait TurnSink {
-    fn on_text_delta(&mut self, delta: &str);
-}
+// Shared between every cancellation exit path so the front-end renders one
+// consistent message whether the interrupt landed before, during, or after the
+// provider stream.
+const INTERRUPT_NOTICE: &str = "interrupted; send another message to continue.";
 
 /// Outcome of an approval review for a single tool call. Provider/UI-neutral so
 /// the core loop owns the approval policy without depending on any front-end.
@@ -56,6 +64,32 @@ pub(crate) enum AgentEvent {
     TurnComplete,
 }
 
+/// A provider-neutral streamed model event. The async [`ChatProvider`] yields a
+/// sequence of these instead of one blocking whole-turn result, so the loop can
+/// race each read against cancellation. Mirrors Codex's `ResponseEvent`
+/// (`core/src/client.rs`): incremental text deltas, then one terminal
+/// `Completed` carrying the assembled turn (text + tool calls).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderEvent {
+    /// Incremental assistant text.
+    TextDelta(String),
+    /// Terminal event: the fully assembled assistant turn.
+    Completed(AssistantTurn),
+}
+
+/// A `!Send` boxed stream of provider events tied to the borrow of the provider
+/// and its inputs. Boxed (not `impl Stream`) so the loop code is uniform and the
+/// real provider can back it with a channel fed by a blocking task.
+pub(crate) type ProviderStream<'a> = Pin<Box<dyn Stream<Item = Result<ProviderEvent>> + 'a>>;
+
+/// A `!Send` boxed tool-execution future, so `Box<dyn Tool>` stays object-safe
+/// while `execute` is async.
+pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>> + 'a>>;
+
+/// A `!Send` boxed approval future, so `&dyn ApprovalGate` stays object-safe
+/// while `review` is async (and therefore raceable against cancellation).
+pub(crate) type ApprovalFuture<'a> = Pin<Box<dyn Future<Output = Result<ApprovalDecision>> + 'a>>;
+
 /// Fire-and-forget event sink the loop emits to. `&self` with no control-flow
 /// return; errors only propagate. Mirrors pi's standalone `AgentEventSink`
 /// passed as a separate argument, not a config field.
@@ -63,12 +97,13 @@ pub(crate) trait AgentObserver {
     fn on_event(&self, event: AgentEvent) -> Result<()>;
 }
 
-/// Request/response approval gate. `&self`; the loop branches on the returned
+/// Request/response approval gate. Async so the loop can race a pending approval
+/// against cancellation (`tokio::select!`); the loop branches on the returned
 /// decision to control execution. Mirrors pi's `beforeToolCall` config hook,
 /// which the loop inspects via `{ block }` -- a seam distinct from the event
 /// sink.
 pub(crate) trait ApprovalGate {
-    fn review(&self, call: &ToolCall) -> Result<ApprovalDecision>;
+    fn review<'a>(&'a self, call: &'a ToolCall) -> ApprovalFuture<'a>;
 }
 
 /// Structured result of a successful tool call: the model-facing text plus
@@ -97,14 +132,17 @@ impl ToolOutput {
     }
 }
 
-/// Execution environment handed to a tool: the workspace root plus the mutable
-/// per-session tool state (observed files, bash sessions). Owned by the Tier-2
-/// Wayland harness and injected into each turn, mirroring how pi's
-/// `AgentHarness` feeds its `ExecutionEnv` into the loop rather than the bare
-/// agent owning the filesystem surface. `ToolState` is defined in `crate::tools`.
+/// Execution environment handed to a tool: the workspace root plus the shared
+/// per-session tool state (observed files, bash sessions). The state is behind a
+/// [`RefCell`] so the loop can hand a shared `&ToolEnv` to several
+/// concurrency-safe tools at once (safe-parallel execution); each tool's body is
+/// synchronous and never holds the borrow across an `.await`. Owned by the
+/// Tier-2 Wayland harness and injected into each turn, mirroring how pi's
+/// `AgentHarness` feeds its `ExecutionEnv` into the loop. `ToolState` is defined
+/// in `crate::tools`.
 pub(crate) struct ToolEnv<'a> {
     pub(crate) workspace: &'a Path,
-    pub(crate) state: &'a mut crate::tools::ToolState,
+    pub(crate) state: &'a RefCell<crate::tools::ToolState>,
 }
 
 /// A tool the agent can invoke. Mirrors pi-ai's `Tool`
@@ -116,7 +154,24 @@ pub(crate) trait Tool {
     fn description(&self) -> &str;
     /// JSON Schema for the arguments, used to build provider tool declarations.
     fn parameters(&self) -> Value;
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput>;
+    /// Run the tool. Async + given a child [`CancellationToken`]: a long-running
+    /// tool (e.g. shell) should observe the token and stop promptly. The loop
+    /// also races this future against the token, so a tool that ignores it is
+    /// still abandoned (with a synthetic cancelled result).
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'a>;
+
+    /// Whether this tool may run concurrently with other concurrency-safe tools
+    /// in the same model turn. Default: exclusive. Only read-only tools whose
+    /// behavior is unaffected by concurrent peers opt in; the loop never runs an
+    /// exclusive tool alongside anything else.
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
 
     /// Whether a call to this tool must be approved before it runs.
     fn requires_approval(&self) -> bool {
@@ -166,14 +221,20 @@ impl Tools {
 }
 
 pub(crate) trait ChatProvider {
-    // Providers translate their native response format into this Nexus-owned turn shape.
-    // `tools` is the injected set the provider advertises as callable declarations.
-    fn respond(
-        &self,
-        messages: &[Message],
-        tools: &Tools,
-        sink: &mut dyn TurnSink,
-    ) -> Result<AssistantTurn>;
+    /// Begin a streamed model response. Providers translate their native wire
+    /// format into a stream of Nexus-owned [`ProviderEvent`]s; setup errors
+    /// (e.g. a bad URL) surface synchronously via the `Result`, stream errors
+    /// arrive as `Err` items. `tools` is the injected set the provider
+    /// advertises as callable declarations. `cancel` is the turn token: a
+    /// provider that does blocking work off-thread should observe it so a
+    /// cancelled turn stops issuing/retrying requests instead of running to
+    /// completion in the background.
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a Tools,
+        cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>>;
 }
 
 pub(crate) struct Agent<P> {
@@ -190,6 +251,36 @@ pub(crate) struct Agent<P> {
     // path = per-exact-command keys (e.g. `bash:<cmd>`) once a real audit trail
     // exists (roadmap #14).
     session_allowed: HashSet<String>,
+}
+
+/// Result of consuming one provider stream to its terminal event (or to a
+/// cancellation). Owned so the borrow of `self.messages`/`self.tools` taken by
+/// the stream is released before the loop mutates the transcript.
+enum StreamResult {
+    Completed {
+        turn: AssistantTurn,
+        saw_delta: bool,
+    },
+    Cancelled {
+        partial: String,
+        saw_delta: bool,
+    },
+}
+
+/// Whether the tool phase wants another model round-trip or ended the turn
+/// itself (a cancellation already emitted `TurnComplete`).
+enum ToolsPhase {
+    Continue,
+    Ended,
+}
+
+/// Internal per-call execution outcome, mapped to a transcript message + event
+/// by [`record_call`].
+enum ToolOutcome {
+    Ok(ToolOutput),
+    Err(anyhow::Error),
+    Cancelled,
+    Denied,
 }
 
 impl<P: ChatProvider> Agent<P> {
@@ -212,30 +303,29 @@ impl<P: ChatProvider> Agent<P> {
         &self.messages
     }
 
-    pub(crate) fn submit_turn(
+    pub(crate) async fn submit_turn(
         &mut self,
         prompt: &str,
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
-        env: &mut ToolEnv,
+        env: &ToolEnv<'_>,
+        token: &CancellationToken,
     ) -> Result<()> {
-        // The `turn` span is owned by the harness so it also covers persistence;
-        // it is the current span here via the harness's guard.
         self.messages.push(Message::user(prompt));
-        crate::signals::reset();
         // The bare agent does no persistence: the harness diffs `messages()`
         // onto its session store after the turn returns (even on error).
-        self.complete_turn(obs, gate, env)
+        self.complete_turn(obs, gate, env, token).await
     }
 
-    fn complete_turn(
+    async fn complete_turn(
         &mut self,
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
-        env: &mut ToolEnv,
+        env: &ToolEnv<'_>,
+        token: &CancellationToken,
     ) -> Result<()> {
         for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
-            if crate::signals::interrupted() {
+            if token.is_cancelled() {
                 tracing::info!(roundtrips = roundtrip, "turn interrupted by user");
                 if roundtrip == 0 {
                     // Nothing was produced this turn yet; drop the unanswered
@@ -243,145 +333,58 @@ impl<P: ChatProvider> Agent<P> {
                     // user messages (rejected by some providers).
                     self.messages.pop();
                 }
-                obs.on_event(AgentEvent::Notice(
-                    "interrupted; send another message to continue.".to_string(),
-                ))?;
-                obs.on_event(AgentEvent::TurnComplete)?;
-                return Ok(());
-            }
-            let mut sink = ObserverTurnSink::new(obs);
-            let turn = self
-                .provider
-                .respond(&self.messages, &self.tools, &mut sink)?;
-            let saw_text_delta = sink.saw_text_delta;
-            let stream_error = sink.error.take();
-            drop(sink);
-            if let Some(error) = stream_error {
-                return Err(error);
-            }
-
-            if let Some(text) = turn.text.as_deref().filter(|text| !text.is_empty()) {
-                if saw_text_delta {
-                    obs.on_event(AgentEvent::AssistantTextEnd(text.to_string()))?;
-                } else {
-                    obs.on_event(AgentEvent::AssistantText(text.to_string()))?;
-                }
-                self.messages.push(Message::assistant(text));
-            } else if saw_text_delta {
-                obs.on_event(AgentEvent::AssistantTextEnd(String::new()))?;
-            }
-
-            if turn.tool_calls.is_empty() {
-                tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
-                obs.on_event(AgentEvent::TurnComplete)?;
+                self.emit_interrupted(obs)?;
                 return Ok(());
             }
 
-            if crate::signals::interrupted() {
-                // Ctrl-C arrived while the model was responding: do not run the
-                // tools it just proposed. Record each as denied so the assistant
-                // turn stays paired with tool results, then end the turn cleanly.
-                tracing::info!(
-                    roundtrips = roundtrip,
-                    "turn interrupted after model response; pending tools denied"
-                );
-                for call in &turn.tool_calls {
-                    self.messages.push(Message::assistant_tool_call(call));
-                    obs.on_event(AgentEvent::ToolDenied(call.clone()))?;
-                    self.messages.push(Message::tool_result(
-                        &call.id,
-                        &call.name,
-                        &denied_tool_result_json(),
-                    ));
-                }
-                obs.on_event(AgentEvent::Notice(
-                    "interrupted; send another message to continue.".to_string(),
-                ))?;
-                obs.on_event(AgentEvent::TurnComplete)?;
-                return Ok(());
-            }
-
-            for call in turn.tool_calls {
-                self.messages.push(Message::assistant_tool_call(&call));
-
-                // Resolve the call against the injected set by name (pi's
-                // `tools.find(t => t.name === name)`); `None` is an unknown tool.
-                let tool = self.tools.by_name(&call.name);
-                if let Some(tool) = tool.filter(|tool| tool.requires_approval()) {
-                    // A destructive call (e.g. `rm`) always re-prompts, even when
-                    // its tool was "always allowed" this session: a blanket bash
-                    // allow must not silently auto-run data-losing commands.
-                    let destructive = tool.is_destructive(&call.arguments);
-                    let session_allowed = self.session_allowed.contains(&call.name);
-                    let auto_approved =
-                        session_allowed && !destructive && tool.supports_allow_always();
-                    if auto_approved {
-                        obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
-                    }
-                    if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
-                        obs.on_event(AgentEvent::DiffPreview {
-                            call: call.clone(),
-                            diff,
-                        })?;
-                    }
-                    if !auto_approved {
-                        if destructive && session_allowed {
-                            obs.on_event(AgentEvent::Notice(
-                                "destructive command: approval required even though this tool is allow-always"
-                                    .to_string(),
-                            ))?;
+            match self.stream_turn(obs, token).await? {
+                StreamResult::Cancelled { partial, saw_delta } => {
+                    // Commit any partial assistant text so the transcript stays
+                    // valid (paired with the user prompt); otherwise drop the
+                    // unanswered first-round prompt.
+                    if !partial.is_empty() {
+                        if saw_delta {
+                            obs.on_event(AgentEvent::AssistantTextEnd(partial.clone()))?;
+                        } else {
+                            obs.on_event(AgentEvent::AssistantText(partial.clone()))?;
                         }
-                        match gate.review(&call)? {
-                            ApprovalDecision::Deny => {
-                                tracing::warn!(tool = %call.name, "tool call denied by user");
-                                obs.on_event(AgentEvent::ToolDenied(call.clone()))?;
-                                self.messages.push(Message::tool_result(
-                                    &call.id,
-                                    &call.name,
-                                    &denied_tool_result_json(),
-                                ));
-                                continue;
-                            }
-                            ApprovalDecision::AllowAlways => {
-                                if tool.supports_allow_always() {
-                                    tracing::info!(tool = %call.name, "tool always-allowed this session");
-                                    self.session_allowed.insert(call.name.clone());
-                                } else {
-                                    obs.on_event(AgentEvent::Notice(
-                                        "bash always-allow is disabled; shell commands require approval each time."
-                                            .to_string(),
-                                    ))?;
-                                }
-                            }
-                            ApprovalDecision::Allow => {}
-                        }
+                        self.messages.push(Message::assistant(&partial));
+                    } else if roundtrip == 0 {
+                        self.messages.pop();
                     }
-                } else {
-                    obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+                    tracing::info!(
+                        roundtrips = roundtrip,
+                        "turn interrupted during model stream"
+                    );
+                    self.emit_interrupted(obs)?;
+                    return Ok(());
                 }
+                StreamResult::Completed { turn, saw_delta } => {
+                    if let Some(text) = turn.text.as_deref().filter(|text| !text.is_empty()) {
+                        if saw_delta {
+                            obs.on_event(AgentEvent::AssistantTextEnd(text.to_string()))?;
+                        } else {
+                            obs.on_event(AgentEvent::AssistantText(text.to_string()))?;
+                        }
+                        self.messages.push(Message::assistant(text));
+                    } else if saw_delta {
+                        obs.on_event(AgentEvent::AssistantTextEnd(String::new()))?;
+                    }
 
-                // Run the resolved tool with the assembled env; an unknown tool
-                // yields the same `unknown tool: <name>` result as before.
-                let result = match tool {
-                    Some(tool) => tool.execute(&call.arguments, env),
-                    None => Err(anyhow::anyhow!("unknown tool: {}", call.name)),
-                };
-                tracing::info!(tool = %call.name, ok = result.is_ok(), "tool executed");
-                match &result {
-                    Ok(output) => obs.on_event(AgentEvent::ToolResult {
-                        call: call.clone(),
-                        content: output.content.clone(),
-                    })?,
-                    Err(error) => obs.on_event(AgentEvent::ToolError {
-                        call: call.clone(),
-                        message: format!("{error:#}"),
-                    })?,
+                    if turn.tool_calls.is_empty() {
+                        tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
+                        obs.on_event(AgentEvent::TurnComplete)?;
+                        return Ok(());
+                    }
+
+                    match self
+                        .run_tools(turn.tool_calls, obs, gate, env, token)
+                        .await?
+                    {
+                        ToolsPhase::Ended => return Ok(()),
+                        ToolsPhase::Continue => {}
+                    }
                 }
-                self.messages.push(Message::tool_result(
-                    &call.id,
-                    &call.name,
-                    &tool_result_json(&result),
-                ));
             }
         }
 
@@ -399,38 +402,304 @@ impl<P: ChatProvider> Agent<P> {
         obs.on_event(AgentEvent::TurnComplete)?;
         Ok(())
     }
-}
 
-/// Forwards provider text deltas to the observer as `AssistantTextDelta`.
-/// Stashes the first emit error and stops emitting, so a front-end failure
-/// surfaces once without aborting the provider stream mid-flight.
-struct ObserverTurnSink<'a> {
-    obs: &'a dyn AgentObserver,
-    saw_text_delta: bool,
-    error: Option<anyhow::Error>,
-}
-
-impl<'a> ObserverTurnSink<'a> {
-    fn new(obs: &'a dyn AgentObserver) -> Self {
-        Self {
-            obs,
-            saw_text_delta: false,
-            error: None,
+    /// Consume one provider stream to its terminal event, emitting text deltas
+    /// and racing every read against cancellation. Borrows `&self` (messages +
+    /// tools) only for the stream's lifetime; the owned [`StreamResult`] lets
+    /// the caller mutate the transcript afterward.
+    async fn stream_turn(
+        &self,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+    ) -> Result<StreamResult> {
+        let mut stream = self
+            .provider
+            .respond_stream(&self.messages, &self.tools, token)?;
+        let mut saw_delta = false;
+        let mut partial = String::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    return Ok(StreamResult::Cancelled { partial, saw_delta });
+                }
+                item = stream.next() => match item {
+                    Some(Ok(ProviderEvent::TextDelta(delta))) => {
+                        saw_delta = true;
+                        partial.push_str(&delta);
+                        obs.on_event(AgentEvent::AssistantTextDelta(delta))?;
+                    }
+                    Some(Ok(ProviderEvent::Completed(turn))) => {
+                        return Ok(StreamResult::Completed { turn, saw_delta });
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => bail!("provider stream closed before completion"),
+                },
+            }
         }
     }
-}
 
-impl TurnSink for ObserverTurnSink<'_> {
-    fn on_text_delta(&mut self, delta: &str) {
-        self.saw_text_delta = true;
-        if self.error.is_none()
-            && let Err(error) = self
-                .obs
-                .on_event(AgentEvent::AssistantTextDelta(delta.to_string()))
+    /// Execute the model's tool calls: consecutive concurrency-safe calls run in
+    /// parallel, every other call runs exclusively (one at a time). Transcript
+    /// order is preserved regardless of completion order. On cancellation, every
+    /// not-yet-executed call still gets a synthetic cancelled result so the next
+    /// model request stays valid.
+    async fn run_tools(
+        &mut self,
+        calls: Vec<ToolCall>,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+        env: &ToolEnv<'_>,
+        token: &CancellationToken,
+    ) -> Result<ToolsPhase> {
+        let mut idx = 0;
+        while idx < calls.len() {
+            if token.is_cancelled() {
+                tracing::info!(
+                    pending = calls.len() - idx,
+                    "turn interrupted during tools; remaining calls cancelled"
+                );
+                for call in &calls[idx..] {
+                    record_call(&mut self.messages, obs, call, ToolOutcome::Cancelled)?;
+                }
+                self.emit_interrupted(obs)?;
+                return Ok(ToolsPhase::Ended);
+            }
+
+            if self.is_parallelizable(&calls[idx]) {
+                let mut end = idx;
+                while end < calls.len() && self.is_parallelizable(&calls[end]) {
+                    end += 1;
+                }
+                for call in &calls[idx..end] {
+                    obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+                }
+                // Scope the borrow of `self.tools` so it drops before the
+                // transcript pushes below.
+                let outcomes = run_parallel(&self.tools, &calls[idx..end], env, token).await;
+                for (call, outcome) in calls[idx..end].iter().zip(outcomes) {
+                    record_call(&mut self.messages, obs, call, outcome)?;
+                }
+                idx = end;
+            } else {
+                let outcome = self
+                    .run_gated_single(&calls[idx], obs, gate, env, token)
+                    .await?;
+                record_call(&mut self.messages, obs, &calls[idx], outcome)?;
+                idx += 1;
+            }
+        }
+
+        // The model gets another round-trip to react to the tool results; the
+        // turn is not complete here (only an empty tool-call response, the
+        // round-trip cap, or a cancellation ends it).
+        Ok(ToolsPhase::Continue)
+    }
+
+    /// Whether a call may join a parallel batch: it resolves to a known tool
+    /// that is concurrency-safe and ungated. Gated tools always take the
+    /// exclusive path so their approval prompt runs alone.
+    fn is_parallelizable(&self, call: &ToolCall) -> bool {
+        self.tools
+            .by_name(&call.name)
+            .is_some_and(|tool| tool.is_concurrency_safe() && !tool.requires_approval())
+    }
+
+    /// The exclusive (default) path for one call: approval policy, then a single
+    /// cancellation-raced execution. Returns the outcome; the caller records it.
+    async fn run_gated_single(
+        &mut self,
+        call: &ToolCall,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+        env: &ToolEnv<'_>,
+        token: &CancellationToken,
+    ) -> Result<ToolOutcome> {
+        if let Some(tool) = self
+            .tools
+            .by_name(&call.name)
+            .filter(|t| t.requires_approval())
         {
-            self.error = Some(error);
+            // A destructive call (e.g. `rm`) always re-prompts, even when its
+            // tool was "always allowed" this session: a blanket bash allow must
+            // not silently auto-run data-losing commands.
+            let destructive = tool.is_destructive(&call.arguments);
+            let session_allowed = self.session_allowed.contains(&call.name);
+            let auto_approved = session_allowed && !destructive && tool.supports_allow_always();
+            if auto_approved {
+                obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
+            }
+            if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
+                obs.on_event(AgentEvent::DiffPreview {
+                    call: call.clone(),
+                    diff,
+                })?;
+            }
+            if !auto_approved {
+                if destructive && session_allowed {
+                    obs.on_event(AgentEvent::Notice(
+                        "destructive command: approval required even though this tool is allow-always"
+                            .to_string(),
+                    ))?;
+                }
+                // Race the approval against cancellation so a pending prompt
+                // does not pin the turn open after a Ctrl-C. Cancellation is
+                // recorded as a cancelled call (not a denial) so the transcript
+                // reflects user intent rather than a refusal.
+                let decision = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
+                    decision = gate.review(call) => decision?,
+                };
+                // A blocking front-end prompt (real terminal) cannot observe
+                // the token mid-read, so it may still return a decision after a
+                // Ctrl-C landed. Treat the turn cancellation as authoritative so
+                // a late Allow/Deny neither runs the tool nor mutates the
+                // session allow-policy.
+                if token.is_cancelled() {
+                    return Ok(ToolOutcome::Cancelled);
+                }
+                match decision {
+                    ApprovalDecision::Deny => {
+                        tracing::warn!(tool = %call.name, "tool call denied by user");
+                        return Ok(ToolOutcome::Denied);
+                    }
+                    ApprovalDecision::AllowAlways => {
+                        if tool.supports_allow_always() {
+                            tracing::info!(tool = %call.name, "tool always-allowed this session");
+                            self.session_allowed.insert(call.name.clone());
+                        } else {
+                            obs.on_event(AgentEvent::Notice(
+                                "bash always-allow is disabled; shell commands require approval each time."
+                                    .to_string(),
+                            ))?;
+                        }
+                    }
+                    ApprovalDecision::Allow => {}
+                }
+            }
+        } else {
+            obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+        }
+
+        // Resolve again for execution (the approval borrow above has ended); an
+        // unknown tool yields the same `unknown tool: <name>` result as before.
+        let outcome = match self.tools.by_name(&call.name) {
+            Some(tool) => run_tool(tool, &call.arguments, env, token.child_token()).await,
+            None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
+        };
+        Ok(outcome)
+    }
+
+    fn emit_interrupted(&self, obs: &dyn AgentObserver) -> Result<()> {
+        obs.on_event(AgentEvent::Notice(INTERRUPT_NOTICE.to_string()))?;
+        obs.on_event(AgentEvent::TurnComplete)
+    }
+}
+
+/// Run a batch of concurrency-safe calls concurrently, returning outcomes in the
+/// same order as `calls`. Each call gets its own child cancellation token. Uses
+/// `join_all` (not `tokio::spawn`) so the `!Send` borrowed futures run on the
+/// loop's executor.
+async fn run_parallel(
+    tools: &Tools,
+    calls: &[ToolCall],
+    env: &ToolEnv<'_>,
+    token: &CancellationToken,
+) -> Vec<ToolOutcome> {
+    let futures = calls.iter().map(|call| {
+        let cancel = token.child_token();
+        async move {
+            match tools.by_name(&call.name) {
+                Some(tool) => run_tool(tool, &call.arguments, env, cancel).await,
+                None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
+            }
+        }
+    });
+    join_all(futures).await
+}
+
+/// Run one tool, racing its future against the (child) cancellation token. The
+/// pre-check matters: a synchronous tool body would otherwise run to completion
+/// on the first poll even when already cancelled (the select is `biased` toward
+/// the tool so a cooperative tool's own result wins over the synthetic one).
+async fn run_tool<'a>(
+    tool: &'a dyn Tool,
+    args: &'a Value,
+    env: &'a ToolEnv<'_>,
+    cancel: CancellationToken,
+) -> ToolOutcome {
+    if cancel.is_cancelled() {
+        return ToolOutcome::Cancelled;
+    }
+    tokio::select! {
+        biased;
+        result = tool.execute(args, env, cancel.clone()) => match result {
+            Ok(output) => ToolOutcome::Ok(output),
+            Err(error) => ToolOutcome::Err(error),
+        },
+        _ = cancel.cancelled() => ToolOutcome::Cancelled,
+    }
+}
+
+/// Append one tool call and its result to the transcript and emit the matching
+/// event. Every model-emitted call goes through here exactly once, so the
+/// assistant-tool-call / tool-result pairing is always complete.
+fn record_call(
+    messages: &mut Vec<Message>,
+    obs: &dyn AgentObserver,
+    call: &ToolCall,
+    outcome: ToolOutcome,
+) -> Result<()> {
+    messages.push(Message::assistant_tool_call(call));
+    match outcome {
+        ToolOutcome::Ok(output) => {
+            tracing::info!(tool = %call.name, ok = true, "tool executed");
+            obs.on_event(AgentEvent::ToolResult {
+                call: call.clone(),
+                content: output.content.clone(),
+            })?;
+            messages.push(Message::tool_result(
+                &call.id,
+                &call.name,
+                &tool_result_json(&Ok(output)),
+            ));
+        }
+        ToolOutcome::Err(error) => {
+            tracing::info!(tool = %call.name, ok = false, "tool executed");
+            obs.on_event(AgentEvent::ToolError {
+                call: call.clone(),
+                message: format!("{error:#}"),
+            })?;
+            messages.push(Message::tool_result(
+                &call.id,
+                &call.name,
+                &tool_result_json(&Err(error)),
+            ));
+        }
+        ToolOutcome::Cancelled => {
+            tracing::info!(tool = %call.name, "tool cancelled");
+            obs.on_event(AgentEvent::ToolError {
+                call: call.clone(),
+                message: "cancelled".to_string(),
+            })?;
+            messages.push(Message::tool_result(
+                &call.id,
+                &call.name,
+                &cancelled_tool_result_json(),
+            ));
+        }
+        ToolOutcome::Denied => {
+            tracing::warn!(tool = %call.name, "tool call denied");
+            obs.on_event(AgentEvent::ToolDenied(call.clone()))?;
+            messages.push(Message::tool_result(
+                &call.id,
+                &call.name,
+                &denied_tool_result_json(),
+            ));
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,6 +814,12 @@ fn tool_result_json(result: &Result<ToolOutput>) -> String {
 // `Err` routed through `tool_result_json`, so the `denied` signal is preserved.
 fn denied_tool_result_json() -> String {
     json!({ "ok": false, "error": "tool call denied by user", "denied": true }).to_string()
+}
+
+// Model-facing cancellation payload, distinct from a tool error so the model can
+// tell "interrupted by the user" apart from "the tool failed".
+fn cancelled_tool_result_json() -> String {
+    json!({ "ok": false, "error": "tool call cancelled by user", "cancelled": true }).to_string()
 }
 
 #[cfg(test)]

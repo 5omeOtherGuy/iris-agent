@@ -1,13 +1,25 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use anyhow::Result;
+use tokio::runtime::Builder;
+use tokio_util::sync::CancellationToken;
 
 use crate::nexus::ChatProvider;
 use crate::ui::{Ui, UiBridge, UiEvent, is_exit_command};
 use crate::wayland::Harness;
 
+/// Drive the interactive REPL. Owns the Tier-3 runtime: a current-thread tokio
+/// runtime that `block_on`s each turn, plus a per-turn cancellation token that a
+/// background watcher thread trips when the user presses Ctrl-C. The blocking
+/// stdin reads and rendering stay synchronous; only the turn itself runs on the
+/// runtime so provider streams and tools are raced against cancellation.
 pub(crate) fn run_session<P: ChatProvider>(
     harness: &mut Harness<P>,
     ui: &mut dyn Ui,
 ) -> Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
     ui.emit(UiEvent::SessionStarted)?;
 
     while let Some(prompt) = ui.next_prompt()? {
@@ -19,20 +31,57 @@ pub(crate) fn run_session<P: ChatProvider>(
             break;
         }
 
+        // Clear any stale interrupt BEFORE arming the watcher, so a Ctrl-C left
+        // over from the idle prompt cannot cancel this fresh turn immediately.
+        crate::signals::reset();
+        let token = CancellationToken::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = std::thread::spawn({
+            let token = token.clone();
+            let done = Arc::clone(&done);
+            move || watch_for_interrupt(&token, &done)
+        });
+
         // One bridge per turn backs both Nexus seams (observer + approval gate)
         // from two shared borrows; it drops here so `ui` is free for the
         // session-driver events below.
         let result = {
             let bridge = UiBridge::new(ui);
-            harness.submit_turn(prompt, &bridge, &bridge)
+            runtime.block_on(harness.submit_turn(prompt, &bridge, &bridge, &token))
         };
+        // Stop and join the watcher so it cannot leak past the turn or trip the
+        // next one.
+        done.store(true, Ordering::Relaxed);
+        let _ = watcher.join();
+
         if let Err(error) = result {
             ui.emit(UiEvent::from_turn_error(&error))?;
         }
     }
 
     ui.shutdown()?;
+    // Bound shutdown so an orphaned blocking provider request (the loop dropped
+    // its stream on cancel) cannot hang process exit.
+    runtime.shutdown_timeout(Duration::from_secs(1));
     Ok(())
+}
+
+/// Bridge the async-signal-safe SIGINT handler (which only flips a global
+/// atomic) onto a turn's [`CancellationToken`], running on its own OS thread so
+/// it can trip the token even while a synchronous blocking tool occupies the
+/// runtime's executor thread.
+///
+/// ponytail: 20ms poll. A self-pipe/eventfd would remove the poll, but for
+/// human-scale Ctrl-C latency the poll is enough; it stops as soon as the turn
+/// finishes (`done`).
+fn watch_for_interrupt(token: &CancellationToken, done: &AtomicBool) {
+    while !done.load(Ordering::Relaxed) {
+        if crate::signals::interrupted() {
+            token.cancel();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
@@ -41,7 +90,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use std::cell::RefCell;
 
-    use crate::nexus::{Agent, AssistantTurn, Message, Tools, TurnSink};
+    use crate::nexus::{Agent, AssistantTurn, Message, ProviderEvent, ProviderStream, Tools};
     use crate::ui::text::TextUi;
     use crate::wayland::Harness;
 
@@ -64,17 +113,18 @@ mod tests {
     }
 
     impl ChatProvider for FakeProvider {
-        fn respond(
-            &self,
-            _messages: &[Message],
-            _tools: &Tools,
-            _sink: &mut dyn TurnSink,
-        ) -> Result<AssistantTurn> {
-            match self.responses.borrow_mut().pop() {
-                Some(Ok(turn)) => Ok(turn),
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let item = match self.responses.borrow_mut().pop() {
+                Some(Ok(turn)) => Ok(ProviderEvent::Completed(turn)),
                 Some(Err(error)) => Err(anyhow!(error)),
                 None => Err(anyhow!("unexpected call")),
-            }
+            };
+            Ok(Box::pin(futures::stream::once(async move { item })))
         }
     }
 

@@ -11,11 +11,46 @@ use reqwest::header::{
     AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT,
 };
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::errors::AuthError;
-use crate::nexus::{AssistantTurn, ChatProvider, Message, Role, ToolCall, Tools, TurnSink};
+use crate::nexus::{
+    AssistantTurn, ChatProvider, Message, ProviderEvent, ProviderStream, Role, ToolCall, Tools,
+};
 use crate::telemetry;
+use futures::channel::mpsc;
+
+/// Provider-internal seam for incremental assistant text. The streamed SSE
+/// parser pushes deltas here; the live provider forwards them onto the
+/// [`ProviderStream`] channel, while tests use a no-op sink. Not part of the
+/// Nexus contract: `ChatProvider` is async-streaming, so deltas reach the loop
+/// as `ProviderEvent::TextDelta` rather than through a sink argument.
+trait TurnSink {
+    /// Forward one text delta. Returns `Err` when the consumer has dropped the
+    /// stream (cancellation): the SSE read loop then stops early instead of
+    /// draining the rest of the response, mirroring Codex's dropped-stream
+    /// cancellation.
+    fn on_text_delta(&mut self, delta: &str) -> Result<()>;
+}
+
+/// [`TurnSink`] that forwards each text delta onto the provider's event channel.
+/// `unbounded_send` is synchronous, so it is safe to call from the blocking
+/// request thread.
+struct ChannelSink {
+    tx: mpsc::UnboundedSender<Result<ProviderEvent>>,
+}
+
+impl TurnSink for ChannelSink {
+    fn on_text_delta(&mut self, delta: &str) -> Result<()> {
+        // A send error means the consumer dropped the stream (cancellation):
+        // surface it so the SSE read loop breaks immediately rather than
+        // downloading and discarding the rest of the response on a leaked thread.
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::TextDelta(delta.to_string())))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
+}
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_MODEL: &str = "gpt-5.5";
@@ -56,17 +91,52 @@ impl OpenAiCodexResponsesProvider {
 }
 
 impl ChatProvider for OpenAiCodexResponsesProvider {
-    fn respond(
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a Tools,
+        cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        // Build the request eagerly so setup errors (e.g. a bad base URL) surface
+        // synchronously and nothing borrowed from `self`/`messages`/`tools` is
+        // captured by the blocking task.
+        let request = build_codex_request(&self.config.model, &self.system_prompt, messages, tools);
+        let url = resolve_codex_url(&self.config.base_url)?;
+        let provider = self.clone();
+        let cancel = cancel.clone();
+        let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
+        // The blocking reqwest+SSE work runs off the loop's executor; it streams
+        // text deltas through the channel and ends with one terminal item.
+        // Mirrors Codex's `map_response_events` (spawn + channel), minus the
+        // unused transport/telemetry machinery. The turn token is checked
+        // cooperatively (before each attempt, across retry backoff, and between
+        // SSE lines) so a cancelled turn stops promptly instead of draining the
+        // whole response on a leaked thread.
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelSink { tx: tx.clone() };
+            let terminal = match provider.run_blocking(url, &request, &mut sink, &cancel) {
+                Ok(turn) => Ok(ProviderEvent::Completed(turn)),
+                Err(error) => Err(error),
+            };
+            let _ = tx.unbounded_send(terminal);
+        });
+        Ok(Box::pin(rx))
+    }
+}
+
+impl OpenAiCodexResponsesProvider {
+    /// Drive the blocking retry/reauth state machine and SSE parse on a
+    /// `spawn_blocking` thread, forwarding text deltas through `sink` and
+    /// returning the assembled turn.
+    fn run_blocking(
         &self,
-        messages: &[Message],
-        tools: &Tools,
+        url: Url,
+        request: &Value,
         sink: &mut dyn TurnSink,
+        cancel: &CancellationToken,
     ) -> Result<AssistantTurn> {
         let span = tracing::info_span!("codex_roundtrip", model = %self.config.model);
         let _guard = span.enter();
-
-        let request = build_codex_request(&self.config.model, &self.system_prompt, messages, tools);
-        let url = resolve_codex_url(&self.config.base_url)?;
 
         run_retry_loop(
             |force_refresh| {
@@ -78,14 +148,18 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             },
             |token| {
                 let started = Instant::now();
-                let attempt = self.send_once(url.clone(), token, &request, sink);
+                let attempt = self.send_once(url.clone(), token, request, sink, cancel);
                 tracing::debug!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "codex attempt complete"
                 );
                 attempt
             },
-            sleep,
+            // Sleep in slices so a turn-level Ctrl-C interrupts retry backoff;
+            // the loop's cancellation check then ends the attempt without
+            // firing another request.
+            |delay| sleep_cancellable(delay, cancel),
+            || cancel.is_cancelled(),
         )
     }
 }
@@ -102,12 +176,18 @@ fn run_retry_loop(
     mut get_token: impl FnMut(bool) -> Result<AccessToken>,
     mut send: impl FnMut(&AccessToken) -> Attempt,
     mut sleep: impl FnMut(Duration),
+    is_cancelled: impl Fn() -> bool,
 ) -> Result<AssistantTurn> {
     let mut transient_retries: u32 = 0;
     let mut reauth_used = false;
     let mut force_refresh = false;
 
     loop {
+        // Checked before every attempt and after each backoff sleep: a cancelled
+        // turn stops here rather than issuing or retrying a request.
+        if is_cancelled() {
+            return Err(anyhow!("Codex request cancelled"));
+        }
         let token = match get_token(force_refresh) {
             Ok(token) => token,
             Err(error) => {
@@ -172,6 +252,7 @@ impl OpenAiCodexResponsesProvider {
         token: &AccessToken,
         request: &Value,
         sink: &mut dyn TurnSink,
+        cancel: &CancellationToken,
     ) -> Attempt {
         let headers = match codex_headers(token) {
             Ok(headers) => headers,
@@ -189,7 +270,7 @@ impl OpenAiCodexResponsesProvider {
 
         let status = response.status();
         if status.is_success() {
-            return match parse_response_stream_reader(BufReader::new(response), sink) {
+            return match parse_response_stream_reader(BufReader::new(response), sink, cancel) {
                 Ok(turn) => Attempt::Done(turn),
                 Err(error) => Attempt::Fatal(error),
             };
@@ -440,20 +521,46 @@ fn parse_response_json(value: Value) -> Result<AssistantTurn> {
     Ok(turn)
 }
 
+/// Sleep up to `delay`, but in slices so `cancel` is observed promptly; returns
+/// early once cancelled.
+fn sleep_cancellable(delay: Duration, cancel: &CancellationToken) {
+    const SLICE: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        sleep(remaining.min(SLICE));
+    }
+}
+
 #[cfg(test)]
 fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
     let mut sink = NoopSink;
-    parse_response_stream_reader(BufReader::new(body.as_bytes()), &mut sink)
+    parse_response_stream_reader(
+        BufReader::new(body.as_bytes()),
+        &mut sink,
+        &CancellationToken::new(),
+    )
 }
 
 fn parse_response_stream_reader(
     reader: impl BufRead,
     sink: &mut dyn TurnSink,
+    cancel: &CancellationToken,
 ) -> Result<AssistantTurn> {
     let mut parser = ResponseStreamParser::default();
     let mut event = String::new();
 
     for line in reader.lines() {
+        // Between lines: a cancelled turn stops draining an actively streaming
+        // response promptly (an idle socket read still blocks until the next
+        // byte or the client timeout -- blocking reqwest cannot be force-aborted
+        // mid-read).
+        if cancel.is_cancelled() {
+            bail!("Codex stream cancelled");
+        }
         let line = line.context("failed to read Codex stream response")?;
         if line.trim_end_matches('\r').is_empty() {
             parser.ingest_event(&event, sink)?;
@@ -490,7 +597,7 @@ impl ResponseStreamParser {
             Some("response.output_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                     self.text.push_str(delta);
-                    sink.on_text_delta(delta);
+                    sink.on_text_delta(delta)?;
                 }
             }
             Some("response.output_item.done") => {
@@ -545,7 +652,9 @@ struct NoopSink;
 
 #[cfg(test)]
 impl TurnSink for NoopSink {
-    fn on_text_delta(&mut self, _delta: &str) {}
+    fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn event_data(event: &str) -> String {

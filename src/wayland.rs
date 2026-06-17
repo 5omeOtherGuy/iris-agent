@@ -7,9 +7,12 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::nexus::{Agent, AgentObserver, ApprovalGate, ChatProvider, ToolEnv};
 use crate::session::SessionLog;
@@ -20,7 +23,9 @@ use crate::tools::ToolState;
 pub(crate) struct Harness<P> {
     pub(crate) agent: Agent<P>,
     workspace: PathBuf,
-    state: ToolState,
+    // Shared so the loop can hand a `&ToolEnv` to several concurrency-safe tools
+    // at once; tool bodies borrow it only for their synchronous duration.
+    state: RefCell<ToolState>,
     // Optional transcript persistence. When present, new messages are appended
     // to the JSONL log after each turn (`persisted` tracks how many of the
     // agent's messages are already on disk). None when no log could be opened,
@@ -40,7 +45,7 @@ impl<P: ChatProvider> Harness<P> {
         Self {
             agent,
             workspace,
-            state,
+            state: RefCell::new(state),
             session,
             persisted: 0,
         }
@@ -50,21 +55,24 @@ impl<P: ChatProvider> Harness<P> {
     /// transcript messages. The env is injected into the bare loop (mirroring
     /// `AgentHarness` passing `env` into the run); persistence lives here, not
     /// in the loop.
-    pub(crate) fn submit_turn(
+    pub(crate) async fn submit_turn(
         &mut self,
         prompt: &str,
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
+        token: &CancellationToken,
     ) -> Result<()> {
-        // The turn span covers both the loop and persistence; the bare agent's
-        // tracing events record under it via this guard.
-        let span = tracing::info_span!("turn");
-        let _guard = span.enter();
-        let mut env = ToolEnv {
+        let env = ToolEnv {
             workspace: &self.workspace,
-            state: &mut self.state,
+            state: &self.state,
         };
-        let result = self.agent.submit_turn(prompt, obs, gate, &mut env);
+        // The turn span covers the loop; `Instrument` carries it across awaits
+        // (a held `enter()` guard does not).
+        let result = self
+            .agent
+            .submit_turn(prompt, obs, gate, &env, token)
+            .instrument(tracing::info_span!("turn"))
+            .await;
         // Persist whatever the turn produced even when it ended in an error, so
         // the transcript records the user prompt and any tool work. Best-effort:
         // a write failure is logged, never fatal to the session.
