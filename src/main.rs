@@ -12,6 +12,7 @@ mod approval;
 mod cli;
 mod config;
 mod errors;
+mod handles;
 mod mimir;
 mod nexus;
 mod process_group;
@@ -101,7 +102,10 @@ fn configured_provider() -> String {
 fn run_agent() -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    let provider = build_provider(resolve_provider_id(&settings), &settings, &cwd)?;
+    // Harness-owned assembly: base instructions + runtime context + project
+    // instructions (root AGENTS.md). Fresh and resume call the same function.
+    let system_prompt = wayland::system_prompt::assemble(&cwd);
+    let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
     let agent = Agent::new(provider, tools::built_in_tools());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
@@ -151,7 +155,11 @@ fn resume_agent(session_id: &str) -> Result<()> {
 
     let settings = config::Settings::load(&cwd)?;
     let budget = Some(settings.context_token_budget());
-    let provider = build_provider(resolve_provider_id(&settings), &settings, &cwd)?;
+    // Resume assembles instructions through the same harness-owned path as a
+    // fresh session, so a resumed turn gets identical base/runtime/project
+    // instructions.
+    let system_prompt = wayland::system_prompt::assemble(&cwd);
+    let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
     let agent = Agent::resumed(provider, tools::built_in_tools(), stored.messages);
 
     // Reopen the same transcript for append so continued turns extend it rather
@@ -236,21 +244,29 @@ fn log_resumable_sessions(cwd: &Path) {
 fn build_provider(
     provider_id: &str,
     settings: &config::Settings,
-    cwd: &Path,
+    system_prompt: &str,
 ) -> Result<Box<dyn ChatProvider>> {
     let model = settings.default_model.as_deref();
     let base_url = settings.base_url.as_deref();
     let provider: Box<dyn ChatProvider> = match provider_id {
         "openai-codex" => Box::new(
             mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
-                model, base_url, cwd,
+                model,
+                base_url,
+                system_prompt,
             )?,
         ),
         "anthropic" => Box::new(
-            mimir::providers::anthropic_messages::AnthropicProvider::new(model, base_url, cwd)?,
+            mimir::providers::anthropic_messages::AnthropicProvider::new(
+                model,
+                base_url,
+                system_prompt,
+            )?,
         ),
         "antigravity" => Box::new(mimir::providers::antigravity::AntigravityProvider::new(
-            model, base_url, cwd,
+            model,
+            base_url,
+            system_prompt,
         )?),
         other => {
             return Err(errors::UsageError::new(format!(

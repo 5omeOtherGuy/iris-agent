@@ -1,6 +1,5 @@
 use std::env;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,6 @@ use reqwest::header::{
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::build_iris_system_prompt;
 use crate::errors::AuthError;
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::nexus::{
@@ -74,18 +72,20 @@ pub(crate) struct OpenAiCodexResponsesProvider {
 impl OpenAiCodexResponsesProvider {
     /// Build the provider, resolving model and base URL from the optional
     /// settings values. The provider stays decoupled from the app-level config
-    /// type by taking only the strings it needs.
+    /// type by taking only the strings it needs. `system_prompt` is the
+    /// harness-assembled instruction string (base + runtime context + project
+    /// instructions); the provider only forwards it into the request envelope.
     pub(crate) fn new(
         model: Option<&str>,
         base_url: Option<&str>,
-        workspace: &Path,
+        system_prompt: &str,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
             config: OpenAiCodexResponsesConfig::resolve(model, base_url),
-            system_prompt: build_iris_system_prompt(workspace),
+            system_prompt: system_prompt.to_string(),
             tokens: OpenAiCodexTokenStore::from_env()?,
         })
     }

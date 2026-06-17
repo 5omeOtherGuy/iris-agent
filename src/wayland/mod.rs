@@ -7,6 +7,8 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+pub(crate) mod system_prompt;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -14,6 +16,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::handles::HandleStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, ToolEnv,
 };
@@ -49,6 +52,10 @@ pub(crate) struct Harness<P> {
     // Context token budget that triggers auto-compaction, or `None` to disable
     // it (in-memory loop tests). The Tier-3 app passes the configured budget.
     budget: Option<u64>,
+    // Out-of-context store for oversized tool outputs (issue #61). Present only
+    // when a transcript log is attached, since handles live beside the session
+    // file; an in-memory session keeps every output inline.
+    output_store: Option<HandleStore>,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -117,6 +124,11 @@ impl<P: ChatProvider> Harness<P> {
         entry_ids: Vec<Option<String>>,
         budget: Option<u64>,
     ) -> Self {
+        // Derive the handle store from the session file so oversized outputs are
+        // stored beside the transcript that references them.
+        let output_store = session
+            .as_ref()
+            .map(|log| HandleStore::for_session(log.path()));
         Self {
             agent,
             workspace,
@@ -125,6 +137,7 @@ impl<P: ChatProvider> Harness<P> {
             persisted,
             entry_ids,
             budget,
+            output_store,
         }
     }
 
@@ -147,6 +160,10 @@ impl<P: ChatProvider> Harness<P> {
         let env = ToolEnv {
             workspace: &self.workspace,
             state: &self.state,
+            output_store: self
+                .output_store
+                .as_ref()
+                .map(|store| store as &dyn crate::nexus::ToolOutputStore),
         };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
