@@ -123,7 +123,7 @@ impl AgentObserver for RecordingFrontend {
 }
 
 impl ApprovalGate for RecordingFrontend {
-    fn review<'a>(&'a self, _call: &'a ToolCall) -> ApprovalFuture<'a> {
+    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
         let mut snapshot = self.events_at_review.borrow_mut();
         if snapshot.is_none() {
             *snapshot = Some(self.events.borrow().clone());
@@ -1425,7 +1425,7 @@ impl AgentObserver for BlockingApprovalGate {
     }
 }
 impl ApprovalGate for BlockingApprovalGate {
-    fn review<'a>(&'a self, _call: &'a ToolCall) -> ApprovalFuture<'a> {
+    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
         Box::pin(async move {
             futures::future::pending::<()>().await;
             Ok(ApprovalDecision::Allow)

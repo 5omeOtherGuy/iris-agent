@@ -62,6 +62,11 @@ fn err_style() -> Style {
 fn dim_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
+fn prompt_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
 fn banner_style() -> Style {
     Style::default().fg(Color::Magenta)
 }
@@ -110,6 +115,26 @@ impl Screen {
         }
     }
 
+    /// Append a blank separator row before a new top-level block, unless the
+    /// transcript is empty or already ends in a blank row. Keeps consecutive
+    /// event blocks visually distinct without stacking multiple blank lines.
+    fn push_blank(&mut self) {
+        match self.transcript.last() {
+            None => {}
+            Some(last) if last.text.is_empty() => {}
+            _ => self.transcript.push(Row {
+                text: String::new(),
+                style: Style::default(),
+            }),
+        }
+    }
+
+    /// Finish any live stream and open a fresh block with a leading separator.
+    fn begin_block(&mut self) {
+        self.finish_stream();
+        self.push_blank();
+    }
+
     /// Push each line of `text` into the transcript with one style.
     fn push(&mut self, text: &str, style: Style) {
         for line in text.split('\n') {
@@ -133,6 +158,9 @@ impl Screen {
     pub(crate) fn apply(&mut self, event: UiEvent) {
         match event {
             UiEvent::AssistantTextDelta(delta) => {
+                if self.streaming.is_none() {
+                    self.push_blank();
+                }
                 self.streaming
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
@@ -142,12 +170,14 @@ impl Screen {
                 // the accumulator and commit the authoritative text exactly once.
                 self.streaming = None;
                 if !text.is_empty() {
+                    self.push_blank();
                     self.push(&text, assistant_style());
                 }
             }
             UiEvent::AssistantText(text) => {
                 self.finish_stream();
                 if !text.is_empty() {
+                    self.push_blank();
                     self.push(&text, assistant_style());
                 }
             }
@@ -162,28 +192,28 @@ impl Screen {
                 self.finish_stream();
             }
             UiEvent::ToolAutoApproved(call) => {
-                self.finish_stream();
+                self.begin_block();
                 self.push(
                     &format!("auto-approved - {} - session", summarize(&call)),
                     dim_style(),
                 );
             }
             UiEvent::DiffPreview { call, diff } => {
-                self.finish_stream();
+                self.begin_block();
                 self.push(&format!("diff - {}", summarize(&call)), dim_style());
                 for (text, style) in diff_rows(&diff) {
                     self.transcript.push(Row { text, style });
                 }
             }
             UiEvent::ToolDenied(call) => {
-                self.finish_stream();
+                self.begin_block();
                 self.push(
                     &format!("[error] denied - {}", summarize(&call)),
                     err_style(),
                 );
             }
             UiEvent::ToolResult { call, content } => {
-                self.finish_stream();
+                self.begin_block();
                 let summary = summarize(&call);
                 let head = if content.is_empty() {
                     summary
@@ -205,16 +235,16 @@ impl Screen {
                 }
             }
             UiEvent::ToolError { call, message } => {
-                self.finish_stream();
+                self.begin_block();
                 self.push(&format!("[error] {}", summarize(&call)), err_style());
                 self.push(&format!("  error: {message}"), err_style());
             }
             UiEvent::Notice(message) => {
-                self.finish_stream();
+                self.begin_block();
                 self.push(&format!("note: {message}"), dim_style());
             }
             UiEvent::TurnError { kind, message } => {
-                self.finish_stream();
+                self.begin_block();
                 match kind {
                     TurnErrorKind::Auth => {
                         self.push(&format!("auth error: {message}"), err_style());
@@ -310,6 +340,7 @@ impl Screen {
 
     /// Commit a submitted prompt into the transcript as a user line.
     fn commit_user(&mut self, text: &str) {
+        self.push_blank();
         for line in text.split('\n') {
             self.push(&format!("> {line}"), user_style());
         }
@@ -653,14 +684,20 @@ impl Ui for TuiUi {
         self.draw(false)
     }
 
-    fn request_approval(&mut self, call: &ToolCall) -> Result<ApprovalDecision> {
-        self.screen.finish_stream();
+    fn request_approval(
+        &mut self,
+        call: &ToolCall,
+        allow_always: bool,
+    ) -> Result<ApprovalDecision> {
+        self.screen.begin_block();
+        let options = if allow_always {
+            "[y] once  [a] always  [N] deny"
+        } else {
+            "[y] once  [N] deny"
+        };
         self.screen.push(
-            &format!(
-                "approve {}?  [y] once  [a] always  [N] deny",
-                summarize(call)
-            ),
-            dim_style(),
+            &format!("approve {}?  {options}", summarize(call)),
+            prompt_style(),
         );
         let _guard = RawGuard::new()?;
         loop {
@@ -679,7 +716,7 @@ impl Ui for TuiUi {
             }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(ApprovalDecision::Allow),
-                KeyCode::Char('a') | KeyCode::Char('A') => {
+                KeyCode::Char('a') | KeyCode::Char('A') if allow_always => {
                     return Ok(ApprovalDecision::AllowAlways);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter | KeyCode::Esc => {
@@ -778,6 +815,19 @@ mod tests {
         assert!(texts.iter().any(|t| t == "[ok] read note.txt - 2 lines"));
         assert!(texts.iter().any(|t| t == "  a"));
         assert!(texts.iter().any(|t| t == "  b"));
+    }
+
+    #[test]
+    fn consecutive_blocks_get_one_blank_separator() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantText("hi".to_string()));
+        screen.apply(UiEvent::Notice("note".to_string()));
+        let texts: Vec<String> = screen.transcript.iter().map(row_text).collect();
+        // A single blank row separates the two blocks; no leading or double blank.
+        assert_eq!(
+            texts,
+            vec!["hi".to_string(), String::new(), "note: note".to_string()]
+        );
     }
 
     #[test]

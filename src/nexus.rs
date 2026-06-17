@@ -106,7 +106,10 @@ pub(crate) trait AgentObserver {
 /// which the loop inspects via `{ block }` -- a seam distinct from the event
 /// sink.
 pub(crate) trait ApprovalGate {
-    fn review<'a>(&'a self, call: &'a ToolCall) -> ApprovalFuture<'a>;
+    /// `allow_always` mirrors the tool's [`Tool::supports_allow_always`] so the
+    /// front-end only offers an "always allow" choice the loop will honor (shell
+    /// tools opt out, so their prompt is y/N only).
+    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a>;
 }
 
 /// Structured result of a successful tool call: the model-facing text plus
@@ -566,7 +569,7 @@ impl<P: ChatProvider> Agent<P> {
                 let decision = tokio::select! {
                     biased;
                     _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
-                    decision = gate.review(call) => decision?,
+                    decision = gate.review(call, tool.supports_allow_always()) => decision?,
                 };
                 // A blocking front-end prompt (real terminal) cannot observe
                 // the token mid-read, so it may still return a decision after a
