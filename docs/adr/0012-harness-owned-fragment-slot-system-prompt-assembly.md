@@ -1,7 +1,7 @@
 # ADR-0012: Harness-owned fragment/slot system-prompt assembly
 
 **Date**: 2026-06-18
-**Status**: accepted
+**Status**: accepted (numeric `slot` ordering revised by ADR-0015)
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context

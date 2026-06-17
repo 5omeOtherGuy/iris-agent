@@ -16,3 +16,4 @@
 | [0012](0012-harness-owned-fragment-slot-system-prompt-assembly.md) | Harness-owned fragment/slot system-prompt assembly | accepted | 2026-06-18 |
 | [0013](0013-shared-selector-schema-for-dynamic-prompt-and-tool-assembly.md) | Shared selector schema for dynamic system-prompt and tool-surface assembly | proposed | 2026-06-18 |
 | [0014](0014-tool-visibility-is-not-authorization.md) | Tool visibility is not authorization | accepted | 2026-06-18 |
+| [0015](0015-assign-fragments-to-config-defined-named-slots.md) | Assign fragments to config-defined named slots instead of numeric slots | proposed | 2026-06-18 |
