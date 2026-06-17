@@ -19,9 +19,16 @@
 //!   one back by id with its entries in order.
 //!
 //! Deliberately out of scope for this slice (later milestones): tree navigation
-//! and branch/leaf markers, compaction entries, labels, fork, token accounting,
-//! and the `/resume` UI. The id + `parentId` shape is chosen so those can be
-//! added without rewriting the on-disk format.
+//! and branch/leaf markers, labels, fork, and full token accounting. The id +
+//! `parentId` shape is chosen so those can be added without rewriting the
+//! on-disk format.
+//!
+//! A `compaction` entry records that an inclusive range of prior `message`
+//! entries was summarized. [`read_messages`] replaces that covered range with
+//! the summary during context rebuild, so a resumed session sees the summary
+//! instead of replaying the covered turns. The entry stores enough metadata
+//! (covered range, summary, `createdAt`, token-estimate placeholder) for later
+//! auto-compaction/token-budget policy to attach without changing the kind.
 //!
 //! Location (mirrors pi's `~/.pi/agent/sessions/...`):
 //!
@@ -32,6 +39,7 @@
 //! where `<root>` is `IRIS_SESSION_DIR` if set, else `~/.iris/sessions`, and
 //! `<cwd-slug>` is the working directory with path separators flattened.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -109,14 +117,66 @@ impl SessionLog {
     }
 
     /// Append one conversation message as a `message` entry line, generating a
-    /// stable entry id and linking `parentId` to the previous leaf.
-    pub(crate) fn append(&mut self, message: &Message) -> Result<()> {
+    /// stable entry id and linking `parentId` to the previous leaf. Returns the
+    /// assigned entry id so a caller can later reference it (e.g. as a
+    /// compaction coverage bound) without assuming the id format.
+    pub(crate) fn append(&mut self, message: &Message) -> Result<String> {
         let id = self.next_id();
         let entry = message_entry(&id, self.last_id.as_deref(), message);
         write_line(&mut self.file, &entry)
             .with_context(|| format!("failed to append to session {}", self.path.display()))?;
-        self.last_id = Some(id);
-        Ok(())
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Append a `compaction` entry recording that the inclusive range of
+    /// `message` entries `[covered_from, covered_to]` was summarized into
+    /// `summary`. During context rebuild ([`read_messages`]) those covered
+    /// messages are replaced by a single summary message, so a resumed session
+    /// rebuilds context through the summary instead of replaying the range.
+    ///
+    /// This is the manual/internal append path: the summary text is produced by
+    /// the caller, so the entry is independent of *how* it was summarized
+    /// (manual now; a provider/local/remote summarizer later). `token_estimate`
+    /// is an upgrade-safe placeholder -- `None` until a token-accounting
+    /// convention exists, `Some(n)` once one does, without changing the kind.
+    //
+    // ponytail: the write side has no production trigger in this foundation
+    // slice -- auto-compaction is deferred (issue #49) and a CLI/TUI command is
+    // explicitly out of scope, so the manual path is exercised by tests until a
+    // trigger lands. `allow(dead_code)` marks that intent rather than adding an
+    // out-of-scope command just to satisfy the no-warnings gate.
+    #[allow(dead_code)]
+    pub(crate) fn append_compaction(
+        &mut self,
+        covered_from: &str,
+        covered_to: &str,
+        summary: &str,
+        token_estimate: Option<u64>,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "compaction",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "createdAt": now_ms(),
+            "coveredFrom": covered_from,
+            "coveredTo": covered_to,
+            "summary": summary,
+            // ponytail: no token-accounting convention yet, so this is an
+            // explicit null placeholder. Upgrade path = write the real estimate
+            // here when auto-compaction/token budgeting lands; kind unchanged.
+            "tokenEstimate": token_estimate,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append compaction to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
     }
 
     /// Reopen an existing transcript file for append, so a resumed session
@@ -340,8 +400,12 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        if value.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
+        // Both `message` and `compaction` entries occupy the leaf chain and an
+        // entry-id slot, so a resumed append must link its `parentId` past, and
+        // count its `next_seq` beyond, whichever kind is the current leaf.
+        match value.get("type").and_then(Value::as_str) {
+            Some("message") | Some("compaction") => {}
+            _ => continue,
         }
         count += 1;
         if let Some(entry_id) = value.get("id").and_then(Value::as_str) {
@@ -418,7 +482,12 @@ fn read_messages(path: &Path) -> Result<Vec<Message>> {
         bail!("first line is not a session header in {}", path.display());
     }
 
-    let mut messages = Vec::new();
+    // Collect message entries (with their ids, for compaction coverage lookup)
+    // and compaction entries separately, then rebuild: covered ranges are
+    // replaced by their summary so the resumed context carries the summary
+    // instead of the original turns.
+    let mut entries: Vec<(Option<String>, Message)> = Vec::new();
+    let mut compactions: Vec<Compaction> = Vec::new();
     for line in lines {
         let Ok(text) = line else {
             tracing::warn!(path = %path.display(), "skipping non-UTF-8 session line");
@@ -428,14 +497,136 @@ fn read_messages(path: &Path) -> Result<Vec<Message>> {
             tracing::warn!(path = %path.display(), "skipping malformed session line");
             continue;
         };
-        if value.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
+        match value.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let id = value.get("id").and_then(Value::as_str).map(String::from);
+                if let Some(message) = value.get("message").and_then(parse_message) {
+                    entries.push((id, message));
+                }
+            }
+            Some("compaction") => match parse_compaction(&value) {
+                Some(compaction) => compactions.push(compaction),
+                None => {
+                    tracing::warn!(path = %path.display(), "skipping malformed compaction entry");
+                }
+            },
+            _ => continue,
         }
-        if let Some(message) = value.get("message").and_then(parse_message) {
+    }
+    rebuild_with_compactions(path, entries, compactions)
+}
+
+/// A persisted compaction entry's rebuild-relevant fields: the inclusive range
+/// of covered `message` entry ids and the summary that replaces them. Other
+/// persisted metadata (`createdAt`, `tokenEstimate`) is durable but not needed
+/// to rebuild context, so it is not read here.
+struct Compaction {
+    covered_from: String,
+    covered_to: String,
+    summary: String,
+}
+
+/// Parse a `compaction` entry's rebuild fields. `None` (skipped as malformed)
+/// when a required field is missing, mirroring the line-level leniency for
+/// truncated/garbled entries.
+fn parse_compaction(value: &Value) -> Option<Compaction> {
+    Some(Compaction {
+        covered_from: value
+            .get("coveredFrom")
+            .and_then(Value::as_str)?
+            .to_string(),
+        covered_to: value.get("coveredTo").and_then(Value::as_str)?.to_string(),
+        summary: value.get("summary").and_then(Value::as_str)?.to_string(),
+    })
+}
+
+/// Rebuild the provider-visible message list, replacing each compaction's
+/// covered inclusive id range with a single summary message in place of the
+/// first covered message.
+///
+/// Coverage is keyed on durable message entry ids, not array positions, so the
+/// result is stable across reads. Multiple non-overlapping compactions apply
+/// independently and deterministically. A range whose endpoints reference a
+/// missing id, run backwards, or overlap another compaction's range is rejected
+/// as invalid session data (an explicit error, like the read path's other hard
+/// failures) rather than silently dropping covered turns or their summary.
+//
+// ponytail: the covered range is taken as given; a caller that splits a
+// tool-call/tool-result pair across the boundary can leave a dangling half.
+// The manual append path chooses clean boundaries today; add pair-aware range
+// validation when an automatic summarizer picks ranges without that care.
+fn rebuild_with_compactions(
+    path: &Path,
+    entries: Vec<(Option<String>, Message)>,
+    compactions: Vec<Compaction>,
+) -> Result<Vec<Message>> {
+    if compactions.is_empty() {
+        return Ok(entries.into_iter().map(|(_, message)| message).collect());
+    }
+    // Owned-key map (ids are tiny) so `entries` can be consumed below without a
+    // lingering borrow. Ids are unique per session by construction, so there is
+    // no real collision; `collect` would otherwise keep the last seen.
+    let index_of: HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (id, _))| id.clone().map(|id| (id, i)))
+        .collect();
+
+    let mut covered = vec![false; entries.len()];
+    // Summary to emit at the position of each range's first covered message.
+    let mut summary_at: Vec<Option<String>> = vec![None; entries.len()];
+    for compaction in compactions {
+        let from = lookup_covered(&index_of, &compaction.covered_from, path)?;
+        let to = lookup_covered(&index_of, &compaction.covered_to, path)?;
+        if from > to {
+            bail!(
+                "compaction range {}..{} runs backwards in {}",
+                compaction.covered_from,
+                compaction.covered_to,
+                path.display()
+            );
+        }
+        // `from <= to` is checked above, so the inclusive range is valid.
+        for slot in &mut covered[from..=to] {
+            if *slot {
+                bail!(
+                    "overlapping compaction coverage at id {} in {}",
+                    compaction.covered_from,
+                    path.display()
+                );
+            }
+            *slot = true;
+        }
+        summary_at[from] = Some(compaction.summary);
+    }
+
+    let mut messages = Vec::new();
+    for (i, (_, message)) in entries.into_iter().enumerate() {
+        if let Some(summary) = summary_at[i].take() {
+            // The summary stands in for the covered turns as a single user-role
+            // message; providers accept it verbatim and resume continues from
+            // it. The role/text choice lives only here, so swapping in a
+            // provider/local summarizer later changes how the text is produced,
+            // not how storage or rebuild work.
+            messages.push(Message::user(&summary));
+        }
+        if !covered[i] {
             messages.push(message);
         }
     }
     Ok(messages)
+}
+
+/// Resolve a compaction coverage endpoint id to its message index, erroring
+/// when the id is not a known message entry in this session.
+fn lookup_covered(index_of: &HashMap<String, usize>, id: &str, path: &Path) -> Result<usize> {
+    index_of.get(id).copied().with_context(|| {
+        format!(
+            "compaction covers unknown message id {} in {}",
+            id,
+            path.display()
+        )
+    })
 }
 
 /// Reconstruct a [`Message`] from a persisted entry's inner `message` object.
@@ -861,5 +1052,145 @@ mod tests {
     fn cwd_slug_flattens_separators_and_handles_root() {
         assert_eq!(cwd_slug(Path::new("/home/dev/my-proj")), "home-dev-my-proj");
         assert_eq!(cwd_slug(Path::new("/")), "root");
+    }
+
+    /// Message contents in rebuild order -- the provider-visible context shape.
+    fn contents(session: &StoredSession) -> Vec<String> {
+        session.messages.iter().map(|m| m.content.clone()).collect()
+    }
+
+    #[test]
+    fn append_compaction_writes_a_compaction_entry_with_durable_metadata() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let compaction_id = log
+            .append_compaction(&from, &to, "summary text", None)
+            .unwrap();
+
+        let entries = lines(log.path());
+        let entry = entries.last().unwrap();
+        assert_eq!(entry["type"], "compaction");
+        assert_eq!(entry["id"], compaction_id);
+        // The compaction links onto the leaf it summarizes, keeping the chain.
+        assert_eq!(entry["parentId"], to);
+        assert_eq!(entry["coveredFrom"], from);
+        assert_eq!(entry["coveredTo"], to);
+        assert_eq!(entry["summary"], "summary text");
+        assert!(entry["createdAt"].is_u64());
+        // Token estimate is an explicit upgrade-safe placeholder until a token
+        // convention exists.
+        assert!(entry["tokenEstimate"].is_null());
+    }
+
+    #[test]
+    fn rebuild_replaces_the_covered_range_with_the_summary() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        log.append(&Message::user("gamma")).unwrap();
+        log.append(&Message::assistant("delta")).unwrap();
+        log.append_compaction(&from, &to, "SUMMARY", None).unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        // The covered turns are gone, replaced in place by one summary message;
+        // the uncovered tail is preserved. Fails if covered turns are replayed.
+        assert_eq!(contents(&session), ["SUMMARY", "gamma", "delta"]);
+        assert_eq!(session.messages[0].role, Role::User);
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|m| m.content != "alpha" && m.content != "beta"),
+            "covered turns must not be replayed alongside the summary"
+        );
+    }
+
+    #[test]
+    fn rebuild_applies_multiple_non_overlapping_compactions() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let a = log.append(&Message::user("a")).unwrap();
+        log.append(&Message::assistant("b")).unwrap();
+        let c = log.append(&Message::user("c")).unwrap();
+        log.append(&Message::assistant("d")).unwrap();
+        log.append_compaction(&a, &a, "S1", None).unwrap();
+        log.append_compaction(&c, &c, "S2", None).unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        // Each covered id is replaced independently and deterministically.
+        assert_eq!(contents(&session), ["S1", "b", "S2", "d"]);
+    }
+
+    #[test]
+    fn rebuild_rejects_overlapping_compaction_coverage() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let a = log.append(&Message::user("a")).unwrap();
+        let b = log.append(&Message::assistant("b")).unwrap();
+        let c = log.append(&Message::user("c")).unwrap();
+        // Two compactions whose covered ranges overlap on `b`.
+        log.append_compaction(&a, &b, "S1", None).unwrap();
+        log.append_compaction(&b, &c, "S2", None).unwrap();
+        drop(log);
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let meta = store.find(&id).unwrap().unwrap();
+        assert!(
+            store.open(&meta).is_err(),
+            "overlapping compaction coverage must be rejected, not silently merged"
+        );
+    }
+
+    #[test]
+    fn rebuild_rejects_compaction_covering_an_unknown_id() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("a")).unwrap();
+        // `ffffffff` is not an entry id in this session.
+        log.append_compaction("ffffffff", "ffffffff", "S", None)
+            .unwrap();
+        drop(log);
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let meta = store.find(&id).unwrap().unwrap();
+        assert!(store.open(&meta).is_err());
+    }
+
+    #[test]
+    fn resume_continues_the_chain_after_a_compaction_entry() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("a")).unwrap();
+        let to = log.append(&Message::assistant("b")).unwrap();
+        let compaction_id = log.append_compaction(&from, &to, "SUM", None).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Resuming must treat the compaction entry as the current leaf: the next
+        // append links onto it and draws a fresh, non-colliding id.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        let new_id = resumed.append(&Message::user("c")).unwrap();
+        drop(resumed);
+        assert_ne!(
+            new_id, compaction_id,
+            "resumed id must not collide with the compaction id"
+        );
+        let last = lines(&path).pop().unwrap();
+        assert_eq!(last["message"]["content"], "c");
+        assert_eq!(last["parentId"], compaction_id);
+
+        // And the rebuilt context is summary + the post-compaction turn.
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(contents(&session), ["SUM", "c"]);
     }
 }
