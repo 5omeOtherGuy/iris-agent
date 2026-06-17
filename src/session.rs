@@ -653,7 +653,7 @@ mod tests {
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
         let id = log.id().to_string();
         // A full non-ASCII line round-trips fine.
-        log.append(&Message::user("caf\u{e9}")).unwrap();
+        log.append(&Message::user("\u{4f60}\u{597d}")).unwrap();
         let path = log.path().to_path_buf();
         drop(log);
         // A crash mid-write can leave a fragment whose bytes are an incomplete
@@ -665,7 +665,7 @@ mod tests {
 
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
         assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].content, "caf\u{e9}");
+        assert_eq!(session.messages[0].content, "\u{4f60}\u{597d}");
     }
 
     #[test]
