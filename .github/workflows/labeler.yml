@@ -1,0 +1,17 @@
+# Auto-label PRs by which paths they touch, feeding triage and the release-note
+# categories in .github/release.yml. Rules live in .github/labeler.yml.
+name: Labeler
+
+on: [pull_request_target]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Apply labels
+        uses: actions/labeler@v5

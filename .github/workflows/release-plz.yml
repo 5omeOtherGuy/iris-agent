@@ -1,0 +1,39 @@
+# release-plz: the Rust-native release automation. On every push to main it
+# opens/updates a "release" PR that bumps the version and maintains CHANGELOG.md
+# from the merged commits. Publishing to crates.io is disabled (release-plz.toml),
+# so this only runs the release-PR step; merge that PR to cut a version.
+# Docs: https://release-plz.dev/docs/github
+name: release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

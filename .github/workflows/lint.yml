@@ -1,0 +1,42 @@
+# Lightweight, fast linters that are not Rust compilation:
+#   - actionlint: validates the GitHub Actions workflow files themselves.
+#   - typos: catches spelling mistakes in source, comments, and docs.
+# Both are cheap and run independently of the cargo CI job.
+name: Lint
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Run typos
+        uses: crate-ci/typos@master

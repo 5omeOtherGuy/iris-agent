@@ -1,0 +1,28 @@
+# Path-based PR labels (actions/labeler v5 format).
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ["**/*.md", "docs/**"]
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file: ["Cargo.toml", "Cargo.lock", "deny.toml", ".github/dependabot.yml"]
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: [".github/**", "scripts/**"]
+
+runtime:
+  - changed-files:
+      - any-glob-to-any-file: ["src/nexus*.rs"]
+
+providers:
+  - changed-files:
+      - any-glob-to-any-file: ["src/providers/**", "src/auth/**"]
+
+tools:
+  - changed-files:
+      - any-glob-to-any-file: ["src/tools/**"]
+
+cli:
+  - changed-files:
+      - any-glob-to-any-file: ["src/cli.rs", "src/ui/**"]

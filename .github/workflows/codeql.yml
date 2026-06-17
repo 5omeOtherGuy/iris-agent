@@ -1,0 +1,61 @@
+# CodeQL: GitHub's static analysis. Scans the Rust source for known
+# vulnerability and quality issues. Findings appear under the repo's
+# "Security" tab -> "Code scanning". CodeQL Rust support is generally
+# available (since October 2025).
+# Docs: https://docs.github.com/en/code-security/code-scanning
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday scan. Pull requests and pushes are scanned separately.
+    - cron: "24 5 * * 1"
+  workflow_dispatch:
+
+# Cancel previous CodeQL runs on the same ref when a new commit arrives.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required for CodeQL to upload SARIF results to the Security tab.
+  security-events: write
+  # Required for the CodeQL action to read the workflow's own status.
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # Private repositories need GitHub Advanced Security/code scanning enabled
+    # before CodeQL can upload SARIF. Keep the workflow ready, but avoid a
+    # failing required check when the feature is unavailable.
+    if: ${{ github.event.repository.private == false || vars.ENABLE_GHAS_SCANS == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # "security-and-quality" is broader than the default; trades a few
+          # more false positives for catching more real issues.
+          queries: security-and-quality
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
