@@ -10,7 +10,7 @@ base64 = "0.22"
 # PATH. `grep` re-exports the matcher/searcher crates; `ignore` provides the
 # .gitignore-aware directory walk and glob overrides.
 globset = "0.4"
-grep = "0.3"
+grep = "0.4"
 ignore = "0.4"
 # Kernel sandbox for the bash tool. Used instead of hand-rolling Landlock LSM
 # syscalls + struct ABI by hand, which is an error-prone security-critical path.
