@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -7,8 +8,35 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
 use crate::nexus::ChatProvider;
-use crate::ui::{Ui, UiBridge, UiEvent, is_exit_command};
+use crate::ui::tui::TuiUi;
+use crate::ui::{Ui, UiBridge, UiEvent, slash};
 use crate::wayland::Harness;
+
+/// Entry point for the interactive session. Selects the front-end exactly as the
+/// former `ui::tui::stdio()` did -- the persistent full-screen TUI when both
+/// stdin and stdout are terminals, otherwise the blocking text UI for pipes/CI
+/// -- and runs the matching driver.
+pub(crate) fn run_interactive<P: ChatProvider>(harness: &mut Harness<P>) -> Result<()> {
+    if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+        match TuiUi::new() {
+            Ok(tui) => return run_tui(harness, tui),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "TUI unavailable; using text UI");
+            }
+        }
+    }
+    let mut ui = crate::ui::text::TextUi::stdio();
+    run_session(harness, &mut ui)
+}
+
+/// Drive the full-screen TUI: owns a Tier-3 current-thread runtime, hands it to
+/// the async event loop, and bounds shutdown like the text driver does.
+fn run_tui<P: ChatProvider>(harness: &mut Harness<P>, tui: TuiUi) -> Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let result = crate::ui::tui_loop::run(harness, &runtime, tui);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
 
 /// Drive the interactive REPL. Owns the Tier-3 runtime: a current-thread tokio
 /// runtime that `block_on`s each turn, plus a per-turn cancellation token that a
@@ -39,7 +67,7 @@ fn run_session_inner<P: ChatProvider>(
         if prompt.is_empty() {
             continue;
         }
-        if is_exit_command(prompt) {
+        if slash::is_exit(prompt) {
             break;
         }
 
@@ -146,6 +174,7 @@ mod tests {
             agent,
             dir.path.clone(),
             crate::tools::ToolState::new(),
+            None,
             None,
         );
         let mut ui = TextUi::new("bad\nagain\n/exit\n".as_bytes(), Vec::new(), Vec::new());

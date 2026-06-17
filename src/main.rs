@@ -12,6 +12,7 @@ mod approval;
 mod cli;
 mod config;
 mod errors;
+mod handles;
 mod mimir;
 mod nexus;
 mod process_group;
@@ -101,7 +102,10 @@ fn configured_provider() -> String {
 fn run_agent() -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    let provider = build_provider(resolve_provider_id(&settings), &settings, &cwd)?;
+    // Harness-owned assembly: base instructions + runtime context + project
+    // instructions (root AGENTS.md). Fresh and resume call the same function.
+    let system_prompt = wayland::system_prompt::assemble(&cwd);
+    let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
     let agent = Agent::new(provider, tools::built_in_tools());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
@@ -119,11 +123,14 @@ fn run_agent() -> Result<()> {
     // The /resume UI is a later milestone; this only proves the store reads
     // back and signals that persistence is durable and resumable.
     log_resumable_sessions(&cwd);
-    // The Tier-2 harness owns the execution surface (workspace + tool state) and
-    // persistence, wrapping the bare in-memory agent.
-    let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
-    let mut ui = ui::tui::stdio();
-    cli::run_session(&mut harness, ui.as_mut())
+    // The Tier-2 harness owns the execution surface (workspace + tool state),
+    // persistence, and the auto-compaction policy, wrapping the bare in-memory
+    // agent. When the context token total exceeds the budget at a turn
+    // boundary, the harness compacts before the provider request.
+    let budget = Some(settings.context_token_budget());
+    let mut harness =
+        wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    cli::run_interactive(&mut harness)
 }
 
 /// Resume an existing session by id: load its transcript from the store,
@@ -140,9 +147,19 @@ fn resume_agent(session_id: &str) -> Result<()> {
     })?;
     let stored = store.open(&meta)?;
     let resumed = stored.messages.len();
+    // The rebuilt context's token total from the reconstruction path -- the same
+    // number the live session reports via `session::context_tokens`, so it is
+    // stable across resume. The harness compares it against the budget at the
+    // next turn boundary.
+    let context_tokens = stored.context_tokens;
 
     let settings = config::Settings::load(&cwd)?;
-    let provider = build_provider(resolve_provider_id(&settings), &settings, &cwd)?;
+    let budget = Some(settings.context_token_budget());
+    // Resume assembles instructions through the same harness-owned path as a
+    // fresh session, so a resumed turn gets identical base/runtime/project
+    // instructions.
+    let system_prompt = wayland::system_prompt::assemble(&cwd);
+    let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
     let agent = Agent::resumed(provider, tools::built_in_tools(), stored.messages);
 
     // Reopen the same transcript for append so continued turns extend it rather
@@ -155,7 +172,7 @@ fn resume_agent(session_id: &str) -> Result<()> {
             None
         }
     };
-    tracing::info!(id = %meta.id, messages = resumed, "resumed session");
+    tracing::info!(id = %meta.id, messages = resumed, context_tokens, "resumed session");
 
     let mut harness = wayland::Harness::resumed(
         agent,
@@ -163,9 +180,9 @@ fn resume_agent(session_id: &str) -> Result<()> {
         tools::ToolState::new(),
         session,
         resumed,
+        budget,
     );
-    let mut ui = ui::tui::stdio();
-    cli::run_session(&mut harness, ui.as_mut())
+    cli::run_interactive(&mut harness)
 }
 
 /// Resolve the configured provider id from settings, falling back to the
@@ -227,21 +244,29 @@ fn log_resumable_sessions(cwd: &Path) {
 fn build_provider(
     provider_id: &str,
     settings: &config::Settings,
-    cwd: &Path,
+    system_prompt: &str,
 ) -> Result<Box<dyn ChatProvider>> {
     let model = settings.default_model.as_deref();
     let base_url = settings.base_url.as_deref();
     let provider: Box<dyn ChatProvider> = match provider_id {
         "openai-codex" => Box::new(
             mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
-                model, base_url, cwd,
+                model,
+                base_url,
+                system_prompt,
             )?,
         ),
         "anthropic" => Box::new(
-            mimir::providers::anthropic_messages::AnthropicProvider::new(model, base_url, cwd)?,
+            mimir::providers::anthropic_messages::AnthropicProvider::new(
+                model,
+                base_url,
+                system_prompt,
+            )?,
         ),
         "antigravity" => Box::new(mimir::providers::antigravity::AntigravityProvider::new(
-            model, base_url, cwd,
+            model,
+            base_url,
+            system_prompt,
         )?),
         other => {
             return Err(errors::UsageError::new(format!(

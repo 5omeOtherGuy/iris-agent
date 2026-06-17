@@ -18,10 +18,13 @@
 //! File writes are atomic (temp-file + rename), so an interrupt at any point
 //! cannot leave a partially written file.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static RESTORE_TERMINAL_ON_FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+// The terminal's pre-raw-mode `termios`, leaked so the signal handler can read
+// it without allocation. Null until the TUI captures it at startup.
+static SAVED_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 
 // Async-signal-safe terminal cleanup for a TUI force-quit path: show cursor,
 // disable common mouse/bracketed-paste modes, and leave the alternate screen.
@@ -67,16 +70,56 @@ fn record_interrupt(flag: &AtomicBool) -> bool {
 }
 
 fn restore_terminal_from_signal() {
-    if RESTORE_TERMINAL_ON_FORCE_QUIT.load(Ordering::Relaxed) {
-        // SAFETY: `write` is async-signal-safe; pointer/length come from a
-        // static byte string.
-        let _ = unsafe {
-            libc::write(
-                libc::STDOUT_FILENO,
-                TUI_FORCE_QUIT_RESTORE.as_ptr().cast(),
-                TUI_FORCE_QUIT_RESTORE.len(),
-            )
-        };
+    if !RESTORE_TERMINAL_ON_FORCE_QUIT.load(Ordering::Relaxed) {
+        return;
+    }
+    // Restore cooked-mode termios first so the shell regains echo and line
+    // editing -- `Drop` does not run on a signal-killed process, so the escape
+    // write alone would leave the tty in raw mode. `tcsetattr` is POSIX
+    // async-signal-safe.
+    let termios = SAVED_TERMIOS.load(Ordering::Acquire);
+    if !termios.is_null() {
+        // SAFETY: `termios` is a live, leaked pointer from
+        // `save_termios_for_force_quit`; `tcsetattr` is async-signal-safe.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios);
+        }
+    }
+    // SAFETY: `write` is async-signal-safe; pointer/length come from a
+    // static byte string.
+    let _ = unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            TUI_FORCE_QUIT_RESTORE.as_ptr().cast(),
+            TUI_FORCE_QUIT_RESTORE.len(),
+        )
+    };
+}
+
+/// Capture the terminal's current (pre-raw-mode) `termios` so the force-quit
+/// signal handler can restore cooked mode. Call once, before enabling raw mode.
+/// A no-op if stdin is not a terminal or a prior session already captured it.
+pub(crate) fn save_termios_for_force_quit() {
+    let mut term = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `tcgetattr` only writes through `term` for the duration of the
+    // call; we act on the result solely when it reports success.
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, term.as_mut_ptr()) } != 0 {
+        return;
+    }
+    // SAFETY: `tcgetattr` returned 0, so `term` is initialized.
+    let ptr = Box::into_raw(Box::new(unsafe { term.assume_init() }));
+    // Store exactly once; if a prior session already saved, drop the new box.
+    if SAVED_TERMIOS
+        .compare_exchange(
+            std::ptr::null_mut(),
+            ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // SAFETY: `ptr` came from `Box::into_raw` above and was not stored.
+        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 

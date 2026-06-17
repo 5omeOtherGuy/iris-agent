@@ -98,7 +98,8 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Context compaction | _planned_ |
-| Skills / system-prompt assembly | _planned_ |
+| System-prompt / project-instruction assembly (base + runtime context + root `AGENTS.md`) | `wayland/system_prompt.rs` |
+| Skills | _planned_ |
 
 Depends on Tier 1 only. The `Harness` is the analogue of pi's `AgentHarness`
 (`agent-harness.ts`): it owns `env`/`session`, passes `env` into the run, and

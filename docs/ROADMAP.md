@@ -84,6 +84,13 @@ Implemented today:
 - OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini Code Assist
   request/response handling, including tool schemas and streamed-response
   parsing.
+- Harness-owned system-prompt / project-instruction assembly
+  ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56)): the Tier-2
+  Wayland `system_prompt::assemble` builds base instructions + runtime context +
+  the workspace-root `AGENTS.md` (path-safe, missing-file tolerant) in one place;
+  fresh and resumed sessions feed the same assembled string through the existing
+  provider request path. Nested/ancestor/global `AGENTS.md`, skills, and prompt
+  templates are deferred (skills/templates are issue #57).
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.
@@ -327,12 +334,12 @@ Shared tool infrastructure issues opened 2026-06-15:
 | [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Done (MVP): `edit`/`write` reject mutating an existing file that was never read or changed since last read (hash-decided; mtime refreshed on benign change). New files may be created blind. |
 | [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; observation refresh now happens after each mutation; no canonical mutation queue. |
 | [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Done (MVP): Nexus enforces a session allow-policy. Approval offers `[y] once` / `[a] always this session` / `[N] deny`; `always` records the tool name in a Nexus-owned `session_allowed` set so later same-tool calls auto-approve (emitted as `ToolAutoApproved`, never inferred by the UI). Deny stays safe-by-default (empty/invalid/EOF). Diff previews now render colored +/- with relative headers (the `a//abs` double-slash and write-vs-edit path inconsistency are fixed). Remaining: cross-session persistence, risk labels, and per-exact-command bash granularity (`always` on `bash` currently authorizes any later shell command this session). |
-| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): `dispatch` returns a `ToolOutput { content, metadata }`; success results carry a per-tool `metadata` object on the wire (`read` byte/line/`truncated`, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs is the remaining Milestone 2 work. |
+| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): `dispatch` returns a `ToolOutput { content, metadata }`; success results carry a per-tool `metadata` object on the wire (`read` byte/line/`truncated`, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs shipped ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): oversized results are offloaded out of context behind a stable handle with a compact preview + `outputHandle` metadata. |
 
 Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
 on Claude Code's exact-string contract, a shared read-before-mutate stale-file
 guard, and a structured `ToolOutput` result/metadata contract. The honest gaps
-are `bash` (large), handle-backed large outputs (medium), persistent approval policy/risk
+are `bash` (large), persistent approval policy/risk
 labels (medium; diff preview already shipped). The `rg`/`fd` packaging gap is
 closed: `grep`/`find` are now native libraries with no external binary.
 
@@ -352,6 +359,13 @@ Codex routes is the first/reference instance. Requires a tool registry that can
 vary the advertised tool set by active provider/model (plugs into the Milestone 4
 routing work); result shape, path safety, and approval gates stay centralized in
 Nexus regardless of which variant runs.
+
+The planner seam exists ([#60](https://github.com/5omeOtherGuy/iris-agent/issues/60)):
+`ProviderCapabilities` (reported by each provider) drives `Tools::plan_surface`,
+which narrows the *model-visible* surface (`Tools::iter`) while leaving execution
+lookup (`Tools::by_name`) over the full registry untouched. Default capabilities
+advertise the full built-in surface, so every provider is unchanged today; the
+native-edit replacement tool itself is still future work.
 
 ## Milestone 0 — Agent Kernel MVP
 
@@ -507,11 +521,43 @@ Potential scope:
   newest-first) by reading only each header line + mtime, and `open(id)` reads
   a session back with its messages in order (skipping a truncated trailing
   fragment). Tests cover create/open/list/read/append/parent-linkage.
-  Deferred (later milestones, intentionally outside this slice): the `/resume`
-  UI command and context reconstruction, surfacing entry ids/`parentId` on read
-  for branching/tree navigation, compaction/branch-summary entries, labels,
-  fork, and token accounting. This ships the durable, resumable-ready store,
-  not session resume itself.]
+  Deferred (later milestones, intentionally outside this slice): surfacing
+  entry ids/`parentId` on read for branching/tree navigation,
+  compaction/branch-summary entries, labels, fork, and token accounting. This
+  ships the durable, resumable-ready store. Session Resume MVP
+  ([#47](https://github.com/5omeOtherGuy/iris-agent/issues/47), shipped
+  2026-06-17) builds on it: `iris-agent resume <session-id>` finds the session
+  via `SessionStore::find`, reconstructs the prior provider-visible messages
+  (`Agent::resumed` seeds the loaded transcript), reopens the same JSONL file
+  for append (`SessionLog::resume` restores the leaf link + id counter), and
+  the harness continues appending future turns to that same log (a `persisted`
+  cursor past the loaded history avoids rewriting it). Errors clearly on an
+  unknown id. A focused test
+  (`resumed_session_feeds_prior_context_into_next_turn`) proves the loaded fact
+  reaches the next model turn and that continuation does not duplicate history.
+  Still deferred (outside #47): the in-session `/resume` picker UI, branching,
+  rollback, and session search. Context Compaction Foundation
+  ([#49](https://github.com/5omeOtherGuy/iris-agent/issues/49), shipped
+  2026-06-17) adds the first compaction slice on top of the resume path: a
+  durable `compaction` JSONL entry records an inclusive range of covered
+  `message` entry ids, the `summary` that replaces them, a `createdAt`
+  timestamp, and a `tokenEstimate` placeholder (`null` until a token convention
+  exists). A manual/internal append path (`SessionLog::append_compaction`,
+  which returns the assigned entry id, as `append` now does) writes one;
+  `read_messages` rebuilds context by replacing each covered range with its
+  summary in place, so a resumed session sees the summary instead of replaying
+  the covered turns, without duplicating them. Coverage is keyed on durable
+  entry ids (not array positions); multiple non-overlapping compactions apply
+  deterministically, and an overlapping/missing-id range is rejected as invalid
+  session data. `resume` treats a compaction entry as the leaf so a continued
+  session chains and counts past it. Tests cover the compacted rebuild, the
+  unchanged uncompacted resume, multiple compactions, overlap/missing-id
+  rejection, and resume-after-compaction. The summary's production is kept
+  swappable: storage and rebuild are independent of how the text was made
+  (manual now; a provider/local/remote summarizer later), and the role/text of
+  the rebuilt summary message lives in one place. Deferred (outside #49,
+  intentionally): auto-compaction thresholds, full token-budget policy, branch
+  summaries, rollback, and a TUI/CLI compaction command.]
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
   override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project).
@@ -576,11 +622,57 @@ large outputs can later become handle-backed without changing every caller.
 
 Potential scope:
 
-- Content-addressed store.
-- Handle-returning large tool outputs.
+- Content-addressed store. [Foundation shipped as part of
+  [#61](https://github.com/5omeOtherGuy/iris-agent/issues/61): oversized tool
+  outputs are stored content-addressed (`sha256[..16]`) in a session-sibling
+  `<session>.outputs/` directory (`src/handles.rs`).]
+- Handle-returning large tool outputs. [Foundation shipped
+  ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): a successful
+  tool result over a 16 KiB threshold is persisted out of provider context
+  behind a stable handle, and the transcript carries a compact head+tail preview
+  plus an `outputHandle` metadata pointer (`id`/`bytes`/`lines`) instead of the
+  full payload. Nexus owns the threshold/offload policy and a Tier-1
+  `ToolOutputStore` contract; the Wayland harness implements it over local
+  session storage and injects it via `ToolEnv`. Small outputs keep their exact
+  inline encoding; with no durable store (in-memory session) or on a store-write
+  failure the full output stays inline rather than being truncated/discarded.
+  Because the substitution happens before the message enters context, resume
+  rebuilds the compact form for free and never re-inlines the payload. Deferred
+  (outside #61): a model-facing dereference tool / TUI attachment browser
+  (`HandleStore::get` is the retrieval seam), binary artifacts, and
+  search/indexing.]
 - Micro-summary schema for large results.
 - Selective handle dereferencing.
-- Token accounting per turn.
+- Token accounting per turn. [Foundation shipped
+  ([#54](https://github.com/5omeOtherGuy/iris-agent/issues/54)): each `message`
+  session entry persists a conservative content-derived `tokenEstimate`, the
+  read/rebuild path sums them (preferring the persisted value, recomputing from
+  content for legacy v1 entries) into `StoredSession.context_tokens`, and a
+  compacted range contributes its summary's estimate instead of the covered
+  turns -- so a reopened session reports the same context token total it had in
+  memory (`session::context_tokens`). A `contextTokenBudget` setting is
+  parsed/defaulted. Deferred (outside #54): pricing/cost accounting, and exact
+  provider-reported usage (the `tokenEstimate` field is the swap-in point once
+  providers surface it).]
+  Auto Compaction Foundation
+  ([#55](https://github.com/5omeOtherGuy/iris-agent/issues/55), shipped
+  2026-06-17) makes `contextTokenBudget` trigger runtime behavior: the Tier-2
+  Wayland harness compares the current context token total against the budget at
+  each safe turn boundary (before the provider request) and, when it is
+  exceeded, compacts via the existing `SessionLog::append_compaction` +
+  read-time rebuild. A deterministic internal summarizer (`wayland::summarize`,
+  bounded excerpts) stands in for a real summary and is the explicit swap point;
+  the harness picks a covered range that keeps the recent tail within budget and
+  never splits a tool-call/result pair, then replaces the in-memory context with
+  `summary + tail` so the next request uses the summary instead of the covered
+  turns. Under-budget sessions never compact; over-budget sessions create a
+  compaction entry; resumed sessions rebuild through prior summaries
+  (already-loaded history is tracked id-less this slice, so only post-resume
+  turns are re-coverable -- a documented ceiling). Tests cover under-budget
+  no-op, over-budget compaction at a turn boundary, and resume/rebuild after
+  auto-compaction. Deferred (outside #55): provider-generated summaries,
+  branch-aware compaction, rollback, a manual TUI/CLI `/compact` command, and
+  background/offloaded compaction.]
 - Comparison against naive transcript-passing.
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
@@ -734,7 +826,8 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    unblocks Milestone 2.
 6. Next: Milestone 2 (token-efficiency). The metadata gate is already met
    ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) MVP), so the
-   remaining work is handle-backing large tool outputs and token accounting.
+   remaining work is token accounting (handle-backing large tool outputs shipped
+   in [#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)).
    First implement shared tool infrastructure in dependency order: path identity and
    observation store ([#11](https://github.com/5omeOtherGuy/iris-agent/issues/11)),
    mutation preflight ([#12](https://github.com/5omeOtherGuy/iris-agent/issues/12)),

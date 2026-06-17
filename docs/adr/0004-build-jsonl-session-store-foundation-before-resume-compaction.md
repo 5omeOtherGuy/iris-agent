@@ -50,3 +50,8 @@ We build a minimal JSONL Session Store Foundation before implementing `/resume`,
 ### Risks
 - Broken or truncated JSONL could block session reads; mitigate by preserving valid-prefix behavior and testing partial/trailing corruption where practical.
 - Parent/message id choices may constrain future branching; mitigate by following the pi-mono session shape and keeping the format minimal.
+
+## Follow-ups (built on this foundation)
+
+- **Resume MVP (#47/#48).** `iris-agent resume <id>` rebuilds provider context by replaying `StoredSession.messages`, reopens the same JSONL for append with a persisted cursor (continuing the log rather than rewriting it), repairs a dangling trailing tool call with a synthetic result so a crash-truncated session resumes into a provider-valid sequence, and runs in the current cwd (intentional MVP behavior, not the session's stored cwd). This is the execution of this ADR, not a new decision.
+- **Compaction foundation (#49).** The `compaction` entry and context rebuild are recorded separately in ADR-0009.

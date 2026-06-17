@@ -91,6 +91,9 @@ fn test_harness<P: ChatProvider>(provider: P, workspace: &Path, tools: Tools) ->
         workspace.to_path_buf(),
         ToolState::new(),
         None,
+        // Auto-compaction disabled: these tests exercise the loop, not the
+        // budget policy.
+        None,
     )
 }
 
@@ -1452,7 +1455,13 @@ fn turn_persists_transcript_when_log_attached() -> Result<()> {
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let log_path = log.path().to_path_buf();
     // Persistence is a harness concern: construct it with the log attached.
-    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
 
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -1466,6 +1475,340 @@ fn turn_persists_transcript_when_log_attached() -> Result<()> {
     assert!(lines[0].contains("\"type\":\"session\""));
     assert!(lines[1].contains("\"role\":\"user\"") && lines[1].contains("hello"));
     assert!(lines[2].contains("\"role\":\"assistant\"") && lines[2].contains("done"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Large tool output handles (issue #61): an oversized successful tool result is
+// stored out of provider context behind a stable handle, with a compact preview
+// in the transcript; small results stay inline; resume keeps the handle stable
+// and never re-inlines the full payload.
+// ---------------------------------------------------------------------------
+
+/// Test tool that returns a caller-supplied body, so a test can drive a result
+/// of any size through the real record/offload path.
+struct BigTool {
+    body: String,
+}
+
+impl Tool for BigTool {
+    fn name(&self) -> &str {
+        "big"
+    }
+    fn description(&self) -> &str {
+        "emits a large output"
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        let body = self.body.clone();
+        Box::pin(async move { Ok(ToolOutput::text(body)) })
+    }
+}
+
+/// An output comfortably over the inline threshold: a head marker, then filler,
+/// a unique middle marker (which the head+tail preview must omit), more filler,
+/// then a tail marker.
+fn oversized_body() -> String {
+    let filler = "lorem ipsum dolor sit amet filler line\n".repeat(800);
+    let body = format!("HEAD-MARKER\n{filler}MIDDLE-SECRET-MARKER\n{filler}TAIL-END-MARKER");
+    assert!(
+        body.len() > MAX_INLINE_TOOL_OUTPUT_BYTES,
+        "body must exceed the inline threshold"
+    );
+    body
+}
+
+/// Pull the offloaded handle id out of a tool-result JSON payload.
+fn output_handle_id(tool_result_content: &str) -> String {
+    let value: Value = serde_json::from_str(tool_result_content).unwrap();
+    value["metadata"]["outputHandle"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn oversized_tool_output_is_stored_behind_a_handle_and_compacted_in_context() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?; // separate session root
+    let body = oversized_body();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    // The provider's follow-up request carries the compact result, not the full
+    // payload: the middle of the output is omitted, the handle is referenced,
+    // and the payload is far smaller than the original body.
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert_eq!(tool_result.role, Role::Tool);
+    assert!(
+        !tool_result.content.contains("MIDDLE-SECRET-MARKER"),
+        "the omitted middle must not reach provider context"
+    );
+    assert!(
+        tool_result.content.contains("HEAD-MARKER"),
+        "head preview kept"
+    );
+    assert!(
+        tool_result.content.contains("TAIL-END-MARKER"),
+        "tail preview kept"
+    );
+    assert!(tool_result.content.contains("outputHandle"));
+    assert!(
+        tool_result.content.len() < body.len(),
+        "compacted result must be smaller than the full output"
+    );
+
+    // The handle metadata records the true size, and the full output round-trips
+    // from the store by handle -- nothing is truncated and discarded.
+    let parsed: Value = serde_json::from_str(&tool_result.content)?;
+    assert_eq!(parsed["metadata"]["outputHandle"]["bytes"], body.len());
+    assert_eq!(
+        parsed["metadata"]["outputHandle"]["lines"],
+        body.lines().count()
+    );
+    let id = output_handle_id(&tool_result.content);
+    let store = crate::handles::HandleStore::for_session(&log_path);
+    assert_eq!(store.get(&id)?.as_deref(), Some(body.as_str()));
+    Ok(())
+}
+
+#[test]
+fn small_tool_output_stays_inline_unchanged() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // A clearly sub-threshold body keeps the original inline encoding even with a
+    // store attached: full content present, no handle.
+    let body = "a small result\nwith two lines".to_string();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert!(
+        tool_result
+            .content
+            .contains("a small result\\nwith two lines")
+    );
+    assert!(!tool_result.content.contains("outputHandle"));
+    Ok(())
+}
+
+#[test]
+fn oversized_output_without_a_store_is_kept_inline_not_discarded() -> Result<()> {
+    let workspace = test_workspace()?;
+    let body = oversized_body();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    // No session log -> no handle store. The full output must stay inline rather
+    // than be truncated and lost.
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), None, None);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert!(
+        tool_result.content.contains("MIDDLE-SECRET-MARKER"),
+        "without a store the full output stays inline"
+    );
+    assert!(!tool_result.content.contains("outputHandle"));
+    Ok(())
+}
+
+#[test]
+fn offloaded_preview_is_safe_on_multibyte_boundaries() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // A leading ASCII byte shifts every multibyte char off the preview byte caps
+    // (4 KiB / 2 KiB), so clamp_head/clamp_tail must back off to a char boundary
+    // rather than panic on a mid-char slice.
+    let body = format!("x{}", "\u{1F600}".repeat(20_000));
+    assert!(body.len() > MAX_INLINE_TOOL_OUTPUT_BYTES);
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert!(tool_result.content.contains("outputHandle"));
+    // The stored bytes are exactly the original output, intact across the slice.
+    let id = output_handle_id(&tool_result.content);
+    let store = crate::handles::HandleStore::for_session(&log_path);
+    assert_eq!(store.get(&id)?.as_deref(), Some(body.as_str()));
+    Ok(())
+}
+
+#[test]
+fn offload_threshold_is_inclusive_inline_at_limit_offloads_above() -> Result<()> {
+    // Direct unit test of the offload decision: at the threshold stays inline,
+    // one byte over offloads. Exercises the boundary `success_tool_result_json`
+    // branches without a full turn.
+    let dir = test_workspace()?;
+    let store = crate::handles::HandleStore::with_dir(dir.path.join("outputs"));
+
+    let at_limit = ToolOutput::text("a".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES));
+    let at_json = success_tool_result_json(Some(&store), at_limit);
+    assert!(
+        !at_json.contains("outputHandle"),
+        "a result exactly at the threshold stays inline"
+    );
+
+    let over_limit = ToolOutput::text("a".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 1));
+    let over_json = success_tool_result_json(Some(&store), over_limit);
+    assert!(
+        over_json.contains("outputHandle"),
+        "one byte over the threshold offloads"
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_output_stays_inline() {
+    let out = success_tool_result_json(None, ToolOutput::text(""));
+    assert!(out.contains("\"ok\":true"));
+    assert!(!out.contains("outputHandle"));
+}
+
+#[test]
+fn offload_falls_back_to_inline_when_the_store_errors() {
+    // A store whose `put` fails must not lose the payload: the full output is
+    // kept inline rather than truncated and discarded.
+    struct FailingStore;
+    impl ToolOutputStore for FailingStore {
+        fn put(&self, _content: &str) -> Result<String> {
+            Err(anyhow!("disk full"))
+        }
+    }
+
+    let body = "Z".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 100);
+    let out = success_tool_result_json(Some(&FailingStore), ToolOutput::text(body.clone()));
+    assert!(
+        out.contains(&body),
+        "full output preserved inline on store failure"
+    );
+    assert!(!out.contains("outputHandle"));
+}
+
+#[test]
+fn resume_keeps_the_handle_reference_and_does_not_reinline_large_output() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let body = oversized_body();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let session_id = log.id().to_string();
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+    drop(harness); // flush + close the transcript
+
+    // Reopen the session from disk: the rebuilt context carries the compact
+    // handle reference, never the re-inlined full payload, and the handle is
+    // still retrievable from the store.
+    let store = crate::session::SessionStore::with_root(root.path.clone());
+    let meta = store.find(&session_id)?.expect("session present");
+    let stored = store.open(&meta)?;
+    let tool_result = stored
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .expect("a tool result is in the rebuilt context");
+    assert!(
+        !tool_result.content.contains("MIDDLE-SECRET-MARKER"),
+        "resume must not re-inline the offloaded payload"
+    );
+    assert!(tool_result.content.contains("outputHandle"));
+
+    let id = output_handle_id(&tool_result.content);
+    let handles = crate::handles::HandleStore::for_session(&log_path);
+    assert_eq!(handles.get(&id)?.as_deref(), Some(body.as_str()));
     Ok(())
 }
 
@@ -2111,6 +2454,7 @@ fn resumed_session_feeds_prior_context_into_next_turn() -> Result<()> {
         ToolState::new(),
         Some(session),
         resumed,
+        None,
     );
 
     let mut out = Vec::new();
@@ -2177,6 +2521,7 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         ToolState::new(),
         Some(session),
         on_disk,
+        None,
     );
 
     let mut out = Vec::new();
@@ -2206,5 +2551,333 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         .position(|m| m.role == Role::AssistantToolCall)
         .unwrap();
     assert_eq!(reopened.messages[idx + 1].role, Role::Tool);
+    Ok(())
+}
+
+/// Under budget: the harness must not create a compaction entry, and the
+/// second turn still sees the prior context (no loss).
+#[test]
+fn under_budget_session_does_not_auto_compact() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text("a")),
+        Ok(AssistantTurn::text("b")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let log_path = log.path().to_path_buf();
+    // A large budget two short turns stay well under: the policy runs each turn
+    // but never fires.
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(1_000_000),
+    );
+
+    run_text_session(
+        &mut harness,
+        b"hi\nthere\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    let on_disk = fs::read_to_string(&log_path)?;
+    assert!(
+        !on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")),
+        "an under-budget session must not create a compaction entry"
+    );
+    // The second turn still received the first turn's context.
+    assert_eq!(harness.agent.provider.seen.borrow().len(), 2);
+    Ok(())
+}
+
+/// Over budget: at the second turn boundary the accumulated context exceeds the
+/// budget, so the harness compacts before the provider request -- persisting a
+/// compaction entry and opening the request with the summary instead of the
+/// covered turns.
+#[test]
+fn over_budget_session_auto_compacts_at_turn_boundary() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    // ~100-token assistant replies and ~100-token user prompts, against a tiny
+    // 50-token budget, so the second turn's boundary is over budget.
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+
+    let prompt_a = "P".repeat(400);
+    let prompt_b = "Q".repeat(400);
+    let input = format!("{prompt_a}\n{prompt_b}\n/exit\n");
+    run_text_session(
+        &mut harness,
+        input.as_bytes(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    // The compaction entry was written automatically at a safe turn boundary.
+    let on_disk = fs::read_to_string(&log_path)?;
+    assert!(
+        on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")),
+        "an over-budget session must persist a compaction entry"
+    );
+
+    // The second provider request opened with the summary, not the covered
+    // turns, and never replays a covered message verbatim.
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2, "two provider requests");
+    assert!(
+        seen[1][0].content.starts_with("[auto-compacted summary"),
+        "second request must open with the compaction summary, got: {}",
+        seen[1][0].content
+    );
+    assert!(
+        !seen[1].iter().any(|m| m.content == prompt_a),
+        "covered turns must not be replayed as standalone messages"
+    );
+    Ok(())
+}
+
+/// Resume after auto-compaction: reopening a session that was auto-compacted
+/// live rebuilds context through the summary, without duplicating the covered
+/// turns -- the durable read-time view matches the live compacted context.
+#[test]
+fn resume_after_auto_compaction_rebuilds_through_the_summary() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+
+    let prompt_a = "P".repeat(400);
+    let prompt_b = "Q".repeat(400);
+    let input = format!("{prompt_a}\n{prompt_b}\n/exit\n");
+    run_text_session(
+        &mut harness,
+        input.as_bytes(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+    drop(harness);
+
+    // Reopen from disk: the read-time rebuild applies the auto-compaction entry.
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present in store");
+    let stored = store.open(&meta)?;
+    assert!(
+        stored
+            .messages
+            .iter()
+            .any(|m| m.content.starts_with("[auto-compacted summary")),
+        "the rebuilt context must carry the auto-compaction summary"
+    );
+    assert!(
+        !stored.messages.iter().any(|m| m.content == prompt_a),
+        "covered turns must not be duplicated in the rebuilt context"
+    );
+    Ok(())
+}
+
+// --- Provider-specific tool surface planner (issue #60) ---------------------
+
+/// Provider that reports configurable [`ProviderCapabilities`] and records the
+/// model-visible tool names it is asked to advertise each turn, then returns
+/// scripted turns. Proves `Agent::new` applies the surface plan (so providers
+/// advertise the planned set) and that hidden tools stay executable.
+struct SurfaceProbe {
+    caps: ProviderCapabilities,
+    advertised: RefCell<Vec<Vec<String>>>,
+    responses: RefCell<Vec<Result<AssistantTurn, String>>>,
+}
+
+impl SurfaceProbe {
+    fn new(caps: ProviderCapabilities, responses: Vec<Result<AssistantTurn, &str>>) -> Self {
+        Self {
+            caps,
+            advertised: RefCell::new(Vec::new()),
+            responses: RefCell::new(
+                responses
+                    .into_iter()
+                    .map(|result| result.map_err(str::to_string))
+                    .rev()
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl ChatProvider for SurfaceProbe {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        self.advertised
+            .borrow_mut()
+            .push(tools.iter().map(|tool| tool.name().to_string()).collect());
+        let item = match self.responses.borrow_mut().pop() {
+            Some(Ok(turn)) => Ok(turn),
+            Some(Err(error)) => Err(error),
+            None => Err("unexpected call".to_string()),
+        };
+        Ok(turn_stream(item))
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.caps
+    }
+}
+
+const FULL_SURFACE: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+#[test]
+fn surface_plan_defaults_to_full_built_in_surface() {
+    // Default capabilities leave the model-visible surface identical to the
+    // built-in declaration order -- the parity every existing provider relies on.
+    let mut tools = crate::tools::built_in_tools();
+    tools.plan_surface(&ProviderCapabilities::default());
+    let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(visible, FULL_SURFACE);
+}
+
+#[test]
+fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
+    let mut tools = crate::tools::built_in_tools();
+    tools.plan_surface(&ProviderCapabilities { native_edit: true });
+
+    let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(visible, ["read", "bash", "write", "grep", "find", "ls"]);
+    assert!(
+        !visible.contains(&"edit"),
+        "edit must be hidden from the model"
+    );
+    // Safety invariant: hidden from declarations, still resolvable for execution.
+    assert!(
+        tools.by_name("edit").is_some(),
+        "hidden tool must stay in the execution registry"
+    );
+}
+
+#[test]
+fn default_provider_is_advertised_the_full_surface() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = SurfaceProbe::new(
+        ProviderCapabilities::default(),
+        vec![Ok(AssistantTurn::text("done"))],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let advertised = harness.agent.provider.advertised.borrow();
+    assert_eq!(advertised[0], FULL_SURFACE);
+    Ok(())
+}
+
+#[test]
+fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = SurfaceProbe::new(
+        ProviderCapabilities { native_edit: true },
+        vec![Ok(AssistantTurn::text("done"))],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let advertised = harness.agent.provider.advertised.borrow();
+    assert_eq!(
+        advertised[0],
+        ["read", "bash", "write", "grep", "find", "ls"]
+    );
+    assert!(!advertised[0].iter().any(|name| name == "edit"));
+    Ok(())
+}
+
+#[test]
+fn hidden_edit_tool_still_executes_when_the_model_calls_it() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "old\n")?;
+    // The provider hides `edit` from its advertised surface, but the model calls
+    // it anyway (e.g. a resumed transcript). Execution resolves by name over the
+    // full registry, so the call runs and is gated normally rather than failing
+    // as an unknown tool -- approval/execution stay decoupled from visibility.
+    let provider = SurfaceProbe::new(
+        ProviderCapabilities { native_edit: true },
+        vec![
+            Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+            Ok(single_call_turn(
+                "edit",
+                json!({ "file_path": "note.txt", "old_string": "old", "new_string": "new" }),
+            )),
+            Ok(AssistantTurn::text("done")),
+        ],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("fix it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolError { message, .. } if message.contains("unknown tool")
+        )),
+        "hidden edit must not be reported as an unknown tool"
+    );
+    // The edit ran and mutated the file, and the gate was consulted (gated path).
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("note.txt"))?,
+        "new\n"
+    );
+    assert!(frontend.events_at_review.borrow().is_some());
+    // Every advertised surface this turn still omitted edit.
+    assert!(
+        harness
+            .agent
+            .provider
+            .advertised
+            .borrow()
+            .iter()
+            .all(|surface| !surface.iter().any(|name| name == "edit"))
+    );
     Ok(())
 }
