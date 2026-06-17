@@ -111,6 +111,36 @@ impl SessionLog {
         Ok(())
     }
 
+    /// Reopen an existing transcript file for append, so a resumed session
+    /// continues the same log instead of starting a new one. Reads the header
+    /// id and the existing entries to restore the leaf link (`parentId` of the
+    /// next entry) and the id counter, so appended turns stay correctly chained
+    /// and uniquely identified. Mirrors pi-mono's session repo reopening an
+    /// existing session file to append future turns.
+    pub(crate) fn resume(path: &Path) -> Result<Self> {
+        let state = scan_for_resume(path)?;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open {} for resume", path.display()))?;
+        // A prior process that crashed mid-write can leave a truncated last line
+        // with no trailing newline. Appending directly would fuse the next entry
+        // onto that fragment into one malformed line -- losing the first resumed
+        // message too. Terminate the fragment first so it stays a single skipped
+        // bad line and the new entry starts clean.
+        if state.needs_newline {
+            file.write_all(b"\n")
+                .with_context(|| format!("failed to terminate fragment in {}", path.display()))?;
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            id: state.id,
+            last_id: state.last_id,
+            next_seq: state.next_seq,
+        })
+    }
+
     /// Session id (header `id`), used to open this session back later.
     pub(crate) fn id(&self) -> &str {
         &self.id
@@ -187,6 +217,13 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    /// Find one persisted session by its id, returning `None` when no session
+    /// with that id exists. The id-keyed entry point the `resume` CLI path uses
+    /// to turn a user-supplied id into openable metadata.
+    pub(crate) fn find(&self, id: &str) -> Result<Option<SessionMeta>> {
+        Ok(self.list()?.into_iter().find(|meta| meta.id == id))
+    }
+
     /// Open a persisted session from its listing metadata, returning the
     /// metadata plus the conversation messages in order. Mirrors pi-mono's
     /// `repo.open(metadata)`: a caller opens by id by locating the entry in
@@ -246,6 +283,76 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
         "parentId": parent_id,
         "timestamp": now_ms(),
         "message": inner,
+    })
+}
+
+/// What [`SessionLog::resume`] needs to continue an existing transcript.
+struct ResumeState {
+    /// Header session id.
+    id: String,
+    /// Id of the last message entry (the current leaf the next `parentId` links
+    /// to); `None` when there are no entries or they predate entry ids (v1).
+    last_id: Option<String>,
+    /// The next entry id counter. Derived from the highest existing entry id so
+    /// ids stay unique even if a line was skipped, falling back to the entry
+    /// count for id-less v1 files.
+    next_seq: u32,
+    /// Whether the file lacks a trailing newline (a truncated final fragment),
+    /// so resume must terminate it before appending.
+    needs_newline: bool,
+}
+
+/// Scan an existing transcript so [`SessionLog::resume`] can continue it.
+fn scan_for_resume(path: &Path) -> Result<ResumeState> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let needs_newline = bytes.last().is_some_and(|&b| b != b'\n');
+    let mut lines = bytes
+        .split(|&b| b == b'\n')
+        .map(|line| std::str::from_utf8(line).map(str::trim))
+        .filter(|line| !matches!(line, Ok(text) if text.is_empty()));
+    let header_line = lines
+        .next()
+        .with_context(|| format!("empty session file {}", path.display()))?
+        .map_err(|_| anyhow::anyhow!("session header is not valid UTF-8 in {}", path.display()))?;
+    let header: Value = serde_json::from_str(header_line)
+        .with_context(|| format!("session header is not valid JSON in {}", path.display()))?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        bail!("first line is not a session header in {}", path.display());
+    }
+    let id = header
+        .get("id")
+        .and_then(Value::as_str)
+        .context("session header is missing id")?
+        .to_string();
+    let mut last_id = None;
+    let mut count: u32 = 0;
+    let mut max_seq: Option<u32> = None;
+    for line in lines {
+        let Ok(text) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        count += 1;
+        if let Some(entry_id) = value.get("id").and_then(Value::as_str) {
+            last_id = Some(entry_id.to_string());
+            // Entry ids are hex of the seq counter; track the max so the next id
+            // never collides even if an intermediate line was unreadable.
+            if let Ok(seq) = u32::from_str_radix(entry_id, 16) {
+                max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
+            }
+        }
+    }
+    // Prefer the highest id seen (+1); fall back to the count for id-less v1
+    // files. The `.max(count)` keeps the counter ahead of the entry count too.
+    let next_seq = max_seq.map_or(count, |m| (m + 1).max(count));
+    Ok(ResumeState {
+        id,
+        last_id,
+        next_seq,
+        needs_newline,
     })
 }
 
@@ -586,6 +693,72 @@ mod tests {
         assert!(metas[0].created_ms >= metas[1].created_ms);
         assert!(metas[0].path.exists());
         assert_eq!(metas[1].cwd, "/proj/a");
+    }
+
+    #[test]
+    fn resume_appends_to_the_same_file_with_linked_ids() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::user("one")).unwrap();
+        log.append(&Message::assistant("two")).unwrap();
+        let path = log.path().to_path_buf();
+        let id = log.id().to_string();
+        drop(log);
+
+        // Reopen the same transcript and continue it.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        assert_eq!(resumed.path(), path);
+        assert_eq!(resumed.id(), id);
+        resumed.append(&Message::user("three")).unwrap();
+        drop(resumed);
+
+        let entries = lines(&path);
+        assert_eq!(entries.len(), 4); // header + 3 messages, same file
+        let second_id = entries[2]["id"].as_str().unwrap();
+        let third_id = entries[3]["id"].as_str().unwrap();
+        assert_eq!(entries[3]["message"]["content"], "three");
+        // The continued entry links to the prior leaf and gets a fresh id.
+        assert_eq!(entries[3]["parentId"], second_id);
+        assert_ne!(third_id, second_id);
+    }
+
+    #[test]
+    fn resume_after_a_truncated_fragment_keeps_the_first_new_message() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("kept")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        // Simulate a crash mid-write: a truncated final line with no newline.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"type\":\"message\",\"id\"").unwrap();
+        drop(file);
+
+        // Resume and append: the fragment must not swallow the new message.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        resumed.append(&Message::assistant("survives")).unwrap();
+        drop(resumed);
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let session = open_by_id(&store, &id);
+        let contents: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, ["kept", "survives"]);
+    }
+
+    #[test]
+    fn find_returns_metadata_by_id_and_none_for_unknown() {
+        let dir = temp_dir();
+        let log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        drop(log);
+        let store = SessionStore::with_root(dir.path.clone());
+        assert_eq!(store.find(&id).unwrap().unwrap().id, id);
+        assert!(store.find("deadbeef").unwrap().is_none());
     }
 
     #[test]

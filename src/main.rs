@@ -41,6 +41,7 @@ fn main() -> ExitCode {
 fn dispatch() -> Result<()> {
     match env::args().skip(1).collect::<Vec<_>>().as_slice() {
         [] => run_agent(),
+        [command, session_id] if command == "resume" => resume_agent(session_id),
         [command, provider] if command == "login" && provider == "openai-codex" => {
             login_openai_codex(LoginMethod::Browser)
         }
@@ -83,13 +84,7 @@ const DEFAULT_PROVIDER: &str = "openai-codex";
 fn run_agent() -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    let provider_id = settings
-        .default_provider
-        .as_deref()
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-        .unwrap_or(DEFAULT_PROVIDER);
-    let provider = build_provider(provider_id, &settings, &cwd)?;
+    let provider = build_provider(resolve_provider_id(&settings), &settings, &cwd)?;
     let agent = Agent::new(provider, tools::built_in_tools());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
@@ -112,6 +107,59 @@ fn run_agent() -> Result<()> {
     let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
     let mut ui = ui::tui::stdio();
     cli::run_session(&mut harness, ui.as_mut())
+}
+
+/// Resume an existing session by id: load its transcript from the store,
+/// reconstruct the provider-visible messages, seed the agent with them, and
+/// continue appending future turns to the same log. Errors clearly when the id
+/// is unknown or the session cannot be read.
+fn resume_agent(session_id: &str) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let store = session::SessionStore::open_default()?;
+    let meta = store.find(session_id)?.ok_or_else(|| {
+        errors::UsageError::new(format!(
+            "no session found with id '{session_id}'; run with no arguments to start a new session"
+        ))
+    })?;
+    let stored = store.open(&meta)?;
+    let resumed = stored.messages.len();
+
+    let settings = config::Settings::load(&cwd)?;
+    let provider = build_provider(resolve_provider_id(&settings), &settings, &cwd)?;
+    let agent = Agent::resumed(provider, tools::built_in_tools(), stored.messages);
+
+    // Reopen the same transcript for append so continued turns extend it rather
+    // than starting a new file. Best-effort, like new-session persistence: if
+    // the reopen fails, warn and continue in-memory.
+    let session = match session::SessionLog::resume(&meta.path) {
+        Ok(log) => Some(log),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "resume persistence disabled");
+            None
+        }
+    };
+    tracing::info!(id = %meta.id, messages = resumed, "resumed session");
+
+    let mut harness = wayland::Harness::resumed(
+        agent,
+        cwd.clone(),
+        tools::ToolState::new(),
+        session,
+        resumed,
+    );
+    let mut ui = ui::tui::stdio();
+    cli::run_session(&mut harness, ui.as_mut())
+}
+
+/// Resolve the configured provider id from settings, falling back to the
+/// backward-compatible default when none is set.
+fn resolve_provider_id(settings: &config::Settings) -> &str {
+    settings
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .unwrap_or(DEFAULT_PROVIDER)
 }
 
 /// Log the most recent prior session for `cwd` (if any) via the read side of
@@ -236,6 +284,7 @@ fn login_anthropic() -> Result<()> {
 fn print_help() {
     eprintln!("Usage:");
     eprintln!("  iris-agent                              Start interactive agent");
+    eprintln!("  iris-agent resume <session-id>          Resume a prior session by id");
     eprintln!("  iris-agent login openai-codex           Login with browser OAuth (default)");
     eprintln!("  iris-agent login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris-agent login openai-codex --device-code Login with device-code OAuth");

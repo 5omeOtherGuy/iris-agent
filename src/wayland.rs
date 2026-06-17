@@ -42,12 +42,36 @@ impl<P: ChatProvider> Harness<P> {
         state: ToolState,
         session: Option<SessionLog>,
     ) -> Self {
+        Self::with_persisted(agent, workspace, state, session, 0)
+    }
+
+    /// Wrap a resumed agent whose first `persisted` messages are already on
+    /// disk in `session`. The cursor starts past the reconstructed history so
+    /// only new turns are appended, continuing the same transcript instead of
+    /// rewriting the loaded entries.
+    pub(crate) fn resumed(
+        agent: Agent<P>,
+        workspace: PathBuf,
+        state: ToolState,
+        session: Option<SessionLog>,
+        persisted: usize,
+    ) -> Self {
+        Self::with_persisted(agent, workspace, state, session, persisted)
+    }
+
+    fn with_persisted(
+        agent: Agent<P>,
+        workspace: PathBuf,
+        state: ToolState,
+        session: Option<SessionLog>,
+        persisted: usize,
+    ) -> Self {
         Self {
             agent,
             workspace,
             state: RefCell::new(state),
             session,
-            persisted: 0,
+            persisted,
         }
     }
 

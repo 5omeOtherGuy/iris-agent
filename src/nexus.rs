@@ -314,6 +314,21 @@ impl<P: ChatProvider> Agent<P> {
         }
     }
 
+    /// A bare agent seeded with a prior conversation, for resuming a session.
+    /// The reconstructed `messages` become the provider-visible context for the
+    /// next turn; the approval policy starts fresh (allow-always is per-process,
+    /// not persisted). Mirrors pi's harness loading session entries and
+    /// rebuilding context before continuing the conversation.
+    pub(crate) fn resumed(provider: P, tools: Tools, mut messages: Vec<Message>) -> Self {
+        repair_dangling_tool_call(&mut messages);
+        Self {
+            provider,
+            messages,
+            tools,
+            session_allowed: HashSet::new(),
+        }
+    }
+
     /// Read access to the in-memory transcript so the harness can persist it
     /// without the core loop owning a session store.
     pub(crate) fn messages(&self) -> &[Message] {
@@ -824,6 +839,29 @@ impl Role {
             _ => None,
         }
     }
+}
+
+/// Pair a trailing tool call that has no recorded result. A prior session that
+/// crashed between persisting an `AssistantToolCall` and its `Tool` result
+/// leaves the call unanswered as the last entry; appending a new user prompt
+/// then yields a sequence providers reject (every tool call must be answered).
+/// At most one such call can dangle (the loop records each call's result
+/// adjacently), so one synthetic result restores validity. The appended message
+/// is new (beyond the persisted cursor), so the harness writes it to the same
+/// log, keeping disk and memory consistent.
+fn repair_dangling_tool_call(messages: &mut Vec<Message>) {
+    let Some(last) = messages.last() else { return };
+    if last.role != Role::AssistantToolCall {
+        return;
+    }
+    let (Some(call_id), Some(name)) = (last.tool_call_id.clone(), last.tool_name.clone()) else {
+        return;
+    };
+    messages.push(Message::tool_result(
+        &call_id,
+        &name,
+        &cancelled_tool_result_json(),
+    ));
 }
 
 fn tool_result_json(result: &Result<ToolOutput>) -> String {
