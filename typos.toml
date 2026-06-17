@@ -1,0 +1,11 @@
+# typos spell-checker config. https://github.com/crate-ci/typos
+# Allow project-specific tokens that are not misspellings.
+[default.extend-identifiers]
+# Repository owner / handle.
+"5omeOtherGuy" = "5omeOtherGuy"
+
+[default.extend-words]
+# Streaming test fixtures split a word across deltas ("Hel" + "lo").
+Hel = "Hel"
+# Rust TUI crate name.
+ratatui = "ratatui"

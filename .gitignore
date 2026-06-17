@@ -1,2 +1,4 @@
 /target
-/AGENTS.md
+# Full private agent playbook stays local; the committed AGENTS.md is the slim,
+# public-safe version (project context + Codex review guidelines).
+/AGENTS.local.md
