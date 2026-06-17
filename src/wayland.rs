@@ -14,6 +14,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::handles::HandleStore;
 use crate::nexus::{Agent, AgentObserver, ApprovalGate, ChatProvider, ToolEnv};
 use crate::session::SessionLog;
 use crate::tools::ToolState;
@@ -32,6 +33,10 @@ pub(crate) struct Harness<P> {
     // so the harness runs the agent fully in-memory.
     session: Option<SessionLog>,
     persisted: usize,
+    // Out-of-context store for oversized tool outputs (issue #61). Present only
+    // when a transcript log is attached, since handles live beside the session
+    // file; an in-memory session keeps every output inline.
+    output_store: Option<HandleStore>,
 }
 
 impl<P: ChatProvider> Harness<P> {
@@ -66,12 +71,18 @@ impl<P: ChatProvider> Harness<P> {
         session: Option<SessionLog>,
         persisted: usize,
     ) -> Self {
+        // Derive the handle store from the session file so oversized outputs are
+        // stored beside the transcript that references them.
+        let output_store = session
+            .as_ref()
+            .map(|log| HandleStore::for_session(log.path()));
         Self {
             agent,
             workspace,
             state: RefCell::new(state),
             session,
             persisted,
+            output_store,
         }
     }
 
@@ -89,6 +100,10 @@ impl<P: ChatProvider> Harness<P> {
         let env = ToolEnv {
             workspace: &self.workspace,
             state: &self.state,
+            output_store: self
+                .output_store
+                .as_ref()
+                .map(|store| store as &dyn crate::nexus::ToolOutputStore),
         };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).

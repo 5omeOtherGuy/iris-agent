@@ -1470,6 +1470,316 @@ fn turn_persists_transcript_when_log_attached() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Large tool output handles (issue #61): an oversized successful tool result is
+// stored out of provider context behind a stable handle, with a compact preview
+// in the transcript; small results stay inline; resume keeps the handle stable
+// and never re-inlines the full payload.
+// ---------------------------------------------------------------------------
+
+/// Test tool that returns a caller-supplied body, so a test can drive a result
+/// of any size through the real record/offload path.
+struct BigTool {
+    body: String,
+}
+
+impl Tool for BigTool {
+    fn name(&self) -> &str {
+        "big"
+    }
+    fn description(&self) -> &str {
+        "emits a large output"
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        let body = self.body.clone();
+        Box::pin(async move { Ok(ToolOutput::text(body)) })
+    }
+}
+
+/// An output comfortably over the inline threshold: a head marker, then filler,
+/// a unique middle marker (which the head+tail preview must omit), more filler,
+/// then a tail marker.
+fn oversized_body() -> String {
+    let filler = "lorem ipsum dolor sit amet filler line\n".repeat(800);
+    let body = format!("HEAD-MARKER\n{filler}MIDDLE-SECRET-MARKER\n{filler}TAIL-END-MARKER");
+    assert!(
+        body.len() > MAX_INLINE_TOOL_OUTPUT_BYTES,
+        "body must exceed the inline threshold"
+    );
+    body
+}
+
+/// Pull the offloaded handle id out of a tool-result JSON payload.
+fn output_handle_id(tool_result_content: &str) -> String {
+    let value: Value = serde_json::from_str(tool_result_content).unwrap();
+    value["metadata"]["outputHandle"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn oversized_tool_output_is_stored_behind_a_handle_and_compacted_in_context() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?; // separate session root
+    let body = oversized_body();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    // The provider's follow-up request carries the compact result, not the full
+    // payload: the middle of the output is omitted, the handle is referenced,
+    // and the payload is far smaller than the original body.
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert_eq!(tool_result.role, Role::Tool);
+    assert!(
+        !tool_result.content.contains("MIDDLE-SECRET-MARKER"),
+        "the omitted middle must not reach provider context"
+    );
+    assert!(
+        tool_result.content.contains("HEAD-MARKER"),
+        "head preview kept"
+    );
+    assert!(
+        tool_result.content.contains("TAIL-END-MARKER"),
+        "tail preview kept"
+    );
+    assert!(tool_result.content.contains("outputHandle"));
+    assert!(
+        tool_result.content.len() < body.len(),
+        "compacted result must be smaller than the full output"
+    );
+
+    // The handle metadata records the true size, and the full output round-trips
+    // from the store by handle -- nothing is truncated and discarded.
+    let parsed: Value = serde_json::from_str(&tool_result.content)?;
+    assert_eq!(parsed["metadata"]["outputHandle"]["bytes"], body.len());
+    assert_eq!(
+        parsed["metadata"]["outputHandle"]["lines"],
+        body.lines().count()
+    );
+    let id = output_handle_id(&tool_result.content);
+    let store = crate::handles::HandleStore::for_session(&log_path);
+    assert_eq!(store.get(&id)?.as_deref(), Some(body.as_str()));
+    Ok(())
+}
+
+#[test]
+fn small_tool_output_stays_inline_unchanged() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // A clearly sub-threshold body keeps the original inline encoding even with a
+    // store attached: full content present, no handle.
+    let body = "a small result\nwith two lines".to_string();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert!(
+        tool_result
+            .content
+            .contains("a small result\\nwith two lines")
+    );
+    assert!(!tool_result.content.contains("outputHandle"));
+    Ok(())
+}
+
+#[test]
+fn oversized_output_without_a_store_is_kept_inline_not_discarded() -> Result<()> {
+    let workspace = test_workspace()?;
+    let body = oversized_body();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    // No session log -> no handle store. The full output must stay inline rather
+    // than be truncated and lost.
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), None);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert!(
+        tool_result.content.contains("MIDDLE-SECRET-MARKER"),
+        "without a store the full output stays inline"
+    );
+    assert!(!tool_result.content.contains("outputHandle"));
+    Ok(())
+}
+
+#[test]
+fn offloaded_preview_is_safe_on_multibyte_boundaries() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // A leading ASCII byte shifts every multibyte char off the preview byte caps
+    // (4 KiB / 2 KiB), so clamp_head/clamp_tail must back off to a char boundary
+    // rather than panic on a mid-char slice.
+    let body = format!("x{}", "\u{1F600}".repeat(20_000));
+    assert!(body.len() > MAX_INLINE_TOOL_OUTPUT_BYTES);
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert!(tool_result.content.contains("outputHandle"));
+    // The stored bytes are exactly the original output, intact across the slice.
+    let id = output_handle_id(&tool_result.content);
+    let store = crate::handles::HandleStore::for_session(&log_path);
+    assert_eq!(store.get(&id)?.as_deref(), Some(body.as_str()));
+    Ok(())
+}
+
+#[test]
+fn offload_threshold_is_inclusive_inline_at_limit_offloads_above() -> Result<()> {
+    // Direct unit test of the offload decision: at the threshold stays inline,
+    // one byte over offloads. Exercises the boundary `success_tool_result_json`
+    // branches without a full turn.
+    let dir = test_workspace()?;
+    let store = crate::handles::HandleStore::with_dir(dir.path.join("outputs"));
+
+    let at_limit = ToolOutput::text("a".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES));
+    let at_json = success_tool_result_json(Some(&store), at_limit);
+    assert!(
+        !at_json.contains("outputHandle"),
+        "a result exactly at the threshold stays inline"
+    );
+
+    let over_limit = ToolOutput::text("a".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 1));
+    let over_json = success_tool_result_json(Some(&store), over_limit);
+    assert!(
+        over_json.contains("outputHandle"),
+        "one byte over the threshold offloads"
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_output_stays_inline() {
+    let out = success_tool_result_json(None, ToolOutput::text(""));
+    assert!(out.contains("\"ok\":true"));
+    assert!(!out.contains("outputHandle"));
+}
+
+#[test]
+fn offload_falls_back_to_inline_when_the_store_errors() {
+    // A store whose `put` fails must not lose the payload: the full output is
+    // kept inline rather than truncated and discarded.
+    struct FailingStore;
+    impl ToolOutputStore for FailingStore {
+        fn put(&self, _content: &str) -> Result<String> {
+            Err(anyhow!("disk full"))
+        }
+    }
+
+    let body = "Z".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 100);
+    let out = success_tool_result_json(Some(&FailingStore), ToolOutput::text(body.clone()));
+    assert!(
+        out.contains(&body),
+        "full output preserved inline on store failure"
+    );
+    assert!(!out.contains("outputHandle"));
+}
+
+#[test]
+fn resume_keeps_the_handle_reference_and_does_not_reinline_large_output() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let body = oversized_body();
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let session_id = log.id().to_string();
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+    drop(harness); // flush + close the transcript
+
+    // Reopen the session from disk: the rebuilt context carries the compact
+    // handle reference, never the re-inlined full payload, and the handle is
+    // still retrievable from the store.
+    let store = crate::session::SessionStore::with_root(root.path.clone());
+    let meta = store.find(&session_id)?.expect("session present");
+    let stored = store.open(&meta)?;
+    let tool_result = stored
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .expect("a tool result is in the rebuilt context");
+    assert!(
+        !tool_result.content.contains("MIDDLE-SECRET-MARKER"),
+        "resume must not re-inline the offloaded payload"
+    );
+    assert!(tool_result.content.contains("outputHandle"));
+
+    let id = output_handle_id(&tool_result.content);
+    let handles = crate::handles::HandleStore::for_session(&log_path);
+    assert_eq!(handles.get(&id)?.as_deref(), Some(body.as_str()));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Runtime tests: async streaming, cancellation races, and safe-parallel /
 // exclusive tool scheduling. These exercise the Codex-style runtime mechanics
 // added on top of pi-mono's loop shape.
