@@ -26,7 +26,10 @@ fn is_auth_error(error: &anyhow::Error) -> bool {
 }
 
 fn test_system_prompt() -> String {
-    build_iris_system_prompt(Path::new("/tmp/iris"))
+    // The harness-owned assembly is the single source of the instruction string
+    // providers forward; an empty/nonexistent workspace yields base instructions
+    // only (no AGENTS.md), which is all this request-shaping test needs.
+    crate::wayland::system_prompt::assemble(Path::new("/tmp/iris"))
 }
 
 #[test]

@@ -10,7 +10,6 @@
 //! multimodal, no transient backoff. Add them if a real need shows up.
 
 use std::io::BufReader;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,7 +19,6 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValu
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::build_iris_system_prompt;
 use super::transport::{
     Attempt, HttpClass, TurnSink, classify_http_status, for_each_sse_event, run_with_reauth,
     spawn_stream,
@@ -42,10 +40,12 @@ pub(crate) struct AntigravityProvider {
 }
 
 impl AntigravityProvider {
+    /// `system_prompt` is the harness-assembled instruction string; the provider
+    /// forwards it as the request's `systemInstruction`.
     pub(crate) fn new(
         model: Option<&str>,
         base_url: Option<&str>,
-        workspace: &Path,
+        system_prompt: &str,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
@@ -61,7 +61,7 @@ impl AntigravityProvider {
                 .filter(|b| !b.is_empty())
                 .unwrap_or(DEFAULT_BASE_URL)
                 .to_string(),
-            system_prompt: build_iris_system_prompt(workspace),
+            system_prompt: system_prompt.to_string(),
             tokens: AntigravityTokenStore::from_env()?,
         })
     }

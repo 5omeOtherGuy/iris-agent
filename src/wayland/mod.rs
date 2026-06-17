@@ -7,6 +7,8 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+pub(crate) mod system_prompt;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 
