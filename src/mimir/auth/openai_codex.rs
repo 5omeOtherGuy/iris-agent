@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::auth::device_code::{DeviceCodePoll, poll_device_code};
-use crate::auth::storage::{AuthStore, OAuthCredentials};
+use crate::mimir::auth::device_code::{DeviceCodePoll, poll_device_code};
+use crate::mimir::auth::storage::{AuthStore, OAuthCredentials};
 use crate::telemetry;
 
 const AUTH_PROVIDER: &str = "openai-codex";

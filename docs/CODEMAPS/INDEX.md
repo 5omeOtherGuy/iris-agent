@@ -12,7 +12,7 @@ This codemap describes implemented code only. Planned capabilities live in [`../
 │ main.rs      │   │ run_session  │   │ nexus.rs     │   │ provider                   │
 ╰──────┬───────╯   ╰──────┬───────╯   ╰──────┬───────╯   ╰─────────────┬──────────────╯
        │                  │ Ui trait         │ UiEvent /                │
-       │                  ▼ (events)          │ TurnSink                ▼
+       │                  ▼ (events)          │ ProviderEvent           ▼
        │           ╭──────────────╮   ╭───────┴────────╮     ╭────────────────────────────╮
        │           │ ui/ (TextUi) │   ▼                ▼     │ OpenAI Codex OAuth auth    │
        │           │ tool_display │  ╭──────────────╮ ╭─────╮│ token store / refresh      │
@@ -24,20 +24,20 @@ This codemap describes implemented code only. Planned capabilities live in [`../
 │ browser / device code      │
 ╰────────────────────────────╯
 
-Nexus is provider- and UI-neutral: it drives turns and approval policy, streams
-text through a `TurnSink`, and renders nothing itself. All terminal I/O lives
-behind the `Ui` trait; the only implementation today is the text front-end. The
-next planned runtime change is documented in [`../ROADMAP.md`](../ROADMAP.md):
-replace the current blocking provider/tool seams with an async stream/cancel
-runtime while preserving this ownership split.
+Nexus is provider- and UI-neutral: it drives turns and approval policy, consumes
+the provider's async `Stream<ProviderEvent>`, and renders nothing itself. It runs
+on a tokio current-thread runtime (owned by `cli::run_session`) with a per-turn
+`CancellationToken`: provider stream reads, tool futures, and approval reviews are
+raced against cancellation via `tokio::select!`. All terminal I/O lives behind the
+`Ui` trait; the only implementation today is the text front-end.
 
 ## Key Modules
 
 | Module | Purpose | Public/internal API | Dependencies |
 |---|---|---|---|
-| `src/main.rs` | CLI entrypoint. Initializes telemetry, parses args, constructs the bare agent + provider + tools, wraps them in a Tier-2 `wayland::Harness` (with optional session log), runs the session or OpenAI Codex login commands, and maps typed errors to process exit codes. | `main()`, `dispatch()` | `cli`, `nexus::Agent`, `wayland::Harness`, `ui::text::TextUi`, `OpenAiCodexResponsesProvider`, `auth::openai_codex`, `telemetry`, `errors` |
-| `src/cli.rs` | Iris CLI session loop. Reads prompts through the `Ui` seam, skips blanks, exits on `/exit`/`/quit`, and submits each turn on the `wayland::Harness` via a per-turn `UiBridge` that backs both Nexus seams. | `run_session()` | `wayland::Harness`, `nexus::ChatProvider`, `ui::{Ui, UiBridge, UiEvent, is_exit_command}` |
-| `src/nexus.rs` | Runtime core (Tier 1). A provider-, UI-, persistence-, and workspace-neutral in-memory engine: owns conversation state + the injected `Tools` + approval policy, calls the provider with a streaming sink, enforces approval before gated tools, executes tools against an injected `&mut ToolEnv`, and emits `AgentEvent`s to an `AgentObserver`; gates tools via `ApprovalGate`. Holds no filesystem or session store. Bounds the tool loop and ends gracefully at the cap. | `ChatProvider`, `TurnSink`, `Agent`, `Agent::submit_turn()`, `Agent::messages()`, `Tool`, `Tools`, `ToolEnv`, `ToolOutput`, `AgentEvent`, `AgentObserver`, `ApprovalGate`, `ApprovalDecision`, `AssistantTurn`, `ToolCall`, `Message`, `Role` | `anyhow`, `serde_json`, `tracing`, `crate::{tools, signals}` |
+| `src/main.rs` | CLI entrypoint. Initializes telemetry, parses args, constructs the bare agent + provider + tools, wraps them in a Tier-2 `wayland::Harness` (with optional session log), runs the session or OpenAI Codex login commands, and maps typed errors to process exit codes. | `main()`, `dispatch()` | `cli`, `nexus::Agent`, `wayland::Harness`, `ui::text::TextUi`, `OpenAiCodexResponsesProvider`, `mimir::auth::openai_codex`, `telemetry`, `errors` |
+| `src/cli.rs` | Iris CLI session loop (Tier 3). Owns the tokio current-thread runtime and `block_on`s each turn; reads prompts through the `Ui` seam, skips blanks, exits on `/exit`/`/quit`, arms a per-turn `CancellationToken` with a background Ctrl-C watcher thread, and submits each turn on the `wayland::Harness` via a per-turn `UiBridge` that backs both Nexus seams. | `run_session()` | `tokio`, `tokio_util::CancellationToken`, `wayland::Harness`, `nexus::ChatProvider`, `ui::{Ui, UiBridge, UiEvent, is_exit_command}` |
+| `src/nexus.rs` | Runtime core (Tier 1). A provider-, UI-, persistence-, and workspace-neutral async in-memory engine: owns conversation state + the injected `Tools` + approval policy, consumes the provider's `Stream<ProviderEvent>`, enforces approval before gated tools, executes async tools against an injected `&mut ToolEnv` (consecutive concurrency-safe ungated calls run in parallel via `join_all`; everything else exclusively), and emits `AgentEvent`s to an `AgentObserver`; gates tools via `ApprovalGate`. Every emitted tool call gets a real or synthetic cancelled/denied result so the transcript stays valid on abort. Holds no filesystem or session store. Bounds the tool loop and ends gracefully at the cap. | `ChatProvider` (`respond_stream`), `ProviderEvent`, `ProviderStream`, `Agent`, `Agent::submit_turn()`, `Agent::messages()`, `Tool` (async `execute`, `is_concurrency_safe`), `Tools`, `ToolEnv`, `ToolFuture`, `ToolOutput`, `AgentEvent`, `AgentObserver`, `ApprovalGate`, `ApprovalDecision`, `AssistantTurn`, `ToolCall`, `Message`, `Role` | `anyhow`, `serde_json`, `tracing`, `tokio`, `tokio_util::CancellationToken`, `futures`, `crate::tools` |
 | `src/wayland.rs` | Tier-2 harness. Wraps the bare `nexus::Agent`, owns the execution surface (workspace + `tools::ToolState`) and the optional `session::SessionLog`, injects a `ToolEnv` into each turn, and persists new transcript messages post-turn (best-effort, diffing `agent.messages()`). Mirrors pi's `AgentHarness`. | `Harness`, `Harness::new()`, `Harness::submit_turn()` | `anyhow`, `tracing`, `crate::{nexus, session, tools}` |
 | `src/ui/mod.rs` | Terminal front-end seam (Tier 3). Defines the `Ui` trait, the `UiEvent` render protocol, turn-error classification, exit-command parsing, and `UiBridge` (adapts a `Ui` onto the Nexus `AgentObserver`/`ApprovalGate` seams via `RefCell`). | `Ui`, `UiEvent`, `UiBridge`, `TurnErrorKind`, `is_exit_command()` | `anyhow`, `crate::{nexus, errors}` |
 | `src/ui/text.rs` | Text terminal front-end. Owns stdin/stdout/stderr, prints the `iris>` prompt, renders streamed assistant deltas and tool lifecycle lines via `tool_display`, prompts for approval, and routes auth/provider errors to stderr. | `TextUi`, `TextUi::stdio()` | `std::io`, `crate::{approval, nexus, ui, tool_display}` |
@@ -49,7 +49,8 @@ runtime while preserving this ownership split.
 | `src/session.rs` | Best-effort JSONL transcript persistence. Writes a `session` header then appends one `message` line per conversation entry, flushing each write so a crash leaves a valid prefix. Linear transcript only (no tree/branching/compaction). | `SessionLog`, `SessionLog::create()`, `SessionLog::append()`, `SessionLog::path()` | `serde_json`, `anyhow`, `rand`, filesystem/time APIs, `crate::nexus::Message` |
 | `src/signals.rs` | Graceful SIGINT handling for the REPL. First Ctrl-C sets an interrupt flag the tool loop checks between round-trips (ends the turn cleanly); a second reaps tracked process groups via `process_group`, restores the default handler, and re-raises to force-quit. | `install()`, `interrupted()`, `reset()` | `libc`, `crate::process_group`, atomics |
 | `src/process_group.rs` | Single owner of process-group spawn/kill/reap policy for `bash` shells. Puts commands in their own group, kills+reaps groups, and keeps a lock-free registry so the force-quit SIGINT handler can SIGKILL every live group with only async-signal-safe ops. | `in_own_group()`, `kill()`, `kill_and_reap()`, `register()`, `kill_all_from_signal()`, `GroupGuard` | `libc`, atomics, `std::process` |
-| `src/tools/mod.rs` | Built-in tool dispatch, the `ToolOutput { content, metadata }` result contract, JSON tool declarations, mutating-tool approval classifier, diff-preview generation, and shared external-binary lookup. | `dispatch()`, `ToolOutput`, `requires_approval()`, `diff_preview()`, `tool_definitions()` | tool submodules, `anyhow`, `serde_json`, `std::process` |
+| `src/tools/mod.rs` | Built-in tool module root. Declares the per-tool modules, owns `ToolState` (observed files + bash sessions) injected via `ToolEnv`, re-exports the Tier-1 `ToolOutput` contract and `built_in_tools()`, and provides shared diff/preview rendering (`Preview`, `render_preview`, `unified_diff`). | `ToolState`, `ToolOutput` (re-export), `built_in_tools` (re-export), `Preview` | tool submodules, `crate::nexus::ToolOutput`, `similar`, `anyhow` |
+| `src/tools/registry.rs` | Built-in tool adapters (Tier 3). One thin `Tool` impl per tool (`ReadTool`…`LsTool`) wrapping the per-tool `execute`/`parameters` functions plus self-classification (`requires_approval`, `is_destructive`, `is_concurrency_safe`, `diff_preview`); `grep`/`find`/`ls` run their blocking body on `spawn_blocking` and are concurrency-safe, `read`/`edit`/`write`/`bash` stay exclusive. `built_in_tools()` is the injection point the CLI passes into the agent. | `built_in_tools()`, `Tool` impls | `crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools}`, `tokio`, `tokio_util::CancellationToken`, tool submodules |
 | `src/tools/path.rs` | Workspace path resolution and display helpers. Canonicalizes existing paths, normalizes create targets, and rejects workspace escapes. | `workspace_root()`, `resolve_existing()`, `resolve_for_write()`, `relative_display()` | `std::path`, `anyhow` |
 | `src/tools/text.rs` | Shared text, truncation, size-limit, line-ending, and atomic-write helpers. | `atomic_write()`, `truncate_head()`, `truncate_tail()`, line-ending helpers | filesystem APIs, `rand`, `anyhow` |
 | `src/tools/read.rs` | Text-file read tool with offset/limit, line numbers, binary/NUL and invalid UTF-8 rejection. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
@@ -63,26 +64,27 @@ runtime while preserving this ownership split.
 | `src/tools/grep.rs` | Library-backed (grep/ignore) content search, grouped by file with context. | `execute()` | `path`, `text`, `grep`, `ignore`, `serde` |
 | `src/tools/find.rs` | Native (ignore + globset) file glob search sorted newest-first. | `execute()` | `path`, `text`, `ignore`, `globset`, `serde` |
 | `src/tools/ls.rs` | Directory listing tool: directories first, dotfiles, directory suffixes, optional recursive tree, optional `long` mode (type marker + human-readable size), entry-count metadata, and output caps. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
-| `src/auth/mod.rs` | Auth module declaration. | `device_code`, `openai_codex`, `storage` modules | auth submodules |
-| `src/auth/storage.rs` | Provider-keyed auth-file storage for OAuth credentials. Reads missing files as empty, validates credential shape, and writes atomically with restricted Unix permissions. | `AuthStore`, `OAuthCredentials` | filesystem/env APIs, `anyhow`, `serde`, `serde_json` |
-| `src/auth/device_code.rs` | Generic polling helper for OAuth device-code flows. | `DeviceCodePoll`, `poll_device_code()` | `std::thread`, `std::time`, `anyhow` |
-| `src/auth/openai_codex.rs` | OpenAI Codex OAuth integration. Supports browser callback login, device-code login, token exchange/refresh, and account ID extraction from JWT payloads. | `OpenAiCodexTokenStore`, `AccessToken`, `login_browser()`, `login_device_code()` | `AuthStore`, `poll_device_code`, `base64`, `rand`, `reqwest`, `sha2`, `serde`, `serde_json`, TCP/filesystem/time APIs |
-| `src/providers/mod.rs` | Provider module declaration. | `openai_codex_responses` module | `src/providers/openai_codex_responses.rs` |
-| `src/providers/openai_codex_responses.rs` | Implements `ChatProvider` for the ChatGPT Codex Responses endpoint. Builds request JSON/headers/URL, advertises tools, retries with backoff, and parses streamed assistant text (via `TurnSink`) and tool calls. | `OpenAiCodexResponsesProvider` | `OpenAiCodexTokenStore`, `ChatProvider`, `TurnSink`, Nexus message/turn types, `crate::{tools, errors, telemetry}`, `reqwest`, `serde_json`, `tracing` |
+| `src/mimir/mod.rs` | Mimir module declaration: Iris's AI/provider package (the pi-ai equivalent), housing the provider adapters + auth. The `ChatProvider` contract stays in `nexus`. See [`../NAMING.md`](../NAMING.md). | `auth`, `providers` modules | mimir submodules |
+| `src/mimir/auth/mod.rs` | Auth module declaration. | `device_code`, `openai_codex`, `storage` modules | auth submodules |
+| `src/mimir/auth/storage.rs` | Provider-keyed auth-file storage for OAuth credentials. Reads missing files as empty, validates credential shape, and writes atomically with restricted Unix permissions. | `AuthStore`, `OAuthCredentials` | filesystem/env APIs, `anyhow`, `serde`, `serde_json` |
+| `src/mimir/auth/device_code.rs` | Generic polling helper for OAuth device-code flows. | `DeviceCodePoll`, `poll_device_code()` | `std::thread`, `std::time`, `anyhow` |
+| `src/mimir/auth/openai_codex.rs` | OpenAI Codex OAuth integration. Supports browser callback login, device-code login, token exchange/refresh, and account ID extraction from JWT payloads. | `OpenAiCodexTokenStore`, `AccessToken`, `login_browser()`, `login_device_code()` | `AuthStore`, `poll_device_code`, `base64`, `rand`, `reqwest`, `sha2`, `serde`, `serde_json`, TCP/filesystem/time APIs |
+| `src/mimir/providers/mod.rs` | Provider module declaration. | `openai_codex_responses` module | `src/mimir/providers/openai_codex_responses.rs` |
+| `src/mimir/providers/openai_codex_responses.rs` | Implements `ChatProvider::respond_stream` for the ChatGPT Codex Responses endpoint. Runs the existing blocking reqwest/SSE code on `spawn_blocking`, forwarding text deltas and the final turn onto a `futures` channel as `ProviderEvent`s (a provider-internal `TurnSink` adapts the SSE parser onto the channel). Builds request JSON/headers/URL, advertises tools, retries with backoff, and is cancellation-aware (checks the turn token before each attempt, across backoff, and between SSE lines). | `OpenAiCodexResponsesProvider` | `OpenAiCodexTokenStore`, `ChatProvider`, `ProviderEvent`, `ProviderStream`, Nexus message/turn types, `crate::{tools, errors, telemetry}`, `reqwest`, `futures`, `tokio`, `serde_json`, `tracing` |
 
 ## Data Flow
 
 1. `main()` calls `telemetry::init()`, installs the SIGINT handler via `signals::install()`, and runs `dispatch()`.
 2. For the default command, `run_agent()` loads `config::Settings` for the cwd (rejecting an unsupported `default_provider`), builds `OpenAiCodexResponsesProvider::new()` from the settings model/base-url, creates an `Agent` rooted at the current dir, attaches a best-effort `session::SessionLog` (warns and continues in-memory if it cannot be opened), and a stdio `TextUi`, then calls `cli::run_session()`.
-3. `run_session()` emits `SessionStarted`, then loops: read a prompt through `Ui::next_prompt()`, skip blanks, break on `/exit`/`/quit`, and call `Agent::submit_turn(prompt, ui)`.
+3. `run_session()` creates the tokio current-thread runtime, emits `SessionStarted`, then loops: read a prompt through `Ui::next_prompt()`, skip blanks, break on `/exit`/`/quit`, arm a per-turn `CancellationToken` plus a Ctrl-C watcher thread, and `block_on(Harness::submit_turn(prompt, observer, gate, token))`.
 4. `submit_turn()` appends `Message::user(prompt)` and runs `complete_turn()`.
-5. `complete_turn()` calls `ChatProvider::respond(messages, sink)` with a `UiTurnSink`; the provider streams assistant text as `AssistantTextDelta` events through the sink.
-6. The OpenAI Codex provider reads or refreshes OAuth credentials, converts Nexus messages to Codex Responses request JSON (with tool definitions from `tools::tool_definitions()`), sends a blocking request with retry/backoff, and parses streamed events into deltas, final text, and tool calls.
-7. Nexus commits final assistant text as `AssistantText`/`AssistantTextEnd` and appends it to conversation state.
+5. `complete_turn()` calls `ChatProvider::respond_stream(messages, tools, token)`, which returns a `Stream<Result<ProviderEvent>>`; the loop races each stream read against the turn token via `tokio::select!`.
+6. The OpenAI Codex provider runs its blocking work on `spawn_blocking`: it reads or refreshes OAuth credentials, converts Nexus messages to Codex Responses request JSON (with tool definitions advertised per turn), sends a cancellation-aware request with retry/backoff, and forwards parsed events onto a `futures` channel as `ProviderEvent::TextDelta` / `ProviderEvent::Completed`.
+7. Nexus emits `AssistantText`/`AssistantTextEnd` for deltas/final text and appends the final assistant turn to conversation state.
 8. With no tool calls, Nexus emits `TurnComplete` and returns.
-9. For each tool call, Nexus records the assistant tool call. Gated tools (`tools::requires_approval()`) emit a `DiffPreview` when `tools::diff_preview()` returns one, then `Ui::request_approval()` collects a decision; denial emits `ToolDenied` and records `{ ok: false, denied: true }`. Ungated tools emit `ToolProposed`.
-10. Allowed or ungated calls dispatch through `tools::dispatch()`; Nexus emits `ToolResult`/`ToolError` for display and records the full JSON `{ ok, content/error }` result for the model.
-11. The loop repeats until the assistant returns no tool calls or the bounded `MAX_TOOL_ROUNDTRIPS` cap is hit, at which point Nexus emits a `Notice` and `TurnComplete` (graceful, not an error). Between round-trips Nexus checks `signals::interrupted()`: a pending Ctrl-C ends the turn cleanly (pending tools denied) and returns to the prompt.
+9. Tool calls run via `run_tools()`: consecutive concurrency-safe, ungated calls form a parallel batch (`join_all`, in-order results); every other call runs exclusively. For each call Nexus records the assistant tool call. Gated tools (`Tool::requires_approval()`) emit a `DiffPreview` when `Tool::diff_preview()` returns one, then `ApprovalGate::review()` collects a decision (raced against cancellation); denial emits `ToolDenied` and records `{ ok: false, denied: true }`. Ungated tools emit `ToolProposed`.
+10. Allowed or ungated calls run `Tool::execute()` (a future given a child token, raced against cancellation); Nexus emits `ToolResult`/`ToolError` for display and records the full JSON `{ ok, content/error }` result for the model. On cancellation every emitted call still gets a real or synthetic cancelled/denied result so the next request stays valid.
+11. The loop repeats until the assistant returns no tool calls or the bounded `MAX_TOOL_ROUNDTRIPS` cap is hit, at which point Nexus emits a `Notice` and `TurnComplete` (graceful, not an error). A tripped turn token ends the turn promptly and returns to the prompt.
 12. When a session log is attached, each newly committed message is appended to the JSONL transcript as the turn progresses.
 13. Turn errors from `submit_turn()` are classified by `UiEvent::from_turn_error()` into auth vs provider and rendered to stderr; the session continues.
 
@@ -127,6 +129,9 @@ Unknown commands print help and exit with code `2` (`UsageError`); auth failures
 
 - `anyhow` — error propagation and context.
 - `base64` — base64url JWT payload decoding.
+- `futures` — `Stream` trait and the unbounded channel bridging the provider's `spawn_blocking` task to the async loop.
+- `tokio` — current-thread async runtime, `spawn_blocking`, and `tokio::select!` cancellation races.
+- `tokio-util` — `CancellationToken` for per-turn and per-tool cancellation.
 - `landlock` — Linux Landlock LSM ruleset construction for the `bash` kernel sandbox.
 - `libc` — Unix process-group spawn/termination/reaping and async-signal-safe SIGINT handling.
 - `rand` — OAuth PKCE/state token generation and unique atomic-write temp names.
@@ -153,22 +158,24 @@ Current unit tests cover:
 - SIGINT first-press/repeat flag behavior in `src/signals.rs`.
 - Process-group registration/guard, targeted kill, and backgrounded-grandchild reaping in `src/process_group.rs`.
 - Built-in tool behavior under `src/tools/`, including read/write/edit, atomic writes, `ls`, optional `grep`/`find` integration, bash output/timeout/process-group handling, persistent sessions, background jobs, Landlock sandbox decision/fallback, diff previews, and dispatch/tool-definition coverage.
-- Larger Nexus and Codex-provider suites split into `src/nexus_tests.rs` and `src/providers/openai_codex_responses_tests.rs`.
-- Auth storage parsing and atomic restricted writes in `src/auth/storage.rs`.
-- Device-code polling behavior in `src/auth/device_code.rs`.
-- JWT account extraction, browser OAuth URL/callback parsing, device-code interval parsing, and device-auth error parsing in `src/auth/openai_codex.rs`.
-- Codex URL resolution, request JSON construction, streamed text/delta parsing, tool-call parsing, and missing-output errors in `src/providers/openai_codex_responses.rs`.
+- Larger Nexus and Codex-provider suites split into `src/nexus_tests.rs` and `src/mimir/providers/openai_codex_responses_tests.rs`.
+- Auth storage parsing and atomic restricted writes in `src/mimir/auth/storage.rs`.
+- Device-code polling behavior in `src/mimir/auth/device_code.rs`.
+- JWT account extraction, browser OAuth URL/callback parsing, device-code interval parsing, and device-auth error parsing in `src/mimir/auth/openai_codex.rs`.
+- Codex URL resolution, request JSON construction, streamed text/delta parsing, tool-call parsing, and missing-output errors in `src/mimir/providers/openai_codex_responses.rs`.
 
 ## Known Gaps
 
-Milestone 1 is complete, but the runtime is not finished. The important next gap
-is runtime hardness: `ChatProvider` is not yet an async streaming contract,
-active turns do not yet own a real cancellation token, provider reads and tool
-futures are not raced against cancellation, tools do not yet receive child
-cancellation tokens, and concurrency-safe tools do not yet run in parallel under
-Nexus scheduling. Also still missing: persistent approval policies, session
-`/resume` and transcript-tree branching, and the later roadmap systems listed in
-[`../ROADMAP.md`](../ROADMAP.md).
+Milestone 1 and the async-hard runtime are complete: `ChatProvider` is an async
+streaming contract, each turn owns a `CancellationToken`, provider reads / tool
+futures / approval reviews are raced against cancellation, tools receive child
+tokens, and concurrency-safe tools run in parallel. Documented runtime caveats
+(see [`../ROADMAP.md`](../ROADMAP.md)): the real terminal approval prompt is a
+blocking stdin read, so the first Ctrl-C cannot preempt a *pending* prompt; an
+idle provider socket read and an abandoned `grep`/`find`/`ls` walk are not
+force-aborted mid-flight. Still missing: persistent approval policies, session
+`/resume` and transcript-tree branching, and the later roadmap systems (token/
+context, modes, subagents, git/GitHub).
 
 ## Related Areas
 

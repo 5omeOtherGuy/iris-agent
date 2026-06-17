@@ -2,12 +2,14 @@
 
 **A fast, token-efficient coding agent for your terminal.**
 
-> **Status (2026-06-17): Milestone 1 complete.** Iris currently has a text-only
-> REPL, OpenAI Codex OAuth/login support, an OpenAI Codex Responses provider with
-> streamed response parsing, workspace-scoped built-in tools, approval gates with
-> diff previews, provider/model settings, and best-effort JSONL transcripts. The
-> next runtime work is to make Nexus async-hard — async provider streams,
-> cancellation tokens, child cancellation per tool, and safe parallel execution.
+> **Status (2026-06-17): Milestone 1 and the async-hard runtime complete.** Iris
+> currently has a text-only REPL, OpenAI Codex OAuth/login support, an OpenAI
+> Codex Responses provider with streamed response parsing, workspace-scoped
+> built-in tools, approval gates with diff previews, provider/model settings, and
+> best-effort JSONL transcripts. Nexus runs a tokio async loop with turn-level
+> cancellation: async provider streams, per-tool child cancellation, and
+> safe-parallel execution of concurrency-safe tools. The next runtime work is
+> Milestone 2 (token/context).
 > Efficiency claims (token savings, cache hits, cheaper switching, compaction
 > quality) are **design goals to be backed by benchmarks**
 > before they are used as selling points. Read future capability sections below

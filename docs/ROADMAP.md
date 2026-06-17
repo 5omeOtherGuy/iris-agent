@@ -53,10 +53,15 @@ Implemented today:
 - Text-only Nexus session loop with in-memory conversation state, `/exit` /
   `/quit`, and provider-error recovery, driven through a `Ui` front-end seam
   (`src/ui/`, `src/cli.rs`).
-- Incremental terminal streaming of assistant text via the `TurnSink` seam and
+- Incremental terminal streaming of assistant text via the async
+  `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, rendered as
   `UiEvent` deltas.
-- Provider-neutral `ChatProvider`, `TurnSink`, `AssistantTurn`, `ToolCall`,
-  `Message`, and `Role` types.
+- Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and
+  `Role` types.
+- Async tokio agent loop with a per-turn `CancellationToken`: provider stream /
+  tool / approval reads raced against cancellation, async tools with child
+  tokens, safe-parallel batching of concurrency-safe tools, and a valid
+  transcript on abort.
 - Provider tool-call loop with bounded iterations, retry/backoff, and structured
   tool result/error messages.
 - Typed boundary errors with process exit codes (`src/errors.rs`) and `RUST_LOG`
