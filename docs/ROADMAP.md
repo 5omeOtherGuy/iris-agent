@@ -1,10 +1,11 @@
 # Iris — Roadmap
 
 > Status (2026-06-17): Milestone 1 and the async-hard runtime completion are
-> done. Iris has a text-only session loop, OpenAI Codex Responses provider,
-> streamed response parsing, workspace-scoped tools, terminal approval gates with
-> diff previews, provider/model settings, and best-effort JSONL transcript
-> persistence. Nexus now runs a tokio async loop with turn-level cancellation:
+> done. Iris has a text-only session loop, selectable Mimir providers
+> (`openai-codex`, `anthropic`, and `antigravity`), streamed response parsing,
+> workspace-scoped tools, terminal approval gates with diff previews,
+> provider/model settings, and best-effort JSONL transcript persistence. Nexus
+> now runs a tokio async loop with turn-level cancellation:
 > the provider is an async stream raced against cancellation, tools are async
 > with child tokens, concurrency-safe tools run in parallel while everything else
 > stays exclusive, and the transcript stays valid on abort. The next runtime work
@@ -75,10 +76,13 @@ Implemented today:
 - Atomic same-directory file replacement helper used by `write` and `edit`.
 - Text-only `read` rejects binary/NUL-containing and invalid UTF-8 files instead
   of rendering lossy text.
-- OpenAI Codex OAuth token loading/refresh from the Iris auth-file shape.
-- OpenAI Codex browser and device-code login flows.
-- OpenAI Codex Responses request/response handling, including tool schemas and
-  streamed-response parsing.
+- Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
+  subscription OAuth reuse, and Antigravity Google OAuth.
+- OpenAI Codex browser and device-code login flows; Antigravity browser PKCE
+  login; Anthropic instructions for reusing an existing Claude Code login.
+- OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini Code Assist
+  request/response handling, including tool schemas and streamed-response
+  parsing.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.
@@ -496,12 +500,14 @@ Potential scope:
   ships write-only persistence, not session resume.]
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
-  override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project),
-  project overriding global field-by-field, mirroring pi's settings model.
-  Fields: `defaultProvider` (validated; only `openai-codex` today),
-  `defaultModel`, `baseUrl`. Precedence is `env > settings > built-in default`
-  so existing `IRIS_MODEL`/`IRIS_CODEX_BASE_URL` env vars still win; unknown
-  keys are ignored, a malformed file errors with its path. Tool/approval policy
+  override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project).
+  Project-local settings may override only `defaultModel`; global/user settings
+  own `defaultProvider` (validated; supported ids: `openai-codex`, `anthropic`,
+  `antigravity`) and `baseUrl` so a cloned repo cannot redirect bearer tokens.
+  OpenAI Codex keeps its existing env override precedence for `IRIS_MODEL` and
+  `IRIS_CODEX_BASE_URL`; Anthropic and Antigravity use settings/defaults for
+  model/base-url. Unknown keys are ignored, a malformed file errors with its
+  path. Tool/approval policy
   is deliberately out of scope: pi's settings encode none either, and
   cross-session approval persistence is tracked under
   [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14).]

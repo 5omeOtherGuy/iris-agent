@@ -81,8 +81,9 @@ in three layers of very different cost:
 - **Job B — product/crate/binary/env/paths named `iris`: breaking.**
   - Crate + binary `iris-agent`, repo dir, GitHub URL.
   - Env vars `IRIS_MODEL`, `IRIS_CODEX_BASE_URL`, `IRIS_CONFIG_PATH`,
-    `IRIS_SESSION_DIR`, `IRIS_AUTH_PATH` — **breaks existing users** without
-    old-name fallback.
+    `IRIS_SESSION_DIR`, `IRIS_AUTH_PATH`, `CLAUDE_CONFIG_DIR`,
+    `ANTIGRAVITY_CLIENT_SECRET`, `ANTIGRAVITY_PROJECT_ID` — **breaks existing
+    users** without old-name fallback.
   - Data dirs `~/.iris/{settings,auth,sessions}` — **orphans user data** without
     migration/fallback.
   - Internal protocol strings `__IRIS_DONE_` / `__iris_rc`

@@ -3,8 +3,8 @@
 **A fast, token-efficient coding agent for your terminal.**
 
 > **Status (2026-06-17): Milestone 1 and the async-hard runtime complete.** Iris
-> currently has a text-only REPL, OpenAI Codex OAuth/login support, an OpenAI
-> Codex Responses provider with streamed response parsing, workspace-scoped
+> currently has a text-only REPL, selectable Mimir providers (`openai-codex`,
+> `anthropic`, `antigravity`), streamed response parsing, workspace-scoped
 > built-in tools, approval gates with diff previews, provider/model settings, and
 > best-effort JSONL transcripts. Nexus runs a tokio async loop with turn-level
 > cancellation: async provider streams, per-tool child cancellation, and

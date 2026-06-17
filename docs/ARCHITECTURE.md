@@ -122,7 +122,7 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 | Tool implementations: `read` `write` `edit` `bash` `grep` `find` `ls` | `tools/*` (impls) |
 | Plugin runtime + registration, if a plugin system is ever added: executor (WASM/Extism or subprocess), manifest parsing, registry wiring | _exploratory (issue #18)_ |
 | Trusted approval-preview diff rendering | `tools/mod.rs` (`diff_preview`) → Tier 3 |
-| Provider adapter (translates Codex Responses → contracts), packaged as **Mimir** (the AI/provider package; see [`NAMING.md`](NAMING.md)) | `mimir/providers/*` |
+| Provider adapters (translate OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini wire formats → contracts), packaged as **Mimir** (the AI/provider package; see [`NAMING.md`](NAMING.md)) | `mimir/providers/*` |
 | Auth flows + token store (Mimir) | `mimir/auth/*` |
 
 Depends on Tier 1 (contracts) and Tier 2 (harness).
@@ -202,8 +202,8 @@ core never matches on tool names.
 
 ## Packaging
 
-Per [`AGENTS.md`](../AGENTS.md), these tiers are **modules in one crate** for the
-MVP. Do not split into separate crates or processes to satisfy the boundary. The
+Per the project agent guidelines, these tiers are **modules in one crate** for
+the MVP. Do not split into separate crates or processes to satisfy the boundary. The
 discipline is the inward-pointing dependency direction, not the package count.
 Promote `nexus` (core), `wayland` (harness), and `iris` (CLI) to a cargo
 workspace only when a second front-end or published Nexus runtime makes the
