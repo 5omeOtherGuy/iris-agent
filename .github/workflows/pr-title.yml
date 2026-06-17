@@ -27,6 +27,7 @@ jobs:
           types: |
             feat
             fix
+            deps
             docs
             test
             refactor
