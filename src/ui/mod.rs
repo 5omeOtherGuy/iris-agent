@@ -2,7 +2,9 @@ use std::cell::RefCell;
 
 use anyhow::Result;
 
-use crate::nexus::{AgentEvent, AgentObserver, ApprovalDecision, ApprovalGate, ToolCall};
+use crate::nexus::{
+    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ToolCall,
+};
 
 pub(crate) mod text;
 
@@ -124,7 +126,12 @@ impl AgentObserver for UiBridge<'_> {
 }
 
 impl ApprovalGate for UiBridge<'_> {
-    fn review(&self, call: &ToolCall) -> Result<ApprovalDecision> {
-        self.ui.borrow_mut().request_approval(call)
+    fn review<'a>(&'a self, call: &'a ToolCall) -> ApprovalFuture<'a> {
+        Box::pin(async move { self.ui.borrow_mut().request_approval(call) })
+        // ponytail: the terminal prompt is a blocking stdin read, so this future
+        // runs the read inline; the first Ctrl-C does not interrupt a pending
+        // prompt (the loop races this against cancellation, but the read holds
+        // the executor until a second Ctrl-C force-quits). A non-blocking TUI
+        // prompt would let the first Ctrl-C cancel a pending approval too.
     }
 }

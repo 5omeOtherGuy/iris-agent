@@ -42,7 +42,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use tokio_util::sync::CancellationToken;
 
+use super::CANCEL_POLL_INTERVAL;
 use super::sandbox::{self, SandboxStatus};
 
 /// Upper bound on how long a single command may run when the caller passes no
@@ -65,6 +67,10 @@ pub(crate) struct RunOutcome {
     /// Whether the command was cut off by the per-command timeout (the session
     /// is killed and will be recreated on the next run).
     pub(crate) timed_out: bool,
+    /// Whether the command was interrupted by a turn-level cancellation
+    /// (Ctrl-C). Like a timeout, the session shell is killed and recreated next
+    /// run.
+    pub(crate) cancelled: bool,
     /// Sandbox status notice when the shell could not be fully confined; `None`
     /// when fully enforced. Surfaced by the tool layer (never silently dropped).
     pub(crate) notice: Option<String>,
@@ -90,6 +96,7 @@ impl Sessions {
         id: &str,
         command: &str,
         timeout: Option<Duration>,
+        cancel: &CancellationToken,
     ) -> Result<RunOutcome> {
         let fresh = match self.sessions.get(id) {
             Some(session) => !session.alive,
@@ -100,7 +107,7 @@ impl Sessions {
             if let Some(mut old) = self.sessions.remove(id) {
                 old.kill_and_reap();
             }
-            let session = Session::create(root)?;
+            let session = Session::create(root, cancel)?;
             self.sessions.insert(id.to_string(), session);
         }
 
@@ -108,7 +115,7 @@ impl Sessions {
             .sessions
             .get_mut(id)
             .expect("session present after create");
-        let mut outcome = session.run_command(command, timeout);
+        let mut outcome = session.run_command(command, timeout, cancel);
         // Never a silent "sandbox off": carry the notice for the tool layer to
         // surface (kept out of `output` so truncation cannot drop it).
         outcome.notice = session.status.notice();
@@ -150,6 +157,9 @@ enum Marker {
     /// The shell's stdout closed (it exited) before a marker; `output` is
     /// whatever it printed first.
     Disconnected { output: Vec<u8>, dropped: usize },
+    /// A turn-level cancellation (Ctrl-C) interrupted the wait; `output` is what
+    /// was read so far.
+    Cancelled { output: Vec<u8>, dropped: usize },
 }
 
 /// A single persistent shell.
@@ -169,7 +179,7 @@ struct Session {
 impl Session {
     /// Spawn a confined `bash`, merge stderr into stdout, and sync to a clean
     /// state by consuming an initial marker.
-    fn create(root: &Path) -> Result<Self> {
+    fn create(root: &Path, cancel: &CancellationToken) -> Result<Self> {
         let mut command = Command::new(super::resolve_shell());
         command
             .current_dir(root)
@@ -210,7 +220,7 @@ impl Session {
         session
             .write_marker()
             .context("failed to initialize session shell")?;
-        match session.read_until_marker(Some(Instant::now() + Duration::from_secs(10))) {
+        match session.read_until_marker(Some(Instant::now() + Duration::from_secs(10)), cancel) {
             Marker::Found { .. } => Ok(session),
             _ => {
                 session.kill_and_reap();
@@ -226,7 +236,12 @@ impl Session {
 
     /// Run one command and return its output + exit code. Caller guarantees the
     /// session is alive; a dead shell or timeout marks it dead for recreation.
-    fn run_command(&mut self, command: &str, timeout: Option<Duration>) -> RunOutcome {
+    fn run_command(
+        &mut self,
+        command: &str,
+        timeout: Option<Duration>,
+        cancel: &CancellationToken,
+    ) -> RunOutcome {
         if self.write_command(command).is_err() {
             // The shell died between commands; reap it and report dead so the
             // next run recreates it.
@@ -236,13 +251,14 @@ impl Session {
                 output_dropped: 0,
                 exit_code: None,
                 timed_out: false,
+                cancelled: false,
                 notice: None,
             };
         }
         let deadline = timeout
             .map(|d| Instant::now() + d)
             .or_else(|| Some(Instant::now() + SESSION_HARD_CAP));
-        match self.read_until_marker(deadline) {
+        match self.read_until_marker(deadline, cancel) {
             Marker::Found {
                 output,
                 dropped,
@@ -252,6 +268,7 @@ impl Session {
                 output_dropped: dropped,
                 exit_code: code,
                 timed_out: false,
+                cancelled: false,
                 notice: None,
             },
             Marker::TimedOut { output, dropped } => {
@@ -261,6 +278,7 @@ impl Session {
                     output_dropped: dropped,
                     exit_code: None,
                     timed_out: true,
+                    cancelled: false,
                     notice: None,
                 }
             }
@@ -271,6 +289,18 @@ impl Session {
                     output_dropped: dropped,
                     exit_code: None,
                     timed_out: false,
+                    cancelled: false,
+                    notice: None,
+                }
+            }
+            Marker::Cancelled { output, dropped } => {
+                self.kill_and_reap();
+                RunOutcome {
+                    output: String::from_utf8_lossy(&output).into_owned(),
+                    output_dropped: dropped,
+                    exit_code: None,
+                    timed_out: false,
+                    cancelled: true,
                     notice: None,
                 }
             }
@@ -301,7 +331,11 @@ impl Session {
 
     /// Read the output stream until the completion marker, the deadline, or the
     /// shell's stdout closing.
-    fn read_until_marker(&mut self, deadline: Option<Instant>) -> Marker {
+    fn read_until_marker(
+        &mut self,
+        deadline: Option<Instant>,
+        cancel: &CancellationToken,
+    ) -> Marker {
         let prefix = format!("\n__IRIS_DONE_{} ", self.nonce).into_bytes();
         let mut buf = std::mem::take(&mut self.leftover);
         // Rescan from a point that preserves any marker split across reads.
@@ -331,7 +365,19 @@ impl Session {
                 scan_from = buf.len().saturating_sub(prefix.len().saturating_sub(1));
             }
 
-            let chunk = match deadline {
+            if cancel.is_cancelled() {
+                return Marker::Cancelled {
+                    output: buf,
+                    dropped,
+                };
+            }
+
+            // Wait for the next chunk, but never longer than one cancel-poll
+            // slice so a turn-level Ctrl-C is observed promptly even when output
+            // is quiet; the explicit check above handles noisy commands that keep
+            // delivering chunks faster than the slice timeout. The full deadline
+            // is still enforced via the zero-remaining check above each wait.
+            let wait = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -340,31 +386,27 @@ impl Session {
                             dropped,
                         };
                     }
-                    match self.rx.recv_timeout(remaining) {
-                        Ok(chunk) => chunk,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            return Marker::TimedOut {
-                                output: buf,
-                                dropped,
-                            };
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            return Marker::Disconnected {
-                                output: buf,
-                                dropped,
-                            };
-                        }
-                    }
+                    remaining.min(CANCEL_POLL_INTERVAL)
                 }
-                None => match self.rx.recv() {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        return Marker::Disconnected {
+                None => CANCEL_POLL_INTERVAL,
+            };
+            let chunk = match self.rx.recv_timeout(wait) {
+                Ok(chunk) => chunk,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.is_cancelled() {
+                        return Marker::Cancelled {
                             output: buf,
                             dropped,
                         };
                     }
-                },
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Marker::Disconnected {
+                        output: buf,
+                        dropped,
+                    };
+                }
             };
             buf.extend_from_slice(&chunk);
             if buf.len() > SESSION_MAX_OUTPUT_BYTES {
@@ -456,8 +498,11 @@ mod tests {
         let ws = workspace();
         std::fs::create_dir(ws.0.join("sub")).unwrap();
         let mut s = Sessions::new();
-        s.run(&ws.0, "a", "cd sub", None).unwrap();
-        let out = s.run(&ws.0, "a", "pwd", None).unwrap();
+        s.run(&ws.0, "a", "cd sub", None, &CancellationToken::new())
+            .unwrap();
+        let out = s
+            .run(&ws.0, "a", "pwd", None, &CancellationToken::new())
+            .unwrap();
         assert_eq!(out.exit_code, Some(0));
         assert!(
             out.output.trim_end().ends_with("/sub"),
@@ -471,10 +516,22 @@ mod tests {
     fn env_and_shell_vars_persist_between_calls() {
         let ws = workspace();
         let mut s = Sessions::new();
-        s.run(&ws.0, "a", "export FOO=bar", None).unwrap();
-        s.run(&ws.0, "a", "PLAIN=42", None).unwrap();
-        let foo = s.run(&ws.0, "a", "echo $FOO", None).unwrap();
-        let plain = s.run(&ws.0, "a", "echo $PLAIN", None).unwrap();
+        s.run(
+            &ws.0,
+            "a",
+            "export FOO=bar",
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        s.run(&ws.0, "a", "PLAIN=42", None, &CancellationToken::new())
+            .unwrap();
+        let foo = s
+            .run(&ws.0, "a", "echo $FOO", None, &CancellationToken::new())
+            .unwrap();
+        let plain = s
+            .run(&ws.0, "a", "echo $PLAIN", None, &CancellationToken::new())
+            .unwrap();
         assert_eq!(foo.output.trim_end(), "bar");
         assert_eq!(plain.output.trim_end(), "42");
         s.close("a").unwrap();
@@ -485,10 +542,27 @@ mod tests {
         let ws = workspace();
         std::fs::create_dir(ws.0.join("sub")).unwrap();
         let mut s = Sessions::new();
-        s.run(&ws.0, "a", "cd sub; export FOO=bar", None).unwrap();
+        s.run(
+            &ws.0,
+            "a",
+            "cd sub; export FOO=bar",
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         s.reset("a").unwrap();
-        let pwd = s.run(&ws.0, "a", "pwd", None).unwrap();
-        let foo = s.run(&ws.0, "a", "echo \"[${FOO:-unset}]\"", None).unwrap();
+        let pwd = s
+            .run(&ws.0, "a", "pwd", None, &CancellationToken::new())
+            .unwrap();
+        let foo = s
+            .run(
+                &ws.0,
+                "a",
+                "echo \"[${FOO:-unset}]\"",
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert!(
             !pwd.output.trim_end().ends_with("/sub"),
             "cwd not reset: {:?}",
@@ -502,23 +576,42 @@ mod tests {
     fn reports_exit_codes_and_output() {
         let ws = workspace();
         let mut s = Sessions::new();
-        let hello = s.run(&ws.0, "a", "echo hello", None).unwrap();
+        let hello = s
+            .run(&ws.0, "a", "echo hello", None, &CancellationToken::new())
+            .unwrap();
         assert_eq!(hello.output.trim_end(), "hello");
         assert_eq!(hello.exit_code, Some(0));
-        assert_eq!(s.run(&ws.0, "a", "false", None).unwrap().exit_code, Some(1));
+        assert_eq!(
+            s.run(&ws.0, "a", "false", None, &CancellationToken::new())
+                .unwrap()
+                .exit_code,
+            Some(1)
+        );
         // A child process exiting non-zero is reported without killing the
         // session shell (unlike a bare `exit`, which would terminate it).
         assert_eq!(
-            s.run(&ws.0, "a", "bash -c 'exit 7'", None)
-                .unwrap()
-                .exit_code,
+            s.run(
+                &ws.0,
+                "a",
+                "bash -c 'exit 7'",
+                None,
+                &CancellationToken::new()
+            )
+            .unwrap()
+            .exit_code,
             Some(7)
         );
         assert_eq!(
-            s.run(&ws.0, "a", "echo still-alive", None)
-                .unwrap()
-                .output
-                .trim_end(),
+            s.run(
+                &ws.0,
+                "a",
+                "echo still-alive",
+                None,
+                &CancellationToken::new()
+            )
+            .unwrap()
+            .output
+            .trim_end(),
             "still-alive"
         );
         s.close("a").unwrap();
@@ -534,6 +627,7 @@ mod tests {
                 "a",
                 "python3 - <<'PY'\nprint('x' * (2 * 1024 * 1024))\nPY",
                 Some(Duration::from_secs(5)),
+                &CancellationToken::new(),
             )
             .unwrap();
 
@@ -546,7 +640,8 @@ mod tests {
     fn close_kills_and_reaps_shell() {
         let ws = workspace();
         let mut s = Sessions::new();
-        s.run(&ws.0, "a", "echo hi", None).unwrap();
+        s.run(&ws.0, "a", "echo hi", None, &CancellationToken::new())
+            .unwrap();
         let pid = s.child_pid("a").unwrap();
         assert!(pid_alive(pid));
         s.close("a").unwrap();
@@ -563,14 +658,31 @@ mod tests {
     fn dead_session_is_recreated_without_panic() {
         let ws = workspace();
         let mut s = Sessions::new();
-        s.run(&ws.0, "a", "export FOO=bar", None).unwrap();
+        s.run(
+            &ws.0,
+            "a",
+            "export FOO=bar",
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         // `exit` kills the shell mid-command: no marker, defined as dead.
-        let _ = s.run(&ws.0, "a", "exit", None);
+        let _ = s.run(&ws.0, "a", "exit", None, &CancellationToken::new());
         // Next run must transparently recreate a fresh shell.
-        let out = s.run(&ws.0, "a", "echo back", None).unwrap();
+        let out = s
+            .run(&ws.0, "a", "echo back", None, &CancellationToken::new())
+            .unwrap();
         assert_eq!(out.output.trim_end(), "back");
         // Fresh shell, so the old var is gone.
-        let foo = s.run(&ws.0, "a", "echo \"[${FOO:-unset}]\"", None).unwrap();
+        let foo = s
+            .run(
+                &ws.0,
+                "a",
+                "echo \"[${FOO:-unset}]\"",
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert_eq!(foo.output.trim_end(), "[unset]");
         s.close("a").unwrap();
     }
@@ -580,12 +692,19 @@ mod tests {
         let ws = workspace();
         let mut s = Sessions::new();
         let pid = {
-            s.run(&ws.0, "a", "echo warm", None).unwrap();
+            s.run(&ws.0, "a", "echo warm", None, &CancellationToken::new())
+                .unwrap();
             s.child_pid("a").unwrap()
         };
         let started = std::time::Instant::now();
         let out = s
-            .run(&ws.0, "a", "sleep 30", Some(Duration::from_secs(1)))
+            .run(
+                &ws.0,
+                "a",
+                "sleep 30",
+                Some(Duration::from_secs(1)),
+                &CancellationToken::new(),
+            )
             .unwrap();
         assert!(out.timed_out, "expected timeout");
         assert!(
@@ -595,7 +714,100 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(!pid_alive(pid), "timed-out session shell still alive");
         // Recovery: a fresh shell handles the next command.
-        let out = s.run(&ws.0, "a", "echo recovered", None).unwrap();
+        let out = s
+            .run(
+                &ws.0,
+                "a",
+                "echo recovered",
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(out.output.trim_end(), "recovered");
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn cancellation_stops_a_session_run_and_recovers() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        let pid = {
+            s.run(&ws.0, "a", "echo warm", None, &CancellationToken::new())
+                .unwrap();
+            s.child_pid("a").unwrap()
+        };
+        // Trip the turn token while a long command is mid-run.
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trip.cancel();
+        });
+        let started = Instant::now();
+        let out = s.run(&ws.0, "a", "sleep 30", None, &cancel).unwrap();
+        assert!(out.cancelled, "expected cancellation");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "cancelled run did not return promptly"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!pid_alive(pid), "cancelled session shell still alive");
+        // The killed session is transparently recreated on the next run.
+        let out = s
+            .run(
+                &ws.0,
+                "a",
+                "echo recovered",
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(out.output.trim_end(), "recovered");
+        s.close("a").unwrap();
+    }
+
+    #[test]
+    fn cancellation_stops_a_noisy_session_run_promptly() {
+        let ws = workspace();
+        let mut s = Sessions::new();
+        let pid = {
+            s.run(&ws.0, "a", "echo warm", None, &CancellationToken::new())
+                .unwrap();
+            s.child_pid("a").unwrap()
+        };
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trip.cancel();
+        });
+        let started = Instant::now();
+        let out = s
+            .run(
+                &ws.0,
+                "a",
+                "python3 - <<'PY'\nimport sys, time\nwhile True:\n    print('x')\n    sys.stdout.flush()\n    time.sleep(0.005)\nPY",
+                Some(Duration::from_secs(2)),
+                &cancel,
+            )
+            .unwrap();
+        assert!(out.cancelled, "expected cancellation, got: {out:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "noisy cancelled run waited for timeout: {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!pid_alive(pid), "cancelled noisy session shell still alive");
+        let out = s
+            .run(
+                &ws.0,
+                "a",
+                "echo recovered",
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert_eq!(out.output.trim_end(), "recovered");
         s.close("a").unwrap();
     }

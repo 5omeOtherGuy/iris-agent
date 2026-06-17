@@ -15,8 +15,9 @@ struct RecordingSink {
 }
 
 impl TurnSink for RecordingSink {
-    fn on_text_delta(&mut self, delta: &str) {
+    fn on_text_delta(&mut self, delta: &str) -> Result<()> {
         self.deltas.push(delta.to_string());
+        Ok(())
     }
 }
 
@@ -39,12 +40,31 @@ fn retry_loop_exhausts_transient_then_returns_error() {
             Attempt::Retry(anyhow!("503"), None)
         },
         |_delay| sleeps.set(sleeps.get() + 1),
+        || false,
     );
     assert!(result.is_err());
     assert!(!is_auth_error(&result.unwrap_err()));
     // One initial attempt plus MAX retries, sleeping before each retry.
     assert_eq!(sends.get(), MAX_TRANSIENT_RETRIES + 1);
     assert_eq!(sleeps.get(), MAX_TRANSIENT_RETRIES);
+}
+
+#[test]
+fn retry_loop_stops_immediately_when_cancelled() {
+    // A turn-level cancellation ends the loop before any attempt fires, so a
+    // cancelled turn issues no request and does not retry.
+    let sends = Cell::new(0u32);
+    let result = run_retry_loop(
+        |_force| Ok(fake_token()),
+        |_token| {
+            sends.set(sends.get() + 1);
+            Attempt::Done(AssistantTurn::text("unreached"))
+        },
+        |_delay| {},
+        || true,
+    );
+    assert!(result.is_err());
+    assert_eq!(sends.get(), 0, "no request should be sent once cancelled");
 }
 
 #[test]
@@ -67,6 +87,7 @@ fn retry_loop_reauths_exactly_once_then_succeeds() {
             }
         },
         |_delay| {},
+        || false,
     );
     assert!(result.is_ok());
     assert_eq!(forces.take(), vec![false, true]);
@@ -79,6 +100,7 @@ fn retry_loop_second_auth_rejection_returns_auth_error() {
         |_force| Ok(fake_token()),
         |_token| Attempt::Reauth(anyhow!("401")),
         |_delay| {},
+        || false,
     );
     let error = result.unwrap_err();
     assert!(is_auth_error(&error));
@@ -100,6 +122,7 @@ fn retry_loop_force_refresh_failure_returns_auth_error() {
             Attempt::Reauth(anyhow!("401"))
         },
         |_delay| {},
+        || false,
     );
     assert!(is_auth_error(&result.unwrap_err()));
     // First attempt sent (got 401); refresh then failed before any resend.
@@ -121,6 +144,7 @@ fn retry_loop_reauth_does_not_reset_transient_budget() {
             }
         },
         |_delay| {},
+        || false,
     );
     assert!(result.is_err());
     assert!(!is_auth_error(&result.unwrap_err()));
@@ -146,6 +170,7 @@ fn retry_loop_passes_retry_after_delay_to_sleeper() {
             seen.push(delay);
             delays.set(seen);
         },
+        || false,
     );
     let seen = delays.take();
     assert_eq!(seen.len(), 1);
@@ -308,12 +333,74 @@ fn parses_streamed_output_text_delta_events() -> Result<()> {
     );
     let mut sink = RecordingSink::default();
 
-    let turn =
-        parse_response_stream_reader(BufReader::with_capacity(1, stream.as_bytes()), &mut sink)?;
+    let turn = parse_response_stream_reader(
+        BufReader::with_capacity(1, stream.as_bytes()),
+        &mut sink,
+        &CancellationToken::new(),
+    )?;
 
     assert_eq!(turn.text.as_deref(), Some("Hello"));
     assert_eq!(sink.deltas, vec!["Hel", "lo"]);
     Ok(())
+}
+
+/// Sink that fails on the first delta, standing in for a consumer that dropped
+/// the [`ProviderStream`] (cancellation).
+struct DroppedConsumerSink;
+impl TurnSink for DroppedConsumerSink {
+    fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+        Err(anyhow!("response stream dropped by consumer"))
+    }
+}
+
+#[test]
+fn cancelled_token_stops_the_sse_read_early() {
+    // With the turn already cancelled, the SSE read loop bails before parsing
+    // rather than draining the streaming response.
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    let mut sink = RecordingSink::default();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = parse_response_stream_reader(
+        BufReader::with_capacity(1, stream.as_bytes()),
+        &mut sink,
+        &cancel,
+    );
+
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+}
+
+#[test]
+fn dropped_consumer_stops_the_sse_read_early() {
+    // When the sink reports the consumer is gone, the SSE read loop must abort
+    // immediately instead of draining the rest of the response (the live path
+    // would otherwise keep a spawn_blocking thread downloading on a cancelled
+    // turn).
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    let mut sink = DroppedConsumerSink;
+
+    let result = parse_response_stream_reader(
+        BufReader::with_capacity(1, stream.as_bytes()),
+        &mut sink,
+        &CancellationToken::new(),
+    );
+
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("dropped by consumer"), "{error}");
 }
 
 #[test]
@@ -326,7 +413,8 @@ fn streamed_failure_preserves_prior_deltas() {
     );
     let mut sink = RecordingSink::default();
 
-    let err = parse_response_stream_reader(stream.as_bytes(), &mut sink).unwrap_err();
+    let err = parse_response_stream_reader(stream.as_bytes(), &mut sink, &CancellationToken::new())
+        .unwrap_err();
 
     assert!(err.to_string().contains("Codex response failed"));
     assert_eq!(sink.deltas, vec!["partial"]);
@@ -358,7 +446,8 @@ fn parses_streamed_tool_call() -> Result<()> {
     );
 
     let mut sink = RecordingSink::default();
-    let turn = parse_response_stream_reader(stream.as_bytes(), &mut sink)?;
+    let turn =
+        parse_response_stream_reader(stream.as_bytes(), &mut sink, &CancellationToken::new())?;
 
     assert!(sink.deltas.is_empty());
     assert!(turn.text.is_none());

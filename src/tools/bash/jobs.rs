@@ -21,7 +21,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
 
+use super::CANCEL_POLL_INTERVAL;
 use super::sandbox;
 
 /// Default per-job output ring capacity (bytes). Matches the one-shot output
@@ -191,8 +193,15 @@ impl Jobs {
     }
 
     /// Wait up to `wait` (or unbounded if `None`) for completion, draining the
-    /// remaining output. Removes the job once finished.
-    pub(crate) fn finalize(&mut self, id: &str, wait: Option<Duration>) -> Result<JobUpdate> {
+    /// remaining output. Removes the job once finished. A turn-level Ctrl-C
+    /// (`cancel`) stops the wait and returns the partial update; the background
+    /// job keeps running (only an explicit `action=cancel` kills it).
+    pub(crate) fn finalize(
+        &mut self,
+        id: &str,
+        wait: Option<Duration>,
+        cancel: &CancellationToken,
+    ) -> Result<JobUpdate> {
         // Clone the Arc so the condvar wait does not borrow `self`.
         let (shared, mut cursor) = {
             let job = self.map.get(id).context("unknown job")?;
@@ -202,20 +211,29 @@ impl Jobs {
 
         let mut inner = lock(&shared.inner);
         while !inner.finished {
-            match deadline {
+            if cancel.is_cancelled() {
+                // Finalize interrupted; leave the job running and report its
+                // current (still-running) state.
+                break;
+            }
+            // Cap each wait at one cancel-poll slice so cancellation is observed
+            // promptly even on an unbounded finalize; the full deadline is still
+            // enforced by the zero-remaining break.
+            let slice = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
-                    let (guard, _) = shared
-                        .cv
-                        .wait_timeout(inner, remaining)
-                        .unwrap_or_else(|e| e.into_inner());
-                    inner = guard;
+                    remaining.min(CANCEL_POLL_INTERVAL)
                 }
-                None => inner = shared.cv.wait(inner).unwrap_or_else(|e| e.into_inner()),
-            }
+                None => CANCEL_POLL_INTERVAL,
+            };
+            let (guard, _) = shared
+                .cv
+                .wait_timeout(inner, slice)
+                .unwrap_or_else(|e| e.into_inner());
+            inner = guard;
         }
         let (output, next) = read_from(&inner, cursor);
         cursor = next;
@@ -418,7 +436,9 @@ mod tests {
         assert_eq!(first.output, "one");
         assert!(first.running);
         // finalize drains only the new bytes since the last poll.
-        let fin = jobs.finalize(&id, Some(Duration::from_secs(5))).unwrap();
+        let fin = jobs
+            .finalize(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .unwrap();
         assert_eq!(fin.output, "two");
         assert!(fin.finished);
         assert_eq!(fin.exit_code, Some(0));
@@ -430,7 +450,9 @@ mod tests {
         let root = root_of(&dir);
         let mut jobs = Jobs::new();
         let id = jobs.start(&root, "echo hi; exit 3", None).unwrap();
-        let fin = jobs.finalize(&id, Some(Duration::from_secs(5))).unwrap();
+        let fin = jobs
+            .finalize(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .unwrap();
         assert_eq!(fin.output.trim_end(), "hi");
         assert_eq!(fin.exit_code, Some(3));
         assert!(fin.finished);
@@ -461,10 +483,44 @@ mod tests {
         assert!(pid_alive(pgid));
         jobs.cancel(&id).unwrap();
         // finalize observes completion (the waiter reaps the killed child).
-        let fin = jobs.finalize(&id, Some(Duration::from_secs(5))).unwrap();
+        let fin = jobs
+            .finalize(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .unwrap();
         assert!(fin.finished);
         std::thread::sleep(Duration::from_millis(50));
         assert!(!pid_alive(pgid), "cancelled job {pgid} still alive");
+    }
+
+    #[test]
+    fn cancellation_interrupts_finalize_without_killing_job() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut jobs = Jobs::new();
+        let id = jobs.start(&root, "sleep 30; echo done", None).unwrap();
+        // Trip the turn token while finalize is waiting on the long job.
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trip.cancel();
+        });
+        let started = Instant::now();
+        let upd = jobs
+            .finalize(&id, Some(Duration::from_secs(30)), &cancel)
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancelled finalize did not return promptly"
+        );
+        assert!(
+            !upd.finished,
+            "job should still be running after a cancelled finalize"
+        );
+        assert!(
+            jobs.list().iter().any(|j| j.id == id),
+            "job should remain registered after a cancelled finalize"
+        );
+        jobs.cancel(&id).unwrap();
     }
 
     #[test]
@@ -489,7 +545,9 @@ mod tests {
         let id = jobs
             .start(&root, "printf '%0.sX' $(seq 1 100)", None)
             .unwrap();
-        let fin = jobs.finalize(&id, Some(Duration::from_secs(5))).unwrap();
+        let fin = jobs
+            .finalize(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .unwrap();
         assert!(fin.finished);
         assert_eq!(fin.exit_code, Some(0));
         assert!(fin.dropped >= 84, "expected drops, got {}", fin.dropped);

@@ -2,18 +2,32 @@
 //!
 //! Each struct is a thin [`Tool`] impl over the per-tool `execute`/`parameters`
 //! functions plus the self-classification (`requires_approval`,
-//! `is_destructive`, `diff_preview`) the core loop used to compute by tool name.
-//! [`built_in_tools`] is the injection point: the CLI constructs the set and
-//! passes it into the agent, so Nexus instantiates no tool itself.
+//! `is_destructive`, `is_concurrency_safe`, `diff_preview`) the core loop used to
+//! compute by tool name. [`built_in_tools`] is the injection point: the CLI
+//! constructs the set and passes it into the agent, so Nexus instantiates no
+//! tool itself.
+//!
+//! The pure read-only tools (`grep`/`find`/`ls`) touch no [`ToolState`], so
+//! `execute` runs their blocking body on `tokio::task::spawn_blocking` and
+//! awaits the handle: they are `is_concurrency_safe` and a parallel batch runs
+//! them genuinely concurrently on the blocking pool, while awaiting the handle
+//! lets the loop's cancellation race abandon a cancelled call. `read` mutates
+//! `state.observed` (read-before-write tracking) through the env's `!Send`
+//! `RefCell`, so it cannot move off-thread and stays exclusive. Mutating/shell
+//! tools (`edit`/`write`/`bash`) wrap their synchronous body in a ready future
+//! and run exclusively; each borrows the shared `ToolState` only for its
+//! synchronous duration, never across an `.await`.
 
+use std::cell::RefMut;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
-use crate::nexus::{Tool, ToolEnv, ToolOutput, Tools};
+use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
-use super::{Preview, bash, edit, find, grep, ls, path, read, render_preview, write};
+use super::{Preview, ToolState, bash, edit, find, grep, ls, path, read, render_preview, write};
 
 /// Construct the seven workspace tools the CLI injects into the agent. The
 /// order is the provider-declaration order (`read, bash, edit, write, grep,
@@ -37,6 +51,38 @@ fn root(env: &ToolEnv) -> Result<PathBuf> {
     path::workspace_root(env.workspace)
 }
 
+/// Borrow the shared tool state mutably for a synchronous tool body. Uses
+/// `try_borrow_mut` so a (theoretical) overlapping borrow becomes a tool error
+/// rather than a panic; tool bodies never hold this across an `.await`, so it
+/// never actually contends.
+fn state_mut<'e>(env: &'e ToolEnv<'_>) -> Result<RefMut<'e, ToolState>> {
+    env.state
+        .try_borrow_mut()
+        .map_err(|_| anyhow!("tool state is busy; concurrent mutation is not allowed"))
+}
+
+/// Run a pure read-only tool body (`grep`/`find`/`ls`) on the blocking pool.
+/// The body touches no [`ToolState`], so the resolved root and owned args move
+/// into a `spawn_blocking` task: a parallel batch then runs genuinely
+/// concurrently, and awaiting the join handle makes the future yield so the
+/// loop's cancellation race can abandon a cancelled call (the orphaned walk
+/// finishes on the pool and its result is discarded -- `spawn_blocking` cannot
+/// be force-aborted).
+fn run_off_thread(
+    root: Result<PathBuf>,
+    args: Value,
+    label: &'static str,
+    body: fn(&Path, &Value) -> Result<ToolOutput>,
+) -> ToolFuture<'static> {
+    Box::pin(async move {
+        let root = root?;
+        match tokio::task::spawn_blocking(move || body(&root, &args)).await {
+            Ok(result) => result,
+            Err(join_err) => Err(anyhow!("{} tool task failed: {}", label, join_err)),
+        }
+    })
+}
+
 /// Render a mutating tool's preview, resolving the root from the raw workspace
 /// exactly as the old `diff_preview` free function did.
 fn render(workspace: &Path, preview: impl FnOnce(&Path) -> Preview) -> Option<String> {
@@ -58,10 +104,21 @@ impl Tool for ReadTool {
     fn parameters(&self) -> Value {
         read::parameters()
     }
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput> {
-        let root = root(env)?;
-        read::execute(&root, args, &mut env.state.observed)
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let root = root(env)?;
+            let mut state = state_mut(env)?;
+            read::execute(&root, args, &mut state.observed)
+        })
     }
+    // `read` mutates `state.observed` (read-before-write tracking) behind the
+    // env's `!Send` RefCell, so it cannot run off-thread and is not
+    // concurrency-safe; it takes the exclusive path (default).
 }
 
 struct BashTool;
@@ -75,9 +132,17 @@ impl Tool for BashTool {
     fn parameters(&self) -> Value {
         bash::parameters()
     }
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput> {
-        let root = root(env)?;
-        bash::execute(&root, args, &mut env.state.bash)
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let root = root(env)?;
+            let mut state = state_mut(env)?;
+            bash::execute(&root, args, &mut state.bash, &cancel)
+        })
     }
     fn requires_approval(&self) -> bool {
         true
@@ -103,9 +168,17 @@ impl Tool for EditTool {
     fn parameters(&self) -> Value {
         edit::parameters()
     }
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput> {
-        let root = root(env)?;
-        edit::execute(&root, args, &mut env.state.observed)
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let root = root(env)?;
+            let mut state = state_mut(env)?;
+            edit::execute(&root, args, &mut state.observed)
+        })
     }
     fn requires_approval(&self) -> bool {
         true
@@ -126,9 +199,17 @@ impl Tool for WriteTool {
     fn parameters(&self) -> Value {
         write::parameters()
     }
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput> {
-        let root = root(env)?;
-        write::execute(&root, args, &mut env.state.observed)
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let root = root(env)?;
+            let mut state = state_mut(env)?;
+            write::execute(&root, args, &mut state.observed)
+        })
     }
     fn requires_approval(&self) -> bool {
         true
@@ -149,9 +230,16 @@ impl Tool for GrepTool {
     fn parameters(&self) -> Value {
         grep::parameters()
     }
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput> {
-        let root = root(env)?;
-        grep::execute(&root, args)
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        run_off_thread(root(env), args.clone(), "grep", grep::execute)
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
     }
 }
 
@@ -166,9 +254,16 @@ impl Tool for FindTool {
     fn parameters(&self) -> Value {
         find::parameters()
     }
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput> {
-        let root = root(env)?;
-        find::execute(&root, args)
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        run_off_thread(root(env), args.clone(), "find", find::execute)
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
     }
 }
 
@@ -183,9 +278,16 @@ impl Tool for LsTool {
     fn parameters(&self) -> Value {
         ls::parameters()
     }
-    fn execute(&self, args: &Value, env: &mut ToolEnv) -> Result<ToolOutput> {
-        let root = root(env)?;
-        ls::execute(&root, args)
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        run_off_thread(root(env), args.clone(), "ls", ls::execute)
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
     }
 }
 

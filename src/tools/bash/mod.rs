@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 
@@ -18,6 +19,10 @@ mod sandbox;
 mod session;
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
+// How long a bounded wait (session marker read, job finalize) may block before
+// re-checking the turn cancellation token. Small enough that a Ctrl-C is
+// observed promptly, large enough not to busy-poll.
+pub(super) const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Cap on how long we wait for the output reader threads to observe EOF after the
 // shell has exited or been killed. A backgrounded process that escapes the
 // shell's process group (via setsid/double-fork) can keep the pipes open; rather
@@ -67,6 +72,7 @@ pub(super) fn execute(
     root: &Path,
     args: &Value,
     state: &mut BashState,
+    cancel: &CancellationToken,
 ) -> Result<super::ToolOutput> {
     let parsed: BashArgs =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
@@ -81,10 +87,10 @@ pub(super) fn execute(
     } = parsed;
     let text = match action.as_deref().unwrap_or("run") {
         "run" => match session {
-            Some(id) => run_session(root, &id, command, timeout, state)?,
+            Some(id) => run_session(root, &id, command, timeout, state, cancel)?,
             None => {
                 let command = command.context("bash tool arguments must include command")?;
-                bash(root, &BashInput { command, timeout })?
+                bash(root, &BashInput { command, timeout }, cancel)?
             }
         },
         act @ ("reset" | "close") => {
@@ -117,7 +123,7 @@ pub(super) fn execute(
                 Some(secs) => Some(Duration::from_secs(secs)),
                 None => Some(Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS)),
             };
-            render_job(id, state.jobs.finalize(id, wait)?)
+            render_job(id, state.jobs.finalize(id, wait, cancel)?)
         }
         "cancel" => {
             let id = job.as_deref().context("bash cancel requires 'job'")?;
@@ -130,20 +136,23 @@ pub(super) fn execute(
     Ok(super::ToolOutput::text(text))
 }
 
-/// Route a session-scoped `run` to the session registry.
+/// Route a session-scoped `run` to the session registry. The turn token is
+/// passed through so a Ctrl-C interrupts a long-running command (the session
+/// shell is killed and recreated on the next run, like a timeout).
 fn run_session(
     root: &Path,
     id: &str,
     command: Option<String>,
     timeout: Option<u64>,
     state: &mut BashState,
+    cancel: &CancellationToken,
 ) -> Result<String> {
     let command = command
         .filter(|c| !c.trim().is_empty())
         .context("bash session run requires a command")?;
     let timeout_secs = timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
     let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
-    let outcome = state.sessions.run(root, id, &command, timeout)?;
+    let outcome = state.sessions.run(root, id, &command, timeout, cancel)?;
     Ok(render_session(outcome, timeout_secs))
 }
 
@@ -218,7 +227,9 @@ fn render_session(outcome: session::RunOutcome, timeout_secs: u64) -> String {
     if let Some(notice) = outcome.notice {
         out = format!("[{notice}]\n{out}");
     }
-    if outcome.timed_out {
+    if outcome.cancelled {
+        out.push_str("\n\nCommand cancelled by user; session terminated");
+    } else if outcome.timed_out {
         // timeout_secs == 0 means "no per-command limit"; the session still
         // enforces a safety hard cap, so report that bound, not 0.
         let limit = if timeout_secs == 0 {
@@ -260,7 +271,7 @@ struct BashArgs {
     action: Option<String>,
 }
 
-fn bash(root: &Path, input: &BashInput) -> Result<String> {
+fn bash(root: &Path, input: &BashInput, cancel: &CancellationToken) -> Result<String> {
     if input.command.trim().is_empty() {
         bail!("bash command must not be empty");
     }
@@ -305,10 +316,18 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         match child.try_wait().context("failed to wait for shell")? {
             Some(status) => break Some(status),
             None => {
+                // A turn-level Ctrl-C cancels the child token: terminate the
+                // whole group like a timeout does, so the call returns promptly.
+                if cancel.is_cancelled() {
+                    crate::process_group::kill_and_reap(&mut child);
+                    cancelled = true;
+                    break None;
+                }
                 if let Some(timeout) = timeout
                     && start.elapsed() >= timeout
                 {
@@ -379,7 +398,12 @@ fn bash(root: &Path, input: &BashInput) -> Result<String> {
         out = format!("[{notice}]\n{out}");
     }
 
-    if timed_out {
+    if cancelled {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("Command cancelled by user");
+    } else if timed_out {
         if !out.is_empty() {
             out.push_str("\n\n");
         }
@@ -514,6 +538,7 @@ mod tests {
                 command: "echo hello".into(),
                 timeout: None,
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(out.contains("hello"));
@@ -530,6 +555,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout: Some(1),
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(
@@ -554,6 +580,7 @@ mod tests {
                 command: "sleep 30 & echo started; wait".into(),
                 timeout: Some(1),
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(
@@ -577,6 +604,7 @@ mod tests {
                 command: "sleep 30 & echo done".into(),
                 timeout: None,
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(
@@ -599,6 +627,7 @@ mod tests {
                 command: "set -o pipefail; echo ok | cat".into(),
                 timeout: None,
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(out.contains("ok"), "expected bashism to run, got: {out}");
@@ -638,6 +667,7 @@ mod tests {
                 command: format!("echo escaped > {}", outside.display()),
                 timeout: None,
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(!outside.exists(), "sandbox did not block the escape: {out}");
@@ -657,12 +687,14 @@ mod tests {
             &root,
             &json!({ "command": "cd sub", "session": "s1" }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
         let pwd = execute(
             &root,
             &json!({ "command": "pwd", "session": "s1" }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(
@@ -676,6 +708,7 @@ mod tests {
             &root,
             &json!({ "command": "pwd", "session": "s2" }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(!other.content.trim_end().ends_with("/sub"));
@@ -685,6 +718,7 @@ mod tests {
             &root,
             &json!({ "session": "s1", "action": "close" }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(closed.content.contains("closed"));
@@ -692,6 +726,7 @@ mod tests {
             &root,
             &json!({ "command": "pwd", "session": "s1" }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(
@@ -715,6 +750,7 @@ mod tests {
                 "timeout": 5
             }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
 
@@ -732,6 +768,7 @@ mod tests {
             &root,
             &json!({ "action": "start", "command": "printf go; exit 4" }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
         // The id is echoed as job-0 for the first job.
@@ -741,13 +778,20 @@ mod tests {
             started.content
         );
 
-        let listed = execute(&root, &json!({ "action": "list" }), &mut state).unwrap();
+        let listed = execute(
+            &root,
+            &json!({ "action": "list" }),
+            &mut state,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert!(listed.content.contains("job-0"));
 
         let fin = execute(
             &root,
             &json!({ "action": "finalize", "job": "job-0", "timeout": 5 }),
             &mut state,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(
@@ -762,7 +806,13 @@ mod tests {
         );
 
         // Finalized jobs are gone.
-        let after = execute(&root, &json!({ "action": "list" }), &mut state).unwrap();
+        let after = execute(
+            &root,
+            &json!({ "action": "list" }),
+            &mut state,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert!(after.content.contains("no background jobs"));
     }
 
@@ -779,6 +829,7 @@ mod tests {
                 command: "head -c 20000000 /dev/zero".into(),
                 timeout: Some(30),
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         // The capture-specific marker proves the per-stream cap fired (the pump
@@ -812,6 +863,7 @@ mod tests {
                 command: "exit 3".into(),
                 timeout: None,
             },
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(out.contains("Command exited with code 3"));

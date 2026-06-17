@@ -6,8 +6,31 @@ use crate::wayland::Harness;
 use anyhow::anyhow;
 use std::cell::{Cell, RefCell};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_util::sync::CancellationToken;
+
+/// Drive a single async future to completion on a current-thread runtime. The
+/// loop/harness/agent APIs are async; the direct-call tests use this instead of
+/// the full `run_session` REPL driver.
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
+/// Build a single-event provider stream that yields one terminal turn (or a
+/// provider error). No text deltas: tests that need deltas use [`DeltaProvider`].
+fn turn_stream(item: Result<AssistantTurn, String>) -> ProviderStream<'static> {
+    let event = match item {
+        Ok(turn) => Ok(ProviderEvent::Completed(turn)),
+        Err(error) => Err(anyhow!(error)),
+    };
+    Box::pin(futures::stream::once(async move { event }))
+}
 
 struct FakeProvider {
     responses: RefCell<Vec<Result<AssistantTurn, String>>>,
@@ -30,18 +53,19 @@ impl FakeProvider {
 }
 
 impl ChatProvider for FakeProvider {
-    fn respond(
-        &self,
-        messages: &[Message],
-        _tools: &Tools,
-        _sink: &mut dyn TurnSink,
-    ) -> Result<AssistantTurn> {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
         self.seen.borrow_mut().push(messages.to_vec());
-        match self.responses.borrow_mut().pop() {
+        let item = match self.responses.borrow_mut().pop() {
             Some(Ok(turn)) => Ok(turn),
-            Some(Err(error)) => Err(anyhow!(error)),
-            None => Err(anyhow!("unexpected call")),
-        }
+            Some(Err(error)) => Err(error),
+            None => Err("unexpected call".to_string()),
+        };
+        Ok(turn_stream(item))
     }
 }
 
@@ -99,12 +123,13 @@ impl AgentObserver for RecordingFrontend {
 }
 
 impl ApprovalGate for RecordingFrontend {
-    fn review(&self, _call: &ToolCall) -> Result<ApprovalDecision> {
+    fn review<'a>(&'a self, _call: &'a ToolCall) -> ApprovalFuture<'a> {
         let mut snapshot = self.events_at_review.borrow_mut();
         if snapshot.is_none() {
             *snapshot = Some(self.events.borrow().clone());
         }
-        Ok(self.decision.get())
+        let decision = self.decision.get();
+        Box::pin(async move { Ok(decision) })
     }
 }
 
@@ -119,7 +144,7 @@ fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
-    harness.submit_turn("read note", &frontend, &frontend)?;
+    block_on(harness.submit_turn("read note", &frontend, &frontend, &CancellationToken::new()))?;
 
     let events = frontend.events.borrow();
     assert!(matches!(events[0], AgentEvent::ToolProposed(_)));
@@ -147,7 +172,7 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
-    harness.submit_turn("write it", &frontend, &frontend)?;
+    block_on(harness.submit_turn("write it", &frontend, &frontend, &CancellationToken::new()))?;
 
     // The diff preview is emitted before the gate is consulted.
     let at_review = frontend.events_at_review.borrow();
@@ -176,7 +201,7 @@ fn malformed_denial_skips_diff_preview() -> Result<()> {
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
-    harness.submit_turn("write it", &frontend, &frontend)?;
+    block_on(harness.submit_turn("write it", &frontend, &frontend, &CancellationToken::new()))?;
 
     let events = frontend.events.borrow();
     assert!(
@@ -226,27 +251,31 @@ fn repl_keeps_conversation_across_turns() -> Result<()> {
 
 struct AuthFailProvider;
 impl ChatProvider for AuthFailProvider {
-    fn respond(
-        &self,
-        _messages: &[Message],
-        _tools: &Tools,
-        _sink: &mut dyn TurnSink,
-    ) -> Result<AssistantTurn> {
-        Err(crate::errors::AuthError::new("token expired").into())
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let event = Err(crate::errors::AuthError::new("token expired").into());
+        Ok(Box::pin(futures::stream::once(async move { event })))
     }
 }
 
 struct DeltaProvider;
 impl ChatProvider for DeltaProvider {
-    fn respond(
-        &self,
-        _messages: &[Message],
-        _tools: &Tools,
-        sink: &mut dyn TurnSink,
-    ) -> Result<AssistantTurn> {
-        sink.on_text_delta("Hel");
-        sink.on_text_delta("lo");
-        Ok(AssistantTurn::text("Hello"))
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let events = vec![
+            Ok(ProviderEvent::TextDelta("Hel".to_string())),
+            Ok(ProviderEvent::TextDelta("lo".to_string())),
+            Ok(ProviderEvent::Completed(AssistantTurn::text("Hello"))),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
     }
 }
 
@@ -553,8 +582,13 @@ fn injected_custom_tool_is_resolved_and_executed() -> Result<()> {
         fn parameters(&self) -> Value {
             json!({ "type": "object", "properties": {} })
         }
-        fn execute(&self, _args: &Value, _env: &mut ToolEnv) -> Result<ToolOutput> {
-            Ok(ToolOutput::text("marker-tool-ran"))
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("marker-tool-ran")) })
         }
     }
 
@@ -1252,5 +1286,588 @@ fn turn_persists_transcript_when_log_attached() -> Result<()> {
     assert!(lines[0].contains("\"type\":\"session\""));
     assert!(lines[1].contains("\"role\":\"user\"") && lines[1].contains("hello"));
     assert!(lines[2].contains("\"role\":\"assistant\"") && lines[2].contains("done"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Runtime tests: async streaming, cancellation races, and safe-parallel /
+// exclusive tool scheduling. These exercise the Codex-style runtime mechanics
+// added on top of pi-mono's loop shape.
+// ---------------------------------------------------------------------------
+
+use futures::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+/// Provider that streams one text delta and then never completes, so a turn only
+/// ends if cancellation is raced against the pending stream read.
+struct BlockingStreamProvider;
+impl ChatProvider for BlockingStreamProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let head =
+            futures::stream::once(async { Ok(ProviderEvent::TextDelta("partial".to_string())) });
+        let tail = futures::stream::pending::<Result<ProviderEvent>>();
+        Ok(Box::pin(head.chain(tail)))
+    }
+}
+
+/// Tool that awaits before returning, proving the loop awaits async tools.
+struct SlowTool;
+impl Tool for SlowTool {
+    fn name(&self) -> &str {
+        "slow"
+    }
+    fn description(&self) -> &str {
+        "awaits then returns"
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            Ok(ToolOutput::text("slept"))
+        })
+    }
+}
+
+/// Tool that records it received a live cancellation token, waits for it to fire,
+/// then returns an error. Proves child-token delivery + prompt tool abort.
+struct CancelAwareTool {
+    started: Arc<AtomicBool>,
+    saw_cancel: Arc<AtomicBool>,
+}
+impl Tool for CancelAwareTool {
+    fn name(&self) -> &str {
+        "cancelaware"
+    }
+    fn description(&self) -> &str {
+        "waits for cancellation"
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.started.store(true, AtomicOrdering::SeqCst);
+            cancel.cancelled().await;
+            self.saw_cancel.store(true, AtomicOrdering::SeqCst);
+            Err(anyhow!("tool observed cancellation"))
+        })
+    }
+}
+
+/// Tool that records peak concurrency. `active`/`peak` are shared so a test can
+/// observe whether two calls overlapped. Echoes its `tag` argument so result
+/// ordering is checkable. `safe` controls concurrency-safety.
+struct ProbeTool {
+    tool_name: String,
+    safe: bool,
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+impl Tool for ProbeTool {
+    fn name(&self) -> &str {
+        &self.tool_name
+    }
+    fn description(&self) -> &str {
+        "concurrency probe"
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": { "tag": { "type": "string" } } })
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        self.safe
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let current = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.peak.fetch_max(current, AtomicOrdering::SeqCst);
+            // Yield so a concurrent peer can also enter before we leave.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            let tag = args.get("tag").and_then(Value::as_str).unwrap_or("");
+            Ok(ToolOutput::text(format!("{}:{tag}", self.tool_name)))
+        })
+    }
+}
+
+/// Approval gate whose `review` future never resolves, standing in for a
+/// *cancellable* pending approval (one the executor can poll). It lets a test
+/// prove the loop races a pending approval against cancellation; it is NOT the
+/// real terminal gate, whose stdin read is blocking and cannot be preempted.
+struct BlockingApprovalGate;
+impl AgentObserver for BlockingApprovalGate {
+    fn on_event(&self, _event: AgentEvent) -> Result<()> {
+        Ok(())
+    }
+}
+impl ApprovalGate for BlockingApprovalGate {
+    fn review<'a>(&'a self, _call: &'a ToolCall) -> ApprovalFuture<'a> {
+        Box::pin(async move {
+            futures::future::pending::<()>().await;
+            Ok(ApprovalDecision::Allow)
+        })
+    }
+}
+
+fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+    }
+}
+
+#[test]
+fn streamed_events_reach_observer_in_order() -> Result<()> {
+    // A provider that streams two deltas then completes: the observer must see
+    // the deltas in order, a single committed end event, and a correct turn.
+    let workspace = test_workspace()?;
+    let mut harness = test_harness(
+        DeltaProvider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert_eq!(events[0], AgentEvent::AssistantTextDelta("Hel".to_string()));
+    assert_eq!(events[1], AgentEvent::AssistantTextDelta("lo".to_string()));
+    assert_eq!(events[2], AgentEvent::AssistantTextEnd("Hello".to_string()));
+    assert_eq!(events[3], AgentEvent::TurnComplete);
+    assert_eq!(harness.agent.messages().last().unwrap().content, "Hello");
+    Ok(())
+}
+
+#[test]
+fn cancellation_during_provider_stream_exits_promptly_with_valid_state() -> Result<()> {
+    let workspace = test_workspace()?;
+    let mut harness = test_harness(
+        BlockingStreamProvider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let token = CancellationToken::new();
+
+    block_on(async {
+        let turn = harness.submit_turn("go", &frontend, &frontend, &token);
+        let canceller = async {
+            // Cancel only once the first delta has actually streamed in.
+            loop {
+                let saw_delta = frontend
+                    .events
+                    .borrow()
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::AssistantTextDelta(_)));
+                if saw_delta {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(turn, canceller);
+        result
+    })?;
+
+    // Partial text is committed (transcript stays valid: user + assistant), and
+    // an interrupt notice is emitted. No hang: reaching here is the proof.
+    let messages = harness.agent.messages();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].content, "go");
+    assert_eq!(messages[1], Message::assistant("partial"));
+    assert!(
+        frontend
+            .events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(m) if m.contains("interrupted")))
+    );
+    Ok(())
+}
+
+#[test]
+fn async_tool_result_feeds_follow_up_turn() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("slow", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(SlowTool)]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2, "tool result must drive a follow-up turn");
+    let tool_result = seen[1].last().unwrap();
+    assert_eq!(tool_result.role, Role::Tool);
+    assert!(tool_result.content.contains("slept"));
+    assert_eq!(harness.agent.messages().last().unwrap().content, "done");
+    Ok(())
+}
+
+#[test]
+fn cancellation_during_tool_aborts_and_records_valid_result() -> Result<()> {
+    let started = Arc::new(AtomicBool::new(false));
+    let saw_cancel = Arc::new(AtomicBool::new(false));
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("cancelaware", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(CancelAwareTool {
+            started: Arc::clone(&started),
+            saw_cancel: Arc::clone(&saw_cancel),
+        })]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let token = CancellationToken::new();
+
+    block_on(async {
+        let turn = harness.submit_turn("go", &frontend, &frontend, &token);
+        let canceller = async {
+            while !started.load(AtomicOrdering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(turn, canceller);
+        result
+    })?;
+
+    assert!(
+        saw_cancel.load(AtomicOrdering::SeqCst),
+        "tool must receive the child cancellation token"
+    );
+    // Every emitted call gets a result: the tool's cooperative error is recorded
+    // and the transcript ends valid.
+    let messages = harness.agent.messages();
+    let tool_result = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .unwrap();
+    assert!(tool_result.content.contains("\"ok\":false"));
+    Ok(())
+}
+
+#[test]
+fn cancelled_bash_records_cancelled_result_not_success() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(single_call_turn(
+        "bash",
+        json!({ "command": "sleep 30", "timeout": 30 }),
+    ))]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let token = CancellationToken::new();
+    let trip = token.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        trip.cancel();
+    });
+
+    block_on(harness.submit_turn("run", &frontend, &frontend, &token))?;
+    canceller.join().unwrap();
+
+    let tool_result = harness
+        .agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .unwrap();
+    assert!(
+        tool_result.content.contains("\"cancelled\":true"),
+        "expected cancelled payload, got: {}",
+        tool_result.content
+    );
+    assert!(
+        !tool_result.content.contains("\"ok\":true"),
+        "cancelled bash must not be recorded as success: {}",
+        tool_result.content
+    );
+    Ok(())
+}
+
+#[test]
+fn unsafe_tools_run_sequentially() -> Result<()> {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            tool_calls: vec![
+                call("c1", "probe", json!({ "tag": "a" })),
+                call("c2", "probe", json!({ "tag": "b" })),
+            ],
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(ProbeTool {
+            tool_name: "probe".to_string(),
+            safe: false,
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        })]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        peak.load(AtomicOrdering::SeqCst),
+        1,
+        "exclusive tools overlapped"
+    );
+    Ok(())
+}
+
+#[test]
+fn safe_tools_run_in_parallel_with_ordered_results() -> Result<()> {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            tool_calls: vec![
+                call("c1", "probe", json!({ "tag": "a" })),
+                call("c2", "probe", json!({ "tag": "b" })),
+            ],
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(ProbeTool {
+            tool_name: "probe".to_string(),
+            safe: true,
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        })]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        peak.load(AtomicOrdering::SeqCst),
+        2,
+        "two concurrency-safe tools should overlap"
+    );
+    // Results are recorded in the model's call order, not completion order.
+    let seen = harness.agent.provider.seen.borrow();
+    let results: Vec<&str> = seen[1]
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        results[0].contains("probe:a"),
+        "first result out of order: {results:?}"
+    );
+    assert!(
+        results[1].contains("probe:b"),
+        "second result out of order: {results:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn safe_tool_parallelism_is_bounded() -> Result<()> {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let workspace = test_workspace()?;
+    let tool_calls = (0..MAX_PARALLEL_TOOL_CALLS + 2)
+        .map(|idx| {
+            call(
+                &format!("c{idx}"),
+                "probe",
+                json!({ "tag": idx.to_string() }),
+            )
+        })
+        .collect();
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            tool_calls,
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(ProbeTool {
+            tool_name: "probe".to_string(),
+            safe: true,
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        })]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let peak = peak.load(AtomicOrdering::SeqCst);
+    assert!(peak > 1, "safe calls should still overlap");
+    assert!(
+        peak <= MAX_PARALLEL_TOOL_CALLS,
+        "parallel batch exceeded cap: {peak}"
+    );
+    Ok(())
+}
+
+#[test]
+fn safe_tools_do_not_cross_an_unsafe_tool() -> Result<()> {
+    // [safe, safe, unsafe]: the safe pair overlaps (peak_safe == 2), but the
+    // exclusive tool runs alone (peak_unsafe == 1), and results stay in order.
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak_safe = Arc::new(AtomicUsize::new(0));
+    let peak_unsafe = Arc::new(AtomicUsize::new(0));
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            tool_calls: vec![
+                call("c1", "safe", json!({ "tag": "a" })),
+                call("c2", "safe", json!({ "tag": "b" })),
+                call("c3", "danger", json!({ "tag": "c" })),
+            ],
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![
+            Box::new(ProbeTool {
+                tool_name: "safe".to_string(),
+                safe: true,
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak_safe),
+            }),
+            Box::new(ProbeTool {
+                tool_name: "danger".to_string(),
+                safe: false,
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak_unsafe),
+            }),
+        ]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        peak_safe.load(AtomicOrdering::SeqCst),
+        2,
+        "safe pair did not overlap"
+    );
+    assert_eq!(
+        peak_unsafe.load(AtomicOrdering::SeqCst),
+        1,
+        "exclusive tool ran alongside a peer"
+    );
+    let seen = harness.agent.provider.seen.borrow();
+    let results: Vec<&str> = seen[1]
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(results[0].contains("safe:a"));
+    assert!(results[1].contains("safe:b"));
+    assert!(results[2].contains("danger:c"));
+    Ok(())
+}
+
+// NOTE: this exercises the Nexus loop's approval/cancellation race with a
+// *cancellable* gate (a future the executor can poll), not the real terminal
+// prompt. The terminal `UiBridge::review` does a blocking stdin read that the
+// single-threaded executor cannot preempt, so the first Ctrl-C does not
+// interrupt a pending terminal prompt (the second force-quits at the process
+// level). Real-terminal approval cancellation needs a non-blocking input layer
+// (deferred; see ROADMAP).
+#[test]
+fn loop_cancels_a_pending_approval_with_a_cancellable_gate() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "out.txt", "content": "hi" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let gate = BlockingApprovalGate;
+    let token = CancellationToken::new();
+
+    block_on(async {
+        let turn = harness.submit_turn("write it", &gate, &gate, &token);
+        let canceller = async {
+            // Give the turn a chance to reach the pending approval, then cancel.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(turn, canceller);
+        result
+    })?;
+
+    // The gated write never ran...
+    assert!(!workspace.path.join("out.txt").exists());
+    // ...and the call is recorded as cancelled (not denied), keeping the
+    // transcript valid: the emitted tool call still has exactly one result.
+    let messages = harness.agent.messages();
+    let tool_result = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .unwrap();
+    assert!(
+        tool_result.content.contains("cancelled"),
+        "expected a cancelled tool result, got: {}",
+        tool_result.content
+    );
     Ok(())
 }

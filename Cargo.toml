@@ -6,6 +6,13 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+# Async runtime primitives for the agent loop. tokio (current-thread runtime +
+# spawn_blocking for the blocking provider), tokio-util for `CancellationToken`,
+# and futures for `Stream`/local boxed futures. Adopted from Codex's
+# runtime mechanics; no bespoke runtime is introduced.
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio-util = "0.7"
 # ripgrep as a library: content search without requiring the `rg` binary on
 # PATH. `grep` re-exports the matcher/searcher crates; `ignore` provides the
 # .gitignore-aware directory walk and glob overrides.

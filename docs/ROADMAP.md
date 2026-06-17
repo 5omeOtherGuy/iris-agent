@@ -1,12 +1,16 @@
 # Iris — Roadmap
 
-> Status (2026-06-17): Milestone 1 is complete. Iris has a text-only session
-> loop, OpenAI Codex Responses provider, streamed response parsing, workspace-
-> scoped tools, terminal approval gates with diff previews, provider/model
-> settings, and best-effort JSONL transcript persistence. The next runtime work
-> is to finish Nexus's async-hard agent loop before token/context milestones.
-> This roadmap defines build order and acceptance criteria. `FEATURES.md` remains
-> the capability inventory; this document says what to build first.
+> Status (2026-06-17): Milestone 1 and the async-hard runtime completion are
+> done. Iris has a text-only session loop, OpenAI Codex Responses provider,
+> streamed response parsing, workspace-scoped tools, terminal approval gates with
+> diff previews, provider/model settings, and best-effort JSONL transcript
+> persistence. Nexus now runs a tokio async loop with turn-level cancellation:
+> the provider is an async stream raced against cancellation, tools are async
+> with child tokens, concurrency-safe tools run in parallel while everything else
+> stays exclusive, and the transcript stays valid on abort. The next runtime work
+> is Milestone 2 (token/context). This roadmap defines build order and acceptance
+> criteria. `FEATURES.md` remains the capability inventory; this document says
+> what to build first.
 
 This is not an implementation plan. It should define sequencing, scope boundaries,
 quality gates, and open design decisions. Detailed module structure, Rust types,
@@ -76,22 +80,67 @@ Implemented today:
 
 Not implemented yet:
 
-- Runtime-hard async provider/tool contracts, turn-level cancellation tokens,
-  stream/tool cancellation races, child cancellation per tool, and safe parallel
-  tool execution.
 - Persistent approval policies, session `/resume` and transcript-tree branching,
   modes, subagents, context ledger, content handles, git automation, and GitHub
   integration.
 
-## Runtime completion — finish Nexus before Milestone 2
+## Runtime completion — finish Nexus before Milestone 2 [SHIPPED 2026-06-17]
 
 **Goal:** finish the agent runtime, not just the feature checklist. Nexus should
 keep pi-mono's clean contracts-in/events-out shape while adopting the mature
 Rust async mechanics used by Codex CLI.
 
-This work is the next sequencing gate before Milestone 2. The current loop is
-clear and already parses provider streams, but the provider/tool seams are still
-too blocking for a terminal agent: cancellation is observed between steps rather
+**Status: shipped.** Nexus runs a tokio current-thread runtime (`run_session`
+owns it and `block_on`s each turn). `ChatProvider::respond_stream` yields a
+`Stream<Item = Result<ProviderEvent>>`; the live provider backs it with
+`spawn_blocking` + a `futures` unbounded channel (the existing blocking
+reqwest/SSE code is unchanged, just wrapped), mirroring Codex's `map_response_
+events` minus the transport/telemetry machinery. Each turn owns a
+`tokio_util::sync::CancellationToken`; `tokio::select!` races every provider
+stream read and every tool future against it, tools receive a `child_token()`,
+and a Ctrl-C watcher thread bridges the async-signal-safe SIGINT atomic onto the
+token (the two-stage force-quit/reap handler is untouched). Tools are async
+(`Tool::execute` returns a boxed future) and classify themselves via
+`is_concurrency_safe`; the loop runs consecutive concurrency-safe, ungated calls
+in parallel (`join_all`, in-order result assembly) and everything else
+exclusively. The concurrency-safe built-ins (`grep`/`find`/`ls`) run their
+blocking body on `spawn_blocking` and await the handle, so a parallel batch is
+genuinely concurrent and the future yields for the cancellation race; `read`
+stays exclusive because it mutates the read-before-write state behind the env's
+`!Send` RefCell. On cancellation every model-emitted call still gets a real or
+synthetic cancelled tool result, so the next request stays valid. Long blocking
+work is cooperatively cancellable: one-shot bash kills its process group, and
+persistent-session `run` and background-job `finalize` poll the turn token while
+waiting; a cancelled approval is recorded as cancelled (never a silent deny) and
+cannot mutate the session allow-policy; the provider's blocking task checks the
+token before each attempt, across retry backoff, and between SSE lines. The bare
+`Agent` depends on no UI/signals/concrete tools. Verified: `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test` (245 tests, 10 new
+runtime tests covering streaming order, stream cancel, async tool feed, tool
+cancel, sequential default, safe parallel, unsafe exclusivity, approval cancel,
+and bash session/job cancellation).
+
+Deferred (bounded, documented in code with `ponytail:` markers):
+- **Real-terminal approval cancellation is NOT implemented.** `UiBridge::review`
+  does a blocking stdin read; the single-threaded executor cannot preempt it, so
+  the first Ctrl-C does not interrupt a *pending terminal* prompt (the loop
+  races the approval against the token, and once the read returns a late
+  decision is discarded, but the read itself blocks until the second Ctrl-C
+  force-quits at the process level). The loop-level cancellation race is proven
+  with a cancellable gate (`loop_cancels_a_pending_approval_with_a_cancellable_gate`).
+  Upgrade path: a non-blocking / single-owner terminal input event loop.
+- A cancelled provider stream's `spawn_blocking` HTTP request is preempted
+  promptly while actively streaming (token check + dropped-consumer break), but
+  an *idle* socket read is not interrupted until the next byte or the 120s
+  reqwest timeout (blocking reqwest cannot be force-aborted mid-read); bounded at
+  process exit by `Runtime::shutdown_timeout`. Upgrade path: async reqwest.
+- A cancelled `grep`/`find`/`ls` is abandoned, not aborted: dropping the
+  `spawn_blocking` handle lets the orphaned walk finish on the pool with its
+  result discarded. Upgrade path: thread cancellation into the `ignore` walker.
+
+This work was the next sequencing gate before Milestone 2. The previous loop was
+clear and already parsed provider streams, but the provider/tool seams were too
+blocking for a terminal agent: cancellation was observed between steps rather
 than raced against in-flight provider reads and long-running tools.
 
 ### Reference split
@@ -131,25 +180,42 @@ than raced against in-flight provider reads and long-running tools.
    remains valid by recording either real tool results or synthetic cancelled
    tool-result data for every emitted call.
 
-### Acceptance criteria
+### Acceptance criteria [all met]
 
-Runtime completion is done only when tests prove:
+Runtime completion is done only when tests prove (all shipped in
+`src/nexus_tests.rs`):
 
-1. A fake streaming provider emits multiple events in order and the observer sees
-   them in order.
-2. Cancelling while a fake provider stream is pending exits promptly and leaves
+1. [done: `streamed_events_reach_observer_in_order`] A fake streaming provider
+   emits multiple events in order and the observer sees them in order.
+2. [done: `cancellation_during_provider_stream_exits_promptly_with_valid_state`]
+   Cancelling while a fake provider stream is pending exits promptly and leaves
    valid turn state.
-3. Async tools are awaited and their results feed a follow-up model turn.
-4. Cancelling while a fake tool is pending exits promptly and records a valid
+3. [done: `async_tool_result_feeds_follow_up_turn`] Async tools are awaited and
+   their results feed a follow-up model turn.
+4. [done: `cancellation_during_tool_aborts_and_records_valid_result`] Cancelling
+   while a fake tool is pending exits promptly and records a valid
    cancelled/error tool result.
-5. Two unsafe tools do not overlap.
-6. Two explicitly safe tools do overlap, while their recorded results remain
-   deterministic.
-7. Safe tools do not cross an unsafe tool in a way that changes effects or
-   transcript order.
-8. Pending approval, if any, unblocks on cancellation.
-9. Existing observer, approval, provider, tool, path-safety, and transcript tests
-   remain green.
+5. [done: `unsafe_tools_run_sequentially`] Two unsafe tools do not overlap.
+6. [done: `safe_tools_run_in_parallel_with_ordered_results`] Two explicitly safe
+   tools do overlap, while their recorded results remain deterministic.
+7. [done: `safe_tools_do_not_cross_an_unsafe_tool`] Safe tools do not cross an
+   unsafe tool in a way that changes effects or transcript order.
+8. [done at the loop level: `loop_cancels_a_pending_approval_with_a_cancellable_gate`]
+   A pending approval unblocks on cancellation and is recorded as cancelled (not
+   denied). CAVEAT: this holds for any *cancellable* gate; the real terminal
+   gate's stdin read is blocking and is NOT cancellable until a non-blocking
+   input layer lands (see Deferred above).
+9. [done] Existing observer, approval, provider, tool, path-safety, and
+   transcript tests remain green. Plus `cancellation_stops_a_session_run_and_recovers`
+   and `cancellation_interrupts_finalize_without_killing_job` cover the bash
+   session/job cancellation paths (245 total).
+
+Resolved review findings (2026-06-17, post-ship): real-terminal approval
+cancellation honestly de-scoped (above); bash persistent-session/finalize waits
+now poll the turn token; `grep`/`find`/`ls` made genuinely parallel via
+`spawn_blocking` (and `read` correctly marked exclusive); the provider blocking
+task made cancellation-aware; and a cancelled approval is recorded as
+`Cancelled` rather than `Deny`.
 
 Verification gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 and `cargo test`. If any check cannot run or fails for a pre-existing reason,
@@ -637,11 +703,11 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
 4. Done: the tier-boundary cuts are shipped (see [`ARCHITECTURE.md`](ARCHITECTURE.md)).
    Protect that split during runtime work: Nexus stays the bare runtime, Wayland
    stays the harness, and Iris CLI stays terminal I/O/adapters.
-5. Next: Runtime completion (the section above). Convert the provider/tool loop
-   to the Codex-style async stream/cancel/tool runtime while preserving pi-mono's
-   clean contract shape. This gates Milestone 2 because context/token work should
-   build on the finished loop, not on the current between-step cancellation model.
-6. After runtime completion: Milestone 2 (token-efficiency). The metadata gate is already met
+5. Done (2026-06-17): Runtime completion (the section above). The provider/tool
+   loop is now the Codex-style async stream/cancel/tool runtime, preserving
+   pi-mono's clean contract shape, with all nine acceptance tests green. This
+   unblocks Milestone 2.
+6. Next: Milestone 2 (token-efficiency). The metadata gate is already met
    ([#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) MVP), so the
    remaining work is handle-backing large tool outputs and token accounting.
    First implement shared tool infrastructure in dependency order: path identity and
