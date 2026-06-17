@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Block commits to the primary checkout's `main` when it has drifted
+# behind `origin/main`. Encourages either (a) `bash scripts/sync-primary.sh`
+# before editing, or (b) doing the work in a task worktree branched from
+# `origin/main` (the documented workflow in AGENTS.md / CONTRIBUTING.md).
+#
+# Worktrees on feature branches are unaffected: this hook only fires
+# when HEAD on the primary checkout is `main`.
+#
+# Bypassable via `git commit --no-verify` for legitimate cases (e.g.,
+# committing a fix to the sync mechanism itself).
+
+set -eu
+
+# Identify the primary checkout: .git is a real directory (worktrees have
+# .git as a file pointing at a gitdir).
+REPO_TOP=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -n "$REPO_TOP" ] || exit 0
+[ -d "$REPO_TOP/.git" ] || exit 0
+
+# Only enforce on commits to local main.
+CURRENT_BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+[ "$CURRENT_BRANCH" = "main" ] || exit 0
+
+# Only enforce when we know the remote ref. If we have never fetched,
+# do not block; that is a separate user problem.
+git show-ref --verify --quiet refs/remotes/origin/main || exit 0
+
+LOCAL=$(git rev-parse refs/heads/main)
+REMOTE=$(git rev-parse refs/remotes/origin/main)
+[ "$LOCAL" != "$REMOTE" ] || exit 0
+
+BEHIND=$(git rev-list --count refs/heads/main..refs/remotes/origin/main)
+AHEAD=$(git rev-list --count refs/remotes/origin/main..refs/heads/main)
+
+if [ "$BEHIND" -gt 0 ]; then
+  cat >&2 <<EOF
+pre-commit: refusing to commit on primary 'main' (behind origin/main by $BEHIND).
+
+  Workflow: commit on a task worktree branched from origin/main, not on
+  the primary checkout's local main. Run:
+
+      git worktree add ../iris-<slug> -b <branch> origin/main
+
+  Or, if this commit really belongs on main, first reconcile:
+
+      bash scripts/sync-primary.sh
+
+  Bypass (intentional fix on a stale main) with: git commit --no-verify
+EOF
+  exit 1
+fi
+
+if [ "$AHEAD" -gt 0 ]; then
+  # Ahead-only is fine (unpushed work). No-op.
+  exit 0
+fi
+
+exit 0

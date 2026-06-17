@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Block pushing the primary checkout's `main` if it is behind
+# `origin/main` (which would mean the push is rejected anyway, or worse,
+# is force-pushing over work that already merged). Belt-and-suspenders
+# with pre-commit; catches the case where the dirty primary was
+# committed elsewhere and someone now tries to push.
+#
+# Only fires when the local ref being pushed is `refs/heads/main`.
+# Bypassable via `git push --no-verify` for legitimate cases.
+
+set -eu
+
+REPO_TOP=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -n "$REPO_TOP" ] || exit 0
+[ -d "$REPO_TOP/.git" ] || exit 0
+
+# Read the push spec on stdin: `<local-ref> <local-sha> <remote-ref> <remote-sha>` per line.
+PUSHING_MAIN=0
+while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+  if [ "$LOCAL_REF" = "refs/heads/main" ]; then
+    PUSHING_MAIN=1
+    break
+  fi
+done
+
+[ "$PUSHING_MAIN" = "1" ] || exit 0
+
+git show-ref --verify --quiet refs/remotes/origin/main || exit 0
+BEHIND=$(git rev-list --count refs/heads/main..refs/remotes/origin/main 2>/dev/null || echo 0)
+
+if [ "$BEHIND" -gt 0 ]; then
+  cat >&2 <<EOF
+pre-push: refusing to push 'main' (local is behind origin/main by $BEHIND).
+
+  Reconcile first:
+      git fetch origin --prune
+      bash scripts/sync-primary.sh
+
+  Then re-attempt the push, or open a PR through the worktree workflow.
+  Bypass (rare) with: git push --no-verify
+EOF
+  exit 1
+fi
+
+exit 0

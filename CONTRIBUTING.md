@@ -23,6 +23,17 @@ Thanks for improving Iris.
 - Use labels to make release notes and triage easier: `bug`, `enhancement`, `documentation`, `security`, `dependencies`, `chore`, `tooling`, or `good first issue`.
 - After checks finish, review failures with `gh pr checks` or `gh run view --log-failed`.
 
+## Worktree workflow (for parallel work or multiple agents)
+
+When more than one task or agent is active, isolate each in its own git worktree so concurrent work never collides in a shared checkout.
+
+1. Install the repo hooks once per clone: `bash scripts/install-hooks.sh`. They block commits/pushes on a primary `main` that has drifted behind `origin/main` (bypass with `--no-verify` when you know why).
+2. Preflight before branching: `bash scripts/worktree-preflight.sh` (fetches origin and checks primary freshness).
+3. Create a worktree off `origin/main`: `git worktree add ../iris-<slug> -b <branch> origin/main`. The primary checkout is control-only -- never edit files or switch branches there.
+4. Optionally `export CARGO_TARGET_DIR=~/.cache/iris-target` so worktrees share build artifacts instead of each rebuilding `target/`.
+5. Merge with `gh pr merge <N> --squash`, then clean up from outside the worktree: `bash scripts/worktree-cleanup.sh ../iris-<slug>` (removes the worktree, deletes the merged branch, and fast-forwards primary `main`).
+6. Leave worktrees and branches you do not own untouched.
+
 ## Commit messages
 
 Use Conventional Commits:
