@@ -240,6 +240,20 @@ pub(crate) trait ChatProvider {
     ) -> Result<ProviderStream<'a>>;
 }
 
+/// Forward the contract through a boxed provider so the front-end can select
+/// one of several concrete providers at runtime (`Box<dyn ChatProvider>`)
+/// without making every downstream type generic over the choice.
+impl ChatProvider for Box<dyn ChatProvider> {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a Tools,
+        cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        (**self).respond_stream(messages, tools, cancel)
+    }
+}
+
 pub(crate) struct Agent<P> {
     pub(crate) provider: P,
     messages: Vec<Message>,

@@ -1,0 +1,640 @@
+//! Antigravity provider (Google-account OAuth -> Gemini via Code Assist).
+//! Mirrors `anthropic_messages.rs`: the request is built eagerly, then a
+//! blocking reqwest + SSE parse runs through the shared `transport` channel +
+//! one-shot reauth glue. The wire surface is Code Assist's
+//! `v1internal:streamGenerateContent?alt=sse`: the Gemini request is wrapped in
+//! an Antigravity envelope and the SSE candidates are assembled into an
+//! `AssistantTurn`.
+//!
+//! ponytail: MVP wire surface only -- no generationConfig/thinking, no
+//! multimodal, no transient backoff. Add them if a real need shows up.
+
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Result, anyhow};
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use super::build_iris_system_prompt;
+use super::transport::{
+    Attempt, HttpClass, TurnSink, classify_http_status, for_each_sse_event, run_with_reauth,
+    spawn_stream,
+};
+use crate::mimir::auth::antigravity::AntigravityTokenStore;
+use crate::nexus::{AssistantTurn, ChatProvider, Message, ProviderStream, Role, ToolCall, Tools};
+
+const DEFAULT_MODEL: &str = "gemini-3.5-flash";
+const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+const USER_AGENT_VALUE: &str = "antigravity/1.0.2 linux/amd64";
+
+#[derive(Debug, Clone)]
+pub(crate) struct AntigravityProvider {
+    client: Client,
+    model: String,
+    base_url: String,
+    system_prompt: String,
+    tokens: AntigravityTokenStore,
+}
+
+impl AntigravityProvider {
+    pub(crate) fn new(
+        model: Option<&str>,
+        base_url: Option<&str>,
+        workspace: &Path,
+    ) -> Result<Self> {
+        Ok(Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()?,
+            model: model
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .unwrap_or(DEFAULT_MODEL)
+                .to_string(),
+            base_url: base_url
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .unwrap_or(DEFAULT_BASE_URL)
+                .to_string(),
+            system_prompt: build_iris_system_prompt(workspace),
+            tokens: AntigravityTokenStore::from_env()?,
+        })
+    }
+}
+
+impl ChatProvider for AntigravityProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a Tools,
+        cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        // Build the inner Gemini request eagerly so the blocking task captures
+        // only an owned `Value` and a cloned provider, never a borrow of
+        // `self`/`messages`/`tools`. The envelope (which needs project id) is
+        // assembled per-attempt from this inner request.
+        let inner = build_inner_request(&self.system_prompt, messages, tools);
+        let wire_slot = wire_model_slot(&self.model).to_string();
+        let provider = self.clone();
+        let cancel = cancel.clone();
+        Ok(spawn_stream(
+            move |sink, cancel| {
+                run_with_reauth(
+                    cancel,
+                    |force| {
+                        if force {
+                            provider.tokens.force_refresh(&provider.client)
+                        } else {
+                            provider.tokens.access_token(&provider.client)
+                        }
+                    },
+                    |token| provider.send_once(token, &inner, &wire_slot, sink, cancel),
+                )
+            },
+            cancel,
+        ))
+    }
+}
+
+impl AntigravityProvider {
+    fn send_once(
+        &self,
+        token: &crate::mimir::auth::antigravity::AntigravityToken,
+        inner: &Value,
+        wire_slot: &str,
+        sink: &mut dyn TurnSink,
+        cancel: &CancellationToken,
+    ) -> Attempt {
+        let envelope = wrap_request(&token.project_id, wire_slot, inner.clone());
+        let headers = match antigravity_headers(&token.bearer) {
+            Ok(headers) => headers,
+            Err(error) => return Attempt::Fatal(error),
+        };
+        let url = format!("{}/v1internal:streamGenerateContent?alt=sse", self.base_url);
+        let response = match self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&envelope)
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Attempt::Fatal(
+                    anyhow::Error::new(error).context("failed to send Antigravity request"),
+                );
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            let mut parser = GeminiStreamParser::default();
+            if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                parser.ingest_event(data, sink)
+            }) {
+                return Attempt::Fatal(error);
+            }
+            return match parser.finish() {
+                Ok(turn) => Attempt::Done(turn),
+                Err(error) => Attempt::Fatal(error),
+            };
+        }
+
+        let body = response.text().unwrap_or_default();
+        let error = match crate::telemetry::sanitize_external_body(&body) {
+            Some(detail) => anyhow!("Antigravity request failed ({status}): {detail}"),
+            None => anyhow!("Antigravity request failed ({status})"),
+        };
+        match classify_http_status(status.as_u16()) {
+            HttpClass::Reauth => Attempt::Reauth(error),
+            HttpClass::Fatal => Attempt::Fatal(error),
+        }
+    }
+}
+
+fn antigravity_headers(token: &str) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
+    Ok(headers)
+}
+
+/// Translate a stable Pi-visible model id to the Antigravity backend wire slot.
+/// The backend periodically renames its slots; unknown ids pass through.
+fn wire_model_slot(model: &str) -> &str {
+    match model {
+        "gemini-3.5-flash" => "gemini-3.5-flash-low",
+        "gemini-3.1-pro" => "gemini-3.1-pro-low",
+        "gemini-3-flash" => "gemini-3-flash",
+        other => other,
+    }
+}
+
+/// Wrap the inner Gemini request in the Antigravity Code Assist envelope.
+fn wrap_request(project_id: &str, wire_slot: &str, inner: Value) -> Value {
+    json!({
+        "project": project_id,
+        "model": wire_slot,
+        "request": inner,
+        "requestType": "agent",
+        "userAgent": "antigravity",
+        "requestId": format!("agent-{}", unique_id()),
+    })
+}
+
+fn build_inner_request(system_prompt: &str, messages: &[Message], tools: &Tools) -> Value {
+    let mut request = json!({
+        "contents": build_contents(messages),
+        "sessionId": format!("pi-{}", unique_id()),
+    });
+    if !system_prompt.is_empty() {
+        request["systemInstruction"] = json!({
+            "role": "user",
+            "parts": [{ "text": system_prompt }],
+        });
+    }
+    let declarations = tool_declarations(tools);
+    if !declarations.is_empty() {
+        request["tools"] = json!([{ "functionDeclarations": declarations }]);
+        request["toolConfig"] = json!({ "functionCallingConfig": { "mode": "AUTO" } });
+    }
+    request
+}
+
+fn tool_declarations(tools: &Tools) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "parameters": sanitize_schema(tool.parameters()),
+            })
+        })
+        .collect()
+}
+
+/// Recursively drop JSON-Schema meta keys Gemini's OpenAPI subset rejects.
+///
+/// ponytail: light sanitize (only the keys seen to 400 today); expand the drop
+/// set if Gemini starts rejecting other schema constructs.
+fn sanitize_schema(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(key, _)| {
+                    !matches!(key.as_str(), "$schema" | "$defs" | "additionalProperties")
+                })
+                .map(|(key, val)| (key, sanitize_schema(val)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(sanitize_schema).collect()),
+        other => other,
+    }
+}
+
+/// Map Nexus messages onto Gemini `contents`, coalescing consecutive entries
+/// that share a wire role ("user" or "model") into a single entry so the parts
+/// accumulate. Tool calls are model-role `functionCall` parts; tool results are
+/// user-role `functionResponse` parts.
+fn build_contents(messages: &[Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for message in messages {
+        let (role, part) = match message.role {
+            Role::User => ("user", json!({ "text": message.content })),
+            Role::Assistant => ("model", json!({ "text": message.content })),
+            Role::AssistantToolCall => {
+                let mut function_call = json!({
+                    "name": message.tool_name.as_deref().unwrap_or_default(),
+                    "args": serde_json::from_str::<Value>(&message.content)
+                        .unwrap_or_else(|_| json!({})),
+                });
+                insert_optional_id(&mut function_call, message.tool_call_id.as_deref());
+                ("model", json!({ "functionCall": function_call }))
+            }
+            Role::Tool => {
+                let mut function_response = json!({
+                    "name": message.tool_name.as_deref().unwrap_or_default(),
+                    "response": { "output": message.content },
+                });
+                insert_optional_id(&mut function_response, message.tool_call_id.as_deref());
+                ("user", json!({ "functionResponse": function_response }))
+            }
+        };
+        push_part(&mut out, role, part);
+    }
+    out
+}
+
+fn insert_optional_id(object: &mut Value, id: Option<&str>) {
+    if let Some(id) = id.map(str::trim).filter(|id| !id.is_empty())
+        && let Some(map) = object.as_object_mut()
+    {
+        map.insert("id".to_string(), json!(id));
+    }
+}
+
+fn push_part(out: &mut Vec<Value>, role: &str, part: Value) {
+    if let Some(last) = out.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some(role)
+        && let Some(parts) = last.get_mut("parts").and_then(Value::as_array_mut)
+    {
+        parts.push(part);
+        return;
+    }
+    out.push(json!({ "role": role, "parts": [part] }));
+}
+
+/// Process-unique id (nanos since epoch + a monotonic counter) for request and
+/// session ids. No uuid dependency; uniqueness within a process is sufficient.
+fn unique_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{count:x}")
+}
+
+/// Incremental SSE assembler for Gemini `streamGenerateContent` events.
+#[derive(Default)]
+struct GeminiStreamParser {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    generated_calls: u64,
+}
+
+impl GeminiStreamParser {
+    fn ingest_event(&mut self, data: &str, sink: &mut dyn TurnSink) -> Result<()> {
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        let value: Value = serde_json::from_str(data)
+            .map_err(|e| anyhow!("failed to parse Antigravity SSE: {e}"))?;
+        // Each event may be a single object, an array, or wrapped in `response`.
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    self.ingest_payload(&unwrap_response(item), sink)?;
+                }
+            }
+            other => self.ingest_payload(&unwrap_response(other), sink)?,
+        }
+        Ok(())
+    }
+
+    fn ingest_payload(&mut self, payload: &Value, sink: &mut dyn TurnSink) -> Result<()> {
+        if let Some(message) = payload
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+        {
+            return Err(anyhow!("{message}"));
+        }
+        if let Some(reason) = payload
+            .get("promptFeedback")
+            .and_then(|feedback| feedback.get("blockReason"))
+            .and_then(Value::as_str)
+        {
+            return Err(anyhow!("Antigravity response blocked: {reason}"));
+        }
+
+        let Some(parts) = payload
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            return Ok(());
+        };
+
+        for part in parts {
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if let Some(call) = part.get("functionCall") {
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        self.generated_calls += 1;
+                        format!("call_{}", self.generated_calls)
+                    });
+                let name = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                self.tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
+            } else if let Some(text) = part.get("text").and_then(Value::as_str) {
+                self.text.push_str(text);
+                sink.on_text_delta(text)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<AssistantTurn> {
+        if self.text.is_empty() && self.tool_calls.is_empty() {
+            return Err(anyhow!(
+                "Antigravity response did not include assistant text or tool calls"
+            ));
+        }
+        Ok(AssistantTurn {
+            text: (!self.text.is_empty()).then_some(self.text),
+            tool_calls: self.tool_calls,
+        })
+    }
+}
+
+/// Unwrap a `{ "response": INNER }` envelope, returning INNER (or the value
+/// unchanged when there is no wrapper).
+fn unwrap_response(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => map.remove("response").unwrap_or(Value::Object(map)),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+fn parse_antigravity_sse(body: &str) -> Result<AssistantTurn> {
+    struct NoopSink;
+    impl TurnSink for NoopSink {
+        fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let mut parser = GeminiStreamParser::default();
+    let mut sink = NoopSink;
+    for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
+        parser.ingest_event(data, &mut sink)
+    })?;
+    parser.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nexus::{Message, Tools};
+
+    #[test]
+    fn text_parts_assemble_into_turn() {
+        let body = "\
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello \"}]}}]}
+
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"}]}}]}
+
+";
+        let turn = parse_antigravity_sse(body).expect("stream should parse");
+        assert_eq!(turn.text.as_deref(), Some("Hello world"));
+        assert!(turn.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn function_call_parses_args_and_generates_id_when_missing() {
+        let body = "\
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.rs\"}}}]}}]}
+
+";
+        let turn = parse_antigravity_sse(body).expect("stream should parse");
+        assert_eq!(turn.tool_calls.len(), 1);
+        let call = &turn.tool_calls[0];
+        assert_eq!(call.name, "read");
+        assert_eq!(
+            call.id, "call_1",
+            "generated id when functionCall.id absent"
+        );
+        assert_eq!(call.arguments, json!({ "path": "a.rs" }));
+    }
+
+    #[test]
+    fn function_call_without_args_defaults_to_empty_object() {
+        let body = "\
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"list\",\"id\":\"fc_7\"}}]}}]}
+
+";
+        let turn = parse_antigravity_sse(body).expect("stream should parse");
+        let call = &turn.tool_calls[0];
+        assert_eq!(call.id, "fc_7", "provided functionCall.id is used");
+        assert_eq!(call.arguments, json!({}));
+    }
+
+    #[test]
+    fn response_wrapper_is_unwrapped() {
+        let body = "\
+data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}}
+
+";
+        let turn = parse_antigravity_sse(body).expect("stream should parse");
+        assert_eq!(turn.text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn thought_parts_are_skipped() {
+        let body = "\
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"secret\",\"thought\":true},{\"text\":\"shown\"}]}}]}
+
+";
+        let turn = parse_antigravity_sse(body).expect("stream should parse");
+        assert_eq!(turn.text.as_deref(), Some("shown"));
+    }
+
+    #[test]
+    fn top_level_error_is_error() {
+        let body = "\
+data: {\"error\":{\"message\":\"quota exceeded\"}}
+
+";
+        let error = parse_antigravity_sse(body).unwrap_err().to_string();
+        assert!(error.contains("quota exceeded"), "got: {error}");
+    }
+
+    #[test]
+    fn request_envelope_has_agent_metadata_and_maps_tool_result() {
+        let messages = vec![
+            Message::user("hi"),
+            Message {
+                role: Role::Tool,
+                content: "result body".to_string(),
+                tool_call_id: Some("fc_1".to_string()),
+                tool_name: Some("read".to_string()),
+            },
+        ];
+        let inner = build_inner_request("IRIS PROMPT", &messages, &Tools::new(Vec::new()));
+        let envelope = wrap_request("proj-1", wire_model_slot("gemini-3.5-flash"), inner);
+
+        assert_eq!(envelope["requestType"], json!("agent"));
+        assert_eq!(envelope["userAgent"], json!("antigravity"));
+        assert_eq!(envelope["project"], json!("proj-1"));
+        assert_eq!(
+            envelope["model"],
+            json!("gemini-3.5-flash-low"),
+            "wire slot mapped"
+        );
+
+        let request = &envelope["request"];
+        assert_eq!(
+            request["systemInstruction"]["parts"][0]["text"],
+            json!("IRIS PROMPT")
+        );
+        assert!(request.get("tools").is_none(), "empty tools omitted");
+        assert!(
+            request.get("toolConfig").is_none(),
+            "no toolConfig without tools"
+        );
+
+        // The user "hi" text and the tool result share the "user" wire role,
+        // so they coalesce into one content entry (text part, then the
+        // functionResponse part).
+        let contents = request["contents"].as_array().expect("contents array");
+        let user_entry = contents.last().expect("user content");
+        assert_eq!(user_entry["role"], json!("user"));
+        let parts = user_entry["parts"].as_array().expect("parts array");
+        let fr = &parts.last().expect("functionResponse part")["functionResponse"];
+        assert_eq!(fr["name"], json!("read"));
+        assert_eq!(fr["id"], json!("fc_1"));
+        assert_eq!(fr["response"]["output"], json!("result body"));
+    }
+
+    #[test]
+    fn consecutive_same_role_messages_coalesce() {
+        let messages = vec![
+            Message::user("a"),
+            Message::user("b"),
+            Message::assistant("c"),
+            Message {
+                role: Role::AssistantToolCall,
+                content: "{\"path\":\"x\"}".to_string(),
+                tool_call_id: Some("fc_1".to_string()),
+                tool_name: Some("read".to_string()),
+            },
+        ];
+        let contents = build_contents(&messages);
+        assert_eq!(
+            contents.len(),
+            2,
+            "user*2 coalesce, model+toolcall coalesce"
+        );
+        assert_eq!(contents[0]["role"], json!("user"));
+        assert_eq!(contents[0]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(contents[1]["role"], json!("model"));
+        let model_parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(
+            model_parts.len(),
+            2,
+            "text + functionCall in one model entry"
+        );
+        assert_eq!(model_parts[1]["functionCall"]["id"], json!("fc_1"));
+        assert_eq!(
+            model_parts[1]["functionCall"]["args"],
+            json!({ "path": "x" })
+        );
+    }
+
+    #[test]
+    fn tools_present_adds_declarations_and_tool_config() {
+        struct FakeTool;
+        impl crate::nexus::Tool for FakeTool {
+            fn name(&self) -> &str {
+                "read"
+            }
+            fn description(&self) -> &str {
+                "read a file"
+            }
+            fn parameters(&self) -> Value {
+                json!({
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "path": { "type": "string" } }
+                })
+            }
+            fn execute<'a>(
+                &'a self,
+                _args: &'a Value,
+                _env: &'a crate::nexus::ToolEnv<'_>,
+                _cancel: CancellationToken,
+            ) -> crate::nexus::ToolFuture<'a> {
+                unimplemented!()
+            }
+        }
+        let tools = Tools::new(vec![Box::new(FakeTool)]);
+        let inner = build_inner_request("", &[Message::user("hi")], &tools);
+        let decl = &inner["tools"][0]["functionDeclarations"][0];
+        assert_eq!(decl["name"], json!("read"));
+        let params = &decl["parameters"];
+        assert!(params.get("$schema").is_none(), "$schema sanitized out");
+        assert!(
+            params.get("additionalProperties").is_none(),
+            "additionalProperties sanitized out"
+        );
+        assert_eq!(params["properties"]["path"]["type"], json!("string"));
+        assert_eq!(
+            inner["toolConfig"]["functionCallingConfig"]["mode"],
+            json!("AUTO")
+        );
+        assert!(
+            inner.get("systemInstruction").is_none(),
+            "empty system prompt omitted"
+        );
+    }
+}

@@ -2,8 +2,10 @@ use std::env;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use std::path::Path;
+
 use anyhow::Result;
-use nexus::Agent;
+use nexus::{Agent, ChatProvider};
 use reqwest::blocking::Client;
 
 mod approval;
@@ -42,6 +44,10 @@ fn dispatch() -> Result<()> {
         [command, provider] if command == "login" && provider == "openai-codex" => {
             login_openai_codex(LoginMethod::Browser)
         }
+        [command, provider] if command == "login" && provider == "antigravity" => {
+            login_antigravity()
+        }
+        [command, provider] if command == "login" && provider == "anthropic" => login_anthropic(),
         [command, provider, flag]
             if command == "login" && provider == "openai-codex" && flag == "--browser" =>
         {
@@ -69,28 +75,21 @@ enum LoginMethod {
     DeviceCode,
 }
 
-const SUPPORTED_PROVIDER: &str = "openai-codex";
+/// Provider used when the settings file selects none. Stays `openai-codex` for
+/// backward compatibility; `anthropic` and `antigravity` are opt-in via
+/// `defaultProvider` in settings.
+const DEFAULT_PROVIDER: &str = "openai-codex";
 
 fn run_agent() -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    if let Some(provider) = settings
+    let provider_id = settings
         .default_provider
         .as_deref()
         .map(str::trim)
         .filter(|provider| !provider.is_empty())
-        && provider != SUPPORTED_PROVIDER
-    {
-        return Err(errors::UsageError::new(format!(
-            "unsupported provider '{provider}' in settings; only '{SUPPORTED_PROVIDER}' is supported"
-        ))
-        .into());
-    }
-    let provider = mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
-        settings.default_model.as_deref(),
-        settings.base_url.as_deref(),
-        &cwd,
-    )?;
+        .unwrap_or(DEFAULT_PROVIDER);
+    let provider = build_provider(provider_id, &settings, &cwd)?;
     let agent = Agent::new(provider, tools::built_in_tools());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
@@ -109,6 +108,39 @@ fn run_agent() -> Result<()> {
     let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
     let mut ui = ui::text::TextUi::stdio();
     cli::run_session(&mut harness, &mut ui)
+}
+
+/// Build the configured provider as a boxed trait object so a single
+/// `Agent<Box<dyn ChatProvider>>` can back any provider chosen at runtime. Each
+/// provider resolves its own default model/base URL from the passed-through
+/// settings (env still wins inside the provider).
+fn build_provider(
+    provider_id: &str,
+    settings: &config::Settings,
+    cwd: &Path,
+) -> Result<Box<dyn ChatProvider>> {
+    let model = settings.default_model.as_deref();
+    let base_url = settings.base_url.as_deref();
+    let provider: Box<dyn ChatProvider> = match provider_id {
+        "openai-codex" => Box::new(
+            mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+                model, base_url, cwd,
+            )?,
+        ),
+        "anthropic" => Box::new(
+            mimir::providers::anthropic_messages::AnthropicProvider::new(model, base_url, cwd)?,
+        ),
+        "antigravity" => Box::new(mimir::providers::antigravity::AntigravityProvider::new(
+            model, base_url, cwd,
+        )?),
+        other => {
+            return Err(errors::UsageError::new(format!(
+                "unsupported provider '{other}' in settings; supported: openai-codex, anthropic, antigravity"
+            ))
+            .into());
+        }
+    };
+    Ok(provider)
 }
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {
@@ -134,10 +166,34 @@ fn login_openai_codex(method: LoginMethod) -> Result<()> {
     Ok(())
 }
 
+fn login_antigravity() -> Result<()> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    mimir::auth::antigravity::login_browser(&client, |url| {
+        println!("Antigravity (Google account) login");
+        println!("Open: {url}");
+        println!("Waiting for callback...");
+    })?;
+    println!("Logged in to antigravity.");
+    Ok(())
+}
+
+fn login_anthropic() -> Result<()> {
+    // ponytail: no dedicated Anthropic login. The Claude Code subscription lane
+    // reuses an existing Claude Code OAuth login; Iris reads that credential.
+    // Add a manual-code-paste OAuth flow here if standalone login is needed.
+    println!("Anthropic uses your existing Claude Code login.");
+    println!("Sign in once with the Claude Code CLI; Iris reads its OAuth token.");
+    Ok(())
+}
+
 fn print_help() {
     eprintln!("Usage:");
     eprintln!("  iris-agent                              Start interactive agent");
     eprintln!("  iris-agent login openai-codex           Login with browser OAuth (default)");
     eprintln!("  iris-agent login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris-agent login openai-codex --device-code Login with device-code OAuth");
+    eprintln!("  iris-agent login antigravity            Login with Google account OAuth");
+    eprintln!("  iris-agent login anthropic              Show Claude Code login instructions");
 }
