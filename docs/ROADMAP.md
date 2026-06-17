@@ -650,9 +650,28 @@ Potential scope:
   compacted range contributes its summary's estimate instead of the covered
   turns -- so a reopened session reports the same context token total it had in
   memory (`session::context_tokens`). A `contextTokenBudget` setting is
-  parsed/defaulted but triggers nothing. Deferred (outside #54): auto-compaction
-  thresholds, pricing/cost accounting, and exact provider-reported usage (the
-  `tokenEstimate` field is the swap-in point once providers surface it).]
+  parsed/defaulted. Deferred (outside #54): pricing/cost accounting, and exact
+  provider-reported usage (the `tokenEstimate` field is the swap-in point once
+  providers surface it).]
+  Auto Compaction Foundation
+  ([#55](https://github.com/5omeOtherGuy/iris-agent/issues/55), shipped
+  2026-06-17) makes `contextTokenBudget` trigger runtime behavior: the Tier-2
+  Wayland harness compares the current context token total against the budget at
+  each safe turn boundary (before the provider request) and, when it is
+  exceeded, compacts via the existing `SessionLog::append_compaction` +
+  read-time rebuild. A deterministic internal summarizer (`wayland::summarize`,
+  bounded excerpts) stands in for a real summary and is the explicit swap point;
+  the harness picks a covered range that keeps the recent tail within budget and
+  never splits a tool-call/result pair, then replaces the in-memory context with
+  `summary + tail` so the next request uses the summary instead of the covered
+  turns. Under-budget sessions never compact; over-budget sessions create a
+  compaction entry; resumed sessions rebuild through prior summaries
+  (already-loaded history is tracked id-less this slice, so only post-resume
+  turns are re-coverable -- a documented ceiling). Tests cover under-budget
+  no-op, over-budget compaction at a turn boundary, and resume/rebuild after
+  auto-compaction. Deferred (outside #55): provider-generated summaries,
+  branch-aware compaction, rollback, a manual TUI/CLI `/compact` command, and
+  background/offloaded compaction.]
 - Comparison against naive transcript-passing.
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce

@@ -91,6 +91,9 @@ fn test_harness<P: ChatProvider>(provider: P, workspace: &Path, tools: Tools) ->
         workspace.to_path_buf(),
         ToolState::new(),
         None,
+        // Auto-compaction disabled: these tests exercise the loop, not the
+        // budget policy.
+        None,
     )
 }
 
@@ -1452,7 +1455,13 @@ fn turn_persists_transcript_when_log_attached() -> Result<()> {
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let log_path = log.path().to_path_buf();
     // Persistence is a harness concern: construct it with the log attached.
-    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
 
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -1541,7 +1550,13 @@ fn oversized_tool_output_is_stored_behind_a_handle_and_compacted_in_context() ->
     );
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let log_path = log.path().to_path_buf();
-    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
@@ -1601,7 +1616,13 @@ fn small_tool_output_stays_inline_unchanged() -> Result<()> {
         Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
     );
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
-    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
@@ -1632,7 +1653,7 @@ fn oversized_output_without_a_store_is_kept_inline_not_discarded() -> Result<()>
     );
     // No session log -> no handle store. The full output must stay inline rather
     // than be truncated and lost.
-    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), None);
+    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), None, None);
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
@@ -1667,7 +1688,13 @@ fn offloaded_preview_is_safe_on_multibyte_boundaries() -> Result<()> {
     );
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let log_path = log.path().to_path_buf();
-    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
@@ -1750,7 +1777,13 @@ fn resume_keeps_the_handle_reference_and_does_not_reinline_large_output() -> Res
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let session_id = log.id().to_string();
     let log_path = log.path().to_path_buf();
-    let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), Some(log));
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
@@ -2421,6 +2454,7 @@ fn resumed_session_feeds_prior_context_into_next_turn() -> Result<()> {
         ToolState::new(),
         Some(session),
         resumed,
+        None,
     );
 
     let mut out = Vec::new();
@@ -2487,6 +2521,7 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         ToolState::new(),
         Some(session),
         on_disk,
+        None,
     );
 
     let mut out = Vec::new();
@@ -2516,6 +2551,164 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         .position(|m| m.role == Role::AssistantToolCall)
         .unwrap();
     assert_eq!(reopened.messages[idx + 1].role, Role::Tool);
+    Ok(())
+}
+
+/// Under budget: the harness must not create a compaction entry, and the
+/// second turn still sees the prior context (no loss).
+#[test]
+fn under_budget_session_does_not_auto_compact() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text("a")),
+        Ok(AssistantTurn::text("b")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let log_path = log.path().to_path_buf();
+    // A large budget two short turns stay well under: the policy runs each turn
+    // but never fires.
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(1_000_000),
+    );
+
+    run_text_session(
+        &mut harness,
+        b"hi\nthere\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    let on_disk = fs::read_to_string(&log_path)?;
+    assert!(
+        !on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")),
+        "an under-budget session must not create a compaction entry"
+    );
+    // The second turn still received the first turn's context.
+    assert_eq!(harness.agent.provider.seen.borrow().len(), 2);
+    Ok(())
+}
+
+/// Over budget: at the second turn boundary the accumulated context exceeds the
+/// budget, so the harness compacts before the provider request -- persisting a
+/// compaction entry and opening the request with the summary instead of the
+/// covered turns.
+#[test]
+fn over_budget_session_auto_compacts_at_turn_boundary() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    // ~100-token assistant replies and ~100-token user prompts, against a tiny
+    // 50-token budget, so the second turn's boundary is over budget.
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+
+    let prompt_a = "P".repeat(400);
+    let prompt_b = "Q".repeat(400);
+    let input = format!("{prompt_a}\n{prompt_b}\n/exit\n");
+    run_text_session(
+        &mut harness,
+        input.as_bytes(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    // The compaction entry was written automatically at a safe turn boundary.
+    let on_disk = fs::read_to_string(&log_path)?;
+    assert!(
+        on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")),
+        "an over-budget session must persist a compaction entry"
+    );
+
+    // The second provider request opened with the summary, not the covered
+    // turns, and never replays a covered message verbatim.
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2, "two provider requests");
+    assert!(
+        seen[1][0].content.starts_with("[auto-compacted summary"),
+        "second request must open with the compaction summary, got: {}",
+        seen[1][0].content
+    );
+    assert!(
+        !seen[1].iter().any(|m| m.content == prompt_a),
+        "covered turns must not be replayed as standalone messages"
+    );
+    Ok(())
+}
+
+/// Resume after auto-compaction: reopening a session that was auto-compacted
+/// live rebuilds context through the summary, without duplicating the covered
+/// turns -- the durable read-time view matches the live compacted context.
+#[test]
+fn resume_after_auto_compaction_rebuilds_through_the_summary() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+
+    let prompt_a = "P".repeat(400);
+    let prompt_b = "Q".repeat(400);
+    let input = format!("{prompt_a}\n{prompt_b}\n/exit\n");
+    run_text_session(
+        &mut harness,
+        input.as_bytes(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+    drop(harness);
+
+    // Reopen from disk: the read-time rebuild applies the auto-compaction entry.
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present in store");
+    let stored = store.open(&meta)?;
+    assert!(
+        stored
+            .messages
+            .iter()
+            .any(|m| m.content.starts_with("[auto-compacted summary")),
+        "the rebuilt context must carry the auto-compaction summary"
+    );
+    assert!(
+        !stored.messages.iter().any(|m| m.content == prompt_a),
+        "covered turns must not be duplicated in the rebuilt context"
+    );
     Ok(())
 }
 

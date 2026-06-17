@@ -123,9 +123,13 @@ fn run_agent() -> Result<()> {
     // The /resume UI is a later milestone; this only proves the store reads
     // back and signals that persistence is durable and resumable.
     log_resumable_sessions(&cwd);
-    // The Tier-2 harness owns the execution surface (workspace + tool state) and
-    // persistence, wrapping the bare in-memory agent.
-    let mut harness = wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session);
+    // The Tier-2 harness owns the execution surface (workspace + tool state),
+    // persistence, and the auto-compaction policy, wrapping the bare in-memory
+    // agent. When the context token total exceeds the budget at a turn
+    // boundary, the harness compacts before the provider request.
+    let budget = Some(settings.context_token_budget());
+    let mut harness =
+        wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
     cli::run_interactive(&mut harness)
 }
 
@@ -143,13 +147,14 @@ fn resume_agent(session_id: &str) -> Result<()> {
     })?;
     let stored = store.open(&meta)?;
     let resumed = stored.messages.len();
-    // Expose the rebuilt context's token total from the reconstruction path.
-    // Read-only for now (no auto-compaction trigger yet); the same number the
-    // live session reports via `session::context_tokens`, so it is stable
-    // across resume.
+    // The rebuilt context's token total from the reconstruction path -- the same
+    // number the live session reports via `session::context_tokens`, so it is
+    // stable across resume. The harness compares it against the budget at the
+    // next turn boundary.
     let context_tokens = stored.context_tokens;
 
     let settings = config::Settings::load(&cwd)?;
+    let budget = Some(settings.context_token_budget());
     // Resume assembles instructions through the same harness-owned path as a
     // fresh session, so a resumed turn gets identical base/runtime/project
     // instructions.
@@ -175,6 +180,7 @@ fn resume_agent(session_id: &str) -> Result<()> {
         tools::ToolState::new(),
         session,
         resumed,
+        budget,
     );
     cli::run_interactive(&mut harness)
 }

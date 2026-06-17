@@ -461,6 +461,14 @@ impl<P: ChatProvider> Agent<P> {
         &self.messages
     }
 
+    /// Replace the in-memory provider-visible context. The Tier-2 harness uses
+    /// this to install a compacted context (summary + retained tail) before the
+    /// next turn; the bare agent stays oblivious to compaction policy and
+    /// persistence, just as [`resumed`](Self::resumed) seeds context on resume.
+    pub(crate) fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
     pub(crate) async fn submit_turn(
         &mut self,
         prompt: &str,

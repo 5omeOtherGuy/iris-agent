@@ -175,6 +175,7 @@ mod tests {
             dir.path.clone(),
             crate::tools::ToolState::new(),
             None,
+            None,
         );
         let mut ui = TextUi::new("bad\nagain\n/exit\n".as_bytes(), Vec::new(), Vec::new());
 
