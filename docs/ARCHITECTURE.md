@@ -92,7 +92,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Owns | Today's file(s) |
 |---|---|
 | Harness wrapping the bare agent: owns the execution env + session, injects `ToolEnv`, persists the transcript post-turn | `wayland.rs` (`Harness`) |
-| Session transcript persistence | `session.rs` |
+| Session transcript persistence/read store | `session.rs` |
 | Settings / configuration loading | `config.rs` |
 | Workspace path safety (the FS/Shell sandbox surface) | `tools/path.rs`, `tools/bash/sandbox.rs` |
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
@@ -136,7 +136,8 @@ The four cuts are done: the bare `Agent` in `nexus.rs` is a provider-, UI-,
 persistence-, and workspace-neutral in-memory engine. It imports no `crate::ui`/
 `crate::approval` (Step A), resolves tools by name over an injected set (Step B),
 and owns no filesystem or session store (Step C) -- the Tier-2 `Harness`
-(`wayland.rs`) owns the execution env and persistence and injects a `&mut ToolEnv`
+(`wayland.rs`) owns the execution env and live persistence, while `session.rs`
+also owns the read-side `SessionStore`; Wayland injects a `&mut ToolEnv`
 into each turn. The only `crate::tools` reference left in core is the `ToolState`
 type borrowed through `ToolEnv` (the type stays in `crate::tools`; the harness
 owns the instance). The cuts that reached this split:
@@ -157,12 +158,13 @@ owns the instance). The cuts that reached this split:
    system (issue #18) would be one optional consumer, not the reason for it.
    Relocating `ToolState` to the harness is Step C. See "Tools across the tiers".
 4. **Persistence + execution surface are harness-tier.** _(done)_ The bare
-   `Agent` holds no `workspace`, `ToolState`, or `SessionLog`. The Tier-2
+   `Agent` holds no `workspace`, `ToolState`, `SessionLog`, or `SessionStore`. The Tier-2
    `Harness` (`wayland.rs`) wraps the agent, owns the workspace + `ToolState`
    (injected per turn as `ToolEnv`) and the optional `SessionLog`, and persists
-   the transcript by diffing `agent.messages()` after each turn -- mirroring
-   pi's `AgentHarness` owning `ExecutionEnv` + session and appending messages
-   itself, never in the core loop.
+   the transcript by diffing `agent.messages()` after each turn. The read-side
+   `SessionStore` lists/opens persisted transcripts for future `/resume`, still
+   outside the core loop -- mirroring pi's `AgentHarness` owning `ExecutionEnv`
+   + session and appending messages itself, never in Nexus.
 
 ## Tools across the tiers
 

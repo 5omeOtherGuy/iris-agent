@@ -4,7 +4,8 @@
 > done. Iris has a text-only session loop, selectable Mimir providers
 > (`openai-codex`, `anthropic`, and `antigravity`), streamed response parsing,
 > workspace-scoped tools, terminal approval gates with diff previews,
-> provider/model settings, and best-effort JSONL transcript persistence. Nexus
+> provider/model settings, and a best-effort JSONL read/write session-store
+> foundation. Nexus
 > now runs a tokio async loop with turn-level cancellation:
 > the provider is an async stream raced against cancellation, tools are async
 > with child tokens, concurrency-safe tools run in parallel while everything else
@@ -506,22 +507,11 @@ Potential scope:
   newest-first) by reading only each header line + mtime, and `open(id)` reads
   a session back with its messages in order (skipping a truncated trailing
   fragment). Tests cover create/open/list/read/append/parent-linkage.
-  Deferred (later milestones, intentionally outside this slice): surfacing
-  entry ids/`parentId` on read for branching/tree navigation,
-  compaction/branch-summary entries, labels, fork, and token accounting. This
-  ships the durable, resumable-ready store. Session Resume MVP
-  ([#47](https://github.com/5omeOtherGuy/iris-agent/issues/47), shipped
-  2026-06-17) builds on it: `iris-agent resume <session-id>` finds the session
-  via `SessionStore::find`, reconstructs the prior provider-visible messages
-  (`Agent::resumed` seeds the loaded transcript), reopens the same JSONL file
-  for append (`SessionLog::resume` restores the leaf link + id counter), and
-  the harness continues appending future turns to that same log (a `persisted`
-  cursor past the loaded history avoids rewriting it). Errors clearly on an
-  unknown id. A focused test
-  (`resumed_session_feeds_prior_context_into_next_turn`) proves the loaded fact
-  reaches the next model turn and that continuation does not duplicate history.
-  Still deferred (outside #47): the in-session `/resume` picker UI, branching,
-  rollback, compaction/summaries, and session search.]
+  Deferred (later milestones, intentionally outside this slice): the `/resume`
+  UI command and context reconstruction, surfacing entry ids/`parentId` on read
+  for branching/tree navigation, compaction/branch-summary entries, labels,
+  fork, and token accounting. This ships the durable, resumable-ready store,
+  not session resume itself.]
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
   override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project).
@@ -695,9 +685,9 @@ Milestone 0/1 verification gates green.
    [#18](https://github.com/5omeOtherGuy/iris-agent/issues/18)) would be one
    optional consumer of the same seam, not a reason to build it and not a
    dependency of this refactor.
-4. **Persistence is harness-tier.** Move `SessionLog`, `attach_session_log`,
-   `persist_new_messages`, and the `workspace` execution surface out of the bare
-   core loop into Wayland (Tier 2), or behind a Tier 1 event subscriber.
+4. **Persistence is harness-tier.** Keep `SessionLog`/`SessionStore`, transcript
+   append/read-back, and the `workspace` execution surface out of the bare core
+   loop in Wayland (Tier 2), or behind a Tier 1 event subscriber.
 
 Acceptance signal: `src/nexus.rs` imports nothing from `crate::ui`,
 `crate::approval`, `crate::session`, or concrete `crate::tools::*` impls, and the

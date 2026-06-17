@@ -1,12 +1,14 @@
 # ADR-0004: Build JSONL session store foundation before resume and compaction
 
 **Date**: 2026-06-17
-**Status**: accepted
+**Status**: accepted; implemented in issue #42
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context
 
-Iris currently has best-effort write-only JSONL transcript logging. The harness capability matrix found session persistence is the next major gap versus pi-mono and Codex. Issue #42 defines the smallest useful slice: a JSONL-backed session store with ids, parent links, read/open/list support, and tests.
+At decision time, Iris had best-effort write-only JSONL transcript logging. The harness capability matrix found session persistence was the next major gap versus pi-mono and Codex. Issue #42 defined the smallest useful slice: a JSONL-backed session store with ids, parent links, read/open/list support, and tests.
+
+Outcome: implemented as a v2 JSONL store. `SessionLog` remains the live append handle; `SessionStore` lists sessions and opens one back in message order. `/resume`, branching/tree APIs, compaction, labels, fork/rollback, and token accounting remain intentionally deferred.
 
 ## Decision
 
