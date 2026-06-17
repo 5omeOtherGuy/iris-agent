@@ -7,6 +7,7 @@ use crate::nexus::{
 };
 
 pub(crate) mod text;
+pub(crate) mod tui;
 
 /// Terminal front-end seam (Tier 3). Implementations own all terminal I/O.
 ///

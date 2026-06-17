@@ -24,6 +24,15 @@ ignore = "0.4"
 landlock = "0.4.5"
 libc = "0.2.186"
 rand = "0.10"
+# Terminal UI: ratatui owns the cell buffer, frame diff, and width-aware
+# layout; it re-exports crossterm (raw mode, alternate screen, key/resize/paste
+# events) as `ratatui::crossterm`, so the renderer builds on ratatui and lets it
+# own the terminal backend. No bespoke cell-buffer/diff is hand-rolled.
+ratatui = "0.30"
+# Display-width measurement for transcript word-wrapping and editor-cursor math.
+# unicode-width is the canonical implementation (already in the tree via
+# ratatui); used instead of counting chars, which is wrong for CJK/emoji.
+unicode-width = "0.2"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
