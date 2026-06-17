@@ -2,6 +2,10 @@
 
 -
 
+## Code review
+
+Comment `@codex review` to request a Codex review (auto-review also runs on push).
+
 ## Verification
 
 - [ ] `cargo fmt --all --check`
