@@ -284,12 +284,19 @@ fn read_meta(path: &Path) -> Result<SessionMeta> {
 /// malformed lines (e.g. a truncated trailing fragment from a partial write)
 /// are skipped rather than failing the whole open.
 fn read_messages(path: &Path) -> Result<Vec<Message>> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut lines = content.lines().filter(|line| !line.trim().is_empty());
+    // Read raw bytes and split on '\n' so a truncated trailing fragment that
+    // splits a multibyte UTF-8 char is discarded as one bad line, rather than
+    // failing the whole read -- which `read_to_string` would, since invalid
+    // UTF-8 anywhere in the file errors before any line is parsed.
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut lines = bytes
+        .split(|&b| b == b'\n')
+        .map(|line| std::str::from_utf8(line).map(str::trim))
+        .filter(|line| !matches!(line, Ok(text) if text.is_empty()));
     let header_line = lines
         .next()
-        .with_context(|| format!("empty session file {}", path.display()))?;
+        .with_context(|| format!("empty session file {}", path.display()))?
+        .map_err(|_| anyhow::anyhow!("session header is not valid UTF-8 in {}", path.display()))?;
     let header: Value = serde_json::from_str(header_line)
         .with_context(|| format!("session header is not valid JSON in {}", path.display()))?;
     if header.get("type").and_then(Value::as_str) != Some("session") {
@@ -298,7 +305,11 @@ fn read_messages(path: &Path) -> Result<Vec<Message>> {
 
     let mut messages = Vec::new();
     for line in lines {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+        let Ok(text) = line else {
+            tracing::warn!(path = %path.display(), "skipping non-UTF-8 session line");
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
             tracing::warn!(path = %path.display(), "skipping malformed session line");
             continue;
         };
@@ -634,6 +645,27 @@ mod tests {
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "ok");
+    }
+
+    #[test]
+    fn read_skips_a_trailing_fragment_that_splits_a_utf8_char() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        // A full non-ASCII line round-trips fine.
+        log.append(&Message::user("caf\u{e9}")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        // A crash mid-write can leave a fragment whose bytes are an incomplete
+        // multibyte char (the first two bytes of "\u{1F600}"). read_to_string
+        // would reject the whole file; the byte reader must skip only this line.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0xF0, 0x9F]).unwrap();
+        drop(file);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "caf\u{e9}");
     }
 
     #[test]
