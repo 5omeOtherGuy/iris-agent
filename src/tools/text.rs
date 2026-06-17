@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rand::RngCore;
+use rand::Rng;
 
 /// Default output cap: keep at most the first/last 2000 lines.
 pub(super) const DEFAULT_MAX_LINES: usize = 2000;
