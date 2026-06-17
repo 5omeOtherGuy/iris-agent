@@ -611,7 +611,17 @@ Potential scope:
 - Handle-returning large tool outputs.
 - Micro-summary schema for large results.
 - Selective handle dereferencing.
-- Token accounting per turn.
+- Token accounting per turn. [Foundation shipped
+  ([#54](https://github.com/5omeOtherGuy/iris-agent/issues/54)): each `message`
+  session entry persists a conservative content-derived `tokenEstimate`, the
+  read/rebuild path sums them (preferring the persisted value, recomputing from
+  content for legacy v1 entries) into `StoredSession.context_tokens`, and a
+  compacted range contributes its summary's estimate instead of the covered
+  turns -- so a reopened session reports the same context token total it had in
+  memory (`session::context_tokens`). A `contextTokenBudget` setting is
+  parsed/defaulted but triggers nothing. Deferred (outside #54): auto-compaction
+  thresholds, pricing/cost accounting, and exact provider-reported usage (the
+  `tokenEstimate` field is the swap-in point once providers surface it).]
 - Comparison against naive transcript-passing.
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce

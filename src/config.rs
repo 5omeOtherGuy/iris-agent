@@ -42,7 +42,17 @@ pub(crate) struct Settings {
     pub(crate) default_model: Option<String>,
     /// Base URL override for the active provider's API endpoint.
     pub(crate) base_url: Option<String>,
+    /// Context token budget threshold. Stored and read only in this slice; the
+    /// next slice (auto-compaction) reads it to decide when to compact. Parsing
+    /// it now keeps the on-disk config forward-compatible without changing
+    /// runtime behavior. Absent -> [`Settings::context_token_budget`] default.
+    pub(crate) context_token_budget: Option<u64>,
 }
+
+/// Default context token budget when none is configured. A conservative ceiling
+/// that fits common model context windows; it is only surfaced through
+/// [`Settings::context_token_budget`] and triggers nothing yet.
+const DEFAULT_CONTEXT_TOKEN_BUDGET: u64 = 128_000;
 
 impl Settings {
     /// Load and merge the global and project settings files for `cwd`.
@@ -71,7 +81,24 @@ impl Settings {
             default_provider: self.default_provider,
             default_model: project.default_model.or(self.default_model),
             base_url: self.base_url,
+            // A budget is not a security-sensitive redirect (unlike provider /
+            // base-url), so a project may tune it; fall back to global, then the
+            // built-in default via the accessor.
+            context_token_budget: project.context_token_budget.or(self.context_token_budget),
         }
+    }
+
+    /// Configured context token budget, or the built-in default when unset. The
+    /// foundation value the next slice's auto-compaction policy reads; nothing
+    /// triggers on it yet.
+    //
+    // ponytail: read-only foundation. `allow(dead_code)` until the
+    // auto-compaction slice consumes it -- the field is parsed/defaulted now so
+    // the config format is stable, but adding a trigger here is out of scope.
+    #[allow(dead_code)]
+    pub(crate) fn context_token_budget(&self) -> u64 {
+        self.context_token_budget
+            .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
     }
 }
 
@@ -176,6 +203,29 @@ mod tests {
         assert_eq!(settings.default_provider.as_deref(), Some("openai-codex"));
         assert_eq!(settings.default_model.as_deref(), Some("project-model"));
         assert_eq!(settings.base_url.as_deref(), Some("https://global.example"));
+    }
+
+    #[test]
+    fn context_token_budget_defaults_when_unset_and_parses_when_present() {
+        let dir = temp_dir();
+        // Unset -> built-in default, no error.
+        let defaulted = Settings::load_from(
+            Some(&dir.path.join("none.json")),
+            &dir.path.join("none.json"),
+        )
+        .unwrap();
+        assert_eq!(defaulted.context_token_budget, None);
+        assert_eq!(
+            defaulted.context_token_budget(),
+            DEFAULT_CONTEXT_TOKEN_BUDGET
+        );
+
+        // Present -> parsed and surfaced; a project may tune it.
+        let project = dir.path.join("project.json");
+        fs::write(&project, r#"{ "contextTokenBudget": 64000 }"#).unwrap();
+        let configured = Settings::load_from(None, &project).unwrap();
+        assert_eq!(configured.context_token_budget, Some(64_000));
+        assert_eq!(configured.context_token_budget(), 64_000);
     }
 
     #[test]

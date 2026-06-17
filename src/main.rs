@@ -140,6 +140,11 @@ fn resume_agent(session_id: &str) -> Result<()> {
     })?;
     let stored = store.open(&meta)?;
     let resumed = stored.messages.len();
+    // Expose the rebuilt context's token total from the reconstruction path.
+    // Read-only for now (no auto-compaction trigger yet); the same number the
+    // live session reports via `session::context_tokens`, so it is stable
+    // across resume.
+    let context_tokens = stored.context_tokens;
 
     let settings = config::Settings::load(&cwd)?;
     let provider = build_provider(resolve_provider_id(&settings), &settings, &cwd)?;
@@ -155,7 +160,7 @@ fn resume_agent(session_id: &str) -> Result<()> {
             None
         }
     };
-    tracing::info!(id = %meta.id, messages = resumed, "resumed session");
+    tracing::info!(id = %meta.id, messages = resumed, context_tokens, "resumed session");
 
     let mut harness = wayland::Harness::resumed(
         agent,
