@@ -95,7 +95,37 @@ pub(super) const DEFAULTS: &[Default] = &[
         description: "General tool-use discipline: context first, safe parallelism, diagnosing failures.",
         body: TOOL_USE,
     },
+    Default {
+        name: "template",
+        slot: Some(0),
+        description: "Copy-ready, inert example of the fragment format (slot 0 = disabled).",
+        body: TEMPLATE,
+    },
 ];
+
+// A self-documenting, copy-ready template materialized into ~/.iris/fragments.
+// It carries slot 0 so it is disabled: it is never folded into the prompt, it
+// just sits in the directory as a starting point a user copies and edits.
+const TEMPLATE: &str = r#"This file is a copy-ready template. It is disabled (slot: 0), so it never
+appears in the system prompt. Copy it to a new file in this directory --
+name it <something>.md -- and edit it to add your own instructions.
+
+Frontmatter keys (between the --- fences):
+  name         XML tag that wraps this block in the prompt. Defaults to the
+               filename without .md.
+  slot         Integer ordering key; lower numbers appear earlier. Set it to 0
+               to disable the fragment entirely. Omit it to place the block
+               after every slotted fragment (then alphabetical by name).
+  description  One line of intent for humans and agents. Never rendered.
+
+The body is everything after the closing --- fence: the literal text injected
+inside <name>...</name>. A blank body emits nothing.
+
+Shipped slots, for reference when choosing one:
+  identity (anchored first), mission 1, response_style 2, working_with_the_user
+  3, default_to_action 4, investigate_before_acting 5, pragmatism_and_scope 6,
+  verify_and_report_honestly 7, execute_actions_with_care 8, diagrams 9,
+  file_links 10, then the generated tool blocks and tool_use (anchored last)."#;
 
 const IDENTITY: &str = r#"You are iris, a coding assistant collaborating with the user in this workspace on coding tasks."#;
 
