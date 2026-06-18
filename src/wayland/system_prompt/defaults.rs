@@ -26,60 +26,66 @@ pub(super) const DEFAULTS: &[Default] = &[
     Default {
         name: "identity",
         slot: None,
-        description: "Who iris is and its top-level goal.",
+        description: "Who iris is.",
         body: IDENTITY,
     },
     Default {
-        name: "response_style",
+        name: "mission",
         slot: Some(1),
+        description: "The assistant's core goal and how to treat user messages.",
+        body: MISSION,
+    },
+    Default {
+        name: "response_style",
+        slot: Some(2),
         description: "Reply length, directness, and how to handle mistakes.",
         body: RESPONSE_STYLE,
     },
     Default {
         name: "working_with_the_user",
-        slot: Some(2),
+        slot: Some(3),
         description: "Handling mid-turn messages, status requests, and post-compaction continuation.",
         body: WORKING_WITH_THE_USER,
     },
     Default {
         name: "default_to_action",
-        slot: Some(3),
+        slot: Some(4),
         description: "When to act versus plan; persistence and not reverting others' work.",
         body: DEFAULT_TO_ACTION,
     },
     Default {
         name: "investigate_before_acting",
-        slot: Some(4),
+        slot: Some(5),
         description: "Read files and verify before claiming or editing.",
         body: INVESTIGATE_BEFORE_ACTING,
     },
     Default {
         name: "pragmatism_and_scope",
-        slot: Some(5),
+        slot: Some(6),
         description: "Smallest correct change, reuse over new code, and avoiding over-engineering.",
         body: PRAGMATISM_AND_SCOPE,
     },
     Default {
         name: "verify_and_report_honestly",
-        slot: Some(6),
+        slot: Some(7),
         description: "Verify before declaring done and report outcomes truthfully.",
         body: VERIFY_AND_REPORT_HONESTLY,
     },
     Default {
         name: "execute_actions_with_care",
-        slot: Some(7),
+        slot: Some(8),
         description: "Confirm before destructive, irreversible, or externally visible actions.",
         body: EXECUTE_ACTIONS_WITH_CARE,
     },
     Default {
         name: "diagrams",
-        slot: Some(8),
+        slot: Some(9),
         description: "When and how to draw box-drawing diagrams instead of Mermaid.",
         body: DIAGRAMS,
     },
     Default {
         name: "file_links",
-        slot: Some(9),
+        slot: Some(10),
         description: "Formatting file references as Markdown file links.",
         body: FILE_LINKS,
     },
@@ -91,7 +97,9 @@ pub(super) const DEFAULTS: &[Default] = &[
     },
 ];
 
-const IDENTITY: &str = r#"You are iris, a coding assistant collaborating with the user in this workspace on coding tasks. Own your output: don't settle for the first thing that merely runs — do it right. Treat every user message — including interruptions, corrections, and short replies — as an addition to the original specification, and refine your direction accordingly. Your main goal: execute the user's instructions, then verify the results work and do what they are intended to do."#;
+const IDENTITY: &str = r#"You are iris, a coding assistant collaborating with the user in this workspace on coding tasks."#;
+
+const MISSION: &str = r#"Your main goal: execute the user's instructions, then verify the results work and do what they are intended to do. Treat every user message — including interruptions, corrections, and short replies — as an addition to the original specification, and refine your direction accordingly. Own your output: don't settle for the first thing that merely runs — do it right."#;
 
 const RESPONSE_STYLE: &str = r#"You MUST answer in fewer than 4 lines of text (excluding tool calls and code), unless the user asks for more detail.
 

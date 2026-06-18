@@ -598,7 +598,12 @@ fn materialize_writes_defaults_then_does_not_overwrite() {
     assert!(
         loaded
             .iter()
-            .any(|f| f.name == "response_style" && f.slot == Some(1))
+            .any(|f| f.name == "mission" && f.slot == Some(1))
+    );
+    assert!(
+        loaded
+            .iter()
+            .any(|f| f.name == "response_style" && f.slot == Some(2))
     );
 
     // A user edit survives a second materialize (no overwrite).
@@ -609,6 +614,33 @@ fn materialize_writes_defaults_then_does_not_overwrite() {
         fs::read_to_string(&edited).unwrap(),
         "---\nname: response_style\nslot: 1\n---\nMY EDIT"
     );
+}
+
+#[test]
+fn shipped_identity_is_one_sentence_and_mission_follows_it() {
+    // identity is the short standalone block; the goal/refine/own-your-output
+    // prose lives in a separate mission fragment right after it.
+    let prompt = build_prompt(
+        default_fragments(),
+        &built_in_tools(),
+        Path::new("/tmp/iris"),
+        &[],
+        "2026-06-18",
+    );
+    let id = prompt
+        .split_once("<identity>\n")
+        .and_then(|(_, r)| r.split_once("\n</identity>"))
+        .map(|(b, _)| b)
+        .expect("identity block present");
+    assert_eq!(
+        id,
+        "You are iris, a coding assistant collaborating with the user in this workspace on coding tasks."
+    );
+    // mission carries the goal and sits between identity and response_style.
+    assert!(prompt.contains("<mission>"));
+    assert!(prompt.contains("Your main goal: execute the user's instructions"));
+    assert!(at(&prompt, "identity") < at(&prompt, "mission"));
+    assert!(at(&prompt, "mission") < at(&prompt, "response_style"));
 }
 
 #[test]
@@ -651,15 +683,15 @@ fn dropping_a_repo_fragment_changes_the_prompt_at_its_slot_position() {
     let mut frags = default_fragments();
     frags.push(frag(
         "custom_rule",
-        Some(2),
+        Some(3),
         Source::Repo,
         "always run the linter",
     ));
     let prompt = build_with(frags, &[]);
     assert!(prompt.contains("<custom_rule>"));
     assert!(prompt.contains("always run the linter"));
-    // slot 2 sits after response_style (slot 1) and before default_to_action
-    // (slot 3); same-slot rule does not apply since slots differ.
+    // slot 3 sits after response_style (slot 2) and before default_to_action
+    // (slot 4); same-slot rule does not apply since slots differ.
     assert!(at(&prompt, "response_style") < at(&prompt, "custom_rule"));
     assert!(at(&prompt, "custom_rule") < at(&prompt, "default_to_action"));
 }
