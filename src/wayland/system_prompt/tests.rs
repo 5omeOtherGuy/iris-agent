@@ -548,6 +548,43 @@ fn load_dir_rejects_a_symlinked_fragment_file() {
 }
 
 #[test]
+fn template_fragment_ships_disabled_and_is_never_rendered() {
+    // The template materializes into ~/.iris/fragments for discoverability but
+    // carries slot 0, so it must stay out of the assembled prompt.
+    assert!(
+        DEFAULTS
+            .iter()
+            .any(|d| d.name == "template" && d.slot == Some(0))
+    );
+    let prompt = build_prompt(
+        default_fragments(),
+        &built_in_tools(),
+        Path::new("/tmp/iris"),
+        &[],
+        "2026-06-18",
+    );
+    assert!(!prompt.contains("<template>"));
+    assert!(!prompt.contains("This file is a copy-ready template"));
+}
+
+#[test]
+fn template_is_materialized_to_disk_with_slot_zero() {
+    let dir = temp_dir();
+    let frag_dir = dir.path.join("fragments");
+    materialize_defaults(&frag_dir).unwrap();
+    let contents = fs::read_to_string(frag_dir.join("template.md")).unwrap();
+    assert!(contents.contains("name: template"));
+    assert!(contents.contains("slot: 0"));
+    // Re-parsing it yields a disabled fragment (Some(0)).
+    let loaded = load_dir(&frag_dir, Source::Global);
+    assert!(
+        loaded
+            .iter()
+            .any(|f| f.name == "template" && f.slot == Some(0))
+    );
+}
+
+#[test]
 fn every_shipped_default_has_a_description() {
     assert!(
         DEFAULTS.iter().all(|d| !d.description.trim().is_empty()),
