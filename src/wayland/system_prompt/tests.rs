@@ -181,6 +181,42 @@ fn slot_is_a_sort_key_not_a_uniqueness_constraint() {
     assert_eq!(order_middles(frags).len(), 2);
 }
 
+#[test]
+fn repo_fragment_overrides_same_name_global() {
+    // A repo .iris/fragments/pragmatism_and_scope.md overrides the materialized
+    // global default of the same name: one block, repo body wins.
+    let frags = vec![
+        frag(
+            "pragmatism_and_scope",
+            Some(2),
+            Source::Global,
+            "global body",
+        ),
+        frag("pragmatism_and_scope", Some(2), Source::Repo, "repo body"),
+    ];
+    let kept = order_middles(frags);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].body, "repo body");
+
+    // End to end: exactly one rendered block carries the tag, with the repo body.
+    let prompt = build_with(
+        vec![
+            frag("identity", None, Source::Global, "I am iris."),
+            frag(
+                "pragmatism_and_scope",
+                Some(2),
+                Source::Global,
+                "global body",
+            ),
+            frag("pragmatism_and_scope", Some(2), Source::Repo, "repo body"),
+        ],
+        &[],
+    );
+    assert_eq!(prompt.matches("<pragmatism_and_scope>").count(), 1);
+    assert!(prompt.contains("repo body"));
+    assert!(!prompt.contains("global body"));
+}
+
 // ---- Unit 4 + 5: anchoring and empty-body skip ----------------------------
 
 fn build_with(frags: Vec<Fragment>, docs: &[(String, String)]) -> String {
