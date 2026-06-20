@@ -24,10 +24,9 @@ use super::transport::{
     spawn_stream,
 };
 use crate::mimir::auth::antigravity::AntigravityTokenStore;
+use crate::mimir::selection::ReasoningEffort;
 use crate::nexus::{AssistantTurn, ChatProvider, Message, ProviderStream, Role, ToolCall, Tools};
 
-const DEFAULT_MODEL: &str = "gemini-3.5-flash";
-const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const USER_AGENT_VALUE: &str = "antigravity/1.0.2 linux/amd64";
 
 #[derive(Debug, Clone)]
@@ -35,32 +34,29 @@ pub(crate) struct AntigravityProvider {
     client: Client,
     model: String,
     base_url: String,
+    reasoning: Option<ReasoningEffort>,
     system_prompt: String,
     tokens: AntigravityTokenStore,
 }
 
 impl AntigravityProvider {
-    /// `system_prompt` is the harness-assembled instruction string; the provider
-    /// forwards it as the request's `systemInstruction`.
+    /// Build from the resolved model/base-url/reasoning selection (precedence is
+    /// owned by `mimir::selection`). `system_prompt` is the harness-assembled
+    /// instruction string; the provider forwards it as the request's
+    /// `systemInstruction`.
     pub(crate) fn new(
-        model: Option<&str>,
-        base_url: Option<&str>,
+        model: &str,
+        base_url: &str,
+        reasoning: Option<ReasoningEffort>,
         system_prompt: &str,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
-            model: model
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .unwrap_or(DEFAULT_MODEL)
-                .to_string(),
-            base_url: base_url
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .unwrap_or(DEFAULT_BASE_URL)
-                .to_string(),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            reasoning,
             system_prompt: system_prompt.to_string(),
             tokens: AntigravityTokenStore::from_env()?,
         })
@@ -78,7 +74,7 @@ impl ChatProvider for AntigravityProvider {
         // only an owned `Value` and a cloned provider, never a borrow of
         // `self`/`messages`/`tools`. The envelope (which needs project id) is
         // assembled per-attempt from this inner request.
-        let inner = build_inner_request(&self.system_prompt, messages, tools);
+        let inner = build_inner_request(&self.system_prompt, messages, tools, self.reasoning);
         let wire_slot = wire_model_slot(&self.model).to_string();
         let provider = self.clone();
         let cancel = cancel.clone();
@@ -192,7 +188,12 @@ fn wrap_request(project_id: &str, wire_slot: &str, inner: Value) -> Value {
     })
 }
 
-fn build_inner_request(system_prompt: &str, messages: &[Message], tools: &Tools) -> Value {
+fn build_inner_request(
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &Tools,
+    reasoning: Option<ReasoningEffort>,
+) -> Value {
     let mut request = json!({
         "contents": build_contents(messages),
         "sessionId": format!("pi-{}", unique_id()),
@@ -208,7 +209,30 @@ fn build_inner_request(system_prompt: &str, messages: &[Message], tools: &Tools)
         request["tools"] = json!([{ "functionDeclarations": declarations }]);
         request["toolConfig"] = json!({ "functionCallingConfig": { "mode": "AUTO" } });
     }
+    // generationConfig.thinkingConfig is added only when a preference is set, so
+    // the default (None) request is byte-identical to today's (no
+    // generationConfig at all).
+    if let Some(thinking) = antigravity_thinking(reasoning) {
+        request["generationConfig"] = json!({ "thinkingConfig": thinking });
+    }
     request
+}
+
+/// Map a normalized reasoning level to the Gemini `thinkingConfig`, or `None` to
+/// omit it. Verified shape: `generationConfig.thinkingConfig = { includeThoughts:
+/// true, thinkingLevel: <minimal|low|medium|high> }` (gemini-pi
+/// `antigravity-format.ts`; pi-mono google-vertex `thinkingConfig`). The Flash
+/// tier accepts `minimal..high`; `xhigh` clamps to `high`; `Off` omits thinking.
+fn antigravity_thinking(reasoning: Option<ReasoningEffort>) -> Option<Value> {
+    let level = match reasoning? {
+        ReasoningEffort::Off => return None,
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        // Flash tier rejects xhigh; clamp to high (gemini-pi FLASH_THINKING).
+        ReasoningEffort::High | ReasoningEffort::XHigh => "high",
+    };
+    Some(json!({ "includeThoughts": true, "thinkingLevel": level }))
 }
 
 fn tool_declarations(tools: &Tools) -> Vec<Value> {
@@ -519,7 +543,7 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
                 tool_name: Some("read".to_string()),
             },
         ];
-        let inner = build_inner_request("IRIS PROMPT", &messages, &Tools::new(Vec::new()));
+        let inner = build_inner_request("IRIS PROMPT", &messages, &Tools::new(Vec::new()), None);
         let envelope = wrap_request("proj-1", wire_model_slot("gemini-3.5-flash"), inner);
 
         assert_eq!(envelope["requestType"], json!("agent"));
@@ -553,6 +577,40 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
         assert_eq!(fr["name"], json!("read"));
         assert_eq!(fr["id"], json!("fc_1"));
         assert_eq!(fr["response"]["output"], json!("result body"));
+    }
+
+    #[test]
+    fn reasoning_none_omits_generation_config_some_adds_thinking() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+
+        // None: no generationConfig at all (byte-identical to today's wire).
+        let none = build_inner_request("P", &messages, &tools, None);
+        assert!(
+            none.get("generationConfig").is_none(),
+            "None omits generationConfig"
+        );
+
+        // Medium: thinkingConfig with includeThoughts + thinkingLevel.
+        let medium = build_inner_request("P", &messages, &tools, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            medium["generationConfig"]["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "medium" })
+        );
+
+        // xhigh clamps to high on the Flash tier.
+        let xhigh = build_inner_request("P", &messages, &tools, Some(ReasoningEffort::XHigh));
+        assert_eq!(
+            xhigh["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            json!("high")
+        );
+
+        // Off omits generationConfig entirely.
+        let off = build_inner_request("P", &messages, &tools, Some(ReasoningEffort::Off));
+        assert!(
+            off.get("generationConfig").is_none(),
+            "Off omits generationConfig"
+        );
     }
 
     #[test]
@@ -618,7 +676,7 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
             }
         }
         let tools = Tools::new(vec![Box::new(FakeTool)]);
-        let inner = build_inner_request("", &[Message::user("hi")], &tools);
+        let inner = build_inner_request("", &[Message::user("hi")], &tools, None);
         let decl = &inner["tools"][0]["functionDeclarations"][0];
         assert_eq!(decl["name"], json!("read"));
         let params = &decl["parameters"];

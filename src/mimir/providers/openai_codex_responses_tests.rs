@@ -273,6 +273,7 @@ fn builds_codex_request_from_conversation() {
         &instructions,
         &[Message::user("hello"), Message::assistant("hi")],
         &crate::tools::built_in_tools(),
+        None,
     );
     assert_eq!(request["model"], "gpt-test");
     assert_eq!(request["stream"], true);
@@ -312,6 +313,7 @@ fn builds_codex_request_from_tool_messages() {
             },
         ],
         &crate::tools::built_in_tools(),
+        None,
     );
 
     assert_eq!(request["input"][0]["type"], "function_call");
@@ -506,17 +508,59 @@ fn rejects_response_without_text() {
 }
 
 #[test]
-fn resolve_setting_precedence_env_then_setting_then_default() {
-    // env wins over everything
-    assert_eq!(
-        resolve_setting(Some("env".into()), Some("setting"), "default"),
-        "env"
+fn reasoning_none_produces_todays_exact_body() {
+    // The default (no preference) request must be byte-identical to today's: no
+    // `reasoning` key at all, `text.verbosity` still "low".
+    let instructions = test_system_prompt();
+    let tools = crate::tools::built_in_tools();
+    let messages = [Message::user("hello")];
+    let none = build_codex_request("gpt-test", &instructions, &messages, &tools, None);
+    let expected = json!({
+        "model": "gpt-test",
+        "store": false,
+        "stream": true,
+        "instructions": instructions,
+        "input": none["input"].clone(),
+        "tools": none["tools"].clone(),
+        "text": { "verbosity": "low" },
+    });
+    assert_eq!(none, expected);
+    assert!(none.get("reasoning").is_none(), "None must omit reasoning");
+}
+
+#[test]
+fn reasoning_level_adds_effort_and_off_omits() {
+    let instructions = test_system_prompt();
+    let tools = crate::tools::built_in_tools();
+    let messages = [Message::user("hello")];
+
+    let high = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        Some(ReasoningEffort::High),
     );
-    // settings file used when env is absent
-    assert_eq!(resolve_setting(None, Some("setting"), "default"), "setting");
-    // built-in default when neither is set
-    assert_eq!(resolve_setting(None, None, "default"), "default");
-    // blank/whitespace-only settings value is ignored, not used to override
-    assert_eq!(resolve_setting(None, Some(""), "default"), "default");
-    assert_eq!(resolve_setting(None, Some("   "), "default"), "default");
+    assert_eq!(high["reasoning"], json!({ "effort": "high" }));
+    // The rest of the body is unchanged from the None case.
+    assert_eq!(high["text"], json!({ "verbosity": "low" }));
+
+    let xhigh = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        Some(ReasoningEffort::XHigh),
+    );
+    assert_eq!(xhigh["reasoning"], json!({ "effort": "xhigh" }));
+
+    // Off has no disable field on gpt-5.5, so it omits reasoning entirely.
+    let off = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        Some(ReasoningEffort::Off),
+    );
+    assert!(off.get("reasoning").is_none(), "Off omits reasoning");
 }

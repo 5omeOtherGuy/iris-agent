@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{BufRead, BufReader};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -14,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::errors::AuthError;
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
+use crate::mimir::selection::ReasoningEffort;
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ProviderEvent, ProviderStream, Role, ToolCall, Tools,
 };
@@ -51,9 +51,6 @@ impl TurnSink for ChannelSink {
     }
 }
 
-const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const DEFAULT_MODEL: &str = "gpt-5.5";
-
 // Transport resilience for Codex requests. Transient failures (network, 429,
 // 5xx) are retried with exponential backoff plus jitter; a single auth
 // rejection (401/403) triggers one forced token refresh before retrying.
@@ -64,27 +61,33 @@ const MAX_BACKOFF: Duration = Duration::from_secs(8);
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCodexResponsesProvider {
     client: Client,
-    config: OpenAiCodexResponsesConfig,
+    model: String,
+    base_url: String,
+    reasoning: Option<ReasoningEffort>,
     system_prompt: String,
     tokens: OpenAiCodexTokenStore,
 }
 
 impl OpenAiCodexResponsesProvider {
-    /// Build the provider, resolving model and base URL from the optional
-    /// settings values. The provider stays decoupled from the app-level config
-    /// type by taking only the strings it needs. `system_prompt` is the
-    /// harness-assembled instruction string (base + runtime context + project
-    /// instructions); the provider only forwards it into the request envelope.
+    /// Build the provider from the resolved model/base-url/reasoning selection.
+    /// Selection precedence (`IRIS_MODEL`/`IRIS_CODEX_BASE_URL` -> settings ->
+    /// default) now lives in `mimir::selection`, so the adapter just receives the
+    /// resolved strings plus the optional reasoning level. `system_prompt` is the
+    /// harness-assembled instruction string; the provider only forwards it into
+    /// the request envelope.
     pub(crate) fn new(
-        model: Option<&str>,
-        base_url: Option<&str>,
+        model: &str,
+        base_url: &str,
+        reasoning: Option<ReasoningEffort>,
         system_prompt: &str,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
-            config: OpenAiCodexResponsesConfig::resolve(model, base_url),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            reasoning,
             system_prompt: system_prompt.to_string(),
             tokens: OpenAiCodexTokenStore::from_env()?,
         })
@@ -101,8 +104,14 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
         // Build the request eagerly so setup errors (e.g. a bad base URL) surface
         // synchronously and nothing borrowed from `self`/`messages`/`tools` is
         // captured by the blocking task.
-        let request = build_codex_request(&self.config.model, &self.system_prompt, messages, tools);
-        let url = resolve_codex_url(&self.config.base_url)?;
+        let request = build_codex_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            tools,
+            self.reasoning,
+        );
+        let url = resolve_codex_url(&self.base_url)?;
         let provider = self.clone();
         let cancel = cancel.clone();
         let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
@@ -136,7 +145,7 @@ impl OpenAiCodexResponsesProvider {
         sink: &mut dyn TurnSink,
         cancel: &CancellationToken,
     ) -> Result<AssistantTurn> {
-        let span = tracing::info_span!("codex_roundtrip", model = %self.config.model);
+        let span = tracing::info_span!("codex_roundtrip", model = %self.model);
         let _guard = span.enter();
 
         run_retry_loop(
@@ -341,52 +350,17 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-#[derive(Debug, Clone)]
-struct OpenAiCodexResponsesConfig {
-    model: String,
-    base_url: String,
-}
-
-impl OpenAiCodexResponsesConfig {
-    /// Resolve each value with precedence `env > settings file > built-in
-    /// default`, so explicit runtime input always wins over persisted config.
-    fn resolve(model: Option<&str>, base_url: Option<&str>) -> Self {
-        Self {
-            model: resolve_setting(non_empty_env("IRIS_MODEL"), model, DEFAULT_MODEL),
-            base_url: resolve_setting(
-                non_empty_env("IRIS_CODEX_BASE_URL"),
-                base_url,
-                DEFAULT_BASE_URL,
-            ),
-        }
-    }
-}
-
-/// Three-layer precedence helper: env override, then settings value, then the
-/// built-in default. Blank/whitespace-only settings values are ignored so an
-/// empty `"defaultModel": ""` falls back to the default instead of sending an
-/// invalid request. Pure so the precedence is unit-tested without env state.
-fn resolve_setting(env_value: Option<String>, setting: Option<&str>, default: &str) -> String {
-    env_value
-        .or_else(|| {
-            setting
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| default.to_string())
-}
-
 fn build_codex_request(
     model: &str,
     instructions: &str,
     messages: &[Message],
     tools: &Tools,
+    reasoning: Option<ReasoningEffort>,
 ) -> Value {
     // The Codex adapter owns conversion between Nexus messages and Responses wire JSON.
     let input: Vec<Value> = messages.iter().map(codex_input_item).collect();
 
-    json!({
+    let mut body = json!({
         "model": model,
         "store": false,
         "stream": true,
@@ -394,7 +368,31 @@ fn build_codex_request(
         "input": input,
         "tools": tool_declarations(tools),
         "text": { "verbosity": "low" },
-    })
+    });
+    // Reasoning is inserted only when a preference is set, so the default (None)
+    // body is byte-identical to today's request.
+    if let Some(reasoning) = codex_reasoning(reasoning) {
+        body["reasoning"] = reasoning;
+    }
+    body
+}
+
+/// Map a normalized reasoning level to the Codex Responses `reasoning` object,
+/// or `None` to omit it. Verified shape: `reasoning.effort` accepts
+/// `minimal..xhigh` (pi-mono `openai-codex-responses.ts`,
+/// `openai-responses.ts`). `Off` maps to omitted because gpt-5.5 cannot disable
+/// reasoning (`thinkingLevelMap.off == null`), so there is no disable field to
+/// send.
+fn codex_reasoning(reasoning: Option<ReasoningEffort>) -> Option<Value> {
+    let effort = match reasoning? {
+        ReasoningEffort::Off => return None,
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
+    };
+    Some(json!({ "effort": effort }))
 }
 
 /// Build the Codex `tools` declaration array from the injected tool set: one
@@ -462,13 +460,6 @@ fn codex_headers(token: &AccessToken) -> Result<HeaderMap> {
     );
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(headers)
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name).ok().and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
 }
 
 fn resolve_codex_url(base_url: &str) -> Result<Url> {

@@ -173,6 +173,39 @@ impl SessionLog {
         Ok(id)
     }
 
+    /// Append a `modelSelection` entry recording a runtime provider/model/
+    /// reasoning switch, chained onto the leaf like any other entry. This is a
+    /// first-class audit record of mode switches; `read_messages` skips it (it is
+    /// not a `message`/`compaction`), so it never enters the provider-visible
+    /// context. `base_url` is intentionally not recorded (it is not part of the
+    /// reproducible selection and may carry an override the audit log should not
+    /// persist). `reasoning` is `None` when no preference is set.
+    pub(crate) fn append_selection(
+        &mut self,
+        provider: &str,
+        model: &str,
+        reasoning: Option<&str>,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "modelSelection",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "provider": provider,
+            "model": model,
+            "reasoning": reasoning,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append model selection to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
     /// Reopen an existing transcript file for append, so a resumed session
     /// continues the same log instead of starting a new one. Reads the header
     /// id and the existing entries to restore the leaf link (`parentId` of the
@@ -425,11 +458,13 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        // Both `message` and `compaction` entries occupy the leaf chain and an
-        // entry-id slot, so a resumed append must link its `parentId` past, and
-        // count its `next_seq` beyond, whichever kind is the current leaf.
+        // `message`, `compaction`, and `modelSelection` entries all occupy the
+        // leaf chain and an entry-id slot, so a resumed append must link its
+        // `parentId` past, and count its `next_seq` beyond, whichever kind is the
+        // current leaf. (`modelSelection` is an audit record; the read/rebuild
+        // path skips it, but the chain must still flow through it.)
         match value.get("type").and_then(Value::as_str) {
-            Some("message") | Some("compaction") => {}
+            Some("message") | Some("compaction") | Some("modelSelection") => {}
             _ => continue,
         }
         count += 1;
@@ -1145,6 +1180,45 @@ mod tests {
     /// ([`estimate_tokens`]). The live-side comparison for resume stability.
     fn total(messages: &[Message]) -> u64 {
         messages.iter().map(|m| estimate_tokens(&m.content)).sum()
+    }
+
+    #[test]
+    fn model_selection_entry_is_written_chained_and_skipped_by_read() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let user_id = log.append(&Message::user("hello")).unwrap();
+        let sel_id = log
+            .append_selection("anthropic", "claude-sonnet-4-6", Some("high"))
+            .unwrap();
+        log.append(&Message::assistant("hi")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // The raw line is a first-class audit entry chained onto the leaf, and
+        // base_url is intentionally absent.
+        let entries = lines(&path);
+        let sel = entries
+            .iter()
+            .find(|e| e["type"] == "modelSelection")
+            .expect("modelSelection entry present");
+        assert_eq!(sel["id"], sel_id);
+        assert_eq!(sel["parentId"], user_id);
+        assert_eq!(sel["provider"], "anthropic");
+        assert_eq!(sel["model"], "claude-sonnet-4-6");
+        assert_eq!(sel["reasoning"], "high");
+        assert!(
+            sel.get("baseUrl").is_none(),
+            "base_url must not be recorded"
+        );
+        // The assistant entry chained through the selection entry.
+        let assistant = entries.last().unwrap();
+        assert_eq!(assistant["parentId"], sel_id);
+
+        // read_messages ignores the modelSelection line: only the two real
+        // messages are reconstructed, in order.
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(contents(&session), ["hello", "hi"]);
     }
 
     #[test]

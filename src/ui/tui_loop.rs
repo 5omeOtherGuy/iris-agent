@@ -31,11 +31,12 @@ use tokio::sync::oneshot;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 
+use crate::cli::ModelSwitch;
 use crate::nexus::{
     AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ToolCall,
 };
 use crate::ui::UiEvent;
-use crate::ui::slash::{self, SlashAction};
+use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::tui::{Screen, TuiUi};
 use crate::wayland::Harness;
 
@@ -54,8 +55,9 @@ pub(crate) fn run<P: ChatProvider>(
     harness: &mut Harness<P>,
     runtime: &Runtime,
     mut tui: TuiUi,
+    switch: &mut Option<ModelSwitch<'_, P>>,
 ) -> Result<()> {
-    let result = runtime.block_on(session_loop(harness, &mut tui));
+    let result = runtime.block_on(session_loop(harness, &mut tui, switch));
     tui.shutdown();
     result
 }
@@ -91,7 +93,11 @@ struct ApprovalRequest {
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
-async fn session_loop<P: ChatProvider>(harness: &mut Harness<P>, tui: &mut TuiUi) -> Result<()> {
+async fn session_loop<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+) -> Result<()> {
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
     spawn_input_thread(input_tx, current_turn.clone());
@@ -114,6 +120,17 @@ async fn session_loop<P: ChatProvider>(harness: &mut Harness<P>, tui: &mut TuiUi
                 // exits via the registry, never reaching the model.
                 if slash::is_exit(&prompt) {
                     break;
+                }
+                // Mode switches are handled at this safe inter-turn boundary and
+                // never start a turn: the shared handler does the switch and
+                // returns the lines to show.
+                if let Some(lines) = crate::cli::handle_model_command(&prompt, harness, switch) {
+                    tui.screen.commit_user(&prompt);
+                    for line in lines {
+                        tui.screen.apply_event(UiEvent::Notice(line));
+                    }
+                    tui.draw()?;
+                    continue;
                 }
                 tui.screen.commit_user(&prompt);
                 tui.screen.start_turn();
@@ -346,7 +363,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             }
             KeyCode::Enter if !alt => {
                 if let Some(cmd) = screen.palette.accept(&input) {
-                    return dispatch_action(cmd.action);
+                    return dispatch_command(cmd);
                 }
                 return IdleKey::Continue;
             }
@@ -442,9 +459,14 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     IdleKey::Continue
 }
 
-fn dispatch_action(action: SlashAction) -> IdleKey {
-    match action {
+/// Map a palette-accepted command to its idle outcome. `Exit` ends the session;
+/// `Submit` submits the command name as a line so the shared model-switch
+/// handler routes it (the user may then add args; a bare submit is the
+/// read-only / usage view).
+fn dispatch_command(cmd: &SlashCommand) -> IdleKey {
+    match cmd.action {
         SlashAction::Exit => IdleKey::Exit,
+        SlashAction::Submit => IdleKey::Submit(cmd.name.to_string()),
     }
 }
 
@@ -631,6 +653,21 @@ mod tests {
             handle_idle_event(&mut screen, key(KeyCode::Enter)),
             IdleKey::Exit
         ));
+    }
+
+    #[test]
+    fn slash_enter_submits_model_command_for_the_shared_handler() {
+        let mut screen = Screen::new();
+        // Type `/model`, then Enter accepts the highlighted command and submits
+        // its name as a line for the shared handler to route (not Exit).
+        for c in "/model".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        assert!(screen.palette.is_active(&screen.editor_text()));
+        match handle_idle_event(&mut screen, key(KeyCode::Enter)) {
+            IdleKey::Submit(text) => assert_eq!(text, "/model"),
+            _ => panic!("expected submit of /model"),
+        }
     }
 
     #[test]

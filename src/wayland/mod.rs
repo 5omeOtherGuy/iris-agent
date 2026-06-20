@@ -141,6 +141,36 @@ impl<P: ChatProvider> Harness<P> {
         }
     }
 
+    /// Swap the active provider at a safe turn boundary, delegating to the bare
+    /// agent (which re-plans the model-visible tool surface). Tier 3 owns the
+    /// active selection, system prompt, and provider construction; the harness
+    /// only forwards the rebuilt provider so persistence/compaction state is
+    /// untouched.
+    pub(crate) fn replace_provider(&mut self, provider: P) {
+        self.agent.replace_provider(provider);
+    }
+
+    /// Record a runtime mode switch as a first-class `modelSelection` entry in
+    /// the transcript log. Best-effort (no-op without an attached log), mirroring
+    /// message persistence: a switch is still applied even if it cannot be
+    /// audited. `base_url` is deliberately not recorded.
+    pub(crate) fn record_selection_event(
+        &mut self,
+        provider: &str,
+        model: &str,
+        reasoning: Option<&str>,
+    ) -> Result<()> {
+        let Some(log) = self.session.as_mut() else {
+            return Ok(());
+        };
+        // The selection entry chains onto the leaf and advances the log's id
+        // cursor, but it is not a transcript message: `persisted`/`entry_ids`
+        // (aligned to agent messages) are intentionally left untouched, so the
+        // next message append still chains correctly through it.
+        log.append_selection(provider, model, reasoning)?;
+        Ok(())
+    }
+
     /// Run one turn against the owned execution env, then persist any new
     /// transcript messages. The env is injected into the bare loop (mirroring
     /// `AgentHarness` passing `env` into the run); persistence lives here, not

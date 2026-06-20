@@ -469,6 +469,18 @@ impl<P: ChatProvider> Agent<P> {
         self.messages = messages;
     }
 
+    /// Swap the active provider at a safe turn boundary and re-plan the
+    /// model-visible tool surface from the new provider's capabilities. The
+    /// Tier-3 app rebuilds a provider on a `/model` `/reasoning` switch and
+    /// installs it here; the in-memory conversation and approval policy are
+    /// untouched, so the next turn runs against the new provider with the same
+    /// context. Mirrors [`new`](Self::new)/[`resumed`](Self::resumed) planning
+    /// the surface once from the provider's capabilities.
+    pub(crate) fn replace_provider(&mut self, provider: P) {
+        self.provider = provider;
+        self.tools.plan_surface(&self.provider.capabilities());
+    }
+
     pub(crate) async fn submit_turn(
         &mut self,
         prompt: &str,
