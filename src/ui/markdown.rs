@@ -128,9 +128,13 @@ impl Renderer {
             }
             TagEnd::List(_) => {
                 self.lists.pop();
+                self.prefix = INDENT.repeat(self.lists.len());
                 self.blank();
             }
-            TagEnd::Item => self.flush(),
+            TagEnd::Item => {
+                self.flush();
+                self.prefix.clear();
+            }
             _ => {}
         }
     }
@@ -139,13 +143,14 @@ impl Renderer {
         if self.in_code_block {
             // Each source line of a fenced block is its own dim, indented row;
             // no syntax highlighting. `lines()` drops the trailing newline.
+            let prefix = self.code_block_prefix();
             for line in text.split('\n') {
                 // Skip the final empty segment from a trailing newline.
                 if line.is_empty() && text.ends_with('\n') {
                     continue;
                 }
                 self.out
-                    .push(Line::from(Span::styled(format!("    {line}"), dim())));
+                    .push(Line::from(Span::styled(format!("{prefix}{line}"), dim())));
             }
             return;
         }
@@ -174,13 +179,30 @@ impl Renderer {
         self.spans.push(Span::styled(content, style));
     }
 
+    fn code_block_prefix(&self) -> String {
+        let mut prefix = "> ".repeat(self.quote as usize);
+        prefix.push_str(&Self::continuation_prefix(&self.prefix));
+        prefix.push_str("    ");
+        prefix
+    }
+
+    fn continuation_prefix(prefix: &str) -> String {
+        " ".repeat(prefix.chars().count())
+    }
+
     /// Flush the in-progress spans as one line, prepending the indent/quote
     /// marker prefix. A line with only a prefix (e.g. an empty list item) is
     /// still emitted so structure is visible.
     fn flush(&mut self) {
         let quote = "> ".repeat(self.quote as usize);
-        let prefix = format!("{quote}{}", std::mem::take(&mut self.prefix));
-        if self.spans.is_empty() && prefix.is_empty() {
+        let prefix = format!("{quote}{}", self.prefix);
+        if self.spans.is_empty() && self.prefix.is_empty() {
+            return;
+        }
+        if self.spans.is_empty()
+            && !self.prefix.is_empty()
+            && self.prefix.chars().all(|ch| ch == ' ')
+        {
             return;
         }
         let mut line = Vec::with_capacity(self.spans.len() + 1);
@@ -189,6 +211,9 @@ impl Renderer {
         }
         line.append(&mut self.spans);
         self.out.push(Line::from(line));
+        if !self.prefix.is_empty() && !self.prefix.chars().all(|ch| ch == ' ') {
+            self.prefix = Self::continuation_prefix(&self.prefix);
+        }
     }
 
     /// Push a single blank separator line unless one is already trailing.
@@ -309,6 +334,46 @@ mod tests {
     }
 
     #[test]
+    fn fenced_code_block_inside_blockquote_keeps_quote_prefix() {
+        let out = rendered("> ```\n> code\n> ```");
+        assert!(
+            out.iter().any(|l| l == ">     code"),
+            "blockquote code lost prefix: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_inside_list_stays_indented_under_item() {
+        let out = rendered("- item\n\n  ```\n  code\n  ```");
+        assert!(out.iter().any(|l| l == "- item"));
+        assert!(
+            out.iter().any(|l| l == "      code"),
+            "list code lost indent: {out:?}"
+        );
+    }
+
+    #[test]
+    fn list_item_second_paragraph_keeps_continuation_indent() {
+        let out = rendered("- first\n\n  second");
+        assert!(out.iter().any(|l| l == "- first"));
+        assert!(
+            out.iter().any(|l| l == "  second"),
+            "continuation lost indent: {out:?}"
+        );
+    }
+
+    #[test]
+    fn parent_list_item_continuation_after_nested_list_keeps_parent_indent() {
+        let out = rendered("- parent\n\n  - child\n\n  continuation");
+        assert!(out.iter().any(|l| l == "- parent"));
+        assert!(out.iter().any(|l| l == "  - child"));
+        assert!(
+            out.iter().any(|l| l == "  continuation"),
+            "parent continuation lost indent: {out:?}"
+        );
+    }
+
+    #[test]
     fn bullet_list_items_get_dash_markers() {
         let out = rendered("- one\n- two");
         assert!(out.iter().any(|l| l == "- one"));
@@ -343,6 +408,11 @@ mod tests {
             .find(|s| s.content.as_ref().contains("quoted"))
             .expect("quote body");
         assert_eq!(body.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn blockquoted_list_does_not_leave_trailing_prefix_line() {
+        assert_eq!(rendered("> - item"), vec!["> - item".to_string()]);
     }
 
     #[test]
