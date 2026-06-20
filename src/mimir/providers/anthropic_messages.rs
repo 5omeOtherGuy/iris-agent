@@ -23,7 +23,10 @@ use super::transport::{
 };
 use crate::mimir::auth::anthropic::AnthropicTokenStore;
 use crate::mimir::selection::ReasoningEffort;
-use crate::nexus::{AssistantTurn, ChatProvider, Message, ProviderStream, Role, ToolCall, Tools};
+use crate::nexus::{
+    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ReasoningBlock, Role,
+    ToolCall, Tools,
+};
 
 /// Base output-token allowance. When extended thinking is enabled, the thinking
 /// budget is added on top (Anthropic requires `max_tokens > budget_tokens`), so
@@ -31,6 +34,8 @@ use crate::nexus::{AssistantTurn, ChatProvider, Message, ProviderStream, Role, T
 const MAX_TOKENS: u32 = 8192;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
+const PROVIDER_ID: &str = "anthropic";
+const API_ID: &str = "anthropic-messages";
 
 /// First system block required on the OAuth lane: omitting it gets the request
 /// rejected as not coming from the Claude Code client.
@@ -131,7 +136,7 @@ impl AnthropicProvider {
 
         let status = response.status();
         if status.is_success() {
-            let mut parser = AnthropicStreamParser::default();
+            let mut parser = AnthropicStreamParser::new(anthropic_origin(&self.model));
             if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
                 parser.ingest_event(data, sink)
             }) {
@@ -192,7 +197,7 @@ fn build_anthropic_request(
             { "type": "text", "text": CLAUDE_CODE_IDENTITY },
             { "type": "text", "text": system_prompt },
         ],
-        "messages": build_messages(messages),
+        "messages": build_messages(messages, &anthropic_origin(model)),
     });
     // Extended thinking is added only when a preference is set, so the default
     // (None) body is byte-identical to today's request (max_tokens unchanged, no
@@ -311,16 +316,19 @@ fn tool_declarations(tools: &Tools) -> Vec<Value> {
 /// Map Nexus messages onto Anthropic wire messages. The Messages API requires
 /// strict user/assistant alternation, so every Nexus message becomes a content
 /// block appended to the previous wire message when the role matches.
-fn build_messages(messages: &[Message]) -> Vec<Value> {
+fn build_messages(messages: &[Message], current_origin: &ModelOrigin) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for message in messages {
-        let (role, block) = match message.role {
-            Role::User => ("user", json!({ "type": "text", "text": message.content })),
-            Role::Assistant => (
+        let mapped = match message.role {
+            Role::User => Some(("user", json!({ "type": "text", "text": message.content }))),
+            Role::Assistant => Some((
                 "assistant",
                 json!({ "type": "text", "text": message.content }),
-            ),
-            Role::AssistantToolCall => (
+            )),
+            Role::AssistantReasoning => {
+                reasoning_block(message, current_origin).map(|block| ("assistant", block))
+            }
+            Role::AssistantToolCall => Some((
                 "assistant",
                 json!({
                     "type": "tool_use",
@@ -328,8 +336,8 @@ fn build_messages(messages: &[Message]) -> Vec<Value> {
                     "name": message.tool_name.as_deref().unwrap_or_default(),
                     "input": serde_json::from_str::<Value>(&message.content).unwrap_or_else(|_| json!({})),
                 }),
-            ),
-            Role::Tool => (
+            )),
+            Role::Tool => Some((
                 "user",
                 json!({
                     "type": "tool_result",
@@ -337,11 +345,37 @@ fn build_messages(messages: &[Message]) -> Vec<Value> {
                     "content": message.content,
                     "is_error": false,
                 }),
-            ),
+            )),
         };
-        push_block(&mut out, role, block);
+        if let Some((role, block)) = mapped {
+            push_block(&mut out, role, block);
+        }
     }
     out
+}
+
+fn anthropic_origin(model: &str) -> ModelOrigin {
+    ModelOrigin::new(PROVIDER_ID, API_ID, model)
+}
+
+fn reasoning_block(message: &Message, current_origin: &ModelOrigin) -> Option<Value> {
+    let same_origin = message.origin.as_ref() == Some(current_origin);
+    if message.redacted {
+        return same_origin.then(|| {
+            message
+                .continuity
+                .as_ref()
+                .map(|data| json!({ "type": "redacted_thinking", "data": data }))
+        })?;
+    }
+    if same_origin && let Some(signature) = &message.continuity {
+        return Some(json!({
+            "type": "thinking",
+            "thinking": message.content,
+            "signature": signature,
+        }));
+    }
+    (!message.content.is_empty()).then(|| json!({ "type": "text", "text": message.content }))
 }
 
 fn push_block(out: &mut Vec<Value>, role: &str, block: Value) {
@@ -358,11 +392,13 @@ fn push_block(out: &mut Vec<Value>, role: &str, block: Value) {
 /// Incremental SSE assembler. Text deltas accumulate into one buffer; each
 /// `tool_use` content block is tracked by its stream index until its
 /// `content_block_stop` finalizes it into a [`ToolCall`] (encounter order).
-#[derive(Default)]
 struct AnthropicStreamParser {
+    origin: ModelOrigin,
     text: String,
     open_tools: HashMap<u64, ToolBlock>,
     tool_calls: Vec<ToolCall>,
+    open_reasoning: HashMap<u64, ReasoningBlock>,
+    reasoning: Vec<ReasoningBlock>,
     message_stopped: bool,
 }
 
@@ -374,6 +410,18 @@ struct ToolBlock {
 }
 
 impl AnthropicStreamParser {
+    fn new(origin: ModelOrigin) -> Self {
+        Self {
+            origin,
+            text: String::new(),
+            open_tools: HashMap::new(),
+            tool_calls: Vec::new(),
+            open_reasoning: HashMap::new(),
+            reasoning: Vec::new(),
+            message_stopped: false,
+        }
+    }
+
     fn ingest_event(&mut self, data: &str, sink: &mut dyn TurnSink) -> Result<()> {
         if data == "[DONE]" {
             return Ok(());
@@ -383,22 +431,45 @@ impl AnthropicStreamParser {
         match value.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 let index = block_index(&value);
-                if let Some(block) = value.get("content_block")
-                    && block.get("type").and_then(Value::as_str) == Some("tool_use")
-                {
-                    let inline = block
-                        .get("input")
-                        .filter(|input| !matches!(input, Value::Object(map) if map.is_empty()))
-                        .cloned();
-                    self.open_tools.insert(
-                        index,
-                        ToolBlock {
-                            id: str_field(block, "id"),
-                            name: str_field(block, "name"),
-                            partial_json: String::new(),
-                            inline_input: inline,
-                        },
-                    );
+                if let Some(block) = value.get("content_block") {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("thinking") => {
+                            self.open_reasoning.insert(
+                                index,
+                                ReasoningBlock::new(
+                                    &str_field(block, "thinking"),
+                                    None,
+                                    false,
+                                    self.origin.clone(),
+                                ),
+                            );
+                        }
+                        Some("redacted_thinking") => {
+                            let data = str_field(block, "data");
+                            self.open_reasoning.insert(
+                                index,
+                                ReasoningBlock::new("", Some(&data), true, self.origin.clone()),
+                            );
+                        }
+                        Some("tool_use") => {
+                            let inline = block
+                                .get("input")
+                                .filter(
+                                    |input| !matches!(input, Value::Object(map) if map.is_empty()),
+                                )
+                                .cloned();
+                            self.open_tools.insert(
+                                index,
+                                ToolBlock {
+                                    id: str_field(block, "id"),
+                                    name: str_field(block, "name"),
+                                    partial_json: String::new(),
+                                    inline_input: inline,
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             }
             Some("content_block_delta") => {
@@ -419,7 +490,25 @@ impl AnthropicStreamParser {
                                 block.partial_json.push_str(partial);
                             }
                         }
-                        // thinking_delta / signature_delta: ignored on this lane.
+                        Some("thinking_delta") => {
+                            if let (Some(block), Some(thinking)) = (
+                                self.open_reasoning.get_mut(&index),
+                                delta.get("thinking").and_then(Value::as_str),
+                            ) {
+                                block.text.push_str(thinking);
+                            }
+                        }
+                        Some("signature_delta") => {
+                            if let (Some(block), Some(signature)) = (
+                                self.open_reasoning.get_mut(&index),
+                                delta.get("signature").and_then(Value::as_str),
+                            ) {
+                                block
+                                    .continuity
+                                    .get_or_insert_with(String::new)
+                                    .push_str(signature);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -428,6 +517,8 @@ impl AnthropicStreamParser {
                 let index = block_index(&value);
                 if let Some(block) = self.open_tools.remove(&index) {
                     self.tool_calls.push(finalize_tool(block)?);
+                } else if let Some(block) = self.open_reasoning.remove(&index) {
+                    self.reasoning.push(block);
                 }
             }
             Some("message_stop") => {
@@ -452,16 +543,17 @@ impl AnthropicStreamParser {
         if !self.message_stopped {
             return Err(anyhow!("Anthropic stream ended before message_stop"));
         }
-        if !self.open_tools.is_empty() {
+        if !self.open_tools.is_empty() || !self.open_reasoning.is_empty() {
             return Err(anyhow!("Anthropic stream ended before content_block_stop"));
         }
-        if self.text.is_empty() && self.tool_calls.is_empty() {
+        if self.text.is_empty() && self.tool_calls.is_empty() && self.reasoning.is_empty() {
             return Err(anyhow!(
-                "Anthropic response did not include assistant text or tool calls"
+                "Anthropic response did not include assistant text, reasoning, or tool calls"
             ));
         }
         Ok(AssistantTurn {
             text: (!self.text.is_empty()).then_some(self.text),
+            reasoning: self.reasoning,
             tool_calls: self.tool_calls,
         })
     }
@@ -498,13 +590,18 @@ fn str_field(value: &Value, field: &str) -> String {
 
 #[cfg(test)]
 fn parse_anthropic_sse(body: &str) -> Result<AssistantTurn> {
+    parse_anthropic_sse_for_model(body, "m")
+}
+
+#[cfg(test)]
+fn parse_anthropic_sse_for_model(body: &str, model: &str) -> Result<AssistantTurn> {
     struct NoopSink;
     impl TurnSink for NoopSink {
         fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
             Ok(())
         }
     }
-    let mut parser = AnthropicStreamParser::default();
+    let mut parser = AnthropicStreamParser::new(anthropic_origin(model));
     let mut sink = NoopSink;
     for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
         parser.ingest_event(data, &mut sink)
@@ -515,7 +612,7 @@ fn parse_anthropic_sse(body: &str) -> Result<AssistantTurn> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nexus::{Message, Tools};
+    use crate::nexus::{Message, ModelOrigin, Tools};
 
     #[test]
     fn text_deltas_assemble_into_turn() {
@@ -607,6 +704,9 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                 content: "result body".to_string(),
                 tool_call_id: Some("toolu_1".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
         ];
         let request =
@@ -751,17 +851,108 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                 content: "result body".to_string(),
                 tool_call_id: Some("toolu_1".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
             Message::user("next prompt"),
         ];
 
-        let msgs = build_messages(&messages);
+        let msgs = build_messages(&messages, &anthropic_origin("m"));
 
         assert_eq!(msgs.len(), 1, "same-role user blocks coalesce");
         assert_eq!(msgs[0]["role"], json!("user"));
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], json!("tool_result"));
         assert_eq!(content[1], json!({ "type": "text", "text": "next prompt" }));
+    }
+
+    #[test]
+    fn thinking_and_redacted_sse_blocks_capture_reasoning() {
+        let body = "\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\"}}
+
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"raw \"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" bytes\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-a\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-b\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":1}
+
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":2}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let turn =
+            parse_anthropic_sse_for_model(body, "claude-sonnet-4-6").expect("stream should parse");
+
+        assert_eq!(turn.reasoning.len(), 2);
+        assert_eq!(turn.reasoning[0].text, "raw  bytes");
+        assert_eq!(turn.reasoning[0].continuity.as_deref(), Some("sig-asig-b"));
+        assert!(!turn.reasoning[0].redacted);
+        assert_eq!(turn.reasoning[0].origin.model, "claude-sonnet-4-6");
+        assert_eq!(turn.reasoning[1].text, "");
+        assert_eq!(
+            turn.reasoning[1].continuity.as_deref(),
+            Some("opaque-redacted")
+        );
+        assert!(turn.reasoning[1].redacted);
+        assert_eq!(turn.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn reasoning_replay_is_same_origin_gated_and_byte_exact() {
+        let same = ModelOrigin::new("anthropic", "anthropic-messages", "claude-sonnet-4-6");
+        let other = ModelOrigin::new("anthropic", "anthropic-messages", "claude-opus-4-6");
+        let messages = vec![
+            Message::user("go"),
+            // Empty visible thinking must still replay when signed.
+            Message::assistant_reasoning("", "sig-empty", false, same.clone()),
+            Message::assistant_reasoning(
+                " foreign  thinking ",
+                "sig-foreign",
+                false,
+                other.clone(),
+            ),
+            Message::assistant_reasoning("", "opaque-same", true, same),
+            Message::assistant_reasoning("", "opaque-foreign", true, other),
+            Message::assistant("answer"),
+        ];
+
+        let request = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+        );
+        let assistant = &request["messages"].as_array().unwrap()[1];
+        let blocks = assistant["content"].as_array().unwrap();
+
+        assert_eq!(
+            blocks[0],
+            json!({ "type": "thinking", "thinking": "", "signature": "sig-empty" })
+        );
+        assert_eq!(
+            blocks[1],
+            json!({ "type": "text", "text": " foreign  thinking " })
+        );
+        assert_eq!(
+            blocks[2],
+            json!({ "type": "redacted_thinking", "data": "opaque-same" })
+        );
+        assert_eq!(blocks[3], json!({ "type": "text", "text": "answer" }));
+        assert_eq!(blocks.len(), 4, "foreign redacted thinking is dropped");
     }
 
     #[test]
@@ -777,27 +968,39 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                 content: "{\"path\":\"a\"}".to_string(),
                 tool_call_id: Some("toolu_1".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
             Message {
                 role: Role::AssistantToolCall,
                 content: "{\"path\":\"b\"}".to_string(),
                 tool_call_id: Some("toolu_2".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
             Message {
                 role: Role::Tool,
                 content: "A".to_string(),
                 tool_call_id: Some("toolu_1".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
             Message {
                 role: Role::Tool,
                 content: "B".to_string(),
                 tool_call_id: Some("toolu_2".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
         ];
-        let msgs = build_messages(&messages);
+        let msgs = build_messages(&messages, &anthropic_origin("m"));
         let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(
             roles,

@@ -358,7 +358,11 @@ fn build_codex_request(
     reasoning: Option<ReasoningEffort>,
 ) -> Value {
     // The Codex adapter owns conversion between Nexus messages and Responses wire JSON.
-    let input: Vec<Value> = messages.iter().map(codex_input_item).collect();
+    let input: Vec<Value> = messages
+        .iter()
+        .filter(|message| message.role != Role::AssistantReasoning)
+        .map(codex_input_item)
+        .collect();
 
     let mut body = json!({
         "model": model,
@@ -431,6 +435,7 @@ fn codex_input_item(message: &Message) -> Value {
             "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
             "output": message.content,
         }),
+        Role::AssistantReasoning => unreachable!("reasoning rows are filtered out"),
     }
 }
 
@@ -438,7 +443,9 @@ fn message_content_type(role: Role) -> &'static str {
     match role {
         Role::User => "input_text",
         Role::Assistant => "output_text",
-        Role::AssistantToolCall | Role::Tool => unreachable!("tool messages are not text messages"),
+        Role::AssistantReasoning | Role::AssistantToolCall | Role::Tool => {
+            unreachable!("non-text messages are not text messages")
+        }
     }
 }
 
@@ -609,6 +616,7 @@ impl ResponseStreamParser {
         }
         Ok(AssistantTurn {
             text: (!self.text.is_empty()).then_some(self.text),
+            reasoning: Vec::new(),
             tool_calls: self.tool_calls,
         })
     }
@@ -658,6 +666,7 @@ fn extract_assistant_turn(value: &Value) -> AssistantTurn {
     let tool_calls = extract_tool_calls(value);
     AssistantTurn {
         text: (!text.is_empty()).then_some(text),
+        reasoning: Vec::new(),
         tool_calls,
     }
 }

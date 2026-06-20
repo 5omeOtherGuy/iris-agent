@@ -274,6 +274,9 @@ fn sanitize_schema(value: Value) -> Value {
 fn build_contents(messages: &[Message]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for message in messages {
+        if message.role == Role::AssistantReasoning {
+            continue;
+        }
         let (role, part) = match message.role {
             Role::User => ("user", json!({ "text": message.content })),
             Role::Assistant => ("model", json!({ "text": message.content })),
@@ -294,6 +297,7 @@ fn build_contents(messages: &[Message]) -> Vec<Value> {
                 insert_optional_id(&mut function_response, message.tool_call_id.as_deref());
                 ("user", json!({ "functionResponse": function_response }))
             }
+            Role::AssistantReasoning => unreachable!("reasoning rows are skipped above"),
         };
         push_part(&mut out, role, part);
     }
@@ -425,6 +429,7 @@ impl GeminiStreamParser {
         }
         Ok(AssistantTurn {
             text: (!self.text.is_empty()).then_some(self.text),
+            reasoning: Vec::new(),
             tool_calls: self.tool_calls,
         })
     }
@@ -541,6 +546,9 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
                 content: "result body".to_string(),
                 tool_call_id: Some("fc_1".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
         ];
         let inner = build_inner_request("IRIS PROMPT", &messages, &Tools::new(Vec::new()), None);
@@ -624,6 +632,9 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
                 content: "{\"path\":\"x\"}".to_string(),
                 tool_call_id: Some("fc_1".to_string()),
                 tool_name: Some("read".to_string()),
+                continuity: None,
+                redacted: false,
+                origin: None,
             },
         ];
         let contents = build_contents(&messages);

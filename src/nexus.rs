@@ -574,7 +574,16 @@ impl<P: ChatProvider> Agent<P> {
                     return Ok(());
                 }
                 StreamResult::Completed { turn, saw_delta } => {
-                    if let Some(text) = turn.text.as_deref().filter(|text| !text.is_empty()) {
+                    let AssistantTurn {
+                        text,
+                        reasoning,
+                        tool_calls,
+                    } = turn;
+                    for block in reasoning {
+                        self.messages
+                            .push(Message::assistant_reasoning_block(block));
+                    }
+                    if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
                         if saw_delta {
                             obs.on_event(AgentEvent::AssistantTextEnd(text.to_string()))?;
                         } else {
@@ -585,16 +594,16 @@ impl<P: ChatProvider> Agent<P> {
                         obs.on_event(AgentEvent::AssistantTextEnd(String::new()))?;
                     }
 
-                    if turn.tool_calls.is_empty() {
+                    if tool_calls.is_empty() {
                         tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
                         obs.on_event(AgentEvent::TurnComplete)?;
                         return Ok(());
                     }
+                    for call in &tool_calls {
+                        self.messages.push(Message::assistant_tool_call(call));
+                    }
 
-                    match self
-                        .run_tools(turn.tool_calls, obs, gate, env, token)
-                        .await?
-                    {
+                    match self.run_tools(tool_calls, obs, gate, env, token).await? {
                         ToolsPhase::Ended => return Ok(()),
                         ToolsPhase::Continue => {}
                     }
@@ -914,12 +923,9 @@ fn record_call(
     call: &ToolCall,
     outcome: ToolOutcome,
 ) -> Result<()> {
-    // Append the assistant tool call and its paired result together, BEFORE
-    // emitting the observer event. An observer error must not early-return
-    // between the two pushes: Wayland persists the transcript even on a turn
-    // error, so a dangling assistant-tool-call with no matching tool-result
-    // would be flushed to disk and rejected by the next provider request.
-    messages.push(Message::assistant_tool_call(call));
+    // Append the tool result BEFORE emitting the observer event. An observer
+    // error must not skip the provider-visible result for a call that already
+    // ran; Wayland persists the transcript even on a turn error.
     let event = match outcome {
         ToolOutcome::Ok(mut output) => {
             tracing::info!(tool = %call.name, ok = true, "tool executed");
@@ -994,6 +1000,7 @@ fn record_call(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AssistantTurn {
     pub(crate) text: Option<String>,
+    pub(crate) reasoning: Vec<ReasoningBlock>,
     pub(crate) tool_calls: Vec<ToolCall>,
 }
 
@@ -1002,7 +1009,49 @@ impl AssistantTurn {
     pub(crate) fn text(text: &str) -> Self {
         Self {
             text: Some(text.to_string()),
+            reasoning: Vec::new(),
             tool_calls: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelOrigin {
+    pub(crate) provider: String,
+    pub(crate) api: String,
+    pub(crate) model: String,
+}
+
+impl ModelOrigin {
+    pub(crate) fn new(provider: &str, api: &str, model: &str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            api: api.to_string(),
+            model: model.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReasoningBlock {
+    pub(crate) text: String,
+    pub(crate) continuity: Option<String>,
+    pub(crate) redacted: bool,
+    pub(crate) origin: ModelOrigin,
+}
+
+impl ReasoningBlock {
+    pub(crate) fn new(
+        text: &str,
+        continuity: Option<&str>,
+        redacted: bool,
+        origin: ModelOrigin,
+    ) -> Self {
+        Self {
+            text: text.to_string(),
+            continuity: continuity.map(str::to_string),
+            redacted,
+            origin,
         }
     }
 }
@@ -1021,6 +1070,11 @@ pub(crate) struct Message {
     // Tool-call and tool-result messages must carry both fields; text messages leave them empty.
     pub(crate) tool_call_id: Option<String>,
     pub(crate) tool_name: Option<String>,
+    // Provider-neutral reasoning continuity. Only AssistantReasoning rows use
+    // these; Nexus stores them opaquely and never interprets signatures/data.
+    pub(crate) continuity: Option<String>,
+    pub(crate) redacted: bool,
+    pub(crate) origin: Option<ModelOrigin>,
 }
 
 impl Message {
@@ -1032,12 +1086,42 @@ impl Message {
         Self::new(Role::Assistant, content)
     }
 
+    #[cfg(test)]
+    pub(crate) fn assistant_reasoning(
+        content: &str,
+        continuity: &str,
+        redacted: bool,
+        origin: ModelOrigin,
+    ) -> Self {
+        Self::assistant_reasoning_block(ReasoningBlock::new(
+            content,
+            Some(continuity),
+            redacted,
+            origin,
+        ))
+    }
+
+    pub(crate) fn assistant_reasoning_block(block: ReasoningBlock) -> Self {
+        Self {
+            role: Role::AssistantReasoning,
+            content: block.text,
+            tool_call_id: None,
+            tool_name: None,
+            continuity: block.continuity,
+            redacted: block.redacted,
+            origin: Some(block.origin),
+        }
+    }
+
     pub(crate) fn assistant_tool_call(call: &ToolCall) -> Self {
         Self {
             role: Role::AssistantToolCall,
             content: call.arguments.to_string(),
             tool_call_id: Some(call.id.clone()),
             tool_name: Some(call.name.clone()),
+            continuity: None,
+            redacted: false,
+            origin: None,
         }
     }
 
@@ -1047,6 +1131,9 @@ impl Message {
             content: content.to_string(),
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some(name.to_string()),
+            continuity: None,
+            redacted: false,
+            origin: None,
         }
     }
 
@@ -1056,6 +1143,9 @@ impl Message {
             content: content.to_string(),
             tool_call_id: None,
             tool_name: None,
+            continuity: None,
+            redacted: false,
+            origin: None,
         }
     }
 }
@@ -1064,6 +1154,7 @@ impl Message {
 pub(crate) enum Role {
     User,
     Assistant,
+    AssistantReasoning,
     AssistantToolCall,
     Tool,
 }
@@ -1073,6 +1164,7 @@ impl Role {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::AssistantReasoning => "assistant_reasoning",
             Self::AssistantToolCall => "assistant_tool_call",
             Self::Tool => "tool",
         }
@@ -1085,6 +1177,7 @@ impl Role {
         match role {
             "user" => Some(Self::User),
             "assistant" => Some(Self::Assistant),
+            "assistant_reasoning" => Some(Self::AssistantReasoning),
             "assistant_tool_call" => Some(Self::AssistantToolCall),
             "tool" => Some(Self::Tool),
             _ => None,
@@ -1101,18 +1194,31 @@ impl Role {
 /// is new (beyond the persisted cursor), so the harness writes it to the same
 /// log, keeping disk and memory consistent.
 fn repair_dangling_tool_call(messages: &mut Vec<Message>) {
-    let Some(last) = messages.last() else { return };
-    if last.role != Role::AssistantToolCall {
-        return;
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for message in messages.iter() {
+        match message.role {
+            Role::AssistantToolCall => {
+                if let (Some(call_id), Some(name)) = (&message.tool_call_id, &message.tool_name) {
+                    pending.push((call_id.clone(), name.clone()));
+                }
+            }
+            Role::Tool => {
+                if let Some(call_id) = &message.tool_call_id
+                    && let Some(pos) = pending.iter().position(|(id, _)| id == call_id)
+                {
+                    pending.remove(pos);
+                }
+            }
+            Role::User | Role::Assistant | Role::AssistantReasoning => {}
+        }
     }
-    let (Some(call_id), Some(name)) = (last.tool_call_id.clone(), last.tool_name.clone()) else {
-        return;
-    };
-    messages.push(Message::tool_result(
-        &call_id,
-        &name,
-        &cancelled_tool_result_json(),
-    ));
+    for (call_id, name) in pending {
+        messages.push(Message::tool_result(
+            &call_id,
+            &name,
+            &cancelled_tool_result_json(),
+        ));
+    }
 }
 
 /// Build the model-facing JSON for a successful tool result, offloading the

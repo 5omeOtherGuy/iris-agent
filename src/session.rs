@@ -49,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::nexus::{Message, Role};
+use crate::nexus::{Message, ModelOrigin, Role};
 
 /// Current transcript format version. v2 adds per-entry `id` + `parentId` to the
 /// v1 linear layout, so entries are tree-ready. The reader accepts older files
@@ -385,17 +385,29 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
     if let Some(name) = &message.tool_name {
         inner["toolName"] = json!(name);
     }
+    if message.role == Role::AssistantReasoning {
+        inner["redacted"] = json!(message.redacted);
+        if let Some(continuity) = &message.continuity {
+            inner["continuity"] = json!(continuity);
+        }
+        if let Some(origin) = &message.origin {
+            inner["origin"] = json!({
+                "provider": origin.provider,
+                "api": origin.api,
+                "model": origin.model,
+            });
+        }
+    }
     json!({
         "type": "message",
         "id": id,
         "parentId": parent_id,
         "timestamp": now_ms(),
         // Durable per-entry token accounting. Today this is a content-derived
-        // estimate (providers do not surface usage through the stream yet); the
-        // read path prefers this persisted value, so swapping in real provider
-        // usage later means writing the real number here without touching
-        // rebuild. See `estimate_tokens`.
-        "tokenEstimate": estimate_tokens(&message.content),
+        // estimate plus opaque reasoning continuity; the read path prefers this
+        // persisted value, so swapping in real provider usage later means
+        // writing the real number here without touching rebuild.
+        "tokenEstimate": message_token_estimate(message),
         "message": inner,
     })
 }
@@ -410,6 +422,15 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
 // (the read path already does).
 pub(crate) fn estimate_tokens(content: &str) -> u64 {
     (content.chars().count() as u64).div_ceil(4)
+}
+
+pub(crate) fn message_token_estimate(message: &Message) -> u64 {
+    let continuity = message
+        .continuity
+        .as_deref()
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    estimate_tokens(&message.content).saturating_add(continuity)
 }
 
 /// What [`SessionLog::resume`] needs to continue an existing transcript.
@@ -568,7 +589,7 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
                     let tokens = value
                         .get("tokenEstimate")
                         .and_then(Value::as_u64)
-                        .unwrap_or_else(|| estimate_tokens(&message.content));
+                        .unwrap_or_else(|| message_token_estimate(&message));
                     entries.push(MessageEntry {
                         id,
                         message,
@@ -764,7 +785,24 @@ fn parse_message(inner: &Value) -> Option<Message> {
             .get("toolName")
             .and_then(Value::as_str)
             .map(String::from),
+        continuity: inner
+            .get("continuity")
+            .and_then(Value::as_str)
+            .map(String::from),
+        redacted: inner
+            .get("redacted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        origin: inner.get("origin").and_then(parse_origin),
     })
+}
+
+fn parse_origin(value: &Value) -> Option<ModelOrigin> {
+    Some(ModelOrigin::new(
+        value.get("provider").and_then(Value::as_str)?,
+        value.get("api").and_then(Value::as_str)?,
+        value.get("model").and_then(Value::as_str)?,
+    ))
 }
 
 /// Parse a JSON timestamp number into unix ms. Timestamps are written as
@@ -837,7 +875,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nexus::{Message, ToolCall};
+    use crate::nexus::{Message, ModelOrigin, ToolCall};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir {
@@ -906,6 +944,52 @@ mod tests {
         assert!(entries[1]["parentId"].is_null());
         assert_eq!(entries[2]["parentId"], first_id);
         assert_ne!(first_id, second_id, "entry ids must be distinct");
+    }
+
+    #[test]
+    fn reasoning_entry_round_trips_continuity_origin_and_tokens() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let origin = ModelOrigin::new("anthropic", "anthropic-messages", "claude-sonnet-4-6");
+        log.append(&Message::assistant_reasoning(
+            "",
+            "opaque-redacted",
+            true,
+            origin.clone(),
+        ))
+        .unwrap();
+        drop(log);
+
+        let raw = lines(
+            &SessionStore::with_root(dir.path.clone())
+                .find(&id)
+                .unwrap()
+                .unwrap()
+                .path,
+        );
+        let entry = &raw[1];
+        assert_eq!(entry["message"]["role"], "assistant_reasoning");
+        assert_eq!(entry["message"]["content"], "");
+        assert_eq!(entry["message"]["continuity"], "opaque-redacted");
+        assert_eq!(entry["message"]["redacted"], true);
+        assert_eq!(entry["message"]["origin"]["provider"], "anthropic");
+        assert_eq!(entry["message"]["origin"]["api"], "anthropic-messages");
+        assert_eq!(entry["message"]["origin"]["model"], "claude-sonnet-4-6");
+        assert_eq!(
+            entry["tokenEstimate"],
+            json!(estimate_tokens("opaque-redacted"))
+        );
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages.len(), 1);
+        let message = &session.messages[0];
+        assert_eq!(message.role, Role::AssistantReasoning);
+        assert_eq!(message.content, "");
+        assert_eq!(message.continuity.as_deref(), Some("opaque-redacted"));
+        assert!(message.redacted);
+        assert_eq!(message.origin.as_ref(), Some(&origin));
+        assert_eq!(session.context_tokens, estimate_tokens("opaque-redacted"));
     }
 
     #[test]
@@ -1179,7 +1263,7 @@ mod tests {
     /// per-message convention the read path persists and rebuilds with
     /// ([`estimate_tokens`]). The live-side comparison for resume stability.
     fn total(messages: &[Message]) -> u64 {
-        messages.iter().map(|m| estimate_tokens(&m.content)).sum()
+        messages.iter().map(message_token_estimate).sum()
     }
 
     #[test]
