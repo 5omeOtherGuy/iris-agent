@@ -198,6 +198,7 @@ mod tests {
                 } else {
                     Attempt::Done(AssistantTurn {
                         text: Some("ok".to_string()),
+                        reasoning: Vec::new(),
                         tool_calls: Vec::new(),
                     })
                 }

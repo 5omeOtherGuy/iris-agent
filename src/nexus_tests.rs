@@ -371,6 +371,7 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
@@ -411,6 +412,7 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
@@ -446,6 +448,7 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "unknown".to_string(),
@@ -480,6 +483,7 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
     let repeated_call = || {
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
@@ -519,6 +523,7 @@ fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "unknown".to_string(),
@@ -667,6 +672,7 @@ fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
@@ -748,12 +754,61 @@ fn read_tool_returns_missing_file_error() -> Result<()> {
 fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
     AssistantTurn {
         text: None,
+        reasoning: Vec::new(),
         tool_calls: vec![ToolCall {
             id: "call_1".to_string(),
             name: name.to_string(),
             arguments,
         }],
     }
+}
+
+#[test]
+fn completed_turn_records_reasoning_and_all_tool_calls_before_results() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("a.txt"), "A")?;
+    fs::write(workspace.path.join("b.txt"), "B")?;
+    let origin = ModelOrigin::new("anthropic", "anthropic-messages", "claude-sonnet-4-6");
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: Some("working".to_string()),
+            reasoning: vec![ReasoningBlock::new("thinking", Some("sig"), false, origin)],
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "a.txt" }),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "b.txt" }),
+                },
+            ],
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let roles: Vec<Role> = harness.agent.messages().iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            Role::User,
+            Role::AssistantReasoning,
+            Role::Assistant,
+            Role::AssistantToolCall,
+            Role::AssistantToolCall,
+            Role::Tool,
+            Role::Tool,
+            Role::Assistant,
+        ],
+        "one model turn must keep reasoning/text/all tool calls contiguous before tool results"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1204,6 +1259,7 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
@@ -1273,6 +1329,7 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
@@ -1419,6 +1476,7 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
@@ -2193,6 +2251,7 @@ fn unsafe_tools_run_sequentially() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![
                 call("c1", "probe", json!({ "tag": "a" })),
                 call("c2", "probe", json!({ "tag": "b" })),
@@ -2230,6 +2289,7 @@ fn safe_tools_run_in_parallel_with_ordered_results() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![
                 call("c1", "probe", json!({ "tag": "a" })),
                 call("c2", "probe", json!({ "tag": "b" })),
@@ -2275,6 +2335,65 @@ fn safe_tools_run_in_parallel_with_ordered_results() -> Result<()> {
 }
 
 #[test]
+fn auto_compaction_does_not_split_reasoning_from_retained_tool_calls() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let reasoning = "R".repeat(400);
+    let origin = ModelOrigin::new("anthropic", "anthropic-messages", "claude-sonnet-4-6");
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            text: None,
+            reasoning: vec![ReasoningBlock::new(&reasoning, Some("sig"), false, origin)],
+            tool_calls: vec![call("c1", "probe", json!({ "tag": "a" }))],
+        }),
+        Ok(AssistantTurn::text("after tool")),
+        Ok(AssistantTurn::text("second done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![Box::new(ProbeTool {
+            tool_name: "probe".to_string(),
+            safe: false,
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        })]),
+    );
+    let log = SessionLog::create_in(&root.path, &workspace.path)?;
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(80),
+    );
+
+    run_text_session(
+        &mut harness,
+        b"first\nsecond\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let second_turn_context = &seen[2];
+    let call_idx = second_turn_context
+        .iter()
+        .position(|m| m.role == Role::AssistantToolCall && m.tool_call_id.as_deref() == Some("c1"))
+        .expect("the first turn's tool call should be retained in the tail");
+    assert!(
+        second_turn_context[..call_idx]
+            .iter()
+            .any(|m| m.role == Role::AssistantReasoning && m.content == reasoning),
+        "compaction retained a tool call without its preceding reasoning row"
+    );
+    Ok(())
+}
+
+#[test]
 fn safe_tool_parallelism_is_bounded() -> Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -2291,6 +2410,7 @@ fn safe_tool_parallelism_is_bounded() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls,
         }),
         Ok(AssistantTurn::text("done")),
@@ -2329,6 +2449,7 @@ fn safe_tools_do_not_cross_an_unsafe_tool() -> Result<()> {
     let provider = FakeProvider::new(vec![
         Ok(AssistantTurn {
             text: None,
+            reasoning: Vec::new(),
             tool_calls: vec![
                 call("c1", "safe", json!({ "tag": "a" })),
                 call("c2", "safe", json!({ "tag": "b" })),
@@ -2589,6 +2710,73 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         .position(|m| m.role == Role::AssistantToolCall)
         .unwrap();
     assert_eq!(reopened.messages[idx + 1].role, Role::Tool);
+    Ok(())
+}
+
+#[test]
+fn resume_repairs_all_dangling_tool_calls_before_the_next_turn() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    log.append(&Message::user("run both tools"))?;
+    for call in [
+        ToolCall {
+            id: "call_1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": "a.txt" }),
+        },
+        ToolCall {
+            id: "call_2".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": "b.txt" }),
+        },
+    ] {
+        log.append(&Message::assistant_tool_call(&call))?;
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present");
+    let stored = store.open(&meta)?;
+    let on_disk = stored.messages.len();
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
+    let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        on_disk,
+        None,
+    );
+
+    run_text_session(
+        &mut harness,
+        b"continue\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let first = seen.first().expect("provider was called");
+    let new_user_idx = first
+        .iter()
+        .position(|m| m.role == Role::User && m.content == "continue")
+        .expect("new user prompt present");
+    for id in ["call_1", "call_2"] {
+        let result_idx = first
+            .iter()
+            .position(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("missing synthetic result for {id}"));
+        assert!(
+            result_idx < new_user_idx,
+            "{id} must be answered before the next user prompt"
+        );
+    }
     Ok(())
 }
 

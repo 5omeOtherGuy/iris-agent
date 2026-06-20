@@ -20,7 +20,7 @@ use crate::handles::HandleStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, ToolEnv,
 };
-use crate::session::{SessionLog, estimate_tokens};
+use crate::session::{SessionLog, estimate_tokens, message_token_estimate};
 use crate::tools::ToolState;
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
@@ -344,7 +344,7 @@ impl<P: ChatProvider> Harness<P> {
         let mut k = messages.len();
         let mut tail = 0u64;
         while k > 0 {
-            let t = estimate_tokens(&messages[k - 1].content);
+            let t = message_token_estimate(&messages[k - 1]);
             if tail.saturating_add(t) > keep_target {
                 break;
             }
@@ -354,14 +354,27 @@ impl<P: ChatProvider> Harness<P> {
         // Covered range ends at the tail boundary, never past the coverable
         // (persisted, id-bearing) region.
         let mut end = k.min(n);
+        // If the retained tail would begin inside an assistant/tool-use turn,
+        // pull the boundary left so reasoning -> text -> tool calls -> results
+        // stay together. A boundary before a user message (or at EOF) is already
+        // between turns.
+        if end < messages.len() && messages[end].role != Role::User {
+            end = assistant_turn_start(messages, end);
+        }
         // Start at the first coverable (Some-id) message; bail if none.
         let mut start = (0..end).find(|&i| self.entry_ids.get(i).is_some_and(Option::is_some))?;
         // Keep the covered range a contiguous run of coverable ids.
         if let Some(none_at) = (start..end).find(|&i| self.entry_ids[i].is_none()) {
             end = none_at;
         }
-        // Never begin a covered range on an orphan tool result.
-        while start < end && messages[start].role == Role::Tool {
+        // Never begin a covered range on an orphan tool fragment.
+        while start < end
+            && (messages[start].role == Role::Tool
+                || messages[start].role == Role::AssistantToolCall
+                || (messages[start].role == Role::Assistant
+                    && start > 0
+                    && messages[start - 1].role == Role::AssistantReasoning))
+        {
             start += 1;
         }
         // Never split a tool-call / tool-result pair at the tail boundary.
@@ -388,8 +401,15 @@ impl<P: ChatProvider> Harness<P> {
 fn context_tokens(messages: &[Message]) -> u64 {
     messages
         .iter()
-        .map(|m| estimate_tokens(&m.content))
+        .map(message_token_estimate)
         .fold(0, u64::saturating_add)
+}
+
+fn assistant_turn_start(messages: &[Message], mut index: usize) -> usize {
+    while index > 0 && messages[index - 1].role != Role::User {
+        index -= 1;
+    }
+    index
 }
 
 /// Produce a deterministic stand-in summary for a covered message range.
