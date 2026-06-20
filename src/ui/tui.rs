@@ -1149,6 +1149,7 @@ fn insert_lines_before<B: Backend>(
 pub(crate) struct TuiUi {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     pub(crate) screen: Screen,
+    native_scrollback: bool,
     active: bool,
 }
 
@@ -1167,8 +1168,22 @@ impl TuiUi {
         let options = TerminalOptions {
             viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
         };
-        let terminal = match Terminal::with_options(backend, options) {
-            Ok(terminal) => terminal,
+        let (terminal, native_scrollback) = match Terminal::with_options(backend, options) {
+            Ok(terminal) => (terminal, true),
+            Err(error) if is_cursor_position_timeout(&error) => {
+                // ponytail: full-screen TUI fallback. Native scrollback needs
+                // an inline cursor probe; if this terminal cannot answer it,
+                // keep the TUI alive and let the in-frame transcript hold
+                // history. Upgrade path: switch input to an interruptible
+                // event stream so inline resize probes can be serialized.
+                match Terminal::new(CrosstermBackend::new(io::stdout())) {
+                    Ok(terminal) => (terminal, false),
+                    Err(error) => {
+                        let _ = disable_raw_mode();
+                        return Err(error.into());
+                    }
+                }
+            }
             Err(error) => {
                 let _ = disable_raw_mode();
                 return Err(error.into());
@@ -1183,6 +1198,7 @@ impl TuiUi {
         Ok(Self {
             terminal,
             screen: Screen::new(),
+            native_scrollback,
             active: true,
         })
     }
@@ -1190,10 +1206,14 @@ impl TuiUi {
     pub(crate) fn draw(&mut self) -> Result<()> {
         // Pick up any terminal resize before measuring width and committing, so
         // finalized rows are wrapped to the current width.
-        self.terminal.autoresize()?;
+        if self.native_scrollback {
+            self.terminal.autoresize()?;
+        }
         let width = self.terminal.size()?.width;
-        let committed = self.screen.take_scrollback(width);
-        insert_lines_before(&mut self.terminal, committed)?;
+        if self.native_scrollback {
+            let committed = self.screen.take_scrollback(width);
+            insert_lines_before(&mut self.terminal, committed)?;
+        }
         let screen = &mut self.screen;
         self.terminal.draw(|frame| render(frame, screen))?;
         Ok(())
@@ -1227,6 +1247,12 @@ impl Drop for TuiUi {
     fn drop(&mut self) {
         self.restore();
     }
+}
+
+fn is_cursor_position_timeout(error: &io::Error) -> bool {
+    error
+        .to_string()
+        .contains("cursor position could not be read")
 }
 
 #[cfg(test)]
@@ -1693,10 +1719,26 @@ mod tests {
     where
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        terminal.autoresize()?;
+        draw_step_with_scrollback(terminal, screen, true)
+    }
+
+    fn draw_step_with_scrollback<B>(
+        terminal: &mut Terminal<B>,
+        screen: &mut Screen,
+        native_scrollback: bool,
+    ) -> Result<()>
+    where
+        B: Backend,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if native_scrollback {
+            terminal.autoresize()?;
+        }
         let width = terminal.size()?.width;
-        let committed = screen.take_scrollback(width);
-        insert_lines_before(terminal, committed)?;
+        if native_scrollback {
+            let committed = screen.take_scrollback(width);
+            insert_lines_before(terminal, committed)?;
+        }
         terminal.draw(|frame| render(frame, screen))?;
         Ok(())
     }
@@ -1774,6 +1816,42 @@ mod tests {
         assert!(
             buffer_text(&terminal).contains("message"),
             "editor lost after resize"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fullscreen_tui_fallback_keeps_history_in_frame() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(40, 14))?;
+        let mut screen = Screen::new();
+
+        screen.apply(UiEvent::SessionStarted);
+        draw_step_with_scrollback(&mut terminal, &mut screen, false)?;
+        assert!(buffer_text(&terminal).contains("iris"));
+        assert!(
+            !screen.transcript.rows.is_empty(),
+            "full-screen fallback must not drain history into native scrollback"
+        );
+
+        screen.commit_user("hello there");
+        screen.start_turn();
+        screen.apply(UiEvent::AssistantText("ok".to_string()));
+        screen.end_turn();
+        draw_step_with_scrollback(&mut terminal, &mut screen, false)?;
+
+        let frame = buffer_text(&terminal);
+        assert!(
+            frame.contains("hello there"),
+            "user line missing: {frame:?}"
+        );
+        assert!(frame.contains("ok"), "assistant text missing: {frame:?}");
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|row| row.text.contains("hello")),
+            "history should remain live in full-screen fallback"
         );
         Ok(())
     }

@@ -94,13 +94,17 @@ struct ApprovalRequest {
 async fn session_loop<P: ChatProvider>(harness: &mut Harness<P>, tui: &mut TuiUi) -> Result<()> {
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
-    spawn_input_thread(input_tx, current_turn.clone());
 
     let mut tick = interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     tui.screen.apply_event(UiEvent::SessionStarted);
     tui.draw()?;
+    // Draw the inline viewport before starting the blocking input reader. The
+    // first draw commits the banner through Ratatui, which may still need a
+    // terminal cursor-position probe on some backends; a concurrent event::read
+    // can steal that response and make startup fail.
+    spawn_input_thread(input_tx, current_turn.clone());
 
     loop {
         match idle_phase(tui, &mut input_rx, &mut tick).await? {
