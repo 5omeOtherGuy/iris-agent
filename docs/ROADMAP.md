@@ -523,9 +523,14 @@ Potential scope:
   ([#88](https://github.com/5omeOtherGuy/iris-agent/issues/88)); diff colorizer
   false-positive on zero-context (`-U0`) diffs
   ([#89](https://github.com/5omeOtherGuy/iris-agent/issues/89)); larger TUI
-  scope -- per-command streaming, Running/Ran exit-code+duration cells, full
-  diff/syntax rendering
-  ([#90](https://github.com/5omeOtherGuy/iris-agent/issues/90)); and a real-TTY
+  scope ([#90](https://github.com/5omeOtherGuy/iris-agent/issues/90)) -- of which
+  sub-item 1, per-command live bash streaming with Running/Ran exit-code+duration
+  exec lifecycle cells, shipped in
+  [#94](https://github.com/5omeOtherGuy/iris-agent/pull/94) (2026-06-20:
+  `ToolStarted`/`ToolOutputDelta` display-only events + `exit_code`/`duration` on
+  `ToolResult`, a `ToolOutputSink` seam streaming one-shot bash chunks, and an
+  in-place-finalizing exec cell; session-path live deltas, full diff/syntax
+  rendering as #90.2, and DIM parity as #90.3 still deferred); and a real-TTY
   smoke verification pass
   ([#91](https://github.com/5omeOtherGuy/iris-agent/issues/91)). Still deferred:
   interactive expand/collapse of folded blocks and full right-bordered box
