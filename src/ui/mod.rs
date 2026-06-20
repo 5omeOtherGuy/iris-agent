@@ -57,6 +57,8 @@ pub(crate) enum UiEvent {
     AssistantTextDelta(String),
     AssistantTextEnd(String),
     ToolProposed(ToolCall),
+    /// A tool is about to execute; lets the front-end open a live progress cell.
+    ToolStarted(ToolCall),
     /// A gated tool was auto-approved by the session allow-policy (the user
     /// chose "always" for this tool earlier). Emitted by Nexus, never inferred
     /// by the UI, so the policy stays Nexus-owned.
@@ -69,6 +71,13 @@ pub(crate) enum UiEvent {
     ToolResult {
         call: ToolCall,
         content: String,
+        exit_code: Option<i32>,
+        duration: Option<std::time::Duration>,
+    },
+    /// A display-only chunk of a running tool's live output.
+    ToolOutputDelta {
+        call_id: String,
+        chunk: String,
     },
     ToolError {
         call: ToolCall,
@@ -97,10 +106,24 @@ impl UiEvent {
             AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
             AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),
             AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
+            AgentEvent::ToolStarted(call) => UiEvent::ToolStarted(call),
             AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),
             AgentEvent::DiffPreview { call, diff } => UiEvent::DiffPreview { call, diff },
             AgentEvent::ToolDenied(call) => UiEvent::ToolDenied(call),
-            AgentEvent::ToolResult { call, content } => UiEvent::ToolResult { call, content },
+            AgentEvent::ToolResult {
+                call,
+                content,
+                exit_code,
+                duration,
+            } => UiEvent::ToolResult {
+                call,
+                content,
+                exit_code,
+                duration,
+            },
+            AgentEvent::ToolOutputDelta { call_id, chunk } => {
+                UiEvent::ToolOutputDelta { call_id, chunk }
+            }
             AgentEvent::ToolError { call, message } => UiEvent::ToolError { call, message },
             AgentEvent::Notice(message) => UiEvent::Notice(message),
             AgentEvent::TurnComplete => UiEvent::TurnComplete,
@@ -158,5 +181,60 @@ impl ApprovalGate for UiBridge<'_> {
         // input arrives, with a second Ctrl-C as the force-quit backstop. Either
         // way, Nexus's post-review `token.is_cancelled()` check keeps a late
         // decision from running the tool or mutating the session allow-policy.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nexus::AgentEvent;
+    use std::time::Duration;
+
+    fn call() -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": "echo hi" }),
+        }
+    }
+
+    #[test]
+    fn maps_tool_started_to_ui_event() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ToolStarted(call()));
+        assert_eq!(mapped, UiEvent::ToolStarted(call()));
+    }
+
+    #[test]
+    fn maps_tool_output_delta_to_ui_event() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_1".to_string(),
+            chunk: "partial output".to_string(),
+        });
+        assert_eq!(
+            mapped,
+            UiEvent::ToolOutputDelta {
+                call_id: "call_1".to_string(),
+                chunk: "partial output".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn maps_tool_result_with_exit_code_and_duration() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ToolResult {
+            call: call(),
+            content: "done".to_string(),
+            exit_code: Some(3),
+            duration: Some(Duration::from_millis(1200)),
+        });
+        assert_eq!(
+            mapped,
+            UiEvent::ToolResult {
+                call: call(),
+                content: "done".to_string(),
+                exit_code: Some(3),
+                duration: Some(Duration::from_millis(1200)),
+            }
+        );
     }
 }

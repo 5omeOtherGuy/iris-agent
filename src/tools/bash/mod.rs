@@ -73,6 +73,7 @@ pub(super) fn execute(
     args: &Value,
     state: &mut BashState,
     cancel: &CancellationToken,
+    sink: Option<&dyn crate::nexus::ToolOutputSink>,
 ) -> Result<super::ToolOutput> {
     let parsed: BashArgs =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
@@ -85,12 +86,24 @@ pub(super) fn execute(
         job,
         action,
     } = parsed;
+    // Exit code + wall-clock duration for the command-running arms (one-shot and
+    // persistent session); `None` for the management arms (reset/close/jobs),
+    // which carry no command status. Surfaced as `ToolOutput` metadata that
+    // Nexus lifts onto the `ToolResult` event for the live exec cell.
+    let mut exec: Option<(Option<i32>, Duration)> = None;
     let text = match action.as_deref().unwrap_or("run") {
         "run" => match session {
-            Some(id) => run_session(root, &id, command, timeout, state, cancel)?,
+            Some(id) => {
+                let (text, code, duration) =
+                    run_session(root, &id, command, timeout, state, cancel)?;
+                exec = Some((code, duration));
+                text
+            }
             None => {
                 let command = command.context("bash tool arguments must include command")?;
-                bash(root, &BashInput { command, timeout }, cancel)?
+                let run = bash(root, &BashInput { command, timeout }, cancel, sink)?;
+                exec = Some((run.exit_code, run.duration));
+                run.text
             }
         },
         act @ ("reset" | "close") => {
@@ -133,7 +146,15 @@ pub(super) fn execute(
         "list" => render_job_list(state.jobs.list()),
         other => bail!("unknown bash action: {other}"),
     };
-    Ok(super::ToolOutput::text(text))
+    let mut output = super::ToolOutput::text(text);
+    if let Some((code, duration)) = exec {
+        output = output.with(
+            "durationMs",
+            json!(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        );
+        output = output.with("exitCode", code.map_or(Value::Null, |code| json!(code)));
+    }
+    Ok(output)
 }
 
 /// Route a session-scoped `run` to the session registry. The turn token is
@@ -146,14 +167,23 @@ fn run_session(
     timeout: Option<u64>,
     state: &mut BashState,
     cancel: &CancellationToken,
-) -> Result<String> {
+) -> Result<(String, Option<i32>, Duration)> {
     let command = command
         .filter(|c| !c.trim().is_empty())
         .context("bash session run requires a command")?;
     let timeout_secs = timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
     let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+    // ponytail: session-path LIVE streaming is deferred (issue #90 follow-up).
+    // The persistent shell interleaves a `__IRIS_DONE_<nonce>` completion marker
+    // in the same stdout stream, so forwarding raw chunks would leak the
+    // sentinel into the live display. Exit code + duration metadata is surfaced
+    // here; live deltas for this path are the named follow-up. Upgrade path =
+    // stream only the marker-safe prefix of the session buffer.
+    let start = Instant::now();
     let outcome = state.sessions.run(root, id, &command, timeout, cancel)?;
-    Ok(render_session(outcome, timeout_secs))
+    let duration = start.elapsed();
+    let exit_code = outcome.exit_code;
+    Ok((render_session(outcome, timeout_secs), exit_code, duration))
 }
 
 /// Format a background-job update: bounded output, drop/sandbox notices, status.
@@ -271,7 +301,22 @@ struct BashArgs {
     action: Option<String>,
 }
 
-fn bash(root: &Path, input: &BashInput, cancel: &CancellationToken) -> Result<String> {
+/// One-shot `bash` result: rendered output plus the command's exit code and
+/// wall-clock duration, surfaced as `ToolOutput` metadata for the live exec
+/// cell. `exit_code` is `None` when the shell reported no status (cancelled,
+/// timed out, or killed).
+struct BashRun {
+    text: String,
+    exit_code: Option<i32>,
+    duration: Duration,
+}
+
+fn bash(
+    root: &Path,
+    input: &BashInput,
+    cancel: &CancellationToken,
+    sink: Option<&dyn crate::nexus::ToolOutputSink>,
+) -> Result<BashRun> {
     if input.command.trim().is_empty() {
         bail!("bash command must not be empty");
     }
@@ -369,8 +414,21 @@ fn bash(root: &Path, input: &BashInput, cancel: &CancellationToken) -> Result<St
             break;
         }
         match rx.recv_timeout(remaining) {
-            Ok(PumpMsg::Chunk(BashStream::Stdout, chunk)) => stdout_bytes.extend_from_slice(&chunk),
-            Ok(PumpMsg::Chunk(BashStream::Stderr, chunk)) => stderr_bytes.extend_from_slice(&chunk),
+            Ok(PumpMsg::Chunk(stream, chunk)) => {
+                // Forward the chunk live to the sink (lossy decode) before
+                // accumulating it for the final result. ponytail: per-chunk
+                // lossy UTF-8 can emit a replacement char when a multibyte
+                // sequence straddles a chunk boundary -- display-only, so
+                // acceptable; the accumulated bytes below are decoded whole for
+                // the model-facing output.
+                if let Some(sink) = sink {
+                    sink.emit_chunk(&String::from_utf8_lossy(&chunk));
+                }
+                match stream {
+                    BashStream::Stdout => stdout_bytes.extend_from_slice(&chunk),
+                    BashStream::Stderr => stderr_bytes.extend_from_slice(&chunk),
+                }
+            }
             Ok(PumpMsg::Truncated) => capture_truncated = true,
             Err(_) => break,
         }
@@ -415,7 +473,11 @@ fn bash(root: &Path, input: &BashInput, cancel: &CancellationToken) -> Result<St
         out.push_str(&format!("\n\nCommand exited with code {code}"));
     }
 
-    Ok(out)
+    Ok(BashRun {
+        text: out,
+        exit_code: status.and_then(|status| status.code()),
+        duration: start.elapsed(),
+    })
 }
 
 /// Apply the shared output policy: keep the bounded tail, mark `(no output)`
@@ -527,6 +589,121 @@ fn write_overflow_file(content: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::tools::test_support::{root_of, temp_dir};
+    use std::cell::RefCell;
+
+    /// Records every chunk forwarded to the streaming sink (single-threaded;
+    /// `bash()` forwards on the calling thread).
+    struct RecordingSink {
+        chunks: RefCell<Vec<String>>,
+    }
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                chunks: RefCell::new(Vec::new()),
+            }
+        }
+        fn joined(&self) -> String {
+            self.chunks.borrow().concat()
+        }
+    }
+    impl crate::nexus::ToolOutputSink for RecordingSink {
+        fn emit_chunk(&self, chunk: &str) {
+            self.chunks.borrow_mut().push(chunk.to_string());
+        }
+    }
+
+    #[test]
+    fn bash_streams_chunks_to_sink_while_accumulating_final_output() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let sink = RecordingSink::new();
+        let run = bash(
+            &root,
+            &BashInput {
+                command: "printf 'one\\ntwo\\n'".into(),
+                timeout: None,
+            },
+            &CancellationToken::new(),
+            Some(&sink),
+        )
+        .unwrap();
+        // The sink saw the live chunks as they arrived.
+        assert!(sink.joined().contains("one"), "sink missing live output");
+        assert!(sink.joined().contains("two"), "sink missing live output");
+        // The final accumulated output is still complete.
+        assert!(run.text.contains("one") && run.text.contains("two"));
+    }
+
+    #[test]
+    fn bash_without_sink_behaves_unchanged() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let run = bash(
+            &root,
+            &BashInput {
+                command: "echo hi".into(),
+                timeout: None,
+            },
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(run.text.contains("hi"));
+    }
+
+    #[test]
+    fn execute_run_attaches_exit_code_and_duration_metadata() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        // Non-zero exit: metadata must carry the exact code and a duration.
+        let out = execute(
+            &root,
+            &json!({ "command": "exit 3" }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.metadata.get("exitCode"), Some(&json!(3)));
+        assert!(
+            out.metadata
+                .get("durationMs")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "durationMs metadata missing: {:?}",
+            out.metadata
+        );
+    }
+
+    #[test]
+    fn execute_session_run_attaches_exit_code_and_duration_metadata() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        // The persistent-session path carries exit code + duration metadata too.
+        // Use a subshell so the non-zero status is reported without killing the
+        // session shell (a bare `exit` would close the shell -> no exit code).
+        let out = execute(
+            &root,
+            &json!({ "command": "(exit 5)", "session": "s1", "timeout": 5 }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.metadata.get("exitCode"), Some(&json!(5)));
+        assert!(
+            out.metadata
+                .get("durationMs")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "durationMs metadata missing on session path: {:?}",
+            out.metadata
+        );
+    }
 
     #[test]
     fn bash_runs_command_and_captures_output() {
@@ -539,8 +716,10 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(out.contains("hello"));
     }
 
@@ -556,8 +735,10 @@ mod tests {
                 timeout: Some(1),
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "bash hung past timeout"
@@ -581,8 +762,10 @@ mod tests {
                 timeout: Some(1),
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "bash hung past timeout despite backgrounded pipe holder"
@@ -605,8 +788,10 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(
             started.elapsed() < Duration::from_secs(BASH_DRAIN_TIMEOUT_SECS + 5),
             "bash blocked on a backgrounded pipe holder"
@@ -628,8 +813,10 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(out.contains("ok"), "expected bashism to run, got: {out}");
         assert!(
             !out.contains("Command exited with code"),
@@ -668,8 +855,10 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(!outside.exists(), "sandbox did not block the escape: {out}");
         std::fs::remove_file(&outside).ok();
     }
@@ -688,6 +877,7 @@ mod tests {
             &json!({ "command": "cd sub", "session": "s1" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         let pwd = execute(
@@ -695,6 +885,7 @@ mod tests {
             &json!({ "command": "pwd", "session": "s1" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert!(
@@ -709,6 +900,7 @@ mod tests {
             &json!({ "command": "pwd", "session": "s2" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert!(!other.content.trim_end().ends_with("/sub"));
@@ -719,6 +911,7 @@ mod tests {
             &json!({ "session": "s1", "action": "close" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert!(closed.content.contains("closed"));
@@ -727,6 +920,7 @@ mod tests {
             &json!({ "command": "pwd", "session": "s1" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert!(
@@ -751,6 +945,7 @@ mod tests {
             }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
 
@@ -769,6 +964,7 @@ mod tests {
             &json!({ "action": "start", "command": "printf go; exit 4" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         // The id is echoed as job-0 for the first job.
@@ -783,6 +979,7 @@ mod tests {
             &json!({ "action": "list" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert!(listed.content.contains("job-0"));
@@ -792,6 +989,7 @@ mod tests {
             &json!({ "action": "finalize", "job": "job-0", "timeout": 5 }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert!(
@@ -811,6 +1009,7 @@ mod tests {
             &json!({ "action": "list" }),
             &mut state,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert!(after.content.contains("no background jobs"));
@@ -830,8 +1029,10 @@ mod tests {
                 timeout: Some(30),
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         // The capture-specific marker proves the per-stream cap fired (the pump
         // stopped forwarding), not merely the display-tail truncation.
         assert!(
@@ -864,8 +1065,10 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(out.contains("Command exited with code 3"));
     }
 }

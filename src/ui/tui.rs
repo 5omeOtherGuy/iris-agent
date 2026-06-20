@@ -71,6 +71,13 @@ const MAX_TOOL_OUTPUT_ROWS: usize = 24;
 /// before wrapping, so one pathological line cannot dominate the row budget.
 const MAX_TOOL_OUTPUT_LINE_CHARS: usize = 2000;
 
+/// Cap on the live exec stream buffer re-rendered under the gutter on each
+/// delta. Only the tail (flood-capped to `MAX_TOOL_OUTPUT_ROWS`) is shown and
+/// the authoritative full output arrives with the final `ToolResult`, so
+/// trimming the head here only bounds the per-delta re-render cost; it never
+/// reaches the model.
+const MAX_EXEC_STREAM_BYTES: usize = 64 * 1024;
+
 /// Braille spinner frames; cycled by the render tick while a turn computes.
 /// Not emojis: single-cell Unicode glyphs that render on any UTF-8 terminal.
 const SPINNER_FRAMES: &[&str] = &[
@@ -100,6 +107,26 @@ fn prompt_style() -> Style {
 }
 fn tool_header_style() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
+}
+
+/// Bullet glyph + style for a finalized exec cell: a green bullet on success
+/// (`Some(0)` or no reported status) and a red cross on a non-zero exit.
+fn exec_status(exit_code: Option<i32>) -> (&'static str, Style) {
+    match exit_code {
+        Some(0) | None => ("\u{2022}", ok_style()),
+        Some(_) => ("\u{2717}", err_style()),
+    }
+}
+
+/// Render a tool's wall-clock duration compactly: `340ms` under a second, else
+/// `1.2s`.
+fn format_duration(duration: std::time::Duration) -> String {
+    let ms = duration.as_millis();
+    if ms >= 1000 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{ms}ms")
+    }
 }
 fn banner_style() -> Style {
     Style::default().fg(Color::Magenta)
@@ -334,6 +361,17 @@ fn push_wrapped_row(
     }
 }
 
+/// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
+/// exclusive, so at most one is ever open. `body_start` is the row index of the
+/// block body (its `Running`/`Ran` header); `take_scrollback` keeps it valid
+/// across scrollback drains. `output` is the bounded live tail re-rendered (and
+/// flood-capped) under the gutter on each delta.
+struct ActiveExec {
+    call: ToolCall,
+    output: String,
+    body_start: usize,
+}
+
 /// Transcript state and width-aware rendering, separate from editor/spinner UI.
 #[derive(Default)]
 struct Transcript {
@@ -341,6 +379,8 @@ struct Transcript {
     /// Live assistant text being streamed; rendered after committed rows and
     /// committed exactly once on `AssistantTextEnd`.
     streaming: Option<String>,
+    /// The open live exec cell, if a streaming tool is running.
+    active_exec: Option<ActiveExec>,
     exploring_open: bool,
     /// Last width the transcript was rendered/flushed at, so width-aware
     /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
@@ -415,23 +455,144 @@ impl Transcript {
         ));
     }
 
-    fn push_tool_result(&mut self, call: &ToolCall, content: &str) {
+    /// Fallback (non-streamed) result render, used when no live exec cell was
+    /// opened: exploration tools group under `Explored`; everything else gets a
+    /// `• Ran`/`✗ Ran` header with the same status-colored bullet + duration as
+    /// the streamed finalize, so both paths look identical.
+    fn push_tool_result(
+        &mut self,
+        call: &ToolCall,
+        content: &str,
+        exit_code: Option<i32>,
+        duration: Option<std::time::Duration>,
+    ) {
         if is_exploration_tool(call) {
             self.push_explored_result(call);
             return;
         }
         self.begin_block();
-        self.push_continued(
-            &format!("• Ran {}", run_target(call)),
-            tool_header_style(),
-            "  │ ",
+        let (bullet, style) = exec_status(exit_code);
+        self.push_exec_header(
+            bullet,
+            style,
+            &format!(" Ran {}", run_target(call)),
+            duration,
         );
         self.push_tool_output(content);
     }
 
     fn push_tool_error(&mut self, call: &ToolCall, message: &str) {
         self.begin_block();
-        self.push_continued(&format!("✗ Ran {}", run_target(call)), err_style(), "  │ ");
+        self.push_exec_header(
+            "\u{2717}",
+            err_style(),
+            &format!(" Ran {}", run_target(call)),
+            None,
+        );
+        self.push_continued(&format!("  └ error: {message}"), err_style(), "    ");
+    }
+
+    /// Push an exec header row (`• Running`/`• Ran`/`✗ Ran`) with a
+    /// status-colored bullet, the verb+target in the tool-header style, and an
+    /// optional duration suffix. Wraps with the `  │ ` gutter like a tool result.
+    fn push_exec_header(
+        &mut self,
+        bullet: &'static str,
+        bullet_style: Style,
+        rest: &str,
+        duration: Option<std::time::Duration>,
+    ) {
+        let mut spans = vec![
+            Span::styled(bullet, bullet_style),
+            Span::styled(rest.to_string(), tool_header_style()),
+        ];
+        if let Some(duration) = duration {
+            spans.push(Span::styled(
+                format!(" ({})", format_duration(duration)),
+                dim_style(),
+            ));
+        }
+        self.rows
+            .push(TranscriptRow::with_line(Line::from(spans), Some("  │ ")));
+    }
+
+    /// Open a live exec block: a `• Running {target}` header under a fresh
+    /// separator, tracked as the active cell so deltas and the final result
+    /// finalize it in place.
+    fn begin_exec(&mut self, call: ToolCall) {
+        self.begin_block();
+        let body_start = self.rows.len();
+        self.push_exec_header(
+            "\u{2022}",
+            tool_header_style(),
+            &format!(" Running {}", run_target(&call)),
+            None,
+        );
+        self.active_exec = Some(ActiveExec {
+            call,
+            output: String::new(),
+            body_start,
+        });
+    }
+
+    /// Re-render the open exec block in place from its bounded output buffer: the
+    /// `Running` header followed by the flood-capped live tail.
+    fn relayout_active_running(&mut self) {
+        let Some(active) = self.active_exec.take() else {
+            return;
+        };
+        self.rows.truncate(active.body_start);
+        self.push_exec_header(
+            "\u{2022}",
+            tool_header_style(),
+            &format!(" Running {}", run_target(&active.call)),
+            None,
+        );
+        self.push_tool_output_tail(&active.output);
+        self.active_exec = Some(active);
+    }
+
+    /// Finalize the open exec block in place (no new separator): rewrite the
+    /// header to `• Ran`/`✗ Ran` with the status-colored bullet and duration,
+    /// then render the authoritative final output.
+    fn finalize_active(
+        &mut self,
+        call: &ToolCall,
+        content: &str,
+        exit_code: Option<i32>,
+        duration: Option<std::time::Duration>,
+    ) {
+        let Some(active) = self.active_exec.take() else {
+            return;
+        };
+        self.rows.truncate(active.body_start);
+        let (bullet, style) = exec_status(exit_code);
+        self.push_exec_header(
+            bullet,
+            style,
+            &format!(" Ran {}", run_target(call)),
+            duration,
+        );
+        self.push_tool_output(content);
+    }
+
+    /// Finalize the open exec block as an error/cancellation in place: a red
+    /// `✗ Ran` header, whatever streamed so far (so a cancelled command keeps
+    /// its partial output), then the error line.
+    fn finalize_active_error(&mut self, call: &ToolCall, message: &str) {
+        let Some(active) = self.active_exec.take() else {
+            return;
+        };
+        self.rows.truncate(active.body_start);
+        self.push_exec_header(
+            "\u{2717}",
+            err_style(),
+            &format!(" Ran {}", run_target(call)),
+            None,
+        );
+        if !active.output.is_empty() {
+            self.push_tool_output_tail(&active.output);
+        }
         self.push_continued(&format!("  └ error: {message}"), err_style(), "    ");
     }
 
@@ -453,6 +614,28 @@ impl Transcript {
         self.rows.iter().rposition(is_separator_row).unwrap_or(0)
     }
 
+    /// Push one gutter-prefixed tool-output line, preserving ANSI styling and
+    /// hard-wrapping so leading indentation/aligned columns survive. `first`
+    /// selects the `  └ ` head gutter vs the `    ` continuation gutter.
+    fn push_output_line(&mut self, raw: &str, first: bool) {
+        let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
+        let prefix = if first { "  └ " } else { "    " };
+        if line.contains("\x1b[") {
+            self.rows.push(TranscriptRow::with_line(
+                tool_output_line(prefix, &line),
+                Some("    "),
+            ));
+        } else {
+            // Char-hard-wrap (via a styled line) rather than word-wrap so leading
+            // indentation and aligned columns in tool output are preserved and
+            // the physical-row estimate stays exact.
+            self.rows.push(TranscriptRow::with_line(
+                Line::from(Span::styled(format!("{prefix}{line}"), dim_style())),
+                Some("    "),
+            ));
+        }
+    }
+
     fn push_tool_output(&mut self, content: &str) {
         if content.is_empty() {
             self.push("  └ (no output)", dim_style());
@@ -461,42 +644,61 @@ impl Transcript {
         // Flood-safe: wrap each output line to the transcript width FIRST, then
         // cap the total *physical* rows so a handful of very long lines cannot
         // flood the viewport/scrollback. The omitted count is logical lines.
-        // (`fold`'s per-line char cap below is the secondary guard.)
+        // This is the HEAD-capped rendering used for a finalized result (matches
+        // the established `• Ran` look); the live cell uses the tail variant.
         let width = self.wrap_width();
         let total_logical = content.lines().count();
         let mut physical = 0usize;
         let mut shown = 0usize;
-        let mut first = true;
         for raw in content.lines() {
-            let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
-            let rows = wrapped_row_estimate(&line, width);
+            let rows =
+                wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width);
             // Always show at least the first line (head); otherwise stop once
             // the next line would exceed the physical-row budget.
             if shown > 0 && physical + rows > MAX_TOOL_OUTPUT_ROWS {
                 break;
             }
-            let prefix = if first { "  └ " } else { "    " };
-            if line.contains("\x1b[") {
-                self.rows.push(TranscriptRow::with_line(
-                    tool_output_line(prefix, &line),
-                    Some("    "),
-                ));
-            } else {
-                // Char-hard-wrap (via a styled line) rather than word-wrap so
-                // leading indentation and aligned columns in tool output are
-                // preserved and the physical-row estimate above stays exact.
-                self.rows.push(TranscriptRow::with_line(
-                    Line::from(Span::styled(format!("{prefix}{line}"), dim_style())),
-                    Some("    "),
-                ));
-            }
+            self.push_output_line(raw, shown == 0);
             physical += rows;
             shown += 1;
-            first = false;
         }
         let hidden = total_logical.saturating_sub(shown);
         if hidden > 0 {
             self.push(&format!("    … +{hidden} lines"), dim_style());
+        }
+    }
+
+    /// TAIL-capped tool output for the LIVE streaming cell: show the most recent
+    /// physical rows so a growing stream scrolls instead of freezing on its
+    /// head, with a leading `… +N earlier lines` note when output was dropped.
+    fn push_tool_output_tail(&mut self, content: &str) {
+        if content.is_empty() {
+            self.push("  └ (no output)", dim_style());
+            return;
+        }
+        let width = self.wrap_width();
+        let lines: Vec<&str> = content.lines().collect();
+        // Walk from the end, accumulating physical rows until the budget, so the
+        // newest output is what stays visible.
+        let mut physical = 0usize;
+        let mut take = 0usize;
+        for raw in lines.iter().rev() {
+            let rows =
+                wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width);
+            if take > 0 && physical + rows > MAX_TOOL_OUTPUT_ROWS {
+                break;
+            }
+            physical += rows;
+            take += 1;
+        }
+        let start = lines.len() - take;
+        if start > 0 {
+            self.push(&format!("  └ … +{start} earlier lines"), dim_style());
+        }
+        for (offset, raw) in lines[start..].iter().enumerate() {
+            // Use the head gutter for the very first visible row only when no
+            // earlier-lines note took it.
+            self.push_output_line(raw, start == 0 && offset == 0);
         }
     }
 
@@ -551,6 +753,35 @@ impl Transcript {
                 // Non-gated tools show only their result row; nothing to render.
                 self.finish_stream();
             }
+            UiEvent::ToolStarted(call) => {
+                // Exploration tools (read/grep/find/ls) stay grouped under
+                // `Explored` and render nothing until their result; only a
+                // non-exploration tool opens a live `Running` exec cell.
+                if is_exploration_tool(&call) {
+                    self.finish_stream();
+                } else {
+                    self.begin_exec(call);
+                }
+            }
+            UiEvent::ToolOutputDelta { call_id, chunk } => {
+                if self
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|a| a.call.id == call_id)
+                {
+                    if let Some(active) = self.active_exec.as_mut() {
+                        active.output.push_str(&chunk);
+                        // Bound the re-rendered buffer to its tail; only ~24 rows
+                        // ever show and the full output arrives with the result.
+                        if active.output.len() > MAX_EXEC_STREAM_BYTES {
+                            let cut = active.output.len() - MAX_EXEC_STREAM_BYTES;
+                            let cut = active.output.ceil_char_boundary(cut);
+                            active.output.drain(..cut);
+                        }
+                    }
+                    self.relayout_active_running();
+                }
+            }
             UiEvent::ToolAutoApproved(call) => {
                 self.record_approval(&call, ApprovalDecision::AllowAlways);
             }
@@ -567,11 +798,32 @@ impl Transcript {
                     "  │ ",
                 );
             }
-            UiEvent::ToolResult { call, content } => {
-                self.push_tool_result(&call, &content);
+            UiEvent::ToolResult {
+                call,
+                content,
+                exit_code,
+                duration,
+            } => {
+                if self
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|a| a.call.id == call.id)
+                {
+                    self.finalize_active(&call, &content, exit_code, duration);
+                } else {
+                    self.push_tool_result(&call, &content, exit_code, duration);
+                }
             }
             UiEvent::ToolError { call, message } => {
-                self.push_tool_error(&call, &message);
+                if self
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|a| a.call.id == call.id)
+                {
+                    self.finalize_active_error(&call, &message);
+                } else {
+                    self.push_tool_error(&call, &message);
+                }
             }
             UiEvent::Notice(message) => {
                 self.begin_block();
@@ -808,6 +1060,13 @@ impl Screen {
             self.transcript.rows.len()
         };
         let drained: Vec<TranscriptRow> = self.transcript.rows.drain(..commit_point).collect();
+        // The drain shifts every surviving row down by `commit_point`; keep the
+        // open exec cell's body anchor pointing at its (now-relocated) header so
+        // in-place finalize/relayout still target the right rows. `commit_point`
+        // never exceeds the active block's start, so this stays non-negative.
+        if let Some(active) = self.transcript.active_exec.as_mut() {
+            active.body_start = active.body_start.saturating_sub(commit_point);
+        }
         let mut out = Vec::new();
         for row in &drained {
             row.render(w, &mut out);
@@ -1375,6 +1634,8 @@ mod tests {
         screen.apply(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "echo hi" })),
             content: "a\nb".to_string(),
+            exit_code: None,
+            duration: None,
         });
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(texts.iter().any(|t| t == "• Ran echo hi"));
@@ -1389,6 +1650,8 @@ mod tests {
         screen.apply(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "printf color" })),
             content: "\x1b[31mred\x1b[0m plain".to_string(),
+            exit_code: None,
+            duration: None,
         });
         let lines = screen.wrapped_lines(80);
         let output = line_matching(&lines, |line| line_text(line).contains("red plain"));
@@ -1407,6 +1670,8 @@ mod tests {
         screen.apply(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "printf color" })),
             content: "\x1b[31mabcdefghijklmnopqrstuvwxyz\x1b[0m".to_string(),
+            exit_code: None,
+            duration: None,
         });
         // Narrow width forces the styled row across multiple physical lines.
         let lines = screen.wrapped_lines(10);
@@ -1439,6 +1704,8 @@ mod tests {
         screen.apply(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "big" })),
             content,
+            exit_code: None,
+            duration: None,
         });
         let lines = screen.wrapped_lines(80);
         let output_rows = lines.iter().filter(|l| line_text(l).contains('x')).count();
@@ -1460,6 +1727,8 @@ mod tests {
         screen.apply(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "true" })),
             content: String::new(),
+            exit_code: None,
+            duration: None,
         });
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(texts.iter().any(|t| t == "• Ran true"));
@@ -1538,10 +1807,14 @@ mod tests {
         screen.apply(UiEvent::ToolResult {
             call: call("read"),
             content: "ignored file body".to_string(),
+            exit_code: None,
+            duration: None,
         });
         screen.apply(UiEvent::ToolResult {
             call: call_args("grep", json!({ "pattern": "needle", "path": "src" })),
             content: "ignored grep body".to_string(),
+            exit_code: None,
+            duration: None,
         });
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert_eq!(
@@ -1563,6 +1836,8 @@ mod tests {
                 json!({ "command": "node -e 'const fs=require(\"fs\"); const p=\"CHANGELOG.md\"; console.log(p)'" }),
             ),
             content: String::new(),
+            exit_code: None,
+            duration: None,
         });
         let lines: Vec<String> = screen.wrapped_lines(34).iter().map(line_text).collect();
         assert!(lines.iter().any(|line| line.starts_with("• Ran node -e")));
@@ -1579,6 +1854,8 @@ mod tests {
                 json!({ "command": "rm -rf tmp && mkdir -p tmp && printf 'Created tmp directory\\n' && pwd && ls -ld tmp", "timeout": 120 }),
             ),
             content: "Created tmp directory\n/home/someotherguy/projects/iris-tool-output\ndrwxrwxr-x 2 someotherguy someotherguy 4096 Jun 17 23:59 tmp".to_string(),
+            exit_code: None,
+            duration: None,
         });
         let lines = screen.wrapped_lines(80);
         let continuation = line_matching(&lines, |line| line_text(line).starts_with("  │ "));
@@ -1734,6 +2011,8 @@ mod tests {
         screen.apply(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "echo hi" })),
             content: "hi".to_string(),
+            exit_code: None,
+            duration: None,
         });
         draw_step(&mut terminal, &mut screen)?;
         screen.end_turn();
@@ -1926,6 +2205,215 @@ mod tests {
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("/exit"));
         assert!(!rendered.contains("/quit"), "filtered to /exit only");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_started_opens_running_cell_live_not_in_scrollback() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call));
+        // The live viewport shows the Running header.
+        let live: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
+        assert!(
+            live.iter().any(|l| l.contains("\u{2022} Running echo hi")),
+            "running header not live: {live:?}"
+        );
+        // While the turn runs, the Running block stays live (not committed).
+        let committed: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
+        assert!(
+            !committed.iter().any(|l| l.contains("Running")),
+            "running cell committed to scrollback too early: {committed:?}"
+        );
+    }
+
+    #[test]
+    fn tool_output_deltas_append_under_gutter_and_are_flood_capped() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = screen.wrapped_lines(80); // prime last_width
+        let call = call_args("bash", json!({ "command": "flood" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        // Stream a flood of long lines; the growing tail must respect the cap.
+        let long = "x".repeat(400);
+        for _ in 0..50 {
+            screen.apply(UiEvent::ToolOutputDelta {
+                call_id: call.id.clone(),
+                chunk: format!("{long}\n"),
+            });
+        }
+        let lines = screen.wrapped_lines(80);
+        let output_rows = lines.iter().filter(|l| line_text(l).contains('x')).count();
+        assert!(
+            output_rows <= MAX_TOOL_OUTPUT_ROWS,
+            "streamed output not flood-capped: {output_rows} rows"
+        );
+        // Still streaming: the Running header is present, not yet finalized.
+        assert!(lines.iter().any(|l| line_text(l).contains("Running flood")));
+    }
+
+    #[test]
+    fn live_cell_shows_newest_streamed_lines_not_frozen_head() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = screen.wrapped_lines(80); // prime last_width
+        let call = call_args("bash", json!({ "command": "seq" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        // Stream more short lines than the row budget; the live tail must scroll
+        // to the newest output rather than freezing on the earliest lines.
+        for i in 0..100 {
+            screen.apply(UiEvent::ToolOutputDelta {
+                call_id: call.id.clone(),
+                chunk: format!("line {i}\n"),
+            });
+        }
+        let lines: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
+        assert!(
+            lines.iter().any(|l| l.contains("line 99")),
+            "newest line not shown: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("line 0\u{0}") || l.ends_with("line 0")),
+            "earliest line should have scrolled off: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("earlier lines")),
+            "missing dropped-earlier-lines indicator: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn exec_cell_finalizes_in_place_with_green_bullet_and_duration() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "hi\n".to_string(),
+        });
+        let sep_before = screen
+            .transcript
+            .rows
+            .iter()
+            .filter(|r| is_separator_row(r))
+            .count();
+        screen.apply(UiEvent::ToolResult {
+            call: call.clone(),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(std::time::Duration::from_millis(1200)),
+        });
+        // Finalize must not open a new block (same separator count).
+        let sep_after = screen
+            .transcript
+            .rows
+            .iter()
+            .filter(|r| is_separator_row(r))
+            .count();
+        assert_eq!(sep_before, sep_after, "finalize opened a new block");
+        let lines = screen.wrapped_lines(80);
+        assert!(
+            !lines.iter().any(|l| line_text(l).contains("Running")),
+            "Running header not replaced in place"
+        );
+        let header = line_matching(&lines, |l| line_text(l).contains("Ran echo hi"));
+        assert_eq!(header.spans[0].content.as_ref(), "\u{2022}");
+        assert_eq!(header.spans[0].style, ok_style());
+        assert!(
+            line_text(header).contains("(1.2s)"),
+            "duration suffix missing: {}",
+            line_text(header)
+        );
+    }
+
+    #[test]
+    fn exec_cell_nonzero_exit_shows_red_cross_bullet() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let call = call_args("bash", json!({ "command": "false" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call: call.clone(),
+            content: "boom".to_string(),
+            exit_code: Some(1),
+            duration: Some(std::time::Duration::from_millis(50)),
+        });
+        let lines = screen.wrapped_lines(80);
+        let header = line_matching(&lines, |l| line_text(l).contains("Ran false"));
+        assert_eq!(header.spans[0].content.as_ref(), "\u{2717}");
+        assert_eq!(header.spans[0].style, err_style());
+        assert!(line_text(header).contains("(50ms)"));
+    }
+
+    #[test]
+    fn exec_cell_error_keeps_streamed_output() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let call = call_args("bash", json!({ "command": "sleep 9" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "partial line\n".to_string(),
+        });
+        // Cancellation finalizes as a ToolError but keeps whatever streamed.
+        screen.apply(UiEvent::ToolError {
+            call: call.clone(),
+            message: "cancelled".to_string(),
+        });
+        let lines: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
+        assert!(lines.iter().any(|l| l.contains("\u{2717} Ran sleep 9")));
+        assert!(
+            lines.iter().any(|l| l.contains("partial line")),
+            "streamed output lost on error finalize: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("error: cancelled")));
+    }
+
+    #[test]
+    fn streamed_exec_cell_lands_in_scrollback_after_finalize() -> Result<()> {
+        let mut backend = TestBackend::new(40, 14);
+        backend.set_cursor_position(ratatui::layout::Position::new(0, 13))?;
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
+            },
+        )?;
+        let mut screen = Screen::new();
+        screen.commit_user("run it");
+        screen.start_turn();
+        draw_step(&mut terminal, &mut screen)?;
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        draw_step(&mut terminal, &mut screen)?;
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "hi\n".to_string(),
+        });
+        draw_step(&mut terminal, &mut screen)?;
+        screen.apply(UiEvent::ToolResult {
+            call: call.clone(),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(std::time::Duration::from_millis(10)),
+        });
+        draw_step(&mut terminal, &mut screen)?;
+        screen.end_turn();
+        draw_step(&mut terminal, &mut screen)?;
+        // The finalized exec cell reached native scrollback and left the live model.
+        let everything = visible_and_scrollback_text(&terminal);
+        assert!(
+            everything.contains("Ran echo hi"),
+            "finalized exec cell missing from scrollback: {everything:?}"
+        );
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "exec rows not drained out of the live viewport"
+        );
         Ok(())
     }
 }

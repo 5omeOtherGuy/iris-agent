@@ -382,10 +382,23 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 self.in_tool_block = false;
                 self.exploring_open = false;
             }
-            UiEvent::ToolResult { call, content } => {
+            UiEvent::ToolStarted(_) | UiEvent::ToolOutputDelta { .. } => {
+                // Non-interactive fallback: no live viewport, so a running tool
+                // stays buffered until its whole result arrives. Streaming
+                // deltas and the start signal render nothing here.
+            }
+            UiEvent::ToolResult {
+                call,
+                content,
+                exit_code,
+                ..
+            } => {
                 self.finish_assistant_stream()?;
                 if is_exploration_tool(&call) {
                     self.write_explored(&call)?;
+                } else if exit_code.is_some_and(|code| code != 0) {
+                    self.write_header("31", "✗", &format!("Ran {}", run_target(&call)))?;
+                    self.write_tool_output(&content)?;
                 } else {
                     self.write_header("2", "•", &format!("Ran {}", run_target(&call)))?;
                     self.write_tool_output(&content)?;
@@ -727,6 +740,8 @@ mod tests {
         ui.emit(UiEvent::ToolResult {
             call: call("read"),
             content: "a\nb\n".to_string(),
+            exit_code: None,
+            duration: None,
         })?;
         let (_, out, _) = ui.into_parts();
         let rendered = String::from_utf8(out)?;
@@ -744,6 +759,8 @@ mod tests {
         ui.emit(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "printf rows" })),
             content,
+            exit_code: None,
+            duration: None,
         })?;
         let (_, out, _) = ui.into_parts();
         let rendered = String::from_utf8(out)?;

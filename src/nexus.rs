@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use futures::Stream;
@@ -68,6 +69,10 @@ pub(crate) enum AgentEvent {
     AssistantTextDelta(String),
     AssistantTextEnd(String),
     ToolProposed(ToolCall),
+    /// A tool is about to execute (emitted once per call, immediately before the
+    /// run, on both the exclusive and parallel paths). Lets a front-end open a
+    /// live progress cell before any output arrives. Display-only.
+    ToolStarted(ToolCall),
     /// A gated tool was auto-approved by the session allow-policy. Emitted by
     /// Nexus, never inferred by a front-end, so the policy stays Nexus-owned.
     ToolAutoApproved(ToolCall),
@@ -79,6 +84,19 @@ pub(crate) enum AgentEvent {
     ToolResult {
         call: ToolCall,
         content: String,
+        /// Process exit code for a shell-like tool (`Some(0)`/`None` is success,
+        /// non-zero is failure). `None` for tools that have no exit status.
+        exit_code: Option<i32>,
+        /// Wall-clock execution time, when the tool reports it.
+        duration: Option<Duration>,
+    },
+    /// A display-only chunk of a running tool's live output (issue #90 sub-item
+    /// 1). Carries the originating call id so a front-end attaches it to the
+    /// right live cell. NEVER pushed to `self.messages`: the full output reaches
+    /// provider context once, via the tool's final `ToolResult`.
+    ToolOutputDelta {
+        call_id: String,
+        chunk: String,
     },
     ToolError {
         call: ToolCall,
@@ -131,6 +149,19 @@ pub(crate) trait ToolOutputStore {
     /// be stable for identical content so a resumed transcript keeps pointing at
     /// the same stored output (the harness impl is content-addressed).
     fn put(&self, content: &str) -> Result<String>;
+}
+
+/// Display-only live-output sink for a running tool (issue #90 sub-item 1). A
+/// long-running tool (today only `bash`) forwards each output chunk here as it
+/// is produced; Nexus wraps it per-call and re-emits an
+/// [`AgentEvent::ToolOutputDelta`] so the front-end can stream the command's
+/// output live. `None` keeps a tool non-streaming (the parallel/exploration
+/// path and tests inject `None`). Chunks are display-only and NEVER enter
+/// provider context. Mirrors the optional [`ToolOutputStore`] seam.
+pub(crate) trait ToolOutputSink {
+    /// Forward one freshly produced output chunk (lossy-UTF-8 decoded) to the
+    /// front-end. Best-effort: a delivery failure never aborts the tool.
+    fn emit_chunk(&self, chunk: &str);
 }
 
 /// Request/response approval gate. Async so the loop can race a pending approval
@@ -186,6 +217,11 @@ pub(crate) struct ToolEnv<'a> {
     /// `None` keeps every output inline (no durable session storage available),
     /// preserving the original in-memory behavior. Harness-owned, injected here.
     pub(crate) output_store: Option<&'a dyn ToolOutputStore>,
+    /// Optional live-output sink for streaming a running tool's output (issue
+    /// #90 sub-item 1). `None` (the harness default) keeps the tool
+    /// non-streaming; Nexus injects a per-call sink on the exclusive path so a
+    /// streaming tool's chunks reach the front-end as display-only deltas.
+    pub(crate) output_sink: Option<&'a dyn ToolOutputSink>,
 }
 
 /// A tool the agent can invoke. Mirrors pi-ai's `Tool`
@@ -652,6 +688,7 @@ impl<P: ChatProvider> Agent<P> {
                 }
                 for call in &calls[idx..end] {
                     obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+                    obs.on_event(AgentEvent::ToolStarted(call.clone()))?;
                 }
                 // Scope the borrow of `self.tools` so it drops before the
                 // transcript pushes below.
@@ -764,7 +801,26 @@ impl<P: ChatProvider> Agent<P> {
         // Resolve again for execution (the approval borrow above has ended); an
         // unknown tool yields the same `unknown tool: <name>` result as before.
         let outcome = match self.tools.by_name(&call.name) {
-            Some(tool) => run_tool(tool, &call.arguments, env, token.child_token()).await,
+            Some(tool) => {
+                // Announce execution start (so a front-end opens a live cell)
+                // only for a real tool, then inject a per-call streaming emitter
+                // for the run. An unknown tool never opens a phantom cell and
+                // keeps an exact ToolStarted/ToolResult pairing. Only this
+                // exclusive path streams (the parallel/exploration path stays
+                // sink-less), so a single live exec cell is always enough.
+                obs.on_event(AgentEvent::ToolStarted(call.clone()))?;
+                let emitter = ToolDeltaEmitter {
+                    obs,
+                    call_id: call.id.clone(),
+                };
+                let call_env = ToolEnv {
+                    workspace: env.workspace,
+                    state: env.state,
+                    output_store: env.output_store,
+                    output_sink: Some(&emitter),
+                };
+                run_tool(tool, &call.arguments, &call_env, token.child_token()).await
+            }
             None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
         };
         Ok(outcome)
@@ -773,6 +829,27 @@ impl<P: ChatProvider> Agent<P> {
     fn emit_interrupted(&self, obs: &dyn AgentObserver) -> Result<()> {
         obs.on_event(AgentEvent::Notice(INTERRUPT_NOTICE.to_string()))?;
         obs.on_event(AgentEvent::TurnComplete)
+    }
+}
+
+/// Per-call streaming emitter injected into a tool's [`ToolEnv`] on the
+/// exclusive execution path. Forwards each chunk the tool produces to the
+/// observer as a display-only [`AgentEvent::ToolOutputDelta`] tagged with the
+/// call id, so the front-end attaches the live output to the right cell. The
+/// observer error is intentionally swallowed: a streamed-progress delivery
+/// failure must not abort the tool, whose final result still flows through
+/// [`record_call`].
+struct ToolDeltaEmitter<'a> {
+    obs: &'a dyn AgentObserver,
+    call_id: String,
+}
+
+impl ToolOutputSink for ToolDeltaEmitter<'_> {
+    fn emit_chunk(&self, chunk: &str) {
+        let _ = self.obs.on_event(AgentEvent::ToolOutputDelta {
+            call_id: self.call_id.clone(),
+            chunk: chunk.to_string(),
+        });
     }
 }
 
@@ -844,12 +921,26 @@ fn record_call(
     // would be flushed to disk and rejected by the next provider request.
     messages.push(Message::assistant_tool_call(call));
     let event = match outcome {
-        ToolOutcome::Ok(output) => {
+        ToolOutcome::Ok(mut output) => {
             tracing::info!(tool = %call.name, ok = true, "tool executed");
             // The observer still receives the full output: offloading only keeps
             // the oversized payload out of provider context, never out of the
             // user-facing display (which folds it to a preview itself).
             let content = output.content.clone();
+            // Lift the display-only exec metadata out of the output BEFORE
+            // serialization so the non-deterministic duration and the exit code
+            // ride the event, never entering provider context (and the wire
+            // shape stays byte-identical to a plain text-only result).
+            let exit_code = output
+                .metadata
+                .remove("exitCode")
+                .and_then(|value| value.as_i64())
+                .map(|code| code as i32);
+            let duration = output
+                .metadata
+                .remove("durationMs")
+                .and_then(|value| value.as_u64())
+                .map(Duration::from_millis);
             messages.push(Message::tool_result(
                 &call.id,
                 &call.name,
@@ -858,6 +949,8 @@ fn record_call(
             AgentEvent::ToolResult {
                 call: call.clone(),
                 content,
+                exit_code,
+                duration,
             }
         }
         ToolOutcome::Err(error) => {
