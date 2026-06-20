@@ -370,10 +370,7 @@ impl<P: ChatProvider> Harness<P> {
         // Never begin a covered range on an orphan tool fragment.
         while start < end
             && (messages[start].role == Role::Tool
-                || messages[start].role == Role::AssistantToolCall
-                || (messages[start].role == Role::Assistant
-                    && start > 0
-                    && messages[start - 1].role == Role::AssistantReasoning))
+                || messages[start].role == Role::AssistantToolCall)
         {
             start += 1;
         }
