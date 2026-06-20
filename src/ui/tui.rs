@@ -162,10 +162,10 @@ fn push_wrapped_row(
         .unwrap_or_default();
     for physical in wrap_to_width(remainder, continuation_width) {
         if !physical.is_empty() {
-            out.push(Line::from(Span::styled(
-                format!("{prefix}{physical}"),
-                style,
-            )));
+            out.push(Line::from(vec![
+                Span::styled(prefix, dim_style()),
+                Span::styled(physical, style),
+            ]));
         }
     }
 }
@@ -895,6 +895,13 @@ mod tests {
             .collect()
     }
 
+    fn line_matching<'a>(
+        lines: &'a [Line<'static>],
+        predicate: impl Fn(&Line<'static>) -> bool,
+    ) -> &'a Line<'static> {
+        lines.iter().find(|line| predicate(line)).expect("line")
+    }
+
     #[test]
     fn streaming_deltas_commit_once_without_duplication() {
         let mut screen = Screen::new();
@@ -997,6 +1004,24 @@ mod tests {
         assert!(lines.iter().any(|line| line.starts_with("• Ran node -e")));
         assert!(lines.iter().any(|line| line.starts_with("  │ ")));
         assert!(lines.iter().any(|line| line == "  └ (no output)"));
+    }
+
+    #[test]
+    fn long_run_header_gutter_does_not_inherit_bold() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args(
+                "bash",
+                json!({ "command": "rm -rf tmp && mkdir -p tmp && printf 'Created tmp directory\\n' && pwd && ls -ld tmp", "timeout": 120 }),
+            ),
+            content: "Created tmp directory\n/home/someotherguy/projects/iris-tool-output\ndrwxrwxr-x 2 someotherguy someotherguy 4096 Jun 17 23:59 tmp".to_string(),
+        });
+        let lines = screen.wrapped_lines(80);
+        let continuation = line_matching(&lines, |line| line_text(line).starts_with("  │ "));
+        assert_eq!(continuation.spans.len(), 2);
+        assert_eq!(continuation.spans[0].content.as_ref(), "  │ ");
+        assert_eq!(continuation.spans[0].style, dim_style());
+        assert_eq!(continuation.spans[1].style, tool_header_style());
     }
 
     #[test]
