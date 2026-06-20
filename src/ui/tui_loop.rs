@@ -129,7 +129,6 @@ async fn session_loop<P: ChatProvider>(
                     for line in lines {
                         tui.screen.apply_event(UiEvent::Notice(line));
                     }
-                    tui.screen.follow_bottom();
                     tui.draw()?;
                     continue;
                 }
