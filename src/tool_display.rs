@@ -47,6 +47,53 @@ pub(crate) fn summarize(call: &ToolCall) -> String {
     }
 }
 
+/// What the terminal should say a shell-like tool ran. For `bash`, Codex shows
+/// the command itself (`npm install`), not the transport tool name (`bash npm
+/// install`). Non-shell tools keep the ordinary one-line summary.
+pub(crate) fn run_target(call: &ToolCall) -> String {
+    if call.name != "bash" {
+        return summarize(call);
+    }
+    let Some(command) = call.arguments.get("command").and_then(Value::as_str) else {
+        return fallback_summary(call);
+    };
+    let (line, hidden) = bash_display_line(command);
+    let mut target = truncate_inline(line, MAX_SUMMARY_CHARS);
+    if hidden > 0 {
+        let plural = if hidden == 1 { "" } else { "s" };
+        target.push_str(&format!(" (+{hidden} more line{plural})"));
+    }
+    match call.arguments.get("timeout").and_then(Value::as_u64) {
+        Some(0) => target.push_str(" (no timeout)"),
+        Some(n) => target.push_str(&format!(" (timeout {n}s)")),
+        None => {}
+    }
+    target
+}
+
+pub(crate) fn is_exploration_tool(call: &ToolCall) -> bool {
+    matches!(call.name.as_str(), "read" | "grep" | "find" | "ls")
+}
+
+pub(crate) fn exploration_summary(call: &ToolCall) -> String {
+    let summary = summarize(call);
+    match call.name.as_str() {
+        "read" => summary
+            .strip_prefix("read ")
+            .map_or_else(|| summary.clone(), |rest| format!("Read {rest}")),
+        "grep" => summary
+            .strip_prefix("grep ")
+            .map_or_else(|| summary.clone(), |rest| format!("Search {rest}")),
+        "find" => summary
+            .strip_prefix("find ")
+            .map_or_else(|| summary.clone(), |rest| format!("Find {rest}")),
+        "ls" => summary
+            .strip_prefix("ls ")
+            .map_or_else(|| summary.clone(), |rest| format!("List {rest}")),
+        _ => summary,
+    }
+}
+
 /// Fold a tool-output body to a bounded preview plus a hidden-line count.
 ///
 /// Line-bounded first (keep at most [`MAX_DISPLAY_LINES`] source lines), then a
@@ -349,6 +396,21 @@ mod tests {
         assert_eq!(
             summarize(&call("bash", json!({ "command": "echo hi", "timeout": 0 }))),
             "bash echo hi (no timeout)"
+        );
+    }
+
+    #[test]
+    fn run_target_omits_bash_transport_prefix() {
+        assert_eq!(
+            run_target(&call(
+                "bash",
+                json!({ "command": "set -e\nnpm install", "timeout": 5 })
+            )),
+            "npm install (+1 more line) (timeout 5s)"
+        );
+        assert_eq!(
+            exploration_summary(&call("grep", json!({ "pattern": "needle", "path": "src" }))),
+            "Search needle in src"
         );
     }
 

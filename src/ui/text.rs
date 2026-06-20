@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::approval::parse_decision;
 use crate::nexus::{ApprovalDecision, ToolCall};
-use crate::tool_display::{fold, summarize};
+use crate::tool_display::{exploration_summary, fold, is_exploration_tool, run_target, summarize};
 use crate::ui::{TurnErrorKind, Ui, UiEvent};
 
 // Bracketed-paste control sequences. Enabling makes the terminal wrap pasted
@@ -60,6 +60,7 @@ pub(crate) struct TextUi<R, W, E> {
     // we emit exactly one blank-line separator before each block, not between
     // its sub-parts.
     in_tool_block: bool,
+    exploring_open: bool,
 }
 
 impl TextUi<BufReader<Stdin>, Stdout, Stderr> {
@@ -83,6 +84,7 @@ impl<R, W, E> TextUi<R, W, E> {
             paste_terminal: false,
             assistant_stream_open: false,
             in_tool_block: false,
+            exploring_open: false,
         }
     }
 
@@ -113,6 +115,7 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
         if !self.in_tool_block {
             writeln!(self.out)?;
             self.in_tool_block = true;
+            self.exploring_open = false;
         }
         Ok(())
     }
@@ -159,10 +162,63 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
         body
     }
 
-    /// Render a tool result/denied/error row plus an optional folded body.
-    fn write_tool_row(&mut self, glyph_code: &str, glyph: &str, head: String) -> Result<()> {
+    fn write_header(&mut self, marker_code: &str, marker: &str, head: &str) -> Result<()> {
         self.start_block()?;
-        writeln!(self.out, "{} {}", sgr(self.ansi, glyph_code, glyph), head)?;
+        writeln!(self.out, "{} {}", sgr(self.ansi, marker_code, marker), head)?;
+        Ok(())
+    }
+
+    fn write_tool_output(&mut self, content: &str) -> Result<()> {
+        if content.is_empty() {
+            writeln!(self.out, "  └ {}", sgr(self.ansi, "2", "(no output)"))?;
+            self.in_tool_block = false;
+            self.exploring_open = false;
+            return Ok(());
+        }
+
+        let folded = fold(content);
+        let mut first = true;
+        for line in folded.preview.lines() {
+            let prefix = if first { "  └ " } else { "    " };
+            writeln!(
+                self.out,
+                "{}{}",
+                sgr(self.ansi, "2", prefix),
+                sgr(self.ansi, "2", line)
+            )?;
+            first = false;
+        }
+        if folded.hidden_lines > 0 {
+            writeln!(
+                self.out,
+                "    {}",
+                sgr(
+                    self.ansi,
+                    "2",
+                    &format!(
+                        "… +{} lines (ctrl + t to view transcript)",
+                        folded.hidden_lines
+                    ),
+                )
+            )?;
+        }
+        self.in_tool_block = false;
+        self.exploring_open = false;
+        Ok(())
+    }
+
+    fn write_explored(&mut self, call: &ToolCall) -> Result<()> {
+        if !self.exploring_open {
+            self.start_block()?;
+            writeln!(self.out, "{} Explored", sgr(self.ansi, "2", "•"))?;
+            self.exploring_open = true;
+        }
+        writeln!(
+            self.out,
+            "{} {}",
+            sgr(self.ansi, "2", "  └"),
+            exploration_summary(call)
+        )?;
         self.in_tool_block = false;
         Ok(())
     }
@@ -240,6 +296,7 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
     fn next_prompt(&mut self) -> Result<Option<String>> {
         self.finish_assistant_stream()?;
         self.in_tool_block = false;
+        self.exploring_open = false;
         write!(self.out, "{} ", sgr(self.ansi, "1;36", "iris>"))?;
         self.out.flush()?;
 
@@ -257,6 +314,7 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             UiEvent::SessionStarted => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;
+                self.exploring_open = false;
                 for line in BANNER_LINES {
                     writeln!(self.out, "{}", sgr(self.ansi, "38;5;213", line))?;
                 }
@@ -280,11 +338,13 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             UiEvent::AssistantText(text) => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;
+                self.exploring_open = false;
                 writeln!(self.out, "{} {text}", sgr(self.ansi, "1;35", "assistant>"))?;
             }
             UiEvent::AssistantTextDelta(delta) => {
                 if !self.assistant_stream_open {
                     self.in_tool_block = false;
+                    self.exploring_open = false;
                     write!(self.out, "{} ", sgr(self.ansi, "1;35", "assistant>"))?;
                     self.assistant_stream_open = true;
                 }
@@ -302,15 +362,13 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             }
             UiEvent::ToolAutoApproved(call) => {
                 self.finish_assistant_stream()?;
-                self.start_block()?;
-                writeln!(
-                    self.out,
-                    "{}",
-                    sgr(
-                        self.ansi,
-                        "2",
-                        &format!("auto-approved \u{b7} {} \u{b7} session", summarize(&call)),
-                    )
+                self.write_header(
+                    "32",
+                    "✔",
+                    &format!(
+                        "You approved iris to run {} this session",
+                        run_target(&call)
+                    ),
                 )?;
             }
             UiEvent::DiffPreview { call, diff } => {
@@ -322,52 +380,35 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             }
             UiEvent::ToolDenied(call) => {
                 self.finish_assistant_stream()?;
-                let head = format!("denied \u{b7} {}", summarize(&call));
-                self.write_tool_row("31", "\u{2717}", head)?;
+                self.write_header("31", "✗", &format!("Denied {}", run_target(&call)))?;
+                self.in_tool_block = false;
+                self.exploring_open = false;
             }
             UiEvent::ToolResult { call, content } => {
                 self.finish_assistant_stream()?;
-                let lines = content.lines().count();
-                let head = if content.is_empty() {
-                    summarize(&call)
+                if is_exploration_tool(&call) {
+                    self.write_explored(&call)?;
                 } else {
-                    let plural = if lines == 1 { "" } else { "s" };
-                    format!("{} \u{b7} {lines} line{plural}", summarize(&call))
-                };
-                self.write_tool_row("32", "\u{2713}", head)?;
-                let folded = fold(&content);
-                if !folded.preview.is_empty() {
-                    for line in folded.preview.lines() {
-                        writeln!(self.out, "    {line}")?;
-                    }
-                }
-                // ponytail: static "(+N more lines)" indicator; interactive
-                // expand-on-keypress needs raw mode and is deferred to the
-                // future full-TUI milestone.
-                if folded.hidden_lines > 0 {
-                    writeln!(
-                        self.out,
-                        "    {}",
-                        sgr(
-                            self.ansi,
-                            "2",
-                            &format!("\u{2026} (+{} more lines)", folded.hidden_lines),
-                        )
-                    )?;
+                    self.write_header("2", "•", &format!("Ran {}", run_target(&call)))?;
+                    self.write_tool_output(&content)?;
                 }
             }
             UiEvent::ToolError { call, message } => {
                 self.finish_assistant_stream()?;
-                let head = summarize(&call);
-                self.write_tool_row("31", "\u{2717}", head)?;
+                self.write_header("31", "✗", &format!("Ran {}", run_target(&call)))?;
                 writeln!(
                     self.out,
-                    "    {}",
+                    "{}{}",
+                    sgr(self.ansi, "2", "  └ "),
                     sgr(self.ansi, "31", &format!("error: {message}"))
                 )?;
+                self.in_tool_block = false;
+                self.exploring_open = false;
             }
             UiEvent::Notice(message) => {
                 self.finish_assistant_stream()?;
+                self.in_tool_block = false;
+                self.exploring_open = false;
                 writeln!(
                     self.out,
                     "{}",
@@ -392,6 +433,7 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             UiEvent::TurnComplete => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;
+                self.exploring_open = false;
             }
         }
         Ok(())
@@ -427,9 +469,27 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             let always = matches!(trimmed.as_str(), "a" | "always");
             if matches!(trimmed.as_str(), "" | "y" | "yes" | "n" | "no") || (always && allow_always)
             {
+                let decision = parse_decision(&cleaned);
+                match decision {
+                    ApprovalDecision::Allow => {
+                        self.write_header(
+                            "32",
+                            "✔",
+                            &format!("You approved iris to run {} this time", run_target(call)),
+                        )?;
+                    }
+                    ApprovalDecision::AllowAlways => {
+                        self.write_header(
+                            "32",
+                            "✔",
+                            &format!("You approved iris to run {} this session", run_target(call)),
+                        )?;
+                    }
+                    ApprovalDecision::Deny => {}
+                }
                 // Leave `in_tool_block` set so the result/denied row Nexus emits
                 // next attaches to this same block (no extra separator).
-                return Ok(parse_decision(&cleaned));
+                return Ok(decision);
             }
 
             let retry = if allow_always {
@@ -457,10 +517,14 @@ mod tests {
     use serde_json::json;
 
     fn call(name: &str) -> ToolCall {
+        call_args(name, json!({ "path": "note.txt", "content": "hi" }))
+    }
+
+    fn call_args(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "call_1".to_string(),
             name: name.to_string(),
-            arguments: json!({ "path": "note.txt", "content": "hi" }),
+            arguments,
         }
     }
 
@@ -648,15 +712,16 @@ mod tests {
             .join("\n");
         let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
         ui.emit(UiEvent::ToolResult {
-            call: call("read"),
+            call: call_args("bash", json!({ "command": "printf rows" })),
             content,
         })?;
         let (_, out, _) = ui.into_parts();
         let rendered = String::from_utf8(out)?;
-        assert!(rendered.contains("\u{2713} read note.txt \u{b7} 40 lines"));
-        assert!(rendered.contains("row 0"));
+        assert!(rendered.contains("• Ran printf rows"));
+        assert!(rendered.contains("  └ row 0"));
+        assert!(rendered.contains("    row 1"));
         assert!(!rendered.contains("row 39"));
-        assert!(rendered.contains("more lines)"));
+        assert!(rendered.contains("… +28 lines (ctrl + t to view transcript)"));
         Ok(())
     }
 }

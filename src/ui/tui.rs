@@ -34,8 +34,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::nexus::ToolCall;
-use crate::tool_display::{fold, summarize};
+use crate::nexus::{ApprovalDecision, ToolCall};
+use crate::tool_display::{exploration_summary, fold, is_exploration_tool, run_target, summarize};
 use crate::ui::slash::{self, Palette, SlashCommand};
 use crate::ui::{TurnErrorKind, UiEvent};
 
@@ -78,6 +78,9 @@ fn prompt_style() -> Style {
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
 }
+fn tool_header_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
 fn banner_style() -> Style {
     Style::default().fg(Color::Magenta)
 }
@@ -100,6 +103,7 @@ fn char_width(c: char) -> usize {
 struct TranscriptRow {
     text: String,
     style: Style,
+    continuation_prefix: Option<&'static str>,
 }
 
 impl TranscriptRow {
@@ -107,17 +111,62 @@ impl TranscriptRow {
         Self {
             text: text.into(),
             style,
+            continuation_prefix: None,
+        }
+    }
+
+    fn with_continuation(
+        text: impl Into<String>,
+        style: Style,
+        continuation_prefix: &'static str,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            continuation_prefix: Some(continuation_prefix),
         }
     }
 
     fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
-        push_wrapped_row(&self.text, self.style, width, out);
+        push_wrapped_row(&self.text, self.style, width, self.continuation_prefix, out);
     }
 }
 
-fn push_wrapped_row(text: &str, style: Style, width: usize, out: &mut Vec<Line<'static>>) {
-    for physical in wrap_to_width(text, width) {
-        out.push(Line::from(Span::styled(physical, style)));
+fn push_wrapped_row(
+    text: &str,
+    style: Style,
+    width: usize,
+    continuation_prefix: Option<&'static str>,
+    out: &mut Vec<Line<'static>>,
+) {
+    let rows = wrap_to_width(text, width);
+    let Some(first) = rows.first() else {
+        return;
+    };
+    out.push(Line::from(Span::styled(first.clone(), style)));
+    let Some(prefix) = continuation_prefix else {
+        for physical in rows.into_iter().skip(1) {
+            out.push(Line::from(Span::styled(physical, style)));
+        }
+        return;
+    };
+    if first.is_empty() {
+        return;
+    }
+
+    let continuation_width = width.saturating_sub(display_width(prefix)).max(1);
+    let remainder = text
+        .strip_prefix(first)
+        .unwrap_or_default()
+        .strip_prefix(' ')
+        .unwrap_or_default();
+    for physical in wrap_to_width(remainder, continuation_width) {
+        if !physical.is_empty() {
+            out.push(Line::from(Span::styled(
+                format!("{prefix}{physical}"),
+                style,
+            )));
+        }
     }
 }
 
@@ -128,12 +177,14 @@ struct Transcript {
     /// Live assistant text being streamed; rendered after committed rows and
     /// committed exactly once on `AssistantTextEnd`.
     streaming: Option<String>,
+    exploring_open: bool,
 }
 
 impl Transcript {
     /// Append a blank separator row before a new top-level block, unless the
     /// transcript is empty or already ends in a blank row.
     fn push_blank(&mut self) {
+        self.exploring_open = false;
         match self.rows.last() {
             None => {}
             Some(last) if last.text.is_empty() => {}
@@ -156,6 +207,16 @@ impl Transcript {
         }
     }
 
+    fn push_continued(&mut self, text: &str, style: Style, continuation_prefix: &'static str) {
+        for line in text.split('\n') {
+            self.rows.push(TranscriptRow::with_continuation(
+                line,
+                style,
+                continuation_prefix,
+            ));
+        }
+    }
+
     /// Commit any in-flight streamed assistant text into the transcript.
     fn finish_stream(&mut self) {
         if let Some(text) = self.streaming.take()
@@ -163,6 +224,77 @@ impl Transcript {
         {
             self.push(&text, assistant_style());
         }
+    }
+
+    fn record_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
+        let scope = match decision {
+            ApprovalDecision::Allow => "this time",
+            ApprovalDecision::AllowAlways => "this session",
+            ApprovalDecision::Deny => return,
+        };
+        self.begin_block();
+        self.push_continued(
+            &format!("✔ You approved iris to run {} {scope}", run_target(call)),
+            ok_style(),
+            "  │ ",
+        );
+    }
+
+    fn push_tool_result(&mut self, call: &ToolCall, content: &str) {
+        if is_exploration_tool(call) {
+            self.push_explored_result(call);
+            return;
+        }
+        self.begin_block();
+        self.push_continued(
+            &format!("• Ran {}", run_target(call)),
+            tool_header_style(),
+            "  │ ",
+        );
+        self.push_tool_output(content);
+    }
+
+    fn push_tool_error(&mut self, call: &ToolCall, message: &str) {
+        self.begin_block();
+        self.push_continued(&format!("✗ Ran {}", run_target(call)), err_style(), "  │ ");
+        self.push_continued(&format!("  └ error: {message}"), err_style(), "    ");
+    }
+
+    fn push_tool_output(&mut self, content: &str) {
+        if content.is_empty() {
+            self.push("  └ (no output)", dim_style());
+            return;
+        }
+        let folded = fold(content);
+        let mut first = true;
+        for line in folded.preview.lines() {
+            let prefix = if first { "  └ " } else { "    " };
+            self.push_continued(&format!("{prefix}{line}"), dim_style(), "    ");
+            first = false;
+        }
+        if folded.hidden_lines > 0 {
+            self.push(
+                &format!(
+                    "    … +{} lines (ctrl + t to view transcript)",
+                    folded.hidden_lines
+                ),
+                dim_style(),
+            );
+        }
+    }
+
+    fn push_explored_result(&mut self, call: &ToolCall) {
+        self.finish_stream();
+        if !self.exploring_open {
+            self.push_blank();
+            self.push("• Explored", tool_header_style());
+            self.exploring_open = true;
+        }
+        self.push_continued(
+            &format!("  └ {}", exploration_summary(call)),
+            dim_style(),
+            "    ",
+        );
     }
 
     /// Apply one semantic event to the transcript rows.
@@ -203,11 +335,7 @@ impl Transcript {
                 self.finish_stream();
             }
             UiEvent::ToolAutoApproved(call) => {
-                self.begin_block();
-                self.push(
-                    &format!("auto-approved - {} - session", summarize(&call)),
-                    dim_style(),
-                );
+                self.record_approval(&call, ApprovalDecision::AllowAlways);
             }
             UiEvent::DiffPreview { call, diff } => {
                 self.begin_block();
@@ -216,37 +344,17 @@ impl Transcript {
             }
             UiEvent::ToolDenied(call) => {
                 self.begin_block();
-                self.push(
-                    &format!("[error] denied - {}", summarize(&call)),
+                self.push_continued(
+                    &format!("✗ Denied {}", run_target(&call)),
                     err_style(),
+                    "  │ ",
                 );
             }
             UiEvent::ToolResult { call, content } => {
-                self.begin_block();
-                let summary = summarize(&call);
-                let head = if content.is_empty() {
-                    summary
-                } else {
-                    let lines = content.lines().count();
-                    let plural = if lines == 1 { "" } else { "s" };
-                    format!("{summary} - {lines} line{plural}")
-                };
-                self.push(&format!("[ok] {head}"), ok_style());
-                let folded = fold(&content);
-                for line in folded.preview.lines() {
-                    self.push(&format!("  {line}"), dim_style());
-                }
-                if folded.hidden_lines > 0 {
-                    self.push(
-                        &format!("  ... (+{} more lines)", folded.hidden_lines),
-                        dim_style(),
-                    );
-                }
+                self.push_tool_result(&call, &content);
             }
             UiEvent::ToolError { call, message } => {
-                self.begin_block();
-                self.push(&format!("[error] {}", summarize(&call)), err_style());
-                self.push(&format!("  error: {message}"), err_style());
+                self.push_tool_error(&call, &message);
             }
             UiEvent::Notice(message) => {
                 self.begin_block();
@@ -289,7 +397,7 @@ impl Transcript {
         }
         if let Some(text) = &self.streaming {
             for line in text.split('\n') {
-                push_wrapped_row(line, assistant_style(), width, &mut rows);
+                push_wrapped_row(line, assistant_style(), width, None, &mut rows);
             }
         }
         rows
@@ -490,20 +598,20 @@ impl Screen {
 
     // --- approval ---
 
-    /// Show a gated tool's approval prompt: a transcript line for history plus a
-    /// short status-row hint. The loop captures the decision from a keypress.
+    /// Show a gated tool's approval prompt in the status row. The transcript
+    /// records the final approval/denial outcome, not the transient prompt.
     pub(crate) fn show_approval(&mut self, call: &ToolCall, allow_always: bool) {
-        self.transcript.begin_block();
         let options = if allow_always {
             "[y] once  [a] always  [N] deny"
         } else {
             "[y] once  [N] deny"
         };
-        self.transcript.push(
-            &format!("approve {}?  {options}", summarize(call)),
-            prompt_style(),
-        );
-        self.approval_hint = Some(format!("awaiting approval  {options}"));
+        self.approval_hint = Some(format!("approve {}  {options}", run_target(call)));
+        self.follow_bottom();
+    }
+
+    pub(crate) fn record_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
+        self.transcript.record_approval(call, decision);
         self.follow_bottom();
     }
 
@@ -765,15 +873,26 @@ mod tests {
     use serde_json::json;
 
     fn call(name: &str) -> ToolCall {
+        call_args(name, json!({ "path": "note.txt", "content": "hi" }))
+    }
+
+    fn call_args(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "call_1".to_string(),
             name: name.to_string(),
-            arguments: json!({ "path": "note.txt", "content": "hi" }),
+            arguments,
         }
     }
 
     fn row_text(row: &TranscriptRow) -> String {
         row.text.clone()
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     #[test]
@@ -810,16 +929,74 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_renders_check_summary_and_folded_preview() {
+    fn bash_tool_result_uses_codex_style_gutters() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "a\nb".to_string(),
+        });
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert!(texts.iter().any(|t| t == "• Ran echo hi"));
+        assert!(texts.iter().any(|t| t == "  └ a"));
+        assert!(texts.iter().any(|t| t == "    b"));
+        assert!(!texts.iter().any(|t| t.starts_with("[ok]")));
+    }
+
+    #[test]
+    fn empty_tool_output_shows_no_output_line() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "true" })),
+            content: String::new(),
+        });
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert!(texts.iter().any(|t| t == "• Ran true"));
+        assert!(texts.iter().any(|t| t == "  └ (no output)"));
+    }
+
+    #[test]
+    fn approval_hint_names_tool_target() {
+        let mut screen = Screen::new();
+        screen.show_approval(&call_args("bash", json!({ "command": "echo hi" })), false);
+        assert!(line_text(&screen.status_line()).contains("approve echo hi"));
+    }
+
+    #[test]
+    fn read_only_tool_results_group_as_explored() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolResult {
             call: call("read"),
-            content: "a\nb\n".to_string(),
+            content: "ignored file body".to_string(),
+        });
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("grep", json!({ "pattern": "needle", "path": "src" })),
+            content: "ignored grep body".to_string(),
         });
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
-        assert!(texts.iter().any(|t| t == "[ok] read note.txt - 2 lines"));
-        assert!(texts.iter().any(|t| t == "  a"));
-        assert!(texts.iter().any(|t| t == "  b"));
+        assert_eq!(
+            texts,
+            vec![
+                "• Explored".to_string(),
+                "  └ Read note.txt".to_string(),
+                "  └ Search needle in src".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn long_run_header_wraps_with_vertical_gutter() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args(
+                "bash",
+                json!({ "command": "node -e 'const fs=require(\"fs\"); const p=\"CHANGELOG.md\"; console.log(p)'" }),
+            ),
+            content: String::new(),
+        });
+        let lines: Vec<String> = screen.wrapped_lines(34).iter().map(line_text).collect();
+        assert!(lines.iter().any(|line| line.starts_with("• Ran node -e")));
+        assert!(lines.iter().any(|line| line.starts_with("  │ ")));
+        assert!(lines.iter().any(|line| line == "  └ (no output)"));
     }
 
     #[test]

@@ -427,9 +427,11 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
     )?;
 
     let rendered = String::from_utf8(output)?;
-    // Result row carries the tool summary and a line count, then the body.
-    assert!(rendered.contains("\u{2713} read note.txt"));
-    assert!(rendered.contains("hello from file"));
+    // Read-only tools render as Codex-style exploration summaries; the full
+    // content still goes to the model, not the terminal transcript.
+    assert!(rendered.contains("• Explored"));
+    assert!(rendered.contains("  └ Read note.txt"));
+    assert!(!rendered.contains("hello from file"));
     assert!(errors.is_empty());
     Ok(())
 }
@@ -460,7 +462,7 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
     )?;
 
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("\u{2717} unknown"));
+    assert!(rendered.contains("✗ Ran unknown"));
     assert!(rendered.contains("error: unknown tool: unknown"));
     assert!(rendered.contains("assistant> recovered"));
     assert!(errors.is_empty());
@@ -846,7 +848,7 @@ fn approved_write_renders_prompt_and_result_without_raw_json() -> Result<()> {
     let rendered = String::from_utf8(output)?;
     // The approval prompt carries the summary; the result row follows it.
     assert!(rendered.contains("approve write out.txt?"));
-    assert!(rendered.contains("\u{2713} write out.txt"));
+    assert!(rendered.contains("• Ran write out.txt"));
     // No separate proposed line and no raw `name({json})` argument dump.
     assert!(!rendered.contains("tool> write({"));
     Ok(())
@@ -876,7 +878,7 @@ fn denied_write_skips_execution_and_records_denial() -> Result<()> {
     assert!(errors.is_empty());
     assert!(!workspace.path.join("out.txt").exists());
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("\u{2717} denied \u{b7} write out.txt"));
+    assert!(rendered.contains("✗ Denied write out.txt"));
     // Gated calls no longer double-print a raw `tool> write({...})` line.
     assert!(!rendered.contains("tool> write({"));
 
@@ -1266,7 +1268,7 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
     )?;
 
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("auto-approved"));
+    assert!(rendered.contains("You approved iris to run approvable"));
     // Both calls ran: the next provider request carries two ok tool results.
     let seen = harness.agent.provider.seen.borrow();
     let results: Vec<_> = seen[1].iter().filter(|m| m.role == Role::Tool).collect();
@@ -1408,7 +1410,7 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
     )?;
 
     let rendered = String::from_utf8(output)?;
-    assert!(!rendered.contains("auto-approved · bash"));
+    assert!(!rendered.contains("You approved iris to run echo second this session"));
     let seen = harness.agent.provider.seen.borrow();
     assert!(seen[1].last().unwrap().content.contains("\"denied\":true"));
     Ok(())
