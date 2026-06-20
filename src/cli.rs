@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_command_rejects_unparseable_level() {
+    fn reasoning_command_rejects_unparsable_level() {
         let (mut harness, _dir) = fake_harness();
         let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
         let mut switch = Some(ModelSwitch::new(
