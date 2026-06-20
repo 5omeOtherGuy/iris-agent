@@ -134,22 +134,26 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
         Ok(())
     }
 
-    /// Colorize a unified diff into gutter body lines. The leading two file
-    /// headers (`--- a/..`, `+++ b/..`) are dropped (the frame title already
-    /// names the file); hunk headers are cyan, additions green, removals red,
-    /// context dimmed. Header detection is stateful (headers only precede the
-    /// first `@@`) so added content beginning with `+`/`-` is never mistaken
-    /// for a header.
+    /// Colorize a unified diff into gutter body lines. Every file-header pair
+    /// (`--- a/..` immediately followed by `+++ b/..` and a `@@` hunk) is
+    /// dropped -- not just the first -- so a multi-file diff never renders
+    /// later files' headers as change lines (the frame title names the file).
+    /// Hunk headers are cyan, additions green, removals red, context dimmed.
+    /// The `@@` guard keeps a removed content line beginning `-- ` from being
+    /// mistaken for a header.
     fn diff_body(&self, diff: &str) -> Vec<String> {
-        let mut seen_hunk = false;
+        let lines: Vec<&str> = diff.lines().collect();
         let mut body = Vec::new();
-        for line in diff.lines() {
-            if !seen_hunk && (line.starts_with("--- ") || line.starts_with("+++ ")) {
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if crate::ui::is_diff_file_header(&lines, i) {
+                i += 2; // skip the `--- `/`+++ ` pair; the `@@` renders next pass
                 continue;
             }
             if line.starts_with("@@") {
-                seen_hunk = true;
                 body.push(sgr(self.ansi, "36", line));
+                i += 1;
                 continue;
             }
             let code = match line.chars().next() {
@@ -158,6 +162,7 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
                 _ => "2",
             };
             body.push(sgr(self.ansi, code, line));
+            i += 1;
         }
         body
     }
@@ -192,14 +197,7 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
             writeln!(
                 self.out,
                 "    {}",
-                sgr(
-                    self.ansi,
-                    "2",
-                    &format!(
-                        "… +{} lines (ctrl + t to view transcript)",
-                        folded.hidden_lines
-                    ),
-                )
+                sgr(self.ansi, "2", &format!("… +{} lines", folded.hidden_lines),)
             )?;
         }
         self.in_tool_block = false;
@@ -687,6 +685,38 @@ mod tests {
     }
 
     #[test]
+    fn two_file_diff_drops_every_header_pair_with_ansi() -> Result<()> {
+        let diff = concat!(
+            "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old1\n+new1\n",
+            "--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old2\n+new2\n"
+        );
+        let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new()).with_ansi(true);
+        ui.emit(UiEvent::DiffPreview {
+            call: call("edit"),
+            diff: diff.to_string(),
+        })?;
+        let (_, out, _) = ui.into_parts();
+        let rendered = String::from_utf8(out)?;
+        assert!(
+            !rendered.contains("--- a/two.txt"),
+            "second file header shown"
+        );
+        assert!(
+            !rendered.contains("+++ b/two.txt"),
+            "second file header shown"
+        );
+        assert!(
+            rendered.contains("\u{1b}[32m+new2\u{1b}[0m"),
+            "second add not green"
+        );
+        assert!(
+            rendered.contains("\u{1b}[31m-old2\u{1b}[0m"),
+            "second remove not red"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn non_tty_output_has_no_ansi_escapes() -> Result<()> {
         let diff = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
         let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
@@ -721,7 +751,8 @@ mod tests {
         assert!(rendered.contains("  └ row 0"));
         assert!(rendered.contains("    row 1"));
         assert!(!rendered.contains("row 39"));
-        assert!(rendered.contains("… +28 lines (ctrl + t to view transcript)"));
+        assert!(rendered.contains("… +28 lines"));
+        assert!(!rendered.contains("ctrl + t"), "no false transcript hint");
         Ok(())
     }
 }

@@ -18,25 +18,20 @@ use std::io::{self, Stdout};
 
 use ansi_to_tui::IntoText;
 use anyhow::Result;
-use ratatui::Frame;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::nexus::{ApprovalDecision, ToolCall};
-use crate::tool_display::{exploration_summary, fold, is_exploration_tool, run_target, summarize};
+use crate::tool_display::{exploration_summary, is_exploration_tool, run_target, summarize};
 use crate::ui::slash::{self, Palette, SlashCommand};
 use crate::ui::{TurnErrorKind, UiEvent};
 
@@ -51,6 +46,30 @@ const MAX_EDITOR_ROWS: u16 = 10;
 
 /// Slash popup height cap (including its border).
 const MAX_PALETTE_ROWS: u16 = 8;
+
+/// Height of the persistent inline live viewport (the small region that
+/// repaints every frame: active in-flight block tail + status + palette +
+/// editor). Everything finalized is committed above it into the terminal's
+/// native scrollback via `insert_before`. ratatui's inline viewport height is
+/// fixed at construction, so this is a deliberate reserved-rows tradeoff: a
+/// small constant keeps the idle gap modest while leaving room for editor
+/// growth and the slash palette (the editor scrolls internally beyond it).
+const LIVE_VIEWPORT_ROWS: u16 = 8;
+
+/// Cap on rows committed in a single `insert_before` call, so one finalized
+/// block never allocates an unbounded scratch buffer; larger blocks are
+/// committed in successive chunks (order preserved).
+const MAX_INSERT_ROWS: usize = 500;
+
+/// Flood guard: cap a tool result at this many physical (wrapped) rows in the
+/// transcript so a few very long lines cannot flood the viewport/scrollback.
+/// The model still receives the full output; only the terminal preview is
+/// bounded, and the omitted logical-line count is reported.
+const MAX_TOOL_OUTPUT_ROWS: usize = 24;
+
+/// Secondary guard: truncate any single output line to this many characters
+/// before wrapping, so one pathological line cannot dominate the row budget.
+const MAX_TOOL_OUTPUT_LINE_CHARS: usize = 2000;
 
 /// Braille spinner frames; cycled by the render tick while a turn computes.
 /// Not emojis: single-cell Unicode glyphs that render on any UTF-8 terminal.
@@ -98,6 +117,24 @@ fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0).max(1)
 }
 
+/// Truncate `text` to at most `max` characters (on a char boundary).
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect()
+    }
+}
+
+/// Estimate the physical rows a tool-output line occupies after wrapping to
+/// `width`, accounting for the 4-column gutter prefix. At least one row. ANSI
+/// escapes are counted as visible width (a conservative over-estimate that only
+/// makes the flood cap trip slightly earlier), which is fine for a guard.
+fn wrapped_row_estimate(line: &str, width: usize) -> usize {
+    let usable = width.saturating_sub(4).max(1);
+    display_width(line).div_ceil(usable).max(1)
+}
+
 /// One styled logical transcript row. Most rows are plain text + style; ANSI
 /// tool output stores a parsed ratatui line so the escape styling survives.
 #[derive(Clone)]
@@ -106,6 +143,11 @@ struct TranscriptRow {
     style: Style,
     continuation_prefix: Option<&'static str>,
     line: Option<Line<'static>>,
+    /// Word-aware (space-breaking, URL-safe) wrap for this row's styled `line`
+    /// instead of the default ANSI char-hard-wrap. Set for Markdown prose; the
+    /// gutter/ANSI tool-output rows keep char-wrap so their leading-space
+    /// prefixes are never collapsed.
+    word_wrap: bool,
 }
 
 impl TranscriptRow {
@@ -115,6 +157,7 @@ impl TranscriptRow {
             style,
             continuation_prefix: None,
             line: None,
+            word_wrap: false,
         }
     }
 
@@ -128,6 +171,7 @@ impl TranscriptRow {
             style,
             continuation_prefix: Some(continuation_prefix),
             line: None,
+            word_wrap: false,
         }
     }
 
@@ -137,14 +181,26 @@ impl TranscriptRow {
             style: Style::default(),
             continuation_prefix,
             line: Some(line),
+            word_wrap: false,
+        }
+    }
+
+    /// A styled Markdown prose line, wrapped word-aware (and URL-safe).
+    fn markdown(line: Line<'static>) -> Self {
+        Self {
+            text: line_text(&line),
+            style: Style::default(),
+            continuation_prefix: None,
+            line: Some(line),
+            word_wrap: true,
         }
     }
 
     fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
-        if let Some(line) = &self.line {
-            push_wrapped_line(line, width, self.continuation_prefix, out);
-        } else {
-            push_wrapped_row(&self.text, self.style, width, self.continuation_prefix, out);
+        match &self.line {
+            Some(line) if self.word_wrap => push_wrapped_line_wordwise(line, width, out),
+            Some(line) => push_wrapped_line(line, width, self.continuation_prefix, out),
+            None => push_wrapped_row(&self.text, self.style, width, self.continuation_prefix, out),
         }
     }
 }
@@ -154,6 +210,14 @@ fn line_text(line: &Line<'_>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect()
+}
+
+/// A block-separator row: the empty plain row `push_blank` inserts between
+/// top-level blocks. Distinguished from a Markdown-internal blank line (which
+/// carries a styled `line`) so only true block boundaries split scrollback
+/// commits.
+fn is_separator_row(row: &TranscriptRow) -> bool {
+    row.text.is_empty() && row.line.is_none()
 }
 
 fn push_span_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
@@ -195,6 +259,41 @@ fn push_wrapped_line(
     }
 
     out.push(Line::from(spans));
+}
+
+/// Word-aware, URL-safe wrap of a styled line, preserving each span's style.
+/// Reuses [`wrap_to_width`] for the break positions (so it breaks at spaces and
+/// keeps long URL/path tokens intact), then re-applies styles by walking the
+/// original chars in parallel. Used for Markdown prose; ANSI/gutter rows keep
+/// the char-hard-wrap [`push_wrapped_line`] so their leading-space prefixes are
+/// never collapsed.
+fn push_wrapped_line_wordwise(line: &Line<'static>, width: usize, out: &mut Vec<Line<'static>>) {
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+        .collect();
+    if cells.is_empty() {
+        out.push(Line::default());
+        return;
+    }
+    let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+    // The only chars wrap_to_width removes are space separators, so matching
+    // each physical row's chars back to the cell stream in order recovers the
+    // style for every glyph (collapsed spaces are skipped over).
+    let mut ci = 0;
+    for physical in wrap_to_width(&text, width.max(1)) {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for rc in physical.chars() {
+            while ci < cells.len() && cells[ci].0 != rc {
+                ci += 1;
+            }
+            let style = cells.get(ci).map_or(Style::default(), |(_, st)| *st);
+            push_span_char(&mut spans, rc, style);
+            ci += 1;
+        }
+        out.push(Line::from(spans));
+    }
 }
 
 fn push_wrapped_row(
@@ -243,6 +342,10 @@ struct Transcript {
     /// committed exactly once on `AssistantTextEnd`.
     streaming: Option<String>,
     exploring_open: bool,
+    /// Last width the transcript was rendered/flushed at, so width-aware
+    /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
+    /// uses a realistic column count. Zero until the first render.
+    last_width: usize,
 }
 
 impl Transcript {
@@ -272,6 +375,14 @@ impl Transcript {
         }
     }
 
+    /// Commit assistant `text` as rendered Markdown (headings/emphasis/code/
+    /// lists/quotes). Tool output and diffs are NOT Markdown and use [`push`].
+    fn push_markdown(&mut self, text: &str) {
+        for line in crate::ui::markdown::render_markdown(text) {
+            self.rows.push(TranscriptRow::markdown(line));
+        }
+    }
+
     fn push_continued(&mut self, text: &str, style: Style, continuation_prefix: &'static str) {
         for line in text.split('\n') {
             self.rows.push(TranscriptRow::with_continuation(
@@ -287,7 +398,7 @@ impl Transcript {
         if let Some(text) = self.streaming.take()
             && !text.is_empty()
         {
-            self.push(&text, assistant_style());
+            self.push_markdown(&text);
         }
     }
 
@@ -324,33 +435,68 @@ impl Transcript {
         self.push_continued(&format!("  └ error: {message}"), err_style(), "    ");
     }
 
+    /// The width to assume when shaping rows during `apply` (before a frame has
+    /// set the real width). Falls back to a sane 80 columns.
+    fn wrap_width(&self) -> usize {
+        if self.last_width == 0 {
+            80
+        } else {
+            self.last_width
+        }
+    }
+
+    /// Index of the last block separator (a blank `push_blank` row), or 0 if
+    /// none. Rows before it form complete blocks safe to commit to scrollback;
+    /// the rows from it onward are the current, still-growable block (so an
+    /// `Explored` group or a streamed message can keep appending to it).
+    fn last_separator_index(&self) -> usize {
+        self.rows.iter().rposition(is_separator_row).unwrap_or(0)
+    }
+
     fn push_tool_output(&mut self, content: &str) {
         if content.is_empty() {
             self.push("  └ (no output)", dim_style());
             return;
         }
-        let folded = fold(content);
+        // Flood-safe: wrap each output line to the transcript width FIRST, then
+        // cap the total *physical* rows so a handful of very long lines cannot
+        // flood the viewport/scrollback. The omitted count is logical lines.
+        // (`fold`'s per-line char cap below is the secondary guard.)
+        let width = self.wrap_width();
+        let total_logical = content.lines().count();
+        let mut physical = 0usize;
+        let mut shown = 0usize;
         let mut first = true;
-        for line in folded.preview.lines() {
+        for raw in content.lines() {
+            let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
+            let rows = wrapped_row_estimate(&line, width);
+            // Always show at least the first line (head); otherwise stop once
+            // the next line would exceed the physical-row budget.
+            if shown > 0 && physical + rows > MAX_TOOL_OUTPUT_ROWS {
+                break;
+            }
             let prefix = if first { "  └ " } else { "    " };
             if line.contains("\x1b[") {
                 self.rows.push(TranscriptRow::with_line(
-                    tool_output_line(prefix, line),
+                    tool_output_line(prefix, &line),
                     Some("    "),
                 ));
             } else {
-                self.push_continued(&format!("{prefix}{line}"), dim_style(), "    ");
+                // Char-hard-wrap (via a styled line) rather than word-wrap so
+                // leading indentation and aligned columns in tool output are
+                // preserved and the physical-row estimate above stays exact.
+                self.rows.push(TranscriptRow::with_line(
+                    Line::from(Span::styled(format!("{prefix}{line}"), dim_style())),
+                    Some("    "),
+                ));
             }
+            physical += rows;
+            shown += 1;
             first = false;
         }
-        if folded.hidden_lines > 0 {
-            self.push(
-                &format!(
-                    "    … +{} lines (ctrl + t to view transcript)",
-                    folded.hidden_lines
-                ),
-                dim_style(),
-            );
+        let hidden = total_logical.saturating_sub(shown);
+        if hidden > 0 {
+            self.push(&format!("    … +{hidden} lines"), dim_style());
         }
     }
 
@@ -385,14 +531,14 @@ impl Transcript {
                 self.streaming = None;
                 if !text.is_empty() {
                     self.push_blank();
-                    self.push(&text, assistant_style());
+                    self.push_markdown(&text);
                 }
             }
             UiEvent::AssistantText(text) => {
                 self.finish_stream();
                 if !text.is_empty() {
                     self.push_blank();
-                    self.push(&text, assistant_style());
+                    self.push_markdown(&text);
                 }
             }
             UiEvent::SessionStarted => {
@@ -460,8 +606,9 @@ impl Transcript {
         }
     }
 
-    fn render(&self, width: u16) -> Vec<Line<'static>> {
+    fn render(&mut self, width: u16) -> Vec<Line<'static>> {
         let width = usize::from(width);
+        self.last_width = width;
         let mut rows = Vec::new();
         for row in &self.rows {
             row.render(width, &mut rows);
@@ -615,9 +762,6 @@ pub(crate) struct Screen {
     spinner: Spinner,
     /// Short status-row hint while a gated tool awaits the user's decision.
     approval_hint: Option<ApprovalHint>,
-    /// Physical rows above the bottom of the transcript to keep in view. Zero
-    /// means follow the latest output.
-    scrollback: u16,
 }
 
 impl Screen {
@@ -628,20 +772,15 @@ impl Screen {
             palette: Palette::default(),
             spinner: Spinner::default(),
             approval_hint: None,
-            scrollback: 0,
         }
     }
 
     // --- transcript ---
 
-    /// Apply one semantic event, preserving follow-to-bottom when the user has
-    /// not scrolled away. The loop calls this for every Nexus event.
+    /// Apply one semantic event to the transcript. The loop calls this for every
+    /// Nexus event; committed history is moved to native scrollback on draw.
     pub(crate) fn apply_event(&mut self, event: UiEvent) {
-        let was_following = self.scrollback == 0;
         self.apply(event);
-        if was_following {
-            self.follow_bottom();
-        }
     }
 
     /// Apply one semantic event to the transcript.
@@ -654,21 +793,32 @@ impl Screen {
         self.transcript.commit_user(text);
     }
 
-    // --- scrollback ---
+    // --- scrollback commit ---
 
-    pub(crate) fn follow_bottom(&mut self) {
-        self.scrollback = 0;
+    /// Drain the finalized transcript rows, wrapped to `width`, for committing
+    /// into the terminal's native scrollback. While a turn is active the
+    /// current (still-growing) block stays live in the viewport; between turns
+    /// everything is finalized so the viewport holds only the editor/status.
+    pub(crate) fn take_scrollback(&mut self, width: u16) -> Vec<Line<'static>> {
+        let w = usize::from(width.max(1));
+        self.transcript.last_width = w;
+        let commit_point = if self.spinner.active {
+            self.transcript.last_separator_index()
+        } else {
+            self.transcript.rows.len()
+        };
+        let drained: Vec<TranscriptRow> = self.transcript.rows.drain(..commit_point).collect();
+        let mut out = Vec::new();
+        for row in &drained {
+            row.render(w, &mut out);
+        }
+        out
     }
 
-    pub(crate) fn scroll_up(&mut self, rows: u16) {
-        self.scrollback = self.scrollback.saturating_add(rows);
-    }
-
-    pub(crate) fn scroll_down(&mut self, rows: u16) {
-        self.scrollback = self.scrollback.saturating_sub(rows);
-    }
-
-    fn wrapped_lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// Render the live (not-yet-finalized) transcript rows plus any in-flight
+    /// stream, wrapped to `width`. This is the bounded active-block content
+    /// shown in the viewport above the editor.
+    fn wrapped_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         self.transcript.render(width)
     }
 
@@ -750,12 +900,10 @@ impl Screen {
             target: run_target(call),
             options,
         });
-        self.follow_bottom();
     }
 
     pub(crate) fn record_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
         self.transcript.record_approval(call, decision);
-        self.follow_bottom();
     }
 
     pub(crate) fn clear_approval(&mut self) {
@@ -783,18 +931,22 @@ impl Screen {
     }
 }
 
-/// Colorize a unified diff into styled transcript rows. The two file headers
-/// before the first hunk are dropped, hunk headers cyan, additions green,
-/// removals red, context dimmed.
+/// Colorize a unified diff into styled transcript rows. Every file-header pair
+/// (`--- ` immediately followed by `+++ ` and a `@@` hunk) is dropped -- not
+/// just the first -- so a multi-file diff never renders later files' headers as
+/// red/green change lines. Hunk headers cyan, additions green, removals red,
+/// context dimmed.
 fn diff_rows(diff: &str) -> Vec<TranscriptRow> {
-    let mut seen_hunk = false;
+    let lines: Vec<&str> = diff.lines().collect();
     let mut out = Vec::new();
-    for line in diff.lines() {
-        if !seen_hunk && (line.starts_with("--- ") || line.starts_with("+++ ")) {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if crate::ui::is_diff_file_header(&lines, i) {
+            i += 2; // skip the `--- `/`+++ ` pair; the `@@` renders next pass
             continue;
         }
         let style = if line.starts_with("@@") {
-            seen_hunk = true;
             Style::default().fg(Color::Cyan)
         } else {
             match line.chars().next() {
@@ -804,13 +956,19 @@ fn diff_rows(diff: &str) -> Vec<TranscriptRow> {
             }
         };
         out.push(TranscriptRow::new(line, style));
+        i += 1;
     }
     out
 }
 
-/// Greedy word-wrap `text` to `width` display columns, breaking at spaces and
-/// hard-breaking any single word longer than the line. Returns at least one row
-/// (possibly empty) so a blank logical line still occupies a row.
+/// Greedy word-wrap `text` to `width` display columns, breaking at spaces. A
+/// word that fits is moved whole onto its own row rather than split mid-token,
+/// so a URL/path that fits within the width stays selectable as one unit; a
+/// single word longer than the width still hard-breaks, because the row-exact
+/// rendering model (one logical row = one physical row, see [`TuiUi::draw`])
+/// cannot emit an over-wide row without the terminal clipping its tail.
+/// Returns at least one row (possibly empty) so a blank logical line still
+/// occupies a row.
 fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     if width == 0 || display_width(text) <= width {
         return vec![text.to_string()];
@@ -836,7 +994,9 @@ fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
         } else {
             for ch in word.chars() {
                 let cw = char_width(ch);
-                if cur_w + cw > width {
+                // Guard `!cur.is_empty()` so a single glyph wider than the
+                // whole width never emits a phantom blank row before itself.
+                if cur_w + cw > width && !cur.is_empty() {
                     rows.push(std::mem::take(&mut cur));
                     cur_w = 0;
                 }
@@ -876,17 +1036,19 @@ fn render_palette(frame: &mut Frame, area: Rect, matches: &[&SlashCommand], sele
     frame.render_widget(Paragraph::new(Text::from(rows)), inner);
 }
 
-/// Render the whole UI: transcript on top, a status/spinner row, an optional
-/// slash popup, then the bordered editor at the bottom. Takes `&mut Screen` so
-/// scrollback can be clamped against the real transcript height computed here.
+/// Render the small live viewport: the active in-flight block (its tail) on
+/// top, a status/spinner row, an optional slash popup, then the bordered editor
+/// pinned at the bottom. Finalized history is NOT drawn here -- it already lives
+/// in the terminal's native scrollback above this viewport (see
+/// [`TuiUi::draw`]). The editor/palette are clamped to the fixed viewport
+/// height; the editor scrolls internally beyond its visible rows.
 fn render(frame: &mut Frame, screen: &mut Screen) {
     let area = frame.area();
-    if area.height < 4 || area.width < 1 {
+    if area.height == 0 || area.width < 1 {
         return;
     }
 
     let editor_rows = editor_visual_rows(&screen.editor, area.width);
-    let editor_h = editor_rows + 2; // top + bottom border
     let input_text = screen.editor_text();
     let palette_active = screen.palette.is_active(&input_text);
     let palette_matches: Vec<&SlashCommand> = if palette_active {
@@ -894,46 +1056,57 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
     } else {
         Vec::new()
     };
-    let palette_h = if palette_active {
+    let palette_wanted = if palette_active {
         (palette_matches.len() as u16 + 2).min(MAX_PALETTE_ROWS)
     } else {
         0
     };
 
+    // Bottom-anchored, clamped to the fixed viewport. The editor and a status
+    // row are reserved FIRST so a tall slash palette can never starve the
+    // editor out of the layout; the palette then takes only what remains, and
+    // the active-block region absorbs any slack at the top.
+    const MIN_EDITOR_H: u16 = 3; // one text row + top/bottom border
+    let palette_h = palette_wanted.min(area.height.saturating_sub(MIN_EDITOR_H).saturating_sub(1));
+    let max_editor_h = area
+        .height
+        .saturating_sub(palette_h)
+        .saturating_sub(1)
+        .max(1);
+    let editor_h = (editor_rows + 2).min(max_editor_h).max(1);
     let desired_status_h = screen.status_height(area.width);
     let max_status_h = area
         .height
         .saturating_sub(editor_h)
         .saturating_sub(palette_h)
-        .saturating_sub(1)
         .max(1);
     let status_h = desired_status_h.min(max_status_h);
     let status_lines = screen.status_lines(area.width);
 
     let chunks = Layout::vertical([
-        Constraint::Min(1),
+        Constraint::Min(0),
         Constraint::Length(status_h),
         Constraint::Length(palette_h),
         Constraint::Length(editor_h),
     ])
     .split(area);
-    let transcript_area = chunks[0];
+    let active_area = chunks[0];
     let status_area = chunks[1];
     let palette_area = chunks[2];
     let editor_area = chunks[3];
 
-    // Transcript: lines pre-wrapped to exactly one physical row each, so the
-    // scroll-to-bottom offset is exact and never diverges from the renderer.
-    // Wrap once per frame, then clamp scrollback against that same count.
-    let lines = screen.wrapped_lines(transcript_area.width);
-    let total_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let max_scroll = total_rows.saturating_sub(transcript_area.height);
-    screen.scrollback = screen.scrollback.min(max_scroll);
-    let scroll = max_scroll.saturating_sub(screen.scrollback);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
-        transcript_area,
-    );
+    // Active in-flight block: show its tail so the newest live output (a
+    // streaming reply or the most recent tool block) stays visible until it is
+    // finalized into scrollback.
+    if active_area.height > 0 {
+        let lines = screen.wrapped_lines(active_area.width);
+        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let scroll = total.saturating_sub(active_area.height);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
+            active_area,
+        );
+    }
 
     frame.render_widget(Paragraph::new(Text::from(status_lines)), status_area);
 
@@ -950,10 +1123,29 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
     frame.render_widget(&screen.editor, editor_area);
 }
 
-/// Terminal driver: owns the ratatui terminal and the persistent
-/// alternate-screen + raw-mode lifecycle for the whole interactive session.
-/// Reads no input itself; [`crate::ui::tui_loop`] feeds it events and calls
-/// [`TuiUi::draw`].
+/// Commit finalized transcript `lines` into the terminal's native scrollback,
+/// above the inline live viewport, in row-bounded chunks (order preserved).
+/// Generic over the backend so it is exercisable with `TestBackend`.
+fn insert_lines_before<B: Backend>(
+    terminal: &mut Terminal<B>,
+    lines: Vec<Line<'static>>,
+) -> Result<(), B::Error> {
+    for chunk in lines.chunks(MAX_INSERT_ROWS) {
+        let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+        let text = Text::from(chunk.to_vec());
+        terminal.insert_before(height, move |buf| {
+            Paragraph::new(text).render(buf.area, buf);
+        })?;
+    }
+    Ok(())
+}
+
+/// Terminal driver: owns the ratatui terminal and the persistent raw-mode +
+/// inline-viewport lifecycle for the whole interactive session. It does NOT
+/// enter the alternate screen: finalized history is committed into the
+/// terminal's native scrollback (selectable, copyable, scrolled by the real
+/// terminal) above a small inline live viewport. Reads no input itself;
+/// [`crate::ui::tui_loop`] feeds it events and calls [`TuiUi::draw`].
 pub(crate) struct TuiUi {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     pub(crate) screen: Screen,
@@ -961,31 +1153,29 @@ pub(crate) struct TuiUi {
 }
 
 impl TuiUi {
-    /// Enter raw mode + the alternate screen ONCE and enable bracketed paste and
-    /// scroll-wheel reporting for the session. Restored on `drop`/`shutdown`,
-    /// and by the signal handler's emergency escape on a force-quit.
+    /// Enter raw mode ONCE and create an inline viewport for the session, plus
+    /// bracketed paste. Mouse capture is deliberately NOT enabled so the
+    /// terminal's own scroll/select/copy works over the native scrollback the
+    /// inline viewport writes into. Restored on `drop`/`shutdown`, and by the
+    /// signal handler's emergency escape on a force-quit.
     pub(crate) fn new() -> Result<Self> {
         // Capture cooked-mode termios before raw mode so the force-quit signal
         // handler can restore the tty even though Drop will not run then.
         crate::signals::save_termios_for_force_quit();
         enable_raw_mode()?;
-        let terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+        let backend = CrosstermBackend::new(io::stdout());
+        let options = TerminalOptions {
+            viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
+        };
+        let terminal = match Terminal::with_options(backend, options) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = disable_raw_mode();
                 return Err(error.into());
             }
         };
-        if let Err(error) = execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture
-        ) {
-            // The combined `execute!` may have partially applied before failing,
-            // so best-effort undo every mode rather than only raw mode.
-            let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -998,6 +1188,12 @@ impl TuiUi {
     }
 
     pub(crate) fn draw(&mut self) -> Result<()> {
+        // Pick up any terminal resize before measuring width and committing, so
+        // finalized rows are wrapped to the current width.
+        self.terminal.autoresize()?;
+        let width = self.terminal.size()?.width;
+        let committed = self.screen.take_scrollback(width);
+        insert_lines_before(&mut self.terminal, committed)?;
         let screen = &mut self.screen;
         self.terminal.draw(|frame| render(frame, screen))?;
         Ok(())
@@ -1005,10 +1201,18 @@ impl TuiUi {
 
     fn restore(&mut self) {
         if self.active {
+            // Clear the live viewport and drop the cursor onto a fresh line so
+            // the shell prompt resumes below, not over the editor box. No
+            // alternate screen was entered, so committed scrollback stays put.
+            let _ = self.terminal.clear();
+            if let Ok(area) = self.terminal.size() {
+                let _ = self
+                    .terminal
+                    .set_cursor_position((0, area.height.saturating_sub(1)));
+            }
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
             let _ = self.terminal.show_cursor();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
             crate::signals::disable_terminal_restore_on_force_quit();
             self.active = false;
         }
@@ -1087,6 +1291,77 @@ mod tests {
     }
 
     #[test]
+    fn assistant_text_renders_as_markdown() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantText(
+            "# Title\n\nuse `cargo test` and:\n- one\n- two".to_string(),
+        ));
+        let lines = screen.wrapped_lines(80);
+        // Heading is bold.
+        let title = line_matching(&lines, |l| line_text(l) == "Title");
+        assert!(
+            title
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+        // Inline code keeps backticks with a distinct color.
+        let code_line = line_matching(&lines, |l| line_text(l).contains("cargo test"));
+        assert!(
+            code_line
+                .spans
+                .iter()
+                .any(|s| s.content.as_ref() == "`cargo test`" && s.style.fg == Some(Color::Cyan))
+        );
+        // Bullets render with dash markers.
+        assert!(lines.iter().any(|l| line_text(l) == "- one"));
+        assert!(lines.iter().any(|l| line_text(l) == "- two"));
+    }
+
+    #[test]
+    fn url_that_fits_moves_to_its_own_row_unbroken() {
+        // A URL that fits within the width is flushed whole onto its own row
+        // (not split mid-token), so it stays selectable as one unit.
+        let url = "https://ex.com/p";
+        let rows = wrap_to_width(&format!("see {url} now"), 16);
+        assert!(
+            rows.iter().any(|r| r == url),
+            "url not kept whole: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r == "see"));
+        assert!(rows.iter().any(|r| r == "now"));
+    }
+
+    #[test]
+    fn over_long_url_hard_breaks_without_losing_characters() {
+        // A URL longer than the width must hard-break: the row-exact model
+        // cannot emit an over-wide row without the terminal clipping its tail,
+        // so visibility wins over keeping it on one row. Every character
+        // survives -- concatenating the fragments rebuilds the URL exactly.
+        let url = "https://example.com/very/long/path/that/exceeds/the/width";
+        let rows = wrap_to_width(url, 20);
+        assert!(rows.len() > 1, "expected a hard-break: {rows:?}");
+        assert_eq!(
+            rows.concat(),
+            url,
+            "characters lost while wrapping: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| display_width(r) <= 20),
+            "a row exceeded the width (would clip on render): {rows:?}"
+        );
+    }
+
+    #[test]
+    fn long_plain_word_still_hard_breaks() {
+        // A non-URL/path long token still hard-breaks (no overflow).
+        assert_eq!(
+            wrap_to_width("abcdefgh", 3),
+            vec!["abc".to_string(), "def".to_string(), "gh".to_string()]
+        );
+    }
+
+    #[test]
     fn long_transcript_line_wraps_to_multiple_rows() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("alpha beta gamma delta".to_string()));
@@ -1149,6 +1424,33 @@ mod tests {
         assert!(
             wrapped_rows > 1,
             "expected the row to wrap, got {wrapped_rows}"
+        );
+    }
+
+    #[test]
+    fn tool_output_caps_by_physical_rows_even_under_logical_line_limit() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80); // prime last_width
+        // 8 logical lines (under the old 12-logical-line fold cap), each ~400
+        // columns => ~6 wrapped rows each => ~48 physical rows if uncapped.
+        // The physical-row cap must bound it and report the omitted lines.
+        let long = "x".repeat(400);
+        let content = std::iter::repeat_n(long, 8).collect::<Vec<_>>().join("\n");
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "big" })),
+            content,
+        });
+        let lines = screen.wrapped_lines(80);
+        let output_rows = lines.iter().filter(|l| line_text(l).contains('x')).count();
+        // 8 logical lines, each estimated at 6 physical rows; the 24-row cap
+        // admits exactly 4 of them (4*6 = 24) and reports the other 4 omitted.
+        assert!(
+            output_rows <= MAX_TOOL_OUTPUT_ROWS,
+            "output not row-capped: {output_rows} physical rows"
+        );
+        assert!(
+            lines.iter().any(|l| line_text(l).contains("… +4 lines")),
+            "expected an accurate '… +4 lines' omitted-line indicator: {lines:?}",
         );
     }
 
@@ -1326,22 +1628,180 @@ mod tests {
     }
 
     #[test]
-    fn scroll_up_clamps_to_real_top_on_render() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(20, 8))?;
+    fn two_file_diff_drops_every_header_pair_not_just_the_first() {
         let mut screen = Screen::new();
-        for i in 0..20 {
+        screen.apply(UiEvent::DiffPreview {
+            call: call("edit"),
+            diff: concat!(
+                "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old1\n+new1\n",
+                "--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old2\n+new2\n"
+            )
+            .to_string(),
+        });
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        // No file header survives, for either file.
+        assert!(!texts.iter().any(|t| t.starts_with("--- ")));
+        assert!(!texts.iter().any(|t| t.starts_with("+++ ")));
+        // Both files' real changes remain.
+        assert!(texts.iter().any(|t| t == "+new1"));
+        assert!(texts.iter().any(|t| t == "+new2"));
+        assert!(texts.iter().any(|t| t == "-old2"));
+        // The second file's removal is red, not mis-styled as context.
+        let remove2 = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|row| row.text == "-old2")
+            .expect("second removal row");
+        assert_eq!(remove2.style, Style::default().fg(Color::Red));
+    }
+
+    #[test]
+    fn take_scrollback_commits_finalized_blocks_and_keeps_current_block_live() {
+        let mut screen = Screen::new();
+        // Active turn: the most recent block stays live for grouping/streaming.
+        screen.start_turn();
+        screen.apply(UiEvent::AssistantText("first answer".to_string()));
+        screen.apply(UiEvent::Notice("a note".to_string()));
+        // Two blocks exist; committing keeps the last (current) block live.
+        let committed: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
+        assert!(committed.iter().any(|l| l == "first answer"));
+        assert!(
+            !committed.iter().any(|l| l.contains("a note")),
+            "current block must stay live during a turn: {committed:?}"
+        );
+        // The live viewport still shows the current block.
+        assert!(
             screen
-                .transcript
-                .push(&format!("line {i}"), assistant_style());
+                .wrapped_lines(80)
+                .iter()
+                .any(|l| line_text(l).contains("a note"))
+        );
+        // Ending the turn finalizes everything; nothing remains live.
+        screen.end_turn();
+        let rest: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
+        assert!(rest.iter().any(|l| l.contains("a note")));
+        assert!(
+            screen.wrapped_lines(80).is_empty(),
+            "viewport empty at idle"
+        );
+    }
+
+    /// Replicate `TuiUi::draw` against a generic backend so the full
+    /// commit-then-render path is exercisable with `TestBackend`.
+    fn draw_step<B: Backend>(terminal: &mut Terminal<B>, screen: &mut Screen) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        terminal.autoresize()?;
+        let width = terminal.size()?.width;
+        let committed = screen.take_scrollback(width);
+        insert_lines_before(terminal, committed)?;
+        terminal.draw(|frame| render(frame, screen))?;
+        Ok(())
+    }
+
+    fn visible_and_scrollback_text(terminal: &Terminal<TestBackend>) -> String {
+        let backend = terminal.backend();
+        let mut out = String::new();
+        for cell in backend.scrollback().content.iter() {
+            out.push_str(cell.symbol());
         }
-        // Scroll past the top; render clamps to the real maximum. Layout: 8 rows
-        // minus status(1) and the editor box(1 + 2 border) leaves a 4-row
-        // transcript, so max scrollback is 20 - 4 = 16.
-        screen.scroll_up(u16::MAX);
-        terminal.draw(|f| render(f, &mut screen))?;
-        assert_eq!(screen.scrollback, 16);
-        screen.scroll_down(10);
-        assert_eq!(screen.scrollback, 6);
+        out.push('\n');
+        out.push_str(&buffer_text(terminal));
+        out
+    }
+
+    #[test]
+    fn full_draw_path_commits_history_keeps_live_viewport_and_survives_resize() -> Result<()> {
+        let mut backend = TestBackend::new(40, 14);
+        backend.set_cursor_position(ratatui::layout::Position::new(0, 13))?;
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
+            },
+        )?;
+        let mut screen = Screen::new();
+
+        // A turn: user prompt, a streamed/markdown assistant answer, a tool
+        // result. Draw after each event like the loop does.
+        screen.commit_user("hello there");
+        screen.start_turn();
+        draw_step(&mut terminal, &mut screen)?;
+        screen.apply(UiEvent::AssistantText("# Done\n\nall good".to_string()));
+        draw_step(&mut terminal, &mut screen)?;
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "hi".to_string(),
+        });
+        draw_step(&mut terminal, &mut screen)?;
+        screen.end_turn();
+        draw_step(&mut terminal, &mut screen)?;
+
+        // Finalized history reached native scrollback (committed above the
+        // viewport), and the live viewport now shows only the editor box.
+        let everything = visible_and_scrollback_text(&terminal);
+        assert!(
+            everything.contains("hello there"),
+            "user line missing: {everything:?}"
+        );
+        assert!(everything.contains("Done"), "assistant heading missing");
+        assert!(everything.contains("Ran echo hi"), "tool block missing");
+        let viewport = buffer_text(&terminal);
+        assert!(
+            viewport.contains("message"),
+            "editor box not in live viewport: {viewport:?}"
+        );
+        // Finalized history must have LEFT the live model (committed to
+        // scrollback, not merely duplicated): at idle the transcript holds no
+        // live rows and the active region renders nothing. (`viewport` above is
+        // the whole backend buffer, which legitimately still shows committed
+        // history above the inline viewport, so it is not the right surface for
+        // a negative check.)
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "finalized rows were not drained out of the live viewport"
+        );
+        assert!(
+            screen.wrapped_lines(40).is_empty(),
+            "live active region still renders finalized content"
+        );
+
+        // A terminal resize must not panic and the viewport keeps rendering.
+        terminal.backend_mut().resize(28, 10);
+        draw_step(&mut terminal, &mut screen)?;
+        assert!(
+            buffer_text(&terminal).contains("message"),
+            "editor lost after resize"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_lines_reach_native_scrollback_via_insert_before() -> Result<()> {
+        // Inline viewport at the bottom of a short screen; committing more lines
+        // than fit above it pushes the overflow into native scrollback.
+        let mut backend = TestBackend::new(16, 6);
+        backend.set_cursor_position(ratatui::layout::Position::new(0, 5))?;
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )?;
+        let lines: Vec<Line<'static>> = (0..6).map(|i| Line::from(format!("history{i}"))).collect();
+        insert_lines_before(&mut terminal, lines)?;
+        let scrollback = terminal.backend().scrollback();
+        let text: String = scrollback
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("history0"),
+            "first line not in scrollback: {text:?}"
+        );
         Ok(())
     }
 

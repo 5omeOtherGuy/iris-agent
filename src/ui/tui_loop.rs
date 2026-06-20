@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui_textarea::CursorMove;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -116,7 +116,6 @@ async fn session_loop<P: ChatProvider>(harness: &mut Harness<P>, tui: &mut TuiUi
                     break;
                 }
                 tui.screen.commit_user(&prompt);
-                tui.screen.follow_bottom();
                 tui.screen.start_turn();
                 tui.draw()?;
                 run_turn(
@@ -311,16 +310,8 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             screen.sync_palette();
             return IdleKey::Continue;
         }
-        Event::Mouse(mouse) => {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => screen.scroll_up(3),
-                MouseEventKind::ScrollDown => screen.scroll_down(3),
-                // Pointer motion and other mouse events change nothing; ignoring
-                // them keeps an idle session from redrawing on every wiggle.
-                _ => return IdleKey::Ignore,
-            }
-            return IdleKey::Continue;
-        }
+        // Mouse capture is disabled so the terminal owns scroll/select/copy of
+        // the native scrollback; no Mouse events arrive here.
         Event::Resize(..) => return IdleKey::Continue,
         Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
             key
@@ -391,11 +382,8 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             return IdleKey::Submit(text);
         }
 
-        // --- transcript scroll ---
-        KeyCode::PageUp => screen.scroll_up(10),
-        KeyCode::PageDown => screen.scroll_down(10),
-        KeyCode::Home if ctrl => screen.scroll_up(u16::MAX),
-        KeyCode::End if ctrl => screen.follow_bottom(),
+        // Transcript scrolling is handled natively by the terminal over its
+        // scrollback (no in-app scroll offset), so PageUp/PageDown fall through.
 
         // --- kill-ring / undo / redo ---
         KeyCode::Char('k') if ctrl => {
@@ -483,17 +471,8 @@ fn handle_running_event(
     pending: &mut Option<PendingApproval>,
 ) -> bool {
     match event {
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                screen.scroll_up(3);
-                true
-            }
-            MouseEventKind::ScrollDown => {
-                screen.scroll_down(3);
-                true
-            }
-            _ => false,
-        },
+        // Mouse capture is off; the terminal scrolls its own scrollback. Resize
+        // still triggers a redraw of the live viewport.
         Event::Resize(..) => true,
         Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -505,27 +484,6 @@ fn handle_running_event(
                     screen.clear_approval();
                 }
                 return true;
-            }
-            // Scrolling works whether or not an approval is pending, so the
-            // user can review transcript context before deciding.
-            match key.code {
-                KeyCode::PageUp => {
-                    screen.scroll_up(10);
-                    return true;
-                }
-                KeyCode::PageDown => {
-                    screen.scroll_down(10);
-                    return true;
-                }
-                KeyCode::Home if ctrl => {
-                    screen.scroll_up(u16::MAX);
-                    return true;
-                }
-                KeyCode::End if ctrl => {
-                    screen.follow_bottom();
-                    return true;
-                }
-                _ => {}
             }
             // Approval decision keys, only while a tool is awaiting one.
             if let Some(p) = pending.as_ref() {
@@ -782,15 +740,16 @@ mod tests {
     }
 
     #[test]
-    fn running_scroll_keys_redraw_without_approval() {
+    fn running_non_decision_keys_are_ignored() {
         let mut screen = Screen::new();
         let mut pending: Option<PendingApproval> = None;
-        assert!(handle_running_event(
+        // Scrolling is native now; PageUp and bare chars while computing are
+        // ignored (the editor is frozen and there is no in-app scroll offset).
+        assert!(!handle_running_event(
             &mut screen,
             key(KeyCode::PageUp),
             &mut pending
         ));
-        // A bare char while computing is ignored (editor frozen).
         assert!(!handle_running_event(
             &mut screen,
             key(KeyCode::Char('x')),
@@ -799,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn scroll_works_while_approval_pending() {
+    fn page_keys_do_not_consume_a_pending_approval() {
         let mut screen = Screen::new();
         let (tx, _rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
@@ -807,13 +766,13 @@ mod tests {
             reply: tx,
             allow_always: true,
         });
-        // PageUp scrolls without consuming the pending approval.
-        assert!(handle_running_event(
+        // PageUp is a no-op (native scroll) and must not answer the approval.
+        assert!(!handle_running_event(
             &mut screen,
             key(KeyCode::PageUp),
             &mut pending
         ));
-        assert!(pending.is_some(), "scrolling does not answer the approval");
+        assert!(pending.is_some(), "a page key must not answer the approval");
     }
 
     #[test]

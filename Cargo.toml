@@ -30,6 +30,12 @@ rand = "0.10"
 # own the terminal backend. No bespoke cell-buffer/diff is hand-rolled.
 ratatui = "0.30"
 ansi-to-tui = "8.0.1"
+# Markdown parser for assistant text rendering. pulldown-cmark is the canonical
+# CommonMark pull parser (the same one Codex CLI uses); Iris maps its event
+# stream to a small set of ratatui Lines/Spans. Adopted instead of hand-rolling
+# a markdown tokenizer, which is an error-prone parser path the reuse ladder
+# forbids. default-features off drops the unused HTML push/CLI features.
+pulldown-cmark = { version = "0.13", default-features = false }
 # Multiline editor widget (undo/redo, kill-ring/yank, word-nav) over the same
 # ratatui buffer. default-features off drops its crossterm/termion/termwiz input
 # backends and the regex search feature: Iris drives edits from its own keymap
