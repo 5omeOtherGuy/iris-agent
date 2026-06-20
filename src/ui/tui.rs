@@ -1646,7 +1646,7 @@ mod tests {
         assert!(texts.iter().any(|t| t == "+new1"));
         assert!(texts.iter().any(|t| t == "+new2"));
         assert!(texts.iter().any(|t| t == "-old2"));
-        // The second file's removal is red, not mis-styled as context.
+        // The second file's removal is red, not styled as plain context.
         let remove2 = screen
             .transcript
             .rows
