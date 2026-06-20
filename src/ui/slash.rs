@@ -4,9 +4,9 @@
 //! match: the TUI palette filters this list as the user types `/`, and the
 //! non-TTY text path consults [`is_exit`] for the same commands. Commands are
 //! registered here ONLY when a real backing action exists; `/exit` and `/quit`
-//! both map to ending the session. Adding a command with no action would lie to
-//! the user, so the list stays honest and short until the harness grows actions
-//! the palette can dispatch.
+//! end the session, `/model` and `/reasoning` route to the shared model-switch
+//! handler (`crate::cli::handle_model_command`). Adding a command with no action
+//! would lie to the user, so the list stays honest and short.
 
 /// What accepting a slash command does. The loop owns dispatch; this enum is the
 /// neutral contract so the registry never reaches into the event loop.
@@ -14,6 +14,11 @@
 pub(crate) enum SlashAction {
     /// End the interactive session.
     Exit,
+    /// Submit the command name as a line so the shared command handler routes it
+    /// (e.g. `/model`, `/reasoning`). The handler parses any arguments the user
+    /// typed after the name; a palette-accepted bare command submits just the
+    /// name (read-only / usage view).
+    Submit,
 }
 
 /// One registered command: the literal token the user types, a one-line
@@ -36,6 +41,16 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         name: "/quit",
         description: "End the session",
         action: SlashAction::Exit,
+    },
+    SlashCommand {
+        name: "/model",
+        description: "Show or switch provider/model",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/reasoning",
+        description: "Set reasoning/thinking effort",
+        action: SlashAction::Submit,
     },
 ];
 
@@ -140,11 +155,13 @@ mod tests {
 
     #[test]
     fn matches_filters_by_prefix_case_insensitively() {
-        assert_eq!(matches("/").len(), 2);
+        assert_eq!(matches("/").len(), 4);
         let ex = matches("/EX");
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name, "/exit");
         assert_eq!(matches("/q")[0].name, "/quit");
+        assert_eq!(matches("/m")[0].name, "/model");
+        assert_eq!(matches("/r")[0].name, "/reasoning");
         assert!(matches("/zzz").is_empty());
         assert!(matches("hello").is_empty());
     }
@@ -165,15 +182,16 @@ mod tests {
         p.sync("/");
         assert!(p.is_active("/"));
         assert_eq!(p.selected(), 0);
-        // Down moves to /quit, then clamps at the last row.
-        p.down("/");
-        assert_eq!(p.selected(), 1);
-        p.down("/");
-        assert_eq!(p.selected(), 1);
-        assert_eq!(p.accept("/").unwrap().name, "/quit");
-        // Up returns to /exit.
+        // Registry order: /exit, /quit, /model, /reasoning. Down walks to the
+        // last row, then clamps there.
+        for _ in 0..10 {
+            p.down("/");
+        }
+        assert_eq!(p.selected(), 3);
+        assert_eq!(p.accept("/").unwrap().name, "/reasoning");
+        // Up returns toward the top.
         p.up();
-        assert_eq!(p.accept("/").unwrap().name, "/exit");
+        assert_eq!(p.accept("/").unwrap().name, "/model");
     }
 
     #[test]

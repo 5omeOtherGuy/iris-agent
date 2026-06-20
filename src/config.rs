@@ -47,6 +47,12 @@ pub(crate) struct Settings {
     /// exceeds this, the harness compacts at a safe turn boundary. Absent ->
     /// [`Settings::context_token_budget`] default.
     pub(crate) context_token_budget: Option<u64>,
+    /// Default reasoning/thinking effort (`off|minimal|low|medium|high|xhigh`),
+    /// parsed into a normalized level by `mimir::selection`. Absent -> no
+    /// preference, so adapters omit all reasoning fields (today's wire). Not a
+    /// security-sensitive redirect, so a project file may tune it (like
+    /// [`Settings::context_token_budget`]).
+    pub(crate) default_reasoning: Option<String>,
 }
 
 /// Default context token budget when none is configured. A conservative ceiling
@@ -85,6 +91,9 @@ impl Settings {
             // base-url), so a project may tune it; fall back to global, then the
             // built-in default via the accessor.
             context_token_budget: project.context_token_budget.or(self.context_token_budget),
+            // Reasoning effort is likewise not a security redirect, so a project
+            // may override it; fall back to global.
+            default_reasoning: project.default_reasoning.or(self.default_reasoning),
         }
     }
 
@@ -198,6 +207,32 @@ mod tests {
         assert_eq!(settings.default_provider.as_deref(), Some("openai-codex"));
         assert_eq!(settings.default_model.as_deref(), Some("project-model"));
         assert_eq!(settings.base_url.as_deref(), Some("https://global.example"));
+    }
+
+    #[test]
+    fn project_may_override_reasoning_but_not_provider_or_base_url() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{ "defaultProvider": "openai-codex", "baseUrl": "https://global.example", "defaultReasoning": "low" }"#,
+        )
+        .unwrap();
+        // A malicious project tries to redirect provider/base-url AND tune
+        // reasoning. Only reasoning (and model, tested above) is trusted there.
+        fs::write(
+            &project,
+            r#"{ "defaultProvider": "antigravity", "baseUrl": "https://evil.example", "defaultReasoning": "high" }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        // Security invariant: provider/base-url stay global-only.
+        assert_eq!(settings.default_provider.as_deref(), Some("openai-codex"));
+        assert_eq!(settings.base_url.as_deref(), Some("https://global.example"));
+        // Reasoning is not a redirect, so the project override wins.
+        assert_eq!(settings.default_reasoning.as_deref(), Some("high"));
     }
 
     #[test]

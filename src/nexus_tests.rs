@@ -76,7 +76,8 @@ fn run_text_session<P: ChatProvider>(
     errors: &mut Vec<u8>,
 ) -> Result<()> {
     let mut ui = TextUi::new(input, Vec::new(), Vec::new());
-    run_session(harness, &mut ui)?;
+    let mut switch = None;
+    run_session(harness, &mut ui, &mut switch)?;
     let (_, out, err) = ui.into_parts();
     *output = out;
     *errors = err;
@@ -2792,6 +2793,38 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
     assert!(
         tools.by_name("edit").is_some(),
         "hidden tool must stay in the execution registry"
+    );
+}
+
+#[test]
+fn replace_provider_replans_the_tool_surface() {
+    // A bare agent over the default (full) surface; swapping in a native-edit
+    // provider must re-plan so `edit` is dropped from the model-visible surface,
+    // while other tools stay visible and `edit` stays executable.
+    let mut agent = Agent::new(
+        SurfaceProbe::new(ProviderCapabilities::default(), Vec::new()),
+        crate::tools::built_in_tools(),
+    );
+    assert!(
+        agent.tools.iter().any(|tool| tool.name() == "edit"),
+        "edit is visible under default capabilities"
+    );
+
+    agent.replace_provider(SurfaceProbe::new(
+        ProviderCapabilities { native_edit: true },
+        Vec::new(),
+    ));
+    assert!(
+        !agent.tools.iter().any(|tool| tool.name() == "edit"),
+        "replace_provider re-plans the surface and hides edit"
+    );
+    assert!(
+        agent.tools.iter().any(|tool| tool.name() == "read"),
+        "other tools stay visible after the swap"
+    );
+    assert!(
+        agent.tools.by_name("edit").is_some(),
+        "hidden edit is still executable"
     );
 }
 

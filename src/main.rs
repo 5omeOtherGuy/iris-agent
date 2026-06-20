@@ -110,7 +110,11 @@ fn run_agent() -> Result<()> {
     // live tool registry. Fresh and resume call the same function.
     let tools = tools::built_in_tools();
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
-    let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
+    // One resolution point owns provider/model/reasoning precedence; capability
+    // validation then rejects a configured reasoning level the model cannot do.
+    let selection = mimir::selection::ModelSelection::resolve(&settings)?;
+    mimir::model_capabilities::validate(&selection)?;
+    let provider = build_provider(&selection, &system_prompt)?;
     let agent = Agent::new(provider, tools);
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
@@ -135,7 +139,13 @@ fn run_agent() -> Result<()> {
     let budget = Some(settings.context_token_budget());
     let mut harness =
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
-    cli::run_interactive(&mut harness)
+    // Tier-3 mode-switch state: `/model` `/reasoning` rebuild a provider from the
+    // same system prompt via `build_provider` and install it at a turn boundary.
+    let build = |selection: &mimir::selection::ModelSelection, prompt: &str| {
+        build_provider(selection, prompt)
+    };
+    let mut switch = Some(cli::ModelSwitch::new(selection, system_prompt, &build));
+    cli::run_interactive(&mut harness, &mut switch)
 }
 
 /// Resume an existing session by id: load its transcript from the store,
@@ -165,7 +175,9 @@ fn resume_agent(session_id: &str) -> Result<()> {
     wayland::system_prompt::ensure_default_fragments();
     let tools = tools::built_in_tools();
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
-    let provider = build_provider(resolve_provider_id(&settings), &settings, &system_prompt)?;
+    let selection = mimir::selection::ModelSelection::resolve(&settings)?;
+    mimir::model_capabilities::validate(&selection)?;
+    let provider = build_provider(&selection, &system_prompt)?;
     let agent = Agent::resumed(provider, tools, stored.messages);
 
     // Reopen the same transcript for append so continued turns extend it rather
@@ -188,18 +200,11 @@ fn resume_agent(session_id: &str) -> Result<()> {
         resumed,
         budget,
     );
-    cli::run_interactive(&mut harness)
-}
-
-/// Resolve the configured provider id from settings, falling back to the
-/// backward-compatible default when none is set.
-fn resolve_provider_id(settings: &config::Settings) -> &str {
-    settings
-        .default_provider
-        .as_deref()
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-        .unwrap_or(DEFAULT_PROVIDER)
+    let build = |selection: &mimir::selection::ModelSelection, prompt: &str| {
+        build_provider(selection, prompt)
+    };
+    let mut switch = Some(cli::ModelSwitch::new(selection, system_prompt, &build));
+    cli::run_interactive(&mut harness, &mut switch)
 }
 
 /// Log the most recent prior session for `cwd` (if any) via the read side of
@@ -243,42 +248,44 @@ fn log_resumable_sessions(cwd: &Path) {
     }
 }
 
-/// Build the configured provider as a boxed trait object so a single
-/// `Agent<Box<dyn ChatProvider>>` can back any provider chosen at runtime. Each
-/// provider resolves its own default model/base URL from the passed-through
-/// settings (env still wins inside the provider).
+/// Build the selected provider as a boxed trait object so a single
+/// `Agent<Box<dyn ChatProvider>>` can back any provider chosen at runtime.
+/// Precedence and the unsupported-provider error now live in `mimir::selection`
+/// (`ModelSelection::resolve`), so this only maps the resolved [`ProviderId`] to
+/// its concrete adapter. Reused at startup and on every `/model` `/reasoning`
+/// switch (rebuilds with the new selection + the same system prompt).
 fn build_provider(
-    provider_id: &str,
-    settings: &config::Settings,
+    selection: &mimir::selection::ModelSelection,
     system_prompt: &str,
 ) -> Result<Box<dyn ChatProvider>> {
-    let model = settings.default_model.as_deref();
-    let base_url = settings.base_url.as_deref();
-    let provider: Box<dyn ChatProvider> = match provider_id {
-        "openai-codex" => Box::new(
+    use mimir::selection::ProviderId;
+    let model = selection.model.as_str();
+    let base_url = selection.base_url.as_str();
+    let reasoning = selection.reasoning;
+    let provider: Box<dyn ChatProvider> = match selection.provider {
+        ProviderId::OpenAiCodex => Box::new(
             mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
                 model,
                 base_url,
+                reasoning,
                 system_prompt,
             )?,
         ),
-        "anthropic" => Box::new(
+        ProviderId::Anthropic => Box::new(
             mimir::providers::anthropic_messages::AnthropicProvider::new(
                 model,
                 base_url,
+                reasoning,
                 system_prompt,
             )?,
         ),
-        "antigravity" => Box::new(mimir::providers::antigravity::AntigravityProvider::new(
-            model,
-            base_url,
-            system_prompt,
-        )?),
-        other => {
-            return Err(errors::UsageError::new(format!(
-                "unsupported provider '{other}' in settings; supported: openai-codex, anthropic, antigravity"
-            ))
-            .into());
+        ProviderId::Antigravity => {
+            Box::new(mimir::providers::antigravity::AntigravityProvider::new(
+                model,
+                base_url,
+                reasoning,
+                system_prompt,
+            )?)
         }
     };
     Ok(provider)
