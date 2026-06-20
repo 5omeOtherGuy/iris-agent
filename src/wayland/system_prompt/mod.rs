@@ -469,7 +469,7 @@ fn strip_frontmatter_open(raw: &str) -> Option<&str> {
 fn split_at_closing_fence(after: &str) -> Option<(&str, &str)> {
     let mut offset = 0;
     for line in after.split_inclusive('\n') {
-        if line.trim_end_matches(['\n', '\r']).trim() == "---" {
+        if line.trim() == "---" {
             return Some((&after[..offset], &after[offset + line.len()..]));
         }
         offset += line.len();
