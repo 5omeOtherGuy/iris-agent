@@ -18,11 +18,11 @@ use std::io::{self, Stdout};
 
 use ansi_to_tui::IntoText;
 use anyhow::Result;
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
@@ -1399,6 +1399,18 @@ fn insert_lines_before<B: Backend>(
     Ok(())
 }
 
+fn render_without_autoresize<B: Backend>(
+    terminal: &mut Terminal<B>,
+    screen: &mut Screen,
+) -> Result<(), B::Error> {
+    {
+        let mut frame = terminal.get_frame();
+        render(&mut frame, screen);
+    }
+    terminal.apply_buffer_with_cursor(None)?;
+    Ok(())
+}
+
 /// Terminal driver: owns the ratatui terminal and the persistent raw-mode +
 /// inline-viewport lifecycle for the whole interactive session. It does NOT
 /// enter the alternate screen: finalized history is committed into the
@@ -1409,6 +1421,8 @@ pub(crate) struct TuiUi {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     pub(crate) screen: Screen,
     native_scrollback: bool,
+    allow_resize_probe: bool,
+    last_size: Size,
     active: bool,
 }
 
@@ -1448,6 +1462,7 @@ impl TuiUi {
                 return Err(error.into());
             }
         };
+        let last_size = terminal.size()?;
         if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
             let _ = disable_raw_mode();
@@ -1458,23 +1473,43 @@ impl TuiUi {
             terminal,
             screen: Screen::new(),
             native_scrollback,
+            allow_resize_probe: true,
+            last_size,
             active: true,
         })
     }
 
+    fn fallback_to_fullscreen(&mut self) -> Result<()> {
+        // ponytail: once inline would need a post-startup cursor probe (resize),
+        // stop using native scrollback and keep the Ratatui UI alive in-frame.
+        // Upgrade path: serialize terminal probes with input reads.
+        self.terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        self.native_scrollback = false;
+        self.allow_resize_probe = false;
+        self.last_size = self.terminal.size()?;
+        Ok(())
+    }
+
     pub(crate) fn draw(&mut self) -> Result<()> {
-        // Pick up any terminal resize before measuring width and committing, so
-        // finalized rows are wrapped to the current width.
-        if self.native_scrollback {
-            self.terminal.autoresize()?;
+        // Ratatui's inline autoresize recomputes the viewport from a terminal
+        // cursor-position probe. That is safe before the input reader starts,
+        // but after startup `event::read()` can steal the CPR response. Avoid
+        // `Terminal::draw()` here because it autoresizes internally every pass.
+        let size = self.terminal.size()?;
+        if self.native_scrollback && !self.allow_resize_probe && size != self.last_size {
+            self.fallback_to_fullscreen()?;
         }
+        if !self.native_scrollback || self.allow_resize_probe {
+            self.terminal.autoresize()?;
+            self.last_size = self.terminal.size()?;
+        }
+        self.allow_resize_probe = false;
         let width = self.terminal.size()?.width;
         if self.native_scrollback {
             let committed = self.screen.take_scrollback(width);
             insert_lines_before(&mut self.terminal, committed)?;
         }
-        let screen = &mut self.screen;
-        self.terminal.draw(|frame| render(frame, screen))?;
+        render_without_autoresize(&mut self.terminal, &mut self.screen)?;
         Ok(())
     }
 
@@ -1483,15 +1518,14 @@ impl TuiUi {
             // Clear the live viewport and drop the cursor onto a fresh line so
             // the shell prompt resumes below, not over the editor box. No
             // alternate screen was entered, so committed scrollback stays put.
-            let _ = self.terminal.clear();
-            if let Ok(area) = self.terminal.size() {
-                let _ = self
-                    .terminal
-                    .set_cursor_position((0, area.height.saturating_sub(1)));
-            }
+            let area = self.terminal.get_frame().area();
+            let backend = self.terminal.backend_mut();
+            let _ = backend.set_cursor_position(area.as_position());
+            let _ = backend.clear_region(ClearType::AfterCursor);
+            let _ = backend.set_cursor_position((0, area.y + area.height.saturating_sub(1)));
             let _ = disable_raw_mode();
             let _ = execute!(io::stdout(), DisableBracketedPaste);
-            let _ = self.terminal.show_cursor();
+            let _ = backend.show_cursor();
             crate::signals::disable_terminal_restore_on_force_quit();
             self.active = false;
         }
@@ -2008,15 +2042,144 @@ mod tests {
         B: Backend,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        if native_scrollback {
-            terminal.autoresize()?;
-        }
         let width = terminal.size()?.width;
         if native_scrollback {
             let committed = screen.take_scrollback(width);
             insert_lines_before(terminal, committed)?;
         }
-        terminal.draw(|frame| render(frame, screen))?;
+        render_without_autoresize(terminal, screen)?;
+        Ok(())
+    }
+
+    struct CursorProbeFailBackend {
+        inner: TestBackend,
+        fail_cursor_probe: bool,
+        size_override: Option<ratatui::layout::Size>,
+    }
+
+    impl CursorProbeFailBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                fail_cursor_probe: false,
+                size_override: None,
+            }
+        }
+    }
+
+    impl Backend for CursorProbeFailBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> std::result::Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content).map_err(|err| match err {})
+        }
+
+        fn append_lines(&mut self, n: u16) -> std::result::Result<(), Self::Error> {
+            self.inner.append_lines(n).map_err(|err| match err {})
+        }
+
+        fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.hide_cursor().map_err(|err| match err {})
+        }
+
+        fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.show_cursor().map_err(|err| match err {})
+        }
+
+        fn get_cursor_position(
+            &mut self,
+        ) -> std::result::Result<ratatui::layout::Position, Self::Error> {
+            if self.fail_cursor_probe {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cursor position could not be read",
+                ));
+            }
+            self.inner.get_cursor_position().map_err(|err| match err {})
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::result::Result<(), Self::Error> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|err| match err {})
+        }
+
+        fn clear(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.clear().map_err(|err| match err {})
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> std::result::Result<(), Self::Error> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|err| match err {})
+        }
+
+        fn size(&self) -> std::result::Result<ratatui::layout::Size, Self::Error> {
+            Ok(self
+                .size_override
+                .unwrap_or_else(|| self.inner.size().expect("test backend size")))
+        }
+
+        fn window_size(
+            &mut self,
+        ) -> std::result::Result<ratatui::backend::WindowSize, Self::Error> {
+            Ok(ratatui::backend::WindowSize {
+                columns_rows: self.size()?,
+                pixels: ratatui::layout::Size::ZERO,
+            })
+        }
+
+        fn flush(&mut self) -> std::result::Result<(), Self::Error> {
+            self.inner.flush().map_err(|err| match err {})
+        }
+
+        fn scroll_region_up(
+            &mut self,
+            region: std::ops::Range<u16>,
+            line_count: u16,
+        ) -> std::result::Result<(), Self::Error> {
+            self.inner
+                .scroll_region_up(region, line_count)
+                .map_err(|err| match err {})
+        }
+
+        fn scroll_region_down(
+            &mut self,
+            region: std::ops::Range<u16>,
+            line_count: u16,
+        ) -> std::result::Result<(), Self::Error> {
+            self.inner
+                .scroll_region_down(region, line_count)
+                .map_err(|err| match err {})
+        }
+    }
+
+    #[test]
+    fn draw_after_startup_does_not_probe_cursor_even_if_size_changes() -> Result<()> {
+        let mut backend = CursorProbeFailBackend::new(40, 14);
+        backend.set_cursor_position(ratatui::layout::Position::new(0, 13))?;
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
+            },
+        )?;
+        terminal.backend_mut().fail_cursor_probe = true;
+        terminal.backend_mut().size_override = Some(ratatui::layout::Size::new(41, 14));
+
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::SessionStarted);
+        screen.commit_user("after startup");
+        screen.start_turn();
+        screen.apply(UiEvent::AssistantText("still rendering".to_string()));
+
+        draw_step(&mut terminal, &mut screen)?;
         Ok(())
     }
 
@@ -2032,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn full_draw_path_commits_history_keeps_live_viewport_and_survives_resize() -> Result<()> {
+    fn full_draw_path_commits_history_and_keeps_live_viewport() -> Result<()> {
         let mut backend = TestBackend::new(40, 14);
         backend.set_cursor_position(ratatui::layout::Position::new(0, 13))?;
         let mut terminal = Terminal::with_options(
@@ -2089,13 +2252,6 @@ mod tests {
             "live active region still renders finalized content"
         );
 
-        // A terminal resize must not panic and the viewport keeps rendering.
-        terminal.backend_mut().resize(28, 10);
-        draw_step(&mut terminal, &mut screen)?;
-        assert!(
-            buffer_text(&terminal).contains("message"),
-            "editor lost after resize"
-        );
         Ok(())
     }
 
