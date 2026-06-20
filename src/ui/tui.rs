@@ -298,11 +298,10 @@ impl Transcript {
             ApprovalDecision::Deny => return,
         };
         self.begin_block();
-        self.push_continued(
-            &format!("✔ You approved iris to run {} {scope}", run_target(call)),
-            ok_style(),
-            "  │ ",
-        );
+        self.rows.push(TranscriptRow::with_line(
+            approval_line(call, scope),
+            Some("  │ "),
+        ));
     }
 
     fn push_tool_result(&mut self, call: &ToolCall, content: &str) {
@@ -478,21 +477,66 @@ impl Transcript {
 
 fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
     let mut spans = vec![Span::styled(prefix, dim_style())];
-    if let Ok(text) = line.into_text() {
+    spans.extend(ansi_spans(line, dim_style()));
+    Line::from(spans)
+}
+
+fn approval_line(call: &ToolCall, scope: &str) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("✔", ok_style()),
+        Span::raw(" You approved iris to run "),
+    ];
+    spans.extend(ansi_spans(&run_target(call), Style::default()));
+    spans.push(Span::raw(format!(" {scope}")));
+    Line::from(spans)
+}
+
+fn approval_status_line(hint: &ApprovalHint) -> Line<'static> {
+    let mut spans = vec![Span::raw("approve ")];
+    spans.extend(ansi_spans(&hint.target, Style::default()));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(hint.options, dim_style()));
+    Line::from(spans)
+}
+
+fn approval_status_lines(hint: &ApprovalHint, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let full = approval_status_line(hint);
+    if display_width(&line_text(&full)) <= width {
+        return vec![full];
+    }
+
+    let mut target = vec![Span::raw("approve ")];
+    target.extend(ansi_spans(&hint.target, Style::default()));
+    let mut lines = Vec::new();
+    push_wrapped_line(&Line::from(target), width, Some("  │ "), &mut lines);
+    lines.push(Line::from(vec![
+        Span::styled("  │ ", dim_style()),
+        Span::styled(hint.options, dim_style()),
+    ]));
+    lines
+}
+
+fn ansi_spans(text: &str, default_style: Style) -> Vec<Span<'static>> {
+    if let Ok(parsed_text) = text.into_text() {
         // Flatten any parsed sub-lines (a stray \r can split one input line)
         // so no styled content is dropped.
-        for mut parsed in text.lines {
+        let mut spans = Vec::new();
+        for mut parsed in parsed_text.lines {
             for span in &mut parsed.spans {
-                if matches!(span.style.fg, None | Some(Color::Reset)) {
-                    span.style = span.style.fg(Color::DarkGray);
+                if matches!(span.style.fg, None | Some(Color::Reset))
+                    && let Some(fg) = default_style.fg
+                {
+                    span.style = span.style.fg(fg);
                 }
             }
             spans.append(&mut parsed.spans);
         }
-    } else {
-        spans.push(Span::styled(line.to_string(), dim_style()));
+        if !spans.is_empty() {
+            return spans;
+        }
     }
-    Line::from(spans)
+    vec![Span::styled(text.to_string(), default_style)]
 }
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -501,6 +545,11 @@ fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
 struct Spinner {
     active: bool,
     frame: usize,
+}
+
+struct ApprovalHint {
+    target: String,
+    options: &'static str,
 }
 
 impl Spinner {
@@ -565,7 +614,7 @@ pub(crate) struct Screen {
     pub(crate) palette: Palette,
     spinner: Spinner,
     /// Short status-row hint while a gated tool awaits the user's decision.
-    approval_hint: Option<String>,
+    approval_hint: Option<ApprovalHint>,
     /// Physical rows above the bottom of the transcript to keep in view. Zero
     /// means follow the latest output.
     scrollback: u16,
@@ -697,7 +746,10 @@ impl Screen {
         } else {
             "[y] once  [N] deny"
         };
-        self.approval_hint = Some(format!("approve {}  {options}", run_target(call)));
+        self.approval_hint = Some(ApprovalHint {
+            target: run_target(call),
+            options,
+        });
         self.follow_bottom();
     }
 
@@ -711,17 +763,23 @@ impl Screen {
     }
 
     /// Status row content: approval hint > spinner > idle hint.
-    fn status_line(&self) -> Line<'static> {
+    fn status_lines(&self, width: u16) -> Vec<Line<'static>> {
         if let Some(hint) = &self.approval_hint {
-            Line::from(Span::styled(hint.clone(), prompt_style()))
+            approval_status_lines(hint, usize::from(width))
         } else if self.spinner.active {
-            Line::from(vec![
+            vec![Line::from(vec![
                 Span::styled(format!("{} ", self.spinner.glyph()), prompt_style()),
                 Span::styled("working", dim_style()),
-            ])
+            ])]
         } else {
-            Line::from(Span::styled(IDLE_HINT, dim_style()))
+            vec![Line::from(Span::styled(IDLE_HINT, dim_style()))]
         }
+    }
+
+    fn status_height(&self, width: u16) -> u16 {
+        u16::try_from(self.status_lines(width).len())
+            .unwrap_or(u16::MAX)
+            .max(1)
     }
 }
 
@@ -842,9 +900,19 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
         0
     };
 
+    let desired_status_h = screen.status_height(area.width);
+    let max_status_h = area
+        .height
+        .saturating_sub(editor_h)
+        .saturating_sub(palette_h)
+        .saturating_sub(1)
+        .max(1);
+    let status_h = desired_status_h.min(max_status_h);
+    let status_lines = screen.status_lines(area.width);
+
     let chunks = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(status_h),
         Constraint::Length(palette_h),
         Constraint::Length(editor_h),
     ])
@@ -867,7 +935,7 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
         transcript_area,
     );
 
-    frame.render_widget(Paragraph::new(screen.status_line()), status_area);
+    frame.render_widget(Paragraph::new(Text::from(status_lines)), status_area);
 
     if palette_h > 0 {
         render_palette(
@@ -1100,7 +1168,66 @@ mod tests {
     fn approval_hint_names_tool_target() {
         let mut screen = Screen::new();
         screen.show_approval(&call_args("bash", json!({ "command": "echo hi" })), false);
-        assert!(line_text(&screen.status_line()).contains("approve echo hi"));
+        let lines = screen.status_lines(80);
+        assert!(line_text(&lines[0]).contains("approve echo hi"));
+    }
+
+    #[test]
+    fn approval_hint_wraps_in_narrow_frame() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(48, 10))?;
+        let mut screen = Screen::new();
+        screen.show_approval(
+            &call_args(
+                "bash",
+                json!({
+                    "command": "printf 'global:\\n'; find \"$HOME/.iris/fragments\" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null",
+                    "timeout": 120
+                }),
+            ),
+            false,
+        );
+        terminal.draw(|f| render(f, &mut screen))?;
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("approve printf 'global:"));
+        assert!(rendered.contains("  │ "));
+        assert!(rendered.contains("(timeout 120s)"));
+        assert!(rendered.contains("[N] deny"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn approval_record_styles_only_marker_green() {
+        let mut screen = Screen::new();
+        screen.record_approval(
+            &call_args("bash", json!({ "command": "echo hi" })),
+            ApprovalDecision::Allow,
+        );
+        let lines = screen.wrapped_lines(80);
+        let line = line_matching(&lines, |line| line_text(line).contains("You approved"));
+        assert_eq!(line.spans[0].content.as_ref(), "✔");
+        assert_eq!(line.spans[0].style, ok_style());
+        assert_eq!(
+            line.spans[1].content.as_ref(),
+            " You approved iris to run echo hi this time"
+        );
+        assert_eq!(line.spans[1].style, Style::default());
+    }
+
+    #[test]
+    fn approval_record_preserves_ansi_target_style() {
+        let mut screen = Screen::new();
+        screen.record_approval(
+            &call_args("bash", json!({ "command": "\u{1b}[31mred\u{1b}[0m" })),
+            ApprovalDecision::Allow,
+        );
+        let lines = screen.wrapped_lines(80);
+        let line = line_matching(&lines, |line| line_text(line).contains("red"));
+        let red = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "red")
+            .expect("red span");
+        assert_eq!(red.style, Style::default().fg(Color::Red));
     }
 
     #[test]
