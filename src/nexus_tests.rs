@@ -151,9 +151,10 @@ fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
 
     let events = frontend.events.borrow();
     assert!(matches!(events[0], AgentEvent::ToolProposed(_)));
-    assert!(matches!(events[1], AgentEvent::ToolResult { .. }));
-    assert!(matches!(events[2], AgentEvent::AssistantText(_)));
-    assert!(matches!(events[3], AgentEvent::TurnComplete));
+    assert!(matches!(events[1], AgentEvent::ToolStarted(_)));
+    assert!(matches!(events[2], AgentEvent::ToolResult { .. }));
+    assert!(matches!(events[3], AgentEvent::AssistantText(_)));
+    assert!(matches!(events[4], AgentEvent::TurnComplete));
     // read is never gated: the approval gate must not be consulted.
     assert!(frontend.events_at_review.borrow().is_none());
     Ok(())
@@ -189,7 +190,9 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
 
     let events = frontend.events.borrow();
     assert!(matches!(events[0], AgentEvent::DiffPreview { .. }));
-    assert!(matches!(events[1], AgentEvent::ToolResult { .. }));
+    // ToolStarted is emitted after approval resolves, before execution.
+    assert!(matches!(events[1], AgentEvent::ToolStarted(_)));
+    assert!(matches!(events[2], AgentEvent::ToolResult { .. }));
     assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "new\n");
     Ok(())
 }
@@ -567,6 +570,38 @@ fn unknown_tool_resolution_yields_unknown_tool_error() -> Result<()> {
     assert_tool_error_contains(
         &harness.agent.provider.seen.borrow()[1],
         "unknown tool: ghost",
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_tool_does_not_emit_a_phantom_tool_started() -> Result<()> {
+    // An unresolved tool must NOT open a live exec cell: `ToolStarted` is
+    // emitted only when a real tool begins executing, so the front-end never
+    // shows a `Running` cell for a call that immediately fails.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("ghost", json!({}))),
+        Ok(AssistantTurn::text("ok")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("use ghost", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolStarted(_))),
+        "a phantom ToolStarted was emitted for an unknown tool"
+    );
+    // The call still produces a ToolError, keeping the transcript pairing valid.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolError { .. })),
+        "unknown tool should still surface a ToolError"
     );
     Ok(())
 }
@@ -2881,5 +2916,94 @@ fn hidden_edit_tool_still_executes_when_the_model_calls_it() -> Result<()> {
             .iter()
             .all(|surface| !surface.iter().any(|name| name == "edit"))
     );
+    Ok(())
+}
+
+#[test]
+fn streaming_tool_deltas_stay_out_of_messages_and_exit_metadata_threads_through() -> Result<()> {
+    // A tool that streams a chunk through the injected sink and reports exit
+    // code + duration via metadata. Exercises the exclusive-path emitter, the
+    // delta event, and record_call lifting the metadata onto ToolResult.
+    struct StreamingTool;
+    impl Tool for StreamingTool {
+        fn name(&self) -> &str {
+            "streamer"
+        }
+        fn description(&self) -> &str {
+            "test streaming tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            let sink = env.output_sink;
+            Box::pin(async move {
+                if let Some(sink) = sink {
+                    sink.emit_chunk("STREAMED_CHUNK");
+                }
+                Ok(ToolOutput::text("final output")
+                    .with("exitCode", json!(7))
+                    .with("durationMs", json!(123)))
+            })
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("streamer", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(StreamingTool)]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("stream", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    // A display-only delta was emitted carrying the chunk.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolOutputDelta { chunk, .. } if chunk == "STREAMED_CHUNK"
+        )),
+        "no ToolOutputDelta emitted"
+    );
+    // The final ToolResult carries exit code + duration lifted from metadata.
+    let (exit_code, duration) = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolResult {
+                exit_code,
+                duration,
+                ..
+            } => Some((*exit_code, *duration)),
+            _ => None,
+        })
+        .expect("a ToolResult event");
+    assert_eq!(exit_code, Some(7));
+    assert_eq!(duration, Some(Duration::from_millis(123)));
+
+    // The streamed delta NEVER enters provider context, and the display-only
+    // exec metadata is stripped from the wire (no exitCode/durationMs leak).
+    for message in harness.agent.messages() {
+        assert!(
+            !message.content.contains("STREAMED_CHUNK"),
+            "streamed delta leaked into provider context: {}",
+            message.content
+        );
+        assert!(
+            !message.content.contains("exitCode") && !message.content.contains("durationMs"),
+            "display-only exec metadata leaked to the wire: {}",
+            message.content
+        );
+    }
     Ok(())
 }

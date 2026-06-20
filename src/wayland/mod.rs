@@ -164,6 +164,9 @@ impl<P: ChatProvider> Harness<P> {
                 .output_store
                 .as_ref()
                 .map(|store| store as &dyn crate::nexus::ToolOutputStore),
+            // Streaming is Nexus-owned: it injects a per-call sink on the
+            // exclusive path. The harness env carries none.
+            output_sink: None,
         };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
