@@ -29,6 +29,7 @@ rand = "0.10"
 # events) as `ratatui::crossterm`, so the renderer builds on ratatui and lets it
 # own the terminal backend. No bespoke cell-buffer/diff is hand-rolled.
 ratatui = "0.30"
+ansi-to-tui = "8.0.1"
 # Multiline editor widget (undo/redo, kill-ring/yank, word-nav) over the same
 # ratatui buffer. default-features off drops its crossterm/termion/termwiz input
 # backends and the regex search feature: Iris drives edits from its own keymap

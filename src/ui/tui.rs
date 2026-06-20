@@ -16,6 +16,7 @@
 
 use std::io::{self, Stdout};
 
+use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -97,13 +98,14 @@ fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0).max(1)
 }
 
-/// One styled logical transcript row. Kept as plain text + style so it can be
-/// rendered from the current width into physical terminal rows.
+/// One styled logical transcript row. Most rows are plain text + style; ANSI
+/// tool output stores a parsed ratatui line so the escape styling survives.
 #[derive(Clone)]
 struct TranscriptRow {
     text: String,
     style: Style,
     continuation_prefix: Option<&'static str>,
+    line: Option<Line<'static>>,
 }
 
 impl TranscriptRow {
@@ -112,6 +114,7 @@ impl TranscriptRow {
             text: text.into(),
             style,
             continuation_prefix: None,
+            line: None,
         }
     }
 
@@ -124,12 +127,74 @@ impl TranscriptRow {
             text: text.into(),
             style,
             continuation_prefix: Some(continuation_prefix),
+            line: None,
+        }
+    }
+
+    fn with_line(line: Line<'static>, continuation_prefix: Option<&'static str>) -> Self {
+        Self {
+            text: line_text(&line),
+            style: Style::default(),
+            continuation_prefix,
+            line: Some(line),
         }
     }
 
     fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
-        push_wrapped_row(&self.text, self.style, width, self.continuation_prefix, out);
+        if let Some(line) = &self.line {
+            push_wrapped_line(line, width, self.continuation_prefix, out);
+        } else {
+            push_wrapped_row(&self.text, self.style, width, self.continuation_prefix, out);
+        }
     }
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn push_span_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push(ch);
+        return;
+    }
+    spans.push(Span::styled(ch.to_string(), style));
+}
+
+fn push_wrapped_line(
+    line: &Line<'static>,
+    width: usize,
+    continuation_prefix: Option<&'static str>,
+    out: &mut Vec<Line<'static>>,
+) {
+    // Ponytail: ANSI rows keep color and hard-wrap only; upgrade to
+    // span-aware word wrap when long colorized logs prove worth the extra code.
+    let width = width.max(1);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0;
+
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let cw = char_width(ch);
+            if cur_w > 0 && cur_w + cw > width {
+                out.push(Line::from(std::mem::take(&mut spans)));
+                cur_w = 0;
+                if let Some(prefix) = continuation_prefix {
+                    spans.push(Span::styled(prefix, dim_style()));
+                    cur_w = display_width(prefix);
+                }
+            }
+            push_span_char(&mut spans, ch, span.style);
+            cur_w += cw;
+        }
+    }
+
+    out.push(Line::from(spans));
 }
 
 fn push_wrapped_row(
@@ -269,7 +334,14 @@ impl Transcript {
         let mut first = true;
         for line in folded.preview.lines() {
             let prefix = if first { "  └ " } else { "    " };
-            self.push_continued(&format!("{prefix}{line}"), dim_style(), "    ");
+            if line.contains("\x1b[") {
+                self.rows.push(TranscriptRow::with_line(
+                    tool_output_line(prefix, line),
+                    Some("    "),
+                ));
+            } else {
+                self.push_continued(&format!("{prefix}{line}"), dim_style(), "    ");
+            }
             first = false;
         }
         if folded.hidden_lines > 0 {
@@ -402,6 +474,25 @@ impl Transcript {
         }
         rows
     }
+}
+
+fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
+    let mut spans = vec![Span::styled(prefix, dim_style())];
+    if let Ok(text) = line.into_text() {
+        // Flatten any parsed sub-lines (a stray \r can split one input line)
+        // so no styled content is dropped.
+        for mut parsed in text.lines {
+            for span in &mut parsed.spans {
+                if matches!(span.style.fg, None | Some(Color::Reset)) {
+                    span.style = span.style.fg(Color::DarkGray);
+                }
+            }
+            spans.append(&mut parsed.spans);
+        }
+    } else {
+        spans.push(Span::styled(line.to_string(), dim_style()));
+    }
+    Line::from(spans)
 }
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -947,6 +1038,50 @@ mod tests {
         assert!(texts.iter().any(|t| t == "  └ a"));
         assert!(texts.iter().any(|t| t == "    b"));
         assert!(!texts.iter().any(|t| t.starts_with("[ok]")));
+    }
+
+    #[test]
+    fn tool_output_preserves_ansi_color_spans() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "printf color" })),
+            content: "\x1b[31mred\x1b[0m plain".to_string(),
+        });
+        let lines = screen.wrapped_lines(80);
+        let output = line_matching(&lines, |line| line_text(line).contains("red plain"));
+        assert_eq!(line_text(output), "  └ red plain");
+        assert_eq!(output.spans[0].content.as_ref(), "  └ ");
+        assert_eq!(output.spans[0].style, dim_style());
+        assert_eq!(output.spans[1].content.as_ref(), "red");
+        assert_eq!(output.spans[1].style, Style::default().fg(Color::Red));
+        assert_eq!(output.spans[2].content.as_ref(), " plain");
+        assert_eq!(output.spans[2].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn ansi_tool_output_hard_wraps_without_dropping_chars() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "printf color" })),
+            content: "\x1b[31mabcdefghijklmnopqrstuvwxyz\x1b[0m".to_string(),
+        });
+        // Narrow width forces the styled row across multiple physical lines.
+        let lines = screen.wrapped_lines(10);
+        let red: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg == Some(Color::Red))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(red, "abcdefghijklmnopqrstuvwxyz");
+        let wrapped_rows = lines
+            .iter()
+            .filter(|line| line.spans.iter().any(|s| s.style.fg == Some(Color::Red)))
+            .count();
+        assert!(
+            wrapped_rows > 1,
+            "expected the row to wrap, got {wrapped_rows}"
+        );
     }
 
     #[test]
