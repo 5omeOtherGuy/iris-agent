@@ -502,8 +502,34 @@ Potential scope:
   (bracketed paste + `\` continuation). Full-screen TUI shipped later on top
   of this: raw-mode alternate screen, persistent transcript, textarea editor,
   spinner, slash palette, and Ctrl-C/input edge-case handling, with text UI as
-  the non-TTY/piped fallback. Still deferred: interactive expand/collapse of
-  folded blocks and full right-bordered box framing.]
+  the non-TTY/piped fallback. Inline-Viewport Native Scrollback
+  ([#86](https://github.com/5omeOtherGuy/iris-agent/pull/86), shipped
+  2026-06-20) then re-architected the interactive TUI off the alternate screen:
+  finalized transcript blocks are committed into the terminal's native
+  scrollback (selectable/copyable, scrolled by the real terminal) via ratatui's
+  `Viewport::Inline` + `Terminal::insert_before`, above a small fixed live
+  viewport (`take_scrollback` keeps the current block live mid-turn and flushes
+  everything at idle). The manual scroll offset and its PageUp/PageDown/
+  Ctrl+Home/End + mouse-wheel handlers were removed (the terminal owns
+  scroll/select/copy). The same slice fixed multi-file diff headers (drop every
+  `---`/`+++` pair), removed the false `ctrl + t` transcript hint, made wrapping
+  URL/long-token-safe (fits -> own row; over-long -> hard-break, never clipped),
+  added flood-safe row-capped tool output, and added markdown rendering for
+  assistant text via pulldown-cmark (`src/ui/markdown.rs`, raw/inline HTML text
+  preserved). Deferred during this slice and tracked as follow-ups: markdown
+  streaming renders raw then snaps to formatted
+  ([#87](https://github.com/5omeOtherGuy/iris-agent/issues/87)); markdown
+  nested-context gaps -- code in blockquote/list, multi-paragraph list items
+  ([#88](https://github.com/5omeOtherGuy/iris-agent/issues/88)); diff colorizer
+  false-positive on zero-context (`-U0`) diffs
+  ([#89](https://github.com/5omeOtherGuy/iris-agent/issues/89)); larger TUI
+  scope -- per-command streaming, Running/Ran exit-code+duration cells, full
+  diff/syntax rendering
+  ([#90](https://github.com/5omeOtherGuy/iris-agent/issues/90)); and a real-TTY
+  smoke verification pass
+  ([#91](https://github.com/5omeOtherGuy/iris-agent/issues/91)). Still deferred:
+  interactive expand/collapse of folded blocks and full right-bordered box
+  framing.]
 - Streaming output if not already in MVP. [Shipped: `TurnSink` deltas.]
 - Session transcript persistence. [Shipped, now a read/write store foundation:
   `src/session.rs` writes a JSONL transcript -- a `session` header line plus one
