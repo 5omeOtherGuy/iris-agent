@@ -62,7 +62,7 @@
 
 mod defaults;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -266,12 +266,42 @@ fn take_anchor(fragments: &mut Vec<Fragment>, name: &str) -> Option<String> {
     body
 }
 
+/// Collapse same-name fragments to one winner (repo beats global; among equal
+/// source the later one wins, matching [`take_anchor`]). Keeps the winner's own
+/// slot and body. Distinct names are untouched even when they share a slot.
+fn dedup_by_name(fragments: Vec<Fragment>) -> Vec<Fragment> {
+    let mut winner: HashMap<&str, usize> = HashMap::new();
+    for (i, fragment) in fragments.iter().enumerate() {
+        match winner.get(fragment.name.as_str()) {
+            Some(&j) if source_rank(fragment.source) < source_rank(fragments[j].source) => {}
+            _ => {
+                winner.insert(fragment.name.as_str(), i);
+            }
+        }
+    }
+    let keep: HashSet<usize> = winner.into_values().collect();
+    fragments
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, f)| keep.contains(&i).then_some(f))
+        .collect()
+}
+
 /// Order the middle fragments: slotted by ascending slot (ties: global before
 /// repo, then alphabetical by name), then all unslotted fragments alphabetically
 /// after every slotted one.
+///
+/// Dedup is by `name` only (never by slot): same-name fragments collapse to one
+/// so a repo `.iris/fragments/foo.md` overrides the materialized global default
+/// of the same name, matching how [`take_anchor`] dedups anchors. The winner
+/// keeps its own slot and body, so its position follows its own slot. Repo beats
+/// global; among same-name same-source ties the later fragment wins (same
+/// "later wins" rule as [`take_anchor`]). Distinct names sharing a slot both
+/// survive -- slot is a sort key, not a uniqueness constraint.
 fn order_middles(fragments: Vec<Fragment>) -> Vec<Fragment> {
-    let (mut slotted, mut unslotted): (Vec<Fragment>, Vec<Fragment>) =
-        fragments.into_iter().partition(|f| f.slot.is_some());
+    let (mut slotted, mut unslotted): (Vec<Fragment>, Vec<Fragment>) = dedup_by_name(fragments)
+        .into_iter()
+        .partition(|f| f.slot.is_some());
     slotted.sort_by(|a, b| {
         a.slot
             .cmp(&b.slot)
