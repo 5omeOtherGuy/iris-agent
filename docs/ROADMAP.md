@@ -102,12 +102,13 @@ Implemented today:
   assembled string through the provider request path. Skills/templates remain
   deferred (issue #57); named slots and selector-driven assembly remain open
   (#76/#73).
-- Milestone 2 foundations: structured metadata, token estimates,
-  handle-backed large tool outputs, session-scoped content-addressed sidecars,
-  turn-boundary auto-compaction, formal correlation-id vocabulary for sessions,
-  message entries, provider turns, tool calls, compactions, and output handles,
-  plus typed observability events for provider-turn lifecycle, tool lifecycle,
-  compaction metadata, and output-handle metadata.
+- Milestone 2 foundations: structured metadata, typed tool-result contracts,
+  token estimates, handle-backed large tool outputs, session-scoped
+  content-addressed sidecars, turn-boundary auto-compaction, formal
+  correlation-id vocabulary for sessions, message entries, provider turns, tool
+  calls, compactions, and output handles, plus typed observability events for
+  provider-turn lifecycle, tool lifecycle, compaction metadata, and
+  output-handle metadata.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.
@@ -352,7 +353,7 @@ Shared tool infrastructure issues opened 2026-06-15:
 | [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Done (MVP): `edit`/`write` reject mutating an existing file that was never read or changed since last read (hash-decided; mtime refreshed on benign change). New files may be created blind. |
 | [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; observation refresh now happens after each mutation; no canonical mutation queue. |
 | [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Done (MVP): Nexus enforces a session allow-policy. Approval offers `[y] once` / `[a] always this session` / `[N] deny`; `always` records the tool name in a Nexus-owned `session_allowed` set so later same-tool calls auto-approve (emitted as `ToolAutoApproved`, never inferred by the UI). Deny stays safe-by-default (empty/invalid/EOF). Diff previews now render colored +/- with relative headers (the `a//abs` double-slash and write-vs-edit path inconsistency are fixed). Remaining: cross-session persistence, risk labels, and per-exact-command bash granularity (`always` on `bash` currently authorizes any later shell command this session). |
-| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): `dispatch` returns a `ToolOutput { content, metadata }`; success results carry a per-tool `metadata` object on the wire (`read` byte/line/`truncated`, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs shipped ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): oversized results are offloaded out of context behind a stable handle with a compact preview + `outputHandle` metadata. |
+| [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): tools return `ToolOutput { content, metadata }`; Nexus serializes the provider-visible `ToolResultContract` for success, tool error, denied, and cancelled results; success results carry optional per-tool `metadata` (`read` byte/line/`truncated`, `grep` metrics, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs shipped ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): oversized results are offloaded out of context behind a stable handle with a compact preview + typed `outputHandle { id, bytes, lines }` metadata. |
 
 Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
 on Claude Code's exact-string contract, a shared read-before-mutate stale-file

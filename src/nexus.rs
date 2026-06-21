@@ -5,7 +5,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Error, Result, bail};
 use futures::Stream;
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -1072,11 +1072,81 @@ fn emit_tool_lifecycle(
     })
 }
 
+/// Stable host metadata for an oversized tool output stored out of provider
+/// context. This is safe to persist and emit because it carries only the handle
+/// id and already-computed size/count data, never the full body or preview.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct OutputHandleInfo {
+struct OutputHandleMetadata {
     id: String,
     bytes: usize,
     lines: usize,
+}
+
+impl OutputHandleMetadata {
+    fn to_value(&self) -> Value {
+        json!({ "id": self.id, "bytes": self.bytes, "lines": self.lines })
+    }
+}
+
+/// Provider-neutral model-facing tool-result envelope. Concrete tools own the
+/// `content` text and optional metadata fields; Nexus owns how those values are
+/// serialized into provider-visible success/error/denied/cancelled results.
+///
+/// Keep this narrow and Rust-native: it documents and enforces today's wire
+/// shape without adding Flue-style schema generation or a public plugin API.
+#[derive(Debug)]
+enum ToolResultContract {
+    Success(ToolOutput),
+    ToolError(Error),
+    Denied,
+    Cancelled,
+}
+
+impl ToolResultContract {
+    fn success(output: ToolOutput) -> Self {
+        Self::Success(output)
+    }
+
+    fn tool_error(error: Error) -> Self {
+        Self::ToolError(error)
+    }
+
+    fn denied() -> Self {
+        Self::Denied
+    }
+
+    fn cancelled() -> Self {
+        Self::Cancelled
+    }
+
+    fn into_wire_json(self) -> String {
+        self.into_wire_value().to_string()
+    }
+
+    fn into_wire_value(self) -> Value {
+        match self {
+            Self::Success(output) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("ok".to_string(), Value::Bool(true));
+                obj.insert("content".to_string(), Value::String(output.content));
+                if !output.metadata.is_empty() {
+                    obj.insert("metadata".to_string(), Value::Object(output.metadata));
+                }
+                Value::Object(obj)
+            }
+            Self::ToolError(error) => json!({ "ok": false, "error": error.to_string() }),
+            Self::Denied => json!({
+                "ok": false,
+                "error": "tool call denied by user",
+                "denied": true
+            }),
+            Self::Cancelled => json!({
+                "ok": false,
+                "error": "tool call cancelled by user",
+                "cancelled": true
+            }),
+        }
+    }
 }
 
 /// Append one tool call and its result to the transcript and emit the matching
@@ -1140,8 +1210,12 @@ fn record_call(
             tracing::info!(tool = %call.name, ok = false, "tool executed");
             let message = format!("{error:#}");
             messages.push(
-                Message::tool_result(&call.id, &call.name, &tool_result_json(&Err(error)))
-                    .with_provider_turn_id(provider_turn_id),
+                Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    &ToolResultContract::tool_error(error).into_wire_json(),
+                )
+                .with_provider_turn_id(provider_turn_id),
             );
             emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Errored)?;
             AgentEvent::ToolError {
@@ -1152,8 +1226,12 @@ fn record_call(
         ToolOutcome::Cancelled => {
             tracing::info!(tool = %call.name, "tool cancelled");
             messages.push(
-                Message::tool_result(&call.id, &call.name, &cancelled_tool_result_json())
-                    .with_provider_turn_id(provider_turn_id),
+                Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    &ToolResultContract::cancelled().into_wire_json(),
+                )
+                .with_provider_turn_id(provider_turn_id),
             );
             emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Cancelled)?;
             AgentEvent::ToolError {
@@ -1164,8 +1242,12 @@ fn record_call(
         ToolOutcome::Denied => {
             tracing::warn!(tool = %call.name, "tool call denied");
             messages.push(
-                Message::tool_result(&call.id, &call.name, &denied_tool_result_json())
-                    .with_provider_turn_id(provider_turn_id),
+                Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    &ToolResultContract::denied().into_wire_json(),
+                )
+                .with_provider_turn_id(provider_turn_id),
             );
             emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Denied)?;
             AgentEvent::ToolDenied(call.clone())
@@ -1417,7 +1499,11 @@ fn repair_dangling_tool_call(messages: &mut Vec<Message>) {
         }
     }
     for (call_id, name, provider_turn_id) in pending {
-        let mut result = Message::tool_result(&call_id, &name, &cancelled_tool_result_json());
+        let mut result = Message::tool_result(
+            &call_id,
+            &name,
+            &ToolResultContract::cancelled().into_wire_json(),
+        );
         result.provider_turn_id = provider_turn_id;
         messages.push(result);
     }
@@ -1431,42 +1517,43 @@ fn repair_dangling_tool_call(messages: &mut Vec<Message>) {
 fn success_tool_result_json(
     store: Option<&dyn ToolOutputStore>,
     mut output: ToolOutput,
-) -> (String, Option<OutputHandleInfo>) {
+) -> (String, Option<OutputHandleMetadata>) {
     if output.content.len() <= MAX_INLINE_TOOL_OUTPUT_BYTES {
-        return (tool_result_json(&Ok(output)), None);
+        return (ToolResultContract::success(output).into_wire_json(), None);
     }
     let Some(store) = store else {
         // No durable store (e.g. in-memory session): keep the full output inline
         // rather than lose it. Larger context, but never data loss.
-        return (tool_result_json(&Ok(output)), None);
+        return (ToolResultContract::success(output).into_wire_json(), None);
     };
     match store.put(&output.content) {
         Ok(handle_id) => {
             // Swap the oversized content for a compact preview and record the
-            // handle pointer in metadata, then serialize through the same
-            // `tool_result_json` envelope as an inline result -- one
-            // serialization path, so the offloaded and inline shapes cannot
-            // drift apart.
+            // typed handle pointer in metadata, then serialize through the same
+            // contract as an inline result -- one serialization path, so the
+            // offloaded and inline shapes cannot drift apart.
             let total_bytes = output.content.len();
             let total_lines = output.content.lines().count();
             output.content = compact_preview(&output.content, &handle_id, total_bytes, total_lines);
-            output.metadata.insert(
-                "outputHandle".to_string(),
-                json!({ "id": handle_id, "bytes": total_bytes, "lines": total_lines }),
-            );
-            let info = OutputHandleInfo {
+            let info = OutputHandleMetadata {
                 id: handle_id,
                 bytes: total_bytes,
                 lines: total_lines,
             };
-            (tool_result_json(&Ok(output)), Some(info))
+            output
+                .metadata
+                .insert("outputHandle".to_string(), info.to_value());
+            (
+                ToolResultContract::success(output).into_wire_json(),
+                Some(info),
+            )
         }
         Err(error) => {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 "tool output handle store failed; inlining full output"
             );
-            (tool_result_json(&Ok(output)), None)
+            (ToolResultContract::success(output).into_wire_json(), None)
         }
     }
 }
@@ -1497,38 +1584,6 @@ fn compact_preview(
          context; {omitted} bytes omitted here. retrieve via output handle {handle_id}] ...\n"
     );
     format!("{head}{notice}{tail}")
-}
-
-fn tool_result_json(result: &Result<ToolOutput>) -> String {
-    match result {
-        Ok(output) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("ok".to_string(), Value::Bool(true));
-            obj.insert("content".to_string(), Value::String(output.content.clone()));
-            // Only emit the metadata object when a tool reported something
-            // structured, keeping text-only results on the wire as before.
-            if !output.metadata.is_empty() {
-                obj.insert(
-                    "metadata".to_string(),
-                    Value::Object(output.metadata.clone()),
-                );
-            }
-            Value::Object(obj).to_string()
-        }
-        Err(error) => json!({ "ok": false, "error": error.to_string() }).to_string(),
-    }
-}
-
-// Model-facing denial payload. Denial is a distinct pre-execution branch, not an
-// `Err` routed through `tool_result_json`, so the `denied` signal is preserved.
-fn denied_tool_result_json() -> String {
-    json!({ "ok": false, "error": "tool call denied by user", "denied": true }).to_string()
-}
-
-// Model-facing cancellation payload, distinct from a tool error so the model can
-// tell "interrupted by the user" apart from "the tool failed".
-fn cancelled_tool_result_json() -> String {
-    json!({ "ok": false, "error": "tool call cancelled by user", "cancelled": true }).to_string()
 }
 
 #[cfg(test)]

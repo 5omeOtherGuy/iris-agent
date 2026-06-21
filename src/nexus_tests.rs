@@ -816,9 +816,8 @@ fn read_tool_rejects_symlink_escape_from_workspace() -> Result<()> {
 fn read_tool_returns_missing_file_error() -> Result<()> {
     let workspace = test_workspace()?;
 
-    let result = tool_result_json(
-        &read_file(&workspace.path, "missing.txt").map(crate::tools::ToolOutput::text),
-    );
+    let error = read_file(&workspace.path, "missing.txt").unwrap_err();
+    let result = ToolResultContract::tool_error(error).into_wire_json();
 
     assert!(result.contains("\"ok\":false"));
     assert!(result.contains("failed to resolve path"));
@@ -1972,6 +1971,56 @@ fn offloaded_preview_is_safe_on_multibyte_boundaries() -> Result<()> {
     let store = crate::handles::HandleStore::for_session(&log_path);
     assert_eq!(store.get(&id)?.as_deref(), Some(body.as_str()));
     Ok(())
+}
+
+#[test]
+fn structured_result_contract_serializes_stable_success_error_denied_and_cancelled_shapes() {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("entries".to_string(), json!(2));
+    metadata.insert("truncated".to_string(), json!(false));
+
+    let success = ToolResultContract::success(ToolOutput {
+        content: "listed".to_string(),
+        metadata,
+    })
+    .into_wire_json();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&success).unwrap(),
+        json!({ "ok": true, "content": "listed", "metadata": { "entries": 2, "truncated": false } })
+    );
+
+    let error = ToolResultContract::tool_error(anyhow!("boom")).into_wire_json();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&error).unwrap(),
+        json!({ "ok": false, "error": "boom" })
+    );
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&ToolResultContract::denied().into_wire_json())
+            .unwrap(),
+        json!({ "ok": false, "error": "tool call denied by user", "denied": true })
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &ToolResultContract::cancelled().into_wire_json()
+        )
+        .unwrap(),
+        json!({ "ok": false, "error": "tool call cancelled by user", "cancelled": true })
+    );
+}
+
+#[test]
+fn output_handle_metadata_contract_serializes_without_body_or_preview() {
+    let handle = OutputHandleMetadata {
+        id: "abc123".to_string(),
+        bytes: 42,
+        lines: 3,
+    };
+
+    assert_eq!(
+        handle.to_value(),
+        json!({ "id": "abc123", "bytes": 42, "lines": 3 })
+    );
 }
 
 #[test]
