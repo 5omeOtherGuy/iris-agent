@@ -57,6 +57,9 @@ pub(crate) trait Ui {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UiEvent {
     SessionStarted,
+    ProviderTurnStarted {
+        turn_id: String,
+    },
     AssistantText(String),
     AssistantTextDelta(String),
     AssistantTextEnd(String),
@@ -106,6 +109,7 @@ impl UiEvent {
     /// both the blocking text bridge and the async loop bridge agree.
     pub(crate) fn from_agent_event(event: AgentEvent) -> Self {
         match event {
+            AgentEvent::ProviderTurnStarted { turn_id } => UiEvent::ProviderTurnStarted { turn_id },
             AgentEvent::AssistantText(text) => UiEvent::AssistantText(text),
             AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
             AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),
