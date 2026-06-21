@@ -34,7 +34,7 @@
 - **Session transcript persistence** — best-effort JSONL read/write store:
   `SessionLog` appends v2 transcript entries with stable ids, `parentId`, and
   token estimates; `SessionStore` lists/finds/opens sessions, rebuilds context
-  through compaction summaries, and `iris-agent resume <id>` continues the same
+  through compaction summaries, and `iris resume <id>` continues the same
   log. Branching/rollback and an in-session resume picker are planned later.
   [Partial]
 
@@ -63,10 +63,10 @@
   already hold Anthropic credentials, and writes rotated tokens back to the same
   source without reshaping or dropping sibling keys. [Partial]
 - **Antigravity Google OAuth login** — browser PKCE OAuth callback flow through
-  `iris-agent login antigravity`; requires `ANTIGRAVITY_CLIENT_SECRET` at login
+  `iris login antigravity`; requires `ANTIGRAVITY_CLIENT_SECRET` at login
   time and during later token refreshes. [Partial]
 - **OpenAI Codex login** — browser OAuth callback flow and device-code OAuth flow
-  through `iris-agent login openai-codex`. [Partial]
+  through `iris login openai-codex`. [Partial]
 - **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
   settings; supported provider ids are `openai-codex`, `anthropic`, and
   `antigravity`. Project-local settings may override only `defaultModel`; global
