@@ -178,6 +178,29 @@ mod tests {
     }
 
     #[test]
+    fn read_result_contract_reports_bounded_metadata() {
+        let dir = temp_dir();
+        fs::write(dir.path.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let root = root_of(&dir);
+        let output = read(
+            &root,
+            &ReadInput {
+                path: "a.txt".into(),
+                offset: None,
+                limit: Some(1),
+            },
+            &mut ObservedFiles::new(),
+        )
+        .unwrap();
+
+        assert_eq!(output.metadata.get("bytes"), Some(&json!(11)));
+        assert_eq!(output.metadata.get("lines"), Some(&json!(1)));
+        assert_eq!(output.metadata.get("total_lines"), Some(&json!(2)));
+        assert_eq!(output.metadata.get("truncated"), Some(&json!(true)));
+        assert!(output.content.contains("Use offset=2 to continue"));
+    }
+
+    #[test]
     fn read_offset_and_limit_window() {
         let dir = temp_dir();
         let body: String = (1..=10).map(|n| format!("line{n}\n")).collect();
