@@ -52,10 +52,9 @@ const MAX_PALETTE_ROWS: u16 = 8;
 /// repaints every frame: active in-flight block tail + status + palette +
 /// editor). Everything finalized is committed above it into the terminal's
 /// native scrollback via `insert_before`. ratatui's inline viewport height is
-/// fixed at construction, so this is a deliberate reserved-rows tradeoff: a
-/// small constant keeps the idle gap modest while leaving room for editor
-/// growth and the slash palette (the editor scrolls internally beyond it).
-const LIVE_VIEWPORT_ROWS: u16 = 8;
+/// fixed at construction, so this reserves enough room for the `/model` modal
+/// mockup plus the current catalog while keeping normal editor slack bounded.
+const LIVE_VIEWPORT_ROWS: u16 = 16;
 
 /// Cap on rows committed in a single `insert_before` call, so one finalized
 /// block never allocates an unbounded scratch buffer; larger blocks are
@@ -1410,15 +1409,15 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
 
 /// Render the active transcript on top and the open modal in a bordered box at
 /// the bottom, in place of the editor/palette/status rows. The modal box is
-/// sized to its content but clamped so the transcript keeps at least one row.
+/// sized to its content and may use the whole live viewport when needed.
 fn render_with_modal(frame: &mut Frame, screen: &mut Screen, area: Rect) {
     let Some(modal) = &screen.modal else {
         return;
     };
     let lines = modal.render(area.width.saturating_sub(2));
     let body_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    // content rows + top/bottom border, leaving at least one transcript row.
-    let max_modal_h = area.height.saturating_sub(1).max(1);
+    // content rows + top/bottom border, clamped to the live viewport.
+    let max_modal_h = area.height.max(1);
     // Prefer at least 3 rows (border + one line), but never exceed the available
     // height: on a tiny terminal `max_modal_h` can be 1-2, so cap last. Using
     // `clamp(3, max_modal_h)` here would panic when max < min.
@@ -2549,10 +2548,33 @@ mod tests {
         // Transcript still on top; the modal frame replaces the editor below.
         assert!(rendered.contains("prior reply"), "{rendered}");
         assert!(rendered.contains("Select model"), "{rendered}");
-        assert!(rendered.contains("GPT-5.5"), "{rendered}");
-        assert!(rendered.contains("Claude Sonnet 4.6"), "{rendered}");
+        assert!(rendered.contains("GPT 5.5"), "{rendered}");
+        assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
         // The editor placeholder is hidden while the modal is open.
         assert!(!rendered.contains("Type a message"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn open_modal_has_room_for_model_picker_footer() -> Result<()> {
+        use crate::mimir::model_catalog;
+        use crate::ui::modal::{Modal, ModelPicker};
+
+        let mut terminal = Terminal::new(TestBackend::new(80, LIVE_VIEWPORT_ROWS))?;
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Model(ModelPicker::new(
+            model_catalog::all(),
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-opus-4-8",
+            crate::mimir::selection::ReasoningEffort::XHigh,
+        )));
+        terminal.draw(|f| render(f, &mut screen))?;
+
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("Haiku 4.5"), "{rendered}");
+        assert!(rendered.contains("GPT 5.5"), "{rendered}");
+        assert!(rendered.contains("xHigh effort"), "{rendered}");
+        assert!(rendered.contains("Enter to set as default"), "{rendered}");
         Ok(())
     }
 
