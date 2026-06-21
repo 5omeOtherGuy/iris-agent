@@ -1532,6 +1532,7 @@ impl TuiUi {
             return Err(error.into());
         }
         crate::signals::enable_terminal_restore_on_force_quit();
+        crate::telemetry::set_tui_active(true);
         Ok(Self {
             terminal,
             screen: Screen::new(),
@@ -1590,6 +1591,7 @@ impl TuiUi {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
             let _ = backend.show_cursor();
             crate::signals::disable_terminal_restore_on_force_quit();
+            crate::telemetry::set_tui_active(false);
             self.active = false;
         }
     }
