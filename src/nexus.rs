@@ -578,6 +578,8 @@ impl<P: ChatProvider> Agent<P> {
                         text,
                         reasoning,
                         tool_calls,
+                        response_id: _,
+                        usage: _,
                     } = turn;
                     for block in reasoning {
                         self.messages
@@ -998,10 +1000,29 @@ fn record_call(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderUsage {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// Total provider-visible input tokens, including cache reads/writes when
+    /// the provider reports them separately.
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    /// Input tokens served from prompt cache. Already included in
+    /// `input_tokens`; callers must not add them again when computing total
+    /// input.
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) cache_write_input_tokens: u64,
+    pub(crate) reasoning_output_tokens: u64,
+    pub(crate) total_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AssistantTurn {
     pub(crate) text: Option<String>,
     pub(crate) reasoning: Vec<ReasoningBlock>,
     pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) response_id: Option<String>,
+    pub(crate) usage: Option<ProviderUsage>,
 }
 
 impl AssistantTurn {
@@ -1011,6 +1032,8 @@ impl AssistantTurn {
             text: Some(text.to_string()),
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            response_id: None,
+            usage: None,
         }
     }
 }

@@ -174,6 +174,7 @@ pub(crate) fn candidate_for(
         model: model.to_string(),
         base_url,
         reasoning,
+        cache_retention: current.cache_retention,
     }
 }
 
@@ -447,6 +448,7 @@ mod tests {
             model: model.to_string(),
             base_url: "https://example".to_string(),
             reasoning: None,
+            cache_retention: selection::PromptCacheRetention::Short,
         }
     }
 

@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -13,9 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::errors::AuthError;
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
-use crate::mimir::selection::ReasoningEffort;
+use crate::mimir::selection::{PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
-    AssistantTurn, ChatProvider, Message, ProviderEvent, ProviderStream, Role, ToolCall, Tools,
+    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderEvent, ProviderStream,
+    ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
 };
 use crate::telemetry;
 use futures::channel::mpsc;
@@ -57,6 +59,9 @@ impl TurnSink for ChannelSink {
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
+const PROVIDER_ID: &str = "openai-codex";
+const API_ID: &str = "openai-codex-responses";
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCodexResponsesProvider {
@@ -65,6 +70,9 @@ pub(crate) struct OpenAiCodexResponsesProvider {
     base_url: String,
     reasoning: Option<ReasoningEffort>,
     system_prompt: String,
+    prompt_cache_key: String,
+    cache_retention: PromptCacheRetention,
+    cache_diagnostics: Arc<Mutex<super::CacheUsageDiagnostics>>,
     tokens: OpenAiCodexTokenStore,
 }
 
@@ -80,6 +88,8 @@ impl OpenAiCodexResponsesProvider {
         base_url: &str,
         reasoning: Option<ReasoningEffort>,
         system_prompt: &str,
+        prompt_cache_key: &str,
+        cache_retention: PromptCacheRetention,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
@@ -89,6 +99,9 @@ impl OpenAiCodexResponsesProvider {
             base_url: base_url.to_string(),
             reasoning,
             system_prompt: system_prompt.to_string(),
+            prompt_cache_key: prompt_cache_key.to_string(),
+            cache_retention,
+            cache_diagnostics: Arc::new(Mutex::new(super::CacheUsageDiagnostics::default())),
             tokens: OpenAiCodexTokenStore::from_env()?,
         })
     }
@@ -110,6 +123,8 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             messages,
             tools,
             self.reasoning,
+            Some(&self.prompt_cache_key),
+            self.cache_retention,
         );
         let url = resolve_codex_url(&self.base_url)?;
         let provider = self.clone();
@@ -280,8 +295,18 @@ impl OpenAiCodexResponsesProvider {
 
         let status = response.status();
         if status.is_success() {
-            return match parse_response_stream_reader(BufReader::new(response), sink, cancel) {
-                Ok(turn) => Attempt::Done(turn),
+            return match parse_response_stream_reader(
+                BufReader::new(response),
+                sink,
+                cancel,
+                &self.model,
+            ) {
+                Ok(turn) => {
+                    if let Some(usage) = &turn.usage {
+                        self.record_usage(usage);
+                    }
+                    Attempt::Done(turn)
+                }
                 Err(error) => Attempt::Fatal(error),
             };
         }
@@ -296,6 +321,32 @@ impl OpenAiCodexResponsesProvider {
             HttpClass::Reauth => Attempt::Reauth(error),
             HttpClass::Retry => Attempt::Retry(error, retry_after),
             HttpClass::Fatal => Attempt::Fatal(error),
+        }
+    }
+
+    fn record_usage(&self, usage: &ProviderUsage) {
+        tracing::info!(
+            provider = %usage.provider,
+            model = %usage.model,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            cache_read_input_tokens = usage.cache_read_input_tokens,
+            cache_write_input_tokens = usage.cache_write_input_tokens,
+            reasoning_output_tokens = usage.reasoning_output_tokens,
+            total_tokens = usage.total_tokens,
+            "provider token usage"
+        );
+        let should_warn = super::CacheUsageDiagnostics::record_locked(
+            &self.cache_diagnostics,
+            self.cache_retention.caching_enabled(),
+            usage,
+        );
+        if should_warn {
+            tracing::warn!(
+                provider = %usage.provider,
+                model = %usage.model,
+                "prompt caching is enabled but repeated cacheable OpenAI requests reported zero cache reads"
+            );
         }
     }
 }
@@ -356,12 +407,14 @@ fn build_codex_request(
     messages: &[Message],
     tools: &Tools,
     reasoning: Option<ReasoningEffort>,
+    prompt_cache_key: Option<&str>,
+    cache_retention: PromptCacheRetention,
 ) -> Value {
     // The Codex adapter owns conversion between Nexus messages and Responses wire JSON.
+    let origin = openai_origin(model);
     let input: Vec<Value> = messages
         .iter()
-        .filter(|message| message.role != Role::AssistantReasoning)
-        .map(codex_input_item)
+        .filter_map(|message| codex_input_item(message, &origin))
         .collect();
 
     let mut body = json!({
@@ -373,10 +426,23 @@ fn build_codex_request(
         "tools": tool_declarations(tools),
         "text": { "verbosity": "low" },
     });
-    // Reasoning is inserted only when a preference is set, so the default (None)
-    // body is byte-identical to today's request.
+    if cache_retention.caching_enabled()
+        && let Some(key) = prompt_cache_key.and_then(clamp_openai_prompt_cache_key)
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
+    // Reasoning is inserted only when a preference is set. Encrypted reasoning
+    // is requested whenever reasoning is active or same-origin continuity is
+    // replayed, matching Responses' include contract without adopting Codex's
+    // websocket/session machinery.
     if let Some(reasoning) = codex_reasoning(reasoning) {
         body["reasoning"] = reasoning;
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    } else if input
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+    {
+        body["include"] = json!(["reasoning.encrypted_content"]);
     }
     body
 }
@@ -417,8 +483,8 @@ fn tool_declarations(tools: &Tools) -> Vec<Value> {
         .collect()
 }
 
-fn codex_input_item(message: &Message) -> Value {
-    match message.role {
+fn codex_input_item(message: &Message, current_origin: &ModelOrigin) -> Option<Value> {
+    let item = match message.role {
         Role::User | Role::Assistant => json!({
             "type": "message",
             "role": message.role.as_str(),
@@ -435,8 +501,39 @@ fn codex_input_item(message: &Message) -> Value {
             "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
             "output": message.content,
         }),
-        Role::AssistantReasoning => unreachable!("reasoning rows are filtered out"),
+        Role::AssistantReasoning => {
+            if message.origin.as_ref() != Some(current_origin) {
+                return None;
+            }
+            let encrypted = message.continuity.as_deref()?.trim();
+            if encrypted.is_empty() {
+                return None;
+            }
+            json!({
+                "type": "reasoning",
+                "encrypted_content": encrypted,
+                "summary": [],
+            })
+        }
+    };
+    Some(item)
+}
+
+fn clamp_openai_prompt_cache_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
     }
+    Some(
+        trimmed
+            .chars()
+            .take(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH)
+            .collect(),
+    )
+}
+
+fn openai_origin(model: &str) -> ModelOrigin {
+    ModelOrigin::new(PROVIDER_ID, API_ID, model)
 }
 
 fn message_content_type(role: Role) -> &'static str {
@@ -488,7 +585,7 @@ fn resolve_codex_url(base_url: &str) -> Result<Url> {
 
 #[cfg(test)]
 fn parse_response_json(value: Value) -> Result<AssistantTurn> {
-    let turn = extract_assistant_turn(&value);
+    let turn = extract_assistant_turn(&value, "gpt-test");
     if turn.text.as_deref().unwrap_or_default().is_empty() && turn.tool_calls.is_empty() {
         bail!("Codex response did not include assistant text or tool calls");
     }
@@ -516,6 +613,7 @@ fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
         BufReader::new(body.as_bytes()),
         &mut sink,
         &CancellationToken::new(),
+        "gpt-test",
     )
 }
 
@@ -523,8 +621,9 @@ fn parse_response_stream_reader(
     reader: impl BufRead,
     sink: &mut dyn TurnSink,
     cancel: &CancellationToken,
+    model: &str,
 ) -> Result<AssistantTurn> {
-    let mut parser = ResponseStreamParser::default();
+    let mut parser = ResponseStreamParser::new(model);
     let mut event = String::new();
 
     for line in reader.lines() {
@@ -551,15 +650,29 @@ fn parse_response_stream_reader(
     parser.finish()
 }
 
-#[derive(Default)]
 struct ResponseStreamParser {
+    origin: ModelOrigin,
     text: String,
+    reasoning: Vec<ReasoningBlock>,
     tool_calls: Vec<ToolCall>,
     completed_response: Option<Value>,
+    response_id: Option<String>,
     saw_completed: bool,
 }
 
 impl ResponseStreamParser {
+    fn new(model: &str) -> Self {
+        Self {
+            origin: openai_origin(model),
+            text: String::new(),
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
+            completed_response: None,
+            response_id: None,
+            saw_completed: false,
+        }
+    }
+
     fn ingest_event(&mut self, event: &str, sink: &mut dyn TurnSink) -> Result<()> {
         let data = event_data(event);
         if data.is_empty() || data == "[DONE]" {
@@ -574,10 +687,20 @@ impl ResponseStreamParser {
                     sink.on_text_delta(delta)?;
                 }
             }
+            Some("response.created") => {
+                self.response_id = value
+                    .get("response")
+                    .and_then(|response| response.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             Some("response.output_item.done") => {
                 if let Some(item) = value.get("item") {
                     if self.text.is_empty() {
                         self.text.push_str(&extract_output_text(item));
+                    }
+                    if let Some(block) = extract_reasoning_block(item, &self.origin) {
+                        self.reasoning.push(block);
                     }
                     if let Some(call) = extract_tool_call(item) {
                         self.tool_calls.push(call);
@@ -587,6 +710,14 @@ impl ResponseStreamParser {
             Some("response.completed") => {
                 self.saw_completed = true;
                 self.completed_response = value.get("response").cloned();
+                if let Some(id) = self
+                    .completed_response
+                    .as_ref()
+                    .and_then(|response| response.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.response_id = Some(id.to_string());
+                }
             }
             Some("response.failed") => bail!("Codex response failed: {}", response_error(&value)),
             Some("response.incomplete") => {
@@ -601,23 +732,33 @@ impl ResponseStreamParser {
         if !self.saw_completed {
             bail!("Codex stream closed before response.completed");
         }
+        let mut usage = None;
         if let Some(response) = self.completed_response.as_ref() {
-            let completed_turn = extract_assistant_turn(response);
+            let completed_turn = extract_assistant_turn(response, &self.origin.model);
             if self.text.is_empty() {
                 self.text
                     .push_str(completed_turn.text.as_deref().unwrap_or_default());
             }
+            if self.reasoning.is_empty() {
+                self.reasoning = completed_turn.reasoning;
+            }
             if self.tool_calls.is_empty() {
                 self.tool_calls = completed_turn.tool_calls;
             }
+            if self.response_id.is_none() {
+                self.response_id = completed_turn.response_id;
+            }
+            usage = completed_turn.usage;
         }
         if self.text.is_empty() && self.tool_calls.is_empty() {
             bail!("Codex response did not include assistant text or tool calls");
         }
         Ok(AssistantTurn {
             text: (!self.text.is_empty()).then_some(self.text),
-            reasoning: Vec::new(),
+            reasoning: self.reasoning,
             tool_calls: self.tool_calls,
+            response_id: self.response_id,
+            usage,
         })
     }
 }
@@ -661,14 +802,98 @@ fn incomplete_reason(value: &Value) -> String {
         .to_string()
 }
 
-fn extract_assistant_turn(value: &Value) -> AssistantTurn {
+fn extract_assistant_turn(value: &Value, model: &str) -> AssistantTurn {
+    let origin = openai_origin(model);
     let text = extract_output_text(value);
+    let reasoning = extract_reasoning_blocks(value, &origin);
     let tool_calls = extract_tool_calls(value);
     AssistantTurn {
         text: (!text.is_empty()).then_some(text),
-        reasoning: Vec::new(),
+        reasoning,
         tool_calls,
+        response_id: value.get("id").and_then(Value::as_str).map(str::to_string),
+        usage: extract_openai_usage(value, model),
     }
+}
+
+fn extract_reasoning_blocks(value: &Value, origin: &ModelOrigin) -> Vec<ReasoningBlock> {
+    let mut blocks = Vec::new();
+    if let Some(block) = extract_reasoning_block(value, origin) {
+        blocks.push(block);
+    }
+    if let Some(items) = value.get("output").and_then(Value::as_array) {
+        blocks.extend(
+            items
+                .iter()
+                .filter_map(|item| extract_reasoning_block(item, origin)),
+        );
+    }
+    blocks
+}
+
+fn extract_reasoning_block(value: &Value, origin: &ModelOrigin) -> Option<ReasoningBlock> {
+    (value.get("type").and_then(Value::as_str) == Some("reasoning")).then(|| {
+        let text = extract_reasoning_text(value);
+        let encrypted = value
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty());
+        ReasoningBlock::new(&text, encrypted, encrypted.is_some(), origin.clone())
+    })
+}
+
+fn extract_reasoning_text(value: &Value) -> String {
+    let mut groups = Vec::new();
+    for key in ["summary", "content"] {
+        let mut group = String::new();
+        if let Some(parts) = value.get(key).and_then(Value::as_array) {
+            for part in parts {
+                if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+                    group.push_str(part_text);
+                }
+            }
+        }
+        if !group.is_empty() {
+            groups.push(group);
+        }
+    }
+    groups.join("\n")
+}
+
+fn extract_openai_usage(value: &Value, model: &str) -> Option<ProviderUsage> {
+    let usage = value.get("usage")?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_output_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    Some(ProviderUsage {
+        provider: PROVIDER_ID.to_string(),
+        model: model.to_string(),
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_write_input_tokens: 0,
+        reasoning_output_tokens,
+        total_tokens,
+    })
 }
 
 fn extract_tool_calls(value: &Value) -> Vec<ToolCall> {

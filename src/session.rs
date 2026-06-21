@@ -74,25 +74,35 @@ pub(crate) struct SessionLog {
 }
 
 impl SessionLog {
-    /// Create a new transcript under the resolved session root for `cwd`,
-    /// writing the header line.
-    pub(crate) fn create(cwd: &Path) -> Result<Self> {
-        Self::create_in(&sessions_root()?, cwd)
+    /// Create a transcript with a caller-supplied session id. Used when the
+    /// provider prompt-cache key must be derived before the transcript file is
+    /// opened; the same opaque id then anchors both concerns.
+    pub(crate) fn create_with_id(cwd: &Path, id: &str) -> Result<Self> {
+        Self::create_in_with_id(&sessions_root()?, cwd, id)
     }
 
     /// Core constructor with an explicit session root, so callers and tests can
     /// persist without env or home-directory state.
     pub(crate) fn create_in(root: &Path, cwd: &Path) -> Result<Self> {
+        let id = new_session_id();
+        Self::create_in_with_id(root, cwd, &id)
+    }
+
+    /// Core constructor with an explicit session root and id, so callers and
+    /// tests can bind transcript id to provider cache key deterministically.
+    pub(crate) fn create_in_with_id(root: &Path, cwd: &Path, id: &str) -> Result<Self> {
+        if !is_valid_session_id(id) {
+            bail!("invalid session id");
+        }
         let dir = root.join(cwd_slug(cwd));
         fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create session dir {}", dir.display()))?;
-        let id = format!("{:08x}", rand::random::<u32>());
         let path = dir.join(format!("{}_{}.jsonl", now_ms(), id));
         // Create exclusively (`create_new`) so a same-millisecond id collision
         // surfaces as an error instead of silently truncating an existing
-        // transcript. A collision needs the same `u32` drawn in the same
-        // millisecond (~1 in 4e9); persistence is best-effort, so erroring out
-        // on that negligible chance is fine -- no retry loop needed.
+        // transcript. A collision needs the same 128-bit id drawn in the same
+        // millisecond; persistence is best-effort, so erroring out on that
+        // negligible chance is fine -- no retry loop needed.
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -110,7 +120,7 @@ impl SessionLog {
         Ok(Self {
             file,
             path,
-            id,
+            id: id.to_string(),
             last_id: None,
             next_seq: 0,
         })
@@ -865,6 +875,14 @@ fn cwd_slug(cwd: &Path) -> String {
     }
 }
 
+pub(crate) fn new_session_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -913,6 +931,38 @@ mod tests {
         assert_eq!(entries[0]["version"], SESSION_VERSION);
         assert_eq!(entries[0]["cwd"], "/home/dev/proj");
         assert_eq!(entries[0]["id"], log.id());
+    }
+
+    #[test]
+    fn create_with_id_uses_supplied_id_for_header_and_filename() {
+        let dir = temp_dir();
+        let log = SessionLog::create_in_with_id(&dir.path, Path::new("/w"), "abc123ef").unwrap();
+        let entries = lines(log.path());
+        assert_eq!(log.id(), "abc123ef");
+        assert_eq!(entries[0]["id"], "abc123ef");
+        assert!(
+            log.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("abc123ef")
+        );
+    }
+
+    #[test]
+    fn generated_session_ids_are_128_bit_hex() {
+        let id = new_session_id();
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn create_with_id_rejects_path_like_ids() {
+        let dir = temp_dir();
+        let error = SessionLog::create_in_with_id(&dir.path, Path::new("/w"), "../bad")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid session id"));
     }
 
     #[test]

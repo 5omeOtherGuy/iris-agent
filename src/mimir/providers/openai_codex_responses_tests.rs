@@ -1,4 +1,6 @@
 use super::*;
+use crate::mimir::selection::PromptCacheRetention;
+use crate::nexus::ModelOrigin;
 use std::cell::Cell;
 use std::path::Path;
 
@@ -274,6 +276,8 @@ fn builds_codex_request_from_conversation() {
         &[Message::user("hello"), Message::assistant("hi")],
         &crate::tools::built_in_tools(),
         None,
+        Some("session-1"),
+        PromptCacheRetention::Short,
     );
     assert_eq!(request["model"], "gpt-test");
     assert_eq!(request["stream"], true);
@@ -320,6 +324,8 @@ fn builds_codex_request_from_tool_messages() {
         ],
         &crate::tools::built_in_tools(),
         None,
+        Some("session-1"),
+        PromptCacheRetention::Short,
     );
 
     assert_eq!(request["input"][0]["type"], "function_call");
@@ -351,6 +357,7 @@ fn parses_streamed_output_text_delta_events() -> Result<()> {
         BufReader::with_capacity(1, stream.as_bytes()),
         &mut sink,
         &CancellationToken::new(),
+        "gpt-test",
     )?;
 
     assert_eq!(turn.text.as_deref(), Some("Hello"));
@@ -385,6 +392,7 @@ fn cancelled_token_stops_the_sse_read_early() {
         BufReader::with_capacity(1, stream.as_bytes()),
         &mut sink,
         &cancel,
+        "gpt-test",
     );
 
     let error = result.unwrap_err();
@@ -411,6 +419,7 @@ fn dropped_consumer_stops_the_sse_read_early() {
         BufReader::with_capacity(1, stream.as_bytes()),
         &mut sink,
         &CancellationToken::new(),
+        "gpt-test",
     );
 
     let error = result.unwrap_err();
@@ -427,8 +436,13 @@ fn streamed_failure_preserves_prior_deltas() {
     );
     let mut sink = RecordingSink::default();
 
-    let err = parse_response_stream_reader(stream.as_bytes(), &mut sink, &CancellationToken::new())
-        .unwrap_err();
+    let err = parse_response_stream_reader(
+        stream.as_bytes(),
+        &mut sink,
+        &CancellationToken::new(),
+        "gpt-test",
+    )
+    .unwrap_err();
 
     assert!(err.to_string().contains("Codex response failed"));
     assert_eq!(sink.deltas, vec!["partial"]);
@@ -460,8 +474,12 @@ fn parses_streamed_tool_call() -> Result<()> {
     );
 
     let mut sink = RecordingSink::default();
-    let turn =
-        parse_response_stream_reader(stream.as_bytes(), &mut sink, &CancellationToken::new())?;
+    let turn = parse_response_stream_reader(
+        stream.as_bytes(),
+        &mut sink,
+        &CancellationToken::new(),
+        "gpt-test",
+    )?;
 
     assert!(sink.deltas.is_empty());
     assert!(turn.text.is_none());
@@ -520,7 +538,15 @@ fn reasoning_none_produces_todays_exact_body() {
     let instructions = test_system_prompt();
     let tools = crate::tools::built_in_tools();
     let messages = [Message::user("hello")];
-    let none = build_codex_request("gpt-test", &instructions, &messages, &tools, None);
+    let none = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        None,
+        Some("session-1"),
+        PromptCacheRetention::Short,
+    );
     let expected = json!({
         "model": "gpt-test",
         "store": false,
@@ -529,6 +555,7 @@ fn reasoning_none_produces_todays_exact_body() {
         "input": none["input"].clone(),
         "tools": none["tools"].clone(),
         "text": { "verbosity": "low" },
+        "prompt_cache_key": "session-1",
     });
     assert_eq!(none, expected);
     assert!(none.get("reasoning").is_none(), "None must omit reasoning");
@@ -546,8 +573,11 @@ fn reasoning_level_adds_effort_and_off_omits() {
         &messages,
         &tools,
         Some(ReasoningEffort::High),
+        Some("session-1"),
+        PromptCacheRetention::Short,
     );
     assert_eq!(high["reasoning"], json!({ "effort": "high" }));
+    assert_eq!(high["include"], json!(["reasoning.encrypted_content"]));
     // The rest of the body is unchanged from the None case.
     assert_eq!(high["text"], json!({ "verbosity": "low" }));
 
@@ -557,6 +587,8 @@ fn reasoning_level_adds_effort_and_off_omits() {
         &messages,
         &tools,
         Some(ReasoningEffort::XHigh),
+        Some("session-1"),
+        PromptCacheRetention::Short,
     );
     assert_eq!(xhigh["reasoning"], json!({ "effort": "xhigh" }));
 
@@ -567,6 +599,118 @@ fn reasoning_level_adds_effort_and_off_omits() {
         &messages,
         &tools,
         Some(ReasoningEffort::Off),
+        Some("session-1"),
+        PromptCacheRetention::Short,
     );
     assert!(off.get("reasoning").is_none(), "Off omits reasoning");
+}
+
+#[test]
+fn prompt_cache_key_is_clamped_to_64_unicode_scalars_and_omitted_when_disabled() {
+    let instructions = test_system_prompt();
+    let tools = crate::tools::built_in_tools();
+    let messages = [Message::user("hello")];
+    let long_key = format!("{}tail", "å".repeat(70));
+
+    let cached = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        None,
+        Some(&long_key),
+        PromptCacheRetention::Short,
+    );
+    let key = cached["prompt_cache_key"].as_str().expect("cache key");
+    assert_eq!(key.chars().count(), 64);
+    assert_eq!(key, "å".repeat(64));
+
+    let long = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        None,
+        Some("session1"),
+        PromptCacheRetention::Long,
+    );
+    assert_eq!(long["prompt_cache_key"], json!("session1"));
+
+    let disabled = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        None,
+        Some("session-1"),
+        PromptCacheRetention::None,
+    );
+    assert!(disabled.get("prompt_cache_key").is_none());
+}
+
+#[test]
+fn reasoning_continuity_replay_requests_encrypted_reasoning() {
+    let instructions = test_system_prompt();
+    let tools = crate::tools::built_in_tools();
+    let origin = ModelOrigin::new("openai-codex", "openai-codex-responses", "gpt-test");
+    let messages = [
+        Message::user("hello"),
+        Message::assistant_reasoning("", "encrypted-reasoning", true, origin),
+    ];
+
+    let request = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        None,
+        Some("session-1"),
+        PromptCacheRetention::Short,
+    );
+
+    assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+    let input = request["input"].as_array().expect("input array");
+    assert!(input.iter().any(|item| {
+        item["type"] == json!("reasoning")
+            && item["encrypted_content"] == json!("encrypted-reasoning")
+    }));
+}
+
+#[test]
+fn parses_usage_response_id_and_encrypted_reasoning_from_stream() -> Result<()> {
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc-1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thought\"}]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"total_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":64},\"output_tokens_details\":{\"reasoning_tokens\":7}}}}\n\n",
+    );
+
+    let turn = parse_response_stream(stream)?;
+
+    assert_eq!(turn.text.as_deref(), Some("Hi"));
+    assert_eq!(turn.response_id.as_deref(), Some("resp_1"));
+    let usage = turn.usage.expect("usage");
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.output_tokens, 20);
+    assert_eq!(usage.cache_read_input_tokens, 64);
+    assert_eq!(usage.cache_write_input_tokens, 0);
+    assert_eq!(usage.reasoning_output_tokens, 7);
+    assert_eq!(usage.total_tokens, 120);
+    assert_eq!(turn.reasoning.len(), 1);
+    assert_eq!(turn.reasoning[0].text, "thought");
+    assert_eq!(turn.reasoning[0].continuity.as_deref(), Some("enc-1"));
+    assert!(turn.reasoning[0].redacted);
+    Ok(())
+}
+
+#[test]
+fn reasoning_summary_and_content_text_are_separated() {
+    let text = extract_reasoning_text(&json!({
+        "type": "reasoning",
+        "summary": [{ "type": "summary_text", "text": "summary" }],
+        "content": [{ "type": "reasoning_text", "text": "content" }]
+    }));
+    assert_eq!(text, "summary\ncontent");
 }

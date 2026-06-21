@@ -200,6 +200,8 @@ mod tests {
                         text: Some("ok".to_string()),
                         reasoning: Vec::new(),
                         tool_calls: Vec::new(),
+                        response_id: None,
+                        usage: None,
                     })
                 }
             },
