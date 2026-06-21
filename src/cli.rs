@@ -548,9 +548,27 @@ mod tests {
             Some(ReasoningEffort::XHigh)
         );
 
-        // Switch to anthropic, where xhigh is unsupported and clamps to high.
+        // Shipped adaptive Anthropic models now accept xhigh (it maps to the
+        // "max" effort): switching to Sonnet 4.6 and asking for xhigh sticks.
         handle_model_command(
             "/model anthropic/claude-sonnet-4-6",
+            &mut harness,
+            &mut switch,
+        );
+        let lines =
+            handle_model_command("/reasoning xhigh", &mut harness, &mut switch).expect("handled");
+        assert!(
+            lines.iter().any(|l| l.contains("reasoning: xhigh")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            switch.as_ref().unwrap().selection.reasoning,
+            Some(ReasoningEffort::XHigh)
+        );
+
+        // An older/unknown Anthropic id still tops out at high: xhigh clamps.
+        handle_model_command(
+            "/model anthropic/claude-3-7-sonnet",
             &mut harness,
             &mut switch,
         );

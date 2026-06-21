@@ -15,10 +15,10 @@
 //! - openai-codex (gpt-5.5): full set incl. `xhigh`
 //!   (`models.generated.ts` `thinkingLevelMap: {off:null, xhigh:xhigh}`; the
 //!   Responses `reasoning.effort` enum accepts `minimal..xhigh`).
-//! - anthropic: model-specific. The adaptive-thinking Opus 4.6/4.7/4.8 models
-//!   accept `xhigh` (`models.generated.ts` `thinkingLevelMap` has an `xhigh`
-//!   entry); Sonnet 4.6 and the older budget-based models top out at `high`
-//!   (`xhigh` clamps to `high` via pi-mono `clampReasoning`).
+//! - anthropic: the adaptive-thinking Opus 4.6/4.7/4.8 and Sonnet 4.6 models
+//!   accept the full iris set off..`xhigh`; the adapter upshifts each level onto
+//!   Anthropic's `low|medium|high|xhigh|max` effort scale (iris `xhigh` -> `max`).
+//!   Unknown/older budget-based ids top out at `high` (`xhigh` clamps to `high`).
 //! - antigravity (gemini-3.5-flash): `off..high`; `xhigh` clamps to `high`
 //!   (gemini-pi `FLASH_THINKING = {minimal,low,medium,high}`, `xhigh -> null`).
 
@@ -45,14 +45,14 @@ pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [R
 }
 
 /// Anthropic supported levels, keyed by model. The adaptive-thinking Opus
-/// 4.6/4.7/4.8 models accept `xhigh` (the adapter maps it to the `xhigh`/`max`
-/// effort token); Sonnet 4.6 and the older budget-based models top out at
-/// `high`. Verified from pi-mono `thinkingLevelMap` (an `xhigh` entry means
-/// xhigh is an accepted input level).
+/// 4.6/4.7/4.8 and Sonnet 4.6 models accept the full iris set off..`xhigh`: the
+/// adapter maps each level one notch up Anthropic's `low|medium|high|xhigh|max`
+/// effort scale (iris `xhigh` -> Anthropic `max`). Unknown/older budget-based
+/// ids stay conservative and top out at `high` (`xhigh` clamps to `high`).
 fn anthropic_supported_levels(model: &str) -> &'static [ReasoningEffort] {
     use ReasoningEffort::{High, Low, Medium, Minimal, Off, XHigh};
     match model {
-        "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" => {
+        "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "claude-sonnet-4-6" => {
             &[Off, Minimal, Low, Medium, High, XHigh]
         }
         _ => &[Off, Minimal, Low, Medium, High],
@@ -193,9 +193,15 @@ mod tests {
 
     #[test]
     fn anthropic_xhigh_is_model_specific() {
-        // Adaptive Opus 4.7/4.8 accept xhigh natively: validate passes, clamp is
-        // identity.
-        for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-4-6"] {
+        // The shipped adaptive models (Opus 4.6/4.7/4.8, Sonnet 4.6) accept xhigh
+        // natively (it maps up to Anthropic's `max`/`xhigh` effort): validate
+        // passes, clamp is identity.
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ] {
             let sel = ModelSelection {
                 provider: ProviderId::Anthropic,
                 model: model.to_string(),
@@ -209,12 +215,11 @@ mod tests {
                 "{model} keeps xhigh"
             );
         }
-        // Sonnet 4.6 (and unknown ids) top out at high: xhigh clamps and validate
-        // rejects the unclamped level.
+        // Unknown/older budget-based ids top out at high: xhigh clamps down.
         assert_eq!(
             clamp(
                 ProviderId::Anthropic,
-                "claude-sonnet-4-6",
+                "claude-3-7-sonnet",
                 ReasoningEffort::XHigh
             ),
             ReasoningEffort::High
@@ -252,8 +257,8 @@ mod tests {
             ),
             Some(ReasoningEffort::XHigh)
         );
-        // Anthropic Sonnet tops out at high: xhigh clamps to high first, so the
-        // forward step wraps to off rather than panicking on an unsupported id.
+        // Anthropic Sonnet now supports xhigh as its top level, so the forward
+        // step from xhigh wraps around to off.
         assert_eq!(
             cycle_effort(
                 ProviderId::Anthropic,
@@ -280,11 +285,11 @@ mod tests {
 
     #[test]
     fn clamp_down_maps_xhigh_to_high_only_where_unsupported() {
-        // Anthropic/Antigravity: xhigh -> high.
+        // Anthropic (older/unknown ids) / Antigravity: xhigh -> high.
         assert_eq!(
             clamp(
                 ProviderId::Anthropic,
-                "claude-sonnet-4-6",
+                "claude-3-7-sonnet",
                 ReasoningEffort::XHigh
             ),
             ReasoningEffort::High

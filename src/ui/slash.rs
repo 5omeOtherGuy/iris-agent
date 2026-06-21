@@ -49,7 +49,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/reasoning",
-        description: "Set reasoning/thinking effort",
+        description: "Set reasoning effort [off|minimal|low|medium|high|xhigh]",
         action: SlashAction::Submit,
     },
     SlashCommand {
