@@ -17,22 +17,45 @@ use crate::mimir::auth::anthropic;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::selection::ProviderId;
 
-/// The hand-maintained set of (provider, model id) pairs Iris supports. New
-/// models are added here in one place; the list intentionally stays small.
-const ENTRIES: &[(ProviderId, &str, &str)] = &[
-    (ProviderId::OpenAiCodex, "gpt-5.5", "GPT-5.5"),
-    (ProviderId::Anthropic, "claude-opus-4-8", "Claude Opus 4.8"),
-    (ProviderId::Anthropic, "claude-opus-4-7", "Claude Opus 4.7"),
-    (ProviderId::Anthropic, "claude-opus-4-6", "Claude Opus 4.6"),
+/// The hand-maintained set of (provider, model id, display name, context-window
+/// label) tuples Iris supports. New models are added here in one place; the list
+/// intentionally stays small.
+///
+// ponytail: the context-window labels are hand-maintained display strings for
+// the `/model` picker badge, not enforced limits. Verify against provider docs
+// when adding models; the upgrade path is a generated registry (declined for
+// now, see model_catalog module docs).
+const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
+    (ProviderId::OpenAiCodex, "gpt-5.5", "GPT-5.5", "300k"),
+    (
+        ProviderId::Anthropic,
+        "claude-opus-4-8",
+        "Claude Opus 4.8",
+        "1M",
+    ),
+    (
+        ProviderId::Anthropic,
+        "claude-opus-4-7",
+        "Claude Opus 4.7",
+        "1M",
+    ),
+    (
+        ProviderId::Anthropic,
+        "claude-opus-4-6",
+        "Claude Opus 4.6",
+        "1M",
+    ),
     (
         ProviderId::Anthropic,
         "claude-sonnet-4-6",
         "Claude Sonnet 4.6",
+        "200k",
     ),
     (
         ProviderId::Antigravity,
         "gemini-3.5-flash",
         "Gemini 3.5 Flash",
+        "1M",
     ),
 ];
 
@@ -82,11 +105,20 @@ impl AuthStatus {
 pub(crate) fn all() -> Vec<CatalogModel> {
     ENTRIES
         .iter()
-        .map(|(provider, id, _name)| CatalogModel {
+        .map(|(provider, id, _name, _ctx)| CatalogModel {
             provider: *provider,
             id: (*id).to_string(),
         })
         .collect()
+}
+
+/// Context-window label for a `provider/modelId` (e.g. "200k", "1M"), shown as the
+/// `/model` picker's `[ctx:...]` badge. `None` for anything not in the catalog.
+pub(crate) fn ctx_label(qualified: &str) -> Option<&'static str> {
+    ENTRIES
+        .iter()
+        .find(|(provider, id, _, _)| format!("{}/{}", provider.as_str(), id) == qualified)
+        .map(|(_, _, _, ctx)| *ctx)
 }
 
 /// Human-friendly display name for a `provider/modelId`, shown in the `/model`
@@ -95,8 +127,8 @@ pub(crate) fn all() -> Vec<CatalogModel> {
 pub(crate) fn display_name(qualified: &str) -> String {
     ENTRIES
         .iter()
-        .find(|(provider, id, _)| format!("{}/{}", provider.as_str(), id) == qualified)
-        .map(|(_, _, name)| (*name).to_string())
+        .find(|(provider, id, _, _)| format!("{}/{}", provider.as_str(), id) == qualified)
+        .map(|(_, _, name, _)| (*name).to_string())
         .unwrap_or_else(|| {
             qualified
                 .split_once('/')
@@ -201,6 +233,14 @@ mod tests {
         // Not in the catalog -> show the bare model id.
         assert_eq!(display_name("openai-codex/gpt-9-mystery"), "gpt-9-mystery");
         assert_eq!(display_name("no-slash"), "no-slash");
+    }
+
+    #[test]
+    fn ctx_label_returns_catalog_value_or_none() {
+        assert_eq!(ctx_label("openai-codex/gpt-5.5"), Some("300k"));
+        assert_eq!(ctx_label("anthropic/claude-sonnet-4-6"), Some("200k"));
+        assert_eq!(ctx_label("anthropic/claude-opus-4-8"), Some("1M"));
+        assert_eq!(ctx_label("openai-codex/gpt-9-mystery"), None);
     }
 
     #[test]

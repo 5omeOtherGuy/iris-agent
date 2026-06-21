@@ -114,9 +114,18 @@ pub(crate) fn model_command<P: ChatProvider>(
     match decide_model_command(arg, &available, &scoped, &current) {
         ModelDecision::Status(lines) => ModelCommand::Lines(lines),
         ModelDecision::Switch(model) => ModelCommand::Lines(apply_model(model, harness, switch)),
-        ModelDecision::Open(search) => ModelCommand::Open(Modal::Model(ModelPicker::new(
-            available, scoped, &current, &search,
-        ))),
+        ModelDecision::Open(_search) => {
+            // The redesigned picker is not searchable, so an unresolved `/model
+            // <arg>` opens the full list rather than a hidden filtered view.
+            let default = config::default_model_qualified().unwrap_or_else(|| current.clone());
+            let effort = switch
+                .selection()
+                .reasoning
+                .unwrap_or(ReasoningEffort::DEFAULT);
+            ModelCommand::Open(Modal::Model(ModelPicker::new(
+                available, &current, &default, effort,
+            )))
+        }
     }
 }
 
@@ -160,8 +169,18 @@ pub(crate) fn apply_action<P: ChatProvider>(
     switch: &mut ModelSwitch<'_, P>,
 ) -> ActionResult {
     match action {
-        ModalAction::SelectModel(id) => match parse_qualified(&id) {
-            Some(model) => ActionResult::Close(apply_model(model, harness, switch)),
+        ModalAction::SelectModel {
+            id,
+            effort,
+            save_default,
+        } => match parse_qualified(&id) {
+            Some(model) => ActionResult::Close(apply_model_effort(
+                model,
+                effort,
+                save_default,
+                harness,
+                switch,
+            )),
             None => ActionResult::Close(vec![format!("unknown model: {id}")]),
         },
         ModalAction::ApplyScoped(ids) => {
@@ -282,6 +301,31 @@ fn apply_model<P: ChatProvider>(
     // blocks the in-session switch.
     if let Err(error) = config::save_default_model(model.provider.as_str(), &model.id) {
         lines.push(format!("(default not saved: {error:#})"));
+    }
+    lines
+}
+
+/// Apply a model switch together with a chosen effort (both clamped to the
+/// model) in a single selection. `save_default` persists the pair as the global
+/// default (Enter); when false the change applies for this session only (`s`).
+fn apply_model_effort<P: ChatProvider>(
+    model: CatalogModel,
+    effort: ReasoningEffort,
+    save_default: bool,
+    harness: &mut Harness<P>,
+    switch: &mut ModelSwitch<'_, P>,
+) -> Vec<String> {
+    let clamped = model_capabilities::clamp(model.provider, &model.id, effort);
+    let mut candidate = cli::candidate_for(switch.selection(), model.provider, &model.id);
+    candidate.reasoning = Some(clamped);
+    let mut lines = cli::apply_selection(candidate, harness, switch);
+    if save_default {
+        if let Err(error) = config::save_default_model(model.provider.as_str(), &model.id) {
+            lines.push(format!("(default not saved: {error:#})"));
+        }
+        if let Err(error) = config::save_default_reasoning(clamped.as_str()) {
+            lines.push(format!("(reasoning not saved: {error:#})"));
+        }
     }
     lines
 }

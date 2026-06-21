@@ -127,6 +127,19 @@ pub(crate) fn save_default_model(provider: &str, model: &str) -> Result<()> {
     ])
 }
 
+/// The persisted global default model as a qualified `provider/model` id, if both
+/// `defaultProvider` and `defaultModel` are set. The `/model` picker uses it to
+/// label the saved default, which can differ from the active session model after
+/// a session-only switch. Global-only, matching where `save_default_model` writes.
+pub(crate) fn default_model_qualified() -> Option<String> {
+    let path = global_path()?;
+    let settings = read_optional(&path).ok().flatten()?;
+    match (settings.default_provider, settings.default_model) {
+        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+        _ => None,
+    }
+}
+
 /// Persist the default reasoning/thinking level in the global settings file.
 pub(crate) fn save_default_reasoning(level: &str) -> Result<()> {
     update_global(&[("defaultReasoning", Value::String(level.to_string()))])
