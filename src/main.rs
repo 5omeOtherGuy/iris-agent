@@ -346,3 +346,17 @@ fn print_help() {
     eprintln!("  iris-agent login antigravity            Login with Google account OAuth");
     eprintln!("  iris-agent login anthropic              Show Claude Code login instructions");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_command_installs_locked_remote_with_force() {
+        assert_eq!(UPDATE_REPO, "https://github.com/5omeOtherGuy/iris-agent.git");
+        assert_eq!(
+            update_args(),
+            &["install", "--git", UPDATE_REPO, "--locked", "--force"]
+        );
+    }
+}
