@@ -53,6 +53,19 @@ fn fable_5_enabled() -> bool {
 // `claude-opus-4-7`).
 const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
     (ProviderId::OpenAiCodex, "gpt-5.5", "GPT 5.5", "300k"),
+    (ProviderId::OpenAiCodex, "gpt-5.4", "GPT 5.4", "300k"),
+    (
+        ProviderId::OpenAiCodex,
+        "gpt-5.4-mini",
+        "GPT 5.4 Mini",
+        "300k",
+    ),
+    (
+        ProviderId::OpenAiCodex,
+        "gpt-5.3-codex-spark",
+        "GPT 5.3 Codex Spark",
+        "300k",
+    ),
     (ProviderId::Anthropic, "claude-opus-4-8", "Opus 4.8", "1M"),
     (ProviderId::Anthropic, "claude-opus-4-7", "Opus 4.7", "1M"),
     (
@@ -79,6 +92,12 @@ const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
         ProviderId::Antigravity,
         "gemini-3.5-flash",
         "Gemini 3.5 Flash",
+        "1M",
+    ),
+    (
+        ProviderId::Antigravity,
+        "gemini-3.1-pro",
+        "Gemini 3.1 Pro",
         "1M",
     ),
 ];
@@ -257,6 +276,13 @@ mod tests {
     #[test]
     fn display_name_uses_catalog_then_falls_back_to_id() {
         assert_eq!(display_name("openai-codex/gpt-5.5"), "GPT 5.5");
+        assert_eq!(display_name("openai-codex/gpt-5.4"), "GPT 5.4");
+        assert_eq!(display_name("openai-codex/gpt-5.4-mini"), "GPT 5.4 Mini");
+        assert_eq!(
+            display_name("openai-codex/gpt-5.3-codex-spark"),
+            "GPT 5.3 Codex Spark"
+        );
+        assert_eq!(display_name("antigravity/gemini-3.1-pro"), "Gemini 3.1 Pro");
         assert_eq!(display_name("anthropic/claude-opus-4-7"), "Opus 4.7");
         assert_eq!(display_name("anthropic/claude-haiku-4-5"), "Haiku 4.5");
         // Not in the catalog -> show the bare model id.
@@ -267,6 +293,9 @@ mod tests {
     #[test]
     fn ctx_label_returns_catalog_value_or_none() {
         assert_eq!(ctx_label("openai-codex/gpt-5.5"), Some("300k"));
+        assert_eq!(ctx_label("openai-codex/gpt-5.4"), Some("300k"));
+        assert_eq!(ctx_label("openai-codex/gpt-5.3-codex-spark"), Some("300k"));
+        assert_eq!(ctx_label("antigravity/gemini-3.1-pro"), Some("1M"));
         assert_eq!(ctx_label("anthropic/claude-sonnet-4-6"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-opus-4-8"), Some("1M"));
