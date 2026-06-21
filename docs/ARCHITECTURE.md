@@ -1,6 +1,6 @@
 # Iris — Architecture: Three-Tier Split
 
-> Status (2026-06-17): target architecture, now realized in the runtime. Iris
+> Status (2026-06-21): target architecture, realized in the runtime. Iris
 > ships today as one binary with the tier boundaries enforced in-module, and the
 > async-hard agent loop (below) is shipped. This document defines the ownership
 > tiers Iris is converging on, modeled on pi's
@@ -99,7 +99,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
 | Context compaction | `wayland/mod.rs`, `session.rs` |
-| System-prompt / project-instruction assembly (base + runtime context + root `AGENTS.md`) | `wayland/system_prompt.rs` |
+| System-prompt / project-instruction assembly (fragments + generated tool blocks + project docs + runtime context) | `wayland/system_prompt/` |
 | Skills | _planned_ |
 
 Depends on Tier 1 only. The `Harness` is the analogue of pi's `AgentHarness`

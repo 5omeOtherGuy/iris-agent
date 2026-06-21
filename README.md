@@ -24,30 +24,33 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-17): Milestone 1 and the async-hard runtime are complete.** The repository currently contains a text-only interactive session backed by selectable Mimir providers (`openai-codex`, `anthropic`, or `antigravity`), streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, provider/model settings, and best-effort JSONL transcript persistence. Nexus now runs a tokio async loop with turn-level cancellation: the provider is an async event stream raced against cancellation, tools are async with per-call child tokens, concurrency-safe tools run in parallel while everything else stays exclusive, and the transcript stays valid on abort. The next runtime work is Milestone 2 (token/context).
+**Status (2026-06-21): Milestone 1, the async-hard runtime, and the Milestone 2 foundations are complete.** The repository currently contains an interactive TUI with inline native scrollback plus a text fallback, selectable Mimir providers (`openai-codex`, `anthropic`, or `antigravity`), runtime model/reasoning switching, streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, fragment-based system-prompt assembly, provider/model/context settings, JSONL transcript persistence/resume, large-output handles, and turn-boundary auto-compaction. Nexus runs a tokio async loop with turn-level cancellation: the provider is an async event stream raced against cancellation, tools are async with per-call child tokens, concurrency-safe tools run in parallel while everything else stays exclusive, and the transcript stays valid on abort. The next milestone gate is proving the token-efficiency thesis with benchmark evidence.
 
 Implemented today:
 
 - CLI entrypoint in `src/main.rs` with typed-error exit codes (`src/errors.rs`) and `RUST_LOG` tracing setup (`src/telemetry.rs`).
-- Iris CLI session loop in `src/cli.rs` driving the agent through a `Ui` front-end seam (`src/ui/`, text implementation in `src/ui/text.rs`).
+- Iris CLI session loop in `src/cli.rs` driving the agent through a `Ui` front-end seam (`src/ui/`): the interactive TUI owns inline native scrollback, textarea input, slash/modals, live bash output cells, and streamed Markdown rendering; `src/ui/text.rs` remains the pipe/CI fallback.
 - Nexus runtime core in `src/nexus.rs` (Tier 1): a tokio async loop with multi-turn conversation state, a per-turn `CancellationToken`, streamed assistant text via the async `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, async `Tool::execute` (per-call child token, concurrency-safe tools batched in parallel), approval/diff-preview enforcement, and semantic `AgentEvent`/`UiEvent` rendering.
-- Tier-2 `wayland::Harness` (`src/wayland.rs`) wrapping the bare agent: owns the execution surface (workspace + `ToolState`) and optional session log, injects a `ToolEnv` per turn, and persists the transcript post-turn.
+- Tier-2 `wayland::Harness` (`src/wayland/mod.rs`) wrapping the bare agent: owns the execution surface (workspace + `ToolState`), optional session log, output handle store, context budget, auto-compaction boundary, injects a `ToolEnv` per turn, and persists the transcript post-turn.
 - Approval decision/parser in `src/approval.rs`, with `y`/`yes` allowing mutating tool calls and anything else denying safely.
 - Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and `Role` types.
+- Runtime `/model` and `/reasoning` switching at safe turn boundaries, plus TUI pickers for model/provider/effort, scoped model cycling, `/settings`, `/login`, and `/logout`.
 - Workspace-scoped built-in tools under `src/tools/`: `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`, built and injected via `tools::built_in_tools()` (`src/tools/registry.rs`) as `Tool` trait impls that self-classify (`requires_approval`/`is_destructive`/`is_concurrency_safe`/`diff_preview`). `edit` uses Claude Code's exact-string contract (`file_path`/`old_string`/`new_string`/`replace_all`).
 - Approval enforcement for `write`, `edit`, and `bash`, with diff previews for file-mutating tools and model-readable denied-call results.
 - Atomic same-directory file replacement for `write` and `edit`.
 - `bash` hardening: a Linux Landlock kernel sandbox (workspace-write, TCP-deny) with explicit fallback, persistent shell sessions, and background jobs (`src/tools/bash/`).
 - Graceful Ctrl-C handling: first press ends the turn between round-trips, a second force-quits and reaps tracked process groups (`src/signals.rs`, `src/process_group.rs`).
-- A JSON settings file for provider/model defaults (`src/config.rs`, `~/.iris/settings.json` + project `.iris/settings.json`).
-- Best-effort JSONL session transcripts (`src/session.rs`).
+- A JSON settings file for provider/model/reasoning/context defaults and scoped model cycling (`src/config.rs`, `~/.iris/settings.json` + project `.iris/settings.json`).
+- Best-effort JSONL session transcripts, linear `iris resume <id>`, model-selection audit entries, assistant-reasoning rows, compaction entries, and token estimates (`src/session.rs`).
+- Session-scoped large-output handle storage (`src/handles.rs`) and handle-backed tool results when output exceeds the context threshold.
+- Harness-owned system prompt assembly from materialized global fragments, repo fragments, project docs, runtime context, and the live tool registry (`src/wayland/system_prompt/`).
 - Mimir auth flows and token loading/refresh under `src/mimir/auth/`: OpenAI Codex browser/device-code OAuth, Anthropic Claude Code OAuth reuse, and Antigravity Google PKCE OAuth (with runtime or build-time client-secret injection).
-- Mimir providers under `src/mimir/providers/`: OpenAI Codex Responses, Anthropic Messages (Claude Code subscription lane), and Antigravity/Gemini Code Assist streaming, all translated into Nexus's `ChatProvider` contract.
-- Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
+- Mimir providers under `src/mimir/providers/`: OpenAI Codex Responses, Anthropic Messages (Claude Code subscription lane), and Antigravity/Gemini Code Assist streaming, all translated into Nexus's `ChatProvider` contract with normalized reasoning controls where supported.
+- Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, runtime selection, prompt assembly, URL resolution, request shaping, and response parsing.
 
 Not implemented yet:
 
-- Persistent approval policies, session `/resume` and transcript-tree branching, modes, subagents, context ledger, content handles, git automation, and GitHub integration.
+- Persistent approval policies, in-session `/resume` picker, transcript-tree branching/rollback, modes, subagents, context ledger/planner, handle dereference UI/tool, token-efficiency benchmark proof, git automation, and GitHub integration.
 - A possible plugin system for third-party extensions (WASM/Extism is one candidate backend, a subprocess protocol another) — exploratory only, tracked in issue #18; Iris is not being built around it.
 
 ## Running
@@ -124,12 +127,15 @@ file (`~/.iris/settings.json`, or `IRIS_CONFIG_PATH`). Example:
 Supported provider ids are `openai-codex`, `anthropic`, and `antigravity`.
 At the TUI prompt, use `/model` to view or switch provider/model and
 `/reasoning off|minimal|low|medium|high|xhigh` to change thinking effort at a
-safe turn boundary. Recognized settings keys are `defaultProvider`,
-`defaultModel`, and `baseUrl`.
+safe turn boundary. The TUI also exposes `/settings`, `/scoped-models`,
+`/login`, and `/logout` selectors. Recognized settings keys are
+`defaultProvider`, `defaultModel`, `baseUrl`, `contextTokenBudget`,
+`defaultReasoning`, and `enabledModels`.
 
 Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
-`defaultModel`; a cloned repo cannot choose your provider or redirect OAuth
-bearer tokens with `baseUrl`.
+`defaultModel`, `defaultReasoning`, and `contextTokenBudget`; a cloned repo
+cannot choose your provider, scoped model cycle, or redirect OAuth bearer tokens
+with `baseUrl`.
 
 Environment variables:
 
