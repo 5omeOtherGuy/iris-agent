@@ -15,7 +15,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::mimir::model_catalog::CatalogModel;
+use crate::mimir::model_capabilities;
+use crate::mimir::model_catalog::{self, CatalogModel};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::ui::selector::{Selector, SelectorItem};
 
@@ -30,6 +31,8 @@ const PROVIDER_ROWS: usize = 8;
 pub(crate) enum ModalKey {
     Up,
     Down,
+    Left,
+    Right,
     Enter,
     Tab,
     Esc,
@@ -63,8 +66,14 @@ pub(crate) enum ProviderPurpose {
 /// modal only names the intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModalAction {
-    /// Switch to this `provider/model` id (model picker / exact `/model`).
-    SelectModel(String),
+    /// Switch to this `provider/model` id with the chosen reasoning effort. The
+    /// model picker emits this on Enter (`save_default: true`, persist as the
+    /// default) or `s` (`save_default: false`, this session only).
+    SelectModel {
+        id: String,
+        effort: ReasoningEffort,
+        save_default: bool,
+    },
     /// Apply this scope to the live session immediately (every scoped edit).
     /// `None` clears the scope (cycle all authenticated models).
     ApplyScoped(Option<Vec<String>>),
@@ -222,82 +231,80 @@ fn render_selector(selector: &Selector, empty: &str, out: &mut Vec<Line<'static>
 
 // --- model picker ---
 
-/// Active scope of the model picker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    All,
-    Scoped,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ModelPicker {
     selector: Selector,
-    /// Ordered, authenticated models for the `all` scope.
-    all: Vec<CatalogModel>,
-    /// Ordered scoped models, when a scope is configured.
-    scoped: Option<Vec<CatalogModel>>,
-    scope: Scope,
+    /// Authenticated models, persisted-default first then by provider name.
+    models: Vec<CatalogModel>,
+    /// Qualified id of the active session model (gets the checkmark).
     current: String,
-    /// Warning shown when no scope exists (pi-mono's "/login to add providers").
-    no_scope_hint: bool,
+    /// Qualified id of the persisted default model (gets the "Default" label).
+    default: String,
+    /// The reasoning effort to apply, kept clamped to the selected model.
+    effort: ReasoningEffort,
 }
 
 impl ModelPicker {
-    /// Build the picker. `available` is the authenticated catalog (registry
-    /// order); `scoped` is the ordered scoped set when configured; `current` is
-    /// the qualified id of the active model; `search` pre-fills the filter.
+    /// Build the picker. `available` is the authenticated catalog; `current` is
+    /// the active session model's qualified id (marked with the checkmark);
+    /// `default` is the persisted default's qualified id (labeled "Default" and
+    /// sorted to the top); `effort` is the active reasoning level (clamped to the
+    /// selected row).
     pub(crate) fn new(
         available: Vec<CatalogModel>,
-        scoped: Option<Vec<CatalogModel>>,
         current: &str,
-        search: &str,
+        default: &str,
+        effort: ReasoningEffort,
     ) -> Self {
-        let all = order_all(available, current);
-        let scope = if scoped.is_some() {
-            Scope::Scoped
-        } else {
-            Scope::All
-        };
-        let no_scope_hint = scoped.is_none();
-        let mut picker = ModelPicker {
-            selector: Selector::new(Vec::new(), true, true, MODEL_ROWS),
-            all,
-            scoped,
-            scope,
-            current: current.to_string(),
-            no_scope_hint,
-        };
-        picker.rebuild();
-        for c in search.chars() {
-            picker.selector.push_char(c);
-        }
-        picker
-    }
-
-    fn models(&self) -> &[CatalogModel] {
-        match self.scope {
-            Scope::All => &self.all,
-            Scope::Scoped => self.scoped.as_deref().unwrap_or(&self.all),
-        }
-    }
-
-    fn rebuild(&mut self) {
-        let current = self.current.clone();
-        let items: Vec<SelectorItem> = self
-            .models()
+        let models = order_by_default(available, default);
+        let items: Vec<SelectorItem> = models
             .iter()
-            .map(|model| {
-                let qualified = model.qualified();
-                let mut item = SelectorItem::new(qualified.clone(), model.id.clone())
-                    .detail(model.provider.as_str());
-                if qualified == current {
-                    item = item.trailing("✓");
-                }
-                item
-            })
+            .map(|model| SelectorItem::new(model.qualified(), model.id.clone()))
             .collect();
-        self.selector.replace_items(items);
-        self.selector.select_id(&current);
+        // Non-searchable: the mockup drives the picker with Up/Down + Left/Right +
+        // Enter/s hotkeys; `/model <id>` still resolves an exact id directly.
+        let mut selector = Selector::new(items, false, true, MODEL_ROWS);
+        selector.select_id(current);
+        ModelPicker {
+            selector,
+            models,
+            current: current.to_string(),
+            default: default.to_string(),
+            effort,
+        }
+    }
+
+    /// The catalog model under the cursor, if any.
+    fn selected_model(&self) -> Option<&CatalogModel> {
+        let id = self.selector.selected_id()?;
+        self.models.iter().find(|model| model.qualified() == id)
+    }
+
+    /// The effort shown and applied for the selected model: the user's target
+    /// (`self.effort`) clamped to that model's supported levels. Navigation never
+    /// mutates the target, so arrowing past a low-cap model does not truncate it.
+    fn display_effort(&self) -> ReasoningEffort {
+        match self.selected_model() {
+            Some(model) => model_capabilities::clamp(model.provider, &model.id, self.effort),
+            None => self.effort,
+        }
+    }
+
+    /// Emit a model+effort selection. `save_default` persists it as the default
+    /// (Enter) versus applying it for this session only (`s`). The emitted effort
+    /// is `display_effort()` (the target clamped to the chosen model), which is
+    /// exactly what the user sees and what is safe to persist: startup `resolve`
+    /// trusts the stored reasoning without re-clamping, so the saved level must be
+    /// valid for the saved model.
+    fn select(&self, save_default: bool) -> ModalOutcome {
+        match self.selector.selected_id() {
+            Some(id) => ModalOutcome::Emit(ModalAction::SelectModel {
+                id: id.to_string(),
+                effort: self.display_effort(),
+                save_default,
+            }),
+            None => ModalOutcome::Ignore,
+        }
     }
 
     fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
@@ -310,81 +317,144 @@ impl ModelPicker {
                 self.selector.down();
                 ModalOutcome::Redraw
             }
-            ModalKey::Tab if self.scoped.is_some() => {
-                self.scope = match self.scope {
-                    Scope::All => Scope::Scoped,
-                    Scope::Scoped => Scope::All,
-                };
-                self.rebuild();
-                ModalOutcome::Redraw
-            }
-            ModalKey::Enter => match self.selector.selected_id() {
-                Some(id) => ModalOutcome::Emit(ModalAction::SelectModel(id.to_string())),
-                None => ModalOutcome::Ignore,
-            },
-            ModalKey::Esc => ModalOutcome::Close,
-            // Per spec, the model picker cancels on Ctrl+C (search-clearing on
-            // Ctrl+C is a scoped-models-only behavior).
-            ModalKey::CtrlC => ModalOutcome::Close,
-            ModalKey::Backspace => {
-                if self.selector.backspace() {
-                    ModalOutcome::Redraw
-                } else {
-                    ModalOutcome::Ignore
+            // Left/Right adjust the inline reasoning effort within the selected
+            // model's supported levels.
+            ModalKey::Left | ModalKey::Right => {
+                let forward = matches!(key, ModalKey::Right);
+                if let Some((provider, id)) =
+                    self.selected_model().map(|m| (m.provider, m.id.clone()))
+                {
+                    // Cycle from the value currently shown (target clamped to
+                    // this model) so adjusting on a capped model is intuitive.
+                    let from = model_capabilities::clamp(provider, &id, self.effort);
+                    if let Some(next) =
+                        model_capabilities::cycle_effort(provider, &id, from, forward)
+                    {
+                        self.effort = next;
+                    }
                 }
-            }
-            ModalKey::Char(c) => {
-                self.selector.push_char(c);
                 ModalOutcome::Redraw
             }
+            // Enter persists the choice as the default; `s` applies it for this
+            // session only.
+            ModalKey::Enter => self.select(true),
+            ModalKey::Char('s') | ModalKey::Char('S') => self.select(false),
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
             _ => ModalOutcome::Ignore,
+        }
+    }
+
+    /// The label column text: "Default" for the persisted default model, else its
+    /// display name.
+    fn label_for(&self, model: &CatalogModel) -> String {
+        if model.qualified() == self.default {
+            "Default".to_string()
+        } else {
+            model_catalog::display_name(&model.qualified())
         }
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
         let mut out = Vec::new();
-        if self.scoped.is_some() {
-            let (all_style, scoped_style) = match self.scope {
-                Scope::All => (accent(), muted()),
-                Scope::Scoped => (muted(), accent()),
+        out.push(Line::from(Span::styled(
+            "Switch between models from registered providers.",
+            dim(),
+        )));
+        out.push(Line::from(""));
+
+        // Column widths so the label and name columns line up.
+        let label_w = self
+            .models
+            .iter()
+            .map(|m| self.label_for(m).len())
+            .max()
+            .unwrap_or(0);
+        let name_w = self
+            .models
+            .iter()
+            .map(|m| model_catalog::display_name(&m.qualified()).len())
+            .max()
+            .unwrap_or(0);
+
+        for row in self.selector.visible() {
+            let qualified = row.item.id.clone();
+            let model = self.models.iter().find(|m| m.qualified() == qualified);
+            let base = if row.selected {
+                accent()
+            } else {
+                Style::default()
             };
-            out.push(Line::from(vec![
-                Span::styled("Scope: ", dim()),
-                Span::styled("all", all_style),
-                Span::styled(" | ", dim()),
-                Span::styled("scoped", scoped_style),
-            ]));
-            out.push(Line::from(Span::styled("tab scope (all/scoped)", dim())));
-            out.push(Line::from(""));
-        } else if self.no_scope_hint {
+            let mut spans = vec![Span::styled(
+                if row.selected { "\u{276f} " } else { "  " },
+                base,
+            )];
+            if qualified == self.current {
+                spans.push(Span::styled("\u{2714} ", Style::default().fg(Color::Green)));
+            } else {
+                spans.push(Span::raw("  "));
+            }
+            let label = model.map(|m| self.label_for(m)).unwrap_or_default();
+            let name = model_catalog::display_name(&qualified);
+            spans.push(Span::styled(format!("{label:<label_w$}  "), base));
+            spans.push(Span::raw(format!("{name:<name_w$}  ")));
+            if let Some(ctx) = model_catalog::ctx_label(&qualified) {
+                spans.push(Span::styled(format!("[ctx:{ctx}]  "), dim()));
+            }
+            if let Some(m) = model {
+                spans.push(Span::styled(
+                    format!("[{}] ", m.provider.display_name()),
+                    dim(),
+                ));
+            }
+            spans.push(Span::styled("[sub]", dim()));
+            out.push(Line::from(spans));
+        }
+        if self.selector.is_scrolled() {
             out.push(Line::from(Span::styled(
-                "Only showing models from configured providers. Use /login to add providers.",
+                self.selector.position_label(),
                 muted(),
             )));
         }
-        render_selector(&self.selector, "No matching models", &mut out);
-        if let Some(item) = self.selector.selected() {
-            out.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Model Name: ", dim()),
-                Span::raw(crate::mimir::model_catalog::display_name(&item.id)),
-            ]));
-        }
+
+        out.push(Line::from(""));
+        out.push(Line::from(vec![
+            Span::styled("\u{25c9} ", accent()),
+            Span::raw(effort_label(self.display_effort())),
+            Span::styled(" effort ", dim()),
+            Span::styled("\u{2190}/\u{2192} to adjust", muted()),
+        ]));
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            "Enter to set as default | s to use this session only | Esc to cancel",
+            dim(),
+        )));
         let _ = width;
         out
     }
 }
 
-/// Order the `all` scope: current model first, then by provider name, preserving
-/// registry order within a provider (pi-mono's ordering).
-fn order_all(models: Vec<CatalogModel>, current: &str) -> Vec<CatalogModel> {
+/// Human-facing reasoning level name for the inline effort control.
+fn effort_label(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Off => "Off",
+        ReasoningEffort::Minimal => "Minimal",
+        ReasoningEffort::Low => "Low",
+        ReasoningEffort::Medium => "Medium",
+        ReasoningEffort::High => "High",
+        ReasoningEffort::XHigh => "xHigh",
+    }
+}
+
+/// Order the list: the persisted default first (labeled "Default"), then the rest
+/// by provider name, preserving registry order within a provider.
+fn order_by_default(models: Vec<CatalogModel>, default: &str) -> Vec<CatalogModel> {
     let mut ordered: Vec<CatalogModel> = Vec::with_capacity(models.len());
-    if let Some(found) = models.iter().find(|model| model.qualified() == current) {
+    if let Some(found) = models.iter().find(|model| model.qualified() == default) {
         ordered.push(found.clone());
     }
     let mut rest: Vec<CatalogModel> = models
         .into_iter()
-        .filter(|model| model.qualified() != current)
+        .filter(|model| model.qualified() != default)
         .collect();
     // Stable sort by provider name keeps within-provider registry order.
     rest.sort_by(|a, b| a.provider.as_str().cmp(b.provider.as_str()));
@@ -1026,28 +1096,8 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn model_picker_enter_emits_selected_qualified_id() {
-        let mut picker = ModelPicker::new(models(), None, "openai-codex/gpt-5.5", "");
-        // Current is first and marked; move to the next and select it.
-        picker.handle_key(ModalKey::Down);
-        match picker.handle_key(ModalKey::Enter) {
-            ModalOutcome::Emit(ModalAction::SelectModel(id)) => {
-                assert_eq!(id, "anthropic/claude-sonnet-4-6");
-            }
-            other => panic!("expected SelectModel, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn model_picker_render_matches_pi_mono_layout() {
-        // Scoped set present so the scope header renders; current is gpt-5.5.
-        let scoped = vec![
-            cat(ProviderId::OpenAiCodex, "gpt-5.5"),
-            cat(ProviderId::Anthropic, "claude-sonnet-4-6"),
-        ];
-        let picker = ModelPicker::new(models(), Some(scoped), "openai-codex/gpt-5.5", "");
-        let text: String = picker
+    fn render_text(picker: &ModelPicker) -> String {
+        picker
             .render(80)
             .iter()
             .map(|l| {
@@ -1057,50 +1107,167 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
-            .join("\n");
-        // Scope hint on its own line, '>' search prompt, and a display-name footer.
-        assert!(text.contains("tab scope (all/scoped)"), "{text}");
-        assert!(text.contains("> "), "{text}");
-        assert!(text.contains("gpt-5.5"), "{text}");
-        assert!(text.contains("Model Name: GPT-5.5"), "{text}");
-        // The old inline hint and 'Model:' label are gone.
-        assert!(!text.contains("Tab to switch"), "{text}");
-        assert!(!text.contains("search: "), "{text}");
+            .join("\n")
     }
 
     #[test]
-    fn model_picker_ctrl_c_cancels_even_with_active_search() {
-        // Spec: the model picker cancels on Ctrl+C; it does not clear the search
-        // first (that is a scoped-models-only behavior).
-        let mut picker = ModelPicker::new(models(), None, "openai-codex/gpt-5.5", "clau");
-        assert_eq!(picker.selector.search(), Some("clau"));
+    fn model_picker_enter_saves_default_and_s_is_session_only() {
+        let mut picker = ModelPicker::new(
+            models(),
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.5",
+            ReasoningEffort::Medium,
+        );
+        // Default (gpt-5.5) is first; move to the next row (sonnet) and pick it.
+        picker.handle_key(ModalKey::Down);
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::SelectModel {
+                id,
+                effort,
+                save_default,
+            }) => {
+                assert_eq!(id, "anthropic/claude-sonnet-4-6");
+                assert_eq!(effort, ReasoningEffort::Medium);
+                assert!(save_default, "Enter persists the default");
+            }
+            other => panic!("expected SelectModel, got {other:?}"),
+        }
+        // `s` selects the same row for this session only (no persist).
+        match picker.handle_key(ModalKey::Char('s')) {
+            ModalOutcome::Emit(ModalAction::SelectModel { save_default, .. }) => {
+                assert!(!save_default, "s applies for this session only");
+            }
+            other => panic!("expected SelectModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_picker_render_shows_columns_effort_and_footer() {
+        let picker = ModelPicker::new(
+            models(),
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.5",
+            ReasoningEffort::High,
+        );
+        let text = render_text(&picker);
+        // Subtitle, cursor, active check, Default label, ctx/provider/sub badges.
+        assert!(
+            text.contains("Switch between models from registered providers."),
+            "{text}"
+        );
+        assert!(text.contains('\u{276f}'), "{text}"); // cursor
+        assert!(text.contains('\u{2714}'), "{text}"); // active check
+        assert!(text.contains("Default"), "{text}");
+        assert!(text.contains("[ctx:300k]"), "{text}");
+        assert!(text.contains("[OpenAI]"), "{text}");
+        assert!(text.contains("[sub]"), "{text}");
+        // Inline effort + footer.
+        assert!(text.contains("High effort"), "{text}");
+        assert!(text.contains("\u{2190}/\u{2192} to adjust"), "{text}");
+        assert!(
+            text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
+            "{text}"
+        );
+        // The old search prompt and scope header are gone.
+        assert!(!text.contains("tab scope"), "{text}");
+        assert!(!text.contains("Model Name:"), "{text}");
+    }
+
+    #[test]
+    fn model_picker_left_right_adjust_inline_effort() {
+        let mut picker = ModelPicker::new(
+            models(),
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.5",
+            ReasoningEffort::Medium,
+        );
+        assert!(render_text(&picker).contains("Medium effort"));
+        picker.handle_key(ModalKey::Right);
+        assert!(render_text(&picker).contains("High effort"));
+        picker.handle_key(ModalKey::Left);
+        assert!(render_text(&picker).contains("Medium effort"));
+    }
+
+    #[test]
+    fn model_picker_navigation_preserves_effort_target() {
+        // gpt-5.5 accepts xhigh; gemini caps at high. With xhigh chosen, arrowing
+        // onto gemini shows the clamped value, but arrowing back restores xhigh
+        // (navigation must not truncate the target).
+        let two = vec![
+            cat(ProviderId::OpenAiCodex, "gpt-5.5"),
+            cat(ProviderId::Antigravity, "gemini-3.5-flash"),
+        ];
+        let mut picker = ModelPicker::new(
+            two,
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.5",
+            ReasoningEffort::XHigh,
+        );
+        assert!(render_text(&picker).contains("xHigh effort"));
+        picker.handle_key(ModalKey::Down); // onto gemini (caps at high)
+        assert!(render_text(&picker).contains("High effort"));
+        picker.handle_key(ModalKey::Up); // back to gpt-5.5
+        assert!(render_text(&picker).contains("xHigh effort"));
+    }
+
+    #[test]
+    fn model_picker_marks_active_and_labels_default_separately() {
+        // Session-only switch: active (sonnet) differs from the persisted default
+        // (gpt-5.5). The check marks the active row; "Default" labels the default.
+        let picker = ModelPicker::new(
+            models(),
+            "anthropic/claude-sonnet-4-6",
+            "openai-codex/gpt-5.5",
+            ReasoningEffort::Medium,
+        );
+        let default_row = picker
+            .render(80)
+            .into_iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .find(|l| l.contains("Default"))
+            .expect("a Default row");
+        assert!(default_row.contains("GPT-5.5"), "{default_row}");
+        assert!(
+            !default_row.contains('\u{2714}'),
+            "default is not active: {default_row}"
+        );
+        let active_row = picker
+            .render(80)
+            .into_iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .find(|l| l.contains('\u{2714}'))
+            .expect("an active row");
+        assert!(active_row.contains("Claude Sonnet 4.6"), "{active_row}");
+    }
+
+    #[test]
+    fn model_picker_is_not_searchable() {
+        let mut picker = ModelPicker::new(
+            models(),
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.5",
+            ReasoningEffort::Medium,
+        );
+        // A non-hotkey char is ignored (no filtering); Ctrl+C and Esc cancel.
+        assert!(matches!(
+            picker.handle_key(ModalKey::Char('z')),
+            ModalOutcome::Ignore
+        ));
+        assert_eq!(picker.selector.filtered_count(), 3);
         assert!(matches!(
             picker.handle_key(ModalKey::CtrlC),
             ModalOutcome::Close
         ));
-    }
-
-    #[test]
-    fn model_picker_search_prefill_and_no_match_message() {
-        let picker = ModelPicker::new(models(), None, "openai-codex/gpt-5.5", "bad-prefix");
-        assert_eq!(picker.selector.search(), Some("bad-prefix"));
-        assert!(picker.selector.is_empty());
-        let lines = picker.render(80);
-        let text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
-            .collect();
-        assert!(text.contains("No matching models"), "{text}");
-    }
-
-    #[test]
-    fn model_picker_tab_toggles_scope_only_when_scoped_exists() {
-        let scoped = vec![cat(ProviderId::Anthropic, "claude-sonnet-4-6")];
-        let mut picker = ModelPicker::new(models(), Some(scoped), "openai-codex/gpt-5.5", "");
-        // Starts in scoped scope: only one model visible.
-        assert_eq!(picker.selector.filtered_count(), 1);
-        picker.handle_key(ModalKey::Tab); // -> all
-        assert_eq!(picker.selector.filtered_count(), 3);
     }
 
     #[test]

@@ -2509,9 +2509,9 @@ mod tests {
                     provider: ProviderId::OpenAiCodex,
                     id: "gpt-5.5".to_string(),
                 }],
-                None,
                 "openai-codex/gpt-5.5",
-                "",
+                "openai-codex/gpt-5.5",
+                crate::mimir::selection::ReasoningEffort::Medium,
             )));
             terminal.draw(|f| render(f, &mut screen))?;
         }
@@ -2539,9 +2539,9 @@ mod tests {
         ];
         screen.open_modal(Modal::Model(ModelPicker::new(
             models,
-            None,
             "openai-codex/gpt-5.5",
-            "",
+            "openai-codex/gpt-5.5",
+            crate::mimir::selection::ReasoningEffort::Medium,
         )));
         terminal.draw(|f| render(f, &mut screen))?;
 
@@ -2549,8 +2549,8 @@ mod tests {
         // Transcript still on top; the modal frame replaces the editor below.
         assert!(rendered.contains("prior reply"), "{rendered}");
         assert!(rendered.contains("Select model"), "{rendered}");
-        assert!(rendered.contains("gpt-5.5"), "{rendered}");
-        assert!(rendered.contains("claude-sonnet-4-6"), "{rendered}");
+        assert!(rendered.contains("GPT-5.5"), "{rendered}");
+        assert!(rendered.contains("Claude Sonnet 4.6"), "{rendered}");
         // The editor placeholder is hidden while the modal is open.
         assert!(!rendered.contains("Type a message"), "{rendered}");
         Ok(())

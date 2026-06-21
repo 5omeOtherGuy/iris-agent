@@ -127,6 +127,22 @@ pub(crate) fn save_default_model(provider: &str, model: &str) -> Result<()> {
     ])
 }
 
+/// The effective default model as a canonical `provider/model` id. The `/model`
+/// picker uses it to label the "Default" row, which can differ from the active
+/// session model after a session-only switch. Resolved through
+/// [`ModelSelection::resolve`] over the global settings so it applies the same
+/// provider/model precedence and built-in fallbacks as startup (and canonicalizes
+/// the provider, so a hand-edited `defaultProvider` casing still matches the
+/// catalog's lowercase qualified ids). Global-only, matching where
+/// `save_default_model` writes; `None` only if the global path is unreadable or
+/// settings are invalid.
+pub(crate) fn default_model_qualified() -> Option<String> {
+    let path = global_path()?;
+    let settings = read_optional(&path).ok().flatten().unwrap_or_default();
+    let resolved = crate::mimir::selection::ModelSelection::resolve(&settings).ok()?;
+    Some(format!("{}/{}", resolved.provider.as_str(), resolved.model))
+}
+
 /// Persist the default reasoning/thinking level in the global settings file.
 pub(crate) fn save_default_reasoning(level: &str) -> Result<()> {
     update_global(&[("defaultReasoning", Value::String(level.to_string()))])

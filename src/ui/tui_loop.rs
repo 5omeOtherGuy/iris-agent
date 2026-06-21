@@ -635,6 +635,8 @@ fn to_modal_key(event: &Event) -> Option<ModalKey> {
         KeyCode::Down if alt => ModalKey::AltDown,
         KeyCode::Up => ModalKey::Up,
         KeyCode::Down => ModalKey::Down,
+        KeyCode::Left if !ctrl && !alt => ModalKey::Left,
+        KeyCode::Right if !ctrl && !alt => ModalKey::Right,
         KeyCode::Enter => ModalKey::Enter,
         KeyCode::Tab => ModalKey::Tab,
         KeyCode::Esc => ModalKey::Esc,

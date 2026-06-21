@@ -302,7 +302,7 @@ mod tests {
         }
         // Removing it reports the OAuth phrasing and clears the store.
         let lines = apply_logout("anthropic", &auth);
-        assert!(lines[0].contains("Logged out of anthropic"), "{lines:?}");
+        assert!(lines[0].contains("Logged out of Anthropic"), "{lines:?}");
         assert!(!auth.has_credentials("anthropic").unwrap());
         // Now empty -> status, not a picker.
         match open_logout(&auth) {
@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(updates.lock().unwrap().len(), 1);
         assert_eq!(
             login_complete_lines(ProviderId::OpenAiCodex, &outcome),
-            vec!["Logged in to openai-codex".to_string()]
+            vec!["Logged in to OpenAI".to_string()]
         );
     }
 }

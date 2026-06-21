@@ -50,7 +50,11 @@ impl ProviderId {
     /// just the wire id; kept as a separate accessor so a friendlier label can
     /// be added without touching call sites.
     pub(crate) fn display_name(self) -> &'static str {
-        self.as_str()
+        match self {
+            ProviderId::OpenAiCodex => "OpenAI",
+            ProviderId::Anthropic => "Anthropic",
+            ProviderId::Antigravity => "Antigravity",
+        }
     }
 
     /// Parse a provider id string. The error mirrors the message and exit-code
