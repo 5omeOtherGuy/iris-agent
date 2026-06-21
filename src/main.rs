@@ -33,7 +33,8 @@ fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             if error.downcast_ref::<errors::AuthError>().is_some() {
                 eprintln!(
-                    "hint: run `iris-agent login {}` to authenticate",
+                    "hint: run `{}` login {} to authenticate",
+                    command_name(),
                     configured_provider()
                 );
             }
@@ -292,15 +293,20 @@ fn build_provider(
     Ok(provider)
 }
 
+const COMMAND_NAME: &str = "iris";
 const UPDATE_REPO: &str = "https://github.com/5omeOtherGuy/iris-agent.git";
 const UPDATE_ARGS: &[&str] = &["install", "--git", UPDATE_REPO, "--locked", "--force"];
+
+fn command_name() -> &'static str {
+    COMMAND_NAME
+}
 
 fn update_args() -> &'static [&'static str] {
     UPDATE_ARGS
 }
 
 fn update_agent() -> Result<()> {
-    println!("Updating iris-agent from {UPDATE_REPO} ...");
+    println!("Updating Iris from {UPDATE_REPO} ...");
     let status = Command::new("cargo")
         .args(update_args())
         .status()
@@ -358,14 +364,14 @@ fn login_anthropic() -> Result<()> {
 
 fn print_help() {
     eprintln!("Usage:");
-    eprintln!("  iris-agent                              Start interactive agent");
-    eprintln!("  iris-agent resume <session-id>          Resume a prior session by id");
-    eprintln!("  iris-agent login openai-codex           Login with browser OAuth (default)");
-    eprintln!("  iris-agent login openai-codex --browser Login with browser OAuth");
-    eprintln!("  iris-agent login openai-codex --device-code Login with device-code OAuth");
-    eprintln!("  iris-agent login antigravity            Login with Google account OAuth");
-    eprintln!("  iris-agent login anthropic              Show Claude Code login instructions");
-    eprintln!("  iris-agent update                       Update Iris from GitHub");
+    eprintln!("  iris                              Start interactive agent");
+    eprintln!("  iris resume <session-id>          Resume a prior session by id");
+    eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
+    eprintln!("  iris login openai-codex --browser Login with browser OAuth");
+    eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
+    eprintln!("  iris login antigravity            Login with Google account OAuth");
+    eprintln!("  iris login anthropic              Show Claude Code login instructions");
+    eprintln!("  iris update                       Update Iris from GitHub");
 }
 
 #[cfg(test)]

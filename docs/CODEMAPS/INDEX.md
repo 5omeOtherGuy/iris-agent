@@ -120,14 +120,15 @@ and the text UI remains the fallback for pipes/CI or TUI startup failure.
 
 | Command | Purpose |
 |---|---|
-| `iris-agent` | Start a new interactive agent session in the current working directory. |
-| `iris-agent resume <session-id>` | Resume a prior session by id: load its transcript, rebuild provider-visible context, and continue appending future turns to the same log. Errors with exit code `2` on an unknown id. |
-| `iris-agent login openai-codex` | Run browser OAuth login using a local callback server. |
-| `iris-agent login openai-codex --browser` | Explicit browser OAuth login. |
-| `iris-agent login openai-codex --device-code` | Run device-code OAuth login. |
-| `iris-agent login anthropic` | Print instructions for signing in with Claude Code; Iris then reuses that OAuth token. |
-| `iris-agent login antigravity` | Run Google browser PKCE OAuth login (requires `ANTIGRAVITY_CLIENT_SECRET`; Antigravity runs also need it available when refresh is required). |
-| `iris-agent help` / `--help` / `-h` | Print command help. |
+| `iris` | Start a new interactive agent session in the current working directory. |
+| `iris resume <session-id>` | Resume a prior session by id: load its transcript, rebuild provider-visible context, and continue appending future turns to the same log. Errors with exit code `2` on an unknown id. |
+| `iris login openai-codex` | Run browser OAuth login using a local callback server. |
+| `iris login openai-codex --browser` | Explicit browser OAuth login. |
+| `iris login openai-codex --device-code` | Run device-code OAuth login. |
+| `iris login anthropic` | Print instructions for signing in with Claude Code; Iris then reuses that OAuth token. |
+| `iris login antigravity` | Run Google browser PKCE OAuth login (requires `ANTIGRAVITY_CLIENT_SECRET`; Antigravity runs also need it available when refresh is required). |
+| `iris update` | Update the installed binary from the GitHub repository via locked Cargo install. |
+| `iris help` / `--help` / `-h` | Print command help. |
 
 Unknown commands print help and exit with code `2` (`UsageError`); auth failures exit `3` (`AuthError`); other errors exit `1`.
 

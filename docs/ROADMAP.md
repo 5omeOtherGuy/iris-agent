@@ -558,7 +558,7 @@ Potential scope:
   compaction/branch-summary entries, labels, fork, and token accounting. This
   ships the durable, resumable-ready store. Session Resume MVP
   ([#47](https://github.com/5omeOtherGuy/iris-agent/issues/47), shipped
-  2026-06-17) builds on it: `iris-agent resume <session-id>` finds the session
+  2026-06-17) builds on it: `iris resume <session-id>` finds the session
   via `SessionStore::find`, reconstructs the prior provider-visible messages
   (`Agent::resumed` seeds the loaded transcript), reopens the same JSONL file
   for append (`SessionLog::resume` restores the leaf link + id counter), and

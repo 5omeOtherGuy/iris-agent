@@ -78,8 +78,8 @@ in three layers of very different cost:
 - **Job A — CLI tier *label* (docs + ~6 source comments + one system-prompt
   string + its test): trivial.** Pure find/replace, no behavior, no path changes.
   This is all a tier-label rename needs.
-- **Job B — product/crate/binary/env/paths named `iris`: breaking.**
-  - Crate + binary `iris-agent`, repo dir, GitHub URL.
+- **Job B — product/crate/env/paths named `iris`: breaking.**
+  - Crate/package, repo dir, and GitHub URL stay `iris-agent`; the installed binary is `iris`.
   - Env vars `IRIS_MODEL`, `IRIS_CODEX_BASE_URL`, `IRIS_CONFIG_PATH`,
     `IRIS_SESSION_DIR`, `IRIS_AUTH_PATH`, `CLAUDE_CONFIG_DIR`,
     `ANTIGRAVITY_CLIENT_SECRET`, `ANTIGRAVITY_PROJECT_ID` — **breaks existing

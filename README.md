@@ -63,7 +63,7 @@ cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked
 Update an installed copy with:
 
 ```bash
-iris-agent update
+iris update
 ```
 
 Or run from a source checkout:
@@ -91,24 +91,24 @@ Iris stores OAuth credentials in an Iris auth file. By default it reads:
 Create or refresh credentials for the provider you want to use:
 
 ```bash
-iris-agent login openai-codex
-iris-agent login openai-codex --device-code
-iris-agent login anthropic
-ANTIGRAVITY_CLIENT_SECRET=... iris-agent login antigravity
+iris login openai-codex
+iris login openai-codex --device-code
+iris login anthropic
+ANTIGRAVITY_CLIENT_SECRET=... iris login antigravity
 ```
 
-From a source checkout, replace `iris-agent` with `cargo run --`.
+From a source checkout, replace `iris` with `cargo run --`.
 
 Provider notes:
 
 - `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the default provider if no setting is present.
-- `anthropic` uses an existing Claude Code OAuth login. `iris-agent login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
+- `anthropic` uses an existing Claude Code OAuth login. `iris login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
 - `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is **not shipped in source** and must be available as `ANTIGRAVITY_CLIENT_SECRET` for `login antigravity` and later Antigravity runs that refresh the token.
 
 Override the auth-file path with:
 
 ```bash
-IRIS_AUTH_PATH=/path/to/auth.json iris-agent
+IRIS_AUTH_PATH=/path/to/auth.json iris
 ```
 
 Choose the provider for a run with `defaultProvider` in the global JSON settings
@@ -145,7 +145,7 @@ Environment variables:
 Start the REPL:
 
 ```bash
-iris-agent
+iris
 ```
 
 Exit with `/exit` or `/quit`.
