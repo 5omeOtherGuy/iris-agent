@@ -45,12 +45,11 @@ fn fable_5_enabled() -> bool {
 // when adding models; the upgrade path is a generated registry (declined for
 // now, see model_catalog module docs).
 // Anthropic rows are the Claude Code subscription matrix; their wire facts
-// (native id, output cap, thinking mode, fallback) live in
+// (model id, output cap, thinking mode, fallback) live in
 // `crate::mimir::anthropic_models`. The display id set here must stay in sync
 // with that matrix -- `catalog_anthropic_ids_match_subscription_matrix` enforces
 // it. The context-window label is the soft routing cap shown in the picker
-// badge (e.g. `claude-opus-4-7-300k` is the 300k soft-cap alias of the 1M
-// `claude-opus-4-7`).
+// badge.
 const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
     (ProviderId::OpenAiCodex, "gpt-5.5", "GPT 5.5", "300k"),
     (ProviderId::OpenAiCodex, "gpt-5.4", "GPT 5.4", "300k"),
@@ -68,12 +67,6 @@ const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
     ),
     (ProviderId::Anthropic, "claude-opus-4-8", "Opus 4.8", "1M"),
     (ProviderId::Anthropic, "claude-opus-4-7", "Opus 4.7", "1M"),
-    (
-        ProviderId::Anthropic,
-        "claude-opus-4-7-300k",
-        "Opus 4.7 300k",
-        "300k",
-    ),
     (ProviderId::Anthropic, "claude-opus-4-6", "Opus 4.6", "1M"),
     (
         ProviderId::Anthropic,
@@ -299,7 +292,7 @@ mod tests {
         assert_eq!(ctx_label("anthropic/claude-sonnet-4-6"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-opus-4-8"), Some("1M"));
-        assert_eq!(ctx_label("anthropic/claude-opus-4-7-300k"), Some("300k"));
+        assert_eq!(ctx_label("anthropic/claude-opus-4-7"), Some("1M"));
         assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-fable-5"), Some("1M"));
         assert_eq!(ctx_label("openai-codex/gpt-9-mystery"), None);
