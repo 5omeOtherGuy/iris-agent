@@ -37,6 +37,22 @@ impl ProviderId {
     /// for backward compatibility.
     pub(crate) const DEFAULT: ProviderId = ProviderId::OpenAiCodex;
 
+    /// Every supported provider, in display/registry order. Used by the model
+    /// catalog and the `/login` provider list so a new provider is added in one
+    /// place.
+    pub(crate) const ALL: [ProviderId; 3] = [
+        ProviderId::OpenAiCodex,
+        ProviderId::Anthropic,
+        ProviderId::Antigravity,
+    ];
+
+    /// Human-facing provider name for selectors and status lines. Today this is
+    /// just the wire id; kept as a separate accessor so a friendlier label can
+    /// be added without touching call sites.
+    pub(crate) fn display_name(self) -> &'static str {
+        self.as_str()
+    }
+
     /// Parse a provider id string. The error mirrors the message and exit-code
     /// classification (`UsageError`) `build_provider` used to emit, so an
     /// unsupported value still fails loudly with the usage exit code.
@@ -64,7 +80,7 @@ impl ProviderId {
     /// Built-in default model for this provider. Inherited placeholders already
     /// present in the per-adapter constants; centralized here so selection owns
     /// the model default.
-    fn default_model(self) -> &'static str {
+    pub(crate) fn default_model(self) -> &'static str {
         match self {
             ProviderId::OpenAiCodex => "gpt-5.5",
             ProviderId::Anthropic => "claude-sonnet-4-6",
@@ -106,7 +122,11 @@ pub(crate) enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Every level, in increasing order. Used by tests to round-trip parsing.
+    /// Default thinking/effort level (`medium`), matching pi-mono. Used when a
+    /// picker needs a starting level and the session has no explicit preference.
+    pub(crate) const DEFAULT: ReasoningEffort = ReasoningEffort::Medium;
+
+    /// Every level, in increasing order. Used to round-trip parsing in tests.
     #[cfg(test)]
     pub(crate) const ALL: [ReasoningEffort; 6] = [
         ReasoningEffort::Off,
@@ -144,6 +164,19 @@ impl ReasoningEffort {
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
             ReasoningEffort::XHigh => "xhigh",
+        }
+    }
+
+    /// Short human description shown in the effort picker, matching pi-mono's
+    /// thinking-level descriptions.
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            ReasoningEffort::Off => "No reasoning",
+            ReasoningEffort::Minimal => "Very brief reasoning (~1k tokens)",
+            ReasoningEffort::Low => "Light reasoning (~2k tokens)",
+            ReasoningEffort::Medium => "Moderate reasoning (~8k tokens)",
+            ReasoningEffort::High => "Deep reasoning (~16k tokens)",
+            ReasoningEffort::XHigh => "Maximum reasoning (~32k tokens)",
         }
     }
 }
@@ -236,6 +269,7 @@ mod tests {
             base_url: base_url.map(str::to_string),
             context_token_budget: None,
             default_reasoning: reasoning.map(str::to_string),
+            enabled_models: None,
         }
     }
 

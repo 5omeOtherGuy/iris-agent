@@ -146,7 +146,12 @@ fn run_agent() -> Result<()> {
     let build = |selection: &mimir::selection::ModelSelection, prompt: &str| {
         build_provider(selection, prompt)
     };
-    let mut switch = Some(cli::ModelSwitch::new(selection, system_prompt, &build));
+    let mut switch = Some(cli::ModelSwitch::new(
+        selection,
+        system_prompt,
+        &build,
+        settings.enabled_models.clone(),
+    ));
     cli::run_interactive(&mut harness, &mut switch)
 }
 
@@ -205,7 +210,12 @@ fn resume_agent(session_id: &str) -> Result<()> {
     let build = |selection: &mimir::selection::ModelSelection, prompt: &str| {
         build_provider(selection, prompt)
     };
-    let mut switch = Some(cli::ModelSwitch::new(selection, system_prompt, &build));
+    let mut switch = Some(cli::ModelSwitch::new(
+        selection,
+        system_prompt,
+        &build,
+        settings.enabled_models.clone(),
+    ));
     cli::run_interactive(&mut harness, &mut switch)
 }
 

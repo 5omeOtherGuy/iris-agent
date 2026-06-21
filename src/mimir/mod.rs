@@ -6,5 +6,6 @@
 //! `ChatProvider` contract stays in `nexus` (Tier 1); Mimir implements it.
 pub(crate) mod auth;
 pub(crate) mod model_capabilities;
+pub(crate) mod model_catalog;
 pub(crate) mod providers;
 pub(crate) mod selection;

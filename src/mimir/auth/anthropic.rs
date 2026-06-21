@@ -95,6 +95,16 @@ impl AnthropicTokenStore {
     }
 }
 
+/// Whether a Claude Code credential file exists to bootstrap from. Used by the
+/// model catalog to mark Anthropic available even when Iris's own auth store has
+/// no stored credential. Only checks for the file's presence -- it never reads,
+/// parses, or exposes the secret.
+pub(crate) fn claude_code_credentials_available() -> bool {
+    claude_code_credentials_path()
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
 fn claude_code_credentials_path() -> Result<PathBuf> {
     if let Ok(dir) = env::var("CLAUDE_CONFIG_DIR") {
         let dir = dir.trim();
