@@ -77,7 +77,7 @@ and the text UI remains the fallback for pipes/CI or TUI startup failure.
 | `src/mimir/auth/device_code.rs` | Generic polling helper for OAuth device-code flows. | `DeviceCodePoll`, `poll_device_code()` | `std::thread`, `std::time`, `anyhow` |
 | `src/mimir/auth/openai_codex.rs` | OpenAI Codex OAuth integration. Supports browser callback login, device-code login, token exchange/refresh, and account ID extraction from JWT payloads. | `OpenAiCodexTokenStore`, `AccessToken`, `login_browser()`, `login_device_code()` | `AuthStore`, `poll_device_code`, `base64`, `rand`, `reqwest`, `sha2`, `serde`, `serde_json`, TCP/filesystem/time APIs |
 | `src/mimir/auth/anthropic.rs` | Anthropic Claude Code subscription OAuth reuse. Loads credentials from the Iris auth store or bootstraps from Claude Code's `.credentials.json`, refreshes via Anthropic OAuth, and writes rotated tokens back to the same source without reshaping/dropping sibling keys. | `AnthropicTokenStore`, `AUTH_PROVIDER` | `AuthStore`, filesystem/env APIs, `reqwest`, `serde_json`, `anyhow` |
-| `src/mimir/auth/antigravity.rs` | Antigravity Google OAuth integration. Runs browser PKCE login on `127.0.0.1:51121`, requires env-only `ANTIGRAVITY_CLIENT_SECRET` for login/refresh, decodes the public installed-app client ID at runtime, refreshes tokens, and discovers/persists `projectId` via Code Assist (`ANTIGRAVITY_PROJECT_ID` wins over persisted ids; no hard-coded fallback is persisted on discovery failure). | `AntigravityTokenStore`, `login_browser()`, `AUTH_PROVIDER` | `AuthStore`, `base64`, `rand`, `reqwest`, `sha2`, `serde_json`, TCP/filesystem/time APIs |
+| `src/mimir/auth/antigravity.rs` | Antigravity Google OAuth integration. Runs browser PKCE login on `127.0.0.1:51121`, uses a runtime or build-time `ANTIGRAVITY_CLIENT_SECRET` for login/refresh, decodes the public installed-app client ID at runtime, refreshes tokens, and discovers/persists `projectId` via Code Assist (`ANTIGRAVITY_PROJECT_ID` wins over persisted ids; no hard-coded fallback is persisted on discovery failure). | `AntigravityTokenStore`, `login_browser()`, `AUTH_PROVIDER` | `AuthStore`, `base64`, `rand`, `reqwest`, `sha2`, `serde_json`, TCP/filesystem/time APIs |
 | `src/mimir/providers/mod.rs` | Provider module declaration. System-prompt assembly lives in `wayland/system_prompt.rs`; provider constructors receive the assembled prompt from `main.rs`. | `anthropic_messages`, `antigravity`, `openai_codex_responses` modules | provider submodules |
 | `src/mimir/providers/transport.rs` | Shared blocking-provider glue: spawns reqwest/SSE work on `spawn_blocking`, forwards events over a channel, classifies HTTP status, performs exactly-once reauth, and parses SSE event framing. | `TurnSink`, `ChannelSink`, `spawn_stream()`, `run_with_reauth()`, `for_each_sse_event()`, `classify_http_status()` | `futures`, `tokio`, `tokio_util`, `reqwest`, `anyhow`, Nexus turn/event types |
 | `src/mimir/providers/openai_codex_responses.rs` | Implements `ChatProvider::respond_stream` for the ChatGPT Codex Responses endpoint. Runs blocking reqwest/SSE code through the shared transport, forwards text deltas and the final turn as `ProviderEvent`s, builds request JSON/headers/URL, advertises tools, retries with backoff, and is cancellation-aware. | `OpenAiCodexResponsesProvider` | `OpenAiCodexTokenStore`, shared transport, `ChatProvider`, Nexus message/turn types, `crate::{tools, errors, telemetry}`, `reqwest`, `serde_json`, `tracing` |
@@ -111,7 +111,7 @@ and the text UI remains the fallback for pipes/CI or TUI startup failure.
 | `IRIS_MODEL` | `gpt-5.5` | OpenAI Codex model override (`env > settings > default`) |
 | `IRIS_CODEX_BASE_URL` | `https://chatgpt.com/backend-api` | OpenAI Codex base-url override (`env > settings > default`) |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Anthropic credential bootstrap path (`CLAUDE_CONFIG_DIR/.credentials.json`) |
-| `ANTIGRAVITY_CLIENT_SECRET` | none (required for login/refresh) | Antigravity Google OAuth token exchange/refresh |
+| `ANTIGRAVITY_CLIENT_SECRET` | none unless injected at build time | Antigravity Google OAuth token exchange/refresh |
 | `ANTIGRAVITY_PROJECT_ID` | discovered project | Antigravity project-id override (wins over stored `projectId`) before `loadCodeAssist` discovery |
 | `RUST_LOG` | `warn` | `telemetry::init()` tracing filter |
 | `HOME` | required when the matching path override is unset | auth/settings/session path resolution |
@@ -126,7 +126,7 @@ and the text UI remains the fallback for pipes/CI or TUI startup failure.
 | `iris login openai-codex --browser` | Explicit browser OAuth login. |
 | `iris login openai-codex --device-code` | Run device-code OAuth login. |
 | `iris login anthropic` | Print instructions for signing in with Claude Code; Iris then reuses that OAuth token. |
-| `iris login antigravity` | Run Google browser PKCE OAuth login (requires `ANTIGRAVITY_CLIENT_SECRET`; Antigravity runs also need it available when refresh is required). |
+| `iris login antigravity` | Run Google browser PKCE OAuth login (requires `ANTIGRAVITY_CLIENT_SECRET` unless the binary was built with it). |
 | `iris update` | Update the installed binary from the GitHub repository via locked Cargo install. |
 | `iris help` / `--help` / `-h` | Print command help. |
 
@@ -185,7 +185,7 @@ Current unit tests cover:
 - Device-code polling behavior in `src/mimir/auth/device_code.rs`.
 - JWT account extraction, browser OAuth URL/callback parsing, device-code interval parsing, and device-auth error parsing in `src/mimir/auth/openai_codex.rs`.
 - Anthropic Claude Code credential parsing/write-back, refresh response parsing, role alternation, request construction, and Anthropic SSE text/tool-call parsing.
-- Antigravity PKCE URL/callback parsing, env-only client secret validation, project-id discovery helpers, request construction, tool schema sanitization, and Gemini SSE text/tool-call parsing.
+- Antigravity PKCE URL/callback parsing, runtime/build-time client-secret resolution, project-id discovery helpers, request construction, tool schema sanitization, and Gemini SSE text/tool-call parsing.
 - Shared provider transport behavior: SSE framing, exactly-once reauth, HTTP-status classification, and dropped-stream handling.
 - Codex URL resolution, request JSON construction, streamed text/delta parsing, tool-call parsing, and missing-output errors in `src/mimir/providers/openai_codex_responses.rs`.
 

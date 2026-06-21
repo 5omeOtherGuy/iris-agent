@@ -41,7 +41,7 @@ Implemented today:
 - Graceful Ctrl-C handling: first press ends the turn between round-trips, a second force-quits and reaps tracked process groups (`src/signals.rs`, `src/process_group.rs`).
 - A JSON settings file for provider/model defaults (`src/config.rs`, `~/.iris/settings.json` + project `.iris/settings.json`).
 - Best-effort JSONL session transcripts (`src/session.rs`).
-- Mimir auth flows and token loading/refresh under `src/mimir/auth/`: OpenAI Codex browser/device-code OAuth, Anthropic Claude Code OAuth reuse, and Antigravity Google PKCE OAuth (with env-only client secret).
+- Mimir auth flows and token loading/refresh under `src/mimir/auth/`: OpenAI Codex browser/device-code OAuth, Anthropic Claude Code OAuth reuse, and Antigravity Google PKCE OAuth (with runtime or build-time client-secret injection).
 - Mimir providers under `src/mimir/providers/`: OpenAI Codex Responses, Anthropic Messages (Claude Code subscription lane), and Antigravity/Gemini Code Assist streaming, all translated into Nexus's `ChatProvider` contract.
 - Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, URL resolution, request shaping, and response parsing.
 
@@ -103,7 +103,7 @@ Provider notes:
 
 - `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the default provider if no setting is present.
 - `anthropic` uses an existing Claude Code OAuth login. `iris login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
-- `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is **not shipped in source** and must be available as `ANTIGRAVITY_CLIENT_SECRET` for `login antigravity` and later Antigravity runs that refresh the token.
+- `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is not committed to source and must be supplied via `ANTIGRAVITY_CLIENT_SECRET` at runtime or when building Iris.
 
 Override the auth-file path with:
 
@@ -139,7 +139,7 @@ Environment variables:
 - `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
 - `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
 - `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
-- `ANTIGRAVITY_CLIENT_SECRET` — required for `login antigravity` and any Antigravity run that may refresh an expired/rejected token; not stored in source.
+- `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.
 - `ANTIGRAVITY_PROJECT_ID` — optional Antigravity project-id override; when set it wins over any persisted project id, otherwise Iris discovers/persists one from `loadCodeAssist` and errors if discovery fails.
 
 Start the REPL:
