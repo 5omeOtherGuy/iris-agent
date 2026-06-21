@@ -104,9 +104,10 @@ Implemented today:
   (#76/#73).
 - Milestone 2 foundations: structured metadata, token estimates,
   handle-backed large tool outputs, session-scoped content-addressed sidecars,
-  turn-boundary auto-compaction, and formal correlation-id vocabulary for
-  sessions, message entries, provider turns, tool calls, compactions, and
-  output handles.
+  turn-boundary auto-compaction, formal correlation-id vocabulary for sessions,
+  message entries, provider turns, tool calls, compactions, and output handles,
+  plus typed observability events for provider-turn lifecycle, tool lifecycle,
+  compaction metadata, and output-handle metadata.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.
