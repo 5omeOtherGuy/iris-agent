@@ -20,8 +20,9 @@ use crate::mimir::model_catalog::{self, CatalogModel};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::ui::selector::{Selector, SelectorItem};
 
-/// Max rows shown in a model/scoped list (pi-mono shows 10 / 8).
-const MODEL_ROWS: usize = 10;
+/// Max rows shown in a model/scoped list. Seven current catalog rows plus the
+/// footer fit in the live viewport; future extra rows scroll.
+const MODEL_ROWS: usize = 7;
 const SCOPED_ROWS: usize = 8;
 const PROVIDER_ROWS: usize = 8;
 
@@ -1174,6 +1175,45 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_render_matches_mockup_contract() {
+        let picker = ModelPicker::new(
+            vec![
+                cat(ProviderId::OpenAiCodex, "gpt-5.5"),
+                cat(ProviderId::Anthropic, "claude-opus-4-8"),
+                cat(ProviderId::Anthropic, "claude-sonnet-4-6"),
+                cat(ProviderId::Anthropic, "claude-haiku-4-5"),
+            ],
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-opus-4-8",
+            ReasoningEffort::XHigh,
+        );
+        let text = render_text(&picker);
+
+        assert!(
+            text.contains("Switch between models from registered providers."),
+            "{text}"
+        );
+        assert!(text.contains("❯ ✔ Default"), "{text}");
+        assert!(text.contains("Opus 4.8"), "{text}");
+        assert!(text.contains("Sonnet 4.6"), "{text}");
+        assert!(text.contains("Haiku 4.5"), "{text}");
+        assert!(text.contains("GPT 5.5"), "{text}");
+        assert!(text.contains("[ctx:1M]"), "{text}");
+        assert!(text.contains("[ctx:200k]"), "{text}");
+        assert!(text.contains("[ctx:300k]"), "{text}");
+        assert!(text.contains("[Anthropic] [sub]"), "{text}");
+        assert!(text.contains("[OpenAI] [sub]"), "{text}");
+        assert!(text.contains("◉ xHigh effort ←/→ to adjust"), "{text}");
+        assert!(
+            text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
+            "{text}"
+        );
+        assert!(!text.contains("Only showing models"), "{text}");
+        assert!(!text.contains("claude-opus-4-8"), "{text}");
+        assert!(!text.contains("GPT-5.5"), "{text}");
+    }
+
+    #[test]
     fn model_picker_left_right_adjust_inline_effort() {
         let mut picker = ModelPicker::new(
             models(),
@@ -1231,7 +1271,7 @@ mod tests {
             })
             .find(|l| l.contains("Default"))
             .expect("a Default row");
-        assert!(default_row.contains("GPT-5.5"), "{default_row}");
+        assert!(default_row.contains("GPT 5.5"), "{default_row}");
         assert!(
             !default_row.contains('\u{2714}'),
             "default is not active: {default_row}"
@@ -1247,7 +1287,7 @@ mod tests {
             })
             .find(|l| l.contains('\u{2714}'))
             .expect("an active row");
-        assert!(active_row.contains("Claude Sonnet 4.6"), "{active_row}");
+        assert!(active_row.contains("Sonnet 4.6"), "{active_row}");
     }
 
     #[test]

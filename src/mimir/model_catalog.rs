@@ -26,29 +26,20 @@ use crate::mimir::selection::ProviderId;
 // when adding models; the upgrade path is a generated registry (declined for
 // now, see model_catalog module docs).
 const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
-    (ProviderId::OpenAiCodex, "gpt-5.5", "GPT-5.5", "300k"),
-    (
-        ProviderId::Anthropic,
-        "claude-opus-4-8",
-        "Claude Opus 4.8",
-        "1M",
-    ),
-    (
-        ProviderId::Anthropic,
-        "claude-opus-4-7",
-        "Claude Opus 4.7",
-        "1M",
-    ),
-    (
-        ProviderId::Anthropic,
-        "claude-opus-4-6",
-        "Claude Opus 4.6",
-        "1M",
-    ),
+    (ProviderId::OpenAiCodex, "gpt-5.5", "GPT 5.5", "300k"),
+    (ProviderId::Anthropic, "claude-opus-4-8", "Opus 4.8", "1M"),
+    (ProviderId::Anthropic, "claude-opus-4-7", "Opus 4.7", "1M"),
+    (ProviderId::Anthropic, "claude-opus-4-6", "Opus 4.6", "1M"),
     (
         ProviderId::Anthropic,
         "claude-sonnet-4-6",
-        "Claude Sonnet 4.6",
+        "Sonnet 4.6",
+        "200k",
+    ),
+    (
+        ProviderId::Anthropic,
+        "claude-haiku-4-5",
+        "Haiku 4.5",
         "200k",
     ),
     (
@@ -228,8 +219,9 @@ mod tests {
 
     #[test]
     fn display_name_uses_catalog_then_falls_back_to_id() {
-        assert_eq!(display_name("openai-codex/gpt-5.5"), "GPT-5.5");
-        assert_eq!(display_name("anthropic/claude-opus-4-7"), "Claude Opus 4.7");
+        assert_eq!(display_name("openai-codex/gpt-5.5"), "GPT 5.5");
+        assert_eq!(display_name("anthropic/claude-opus-4-7"), "Opus 4.7");
+        assert_eq!(display_name("anthropic/claude-haiku-4-5"), "Haiku 4.5");
         // Not in the catalog -> show the bare model id.
         assert_eq!(display_name("openai-codex/gpt-9-mystery"), "gpt-9-mystery");
         assert_eq!(display_name("no-slash"), "no-slash");
@@ -239,6 +231,7 @@ mod tests {
     fn ctx_label_returns_catalog_value_or_none() {
         assert_eq!(ctx_label("openai-codex/gpt-5.5"), Some("300k"));
         assert_eq!(ctx_label("anthropic/claude-sonnet-4-6"), Some("200k"));
+        assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-opus-4-8"), Some("1M"));
         assert_eq!(ctx_label("openai-codex/gpt-9-mystery"), None);
     }
