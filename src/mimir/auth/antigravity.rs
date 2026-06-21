@@ -37,10 +37,10 @@ static CLIENT_ID: LazyLock<String> = LazyLock::new(|| {
     )
     .expect("embedded client id is valid utf-8")
 });
-// The installed-app OAuth client SECRET is intentionally NOT embedded: Google's
-// installed-app token endpoint requires a client_secret even with PKCE, so
-// antigravity login requires the `ANTIGRAVITY_CLIENT_SECRET` environment
-// variable. We never ship a third-party OAuth secret in source.
+// The installed-app OAuth client secret is not committed to the public repo.
+// Release builders may inject it at compile time with ANTIGRAVITY_CLIENT_SECRET;
+// local/development runs may provide the same variable at runtime.
+const COMPILED_CLIENT_SECRET: Option<&str> = option_env!("ANTIGRAVITY_CLIENT_SECRET");
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
@@ -289,21 +289,32 @@ fn parse_callback_request(request: &str, expected_state: &str) -> Result<Option<
         .ok_or_else(|| anyhow!("missing OAuth authorization code"))
 }
 
-/// Resolve the installed-app client secret from `ANTIGRAVITY_CLIENT_SECRET`.
-/// Env-only by design: we do not ship a third-party OAuth secret in source, so
-/// login fails with an actionable error when the variable is unset.
+/// Resolve the installed-app client secret, preferring a runtime override over
+/// the value injected into release builds. Source checkouts without either get
+/// an actionable error instead of a late token-exchange failure.
 fn client_secret() -> Result<String> {
-    resolve_client_secret(std::env::var("ANTIGRAVITY_CLIENT_SECRET").ok())
+    resolve_client_secret(
+        std::env::var("ANTIGRAVITY_CLIENT_SECRET").ok(),
+        COMPILED_CLIENT_SECRET,
+    )
 }
 
-fn resolve_client_secret(env_value: Option<String>) -> Result<String> {
+fn resolve_client_secret(
+    env_value: Option<String>,
+    compiled_value: Option<&str>,
+) -> Result<String> {
     env_value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            compiled_value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .ok_or_else(|| {
             anyhow!(
-                "antigravity login requires the ANTIGRAVITY_CLIENT_SECRET environment variable \
-                 (the Google installed-app OAuth client secret)"
+                "antigravity login requires ANTIGRAVITY_CLIENT_SECRET at runtime or when building Iris"
             )
         })
 }
@@ -465,19 +476,17 @@ mod tests {
     }
 
     #[test]
-    fn client_secret_is_env_only_and_required() {
-        assert!(
-            resolve_client_secret(None).is_err(),
-            "missing secret must fail"
-        );
-        assert!(
-            resolve_client_secret(Some("   ".to_string())).is_err(),
-            "blank secret must fail"
+    fn client_secret_uses_runtime_then_compiled_value() {
+        assert!(resolve_client_secret(None, None).is_err());
+        assert!(resolve_client_secret(Some("   ".to_string()), None).is_err());
+        assert_eq!(
+            resolve_client_secret(None, Some(" built ")).unwrap(),
+            "built"
         );
         assert_eq!(
-            resolve_client_secret(Some("  sek  ".to_string())).unwrap(),
-            "sek",
-            "trims and accepts a real value"
+            resolve_client_secret(Some("  runtime  ".to_string()), Some("built")).unwrap(),
+            "runtime",
+            "runtime override wins over build-time injection"
         );
     }
 

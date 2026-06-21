@@ -53,7 +53,7 @@
   (`v1internal:streamGenerateContent?alt=sse`), project-id discovery/persistence,
   Gemini content/tool mapping, streamed text, and tool-call assembly. The public
   installed-app client ID is decoded at runtime; `ANTIGRAVITY_CLIENT_SECRET` is
-  env-only and required for login/refresh. [Partial]
+  supplied at runtime or injected when building Iris. [Partial]
 - **OpenAI Codex OAuth auth-file support** — reads `~/.iris/auth.json` or
   `IRIS_AUTH_PATH`, refreshes expired access tokens, extracts account ID from the
   JWT payload, and rewrites refreshed credentials atomically with restricted Unix
@@ -63,8 +63,8 @@
   already hold Anthropic credentials, and writes rotated tokens back to the same
   source without reshaping or dropping sibling keys. [Partial]
 - **Antigravity Google OAuth login** — browser PKCE OAuth callback flow through
-  `iris login antigravity`; requires `ANTIGRAVITY_CLIENT_SECRET` at login
-  time and during later token refreshes. [Partial]
+  `iris login antigravity`; requires `ANTIGRAVITY_CLIENT_SECRET` unless the
+  binary was built with it, and uses the same value for later refreshes. [Partial]
 - **OpenAI Codex login** — browser OAuth callback flow and device-code OAuth flow
   through `iris login openai-codex`. [Partial]
 - **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
