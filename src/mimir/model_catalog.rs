@@ -19,13 +19,21 @@ use crate::mimir::selection::ProviderId;
 
 /// The hand-maintained set of (provider, model id) pairs Iris supports. New
 /// models are added here in one place; the list intentionally stays small.
-const ENTRIES: &[(ProviderId, &str)] = &[
-    (ProviderId::OpenAiCodex, "gpt-5.5"),
-    (ProviderId::Anthropic, "claude-opus-4-8"),
-    (ProviderId::Anthropic, "claude-opus-4-7"),
-    (ProviderId::Anthropic, "claude-opus-4-6"),
-    (ProviderId::Anthropic, "claude-sonnet-4-6"),
-    (ProviderId::Antigravity, "gemini-3.5-flash"),
+const ENTRIES: &[(ProviderId, &str, &str)] = &[
+    (ProviderId::OpenAiCodex, "gpt-5.5", "GPT-5.5"),
+    (ProviderId::Anthropic, "claude-opus-4-8", "Claude Opus 4.8"),
+    (ProviderId::Anthropic, "claude-opus-4-7", "Claude Opus 4.7"),
+    (ProviderId::Anthropic, "claude-opus-4-6", "Claude Opus 4.6"),
+    (
+        ProviderId::Anthropic,
+        "claude-sonnet-4-6",
+        "Claude Sonnet 4.6",
+    ),
+    (
+        ProviderId::Antigravity,
+        "gemini-3.5-flash",
+        "Gemini 3.5 Flash",
+    ),
 ];
 
 /// One known model: its provider and id.
@@ -74,11 +82,28 @@ impl AuthStatus {
 pub(crate) fn all() -> Vec<CatalogModel> {
     ENTRIES
         .iter()
-        .map(|(provider, id)| CatalogModel {
+        .map(|(provider, id, _name)| CatalogModel {
             provider: *provider,
             id: (*id).to_string(),
         })
         .collect()
+}
+
+/// Human-friendly display name for a `provider/modelId`, shown in the `/model`
+/// picker footer ("Model Name: ..."). Falls back to the bare model id for
+/// anything not in the catalog.
+pub(crate) fn display_name(qualified: &str) -> String {
+    ENTRIES
+        .iter()
+        .find(|(provider, id, _)| format!("{}/{}", provider.as_str(), id) == qualified)
+        .map(|(_, _, name)| (*name).to_string())
+        .unwrap_or_else(|| {
+            qualified
+                .split_once('/')
+                .map(|(_, id)| id)
+                .unwrap_or(qualified)
+                .to_string()
+        })
 }
 
 /// Auth status for one provider, by credential presence only.
@@ -167,6 +192,15 @@ mod tests {
             model(ProviderId::Anthropic, "claude-sonnet-4-6").qualified(),
             "anthropic/claude-sonnet-4-6"
         );
+    }
+
+    #[test]
+    fn display_name_uses_catalog_then_falls_back_to_id() {
+        assert_eq!(display_name("openai-codex/gpt-5.5"), "GPT-5.5");
+        assert_eq!(display_name("anthropic/claude-opus-4-7"), "Claude Opus 4.7");
+        // Not in the catalog -> show the bare model id.
+        assert_eq!(display_name("openai-codex/gpt-9-mystery"), "gpt-9-mystery");
+        assert_eq!(display_name("no-slash"), "no-slash");
     }
 
     #[test]
