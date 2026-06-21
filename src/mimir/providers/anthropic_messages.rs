@@ -21,6 +21,7 @@ use super::transport::{
     Attempt, HttpClass, TurnSink, classify_http_status, for_each_sse_event, run_with_reauth,
     spawn_stream,
 };
+use crate::mimir::anthropic_models::{self, ThinkingMode};
 use crate::mimir::auth::anthropic::AnthropicTokenStore;
 use crate::mimir::selection::ReasoningEffort;
 use crate::nexus::{
@@ -28,12 +29,29 @@ use crate::nexus::{
     ToolCall, Tools,
 };
 
-/// Base output-token allowance. When extended thinking is enabled, the thinking
-/// budget is added on top (Anthropic requires `max_tokens > budget_tokens`), so
-/// the model keeps roughly this much room for its final answer.
+/// Base output-token allowance, treated as the visible-output ask
+/// (`requested_output_tokens` in the manual-budget invariant). For manual-budget
+/// thinking the budget is added on top and the sum is capped at the model's
+/// output cap; for adaptive thinking the API allocates reasoning dynamically and
+/// this stays the base `max_tokens`.
 const MAX_TOKENS: u32 = 8192;
+/// Default output cap for an unknown/non-subscription Anthropic id (conservative
+/// 64k). Subscription models carry their real cap in `anthropic_models`.
+const DEFAULT_OUTPUT_CAP: u32 = 64000;
+/// Anthropic's extended-thinking floor: `budget_tokens` must be `>= 1024` and
+/// `< max_tokens`, else the request 400s.
+const ANTHROPIC_MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
+/// Base betas every Claude Code OAuth request carries.
+const BASE_ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
+/// Appended only for manual-budget thinking payloads (`thinking.type ==
+/// "enabled"`); adaptive thinking implies interleaved thinking server-side and
+/// no thinking does not need it.
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+/// Appended only when the payload carries a `fallbacks` array (Fable 5 refusal
+/// fallback). The header date is authoritative as written; adopted from
+/// minimalcc-pi `SERVER_SIDE_FALLBACK_BETA`.
+const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-06-01";
 const PROVIDER_ID: &str = "anthropic";
 const API_ID: &str = "anthropic-messages";
 
@@ -129,7 +147,7 @@ impl AnthropicProvider {
         sink: &mut dyn TurnSink,
         cancel: &CancellationToken,
     ) -> Attempt {
-        let headers = match anthropic_headers(token) {
+        let headers = match anthropic_headers(token, request) {
             Ok(headers) => headers,
             Err(error) => return Attempt::Fatal(error),
         };
@@ -169,7 +187,12 @@ impl AnthropicProvider {
     }
 }
 
-fn anthropic_headers(token: &str) -> Result<HeaderMap> {
+/// Build OAuth-lane Anthropic headers. The `anthropic-beta` set is driven by the
+/// request payload shape (like minimalcc-pi `buildNativeMessagesRequest`): base
+/// betas always, `interleaved-thinking` only for manual-budget thinking, and the
+/// server-side fallback beta only when a `fallbacks` array is present. The
+/// OAuth lane never sends `x-api-key` / `anthropic-api-key`.
+fn anthropic_headers(token: &str, request: &Value) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
@@ -181,7 +204,10 @@ fn anthropic_headers(token: &str) -> Result<HeaderMap> {
         "anthropic-version",
         HeaderValue::from_static(ANTHROPIC_VERSION),
     );
-    headers.insert("anthropic-beta", HeaderValue::from_static(ANTHROPIC_BETA));
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_str(&anthropic_beta(request))?,
+    );
     headers.insert(
         "anthropic-dangerous-direct-browser-access",
         HeaderValue::from_static("true"),
@@ -191,6 +217,32 @@ fn anthropic_headers(token: &str) -> Result<HeaderMap> {
     Ok(headers)
 }
 
+/// Build the `anthropic-beta` header value from the outgoing payload. Payload-
+/// driven so header construction needs no model object: manual-budget thinking
+/// is `thinking.type == "enabled"`, the refusal fallback is a non-empty
+/// `fallbacks` array.
+fn anthropic_beta(request: &Value) -> String {
+    let mut betas = String::from(BASE_ANTHROPIC_BETA);
+    let manual_thinking = request
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("enabled");
+    if manual_thinking {
+        betas.push(',');
+        betas.push_str(INTERLEAVED_THINKING_BETA);
+    }
+    let has_fallbacks = request
+        .get("fallbacks")
+        .and_then(Value::as_array)
+        .is_some_and(|fallbacks| !fallbacks.is_empty());
+    if has_fallbacks {
+        betas.push(',');
+        betas.push_str(SERVER_SIDE_FALLBACK_BETA);
+    }
+    betas
+}
+
 fn build_anthropic_request(
     model: &str,
     system_prompt: &str,
@@ -198,35 +250,57 @@ fn build_anthropic_request(
     tools: &Tools,
     reasoning: Option<ReasoningEffort>,
 ) -> Value {
+    let meta = anthropic_models::find(model);
+    // Wire `model` uses the native id; the soft-cap alias `claude-opus-4-7-300k`
+    // sends `claude-opus-4-7`. Everything else sends its own id.
+    let native_id = meta.map(|m| m.native_id).unwrap_or(model);
+    let thinking_mode = meta
+        .map(|m| m.thinking)
+        .unwrap_or(ThinkingMode::ManualBudget);
+    let output_cap = meta.map(|m| m.output_cap).unwrap_or(DEFAULT_OUTPUT_CAP);
+
     let mut body = json!({
-        "model": model,
+        "model": native_id,
         "max_tokens": MAX_TOKENS,
         "stream": true,
         "system": [
             { "type": "text", "text": CLAUDE_CODE_IDENTITY },
             { "type": "text", "text": system_prompt },
         ],
+        // Origin (reasoning-replay continuity) is keyed on the UI model id, not
+        // the native id, so a 300k-alias turn replays against the same selection.
         "messages": build_messages(messages, &anthropic_origin(model)),
     });
-    // Extended thinking is added only when a preference is set, so the default
-    // (None) body is byte-identical to today's request (max_tokens unchanged, no
-    // `thinking` field). Adaptive-thinking models take an effort level via
-    // `output_config`; older models take a token budget that also raises
-    // `max_tokens`.
-    match anthropic_thinking(model, reasoning) {
-        None => {}
-        Some(ThinkingPlan::Adaptive { effort }) => {
-            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
-            body["output_config"] = json!({ "effort": effort });
-        }
-        Some(ThinkingPlan::Budget { budget_tokens }) => {
-            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
-            body["max_tokens"] = json!(MAX_TOKENS + budget_tokens);
-        }
-        Some(ThinkingPlan::Disabled) => {
-            body["thinking"] = json!({ "type": "disabled" });
+
+    // Thinking is added only when a level is set and is not `off`. Both `None`
+    // (no preference) and explicit `Off` omit `thinking` entirely: minimalcc-pi
+    // never sends `thinking: { type: "disabled" }` (it 400s on Fable 5), so
+    // absence is the off signal. The default (None) body stays byte-identical to
+    // today's request.
+    if let Some(level) = reasoning.filter(|level| *level != ReasoningEffort::Off) {
+        match thinking_mode {
+            ThinkingMode::Adaptive => {
+                body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+                body["output_config"] = json!({ "effort": adaptive_effort(level) });
+            }
+            ThinkingMode::ManualBudget => {
+                let (max_tokens, budget_tokens) =
+                    resolve_manual_thinking(MAX_TOKENS, manual_budget(level), output_cap);
+                body["max_tokens"] = json!(max_tokens);
+                if let Some(budget_tokens) = budget_tokens {
+                    body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
+                }
+            }
         }
     }
+
+    // Fable 5 refusal fallback: ask the API to retry a safety-classifier decline
+    // on the fallback model server-side (one round trip). The matching
+    // `server-side-fallback` beta is added from this payload in `anthropic_beta`.
+    if let Some(fallback) = meta.and_then(|m| m.refusal_fallback) {
+        body["fallbacks"] = json!([{ "model": fallback }]);
+    }
+
     let declarations = tool_declarations(tools);
     if !declarations.is_empty() {
         body["tools"] = Value::Array(declarations);
@@ -234,82 +308,66 @@ fn build_anthropic_request(
     body
 }
 
-/// How a reasoning level is encoded for a given Anthropic model.
-enum ThinkingPlan {
-    /// Adaptive-thinking models (Opus 4.6/4.7/4.8, Sonnet 4.6): the model decides
-    /// how much to think and the caller passes an effort level via
-    /// `output_config.effort`. `max_tokens` is left at the base value.
-    Adaptive { effort: &'static str },
-    /// Older models: a fixed thinking token budget; `max_tokens` is raised to
-    /// `base + budget` so `max_tokens > budget_tokens`.
-    Budget { budget_tokens: u32 },
-    /// Explicit `Off` on an adaptive model: disable thinking on the wire
-    /// (`thinking: { type: "disabled" }`). Adaptive models can otherwise default
-    /// thinking on, so omitting the field would not turn it off. `max_tokens`
-    /// stays at the base value.
-    Disabled,
-}
-
-/// Anthropic models that use adaptive thinking instead of budget-based thinking.
-/// Tracks pi-mono `compat.forceAdaptiveThinking` (models.generated.ts); extend
-/// as new adaptive models ship. Unknown/older ids fall back to budget-based.
-fn uses_adaptive_thinking(model: &str) -> bool {
-    matches!(
-        model,
-        "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8"
-    )
-}
-
-/// Map a normalized reasoning level to this model's thinking encoding. `None`
-/// reasoning omits thinking entirely (today's byte-identical default). Verified
-/// shapes (pi-mono `streamSimpleAnthropic` / `buildAnthropicParams`):
-/// - adaptive: `thinking: { type: "adaptive", display: "summarized" }` +
-///   `output_config: { effort }` (effort `low|medium|high|xhigh|max`).
-/// - budget: `thinking: { type: "enabled", budget_tokens: N }` with
-///   `max_tokens > budget_tokens` (`adjustMaxTokensForThinking`).
-/// - explicit `Off`: `thinking: { type: "disabled" }` on adaptive models (which
-///   can default thinking on); omitted on older models (absence already = off,
-///   matching pi-mono's `thinkingLevelMap?.off !== null` guard).
-///
-/// Levels are capability-gated upstream (`model_capabilities::validate`/`clamp`),
-/// so `xhigh` only reaches a model that accepts it.
-//
-// ponytail: the request shape is verified, but this OAuth/claude-code lane does
-// not replay prior `thinking` blocks across tool turns, which Anthropic requires
-// when thinking is enabled with tool use. Multi-turn thinking replay is a
-// follow-up (the no-thinking default path is unaffected).
-fn anthropic_thinking(model: &str, reasoning: Option<ReasoningEffort>) -> Option<ThinkingPlan> {
-    let level = reasoning?;
-    let adaptive = uses_adaptive_thinking(model);
-    if level == ReasoningEffort::Off {
-        // Explicit off: disable on adaptive models (which can default thinking
-        // on); omit on older models where absence already means off.
-        return adaptive.then_some(ThinkingPlan::Disabled);
-    }
-    if adaptive {
-        // Map the iris level one notch up Anthropic's low|medium|high|xhigh|max
-        // effort scale, so iris `xhigh` reaches Anthropic's top `max` effort and
-        // iris `minimal` reaches its lowest non-off `low`. (Codex maps the iris
-        // names through unchanged; this upshift is Anthropic-specific.)
-        let effort = match level {
-            ReasoningEffort::Minimal => "low",
-            ReasoningEffort::Low => "medium",
-            ReasoningEffort::Medium => "high",
-            ReasoningEffort::High => "xhigh",
-            ReasoningEffort::XHigh => "max",
-            ReasoningEffort::Off => unreachable!("off returns above"),
-        };
-        return Some(ThinkingPlan::Adaptive { effort });
-    }
-    let budget_tokens: u32 = match level {
+/// Manual-budget thinking token budget for an iris reasoning level. Adopted
+/// verbatim from minimalcc-pi `DEFAULT_THINKING_BUDGETS`. `Off` yields 0 (no
+/// thinking); it is never reached because callers filter `Off` out first.
+fn manual_budget(level: ReasoningEffort) -> u32 {
+    match level {
+        ReasoningEffort::Off => 0,
         ReasoningEffort::Minimal => 1024,
-        ReasoningEffort::Low => 2048,
-        ReasoningEffort::Medium => 8192,
-        // xhigh shares the high budget on budget-based models.
-        ReasoningEffort::High | ReasoningEffort::XHigh => 16384,
-        ReasoningEffort::Off => unreachable!("off returns above"),
-    };
-    Some(ThinkingPlan::Budget { budget_tokens })
+        ReasoningEffort::Low => 4096,
+        ReasoningEffort::Medium => 10240,
+        ReasoningEffort::High => 20480,
+        ReasoningEffort::XHigh => 32768,
+    }
+}
+
+/// Map an iris reasoning level one notch up Anthropic's `low|medium|high|xhigh|
+/// max` effort scale for adaptive models, so iris `xhigh` reaches Anthropic's
+/// top `max` and iris `minimal` reaches its lowest non-off `low`. Adopted from
+/// minimalcc-pi `CLAUDE_SUBSCRIPTION_ADAPTIVE_OPUS_THINKING_LEVEL_MAP`.
+fn adaptive_effort(level: ReasoningEffort) -> &'static str {
+    match level {
+        ReasoningEffort::Off => "low",
+        ReasoningEffort::Minimal => "low",
+        ReasoningEffort::Low => "medium",
+        ReasoningEffort::Medium => "high",
+        ReasoningEffort::High => "xhigh",
+        ReasoningEffort::XHigh => "max",
+    }
+}
+
+/// Resolve `(max_tokens, budget_tokens)` for manual-budget thinking under
+/// Anthropic's invariants, adopted from minimalcc-pi `resolveManualThinkingPayload`:
+/// - Anthropic `max_tokens` covers thinking + visible output and never exceeds
+///   the model's `output_cap`;
+/// - `budget_tokens` must satisfy `1024 <= budget_tokens < max_tokens`.
+///
+/// `requested_output` is the visible-output ask. `max_tokens` expands to cover
+/// the thinking budget on top of that ask, capped at `output_cap`. When the cap
+/// forces an otherwise-invalid payload the budget is reduced toward the 1024
+/// floor; if no valid budget fits, `budget_tokens` is `None` (omit thinking).
+fn resolve_manual_thinking(
+    requested_output: u32,
+    budget: u32,
+    output_cap: u32,
+) -> (u32, Option<u32>) {
+    let clamped_output = requested_output.min(output_cap);
+    if budget == 0 {
+        return (clamped_output, None);
+    }
+    let max_tokens = clamped_output.saturating_add(budget).min(output_cap);
+    if budget < max_tokens {
+        return (max_tokens, Some(budget));
+    }
+    // The cap forced max_tokens <= budget. Reduce thinking so budget < max_tokens,
+    // preserving as much output room as possible; omit thinking if none fits.
+    let reduced = max_tokens.saturating_sub(clamped_output);
+    if reduced >= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS {
+        (max_tokens, Some(reduced))
+    } else {
+        (clamped_output, None)
+    }
 }
 
 fn tool_declarations(tools: &Tools) -> Vec<Value> {
@@ -745,31 +803,83 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     }
 
     #[test]
-    fn reasoning_none_keeps_todays_body_some_adds_thinking() {
+    fn manual_budget_model_thinking_uses_minimalcc_budgets_and_invariant() {
         let messages = [Message::user("hi")];
         let tools = Tools::new(Vec::new());
 
-        // None: no `thinking`, max_tokens unchanged.
-        let none = build_anthropic_request("m", "P", &messages, &tools, None);
+        // Sonnet 4.6 is a manual-budget model (cap 64k). No reasoning -> no
+        // thinking, base max_tokens (byte-identical default).
+        let none = build_anthropic_request("claude-sonnet-4-6", "P", &messages, &tools, None);
         assert!(none.get("thinking").is_none(), "None omits thinking");
+        assert!(none.get("output_config").is_none());
         assert_eq!(none["max_tokens"], json!(MAX_TOKENS));
 
-        // High: budget-based extended thinking, max_tokens raised above budget.
-        let high =
-            build_anthropic_request("m", "P", &messages, &tools, Some(ReasoningEffort::High));
+        // Explicit Off also omits thinking (no `disabled` block, matching
+        // minimalcc-pi).
+        let off = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::Off),
+        );
+        assert!(off.get("thinking").is_none(), "Off omits thinking");
+        assert_eq!(off["max_tokens"], json!(MAX_TOKENS));
+
+        // High -> 20480 budget; max_tokens = min(8192 + 20480, 64000) = 28672.
+        let high = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+        );
         assert_eq!(
             high["thinking"],
-            json!({ "type": "enabled", "budget_tokens": 16384 })
+            json!({ "type": "enabled", "budget_tokens": 20480 })
         );
-        assert_eq!(high["max_tokens"], json!(MAX_TOKENS + 16384));
+        assert_eq!(high["max_tokens"], json!(MAX_TOKENS + 20480));
         assert!(
-            high["max_tokens"].as_u64().unwrap() > 16384,
-            "max_tokens must exceed the thinking budget"
+            high["thinking"]["budget_tokens"].as_u64().unwrap()
+                < high["max_tokens"].as_u64().unwrap(),
+            "budget_tokens must stay below max_tokens"
+        );
+        assert!(
+            high.get("output_config").is_none(),
+            "manual model has no effort"
         );
 
-        // Off omits thinking entirely (today's wire).
-        let off = build_anthropic_request("m", "P", &messages, &tools, Some(ReasoningEffort::Off));
-        assert!(off.get("thinking").is_none(), "Off omits thinking");
+        // xhigh -> 32768 budget; max_tokens = 8192 + 32768 = 40960 (< 64k cap).
+        let xhigh = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::XHigh),
+        );
+        assert_eq!(
+            xhigh["thinking"],
+            json!({ "type": "enabled", "budget_tokens": 32768 })
+        );
+        assert_eq!(xhigh["max_tokens"], json!(MAX_TOKENS + 32768));
+
+        // The full minimalcc-pi budget map on a manual model.
+        for (level, budget) in [
+            (ReasoningEffort::Minimal, 1024u32),
+            (ReasoningEffort::Low, 4096),
+            (ReasoningEffort::Medium, 10240),
+            (ReasoningEffort::High, 20480),
+            (ReasoningEffort::XHigh, 32768),
+        ] {
+            let body =
+                build_anthropic_request("claude-opus-4-6", "P", &messages, &tools, Some(level));
+            assert_eq!(
+                body["thinking"],
+                json!({ "type": "enabled", "budget_tokens": budget }),
+                "{level:?} -> {budget}"
+            );
+            assert!(body.get("output_config").is_none());
+        }
     }
 
     #[test]
@@ -777,11 +887,10 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         let messages = [Message::user("hi")];
         let tools = Tools::new(Vec::new());
 
-        // Sonnet 4.6 is adaptive: effort via output_config, adaptive thinking,
-        // and max_tokens left at the base (no budget bump, no budget_tokens).
-        // iris High maps one notch up to Anthropic effort "xhigh".
+        // Opus 4.8 is adaptive: effort via output_config, adaptive thinking, and
+        // max_tokens left at the base (no budget bump, no budget_tokens).
         let body = build_anthropic_request(
-            "claude-sonnet-4-6",
+            "claude-opus-4-8",
             "P",
             &messages,
             &tools,
@@ -809,7 +918,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             (ReasoningEffort::XHigh, "max"),
         ] {
             let req =
-                build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, Some(level));
+                build_anthropic_request("claude-opus-4-7", "P", &messages, &tools, Some(level));
             assert_eq!(
                 req["output_config"],
                 json!({ "effort": expected }),
@@ -818,50 +927,112 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             assert_eq!(req["thinking"]["type"], json!("adaptive"));
         }
 
-        // Opus 4.6 follows the same uniform upshift (xhigh -> "max").
-        let opus6 = build_anthropic_request(
-            "claude-opus-4-6",
-            "P",
-            &messages,
-            &tools,
-            Some(ReasoningEffort::XHigh),
-        );
-        assert_eq!(opus6["output_config"], json!({ "effort": "max" }));
-
-        // Adaptive model with no preference is still byte-identical to today.
-        let none = build_anthropic_request("claude-sonnet-4-6", "P", &messages, &tools, None);
+        // Adaptive model with no preference / explicit Off both omit thinking.
+        let none = build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, None);
         assert!(none.get("thinking").is_none());
         assert!(none.get("output_config").is_none());
         assert_eq!(none["max_tokens"], json!(MAX_TOKENS));
-    }
-
-    #[test]
-    fn explicit_off_disables_thinking_on_adaptive_models_only() {
-        let messages = [Message::user("hi")];
-        let tools = Tools::new(Vec::new());
-
-        // Adaptive model + explicit Off: disable on the wire, since omitting would
-        // let the model default thinking on. No effort, base max_tokens.
-        let adaptive_off = build_anthropic_request(
-            "claude-sonnet-4-6",
+        let off = build_anthropic_request(
+            "claude-opus-4-8",
             "P",
             &messages,
             &tools,
             Some(ReasoningEffort::Off),
         );
-        assert_eq!(adaptive_off["thinking"], json!({ "type": "disabled" }));
-        assert!(adaptive_off.get("output_config").is_none());
-        assert_eq!(adaptive_off["max_tokens"], json!(MAX_TOKENS));
+        assert!(off.get("thinking").is_none(), "adaptive Off omits thinking");
+        assert!(off.get("output_config").is_none());
+    }
 
-        // None (no preference) stays byte-identical: no thinking field at all.
-        let adaptive_none =
-            build_anthropic_request("claude-sonnet-4-6", "P", &messages, &tools, None);
-        assert!(adaptive_none.get("thinking").is_none());
+    #[test]
+    fn opus_4_7_300k_sends_native_opus_4_7() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+        let body = build_anthropic_request(
+            "claude-opus-4-7-300k",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::Medium),
+        );
+        assert_eq!(
+            body["model"],
+            json!("claude-opus-4-7"),
+            "300k soft-cap alias sends the native opus-4-7 id"
+        );
+        // Still adaptive, like the base opus-4-7.
+        assert_eq!(body["thinking"]["type"], json!("adaptive"));
+        assert_eq!(body["output_config"], json!({ "effort": "high" }));
+    }
 
-        // Older/budget model + Off: omit thinking (absence already means off).
-        let budget_off =
-            build_anthropic_request("m", "P", &messages, &tools, Some(ReasoningEffort::Off));
-        assert!(budget_off.get("thinking").is_none());
+    #[test]
+    fn fable_5_adds_server_side_fallback_payload_and_other_models_do_not() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+
+        // Fable 5 is adaptive and carries the Opus 4.8 refusal fallback.
+        let fable = build_anthropic_request(
+            "claude-fable-5",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(fable["model"], json!("claude-fable-5"));
+        assert_eq!(fable["thinking"]["type"], json!("adaptive"));
+        assert_eq!(fable["output_config"], json!({ "effort": "xhigh" }));
+        assert_eq!(fable["fallbacks"], json!([{ "model": "claude-opus-4-8" }]));
+
+        // Fallback travels even when reasoning is off (Fable is always-on
+        // server-side; thinking is omitted, fallbacks stay).
+        let fable_off = build_anthropic_request(
+            "claude-fable-5",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::Off),
+        );
+        assert!(fable_off.get("thinking").is_none());
+        assert_eq!(
+            fable_off["fallbacks"],
+            json!([{ "model": "claude-opus-4-8" }])
+        );
+
+        // No other model emits a fallbacks parameter.
+        let opus = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+        );
+        assert!(opus.get("fallbacks").is_none());
+    }
+
+    #[test]
+    fn resolve_manual_thinking_enforces_the_invariant() {
+        // Happy path: budget fits below the cap-bounded max_tokens.
+        assert_eq!(
+            resolve_manual_thinking(8192, 20480, 64000),
+            (28672, Some(20480))
+        );
+        // Zero budget -> no thinking, max_tokens is the clamped output ask.
+        assert_eq!(resolve_manual_thinking(8192, 0, 64000), (8192, None));
+        // Cap forces a reduced (still valid) budget: requested 1000, cap 3000,
+        // budget 4096 -> max_tokens 3000, budget reduced to 2000 (< 3000).
+        let (max_tokens, budget) = resolve_manual_thinking(1000, 4096, 3000);
+        assert_eq!((max_tokens, budget), (3000, Some(2000)));
+        assert!(budget.unwrap() < max_tokens, "reduced budget stays valid");
+        assert!(
+            budget.unwrap() >= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS,
+            "reduced budget honors the 1024 floor"
+        );
+        // Cap leaves no room for a valid budget (would be < 1024): omit thinking
+        // and revert max_tokens to the clamped output ask.
+        assert_eq!(resolve_manual_thinking(500, 4096, 1200), (500, None));
+        // A production manual model never trips the reduce/omit path: even xhigh
+        // (32768) on the 64k cap leaves budget < max_tokens.
+        let (max_tokens, budget) = resolve_manual_thinking(MAX_TOKENS, 32768, 64000);
+        assert!(budget.unwrap() < max_tokens);
     }
 
     #[test]
@@ -1037,5 +1208,92 @@ data: {\"type\":\"message_stop\"}
         let results = msgs[2]["content"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both tool results in one user message");
         assert_eq!(results[0]["tool_use_id"], json!("toolu_1"));
+    }
+
+    #[test]
+    fn headers_carry_oauth_betas_and_never_an_api_key() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+        let body = build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, None);
+        let headers = anthropic_headers("fake-oauth-token", &body).expect("headers");
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer fake-oauth-token"
+        );
+        assert_eq!(
+            headers.get("anthropic-version").unwrap().to_str().unwrap(),
+            ANTHROPIC_VERSION
+        );
+        // OAuth lane: no API-key headers, ever.
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("anthropic-api-key").is_none());
+    }
+
+    #[test]
+    fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+        let beta_of = |body: &Value| anthropic_beta(body);
+
+        // Manual-budget thinking (thinking.type == "enabled") -> interleaved beta.
+        let manual = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+        );
+        let manual_beta = beta_of(&manual);
+        assert!(manual_beta.contains(BASE_ANTHROPIC_BETA));
+        assert!(
+            manual_beta.contains(INTERLEAVED_THINKING_BETA),
+            "manual thinking needs the interleaved beta: {manual_beta}"
+        );
+        assert!(!manual_beta.contains(SERVER_SIDE_FALLBACK_BETA));
+
+        // Adaptive thinking implies interleaved server-side -> beta omitted.
+        let adaptive = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+        );
+        assert!(!beta_of(&adaptive).contains(INTERLEAVED_THINKING_BETA));
+
+        // No thinking -> base betas only.
+        let plain = build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, None);
+        assert_eq!(beta_of(&plain), BASE_ANTHROPIC_BETA);
+    }
+
+    #[test]
+    fn server_side_fallback_beta_is_present_only_for_fable_5() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+
+        let fable = build_anthropic_request(
+            "claude-fable-5",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+        );
+        let fable_beta = anthropic_beta(&fable);
+        assert!(
+            fable_beta.contains(SERVER_SIDE_FALLBACK_BETA),
+            "{fable_beta}"
+        );
+        // Fable is adaptive: no interleaved beta.
+        assert!(!fable_beta.contains(INTERLEAVED_THINKING_BETA));
+
+        let opus = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+        );
+        assert!(!anthropic_beta(&opus).contains(SERVER_SIDE_FALLBACK_BETA));
     }
 }

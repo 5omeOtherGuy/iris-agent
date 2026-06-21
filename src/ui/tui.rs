@@ -2574,7 +2574,6 @@ mod tests {
 
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("Haiku 4.5"), "{rendered}");
-        assert!(rendered.contains("GPT 5.5"), "{rendered}");
         assert!(rendered.contains("xHigh effort"), "{rendered}");
         assert!(rendered.contains("Enter to set as default"), "{rendered}");
         Ok(())

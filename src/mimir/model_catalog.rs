@@ -17,6 +17,25 @@ use crate::mimir::auth::anthropic;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::selection::ProviderId;
 
+/// UI id of the model hidden behind the [`FABLE_5_OPT_IN_ENV`] opt-in.
+const FABLE_5_MODEL_ID: &str = "claude-fable-5";
+
+/// Hidden opt-in for Claude Fable 5. The model stays fully defined in the
+/// subscription matrix (so a deliberate selection still builds a correct
+/// request), but it is omitted from the `/model` candidate set unless this env
+/// var is set to `1`. It is an undocumented 0->1 switch: Fable 5 is gated by
+/// Anthropic (`404 not_found` on accounts without access), so it stays off by
+/// default and is only surfaced for accounts that opt in.
+const FABLE_5_OPT_IN_ENV: &str = "IRIS_ENABLE_FABLE_5";
+
+/// Whether the Fable 5 opt-in is switched on (`IRIS_ENABLE_FABLE_5=1`). Unset,
+/// `0`, or any other value keeps it hidden.
+fn fable_5_enabled() -> bool {
+    std::env::var(FABLE_5_OPT_IN_ENV)
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
 /// The hand-maintained set of (provider, model id, display name, context-window
 /// label) tuples Iris supports. New models are added here in one place; the list
 /// intentionally stays small.
@@ -25,10 +44,23 @@ use crate::mimir::selection::ProviderId;
 // the `/model` picker badge, not enforced limits. Verify against provider docs
 // when adding models; the upgrade path is a generated registry (declined for
 // now, see model_catalog module docs).
+// Anthropic rows are the Claude Code subscription matrix; their wire facts
+// (native id, output cap, thinking mode, fallback) live in
+// `crate::mimir::anthropic_models`. The display id set here must stay in sync
+// with that matrix -- `catalog_anthropic_ids_match_subscription_matrix` enforces
+// it. The context-window label is the soft routing cap shown in the picker
+// badge (e.g. `claude-opus-4-7-300k` is the 300k soft-cap alias of the 1M
+// `claude-opus-4-7`).
 const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
     (ProviderId::OpenAiCodex, "gpt-5.5", "GPT 5.5", "300k"),
     (ProviderId::Anthropic, "claude-opus-4-8", "Opus 4.8", "1M"),
     (ProviderId::Anthropic, "claude-opus-4-7", "Opus 4.7", "1M"),
+    (
+        ProviderId::Anthropic,
+        "claude-opus-4-7-300k",
+        "Opus 4.7 300k",
+        "300k",
+    ),
     (ProviderId::Anthropic, "claude-opus-4-6", "Opus 4.6", "1M"),
     (
         ProviderId::Anthropic,
@@ -42,6 +74,7 @@ const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
         "Haiku 4.5",
         "200k",
     ),
+    (ProviderId::Anthropic, "claude-fable-5", "Fable 5", "1M"),
     (
         ProviderId::Antigravity,
         "gemini-3.5-flash",
@@ -92,10 +125,14 @@ impl AuthStatus {
     }
 }
 
-/// The full catalog, in registry order.
+/// The full catalog, in registry order. Fable 5 is filtered out unless its
+/// hidden opt-in ([`FABLE_5_OPT_IN_ENV`]) is switched on, so it never appears in
+/// the `/model` picker or exact-match candidate set by default.
 pub(crate) fn all() -> Vec<CatalogModel> {
+    let fable_enabled = fable_5_enabled();
     ENTRIES
         .iter()
+        .filter(|(_, id, ..)| fable_enabled || *id != FABLE_5_MODEL_ID)
         .map(|(provider, id, _name, _ctx)| CatalogModel {
             provider: *provider,
             id: (*id).to_string(),
@@ -233,7 +270,43 @@ mod tests {
         assert_eq!(ctx_label("anthropic/claude-sonnet-4-6"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-opus-4-8"), Some("1M"));
+        assert_eq!(ctx_label("anthropic/claude-opus-4-7-300k"), Some("300k"));
+        assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
+        assert_eq!(ctx_label("anthropic/claude-fable-5"), Some("1M"));
         assert_eq!(ctx_label("openai-codex/gpt-9-mystery"), None);
+    }
+
+    #[test]
+    fn fable_5_is_hidden_unless_the_opt_in_is_switched_on() {
+        // SAFETY: env mutation is process-global; this is the only test that reads
+        // IRIS_ENABLE_FABLE_5, and it restores the var before returning.
+        let has = |models: &[CatalogModel]| models.iter().any(|m| m.id == FABLE_5_MODEL_ID);
+        unsafe { std::env::remove_var(FABLE_5_OPT_IN_ENV) };
+        assert!(!has(&all()), "hidden by default (unset)");
+        unsafe { std::env::set_var(FABLE_5_OPT_IN_ENV, "0") };
+        assert!(!has(&all()), "0 keeps it hidden");
+        unsafe { std::env::set_var(FABLE_5_OPT_IN_ENV, "1") };
+        assert!(has(&all()), "1 surfaces it");
+        // Other Anthropic models are unaffected by the toggle.
+        assert!(all().iter().any(|m| m.id == "claude-opus-4-8"));
+        unsafe { std::env::remove_var(FABLE_5_OPT_IN_ENV) };
+    }
+
+    #[test]
+    fn catalog_anthropic_ids_match_subscription_matrix() {
+        use crate::mimir::anthropic_models;
+        let mut catalog_ids: Vec<&str> = ENTRIES
+            .iter()
+            .filter(|(provider, ..)| *provider == ProviderId::Anthropic)
+            .map(|(_, id, ..)| *id)
+            .collect();
+        catalog_ids.sort_unstable();
+        let mut matrix_ids: Vec<&str> = anthropic_models::MODELS.iter().map(|m| m.ui_id).collect();
+        matrix_ids.sort_unstable();
+        assert_eq!(
+            catalog_ids, matrix_ids,
+            "catalog Anthropic ids must match the subscription model matrix"
+        );
     }
 
     #[test]
