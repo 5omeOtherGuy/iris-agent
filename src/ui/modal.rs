@@ -173,9 +173,10 @@ fn render_selector(selector: &Selector, empty: &str, out: &mut Vec<Line<'static>
     if selector.searchable() {
         let search = selector.search().unwrap_or("");
         out.push(Line::from(vec![
-            Span::styled("search: ", dim()),
+            Span::styled("> ", dim()),
             Span::raw(search.to_string()),
         ]));
+        out.push(Line::from(""));
     }
     if selector.is_empty() {
         out.push(Line::from(Span::styled(empty.to_string(), muted())));
@@ -352,8 +353,9 @@ impl ModelPicker {
                 Span::styled("all", all_style),
                 Span::styled(" | ", dim()),
                 Span::styled("scoped", scoped_style),
-                Span::styled("   (Tab to switch)", dim()),
             ]));
+            out.push(Line::from(Span::styled("tab scope (all/scoped)", dim())));
+            out.push(Line::from(""));
         } else if self.no_scope_hint {
             out.push(Line::from(Span::styled(
                 "Only showing models from configured providers. Use /login to add providers.",
@@ -363,8 +365,9 @@ impl ModelPicker {
         render_selector(&self.selector, "No matching models", &mut out);
         if let Some(item) = self.selector.selected() {
             out.push(Line::from(vec![
-                Span::styled("Model: ", dim()),
-                Span::raw(item.label.clone()),
+                Span::raw("  "),
+                Span::styled("Model Name: ", dim()),
+                Span::raw(crate::mimir::model_catalog::display_name(&item.id)),
             ]));
         }
         let _ = width;
@@ -1034,6 +1037,35 @@ mod tests {
             }
             other => panic!("expected SelectModel, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn model_picker_render_matches_pi_mono_layout() {
+        // Scoped set present so the scope header renders; current is gpt-5.5.
+        let scoped = vec![
+            cat(ProviderId::OpenAiCodex, "gpt-5.5"),
+            cat(ProviderId::Anthropic, "claude-sonnet-4-6"),
+        ];
+        let picker = ModelPicker::new(models(), Some(scoped), "openai-codex/gpt-5.5", "");
+        let text: String = picker
+            .render(80)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Scope hint on its own line, '>' search prompt, and a display-name footer.
+        assert!(text.contains("tab scope (all/scoped)"), "{text}");
+        assert!(text.contains("> "), "{text}");
+        assert!(text.contains("gpt-5.5"), "{text}");
+        assert!(text.contains("Model Name: GPT-5.5"), "{text}");
+        // The old inline hint and 'Model:' label are gone.
+        assert!(!text.contains("Tab to switch"), "{text}");
+        assert!(!text.contains("search: "), "{text}");
     }
 
     #[test]
