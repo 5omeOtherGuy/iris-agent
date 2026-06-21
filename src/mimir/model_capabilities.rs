@@ -28,7 +28,7 @@
 use anyhow::Result;
 
 use crate::errors::UsageError;
-use crate::mimir::selection::{ModelSelection, PromptCacheRetention, ProviderId, ReasoningEffort};
+use crate::mimir::selection::{ModelSelection, ProviderId, ReasoningEffort};
 
 /// Reasoning levels a provider/model natively accepts. Codex and Antigravity
 /// share one set per provider; Anthropic is model-specific (adaptive Opus models
@@ -151,6 +151,7 @@ pub(crate) fn join_levels(levels: &[ReasoningEffort]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mimir::selection::PromptCacheRetention;
 
     fn selection(provider: ProviderId, reasoning: Option<ReasoningEffort>) -> ModelSelection {
         ModelSelection {

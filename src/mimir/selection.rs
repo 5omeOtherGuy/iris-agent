@@ -221,6 +221,7 @@ impl PromptCacheRetention {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             PromptCacheRetention::None => "none",

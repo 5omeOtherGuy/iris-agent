@@ -84,8 +84,9 @@ impl SessionLog {
         Self::create_in_with_id(&sessions_root()?, cwd, id)
     }
 
-    /// Core constructor with an explicit session root, so callers and tests can
-    /// persist without env or home-directory state.
+    /// Core constructor with an explicit session root, so tests can persist
+    /// without env or home-directory state.
+    #[cfg(test)]
     pub(crate) fn create_in(root: &Path, cwd: &Path) -> Result<Self> {
         let id = new_session_id();
         Self::create_in_with_id(root, cwd, &id)

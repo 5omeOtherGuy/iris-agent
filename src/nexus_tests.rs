@@ -2437,6 +2437,8 @@ fn cancellation_before_tools_proposes_remaining_calls_before_cancelling() -> Res
             call("call_1", "trip", json!({})),
             call("call_2", "read", json!({ "path": "b.txt" })),
         ],
+        response_id: None,
+        usage: None,
     })]);
     let token = CancellationToken::new();
     let mut harness = test_harness(
