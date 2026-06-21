@@ -54,6 +54,8 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-06-01";
 const PROVIDER_ID: &str = "anthropic";
 const API_ID: &str = "anthropic-messages";
+/// Endpoint path surfaced in failure diagnostics (never the full base URL).
+const ENDPOINT_PATH: &str = "/v1/messages";
 
 /// First system block required on the OAuth lane: omitting it gets the request
 /// rejected as not coming from the Claude Code client.
@@ -151,7 +153,10 @@ impl AnthropicProvider {
             Ok(headers) => headers,
             Err(error) => return Attempt::Fatal(error),
         };
-        let url = format!("{}/v1/messages", self.base_url);
+        // Read auth kind from the request headers we are about to send (the map
+        // is moved into the request below).
+        let auth_kind = auth_kind_label(&headers);
+        let url = format!("{}{ENDPOINT_PATH}", self.base_url);
         let response = match self.client.post(&url).headers(headers).json(request).send() {
             Ok(response) => response,
             Err(error) => {
@@ -162,29 +167,130 @@ impl AnthropicProvider {
         };
 
         let status = response.status();
+        // Request id comes off the response headers, before the body is read.
+        let request_id = extract_request_id(response.headers());
         if status.is_success() {
             let mut parser = AnthropicStreamParser::new(anthropic_origin(&self.model));
+            // Build a safe diagnostic tail from local state only -- never the
+            // streamed body. `last_event_type` is whatever the parser last saw.
+            let diag = |last_event_type: Option<String>| AnthropicDiagnostics {
+                status: status.as_u16(),
+                request_id: request_id.clone(),
+                error_type: None,
+                model: self.model.clone(),
+                endpoint: ENDPOINT_PATH,
+                auth_kind,
+                last_event_type,
+            };
             if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
                 parser.ingest_event(data, sink)
             }) {
-                return Attempt::Fatal(error);
+                let last = parser.last_event_type.clone();
+                return Attempt::Fatal(anyhow!("{error} [{}]", diag(last)));
             }
+            let last = parser.last_event_type.clone();
             return match parser.finish() {
                 Ok(turn) => Attempt::Done(turn),
-                Err(error) => Attempt::Fatal(error),
+                Err(error) => Attempt::Fatal(anyhow!("{error} [{}]", diag(last))),
             };
         }
 
+        // Non-success: surface only safe metadata. The raw body is read and
+        // dropped; only the enumerated `error.type` is pulled out of it (never
+        // the body text, which can carry prompts/paths/args).
         let body = response.text().unwrap_or_default();
-        let error = match crate::telemetry::sanitize_external_body(&body) {
-            Some(detail) => anyhow!("Anthropic request failed ({status}): {detail}"),
-            None => anyhow!("Anthropic request failed ({status})"),
+        let diag = AnthropicDiagnostics {
+            status: status.as_u16(),
+            request_id,
+            error_type: extract_error_type(&body),
+            model: self.model.clone(),
+            endpoint: ENDPOINT_PATH,
+            auth_kind,
+            last_event_type: None,
         };
+        let error = anyhow!("Anthropic request failed [{diag}]");
         match classify_http_status(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
             HttpClass::Fatal => Attempt::Fatal(error),
         }
     }
+}
+
+/// Safe, redacted diagnostics for an Anthropic request/stream failure. Every
+/// field is local metadata that cannot carry a credential, prompt, tool
+/// argument, file path, command string, raw request/response body, or SSE
+/// frame. Adopted conceptually from minimalcc-pi's metadata-only stream
+/// diagnostics, trimmed to the fields Iris can produce cheaply.
+struct AnthropicDiagnostics {
+    status: u16,
+    request_id: Option<String>,
+    /// Enumerated Anthropic error classification (e.g. `invalid_request_error`),
+    /// never the free-text error message.
+    error_type: Option<String>,
+    model: String,
+    endpoint: &'static str,
+    auth_kind: &'static str,
+    last_event_type: Option<String>,
+}
+
+/// Render the safe diagnostic tail as a stable space-separated `key=value`
+/// string; absent optionals are skipped. Writes straight to the formatter (no
+/// intermediate allocation) and lets call sites use `{diag}` in `anyhow!`.
+impl std::fmt::Display for AnthropicDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "status={} endpoint={} model={} auth={}",
+            self.status, self.endpoint, self.model, self.auth_kind
+        )?;
+        if let Some(id) = &self.request_id {
+            write!(f, " request_id={id}")?;
+        }
+        if let Some(kind) = &self.error_type {
+            write!(f, " error_type={kind}")?;
+        }
+        if let Some(event) = &self.last_event_type {
+            write!(f, " last_event={event}")?;
+        }
+        Ok(())
+    }
+}
+
+/// `oauth_bearer` when an `Authorization: Bearer ...` header is present, else
+/// `none`. The OAuth lane always sends a bearer, but this reads the header so
+/// the label tracks what was actually sent.
+fn auth_kind_label(headers: &HeaderMap) -> &'static str {
+    let is_bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "));
+    if is_bearer { "oauth_bearer" } else { "none" }
+}
+
+/// Anthropic request id from response headers (`request-id`, falling back to
+/// `anthropic-request-id`). Safe metadata: an opaque server-side correlation id.
+fn extract_request_id(headers: &HeaderMap) -> Option<String> {
+    ["request-id", "anthropic-request-id"]
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Pull only the enumerated `error.type` out of an error body. Deliberately does
+/// NOT use `telemetry::sanitize_external_body`, which would surface the whole
+/// (key-redacted) body -- non-sensitive keys like `message` can still hold
+/// prompts/paths/commands. Returns None for a non-JSON body or one without a
+/// string error type.
+fn extract_error_type(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Build OAuth-lane Anthropic headers. The `anthropic-beta` set is driven by the
@@ -470,6 +576,8 @@ struct AnthropicStreamParser {
     open_reasoning: HashMap<u64, ReasoningBlock>,
     reasoning: Vec<ReasoningBlock>,
     message_stopped: bool,
+    /// Type of the most recent SSE event seen, for safe failure diagnostics.
+    last_event_type: Option<String>,
 }
 
 struct ToolBlock {
@@ -489,6 +597,7 @@ impl AnthropicStreamParser {
             open_reasoning: HashMap::new(),
             reasoning: Vec::new(),
             message_stopped: false,
+            last_event_type: None,
         }
     }
 
@@ -498,7 +607,11 @@ impl AnthropicStreamParser {
         }
         let value: Value = serde_json::from_str(data)
             .map_err(|e| anyhow!("failed to parse Anthropic SSE: {e}"))?;
-        match value.get("type").and_then(Value::as_str) {
+        let event_type = value.get("type").and_then(Value::as_str);
+        if let Some(event_type) = event_type {
+            self.last_event_type = Some(event_type.to_string());
+        }
+        match event_type {
             Some("content_block_start") => {
                 let index = block_index(&value);
                 if let Some(block) = value.get("content_block") {
@@ -595,12 +708,14 @@ impl AnthropicStreamParser {
                 self.message_stopped = true;
             }
             Some("error") => {
-                let message = value
+                // Surface only the enumerated error type, never the free-text
+                // `message` (which is part of the response body).
+                let error_type = value
                     .get("error")
-                    .and_then(|error| error.get("message"))
+                    .and_then(|error| error.get("type"))
                     .and_then(Value::as_str)
-                    .unwrap_or("Anthropic stream error");
-                return Err(anyhow!("{message}"));
+                    .unwrap_or("error");
+                return Err(anyhow!("Anthropic stream error (error_type={error_type})"));
             }
             // message_start / message_delta carry no payload we assemble here
             // on the MVP lane.
@@ -756,13 +871,156 @@ data: {\"type\":\"message_stop\"}
     }
 
     #[test]
-    fn error_event_is_error() {
+    fn error_event_reports_type_without_leaking_message() {
+        // The free-text message holds prompt/path/command-shaped material; only
+        // the enumerated error type may surface.
         let body = "\
-data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"queue depth 9001 for prompt about /home/u/secret.rs running rm -rf /\"}}
 
 ";
         let error = parse_anthropic_sse(body).unwrap_err().to_string();
-        assert!(error.contains("overloaded"), "got: {error}");
+        assert!(error.contains("overloaded_error"), "type kept: {error}");
+        for leak in ["queue depth", "/home/u/secret.rs", "rm -rf", "prompt about"] {
+            assert!(!error.contains(leak), "leaked {leak}: {error}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_display_emits_safe_metadata_only() {
+        let diag = AnthropicDiagnostics {
+            status: 403,
+            request_id: Some("req_fake_123".to_string()),
+            error_type: Some("authentication_error".to_string()),
+            model: "claude-opus-4-8".to_string(),
+            endpoint: ENDPOINT_PATH,
+            auth_kind: "oauth_bearer",
+            last_event_type: Some("message_start".to_string()),
+        };
+        let rendered = diag.to_string();
+        assert!(rendered.contains("status=403"));
+        assert!(rendered.contains("endpoint=/v1/messages"));
+        assert!(rendered.contains("model=claude-opus-4-8"));
+        assert!(rendered.contains("auth=oauth_bearer"));
+        assert!(rendered.contains("request_id=req_fake_123"));
+        assert!(rendered.contains("error_type=authentication_error"));
+        assert!(rendered.contains("last_event=message_start"));
+    }
+
+    #[test]
+    fn http_failure_diagnostics_drop_raw_body_and_every_secret() {
+        // A hostile error body packed with multiple fake sensitive strings:
+        // prompt text, a file path, a command, an access token, a refresh token,
+        // and tool arguments. None may reach the rendered diagnostic.
+        let body = r#"{
+            "error": {"type":"invalid_request_error","message":"prompt was SECRET_PROMPT_TEXT about /home/u/secret.rs running rm -rf /"},
+            "access_token":"sk-fake-LEAKTOKEN-123",
+            "refresh_token":"refresh-fake-LEAK-456",
+            "tool_args":{"path":"/home/u/secret.rs","command":"rm -rf /"}
+        }"#;
+        // Only the enumerated error type is pulled from the body.
+        assert_eq!(
+            extract_error_type(body).as_deref(),
+            Some("invalid_request_error")
+        );
+        let diag = AnthropicDiagnostics {
+            status: 400,
+            request_id: Some("req_fake".to_string()),
+            error_type: extract_error_type(body),
+            model: "claude-sonnet-4-6".to_string(),
+            endpoint: ENDPOINT_PATH,
+            auth_kind: "oauth_bearer",
+            last_event_type: None,
+        };
+        let rendered = diag.to_string();
+        for leak in [
+            "SECRET_PROMPT_TEXT",
+            "/home/u/secret.rs",
+            "rm -rf",
+            "sk-fake-LEAKTOKEN-123",
+            "refresh-fake-LEAK-456",
+            "prompt was",
+            "tool_args",
+        ] {
+            assert!(!rendered.contains(leak), "leaked {leak}: {rendered}");
+        }
+        // ...while the safe metadata survives.
+        assert!(rendered.contains("status=400"));
+        assert!(rendered.contains("error_type=invalid_request_error"));
+        assert!(rendered.contains("model=claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn extract_error_type_ignores_non_json_and_typeless_bodies() {
+        assert_eq!(extract_error_type("plain text with sk-token123"), None);
+        assert_eq!(extract_error_type(r#"{"error":{"message":"x"}}"#), None);
+        assert_eq!(
+            extract_error_type(r#"{"error":{"type":"rate_limit_error"}}"#).as_deref(),
+            Some("rate_limit_error")
+        );
+    }
+
+    #[test]
+    fn extract_request_id_prefers_request_id_then_falls_back() {
+        let mut headers = HeaderMap::new();
+        assert!(extract_request_id(&headers).is_none());
+        headers.insert(
+            "anthropic-request-id",
+            HeaderValue::from_static("anthropic-fallback"),
+        );
+        assert_eq!(
+            extract_request_id(&headers).as_deref(),
+            Some("anthropic-fallback")
+        );
+        headers.insert("request-id", HeaderValue::from_static("req_primary"));
+        assert_eq!(extract_request_id(&headers).as_deref(), Some("req_primary"));
+    }
+
+    #[test]
+    fn auth_kind_reflects_bearer_header() {
+        let messages = [Message::user("hi")];
+        let request = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+        );
+        let headers = anthropic_headers("fake-oauth-token", &request).unwrap();
+        assert_eq!(auth_kind_label(&headers), "oauth_bearer");
+        assert_eq!(auth_kind_label(&HeaderMap::new()), "none");
+    }
+
+    #[test]
+    fn stream_error_event_surfaces_last_event_type_in_diagnostics() {
+        // Drive a real error frame through the parser, then confirm the diagnostic
+        // tail built from parser state names the error event and no payload.
+        let mut parser = AnthropicStreamParser::new(anthropic_origin("claude-opus-4-8"));
+        struct NoopSink;
+        impl TurnSink for NoopSink {
+            fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = NoopSink;
+        let err = parser
+            .ingest_event(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"/secret/path leak"}}"#,
+                &mut sink,
+            )
+            .unwrap_err();
+        let diag = AnthropicDiagnostics {
+            status: 200,
+            request_id: None,
+            error_type: None,
+            model: "claude-opus-4-8".to_string(),
+            endpoint: ENDPOINT_PATH,
+            auth_kind: "oauth_bearer",
+            last_event_type: parser.last_event_type.clone(),
+        };
+        let wrapped = anyhow!("{err} [{diag}]").to_string();
+        assert!(wrapped.contains("last_event=error"), "got: {wrapped}");
+        assert!(wrapped.contains("error_type=overloaded_error"));
+        assert!(!wrapped.contains("/secret/path"), "got: {wrapped}");
     }
 
     #[test]
