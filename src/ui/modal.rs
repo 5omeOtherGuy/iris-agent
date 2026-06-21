@@ -291,7 +291,11 @@ impl ModelPicker {
     }
 
     /// Emit a model+effort selection. `save_default` persists it as the default
-    /// (Enter) versus applying it for this session only (`s`).
+    /// (Enter) versus applying it for this session only (`s`). The emitted effort
+    /// is `display_effort()` (the target clamped to the chosen model), which is
+    /// exactly what the user sees and what is safe to persist: startup `resolve`
+    /// trusts the stored reasoning without re-clamping, so the saved level must be
+    /// valid for the saved model.
     fn select(&self, save_default: bool) -> ModalOutcome {
         match self.selector.selected_id() {
             Some(id) => ModalOutcome::Emit(ModalAction::SelectModel {

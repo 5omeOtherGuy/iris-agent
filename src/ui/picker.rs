@@ -296,11 +296,20 @@ fn apply_model<P: ChatProvider>(
     switch: &mut ModelSwitch<'_, P>,
 ) -> Vec<String> {
     let candidate = cli::candidate_for(switch.selection(), model.provider, &model.id);
+    // candidate_for clamps the carried reasoning to the new model; capture it so
+    // the persisted default reasoning stays valid for the persisted default model
+    // (resolve() trusts settings without re-clamping at startup).
+    let reasoning = candidate.reasoning;
     let mut lines = cli::apply_selection(candidate, harness, switch);
     // Persist the new default best-effort; a write failure is surfaced but never
     // blocks the in-session switch.
     if let Err(error) = config::save_default_model(model.provider.as_str(), &model.id) {
         lines.push(format!("(default not saved: {error:#})"));
+    }
+    if let Some(reasoning) = reasoning
+        && let Err(error) = config::save_default_reasoning(reasoning.as_str())
+    {
+        lines.push(format!("(reasoning not saved: {error:#})"));
     }
     lines
 }
