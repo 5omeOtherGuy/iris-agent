@@ -103,7 +103,7 @@ Provider notes:
 
 - `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the default provider if no setting is present.
 - `anthropic` uses an existing Claude Code OAuth login. `iris login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
-- `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is not committed to source and must be supplied via `ANTIGRAVITY_CLIENT_SECRET` at runtime or when building Iris.
+- `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is not committed to source and must be supplied via `ANTIGRAVITY_CLIENT_SECRET` at runtime or when building Iris. See [Configuring Antigravity](#configuring-antigravity) below.
 
 Override the auth-file path with:
 
@@ -149,6 +149,46 @@ iris
 ```
 
 Exit with `/exit` or `/quit`.
+
+### Configuring Antigravity
+
+The Antigravity provider talks to Google's Gemini Code Assist through an
+installed-app OAuth client. The client ID ships in the binary, but the OAuth
+client secret is deliberately kept out of source control. Supply it through the
+`ANTIGRAVITY_CLIENT_SECRET` environment variable; `iris login antigravity` and
+every later token refresh read it from there. Without it, login fails with:
+
+```text
+antigravity login requires ANTIGRAVITY_CLIENT_SECRET at runtime or when building Iris
+```
+
+Recommended setup — keep the secret in a local file that is never committed:
+
+1. Create a secret file readable only by you (outside any git repository):
+
+   ```bash
+   install -m 600 /dev/null ~/.iris/antigravity.env
+   printf 'ANTIGRAVITY_CLIENT_SECRET=%s\n' 'GOCSPX-your-client-secret' >> ~/.iris/antigravity.env
+   ```
+
+2. Load it into the environment before running Iris:
+
+   ```bash
+   set -a; source ~/.iris/antigravity.env; set +a
+   iris login antigravity
+   ```
+
+If you instead keep the secret in a file inside a repository, add that file to
+`.gitignore` so it is never committed. For a one-off you can pass it inline:
+
+```bash
+ANTIGRAVITY_CLIENT_SECRET=GOCSPX-... iris login antigravity
+```
+
+Distributors who build Iris themselves can bake the secret in at compile time by
+setting `ANTIGRAVITY_CLIENT_SECRET` in the build environment; it is embedded via
+`option_env!`, so end users then need no configuration. A runtime
+`ANTIGRAVITY_CLIENT_SECRET` always overrides a build-time value.
 
 ## Testing
 
