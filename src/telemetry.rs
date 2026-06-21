@@ -6,13 +6,16 @@
 //! `RUST_LOG` env var via an `EnvFilter`; the default keeps the agent quiet
 //! (warnings and errors only) unless the operator opts in.
 
+use std::io::{self, Write};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
 
 static INIT: Once = Once::new();
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Key fragments whose values are redacted from any external body before it is
 /// surfaced in a log line or error message. Matched case-insensitively as
@@ -31,18 +34,55 @@ const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
 
 const MAX_BODY_CHARS: usize = 500;
 
+/// Whether tracing should avoid stderr because the TUI owns the terminal.
+pub(crate) fn set_tui_active(active: bool) {
+    TUI_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+fn stderr_unless_tui_active() -> LogWriter {
+    // ponytail: drop logs while the live TUI owns the terminal. Add file
+    // logging if operators need diagnostics during interactive sessions.
+    if TUI_ACTIVE.load(Ordering::Relaxed) {
+        LogWriter::Sink(io::sink())
+    } else {
+        LogWriter::Stderr(io::stderr())
+    }
+}
+
+enum LogWriter {
+    Stderr(io::Stderr),
+    Sink(io::Sink),
+}
+
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            LogWriter::Stderr(writer) => writer.write(buf),
+            LogWriter::Sink(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            LogWriter::Stderr(writer) => writer.flush(),
+            LogWriter::Sink(writer) => writer.flush(),
+        }
+    }
+}
+
 /// Initialize the global tracing subscriber exactly once.
 ///
 /// Idempotent and safe to call from `main` before any logging. Reads
 /// `RUST_LOG` (e.g. `RUST_LOG=iris_agent=debug`); when unset it defaults to
-/// `warn`. Writes to stderr to avoid corrupting the stdout transcript. Uses
-/// `try_init` so a pre-installed subscriber (e.g. in tests) does not panic.
+/// `warn`. Writes to stderr to avoid corrupting the stdout transcript, except
+/// while the live TUI is active because stderr is the same terminal surface.
+/// Uses `try_init` so a pre-installed subscriber (e.g. in tests) does not panic.
 pub(crate) fn init() {
     INIT.call_once(|| {
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_writer(std::io::stderr)
+            .with_writer(stderr_unless_tui_active)
             .with_target(true)
             .compact()
             .try_init();
@@ -154,5 +194,16 @@ mod tests {
         let rendered = sanitize_external_body(&big).expect("json body");
         assert!(rendered.contains("(truncated)"));
         assert!(rendered.chars().count() < 600);
+    }
+
+    #[test]
+    fn stderr_writer_is_suppressed_while_tui_is_active() {
+        set_tui_active(false);
+        assert!(matches!(stderr_unless_tui_active(), LogWriter::Stderr(_)));
+
+        set_tui_active(true);
+        assert!(matches!(stderr_unless_tui_active(), LogWriter::Sink(_)));
+
+        set_tui_active(false);
     }
 }
