@@ -267,6 +267,7 @@ impl<P: ChatProvider> Harness<P> {
         };
 
         let covered = plan.end - plan.start;
+        let original_tokens = context_tokens(&messages[plan.start..plan.end]);
         let summary = summarize(&messages[plan.start..plan.end]);
         let summary_tokens = estimate_tokens(&summary);
 
@@ -322,6 +323,15 @@ impl<P: ChatProvider> Harness<P> {
         self.persisted = new_entry_ids.len();
         self.entry_ids = new_entry_ids;
 
+        obs.on_event(AgentEvent::CompactionApplied {
+            compaction_id,
+            covered_from: plan.from_id,
+            covered_to: plan.to_id,
+            covered_messages: covered,
+            original_tokens_estimate: original_tokens,
+            summary_tokens_estimate: summary_tokens,
+            budget,
+        })?;
         obs.on_event(AgentEvent::Notice(format!(
             "compacted {covered} earlier message(s) to stay within the {budget}-token context budget."
         )))

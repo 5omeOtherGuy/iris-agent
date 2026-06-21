@@ -4,9 +4,12 @@
 //! entry line per appended message. The shape mirrors pi-mono's session store
 //! (`packages/agent/src/harness/session/`) at the smallest useful level:
 //!
-//! - stable **session ids** (header `id`) and **entry ids** (`id` per line),
+//! - stable **session ids** (header `id`) and **message entry ids** (`id` per
+//!   line),
 //! - a **`parentId`** link on every entry (the previous leaf, `null` for the
 //!   first), so future branching can attach to any entry,
+//! - optional Nexus-owned **provider turn ids** (`providerTurnId`) on messages
+//!   produced by one provider/model round trip,
 //! - read/open a session back by id, and list sessions with metadata.
 //!
 //! Two halves:
@@ -381,9 +384,10 @@ pub(crate) struct StoredSession {
 
 /// Serialize one message into its session entry value, with a stable id and a
 /// `parentId` link to the previous leaf (`null` for the first entry). Each
-/// entry also records a `tokenEstimate` -- the per-turn token accounting this
+/// entry also records a `tokenEstimate` -- the per-message token accounting this
 /// foundation persists so a resumed session can report a stable context total
-/// without replaying the model.
+/// without replaying the model. Messages produced by a provider/model round
+/// trip may also carry Nexus's optional `providerTurnId` correlation field.
 fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value {
     let mut inner = json!({
         "role": message.role.as_str(),
@@ -408,7 +412,7 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
             });
         }
     }
-    json!({
+    let mut entry = json!({
         "type": "message",
         "id": id,
         "parentId": parent_id,
@@ -419,7 +423,11 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
         // writing the real number here without touching rebuild.
         "tokenEstimate": message_token_estimate(message),
         "message": inner,
-    })
+    });
+    if let Some(provider_turn_id) = &message.provider_turn_id {
+        entry["providerTurnId"] = json!(provider_turn_id);
+    }
+    entry
 }
 
 /// Conservative content-based token estimate for one message body.
@@ -592,7 +600,11 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
         match value.get("type").and_then(Value::as_str) {
             Some("message") => {
                 let id = value.get("id").and_then(Value::as_str).map(String::from);
-                if let Some(message) = value.get("message").and_then(parse_message) {
+                if let Some(mut message) = value.get("message").and_then(parse_message) {
+                    message.provider_turn_id = value
+                        .get("providerTurnId")
+                        .and_then(Value::as_str)
+                        .map(String::from);
                     // Prefer the persisted estimate; recompute from content for
                     // older (v1/v2-pre-token) entries that lack it, so the total
                     // is stable for both new and legacy sessions.
@@ -795,6 +807,7 @@ fn parse_message(inner: &Value) -> Option<Message> {
             .get("toolName")
             .and_then(Value::as_str)
             .map(String::from),
+        provider_turn_id: None,
         continuity: inner
             .get("continuity")
             .and_then(Value::as_str)
@@ -1507,6 +1520,39 @@ mod tests {
         let entry = &lines(log.path())[1];
         // The persisted per-turn token accounting the foundation records.
         assert_eq!(entry["tokenEstimate"], json!(estimate_tokens("hello")));
+    }
+
+    #[test]
+    fn append_persists_optional_provider_turn_id_and_legacy_entries_still_read() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::assistant("hi").with_provider_turn_id("turn_00000000"))
+            .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        let entry = &lines(&path)[1];
+        assert_eq!(entry["providerTurnId"], "turn_00000000");
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(
+            session.messages[0].provider_turn_id.as_deref(),
+            Some("turn_00000000")
+        );
+
+        let cwd_dir = dir.path.join("legacy");
+        fs::create_dir(&cwd_dir).unwrap();
+        let legacy_path = cwd_dir.join("legacy.jsonl");
+        let legacy = concat!(
+            r#"{"type":"session","version":2,"id":"legacy123","timestamp":1700000000000,"cwd":"/legacy"}"#,
+            "\n",
+            r#"{"type":"message","id":"00000000","parentId":null,"timestamp":1700000000001,"tokenEstimate":1,"message":{"role":"assistant","content":"old"}}"#,
+            "\n",
+        );
+        fs::write(&legacy_path, legacy).unwrap();
+        let legacy_session = open_by_id(&SessionStore::with_root(dir.path.clone()), "legacy123");
+        assert_eq!(legacy_session.messages[0].provider_turn_id, None);
     }
 
     #[test]
