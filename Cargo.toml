@@ -24,9 +24,6 @@ tokio-util = "0.7"
 globset = "0.4"
 grep = "0.4"
 ignore = "0.4"
-# Kernel sandbox for the bash tool. Used instead of hand-rolling Landlock LSM
-# syscalls + struct ABI by hand, which is an error-prone security-critical path.
-landlock = "0.4.5"
 libc = "0.2.186"
 rand = "0.10"
 # Terminal UI: ratatui owns the cell buffer, frame diff, and width-aware
@@ -61,3 +58,11 @@ similar = "3.1.1"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Kernel sandbox for the bash tool. Used instead of hand-rolling Landlock LSM
+# syscalls + struct ABI by hand, which is an error-prone security-critical path.
+# Linux-only: the crate uses Linux syscalls (landlock_*, prctl, O_PATH) that do
+# not exist on macOS/Windows, so it is gated to Linux targets. sandbox.rs guards
+# every `landlock::` use behind `#[cfg(target_os = "linux")]`.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.5"
