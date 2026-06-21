@@ -52,6 +52,28 @@ Not implemented yet:
 
 ## Running
 
+### Install from GitHub
+
+Install the latest version from the remote repository:
+
+```bash
+cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked
+```
+
+Update an installed copy with:
+
+```bash
+iris-agent update
+```
+
+Or run from a source checkout:
+
+```bash
+git clone https://github.com/5omeOtherGuy/iris-agent.git
+cd iris-agent
+cargo run
+```
+
 ### Runtime dependencies
 
 None beyond the binary itself. The `grep` and `find` tools search in-process via
@@ -69,22 +91,24 @@ Iris stores OAuth credentials in an Iris auth file. By default it reads:
 Create or refresh credentials for the provider you want to use:
 
 ```bash
-cargo run -- login openai-codex
-cargo run -- login openai-codex --device-code
-cargo run -- login anthropic
-ANTIGRAVITY_CLIENT_SECRET=... cargo run -- login antigravity
+iris-agent login openai-codex
+iris-agent login openai-codex --device-code
+iris-agent login anthropic
+ANTIGRAVITY_CLIENT_SECRET=... iris-agent login antigravity
 ```
+
+From a source checkout, replace `iris-agent` with `cargo run --`.
 
 Provider notes:
 
 - `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the default provider if no setting is present.
-- `anthropic` uses an existing Claude Code OAuth login. `cargo run -- login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
+- `anthropic` uses an existing Claude Code OAuth login. `iris-agent login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
 - `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is **not shipped in source** and must be available as `ANTIGRAVITY_CLIENT_SECRET` for `login antigravity` and later Antigravity runs that refresh the token.
 
 Override the auth-file path with:
 
 ```bash
-IRIS_AUTH_PATH=/path/to/auth.json cargo run
+IRIS_AUTH_PATH=/path/to/auth.json iris-agent
 ```
 
 Choose the provider for a run with `defaultProvider` in the global JSON settings
@@ -98,8 +122,10 @@ file (`~/.iris/settings.json`, or `IRIS_CONFIG_PATH`). Example:
 ```
 
 Supported provider ids are `openai-codex`, `anthropic`, and `antigravity`.
-Iris reads the setting once at startup; there is no in-session provider switch.
-Recognized settings keys are `defaultProvider`, `defaultModel`, and `baseUrl`.
+At the TUI prompt, use `/model` to view or switch provider/model and
+`/reasoning off|minimal|low|medium|high|xhigh` to change thinking effort at a
+safe turn boundary. Recognized settings keys are `defaultProvider`,
+`defaultModel`, and `baseUrl`.
 
 Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
 `defaultModel`; a cloned repo cannot choose your provider or redirect OAuth
@@ -119,7 +145,7 @@ Environment variables:
 Start the REPL:
 
 ```bash
-cargo run
+iris-agent
 ```
 
 Exit with `/exit` or `/quit`.

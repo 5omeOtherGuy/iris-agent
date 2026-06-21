@@ -1,10 +1,10 @@
 use std::env;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use nexus::{Agent, ChatProvider};
 use reqwest::blocking::Client;
 
@@ -63,6 +63,7 @@ fn dispatch() -> Result<()> {
         {
             login_openai_codex(LoginMethod::DeviceCode)
         }
+        [command] if command == "update" => update_agent(),
         [command] if command == "help" || command == "--help" || command == "-h" => {
             print_help();
             Ok(())
@@ -291,6 +292,25 @@ fn build_provider(
     Ok(provider)
 }
 
+const UPDATE_REPO: &str = "https://github.com/5omeOtherGuy/iris-agent.git";
+const UPDATE_ARGS: &[&str] = &["install", "--git", UPDATE_REPO, "--locked", "--force"];
+
+fn update_args() -> &'static [&'static str] {
+    UPDATE_ARGS
+}
+
+fn update_agent() -> Result<()> {
+    println!("Updating iris-agent from {UPDATE_REPO} ...");
+    let status = Command::new("cargo")
+        .args(update_args())
+        .status()
+        .context("failed to run cargo; install Rust/Cargo or update with cargo install manually")?;
+    if !status.success() {
+        bail!("cargo install failed with {status}");
+    }
+    Ok(())
+}
+
 fn login_openai_codex(method: LoginMethod) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
@@ -345,4 +365,22 @@ fn print_help() {
     eprintln!("  iris-agent login openai-codex --device-code Login with device-code OAuth");
     eprintln!("  iris-agent login antigravity            Login with Google account OAuth");
     eprintln!("  iris-agent login anthropic              Show Claude Code login instructions");
+    eprintln!("  iris-agent update                       Update Iris from GitHub");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_command_installs_locked_remote_with_force() {
+        assert_eq!(
+            UPDATE_REPO,
+            "https://github.com/5omeOtherGuy/iris-agent.git"
+        );
+        assert_eq!(
+            update_args(),
+            &["install", "--git", UPDATE_REPO, "--locked", "--force"]
+        );
+    }
 }
