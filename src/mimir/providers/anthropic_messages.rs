@@ -251,24 +251,21 @@ fn build_anthropic_request(
     reasoning: Option<ReasoningEffort>,
 ) -> Value {
     let meta = anthropic_models::find(model);
-    // Wire `model` uses the native id; the soft-cap alias `claude-opus-4-7-300k`
-    // sends `claude-opus-4-7`. Everything else sends its own id.
-    let native_id = meta.map(|m| m.native_id).unwrap_or(model);
     let thinking_mode = meta
         .map(|m| m.thinking)
         .unwrap_or(ThinkingMode::ManualBudget);
     let output_cap = meta.map(|m| m.output_cap).unwrap_or(DEFAULT_OUTPUT_CAP);
 
     let mut body = json!({
-        "model": native_id,
+        "model": model,
         "max_tokens": MAX_TOKENS,
         "stream": true,
         "system": [
             { "type": "text", "text": CLAUDE_CODE_IDENTITY },
             { "type": "text", "text": system_prompt },
         ],
-        // Origin (reasoning-replay continuity) is keyed on the UI model id, not
-        // the native id, so a 300k-alias turn replays against the same selection.
+        // Origin (reasoning-replay continuity) is keyed on the selected model id,
+        // so a turn replays against the same selection.
         "messages": build_messages(messages, &anthropic_origin(model)),
     });
 
@@ -944,11 +941,11 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     }
 
     #[test]
-    fn opus_4_7_300k_sends_native_opus_4_7() {
+    fn opus_4_7_sends_its_own_id() {
         let messages = [Message::user("hi")];
         let tools = Tools::new(Vec::new());
         let body = build_anthropic_request(
-            "claude-opus-4-7-300k",
+            "claude-opus-4-7",
             "P",
             &messages,
             &tools,
@@ -957,9 +954,9 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         assert_eq!(
             body["model"],
             json!("claude-opus-4-7"),
-            "300k soft-cap alias sends the native opus-4-7 id"
+            "the selected model id is sent verbatim"
         );
-        // Still adaptive, like the base opus-4-7.
+        // Adaptive thinking with medium -> high effort.
         assert_eq!(body["thinking"]["type"], json!("adaptive"));
         assert_eq!(body["output_config"], json!({ "effort": "high" }));
     }
