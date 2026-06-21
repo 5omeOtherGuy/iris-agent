@@ -431,6 +431,8 @@ impl GeminiStreamParser {
             text: (!self.text.is_empty()).then_some(self.text),
             reasoning: Vec::new(),
             tool_calls: self.tool_calls,
+            response_id: None,
+            usage: None,
         })
     }
 }

@@ -116,11 +116,12 @@ fn run_agent() -> Result<()> {
     // validation then rejects a configured reasoning level the model cannot do.
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
-    let provider = build_provider(&selection, &system_prompt)?;
+    let session_id = session::new_session_id();
+    let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::new(provider, tools);
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
-    let session = match session::SessionLog::create(&cwd) {
+    let session = match session::SessionLog::create_with_id(&cwd, &session_id) {
         Ok(log) => {
             tracing::info!(id = %log.id(), path = %log.path().display(), "session transcript");
             Some(log)
@@ -143,8 +144,9 @@ fn run_agent() -> Result<()> {
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
     // Tier-3 mode-switch state: `/model` `/reasoning` rebuild a provider from the
     // same system prompt via `build_provider` and install it at a turn boundary.
-    let build = |selection: &mimir::selection::ModelSelection, prompt: &str| {
-        build_provider(selection, prompt)
+    let build_session_id = session_id.clone();
+    let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
+        build_provider(selection, prompt, &build_session_id)
     };
     let mut switch = Some(cli::ModelSwitch::new(
         selection,
@@ -184,7 +186,8 @@ fn resume_agent(session_id: &str) -> Result<()> {
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
-    let provider = build_provider(&selection, &system_prompt)?;
+    let session_id = meta.id.clone();
+    let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::resumed(provider, tools, stored.messages);
 
     // Reopen the same transcript for append so continued turns extend it rather
@@ -207,8 +210,9 @@ fn resume_agent(session_id: &str) -> Result<()> {
         resumed,
         budget,
     );
-    let build = |selection: &mimir::selection::ModelSelection, prompt: &str| {
-        build_provider(selection, prompt)
+    let build_session_id = session_id.clone();
+    let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
+        build_provider(selection, prompt, &build_session_id)
     };
     let mut switch = Some(cli::ModelSwitch::new(
         selection,
@@ -269,6 +273,7 @@ fn log_resumable_sessions(cwd: &Path) {
 fn build_provider(
     selection: &mimir::selection::ModelSelection,
     system_prompt: &str,
+    session_id: &str,
 ) -> Result<Box<dyn ChatProvider>> {
     use mimir::selection::ProviderId;
     let model = selection.model.as_str();
@@ -281,6 +286,8 @@ fn build_provider(
                 base_url,
                 reasoning,
                 system_prompt,
+                session_id,
+                selection.cache_retention,
             )?,
         ),
         ProviderId::Anthropic => Box::new(
@@ -289,6 +296,7 @@ fn build_provider(
                 base_url,
                 reasoning,
                 system_prompt,
+                selection.cache_retention,
             )?,
         ),
         ProviderId::Antigravity => {

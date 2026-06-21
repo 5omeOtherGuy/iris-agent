@@ -451,6 +451,9 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
                 name: "read".to_string(),
                 arguments: json!({ "path": "note.txt" }),
             }],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("The file says hello from file.")),
     ]);
@@ -492,6 +495,9 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
                 name: "read".to_string(),
                 arguments: json!({ "path": "note.txt" }),
             }],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -528,6 +534,9 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
                 name: "unknown".to_string(),
                 arguments: json!({}),
             }],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("recovered")),
     ]);
@@ -563,6 +572,9 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
                 name: "read".to_string(),
                 arguments: json!({ "path": "note.txt" }),
             }],
+
+            response_id: None,
+            usage: None,
         })
     };
     let provider = FakeProvider::new((0..MAX_TOOL_ROUNDTRIPS).map(|_| repeated_call()).collect());
@@ -603,6 +615,9 @@ fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
                 name: "unknown".to_string(),
                 arguments: json!({}),
             }],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("I could not use that tool.")),
     ]);
@@ -752,6 +767,9 @@ fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
                 name: "read".to_string(),
                 arguments: json!({ "not_path": "note.txt" }),
             }],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("The read call was malformed.")),
     ]);
@@ -833,6 +851,8 @@ fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
             name: name.to_string(),
             arguments,
         }],
+        response_id: None,
+        usage: None,
     }
 }
 
@@ -923,6 +943,9 @@ fn completed_turn_records_reasoning_and_all_tool_calls_before_results() -> Resul
                     arguments: json!({ "path": "b.txt" }),
                 },
             ],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -1410,6 +1433,9 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
                     arguments: json!({ "path": "b.txt", "content": "b" }),
                 },
             ],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -1480,6 +1506,9 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
                     arguments: json!({}),
                 },
             ],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -1627,6 +1656,9 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
                     arguments: json!({ "command": "echo second" }),
                 },
             ],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2405,6 +2437,8 @@ fn cancellation_before_tools_proposes_remaining_calls_before_cancelling() -> Res
             call("call_1", "trip", json!({})),
             call("call_2", "read", json!({ "path": "b.txt" })),
         ],
+        response_id: None,
+        usage: None,
     })]);
     let token = CancellationToken::new();
     let mut harness = test_harness(
@@ -2565,6 +2599,9 @@ fn unsafe_tools_run_sequentially() -> Result<()> {
                 call("c1", "probe", json!({ "tag": "a" })),
                 call("c2", "probe", json!({ "tag": "b" })),
             ],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2603,6 +2640,9 @@ fn safe_tools_run_in_parallel_with_ordered_results() -> Result<()> {
                 call("c1", "probe", json!({ "tag": "a" })),
                 call("c2", "probe", json!({ "tag": "b" })),
             ],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2658,6 +2698,9 @@ fn auto_compaction_does_not_split_reasoning_from_retained_tool_calls() -> Result
             text: None,
             reasoning: vec![ReasoningBlock::new(&reasoning, Some("sig"), false, origin)],
             tool_calls: vec![call("c1", "probe", json!({ "tag": "a" }))],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("after tool")),
         Ok(AssistantTurn::text("second done")),
@@ -2721,6 +2764,9 @@ fn safe_tool_parallelism_is_bounded() -> Result<()> {
             text: None,
             reasoning: Vec::new(),
             tool_calls,
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2764,6 +2810,9 @@ fn safe_tools_do_not_cross_an_unsafe_tool() -> Result<()> {
                 call("c2", "safe", json!({ "tag": "b" })),
                 call("c3", "danger", json!({ "tag": "c" })),
             ],
+
+            response_id: None,
+            usage: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);

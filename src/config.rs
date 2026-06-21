@@ -55,6 +55,11 @@ pub(crate) struct Settings {
     /// security-sensitive redirect, so a project file may tune it (like
     /// [`Settings::context_token_budget`]).
     pub(crate) default_reasoning: Option<String>,
+    /// Prompt cache retention (`none|short|long`). Global-only because a cloned
+    /// project must not silently increase how long provider-side prompt material
+    /// may live. Parsed by `mimir::selection`; absent -> provider default
+    /// (`short` for Anthropic, normal prompt-cache-key behavior for OpenAI).
+    pub(crate) prompt_cache_retention: Option<String>,
     /// Ordered `provider/model` ids that scope Ctrl+P cycling (the persisted
     /// `/scoped-models` selection). Like provider/base-url this controls which
     /// providers a session talks to, so it is global-only: a cloned repo cannot
@@ -101,6 +106,9 @@ impl Settings {
             // Reasoning effort is likewise not a security redirect, so a project
             // may override it; fall back to global.
             default_reasoning: project.default_reasoning.or(self.default_reasoning),
+            // Prompt cache retention can affect privacy/cost, so keep it
+            // global-only like provider/base-url and scoped model sets.
+            prompt_cache_retention: self.prompt_cache_retention,
             // Scoped models gate which providers a session cycles through, so
             // (like provider/base-url) they are global-only and never taken from
             // untrusted project config.
@@ -372,6 +380,19 @@ mod tests {
         let configured = Settings::load_from(None, &project).unwrap();
         assert_eq!(configured.context_token_budget, Some(64_000));
         assert_eq!(configured.context_token_budget(), 64_000);
+    }
+
+    #[test]
+    fn prompt_cache_retention_is_global_only() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "promptCacheRetention": "none" }"#).unwrap();
+        fs::write(&project, r#"{ "promptCacheRetention": "long" }"#).unwrap();
+
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+
+        assert_eq!(settings.prompt_cache_retention.as_deref(), Some("none"));
     }
 
     #[test]

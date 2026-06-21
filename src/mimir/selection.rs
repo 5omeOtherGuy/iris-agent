@@ -185,6 +185,56 @@ impl ReasoningEffort {
     }
 }
 
+/// Prompt-cache retention preference shared by provider adapters. `Short` is
+/// the normal provider-default prompt cache behavior; `Long` opts into the
+/// provider's safe longer-lived cache marker only where Iris knows the wire
+/// shape, and `None` disables provider request cache hints entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptCacheRetention {
+    None,
+    Short,
+    Long,
+}
+
+impl PromptCacheRetention {
+    /// Default cache retention. Anthropic maps this to 5-minute ephemeral cache
+    /// control; OpenAI maps it to the normal prompt-cache key behavior with no
+    /// forced long retention.
+    pub(crate) const DEFAULT: PromptCacheRetention = PromptCacheRetention::Short;
+
+    #[cfg(test)]
+    pub(crate) const ALL: [PromptCacheRetention; 3] = [
+        PromptCacheRetention::None,
+        PromptCacheRetention::Short,
+        PromptCacheRetention::Long,
+    ];
+
+    pub(crate) fn parse(value: &str) -> Result<PromptCacheRetention> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(PromptCacheRetention::None),
+            "short" => Ok(PromptCacheRetention::Short),
+            "long" => Ok(PromptCacheRetention::Long),
+            other => Err(UsageError::new(format!(
+                "unsupported prompt cache retention '{other}'; supported: none, short, long"
+            ))
+            .into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PromptCacheRetention::None => "none",
+            PromptCacheRetention::Short => "short",
+            PromptCacheRetention::Long => "long",
+        }
+    }
+
+    pub(crate) fn caching_enabled(self) -> bool {
+        self != PromptCacheRetention::None
+    }
+}
+
 /// The resolved user choice: provider + model + base URL + optional reasoning.
 /// `reasoning: None` means no preference, so adapters omit every reasoning field
 /// and emit byte-identical requests to today's behavior.
@@ -194,6 +244,7 @@ pub(crate) struct ModelSelection {
     pub(crate) model: String,
     pub(crate) base_url: String,
     pub(crate) reasoning: Option<ReasoningEffort>,
+    pub(crate) cache_retention: PromptCacheRetention,
 }
 
 impl ModelSelection {
@@ -203,6 +254,7 @@ impl ModelSelection {
     /// - base_url: provider env (`IRIS_CODEX_BASE_URL` only today) ->
     ///   `settings.base_url` -> per-provider default
     /// - reasoning: `settings.default_reasoning` -> else `None`
+    /// - cache retention: `settings.prompt_cache_retention` -> `short`
     ///
     /// `settings.base_url` is already global-only (the security invariant is
     /// enforced in `Settings::merged_with`), so resolve never re-derives it from
@@ -220,11 +272,16 @@ impl ModelSelection {
             Some(value) => Some(ReasoningEffort::parse(value)?),
             None => None,
         };
+        let cache_retention = match trimmed_non_empty(settings.prompt_cache_retention.as_deref()) {
+            Some(value) => PromptCacheRetention::parse(value)?,
+            None => PromptCacheRetention::DEFAULT,
+        };
         Ok(ModelSelection {
             provider,
             model,
             base_url,
             reasoning,
+            cache_retention,
         })
     }
 }
@@ -273,6 +330,7 @@ mod tests {
             base_url: base_url.map(str::to_string),
             context_token_budget: None,
             default_reasoning: reasoning.map(str::to_string),
+            prompt_cache_retention: None,
             enabled_models: None,
         }
     }
@@ -294,6 +352,7 @@ mod tests {
         assert_eq!(resolved.model, "gpt-5.5");
         assert_eq!(resolved.base_url, "https://chatgpt.com/backend-api");
         assert_eq!(resolved.reasoning, None);
+        assert_eq!(resolved.cache_retention, PromptCacheRetention::Short);
 
         // Settings values win over defaults.
         let s = settings(
@@ -339,7 +398,32 @@ mod tests {
     }
 
     #[test]
-    fn provider_and_reasoning_parse_round_trip() {
+    fn cache_retention_parses_defaults_and_rejects_unknown_values() {
+        let mut s = settings(None, None, None, None);
+        assert_eq!(
+            ModelSelection::resolve(&s).unwrap().cache_retention,
+            PromptCacheRetention::Short
+        );
+
+        s.prompt_cache_retention = Some("none".to_string());
+        assert_eq!(
+            ModelSelection::resolve(&s).unwrap().cache_retention,
+            PromptCacheRetention::None
+        );
+
+        s.prompt_cache_retention = Some("long".to_string());
+        assert_eq!(
+            ModelSelection::resolve(&s).unwrap().cache_retention,
+            PromptCacheRetention::Long
+        );
+
+        s.prompt_cache_retention = Some("forever".to_string());
+        let err = ModelSelection::resolve(&s).unwrap_err().to_string();
+        assert!(err.contains("unsupported prompt cache retention"), "{err}");
+    }
+
+    #[test]
+    fn provider_reasoning_and_cache_retention_parse_round_trip() {
         for provider in [
             ProviderId::OpenAiCodex,
             ProviderId::Anthropic,
@@ -349,6 +433,12 @@ mod tests {
         }
         for level in ReasoningEffort::ALL {
             assert_eq!(ReasoningEffort::parse(level.as_str()).unwrap(), level);
+        }
+        for retention in PromptCacheRetention::ALL {
+            assert_eq!(
+                PromptCacheRetention::parse(retention.as_str()).unwrap(),
+                retention
+            );
         }
         // Case-insensitive.
         assert_eq!(

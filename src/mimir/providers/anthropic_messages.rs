@@ -8,6 +8,7 @@
 //! or extended-thinking replay only if a real need shows up.
 
 use std::io::BufReader;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -23,10 +24,10 @@ use super::transport::{
 };
 use crate::mimir::anthropic_models::{self, ThinkingMode};
 use crate::mimir::auth::anthropic::AnthropicTokenStore;
-use crate::mimir::selection::ReasoningEffort;
+use crate::mimir::selection::{PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
-    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ReasoningBlock, Role,
-    ToolCall, Tools,
+    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ProviderUsage,
+    ReasoningBlock, Role, ToolCall, Tools,
 };
 
 /// Base output-token allowance, treated as the visible-output ask
@@ -48,6 +49,7 @@ const BASE_ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 /// "enabled"`); adaptive thinking implies interleaved thinking server-side and
 /// no thinking does not need it.
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 /// Appended only when the payload carries a `fallbacks` array (Fable 5 refusal
 /// fallback). The header date is authoritative as written; adopted from
 /// minimalcc-pi `SERVER_SIDE_FALLBACK_BETA`.
@@ -68,6 +70,8 @@ pub(crate) struct AnthropicProvider {
     base_url: String,
     reasoning: Option<ReasoningEffort>,
     system_prompt: String,
+    cache_retention: PromptCacheRetention,
+    cache_diagnostics: Arc<Mutex<super::CacheUsageDiagnostics>>,
     tokens: AnthropicTokenStore,
 }
 
@@ -81,6 +85,7 @@ impl AnthropicProvider {
         base_url: &str,
         reasoning: Option<ReasoningEffort>,
         system_prompt: &str,
+        cache_retention: PromptCacheRetention,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
@@ -90,6 +95,8 @@ impl AnthropicProvider {
             base_url: base_url.to_string(),
             reasoning,
             system_prompt: system_prompt.to_string(),
+            cache_retention,
+            cache_diagnostics: Arc::new(Mutex::new(super::CacheUsageDiagnostics::default())),
             tokens: AnthropicTokenStore::from_env()?,
         })
     }
@@ -110,6 +117,7 @@ impl ChatProvider for AnthropicProvider {
             messages,
             tools,
             self.reasoning,
+            self.cache_retention,
         );
         let provider = self.clone();
         let cancel = cancel.clone();
@@ -190,7 +198,12 @@ impl AnthropicProvider {
             }
             let last = parser.last_event_type.clone();
             return match parser.finish() {
-                Ok(turn) => Attempt::Done(turn),
+                Ok(turn) => {
+                    if let Some(usage) = &turn.usage {
+                        self.record_usage(usage);
+                    }
+                    Attempt::Done(turn)
+                }
                 Err(error) => Attempt::Fatal(anyhow!("{error} [{}]", diag(last))),
             };
         }
@@ -212,6 +225,31 @@ impl AnthropicProvider {
         match classify_http_status(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
             HttpClass::Fatal => Attempt::Fatal(error),
+        }
+    }
+
+    fn record_usage(&self, usage: &ProviderUsage) {
+        tracing::info!(
+            provider = %usage.provider,
+            model = %usage.model,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            cache_read_input_tokens = usage.cache_read_input_tokens,
+            cache_write_input_tokens = usage.cache_write_input_tokens,
+            total_tokens = usage.total_tokens,
+            "provider token usage"
+        );
+        let should_warn = super::CacheUsageDiagnostics::record_locked(
+            &self.cache_diagnostics,
+            self.cache_retention.caching_enabled(),
+            usage,
+        );
+        if should_warn {
+            tracing::warn!(
+                provider = %usage.provider,
+                model = %usage.model,
+                "prompt caching is enabled but repeated Anthropic requests reported zero cache reads after cacheable state"
+            );
         }
     }
 }
@@ -346,7 +384,26 @@ fn anthropic_beta(request: &Value) -> String {
         betas.push(',');
         betas.push_str(SERVER_SIDE_FALLBACK_BETA);
     }
+    if request_contains_one_hour_cache(request) {
+        betas.push(',');
+        betas.push_str(EXTENDED_CACHE_TTL_BETA);
+    }
     betas
+}
+
+fn request_contains_one_hour_cache(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let is_one_hour_cache = map
+                .get("cache_control")
+                .and_then(|cache_control| cache_control.get("ttl"))
+                .and_then(Value::as_str)
+                == Some("1h");
+            is_one_hour_cache || map.values().any(request_contains_one_hour_cache)
+        }
+        Value::Array(items) => items.iter().any(request_contains_one_hour_cache),
+        _ => false,
+    }
 }
 
 fn build_anthropic_request(
@@ -355,6 +412,7 @@ fn build_anthropic_request(
     messages: &[Message],
     tools: &Tools,
     reasoning: Option<ReasoningEffort>,
+    cache_retention: PromptCacheRetention,
 ) -> Value {
     let meta = anthropic_models::find(model);
     let thinking_mode = meta
@@ -408,12 +466,55 @@ fn build_anthropic_request(
     if !declarations.is_empty() {
         body["tools"] = Value::Array(declarations);
     }
+    apply_anthropic_cache_control(&mut body, cache_retention);
     body
 }
 
 /// Manual-budget thinking token budget for an iris reasoning level. Adopted
 /// verbatim from minimalcc-pi `DEFAULT_THINKING_BUDGETS`. `Off` yields 0 (no
 /// thinking); it is never reached because callers filter `Off` out first.
+fn apply_anthropic_cache_control(body: &mut Value, retention: PromptCacheRetention) {
+    let Some(cache_control) = anthropic_cache_control(retention) else {
+        return;
+    };
+    if let Some(system) = body.get_mut("system").and_then(Value::as_array_mut)
+        && let Some(block) = system
+            .iter_mut()
+            .rev()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        && let Some(object) = block.as_object_mut()
+    {
+        object.insert("cache_control".to_string(), cache_control.clone());
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut().rev() {
+            if message.get("role").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut)
+                && let Some(block) = content.last_mut()
+                && let Some(object) = block.as_object_mut()
+            {
+                object.insert("cache_control".to_string(), cache_control.clone());
+                break;
+            }
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut)
+        && let Some(tool) = tools.last_mut().and_then(Value::as_object_mut)
+    {
+        tool.insert("cache_control".to_string(), cache_control);
+    }
+}
+
+fn anthropic_cache_control(retention: PromptCacheRetention) -> Option<Value> {
+    match retention {
+        PromptCacheRetention::None => None,
+        PromptCacheRetention::Short => Some(json!({ "type": "ephemeral" })),
+        PromptCacheRetention::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
+    }
+}
+
 fn manual_budget(level: ReasoningEffort) -> u32 {
     match level {
         ReasoningEffort::Off => 0,
@@ -572,6 +673,10 @@ struct AnthropicStreamParser {
     tool_calls: Vec<ToolCall>,
     open_reasoning: HashMap<u64, ReasoningBlock>,
     reasoning: Vec<ReasoningBlock>,
+    response_id: Option<String>,
+    usage: ProviderUsage,
+    raw_input_tokens: u64,
+    usage_seen: bool,
     message_stopped: bool,
     /// Type of the most recent SSE event seen, for safe failure diagnostics.
     last_event_type: Option<String>,
@@ -586,6 +691,7 @@ struct ToolBlock {
 
 impl AnthropicStreamParser {
     fn new(origin: ModelOrigin) -> Self {
+        let model = origin.model.clone();
         Self {
             origin,
             text: String::new(),
@@ -593,6 +699,19 @@ impl AnthropicStreamParser {
             tool_calls: Vec::new(),
             open_reasoning: HashMap::new(),
             reasoning: Vec::new(),
+            response_id: None,
+            usage: ProviderUsage {
+                provider: PROVIDER_ID.to_string(),
+                model,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 0,
+            },
+            raw_input_tokens: 0,
+            usage_seen: false,
             message_stopped: false,
             last_event_type: None,
         }
@@ -609,6 +728,19 @@ impl AnthropicStreamParser {
             self.last_event_type = Some(event_type.to_string());
         }
         match event_type {
+            Some("message_start") => {
+                self.response_id = value
+                    .get("message")
+                    .and_then(|message| message.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(usage) = value
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                {
+                    self.merge_usage(usage);
+                }
+            }
             Some("content_block_start") => {
                 let index = block_index(&value);
                 if let Some(block) = value.get("content_block") {
@@ -701,6 +833,11 @@ impl AnthropicStreamParser {
                     self.reasoning.push(block);
                 }
             }
+            Some("message_delta") => {
+                if let Some(usage) = value.get("usage") {
+                    self.merge_usage(usage);
+                }
+            }
             Some("message_stop") => {
                 self.message_stopped = true;
             }
@@ -721,6 +858,33 @@ impl AnthropicStreamParser {
         Ok(())
     }
 
+    fn merge_usage(&mut self, usage: &Value) {
+        self.usage_seen = true;
+        if let Some(tokens) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.raw_input_tokens = tokens;
+        }
+        if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.usage.output_tokens = tokens;
+        }
+        if let Some(tokens) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.usage.cache_read_input_tokens = tokens;
+        }
+        if let Some(tokens) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.usage.cache_write_input_tokens = tokens;
+        }
+        self.usage.input_tokens = self
+            .raw_input_tokens
+            .saturating_add(self.usage.cache_read_input_tokens)
+            .saturating_add(self.usage.cache_write_input_tokens);
+        self.usage.total_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(self.usage.output_tokens);
+    }
+
     fn finish(self) -> Result<AssistantTurn> {
         if !self.message_stopped {
             return Err(anyhow!("Anthropic stream ended before message_stop"));
@@ -737,6 +901,8 @@ impl AnthropicStreamParser {
             text: (!self.text.is_empty()).then_some(self.text),
             reasoning: self.reasoning,
             tool_calls: self.tool_calls,
+            response_id: self.response_id,
+            usage: self.usage_seen.then_some(self.usage),
         })
     }
 }
@@ -794,6 +960,7 @@ fn parse_anthropic_sse_for_model(body: &str, model: &str) -> Result<AssistantTur
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mimir::selection::PromptCacheRetention;
     use crate::nexus::{Message, ModelOrigin, Tools};
 
     #[test]
@@ -981,6 +1148,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &Tools::new(Vec::new()),
             None,
+            PromptCacheRetention::Short,
         );
         let headers = anthropic_headers("fake-oauth-token", &request).unwrap();
         assert_eq!(auth_kind_label(&headers), "oauth_bearer");
@@ -1035,8 +1203,14 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                 origin: None,
             },
         ];
-        let request =
-            build_anthropic_request("m", "IRIS PROMPT", &messages, &Tools::new(Vec::new()), None);
+        let request = build_anthropic_request(
+            "m",
+            "IRIS PROMPT",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            PromptCacheRetention::Short,
+        );
 
         let system = request["system"].as_array().expect("system is array");
         assert_eq!(system[0]["text"], json!(CLAUDE_CODE_IDENTITY));
@@ -1059,13 +1233,114 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     }
 
     #[test]
+    fn cache_control_short_marks_system_prefix_final_user_and_last_tool_only() {
+        let messages = [Message::user("cache me")];
+        let tools = crate::tools::built_in_tools();
+        let request = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "IRIS PROMPT",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Short,
+        );
+
+        let expected = json!({ "type": "ephemeral" });
+        let system = request["system"].as_array().expect("system array");
+        assert!(
+            system[..system.len() - 1]
+                .iter()
+                .all(|block| block.get("cache_control").is_none())
+        );
+        assert_eq!(system.last().unwrap()["cache_control"], expected);
+        let message_blocks = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(message_blocks.last().unwrap()["cache_control"], expected);
+        let tools = request["tools"].as_array().expect("tools array");
+        assert_eq!(tools.last().unwrap()["cache_control"], expected);
+        assert!(
+            tools[..tools.len() - 1]
+                .iter()
+                .all(|tool| tool.get("cache_control").is_none())
+        );
+    }
+
+    #[test]
+    fn cache_control_none_omits_markers_and_long_uses_one_hour_ttl() {
+        let messages = [Message::user("cache me")];
+        let tools = crate::tools::built_in_tools();
+        let none = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "IRIS PROMPT",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::None,
+        );
+        assert!(!json_contains_key(&none, "cache_control"));
+
+        let long = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "IRIS PROMPT",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Long,
+        );
+        let system = long["system"].as_array().expect("system array");
+        assert_eq!(
+            system.last().unwrap()["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert!(anthropic_beta(&long).contains(EXTENDED_CACHE_TTL_BETA));
+    }
+
+    fn json_contains_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key(key) || map.values().any(|child| json_contains_key(child, key))
+            }
+            Value::Array(items) => items.iter().any(|child| json_contains_key(child, key)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn parses_usage_from_message_start_and_delta_without_breaking_text() {
+        let body = "\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":50,\"output_tokens\":0,\"cache_read_input_tokens\":11,\"cache_creation_input_tokens\":22}}}\n\n
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7,\"cache_read_input_tokens\":13}}\n\n
+data: {\"type\":\"message_stop\"}\n\n";
+
+        let turn = parse_anthropic_sse_for_model(body, "claude-sonnet-4-6").unwrap();
+
+        assert_eq!(turn.text.as_deref(), Some("hello"));
+        assert_eq!(turn.response_id.as_deref(), Some("msg_1"));
+        let usage = turn.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 85);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read_input_tokens, 13);
+        assert_eq!(usage.cache_write_input_tokens, 22);
+        assert_eq!(usage.total_tokens, 92);
+    }
+
+    #[test]
     fn manual_budget_model_thinking_uses_minimalcc_budgets_and_invariant() {
         let messages = [Message::user("hi")];
         let tools = Tools::new(Vec::new());
 
         // Sonnet 4.6 is a manual-budget model (cap 64k). No reasoning -> no
         // thinking, base max_tokens (byte-identical default).
-        let none = build_anthropic_request("claude-sonnet-4-6", "P", &messages, &tools, None);
+        let none = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "P",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Short,
+        );
         assert!(none.get("thinking").is_none(), "None omits thinking");
         assert!(none.get("output_config").is_none());
         assert_eq!(none["max_tokens"], json!(MAX_TOKENS));
@@ -1078,6 +1353,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::Off),
+            PromptCacheRetention::Short,
         );
         assert!(off.get("thinking").is_none(), "Off omits thinking");
         assert_eq!(off["max_tokens"], json!(MAX_TOKENS));
@@ -1089,6 +1365,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         assert_eq!(
             high["thinking"],
@@ -1112,6 +1389,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::XHigh),
+            PromptCacheRetention::Short,
         );
         assert_eq!(
             xhigh["thinking"],
@@ -1127,8 +1405,14 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             (ReasoningEffort::High, 20480),
             (ReasoningEffort::XHigh, 32768),
         ] {
-            let body =
-                build_anthropic_request("claude-opus-4-6", "P", &messages, &tools, Some(level));
+            let body = build_anthropic_request(
+                "claude-opus-4-6",
+                "P",
+                &messages,
+                &tools,
+                Some(level),
+                PromptCacheRetention::Short,
+            );
             assert_eq!(
                 body["thinking"],
                 json!({ "type": "enabled", "budget_tokens": budget }),
@@ -1151,6 +1435,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         assert_eq!(
             body["thinking"],
@@ -1173,8 +1458,14 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             (ReasoningEffort::High, "xhigh"),
             (ReasoningEffort::XHigh, "max"),
         ] {
-            let req =
-                build_anthropic_request("claude-opus-4-7", "P", &messages, &tools, Some(level));
+            let req = build_anthropic_request(
+                "claude-opus-4-7",
+                "P",
+                &messages,
+                &tools,
+                Some(level),
+                PromptCacheRetention::Short,
+            );
             assert_eq!(
                 req["output_config"],
                 json!({ "effort": expected }),
@@ -1184,7 +1475,14 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         }
 
         // Adaptive model with no preference / explicit Off both omit thinking.
-        let none = build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, None);
+        let none = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Short,
+        );
         assert!(none.get("thinking").is_none());
         assert!(none.get("output_config").is_none());
         assert_eq!(none["max_tokens"], json!(MAX_TOKENS));
@@ -1194,6 +1492,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::Off),
+            PromptCacheRetention::Short,
         );
         assert!(off.get("thinking").is_none(), "adaptive Off omits thinking");
         assert!(off.get("output_config").is_none());
@@ -1209,6 +1508,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::Medium),
+            PromptCacheRetention::Short,
         );
         assert_eq!(
             body["model"],
@@ -1232,6 +1532,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         assert_eq!(fable["model"], json!("claude-fable-5"));
         assert_eq!(fable["thinking"]["type"], json!("adaptive"));
@@ -1246,6 +1547,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::Off),
+            PromptCacheRetention::Short,
         );
         assert!(fable_off.get("thinking").is_none());
         assert_eq!(
@@ -1260,6 +1562,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         assert!(opus.get("fallbacks").is_none());
     }
@@ -1384,6 +1687,7 @@ data: {\"type\":\"message_stop\"}
             &messages,
             &Tools::new(Vec::new()),
             None,
+            PromptCacheRetention::Short,
         );
         let assistant = &request["messages"].as_array().unwrap()[1];
         let blocks = assistant["content"].as_array().unwrap();
@@ -1475,7 +1779,14 @@ data: {\"type\":\"message_stop\"}
     fn headers_carry_oauth_betas_and_never_an_api_key() {
         let messages = [Message::user("hi")];
         let tools = Tools::new(Vec::new());
-        let body = build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, None);
+        let body = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Short,
+        );
         let headers = anthropic_headers("fake-oauth-token", &body).expect("headers");
 
         assert_eq!(
@@ -1504,6 +1815,7 @@ data: {\"type\":\"message_stop\"}
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         let manual_beta = beta_of(&manual);
         assert!(manual_beta.contains(BASE_ANTHROPIC_BETA));
@@ -1520,11 +1832,19 @@ data: {\"type\":\"message_stop\"}
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         assert!(!beta_of(&adaptive).contains(INTERLEAVED_THINKING_BETA));
 
         // No thinking -> base betas only.
-        let plain = build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, None);
+        let plain = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Short,
+        );
         assert_eq!(beta_of(&plain), BASE_ANTHROPIC_BETA);
     }
 
@@ -1539,6 +1859,7 @@ data: {\"type\":\"message_stop\"}
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         let fable_beta = anthropic_beta(&fable);
         assert!(
@@ -1554,6 +1875,7 @@ data: {\"type\":\"message_stop\"}
             &messages,
             &tools,
             Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
         );
         assert!(!anthropic_beta(&opus).contains(SERVER_SIDE_FALLBACK_BETA));
     }
