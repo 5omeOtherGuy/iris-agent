@@ -23,10 +23,12 @@
 //! persistence is tracked separately (roadmap #14).
 
 use std::env;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 /// Settings loaded from the JSON config files. Every field is optional; an
 /// absent field falls back to the next layer (safe project fields -> global ->
@@ -53,6 +55,11 @@ pub(crate) struct Settings {
     /// security-sensitive redirect, so a project file may tune it (like
     /// [`Settings::context_token_budget`]).
     pub(crate) default_reasoning: Option<String>,
+    /// Ordered `provider/model` ids that scope Ctrl+P cycling (the persisted
+    /// `/scoped-models` selection). Like provider/base-url this controls which
+    /// providers a session talks to, so it is global-only: a cloned repo cannot
+    /// silently change the cycle scope.
+    pub(crate) enabled_models: Option<Vec<String>>,
 }
 
 /// Default context token budget when none is configured. A conservative ceiling
@@ -94,6 +101,10 @@ impl Settings {
             // Reasoning effort is likewise not a security redirect, so a project
             // may override it; fall back to global.
             default_reasoning: project.default_reasoning.or(self.default_reasoning),
+            // Scoped models gate which providers a session cycles through, so
+            // (like provider/base-url) they are global-only and never taken from
+            // untrusted project config.
+            enabled_models: self.enabled_models,
         }
     }
 
@@ -104,6 +115,95 @@ impl Settings {
         self.context_token_budget
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
     }
+}
+
+/// Persist `provider`/`model` as the default model in the global settings file,
+/// preserving every other key. Written to the user-global file (never project
+/// config) so it is consistent with the global-only provider security rule.
+pub(crate) fn save_default_model(provider: &str, model: &str) -> Result<()> {
+    update_global(&[
+        ("defaultProvider", Value::String(provider.to_string())),
+        ("defaultModel", Value::String(model.to_string())),
+    ])
+}
+
+/// Persist the default reasoning/thinking level in the global settings file.
+pub(crate) fn save_default_reasoning(level: &str) -> Result<()> {
+    update_global(&[("defaultReasoning", Value::String(level.to_string()))])
+}
+
+/// Persist (or clear) the scoped-model cycle set in the global settings file.
+/// `None` (or an empty list) removes `enabledModels` so the session cycles all
+/// authenticated models again, matching pi-mono's Ctrl+S "all enabled" path.
+pub(crate) fn save_enabled_models(ids: Option<&[String]>) -> Result<()> {
+    let value = match ids {
+        Some(ids) if !ids.is_empty() => {
+            Value::Array(ids.iter().cloned().map(Value::String).collect())
+        }
+        // Null is the documented "remove this key" sentinel for `update_global`.
+        _ => Value::Null,
+    };
+    update_global(&[("enabledModels", value)])
+}
+
+/// Read the global settings file as a raw JSON object, apply `updates` (a
+/// `Value::Null` removes the key), and write it back atomically. Reading the raw
+/// map -- rather than reserializing the typed [`Settings`] -- preserves any keys
+/// this binary does not know about, so an older Iris never drops a newer config
+/// field. A missing file starts from an empty object.
+fn update_global(updates: &[(&str, Value)]) -> Result<()> {
+    let path = global_path()
+        .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
+    let mut object = read_object(&path)?;
+    for (key, value) in updates {
+        if value.is_null() {
+            object.remove(*key);
+        } else {
+            object.insert((*key).to_string(), value.clone());
+        }
+    }
+    write_object_atomically(&path, &object)
+}
+
+/// Read a settings file as a JSON object, returning an empty object when the
+/// file is absent. A present-but-non-object file is an error rather than a
+/// silent overwrite, so a hand-edited config is never clobbered blindly.
+fn read_object(path: &Path) -> Result<Map<String, Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => match serde_json::from_str(&contents)
+            .with_context(|| format!("invalid settings file {}", path.display()))?
+        {
+            Value::Object(object) => Ok(object),
+            _ => bail!("settings file {} is not a JSON object", path.display()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// Write the settings object to `path` via temp-file + rename so a crash never
+/// leaves a half-written config.
+fn write_object_atomically(path: &Path, object: &Map<String, Value>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(object)?;
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut file = std::fs::File::create(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    // fsync before the rename: the rename is atomic, but without flushing the
+    // file's data first a crash right after rename can expose a zero-length or
+    // partially written settings.json.
+    file.write_all(raw.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))
 }
 
 /// Parse a settings file, returning `None` when it does not exist.
@@ -269,6 +369,68 @@ mod tests {
         .unwrap();
         let settings = Settings::load_from(Some(&global), &dir.path.join("nope.json")).unwrap();
         assert_eq!(settings.default_model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn update_global_preserves_unknown_keys_and_round_trips() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        std::fs::write(&path, r#"{ "futureKnob": 42, "defaultModel": "old" }"#).unwrap();
+
+        // Set known keys; the unknown key must survive.
+        let mut object = read_object(&path).unwrap();
+        object.insert(
+            "defaultProvider".to_string(),
+            Value::String("anthropic".to_string()),
+        );
+        object.insert(
+            "defaultModel".to_string(),
+            Value::String("claude-sonnet-4-6".to_string()),
+        );
+        write_object_atomically(&path, &object).unwrap();
+
+        let reread = read_object(&path).unwrap();
+        assert_eq!(reread.get("futureKnob"), Some(&Value::from(42)));
+        assert_eq!(
+            reread.get("defaultProvider"),
+            Some(&Value::String("anthropic".to_string()))
+        );
+        assert_eq!(
+            reread.get("defaultModel"),
+            Some(&Value::String("claude-sonnet-4-6".to_string()))
+        );
+        // And the typed loader reads it back.
+        let settings = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert_eq!(settings.default_provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn read_object_missing_file_is_empty_and_non_object_errors() {
+        let dir = temp_dir();
+        assert!(
+            read_object(&dir.path.join("absent.json"))
+                .unwrap()
+                .is_empty()
+        );
+        let path = dir.path.join("array.json");
+        std::fs::write(&path, "[1, 2, 3]").unwrap();
+        let err = read_object(&path).unwrap_err().to_string();
+        assert!(err.contains("not a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn enabled_models_is_global_only() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        std::fs::write(&global, r#"{ "enabledModels": ["openai-codex/gpt-5.5"] }"#).unwrap();
+        // A project file cannot inject a cycle scope.
+        std::fs::write(&project, r#"{ "enabledModels": ["anthropic/evil"] }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(
+            settings.enabled_models.as_deref(),
+            Some(["openai-codex/gpt-5.5".to_string()].as_slice())
+        );
     }
 
     #[test]

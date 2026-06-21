@@ -16,11 +16,23 @@ pub(crate) struct AuthStore {
 
 impl AuthStore {
     pub(crate) fn from_env() -> Result<Self> {
-        let home = env::var("HOME").context("HOME is not set")?;
-        let path = env::var("IRIS_AUTH_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| Path::new(&home).join(".iris/auth.json"));
+        // An explicit IRIS_AUTH_PATH wins and must not require HOME (mirrors
+        // config::global_path), so resolve it before falling back to ~/.iris.
+        let path = match env::var("IRIS_AUTH_PATH") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => {
+                let home = env::var("HOME").context("HOME is not set")?;
+                Path::new(&home).join(".iris/auth.json")
+            }
+        };
         Ok(Self { path })
+    }
+
+    /// Construct a store over an explicit auth-file path (used by tests and any
+    /// caller that already resolved the path).
+    #[cfg(test)]
+    pub(crate) fn from_path(path: PathBuf) -> Self {
+        Self { path }
     }
 
     pub(crate) fn oauth_credentials(&self, provider_id: &str) -> Result<OAuthCredentials> {
@@ -42,6 +54,72 @@ impl AuthStore {
         let mut auth = AuthFile::read_or_default(&self.path)?;
         auth.set_oauth_credentials(provider_id, credentials)?;
         auth.write(&self.path)
+    }
+
+    /// Whether a credential of any kind is stored for `provider_id` in the auth
+    /// file. Used by the `/login` status badges and model-availability checks;
+    /// it reads only the presence of an entry, never the secret material.
+    pub(crate) fn has_credentials(&self, provider_id: &str) -> Result<bool> {
+        Ok(AuthFile::read_or_default(&self.path)?
+            .providers
+            .contains_key(provider_id))
+    }
+
+    /// List the providers with stored credentials and the credential kind, for
+    /// the `/logout` selector. Returns no secret values -- only the provider id
+    /// and whether the stored entry is an OAuth or API-key credential, so the
+    /// caller can phrase the right "logged out" vs "removed API key" message.
+    pub(crate) fn stored_credentials(&self) -> Result<Vec<StoredCredential>> {
+        let auth = AuthFile::read_or_default(&self.path)?;
+        let mut stored: Vec<StoredCredential> = auth
+            .providers
+            .iter()
+            .map(|(provider_id, value)| StoredCredential {
+                provider_id: provider_id.clone(),
+                kind: CredentialKind::from_value(value),
+            })
+            .collect();
+        stored.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+        Ok(stored)
+    }
+
+    /// Remove the stored credential for `provider_id`, returning whether an entry
+    /// existed. Only the auth-file entry is touched; environment variables and
+    /// any external (e.g. Claude Code) credentials are left untouched. A missing
+    /// auth file is treated as "nothing to remove".
+    pub(crate) fn remove_credentials(&self, provider_id: &str) -> Result<bool> {
+        let mut auth = AuthFile::read_or_default(&self.path)?;
+        if auth.providers.remove(provider_id).is_none() {
+            return Ok(false);
+        }
+        auth.write(&self.path)?;
+        Ok(true)
+    }
+}
+
+/// A stored credential's provider and kind, with no secret material attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredCredential {
+    pub(crate) provider_id: String,
+    pub(crate) kind: CredentialKind,
+}
+
+/// The kind of a stored credential, inferred from its `type` field. Used only to
+/// pick the right user-facing message; never carries the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialKind {
+    OAuth,
+    ApiKey,
+    Unknown,
+}
+
+impl CredentialKind {
+    fn from_value(value: &Value) -> Self {
+        match value.get("type").and_then(Value::as_str) {
+            Some("oauth") => CredentialKind::OAuth,
+            Some("api_key") => CredentialKind::ApiKey,
+            _ => CredentialKind::Unknown,
+        }
     }
 }
 
@@ -202,9 +280,71 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn lists_and_removes_only_stored_credentials_without_secrets() -> Result<()> {
+        let dir = unique_test_dir()?;
+        let path = dir.join("auth.json");
+        fs::write(
+            &path,
+            r#"{
+              "openai-codex": {"type": "oauth", "access": "a", "refresh": "r", "expires": 9},
+              "some-provider": {"type": "api_key", "key": "sk-secret"}
+            }"#,
+        )?;
+        let store = AuthStore { path: path.clone() };
+
+        // Listing reports provider + kind, sorted, with no secret material.
+        let stored = store.stored_credentials()?;
+        assert_eq!(
+            stored,
+            vec![
+                StoredCredential {
+                    provider_id: "openai-codex".to_string(),
+                    kind: CredentialKind::OAuth,
+                },
+                StoredCredential {
+                    provider_id: "some-provider".to_string(),
+                    kind: CredentialKind::ApiKey,
+                },
+            ]
+        );
+        assert!(store.has_credentials("openai-codex")?);
+        assert!(!store.has_credentials("anthropic")?);
+
+        // Removing an entry rewrites the file and reports it existed; the other
+        // provider's credential is preserved.
+        assert!(store.remove_credentials("openai-codex")?);
+        assert!(!store.remove_credentials("openai-codex")?);
+        assert!(!store.has_credentials("openai-codex")?);
+        let remaining = fs::read_to_string(&path)?;
+        assert!(remaining.contains("some-provider"));
+        assert!(!remaining.contains("openai-codex"));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_auth_file_lists_nothing_and_removes_nothing() -> Result<()> {
+        let dir = unique_test_dir()?;
+        let store = AuthStore {
+            path: dir.join("missing.json"),
+        };
+        assert!(store.stored_credentials()?.is_empty());
+        assert!(!store.has_credentials("openai-codex")?);
+        assert!(!store.remove_credentials("openai-codex")?);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     fn unique_test_dir() -> Result<PathBuf> {
-        let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-        let path = env::temp_dir().join(format!("iris-auth-test-{millis}"));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!(
+            "iris-auth-test-{nanos}-{}-{seq}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path)?;
         Ok(path)
     }

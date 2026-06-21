@@ -32,6 +32,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::nexus::{ApprovalDecision, ToolCall};
 use crate::tool_display::{exploration_summary, is_exploration_tool, run_target, summarize};
+use crate::ui::modal::Modal;
 use crate::ui::slash::{self, Palette, SlashCommand};
 use crate::ui::{TurnErrorKind, UiEvent};
 
@@ -1011,6 +1012,9 @@ pub(crate) struct Screen {
     spinner: Spinner,
     /// Short status-row hint while a gated tool awaits the user's decision.
     approval_hint: Option<ApprovalHint>,
+    /// The active picker/dialog, when one is open. While present it replaces the
+    /// editor area and the loop routes keys to it instead of the editor.
+    pub(crate) modal: Option<Modal>,
 }
 
 impl Screen {
@@ -1021,7 +1025,25 @@ impl Screen {
             palette: Palette::default(),
             spinner: Spinner::default(),
             approval_hint: None,
+            modal: None,
         }
+    }
+
+    // --- modal/picker ---
+
+    /// Open a picker/dialog, replacing the editor until it closes.
+    pub(crate) fn open_modal(&mut self, modal: Modal) {
+        self.modal = Some(modal);
+    }
+
+    /// Close the active picker and restore the editor.
+    pub(crate) fn close_modal(&mut self) {
+        self.modal = None;
+    }
+
+    /// Whether a picker/dialog is currently open.
+    pub(crate) fn modal_open(&self) -> bool {
+        self.modal.is_some()
     }
 
     // --- transcript ---
@@ -1304,6 +1326,13 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
         return;
     }
 
+    // A picker/dialog replaces the editor area entirely: the active transcript
+    // stays on top, the modal occupies the bottom, framed in its own border.
+    if screen.modal.is_some() {
+        render_with_modal(frame, screen, area);
+        return;
+    }
+
     let editor_rows = editor_visual_rows(&screen.editor, area.width);
     let input_text = screen.editor_text();
     let palette_active = screen.palette.is_active(&input_text);
@@ -1377,6 +1406,44 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
 
     // The TextArea draws its own border (set in `fresh_editor`) and cursor.
     frame.render_widget(&screen.editor, editor_area);
+}
+
+/// Render the active transcript on top and the open modal in a bordered box at
+/// the bottom, in place of the editor/palette/status rows. The modal box is
+/// sized to its content but clamped so the transcript keeps at least one row.
+fn render_with_modal(frame: &mut Frame, screen: &mut Screen, area: Rect) {
+    let Some(modal) = &screen.modal else {
+        return;
+    };
+    let lines = modal.render(area.width.saturating_sub(2));
+    let body_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    // content rows + top/bottom border, leaving at least one transcript row.
+    let max_modal_h = area.height.saturating_sub(1).max(1);
+    // Prefer at least 3 rows (border + one line), but never exceed the available
+    // height: on a tiny terminal `max_modal_h` can be 1-2, so cap last. Using
+    // `clamp(3, max_modal_h)` here would panic when max < min.
+    let modal_h = body_rows.saturating_add(2).max(3).min(max_modal_h);
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(modal_h)]).split(area);
+    let active_area = chunks[0];
+    let modal_area = chunks[1];
+
+    if active_area.height > 0 {
+        let active_lines = screen.transcript.render(active_area.width);
+        let total = u16::try_from(active_lines.len()).unwrap_or(u16::MAX);
+        let scroll = total.saturating_sub(active_area.height);
+        frame.render_widget(
+            Paragraph::new(Text::from(active_lines)).scroll((scroll, 0)),
+            active_area,
+        );
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(prompt_style())
+        .title(Span::styled(format!(" {} ", modal.title()), prompt_style()));
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Commit finalized transcript `lines` into the terminal's native scrollback,
@@ -2425,6 +2492,68 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn modal_render_survives_a_tiny_terminal() -> Result<()> {
+        use crate::mimir::model_catalog::CatalogModel;
+        use crate::mimir::selection::ProviderId;
+        use crate::ui::modal::{Modal, ModelPicker};
+
+        // A 3-row (and 2-row) terminal must not panic on the modal height clamp.
+        for height in [2u16, 3, 4] {
+            let mut terminal = Terminal::new(TestBackend::new(40, height))?;
+            let mut screen = Screen::new();
+            screen.open_modal(Modal::Model(ModelPicker::new(
+                vec![CatalogModel {
+                    provider: ProviderId::OpenAiCodex,
+                    id: "gpt-5.5".to_string(),
+                }],
+                None,
+                "openai-codex/gpt-5.5",
+                "",
+            )));
+            terminal.draw(|f| render(f, &mut screen))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_modal_renders_picker_frame_in_place_of_editor() -> Result<()> {
+        use crate::mimir::model_catalog::CatalogModel;
+        use crate::mimir::selection::ProviderId;
+        use crate::ui::modal::{Modal, ModelPicker};
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 14))?;
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantText("prior reply".to_string()));
+        let models = vec![
+            CatalogModel {
+                provider: ProviderId::OpenAiCodex,
+                id: "gpt-5.5".to_string(),
+            },
+            CatalogModel {
+                provider: ProviderId::Anthropic,
+                id: "claude-sonnet-4-6".to_string(),
+            },
+        ];
+        screen.open_modal(Modal::Model(ModelPicker::new(
+            models,
+            None,
+            "openai-codex/gpt-5.5",
+            "",
+        )));
+        terminal.draw(|f| render(f, &mut screen))?;
+
+        let rendered = buffer_text(&terminal);
+        // Transcript still on top; the modal frame replaces the editor below.
+        assert!(rendered.contains("prior reply"), "{rendered}");
+        assert!(rendered.contains("Select model"), "{rendered}");
+        assert!(rendered.contains("gpt-5.5"), "{rendered}");
+        assert!(rendered.contains("claude-sonnet-4-6"), "{rendered}");
+        // The editor placeholder is hidden while the modal is open.
+        assert!(!rendered.contains("Type a message"), "{rendered}");
+        Ok(())
     }
 
     #[test]

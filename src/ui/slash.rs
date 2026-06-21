@@ -52,6 +52,26 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         description: "Set reasoning/thinking effort",
         action: SlashAction::Submit,
     },
+    SlashCommand {
+        name: "/scoped-models",
+        description: "Enable/disable models for Ctrl+P cycling",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/settings",
+        description: "Open settings menu",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/login",
+        description: "Configure provider authentication",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/logout",
+        description: "Remove provider authentication",
+        action: SlashAction::Submit,
+    },
 ];
 
 /// Whether `input` is a command line: a single line beginning with `/`. A
@@ -155,7 +175,7 @@ mod tests {
 
     #[test]
     fn matches_filters_by_prefix_case_insensitively() {
-        assert_eq!(matches("/").len(), 4);
+        assert_eq!(matches("/").len(), 8);
         let ex = matches("/EX");
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name, "/exit");
@@ -182,16 +202,16 @@ mod tests {
         p.sync("/");
         assert!(p.is_active("/"));
         assert_eq!(p.selected(), 0);
-        // Registry order: /exit, /quit, /model, /reasoning. Down walks to the
-        // last row, then clamps there.
-        for _ in 0..10 {
+        // Registry order ends with /logout (8 commands). Down walks to the last
+        // row, then clamps there.
+        for _ in 0..20 {
             p.down("/");
         }
-        assert_eq!(p.selected(), 3);
-        assert_eq!(p.accept("/").unwrap().name, "/reasoning");
+        assert_eq!(p.selected(), 7);
+        assert_eq!(p.accept("/").unwrap().name, "/logout");
         // Up returns toward the top.
         p.up();
-        assert_eq!(p.accept("/").unwrap().name, "/model");
+        assert_eq!(p.accept("/").unwrap().name, "/login");
     }
 
     #[test]

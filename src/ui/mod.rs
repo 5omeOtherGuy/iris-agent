@@ -6,7 +6,11 @@ use crate::nexus::{
     AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ToolCall,
 };
 
+pub(crate) mod login;
 pub(crate) mod markdown;
+pub(crate) mod modal;
+pub(crate) mod picker;
+pub(crate) mod selector;
 pub(crate) mod slash;
 
 /// True when `lines[i]` begins a unified-diff file header: a `--- ` line

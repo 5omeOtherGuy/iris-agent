@@ -21,9 +21,13 @@ use crate::wayland::Harness;
 /// installs it through [`Harness::replace_provider`]. Threaded into both
 /// front-ends so one handler serves the text loop and the TUI loop.
 pub(crate) struct ModelSwitch<'a, P> {
-    selection: ModelSelection,
+    pub(crate) selection: ModelSelection,
     system_prompt: String,
     build: &'a dyn Fn(&ModelSelection, &str) -> Result<P>,
+    /// Ordered `provider/model` ids that scope Ctrl+P cycling, or `None` to cycle
+    /// every authenticated model. Seeded from `settings.enabled_models` and edited
+    /// by `/scoped-models`; only the picker's Ctrl+S persists it back to settings.
+    scoped: Option<Vec<String>>,
 }
 
 impl<'a, P> ModelSwitch<'a, P> {
@@ -31,12 +35,30 @@ impl<'a, P> ModelSwitch<'a, P> {
         selection: ModelSelection,
         system_prompt: String,
         build: &'a dyn Fn(&ModelSelection, &str) -> Result<P>,
+        scoped: Option<Vec<String>>,
     ) -> Self {
         Self {
             selection,
             system_prompt,
             build,
+            scoped,
         }
+    }
+
+    /// The active resolved selection (provider/model/base-url/reasoning).
+    pub(crate) fn selection(&self) -> &ModelSelection {
+        &self.selection
+    }
+
+    /// The current Ctrl+P cycle scope (ordered qualified ids), or `None` for
+    /// "cycle all authenticated models".
+    pub(crate) fn scoped(&self) -> Option<&[String]> {
+        self.scoped.as_deref()
+    }
+
+    /// Replace the session cycle scope. `None`/empty clears it.
+    pub(crate) fn set_scoped(&mut self, scoped: Option<Vec<String>>) {
+        self.scoped = scoped.filter(|ids| !ids.is_empty());
     }
 }
 
@@ -124,31 +146,41 @@ fn parse_model_target(rest: &str, current: &ModelSelection) -> Result<ModelSelec
     if model.is_empty() {
         bail!("usage: /model <provider>/<model> or /model <model>");
     }
-    // A model-only switch keeps the resolved base url (which respected the
-    // global settings value); a provider switch recomputes from the new
-    // provider's env + default, since a configured base url binds to the
-    // originally selected provider and must not redirect a different one.
+    Ok(candidate_for(current, provider, &model))
+}
+
+/// Build a candidate selection for a (provider, model), carrying base-url and
+/// reasoning forward the same way `/model` does: a model-only switch keeps the
+/// resolved base url (which respected the global settings value); a provider
+/// switch recomputes from the new provider's env + default, since a configured
+/// base url binds to the originally selected provider and must not redirect a
+/// different one. The current reasoning is clamped to the new model. Reused by
+/// the model picker and Ctrl+P cycling so they switch exactly like `/model`.
+pub(crate) fn candidate_for(
+    current: &ModelSelection,
+    provider: ProviderId,
+    model: &str,
+) -> ModelSelection {
     let base_url = if provider == current.provider {
         current.base_url.clone()
     } else {
         selection::base_url_for(provider, None)
     };
-    // Carry the current reasoning, clamped to whatever the new model supports.
     let reasoning = current
         .reasoning
-        .map(|level| model_capabilities::clamp(provider, &model, level));
-    Ok(ModelSelection {
+        .map(|level| model_capabilities::clamp(provider, model, level));
+    ModelSelection {
         provider,
-        model,
+        model: model.to_string(),
         base_url,
         reasoning,
-    })
+    }
 }
 
 /// Validate, rebuild the provider, install it at the safe boundary, and record
 /// the audit event. Any failure (unsupported reasoning, build/auth error) leaves
 /// the active selection and provider untouched.
-fn apply_selection<P: ChatProvider>(
+pub(crate) fn apply_selection<P: ChatProvider>(
     candidate: ModelSelection,
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
@@ -178,6 +210,19 @@ fn apply_selection<P: ChatProvider>(
     );
     switch.selection = candidate;
     vec![confirm]
+}
+
+/// Picker-only slash commands that require the interactive TUI. In the non-TTY
+/// text path these are reported as unavailable instead of being sent to the
+/// model; `/model` and `/reasoning` keep working as text commands.
+fn picker_only_command(prompt: &str) -> Option<&'static str> {
+    match prompt.split_whitespace().next().unwrap_or("") {
+        "/scoped-models" => Some("/scoped-models"),
+        "/settings" => Some("/settings"),
+        "/login" => Some("/login"),
+        "/logout" => Some("/logout"),
+        _ => None,
+    }
 }
 
 /// Read-only `/model` view: current provider/model/reasoning + supported levels.
@@ -266,6 +311,15 @@ fn run_session_inner<P: ChatProvider>(
         }
         if slash::is_exit(prompt) {
             break;
+        }
+        // Picker-only commands need the interactive TUI; in the non-TTY text path
+        // they are a no-op status rather than being sent to the model. `/model`
+        // and `/reasoning` keep their existing text behavior below.
+        if let Some(name) = picker_only_command(prompt) {
+            ui.emit(UiEvent::Notice(format!(
+                "{name} is only available in the interactive TUI"
+            )))?;
+            continue;
         }
         // Mode switches are handled at this safe inter-turn boundary, never sent
         // to the model. The shared handler validates/rebuilds/records and returns
@@ -404,6 +458,7 @@ mod tests {
             selection(ProviderId::OpenAiCodex, "gpt-5.5"),
             "PROMPT".to_string(),
             &build,
+            None,
         ));
         let lines = handle_model_command("/model", &mut harness, &mut switch).expect("handled");
         assert!(lines[0].contains("openai-codex/gpt-5.5"), "{lines:?}");
@@ -422,6 +477,7 @@ mod tests {
             selection(ProviderId::OpenAiCodex, "gpt-5.5"),
             "PROMPT".to_string(),
             &build,
+            None,
         ));
         let lines = handle_model_command(
             "/model anthropic/claude-sonnet-4-6",
@@ -450,6 +506,7 @@ mod tests {
             selection(ProviderId::OpenAiCodex, "gpt-5.5"),
             "PROMPT".to_string(),
             &build,
+            None,
         ));
         // Unknown provider: rejected, selection unchanged.
         let bad =
@@ -478,6 +535,7 @@ mod tests {
             selection(ProviderId::OpenAiCodex, "gpt-5.5"),
             "PROMPT".to_string(),
             &build,
+            None,
         ));
         let lines =
             handle_model_command("/reasoning xhigh", &mut harness, &mut switch).expect("handled");
@@ -518,6 +576,7 @@ mod tests {
             selection(ProviderId::OpenAiCodex, "gpt-5.5"),
             "PROMPT".to_string(),
             &build,
+            None,
         ));
         let lines =
             handle_model_command("/reasoning turbo", &mut harness, &mut switch).expect("handled");
@@ -539,6 +598,7 @@ mod tests {
             selection(ProviderId::OpenAiCodex, "gpt-5.5"),
             "PROMPT".to_string(),
             &build,
+            None,
         ));
         // An ordinary message is not a command -> falls through to a normal turn.
         assert!(handle_model_command("hello there", &mut harness, &mut switch).is_none());

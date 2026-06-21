@@ -59,6 +59,46 @@ fn anthropic_supported_levels(model: &str) -> &'static [ReasoningEffort] {
     }
 }
 
+/// Whether the model exposes any thinking level beyond `off`. A non-reasoning
+/// model exposes only `off`; pi-mono shows "Current model does not support
+/// thinking" for those. All three Iris providers support reasoning today, but
+/// this stays general so a future non-reasoning model is handled.
+pub(crate) fn supports_thinking(provider: ProviderId, model: &str) -> bool {
+    supported_levels(provider, model)
+        .iter()
+        .any(|level| *level != ReasoningEffort::Off)
+}
+
+/// Advance to the next available thinking level for the model, with wraparound,
+/// matching pi-mono's `app.thinking.cycle`. `forward` walks toward higher
+/// effort; `false` walks back. Returns `None` when the model does not support
+/// thinking. A `current` level the model does not natively expose is first
+/// clamped onto the supported set, then advanced.
+pub(crate) fn cycle_effort(
+    provider: ProviderId,
+    model: &str,
+    current: ReasoningEffort,
+    forward: bool,
+) -> Option<ReasoningEffort> {
+    if !supports_thinking(provider, model) {
+        return None;
+    }
+    let levels = supported_levels(provider, model);
+    // Locate the current level, or the clamped stand-in if it is unsupported.
+    let clamped = clamp(provider, model, current);
+    let idx = levels
+        .iter()
+        .position(|level| *level == clamped)
+        .unwrap_or(0);
+    let len = levels.len();
+    let next = if forward {
+        (idx + 1) % len
+    } else {
+        (idx + len - 1) % len
+    };
+    Some(levels[next])
+}
+
 /// Validate an explicit reasoning preference against the active model. `None`
 /// always passes (no preference -> today's wire). `Some(level)` errors with an
 /// actionable message when the level is not natively supported, so a configured
@@ -179,6 +219,63 @@ mod tests {
             ),
             ReasoningEffort::High
         );
+    }
+
+    #[test]
+    fn cycle_effort_wraps_within_supported_levels() {
+        // Codex supports off..xhigh (6 levels): high -> xhigh -> wrap to off.
+        assert_eq!(
+            cycle_effort(
+                ProviderId::OpenAiCodex,
+                "gpt-5.5",
+                ReasoningEffort::High,
+                true
+            ),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            cycle_effort(
+                ProviderId::OpenAiCodex,
+                "gpt-5.5",
+                ReasoningEffort::XHigh,
+                true
+            ),
+            Some(ReasoningEffort::Off)
+        );
+        // Backward from off wraps to the top (xhigh).
+        assert_eq!(
+            cycle_effort(
+                ProviderId::OpenAiCodex,
+                "gpt-5.5",
+                ReasoningEffort::Off,
+                false
+            ),
+            Some(ReasoningEffort::XHigh)
+        );
+        // Anthropic Sonnet tops out at high: xhigh clamps to high first, so the
+        // forward step wraps to off rather than panicking on an unsupported id.
+        assert_eq!(
+            cycle_effort(
+                ProviderId::Anthropic,
+                "claude-sonnet-4-6",
+                ReasoningEffort::XHigh,
+                true
+            ),
+            Some(ReasoningEffort::Off)
+        );
+    }
+
+    #[test]
+    fn supports_thinking_is_true_for_reasoning_providers() {
+        assert!(supports_thinking(ProviderId::OpenAiCodex, "gpt-5.5"));
+        assert!(supports_thinking(
+            ProviderId::Antigravity,
+            "gemini-3.5-flash"
+        ));
+        assert!(supports_thinking(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6"
+        ));
     }
 
     #[test]

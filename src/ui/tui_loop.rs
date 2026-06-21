@@ -32,10 +32,14 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ModelSwitch;
+use crate::mimir::auth::storage::AuthStore;
 use crate::nexus::{
     AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ToolCall,
 };
 use crate::ui::UiEvent;
+use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
+use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
+use crate::ui::picker::{self, ActionResult, ModelCommand};
 use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::tui::{Screen, TuiUi};
 use crate::wayland::Harness;
@@ -66,6 +70,12 @@ pub(crate) fn run<P: ChatProvider>(
 enum IdleOutcome {
     Submit(String),
     Exit,
+    /// Ctrl+L: open the model picker.
+    OpenModelPicker,
+    /// Ctrl+P (forward) / Shift+Ctrl+P (backward): cycle the model.
+    CycleModel(bool),
+    /// Shift+Tab: cycle the thinking/effort level.
+    CycleEffort,
 }
 
 /// Per-key outcome inside the idle phase.
@@ -76,6 +86,9 @@ enum IdleKey {
     Ignore,
     Submit(String),
     Exit,
+    OpenModelPicker,
+    CycleModel(bool),
+    CycleEffort,
 }
 
 /// A gated tool waiting for the user's decision: the reply channel back into the
@@ -112,9 +125,32 @@ async fn session_loop<P: ChatProvider>(
     // can steal that response and make startup fail.
     spawn_input_thread(input_tx, current_turn.clone());
 
+    // The production OAuth backend; `/login` drives it on a blocking task.
+    let login_backend: Arc<dyn LoginBackend> = Arc::new(OAuthLoginBackend);
+
     loop {
         match idle_phase(tui, &mut input_rx, &mut tick).await? {
             IdleOutcome::Exit => break,
+            IdleOutcome::OpenModelPicker => {
+                if let Some(sw) = switch.as_mut() {
+                    match picker::model_command("", harness, sw) {
+                        ModelCommand::Open(modal) => tui.screen.open_modal(modal),
+                        ModelCommand::Lines(lines) => apply_notices(tui, lines),
+                    }
+                }
+            }
+            IdleOutcome::CycleModel(forward) => {
+                if let Some(sw) = switch.as_mut() {
+                    let lines = picker::cycle_model(forward, harness, sw);
+                    apply_notices(tui, lines);
+                }
+            }
+            IdleOutcome::CycleEffort => {
+                if let Some(sw) = switch.as_mut() {
+                    let lines = picker::cycle_effort(harness, sw);
+                    apply_notices(tui, lines);
+                }
+            }
             IdleOutcome::Submit(prompt) => {
                 let prompt = prompt.trim().to_string();
                 if prompt.is_empty() {
@@ -125,35 +161,127 @@ async fn session_loop<P: ChatProvider>(
                 if slash::is_exit(&prompt) {
                     break;
                 }
-                // Mode switches are handled at this safe inter-turn boundary and
-                // never start a turn: the shared handler does the switch and
-                // returns the lines to show.
-                if let Some(lines) = crate::cli::handle_model_command(&prompt, harness, switch) {
+                // Picker/model/reasoning commands are handled at this safe
+                // inter-turn boundary and never start a turn.
+                if route_command(&prompt, harness, tui, switch)? {
+                    // handled (a modal may now be open; run it below)
+                } else {
                     tui.screen.commit_user(&prompt);
-                    for line in lines {
-                        tui.screen.apply_event(UiEvent::Notice(line));
-                    }
+                    tui.screen.start_turn();
                     tui.draw()?;
-                    continue;
+                    run_turn(
+                        harness,
+                        tui,
+                        &mut input_rx,
+                        &mut tick,
+                        &current_turn,
+                        &prompt,
+                    )
+                    .await?;
+                    tui.screen.end_turn();
+                    tui.draw()?;
                 }
-                tui.screen.commit_user(&prompt);
-                tui.screen.start_turn();
-                tui.draw()?;
-                run_turn(
-                    harness,
-                    tui,
-                    &mut input_rx,
-                    &mut tick,
-                    &current_turn,
-                    &prompt,
-                )
-                .await?;
-                tui.screen.end_turn();
-                tui.draw()?;
             }
+        }
+        tui.draw()?;
+        // A command/keybinding may have opened a picker/dialog. Run it to
+        // completion here, where harness + switch are in scope; switches land at
+        // this same inter-turn boundary.
+        if tui.screen.modal_open() {
+            run_modal_phase(
+                harness,
+                tui,
+                &mut input_rx,
+                &mut tick,
+                switch,
+                &login_backend,
+            )
+            .await?;
         }
     }
     Ok(())
+}
+
+/// Append status/notice lines to the transcript (no draw).
+fn apply_notices(tui: &mut TuiUi, lines: Vec<String>) {
+    for line in lines {
+        tui.screen.apply_event(UiEvent::Notice(line));
+    }
+}
+
+/// Route a submitted `/` command to its picker/handler. Returns whether the line
+/// was consumed (so the loop does not start a turn). `/login`/`/logout` with
+/// arguments are intentionally not recognized (pi-mono parity) and fall through
+/// to a normal turn.
+fn route_command<P: ChatProvider>(
+    prompt: &str,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+) -> Result<bool> {
+    let trimmed = prompt.trim();
+    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (trimmed, ""),
+    };
+    match cmd {
+        "/model" => {
+            let Some(sw) = switch.as_mut() else {
+                return Ok(false);
+            };
+            tui.screen.commit_user(prompt);
+            match picker::model_command(rest, harness, sw) {
+                ModelCommand::Open(modal) => tui.screen.open_modal(modal),
+                ModelCommand::Lines(lines) => apply_notices(tui, lines),
+            }
+            Ok(true)
+        }
+        "/scoped-models" => {
+            let Some(sw) = switch.as_mut() else {
+                return Ok(false);
+            };
+            tui.screen.commit_user(prompt);
+            match picker::open_scoped(sw) {
+                ModelCommand::Open(modal) => tui.screen.open_modal(modal),
+                ModelCommand::Lines(lines) => apply_notices(tui, lines),
+            }
+            Ok(true)
+        }
+        "/settings" => {
+            let Some(sw) = switch.as_mut() else {
+                return Ok(false);
+            };
+            tui.screen.commit_user(prompt);
+            tui.screen.open_modal(picker::open_settings(sw));
+            Ok(true)
+        }
+        "/login" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            tui.screen.open_modal(login::open_login());
+            Ok(true)
+        }
+        "/logout" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            match AuthStore::from_env() {
+                Ok(auth) => match login::open_logout(&auth) {
+                    login::LoginStep::Open(modal) => tui.screen.open_modal(modal),
+                    login::LoginStep::Lines(lines) => apply_notices(tui, lines),
+                },
+                Err(error) => apply_notices(tui, vec![format!("auth unavailable: {error:#}")]),
+            }
+            Ok(true)
+        }
+        "/reasoning" => {
+            // Legacy text effort path is preserved as a compatible alias. It
+            // takes the whole `Option<ModelSwitch>` like the text driver does.
+            tui.screen.commit_user(prompt);
+            if let Some(lines) = crate::cli::handle_model_command(prompt, harness, switch) {
+                apply_notices(tui, lines);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Read and edit until the user submits a non-empty prompt or exits. The spinner
@@ -173,6 +301,9 @@ async fn idle_phase(
                     IdleKey::Ignore => {}
                     IdleKey::Submit(text) => return Ok(IdleOutcome::Submit(text)),
                     IdleKey::Exit => return Ok(IdleOutcome::Exit),
+                    IdleKey::OpenModelPicker => return Ok(IdleOutcome::OpenModelPicker),
+                    IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
+                    IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
                 }
             }
             _ = tick.tick() => {}
@@ -279,6 +410,245 @@ async fn run_turn<P: ChatProvider>(
     Ok(())
 }
 
+/// Drive an open picker/dialog to completion: route keys to the modal, apply the
+/// outcomes (model/effort switches, scoped edits, login/logout) at this safe
+/// inter-turn boundary, and return when the modal closes (or input ends).
+async fn run_modal_phase<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    input_rx: &mut UnboundedReceiver<Event>,
+    tick: &mut tokio::time::Interval,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    login_backend: &Arc<dyn LoginBackend>,
+) -> Result<()> {
+    while tui.screen.modal_open() {
+        tokio::select! {
+            maybe = input_rx.recv() => {
+                let Some(event) = maybe else {
+                    // Terminal input ended: close the picker and return.
+                    tui.screen.close_modal();
+                    break;
+                };
+                match to_modal_key(&event) {
+                    Some(key) => {
+                        let outcome = match tui.screen.modal.as_mut() {
+                            Some(modal) => modal.handle_key(key),
+                            None => break,
+                        };
+                        apply_modal_outcome(
+                            outcome, harness, tui, input_rx, tick, switch, login_backend,
+                        )
+                        .await?;
+                        tui.draw()?;
+                    }
+                    None => tui.draw()?,
+                }
+            }
+            _ = tick.tick() => {}
+        }
+    }
+    Ok(())
+}
+
+/// Interpret one [`ModalOutcome`].
+async fn apply_modal_outcome<P: ChatProvider>(
+    outcome: ModalOutcome,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    input_rx: &mut UnboundedReceiver<Event>,
+    tick: &mut tokio::time::Interval,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    login_backend: &Arc<dyn LoginBackend>,
+) -> Result<()> {
+    match outcome {
+        ModalOutcome::Ignore | ModalOutcome::Redraw => {}
+        ModalOutcome::Close => tui.screen.close_modal(),
+        ModalOutcome::Emit(action) => {
+            dispatch_action(action, harness, tui, input_rx, tick, switch, login_backend).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply a [`ModalAction`]: model/scoped/effort actions go through the picker;
+/// login/logout actions are handled here (they need the auth store / backend).
+async fn dispatch_action<P: ChatProvider>(
+    action: ModalAction,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    input_rx: &mut UnboundedReceiver<Event>,
+    tick: &mut tokio::time::Interval,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    login_backend: &Arc<dyn LoginBackend>,
+) -> Result<()> {
+    match action {
+        ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {
+            Ok(auth) => match login::provider_select(method, &auth) {
+                login::LoginStep::Open(modal) => tui.screen.open_modal(modal),
+                login::LoginStep::Lines(lines) => {
+                    apply_notices(tui, lines);
+                    tui.screen.close_modal();
+                }
+            },
+            Err(error) => {
+                apply_notices(tui, vec![format!("auth unavailable: {error:#}")]);
+                tui.screen.close_modal();
+            }
+        },
+        ModalAction::BackToLoginMethod => tui.screen.open_modal(login::open_login()),
+        ModalAction::BeginLogin(provider) => {
+            run_login(provider, tui, input_rx, tick, login_backend).await?;
+        }
+        ModalAction::Logout(id) => {
+            let lines = match AuthStore::from_env() {
+                Ok(auth) => login::apply_logout(&id, &auth),
+                Err(error) => vec![format!("auth unavailable: {error:#}")],
+            };
+            apply_notices(tui, lines);
+            tui.screen.close_modal();
+        }
+        // Model / scoped / effort / settings actions.
+        other => {
+            let Some(sw) = switch.as_mut() else {
+                tui.screen.close_modal();
+                return Ok(());
+            };
+            match picker::apply_action(other, harness, sw) {
+                ActionResult::Close(lines) => {
+                    apply_notices(tui, lines);
+                    tui.screen.close_modal();
+                }
+                ActionResult::Keep(lines) => apply_notices(tui, lines),
+                ActionResult::Replace(modal, lines) => {
+                    apply_notices(tui, lines);
+                    tui.screen.open_modal(*modal);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolution of the blocking login task.
+enum LoginResolution {
+    Done(std::result::Result<Result<LoginOutcome>, tokio::task::JoinError>),
+    Cancelled,
+}
+
+/// Run a blocking OAuth login on a blocking task while keeping the dialog live:
+/// auth-URL / progress updates flow over a channel and Esc/Ctrl+C cancels.
+/// ponytail: cancel stops *waiting* and dismisses the dialog, but the adopted
+/// blocking helper is parked in `TcpListener::incoming()` on the OAuth callback
+/// port and cannot be force-aborted. So until the user's browser hits the
+/// callback (or the process exits) the orphaned thread keeps that port bound
+/// (a re-login attempt can fail to bind) and a late callback can still store
+/// credentials after the UI reported "Login cancelled" - harmless for the
+/// user's own account. Upgrade path: thread a cancel token into the auth
+/// helpers' accept loop and make the listener non-blocking with a deadline so
+/// cancel releases the port immediately.
+async fn run_login(
+    provider: crate::mimir::selection::ProviderId,
+    tui: &mut TuiUi,
+    input_rx: &mut UnboundedReceiver<Event>,
+    tick: &mut tokio::time::Interval,
+    login_backend: &Arc<dyn LoginBackend>,
+) -> Result<()> {
+    let name = provider.display_name().to_string();
+    let mut dialog = LoginDialog::new(&name);
+    tui.screen.open_modal(Modal::LoginDialog(dialog.clone()));
+    tui.draw()?;
+
+    let (upd_tx, mut upd_rx) = unbounded_channel::<LoginUpdate>();
+    let backend = Arc::clone(login_backend);
+    let join = tokio::task::spawn_blocking(move || {
+        backend.login(provider, &move |update| {
+            let _ = upd_tx.send(update);
+        })
+    });
+    let mut join = std::pin::pin!(join);
+
+    let resolution = loop {
+        tokio::select! {
+            res = &mut join => break LoginResolution::Done(res),
+            Some(update) = upd_rx.recv() => {
+                apply_login_update(&mut dialog, update);
+                tui.screen.open_modal(Modal::LoginDialog(dialog.clone()));
+                tui.draw()?;
+            }
+            maybe = input_rx.recv() => {
+                match maybe {
+                    Some(event) if is_modal_cancel(&event) => break LoginResolution::Cancelled,
+                    Some(_) => {}
+                    None => break LoginResolution::Cancelled,
+                }
+            }
+            _ = tick.tick() => {}
+        }
+    };
+
+    let lines = match resolution {
+        LoginResolution::Done(Ok(Ok(outcome))) => login::login_complete_lines(provider, &outcome),
+        LoginResolution::Done(Ok(Err(error))) => {
+            vec![format!("Failed to login to {name}: {error:#}")]
+        }
+        LoginResolution::Done(Err(join_error)) => vec![format!("Login task failed: {join_error}")],
+        LoginResolution::Cancelled => vec!["Login cancelled".to_string()],
+    };
+    apply_notices(tui, lines);
+    tui.screen.close_modal();
+    tui.draw()?;
+    Ok(())
+}
+
+/// Update the login dialog body from a backend callback.
+fn apply_login_update(dialog: &mut LoginDialog, update: LoginUpdate) {
+    match update {
+        LoginUpdate::AuthUrl { url, hint } => {
+            dialog.set_lines(vec![format!("Open: {url}"), hint]);
+        }
+        LoginUpdate::Progress(line) => dialog.push_line(line),
+    }
+}
+
+/// Whether an event is a modal cancel (Esc or Ctrl+C).
+fn is_modal_cancel(event: &Event) -> bool {
+    matches!(event, Event::Key(key)
+        if (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat)
+            && (matches!(key.code, KeyCode::Esc)
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')))))
+}
+
+/// Translate a crossterm event into the modal's neutral key, or `None` for keys
+/// a picker does not consume.
+fn to_modal_key(event: &Event) -> Option<ModalKey> {
+    let Event::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return None;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    Some(match key.code {
+        KeyCode::Up if alt => ModalKey::AltUp,
+        KeyCode::Down if alt => ModalKey::AltDown,
+        KeyCode::Up => ModalKey::Up,
+        KeyCode::Down => ModalKey::Down,
+        KeyCode::Enter => ModalKey::Enter,
+        KeyCode::Tab => ModalKey::Tab,
+        KeyCode::Esc => ModalKey::Esc,
+        KeyCode::Backspace => ModalKey::Backspace,
+        KeyCode::Char('c') | KeyCode::Char('C') if ctrl => ModalKey::CtrlC,
+        KeyCode::Char('a') | KeyCode::Char('A') if ctrl => ModalKey::CtrlA,
+        KeyCode::Char('x') | KeyCode::Char('X') if ctrl => ModalKey::CtrlX,
+        KeyCode::Char('p') | KeyCode::Char('P') if ctrl => ModalKey::CtrlP,
+        KeyCode::Char('s') | KeyCode::Char('S') if ctrl => ModalKey::CtrlS,
+        KeyCode::Char(c) if !ctrl && !alt => ModalKey::Char(c),
+        _ => return None,
+    })
+}
+
 /// Spawn the blocking terminal-read thread. It forwards every event to the loop
 /// and, on a raw Ctrl-C while a turn is active, cancels that turn's token from
 /// this OS thread (the executor thread may be blocked in a synchronous tool).
@@ -342,7 +712,24 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let input = screen.editor_text();
+
+    // Global picker chords work regardless of editor contents (but not while the
+    // slash palette is steering Up/Down/Enter): Ctrl+L opens the model picker,
+    // Ctrl+P / Shift+Ctrl+P cycle models, Shift+Tab cycles effort.
+    if !screen.palette.is_active(&input) {
+        match key.code {
+            KeyCode::Char('l') | KeyCode::Char('L') if ctrl => {
+                return IdleKey::OpenModelPicker;
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') if ctrl => {
+                return IdleKey::CycleModel(!shift);
+            }
+            KeyCode::BackTab => return IdleKey::CycleEffort,
+            _ => {}
+        }
+    }
 
     // Palette navigation takes priority while it is open with matches.
     if screen.palette.is_active(&input) {
@@ -865,5 +1252,90 @@ mod tests {
         let mut release = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         release.kind = KeyEventKind::Release;
         assert!(!is_ctrl_c(&Event::Key(release)));
+    }
+
+    #[test]
+    fn idle_chords_open_picker_and_cycle() {
+        let mut screen = Screen::new();
+        // Ctrl+L opens the model picker.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::OpenModelPicker
+        ));
+        // Ctrl+P cycles forward; Ctrl+Shift+P cycles backward.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::CycleModel(true)
+        ));
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(
+                    KeyCode::Char('p'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                )
+            ),
+            IdleKey::CycleModel(false)
+        ));
+        // Shift+Tab (BackTab) cycles effort.
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::BackTab)),
+            IdleKey::CycleEffort
+        ));
+    }
+
+    #[test]
+    fn idle_chords_yield_to_an_active_palette() {
+        let mut screen = Screen::new();
+        // While the slash palette steers, Ctrl+P must not hijack navigation.
+        handle_idle_event(&mut screen, key(KeyCode::Char('/')));
+        assert!(screen.palette.is_active(&screen.editor_text()));
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue | IdleKey::Ignore
+        ));
+    }
+
+    #[test]
+    fn to_modal_key_maps_navigation_and_chords() {
+        assert_eq!(to_modal_key(&key(KeyCode::Up)), Some(ModalKey::Up));
+        assert_eq!(to_modal_key(&key(KeyCode::Enter)), Some(ModalKey::Enter));
+        assert_eq!(to_modal_key(&key(KeyCode::Tab)), Some(ModalKey::Tab));
+        assert_eq!(
+            to_modal_key(&key(KeyCode::Char('j'))),
+            Some(ModalKey::Char('j'))
+        );
+        assert_eq!(
+            to_modal_key(&key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(ModalKey::CtrlS)
+        );
+        assert_eq!(
+            to_modal_key(&key_mod(KeyCode::Up, KeyModifiers::ALT)),
+            Some(ModalKey::AltUp)
+        );
+        // Unmapped chords fall through to None (the modal ignores them).
+        assert_eq!(
+            to_modal_key(&key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn is_modal_cancel_matches_esc_and_ctrl_c() {
+        assert!(is_modal_cancel(&key(KeyCode::Esc)));
+        assert!(is_modal_cancel(&key_mod(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_modal_cancel(&key(KeyCode::Enter)));
     }
 }
