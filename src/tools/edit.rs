@@ -72,7 +72,9 @@ fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<
     let plan = build_edit(root, input)?;
     // `edit` only ever targets an existing file; require the agent to have seen
     // its current contents so a stale edit cannot silently clobber changes.
-    observed.ensure_fresh(&plan.resolved, plan.old_content.as_bytes())?;
+    if super::path::restrictions_enabled() {
+        observed.ensure_fresh(&plan.resolved, plan.old_content.as_bytes())?;
+    }
     atomic_write(&plan.resolved, plan.new_content.as_bytes())
         .with_context(|| format!("failed to write {}", input.file_path))?;
     observed.observe(&plan.resolved, plan.new_content.as_bytes());

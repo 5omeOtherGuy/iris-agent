@@ -60,7 +60,7 @@ fn write_file(root: &Path, input: &WriteInput, observed: &mut ObservedFiles) -> 
     // Overwriting an existing file requires that the agent has seen its current
     // contents; reject a blind clobber of changes made behind its back. A new
     // file (did not exist) is a blind create, which is allowed.
-    if target.exists() {
+    if super::path::restrictions_enabled() && target.exists() {
         observed.ensure_fresh(&target, old.as_bytes())?;
     }
     if let Some(parent) = target.parent() {

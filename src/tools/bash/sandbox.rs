@@ -1,10 +1,11 @@
 //! Kernel sandbox for the `bash` tool (Linux Landlock LSM).
 //!
-//! Nexus confines every shell command to a data-driven filesystem/network
-//! policy enforced by the kernel, not by string inspection. The default policy
-//! grants write access only to the workspace (plus `/dev/null`) and denies all
-//! TCP networking; reads and program execution are left unrestricted so the
-//! shell and its tools still run.
+//! Disabled by default for development. Set `IRIS_SECURITY_OPT_IN=1` to confine
+//! shell commands to a data-driven filesystem/network policy enforced by the
+//! kernel, not by string inspection. That policy grants write access only to the
+//! workspace (plus temp dirs and `/dev/null`) and denies all TCP networking;
+//! reads and program execution are left unrestricted so the shell and its tools
+//! still run.
 //!
 //! Enforcement happens in the child between `fork` and `exec` via
 //! [`CommandExt::pre_exec`]. To stay safe in a multi-threaded parent (a
@@ -73,6 +74,8 @@ impl SandboxPolicy {
 /// What the kernel can actually enforce for a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SandboxStatus {
+    /// Sandbox intentionally disabled.
+    Disabled,
     /// Filesystem and network policy both enforced.
     Enforced,
     /// Filesystem enforced, but the kernel's Landlock ABI is too old to confine
@@ -88,7 +91,7 @@ impl SandboxStatus {
     /// normal output carries no noise.
     pub(crate) fn notice(&self) -> Option<String> {
         match self {
-            Self::Enforced => None,
+            Self::Disabled | Self::Enforced => None,
             Self::FilesystemOnly => Some(
                 "sandbox: filesystem confined, but this kernel's Landlock ABI is \
                  too old to restrict TCP network access"
@@ -116,6 +119,9 @@ fn decide(abi: Option<u32>) -> SandboxStatus {
 /// Detect + apply: confine `command` to `policy` using the running kernel's
 /// Landlock support, returning what was actually enforced.
 pub(crate) fn confine(command: &mut Command, policy: &SandboxPolicy) -> SandboxStatus {
+    if !crate::tools::path::restrictions_enabled() {
+        return SandboxStatus::Disabled;
+    }
     apply(command, policy, detect_abi())
 }
 

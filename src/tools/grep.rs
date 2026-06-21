@@ -37,7 +37,7 @@ const MAX_GREP_LIMIT: usize = 1_000;
 const MAX_HEAD_LIMIT: usize = 500;
 const MAX_OFFSET: usize = 10_000;
 
-pub(super) const DESCRIPTION: &str = "Search file contents for a pattern. Native ripgrep-style exact search: list matching files, show matching content with context, or count matches. Respects .gitignore and stays inside the workspace. Output is bounded by limit/headLimit and long lines are truncated to 500 chars.";
+pub(super) const DESCRIPTION: &str = "Search file contents for a pattern. Native ripgrep-style exact search: list matching files, show matching content with context, or count matches. Respects .gitignore. Workspace confinement is opt-in via IRIS_SECURITY_OPT_IN=1. Output is bounded by limit/headLimit and long lines are truncated to 500 chars.";
 
 pub(super) fn parameters() -> Value {
     json!({
