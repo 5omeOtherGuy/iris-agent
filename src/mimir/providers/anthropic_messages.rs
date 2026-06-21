@@ -95,14 +95,23 @@ impl ChatProvider for AnthropicProvider {
         let cancel = cancel.clone();
         Ok(spawn_stream(
             move |sink, cancel| {
+                // Remember the token we last handed out so a forced refresh
+                // (after a 401) can tell the rejected token apart from one a
+                // concurrent refresh already rotated in -- otherwise a coalesced
+                // refresh could hand the rejected token straight back.
+                let mut last_token: Option<String> = None;
                 run_with_reauth(
                     cancel,
                     |force| {
-                        if force {
-                            provider.tokens.force_refresh(&provider.client)
+                        let token = if force {
+                            provider
+                                .tokens
+                                .force_refresh(&provider.client, last_token.as_deref())
                         } else {
                             provider.tokens.access_token(&provider.client)
-                        }
+                        }?;
+                        last_token = Some(token.clone());
+                        Ok(token)
                     },
                     |token| provider.send_once(token, &request, sink, cancel),
                 )

@@ -35,6 +35,12 @@ impl AuthStore {
         Self { path }
     }
 
+    /// The auth-file path. Used to key the per-source refresh lock so concurrent
+    /// refreshes of the same store coalesce; carries no secret material.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn oauth_credentials(&self, provider_id: &str) -> Result<OAuthCredentials> {
         AuthFile::read_or_default(&self.path)?
             .oauth_credentials(provider_id)
