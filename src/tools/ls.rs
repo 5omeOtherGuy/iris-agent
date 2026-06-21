@@ -1,7 +1,8 @@
 //! `ls` — list a directory: directories first, then files (case-insensitive),
 //! with `/` suffixes for directories. Optionally renders an indented tree up to
 //! a requested depth. Includes dotfiles. Symlinked directories are shown but not
-//! descended into, so the walk cannot loop or escape the workspace.
+//! descended into, so the walk cannot loop. Workspace confinement is opt-in via
+//! `IRIS_SECURITY_OPT_IN=1`.
 
 use std::fs;
 use std::path::Path;

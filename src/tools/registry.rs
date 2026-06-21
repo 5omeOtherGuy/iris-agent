@@ -145,7 +145,7 @@ impl Tool for BashTool {
         })
     }
     fn requires_approval(&self) -> bool {
-        true
+        path::restrictions_enabled()
     }
     fn is_destructive(&self, args: &Value) -> bool {
         bash_command_is_destructive(args)
@@ -181,7 +181,7 @@ impl Tool for EditTool {
         })
     }
     fn requires_approval(&self) -> bool {
-        true
+        path::restrictions_enabled()
     }
     fn supports_allow_always(&self) -> bool {
         // A blanket "always" on edit would authorize arbitrary later edits to
@@ -218,7 +218,7 @@ impl Tool for WriteTool {
         })
     }
     fn requires_approval(&self) -> bool {
-        true
+        path::restrictions_enabled()
     }
     fn supports_allow_always(&self) -> bool {
         // A blanket "always" on write would authorize arbitrary later writes to
