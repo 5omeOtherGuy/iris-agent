@@ -516,7 +516,11 @@ Potential scope:
   URL/long-token-safe (fits -> own row; over-long -> hard-break, never clipped),
   added flood-safe row-capped tool output, and added markdown rendering for
   assistant text via pulldown-cmark (`src/ui/markdown.rs`, raw/inline HTML text
-  preserved). Deferred during this slice and tracked as follow-ups: markdown
+  preserved). A later shortcut-parity pass aligned the TUI editor/model controls
+  with pi defaults: Shift+Enter (plus Ctrl+Enter/Ctrl+J fallbacks) inserts a
+  newline, Alt+Enter submits, Ctrl+L opens the model selector, Ctrl+P/
+  Shift+Ctrl+P cycles scoped models, Shift+Tab cycles reasoning, and editor
+  movement/deletion keys follow pi's defaults. Deferred during this slice and tracked as follow-ups: markdown
   streaming renders raw then snaps to formatted
   ([#87](https://github.com/5omeOtherGuy/iris-agent/issues/87)); markdown
   nested-context gaps -- code in blockquote/list, multi-paragraph list items
