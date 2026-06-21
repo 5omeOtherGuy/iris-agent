@@ -19,7 +19,10 @@ use std::io::{self, Stdout};
 use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend};
-use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Layout, Rect, Size};
@@ -39,7 +42,8 @@ use crate::ui::{TurnErrorKind, UiEvent};
 const BANNER_LINES: &[&str] = &["iris", "terminal-first coding agent", "Type /exit to quit."];
 
 /// Idle status-row hint: discoverability without a help screen.
-const IDLE_HINT: &str = "enter send \u{b7} alt+enter newline \u{b7} / commands \u{b7} ctrl-c quit";
+const IDLE_HINT: &str =
+    "enter send \u{b7} shift+enter newline \u{b7} / commands \u{b7} ctrl-c quit";
 
 /// Editor box grows with content up to this many text rows, then scrolls
 /// internally (keeps the transcript from being squeezed by a huge paste).
@@ -1126,7 +1130,7 @@ impl Screen {
         text
     }
 
-    /// Clear the editor without submitting (Ctrl-U / Ctrl-C on non-empty input).
+    /// Clear the editor without submitting (Ctrl-C on non-empty input).
     pub(crate) fn clear_editor(&mut self) {
         self.editor = fresh_editor();
         self.palette.sync("");
@@ -1491,7 +1495,7 @@ pub(crate) struct TuiUi {
 
 impl TuiUi {
     /// Enter raw mode ONCE and create an inline viewport for the session, plus
-    /// bracketed paste. Mouse capture is deliberately NOT enabled so the
+    /// bracketed paste and modified-key reporting. Mouse capture is deliberately NOT enabled so the
     /// terminal's own scroll/select/copy works over the native scrollback the
     /// inline viewport writes into. Restored on `drop`/`shutdown`, and by the
     /// signal handler's emergency escape on a force-quit.
@@ -1526,8 +1530,16 @@ impl TuiUi {
             }
         };
         let last_size = terminal.size()?;
-        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
-            let _ = execute!(io::stdout(), DisableBracketedPaste);
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        ) {
+            let _ = execute!(
+                io::stdout(),
+                DisableBracketedPaste,
+                PopKeyboardEnhancementFlags,
+            );
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -1588,7 +1600,11 @@ impl TuiUi {
             let _ = backend.clear_region(ClearType::AfterCursor);
             let _ = backend.set_cursor_position((0, area.y + area.height.saturating_sub(1)));
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste);
+            let _ = execute!(
+                io::stdout(),
+                DisableBracketedPaste,
+                PopKeyboardEnhancementFlags,
+            );
             let _ = backend.show_cursor();
             crate::signals::disable_terminal_restore_on_force_quit();
             crate::telemetry::set_tui_active(false);

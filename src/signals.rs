@@ -31,7 +31,7 @@ static SAVED_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_m
 // This is deliberately raw ANSI bytes so the signal handler can use `write(2)`
 // instead of running crossterm/Drop code.
 const TUI_FORCE_QUIT_RESTORE: &[u8] =
-    b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l";
+    b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<1u\x1b[?1049l";
 
 /// Install the SIGINT handler. Call once at startup.
 pub(crate) fn install() {

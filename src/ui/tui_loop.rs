@@ -754,7 +754,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
                 }
                 return IdleKey::Continue;
             }
-            KeyCode::Enter if !alt => {
+            KeyCode::Enter if !alt && !ctrl && !shift => {
                 if let Some(cmd) = screen.palette.accept(&input) {
                     return dispatch_command(cmd);
                 }
@@ -777,13 +777,15 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             if screen.editor_is_empty() {
                 return IdleKey::Exit;
             }
+            screen.editor.delete_next_char();
             return IdleKey::Continue;
         }
         KeyCode::Char('u') if ctrl => {
-            screen.clear_editor();
+            screen.editor.delete_line_by_head();
             return IdleKey::Continue;
         }
-        KeyCode::Enter if alt => screen.editor.insert_newline(),
+        KeyCode::Char('j') if ctrl => screen.editor.insert_newline(),
+        KeyCode::Enter if shift || ctrl => screen.editor.insert_newline(),
         KeyCode::Enter => {
             let text = screen.submit();
             if text.trim().is_empty() {
@@ -808,7 +810,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
         KeyCode::Char('y') if ctrl => {
             screen.editor.paste();
         }
-        KeyCode::Char('z') if ctrl => {
+        KeyCode::Char('-') if ctrl => {
             screen.editor.undo();
         }
         KeyCode::Char('r') if ctrl => {
@@ -818,6 +820,8 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
         // --- cursor / word navigation ---
         KeyCode::Char('a') if ctrl => screen.editor.move_cursor(CursorMove::Head),
         KeyCode::Char('e') if ctrl => screen.editor.move_cursor(CursorMove::End),
+        KeyCode::Char('b') if ctrl => screen.editor.move_cursor(CursorMove::Back),
+        KeyCode::Char('f') if ctrl => screen.editor.move_cursor(CursorMove::Forward),
         KeyCode::Char('b') if alt => screen.editor.move_cursor(CursorMove::WordBack),
         KeyCode::Char('f') if alt => screen.editor.move_cursor(CursorMove::WordForward),
         KeyCode::Left if ctrl || alt => screen.editor.move_cursor(CursorMove::WordBack),
@@ -836,11 +840,17 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
         KeyCode::Backspace => {
             screen.editor.delete_char();
         }
+        KeyCode::Delete if alt => {
+            screen.editor.delete_next_word();
+        }
         KeyCode::Delete => {
             screen.editor.delete_next_char();
         }
         KeyCode::Tab => {
             screen.editor.insert_str("    ");
+        }
+        KeyCode::Char('\n') => {
+            screen.editor.insert_newline();
         }
         KeyCode::Char(c) if !ctrl && !alt => {
             screen.editor.insert_char(c);
@@ -1004,12 +1014,33 @@ mod tests {
     }
 
     #[test]
-    fn alt_enter_inserts_newline_without_submitting() {
+    fn modified_enter_inserts_newline_without_submitting() {
         let mut screen = Screen::new();
         handle_idle_event(&mut screen, key(KeyCode::Char('a')));
-        handle_idle_event(&mut screen, key_mod(KeyCode::Enter, KeyModifiers::ALT));
+        handle_idle_event(&mut screen, key_mod(KeyCode::Enter, KeyModifiers::SHIFT));
         handle_idle_event(&mut screen, key(KeyCode::Char('b')));
-        assert_eq!(screen.editor_text(), "a\nb");
+        handle_idle_event(&mut screen, key_mod(KeyCode::Enter, KeyModifiers::CONTROL));
+        handle_idle_event(&mut screen, key(KeyCode::Char('c')));
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        handle_idle_event(&mut screen, key(KeyCode::Char('d')));
+        handle_idle_event(&mut screen, key(KeyCode::Char('\n')));
+        handle_idle_event(&mut screen, key(KeyCode::Char('e')));
+        assert_eq!(screen.editor_text(), "a\nb\nc\nd\ne");
+    }
+
+    #[test]
+    fn alt_enter_submits_like_pi_when_idle() {
+        let mut screen = Screen::new();
+        for c in "hello".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        match handle_idle_event(&mut screen, key_mod(KeyCode::Enter, KeyModifiers::ALT)) {
+            IdleKey::Submit(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected submit"),
+        }
     }
 
     #[test]
@@ -1082,6 +1113,66 @@ mod tests {
     }
 
     #[test]
+    fn pi_editor_key_aliases_work() {
+        let mut screen = Screen::new();
+        for c in "ab".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        );
+        handle_idle_event(&mut screen, key(KeyCode::Char('X')));
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        );
+        handle_idle_event(&mut screen, key(KeyCode::Char('Y')));
+        assert_eq!(screen.editor_text(), "aXbY");
+
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(screen.editor_text(), "XbY");
+
+        screen.clear_editor();
+        for c in "alpha beta".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        handle_idle_event(&mut screen, key_mod(KeyCode::Delete, KeyModifiers::ALT));
+        assert_eq!(screen.editor_text(), " beta");
+
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('-'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(screen.editor_text(), "alpha beta");
+
+        screen.clear_editor();
+        for c in "abc".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        handle_idle_event(&mut screen, key_mod(KeyCode::Enter, KeyModifiers::SHIFT));
+        for c in "def".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(screen.editor_text(), "abc\n");
+    }
+
+    #[test]
     fn kill_word_and_yank_via_keymap() {
         let mut screen = Screen::new();
         for c in "alpha beta".chars() {
@@ -1099,10 +1190,10 @@ mod tests {
             key_mod(KeyCode::Char('y'), KeyModifiers::CONTROL),
         );
         assert_eq!(screen.editor_text(), "alpha beta");
-        // Ctrl-Z undoes the yank.
+        // Pi's undo shortcut is Ctrl+-.
         handle_idle_event(
             &mut screen,
-            key_mod(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            key_mod(KeyCode::Char('-'), KeyModifiers::CONTROL),
         );
         assert_eq!(screen.editor_text(), "alpha ");
     }
@@ -1305,6 +1396,16 @@ mod tests {
             ),
             IdleKey::Continue | IdleKey::Ignore
         ));
+
+        let mut screen = Screen::new();
+        for c in "/model".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        assert!(matches!(
+            handle_idle_event(&mut screen, key_mod(KeyCode::Enter, KeyModifiers::SHIFT)),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "/model\n");
     }
 
     #[test]

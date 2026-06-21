@@ -279,7 +279,8 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
             // Backslash continuation is a typed-input convenience only; never
             // reinterpret bytes that came from inside a paste.
             // ponytail: a trailing literal backslash in typed input is treated
-            // as a continuation; rare, and raw-mode (Alt+Enter) is the upgrade.
+            // as a continuation; rare, and the full-screen multiline editor is
+            // the upgrade.
             if !saw_paste && let Some(stripped) = buf.strip_suffix("\\\n") {
                 buf = format!("{stripped}\n");
                 continue;
