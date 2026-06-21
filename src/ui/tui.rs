@@ -85,9 +85,6 @@ const SPINNER_FRAMES: &[&str] = &[
     "\u{2807}", "\u{280f}",
 ];
 
-fn assistant_style() -> Style {
-    Style::default()
-}
 fn user_style() -> Style {
     Style::default().fg(Color::Cyan)
 }
@@ -866,8 +863,8 @@ impl Transcript {
             row.render(width, &mut rows);
         }
         if let Some(text) = &self.streaming {
-            for line in text.split('\n') {
-                push_wrapped_row(line, assistant_style(), width, None, &mut rows);
+            for line in crate::ui::markdown::render_markdown(text) {
+                TranscriptRow::markdown(line).render(width, &mut rows);
             }
         }
         rows
@@ -1577,6 +1574,24 @@ mod tests {
             .collect()
     }
 
+    fn line_signature(lines: &[Line<'static>]) -> Vec<Vec<(String, Option<Color>, Modifier)>> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.content.to_string(),
+                            span.style.fg,
+                            span.style.add_modifier,
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     fn line_matching<'a>(
         lines: &'a [Line<'static>],
         predicate: impl Fn(&Line<'static>) -> bool,
@@ -1635,6 +1650,52 @@ mod tests {
         // Bullets render with dash markers.
         assert!(lines.iter().any(|l| line_text(l) == "- one"));
         assert!(lines.iter().any(|l| line_text(l) == "- two"));
+    }
+
+    #[test]
+    fn streaming_markdown_renders_like_finalized_markdown_without_committing_early() {
+        let markdown = "# Title\n\nuse `cargo test`\n\n- one";
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextDelta(markdown.to_string()));
+
+        let live = screen.wrapped_lines(80);
+        assert!(screen.transcript.rows.is_empty());
+        assert!(screen.take_scrollback(80).is_empty());
+
+        let title = line_matching(&live, |l| line_text(l) == "Title");
+        assert!(
+            title
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+        let code_line = line_matching(&live, |l| line_text(l).contains("cargo test"));
+        assert!(
+            code_line
+                .spans
+                .iter()
+                .any(|s| s.content.as_ref() == "`cargo test`" && s.style.fg == Some(Color::Cyan))
+        );
+        assert!(live.iter().any(|l| line_text(l) == "- one"));
+
+        screen.apply(UiEvent::AssistantTextEnd(markdown.to_string()));
+        let finalized = screen.wrapped_lines(80);
+        assert_eq!(line_signature(&live), line_signature(&finalized));
+
+        let committed = screen.take_scrollback(80);
+        assert_eq!(line_signature(&finalized), line_signature(&committed));
+        assert!(screen.take_scrollback(80).is_empty());
+    }
+
+    #[test]
+    fn partial_streaming_markdown_renders_without_panic() {
+        for markdown in ["```rust\nlet x = **", "half **bold"] {
+            let mut screen = Screen::new();
+            screen.apply(UiEvent::AssistantTextDelta(markdown.to_string()));
+            let lines = screen.wrapped_lines(80);
+            assert!(!lines.is_empty(), "partial markdown vanished: {markdown:?}");
+            assert!(screen.transcript.rows.is_empty());
+        }
     }
 
     #[test]
