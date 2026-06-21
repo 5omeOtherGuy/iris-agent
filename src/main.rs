@@ -373,6 +373,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_name_is_iris() {
+        assert_eq!(command_name(), "iris");
+    }
+
+    #[test]
     fn update_command_installs_locked_remote_with_force() {
         assert_eq!(
             UPDATE_REPO,
