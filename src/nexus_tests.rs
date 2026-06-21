@@ -151,11 +151,13 @@ fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
     block_on(harness.submit_turn("read note", &frontend, &frontend, &CancellationToken::new()))?;
 
     let events = frontend.events.borrow();
-    assert!(matches!(events[0], AgentEvent::ToolProposed(_)));
-    assert!(matches!(events[1], AgentEvent::ToolStarted(_)));
-    assert!(matches!(events[2], AgentEvent::ToolResult { .. }));
-    assert!(matches!(events[3], AgentEvent::AssistantText(_)));
-    assert!(matches!(events[4], AgentEvent::TurnComplete));
+    assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
+    assert!(matches!(events[1], AgentEvent::ToolProposed(_)));
+    assert!(matches!(events[2], AgentEvent::ToolStarted(_)));
+    assert!(matches!(events[3], AgentEvent::ToolResult { .. }));
+    assert!(matches!(events[4], AgentEvent::ProviderTurnStarted { .. }));
+    assert!(matches!(events[5], AgentEvent::AssistantText(_)));
+    assert!(matches!(events[6], AgentEvent::TurnComplete));
     // read is never gated: the approval gate must not be consulted.
     assert!(frontend.events_at_review.borrow().is_none());
     Ok(())
@@ -190,10 +192,11 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
     ));
 
     let events = frontend.events.borrow();
-    assert!(matches!(events[0], AgentEvent::DiffPreview { .. }));
+    assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
+    assert!(matches!(events[1], AgentEvent::DiffPreview { .. }));
     // ToolStarted is emitted after approval resolves, before execution.
-    assert!(matches!(events[1], AgentEvent::ToolStarted(_)));
-    assert!(matches!(events[2], AgentEvent::ToolResult { .. }));
+    assert!(matches!(events[2], AgentEvent::ToolStarted(_)));
+    assert!(matches!(events[3], AgentEvent::ToolResult { .. }));
     assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "new\n");
     Ok(())
 }
@@ -216,14 +219,19 @@ fn malformed_denial_skips_diff_preview() -> Result<()> {
             .iter()
             .all(|event| !matches!(event, AgentEvent::DiffPreview { .. }))
     );
-    assert!(matches!(events[0], AgentEvent::ToolDenied(_)));
-    // Malformed args must not preflight: the gate saw no events before deciding.
+    assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
+    assert!(matches!(events[1], AgentEvent::ToolDenied(_)));
+    // Malformed args must not preflight: the gate saw only the provider-turn
+    // correlation event before deciding.
     assert!(
         frontend
             .events_at_review
             .borrow()
             .as_ref()
-            .is_some_and(Vec::is_empty)
+            .is_some_and(|events| matches!(
+                events.as_slice(),
+                [AgentEvent::ProviderTurnStarted { .. }]
+            ))
     );
     assert!(!workspace.path.join("out.txt").exists());
     Ok(())
@@ -311,7 +319,10 @@ fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
     );
     assert!(errors.is_empty());
     assert_eq!(harness.agent.messages.len(), 2);
-    assert_eq!(harness.agent.messages[1], Message::assistant("Hello"));
+    assert_eq!(
+        harness.agent.messages[1],
+        Message::assistant("Hello").with_provider_turn_id("turn_00000000")
+    );
     Ok(())
 }
 
@@ -761,6 +772,43 @@ fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
             arguments,
         }],
     }
+}
+
+#[test]
+fn provider_turn_started_events_identify_each_model_round_trip() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "hello")?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("read note", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    let turn_ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ProviderTurnStarted { turn_id } => Some(turn_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(turn_ids, ["turn_00000000", "turn_00000001"]);
+    assert_eq!(
+        harness.agent.messages()[1].provider_turn_id.as_deref(),
+        Some("turn_00000000")
+    );
+    assert_eq!(
+        harness.agent.messages()[2].provider_turn_id.as_deref(),
+        Some("turn_00000000")
+    );
+    assert_eq!(
+        harness.agent.messages()[3].provider_turn_id.as_deref(),
+        Some("turn_00000001")
+    );
+    Ok(())
 }
 
 #[test]
@@ -2075,10 +2123,16 @@ fn streamed_events_reach_observer_in_order() -> Result<()> {
     block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
 
     let events = frontend.events.borrow();
-    assert_eq!(events[0], AgentEvent::AssistantTextDelta("Hel".to_string()));
-    assert_eq!(events[1], AgentEvent::AssistantTextDelta("lo".to_string()));
-    assert_eq!(events[2], AgentEvent::AssistantTextEnd("Hello".to_string()));
-    assert_eq!(events[3], AgentEvent::TurnComplete);
+    assert_eq!(
+        events[0],
+        AgentEvent::ProviderTurnStarted {
+            turn_id: "turn_00000000".to_string()
+        }
+    );
+    assert_eq!(events[1], AgentEvent::AssistantTextDelta("Hel".to_string()));
+    assert_eq!(events[2], AgentEvent::AssistantTextDelta("lo".to_string()));
+    assert_eq!(events[3], AgentEvent::AssistantTextEnd("Hello".to_string()));
+    assert_eq!(events[4], AgentEvent::TurnComplete);
     assert_eq!(harness.agent.messages().last().unwrap().content, "Hello");
     Ok(())
 }
@@ -2120,7 +2174,10 @@ fn cancellation_during_provider_stream_exits_promptly_with_valid_state() -> Resu
     let messages = harness.agent.messages();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].content, "go");
-    assert_eq!(messages[1], Message::assistant("partial"));
+    assert_eq!(
+        messages[1],
+        Message::assistant("partial").with_provider_turn_id("turn_00000000")
+    );
     assert!(
         frontend
             .events
@@ -2660,7 +2717,7 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         name: "read".to_string(),
         arguments: serde_json::json!({ "path": "a.txt" }),
     };
-    log.append(&Message::assistant_tool_call(&call))?; // dangling: no Tool result
+    log.append(&Message::assistant_tool_call(&call).with_provider_turn_id("turn_00000005"))?; // dangling: no Tool result
     let path = log.path().to_path_buf();
     drop(log);
 
@@ -2710,6 +2767,11 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         .position(|m| m.role == Role::AssistantToolCall)
         .unwrap();
     assert_eq!(reopened.messages[idx + 1].role, Role::Tool);
+    assert_eq!(
+        reopened.messages[idx + 1].provider_turn_id.as_deref(),
+        Some("turn_00000005"),
+        "synthetic repair result must keep the dangling call's provider turn id"
+    );
     Ok(())
 }
 

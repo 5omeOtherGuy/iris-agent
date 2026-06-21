@@ -310,6 +310,7 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
 
     fn emit(&mut self, event: UiEvent) -> Result<()> {
         match event {
+            UiEvent::ProviderTurnStarted { .. } => {}
             UiEvent::SessionStarted => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;

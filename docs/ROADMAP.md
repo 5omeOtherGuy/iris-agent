@@ -63,7 +63,8 @@ Implemented today:
   `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, rendered as
   `UiEvent` deltas.
 - Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`,
-  `Role`, and assistant-reasoning continuity types.
+  `Role`, Nexus-owned `provider_turn_id` correlation, and assistant-reasoning
+  continuity types.
 - Async tokio agent loop with a per-turn `CancellationToken`: provider stream /
   tool / approval reads raced against cancellation, async tools with child
   tokens, safe-parallel batching of concurrency-safe tools, and a valid
@@ -103,7 +104,9 @@ Implemented today:
   (#76/#73).
 - Milestone 2 foundations: structured metadata, token estimates,
   handle-backed large tool outputs, session-scoped content-addressed sidecars,
-  and turn-boundary auto-compaction.
+  turn-boundary auto-compaction, and formal correlation-id vocabulary for
+  sessions, message entries, provider turns, tool calls, compactions, and
+  output handles.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.
