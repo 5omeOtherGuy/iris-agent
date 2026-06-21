@@ -720,7 +720,13 @@ impl Transcript {
     /// Apply one semantic event to the transcript rows.
     fn apply(&mut self, event: UiEvent) {
         match event {
-            UiEvent::ProviderTurnStarted { .. } => {}
+            UiEvent::ProviderTurnStarted { .. }
+            | UiEvent::ProviderTurnCompleted { .. }
+            | UiEvent::ProviderTurnCancelled { .. }
+            | UiEvent::ProviderTurnError { .. }
+            | UiEvent::ToolLifecycle { .. }
+            | UiEvent::OutputHandleStored { .. }
+            | UiEvent::CompactionApplied { .. } => {}
             UiEvent::AssistantTextDelta(delta) => {
                 if self.streaming.is_none() {
                     self.push_blank();

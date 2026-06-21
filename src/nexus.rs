@@ -70,6 +70,52 @@ pub(crate) enum AgentEvent {
     ProviderTurnStarted {
         turn_id: String,
     },
+    /// One provider/model round trip completed with a terminal provider event.
+    ProviderTurnCompleted {
+        turn_id: String,
+    },
+    /// One provider/model round trip was interrupted before completion.
+    ProviderTurnCancelled {
+        turn_id: String,
+    },
+    /// One provider/model round trip failed. The message is the same sanitized
+    /// boundary error Iris already surfaces; provider request/response payloads
+    /// and auth material are never attached to the event.
+    ProviderTurnError {
+        turn_id: String,
+        message: String,
+    },
+    /// Provider-neutral tool lifecycle metadata for observability. The existing
+    /// display events remain for UI compatibility; this compact event carries
+    /// only ids/state and never includes tool arguments, output, provider
+    /// payloads, paths, or secrets.
+    ToolLifecycle {
+        provider_turn_id: String,
+        call_id: String,
+        name: String,
+        state: ToolEventState,
+    },
+    /// A large successful tool output was offloaded behind a session-scoped
+    /// handle. Metadata only: the full body and preview are intentionally not
+    /// carried by this observability event.
+    OutputHandleStored {
+        provider_turn_id: String,
+        call_id: String,
+        handle_id: String,
+        bytes: usize,
+        lines: usize,
+    },
+    /// The harness compacted persisted context at a safe turn boundary.
+    /// Contains ids and token estimates, not the generated summary text.
+    CompactionApplied {
+        compaction_id: String,
+        covered_from: String,
+        covered_to: String,
+        covered_messages: usize,
+        original_tokens_estimate: u64,
+        summary_tokens_estimate: u64,
+        budget: u64,
+    },
     AssistantText(String),
     AssistantTextDelta(String),
     AssistantTextEnd(String),
@@ -109,6 +155,18 @@ pub(crate) enum AgentEvent {
     },
     Notice(String),
     TurnComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolEventState {
+    Proposed,
+    ApprovalRequested,
+    Approved,
+    Denied,
+    Started,
+    Succeeded,
+    Errored,
+    Cancelled,
 }
 
 /// A provider-neutral streamed model event. The async [`ChatProvider`] yields a
@@ -567,7 +625,18 @@ impl<P: ChatProvider> Agent<P> {
                 turn_id: provider_turn_id.clone(),
             })?;
 
-            match self.stream_turn(obs, token).await? {
+            let stream_result = match self.stream_turn(obs, token).await {
+                Ok(result) => result,
+                Err(error) => {
+                    obs.on_event(AgentEvent::ProviderTurnError {
+                        turn_id: provider_turn_id.clone(),
+                        message: format!("{error:#}"),
+                    })?;
+                    return Err(error);
+                }
+            };
+
+            match stream_result {
                 StreamResult::Cancelled { partial, saw_delta } => {
                     // Commit any partial assistant text so the transcript stays
                     // valid (paired with the user prompt); otherwise drop the
@@ -588,6 +657,9 @@ impl<P: ChatProvider> Agent<P> {
                         roundtrips = roundtrip,
                         "turn interrupted during model stream"
                     );
+                    obs.on_event(AgentEvent::ProviderTurnCancelled {
+                        turn_id: provider_turn_id.clone(),
+                    })?;
                     self.emit_interrupted(obs)?;
                     return Ok(());
                 }
@@ -616,6 +688,9 @@ impl<P: ChatProvider> Agent<P> {
                         obs.on_event(AgentEvent::AssistantTextEnd(String::new()))?;
                     }
 
+                    obs.on_event(AgentEvent::ProviderTurnCompleted {
+                        turn_id: provider_turn_id.clone(),
+                    })?;
                     if tool_calls.is_empty() {
                         tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
                         obs.on_event(AgentEvent::TurnComplete)?;
@@ -713,6 +788,7 @@ impl<P: ChatProvider> Agent<P> {
                     "turn interrupted during tools; remaining calls cancelled"
                 );
                 for call in &calls[idx..] {
+                    emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Proposed)?;
                     record_call(
                         &mut self.messages,
                         obs,
@@ -733,7 +809,9 @@ impl<P: ChatProvider> Agent<P> {
                 }
                 for call in &calls[idx..end] {
                     obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+                    emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Proposed)?;
                     obs.on_event(AgentEvent::ToolStarted(call.clone()))?;
+                    emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Started)?;
                 }
                 // Scope the borrow of `self.tools` so it drops before the
                 // transcript pushes below.
@@ -751,7 +829,7 @@ impl<P: ChatProvider> Agent<P> {
                 idx = end;
             } else {
                 let outcome = self
-                    .run_gated_single(&calls[idx], obs, gate, env, token)
+                    .run_gated_single(&calls[idx], obs, gate, env, token, provider_turn_id)
                     .await?;
                 record_call(
                     &mut self.messages,
@@ -789,7 +867,9 @@ impl<P: ChatProvider> Agent<P> {
         gate: &dyn ApprovalGate,
         env: &ToolEnv<'_>,
         token: &CancellationToken,
+        provider_turn_id: &str,
     ) -> Result<ToolOutcome> {
+        emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Proposed)?;
         if let Some(tool) = self
             .tools
             .by_name(&call.name)
@@ -803,6 +883,7 @@ impl<P: ChatProvider> Agent<P> {
             let auto_approved = session_allowed && !destructive && tool.supports_allow_always();
             if auto_approved {
                 obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
+                emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
             }
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
                 obs.on_event(AgentEvent::DiffPreview {
@@ -821,6 +902,12 @@ impl<P: ChatProvider> Agent<P> {
                 // does not pin the turn open after a Ctrl-C. Cancellation is
                 // recorded as a cancelled call (not a denial) so the transcript
                 // reflects user intent rather than a refusal.
+                emit_tool_lifecycle(
+                    obs,
+                    provider_turn_id,
+                    call,
+                    ToolEventState::ApprovalRequested,
+                )?;
                 let decision = tokio::select! {
                     biased;
                     _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
@@ -852,6 +939,7 @@ impl<P: ChatProvider> Agent<P> {
                     }
                     ApprovalDecision::Allow => {}
                 }
+                emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
             }
         } else {
             obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
@@ -868,6 +956,7 @@ impl<P: ChatProvider> Agent<P> {
                 // exclusive path streams (the parallel/exploration path stays
                 // sink-less), so a single live exec cell is always enough.
                 obs.on_event(AgentEvent::ToolStarted(call.clone()))?;
+                emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Started)?;
                 let emitter = ToolDeltaEmitter {
                     obs,
                     call_id: call.id.clone(),
@@ -969,6 +1058,27 @@ async fn run_tool<'a>(
     }
 }
 
+fn emit_tool_lifecycle(
+    obs: &dyn AgentObserver,
+    provider_turn_id: &str,
+    call: &ToolCall,
+    state: ToolEventState,
+) -> Result<()> {
+    obs.on_event(AgentEvent::ToolLifecycle {
+        provider_turn_id: provider_turn_id.to_string(),
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+        state,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputHandleInfo {
+    id: String,
+    bytes: usize,
+    lines: usize,
+}
+
 /// Append one tool call and its result to the transcript and emit the matching
 /// event. Every model-emitted call goes through here exactly once, so the
 /// assistant-tool-call / tool-result pairing is always complete.
@@ -1004,14 +1114,21 @@ fn record_call(
                 .remove("durationMs")
                 .and_then(|value| value.as_u64())
                 .map(Duration::from_millis);
+            let (result_json, handle) = success_tool_result_json(store, output);
             messages.push(
-                Message::tool_result(
-                    &call.id,
-                    &call.name,
-                    &success_tool_result_json(store, output),
-                )
-                .with_provider_turn_id(provider_turn_id),
+                Message::tool_result(&call.id, &call.name, &result_json)
+                    .with_provider_turn_id(provider_turn_id),
             );
+            if let Some(handle) = handle {
+                obs.on_event(AgentEvent::OutputHandleStored {
+                    provider_turn_id: provider_turn_id.to_string(),
+                    call_id: call.id.clone(),
+                    handle_id: handle.id,
+                    bytes: handle.bytes,
+                    lines: handle.lines,
+                })?;
+            }
+            emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Succeeded)?;
             AgentEvent::ToolResult {
                 call: call.clone(),
                 content,
@@ -1026,6 +1143,7 @@ fn record_call(
                 Message::tool_result(&call.id, &call.name, &tool_result_json(&Err(error)))
                     .with_provider_turn_id(provider_turn_id),
             );
+            emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Errored)?;
             AgentEvent::ToolError {
                 call: call.clone(),
                 message,
@@ -1037,6 +1155,7 @@ fn record_call(
                 Message::tool_result(&call.id, &call.name, &cancelled_tool_result_json())
                     .with_provider_turn_id(provider_turn_id),
             );
+            emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Cancelled)?;
             AgentEvent::ToolError {
                 call: call.clone(),
                 message: "cancelled".to_string(),
@@ -1048,6 +1167,7 @@ fn record_call(
                 Message::tool_result(&call.id, &call.name, &denied_tool_result_json())
                     .with_provider_turn_id(provider_turn_id),
             );
+            emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Denied)?;
             AgentEvent::ToolDenied(call.clone())
         }
     };
@@ -1308,14 +1428,17 @@ fn repair_dangling_tool_call(messages: &mut Vec<Message>) {
 /// (issue #61). Small outputs, and the fallback when no store exists or the
 /// store write fails, are byte-identical to the original inline encoding -- the
 /// full output is never truncated and discarded.
-fn success_tool_result_json(store: Option<&dyn ToolOutputStore>, mut output: ToolOutput) -> String {
+fn success_tool_result_json(
+    store: Option<&dyn ToolOutputStore>,
+    mut output: ToolOutput,
+) -> (String, Option<OutputHandleInfo>) {
     if output.content.len() <= MAX_INLINE_TOOL_OUTPUT_BYTES {
-        return tool_result_json(&Ok(output));
+        return (tool_result_json(&Ok(output)), None);
     }
     let Some(store) = store else {
         // No durable store (e.g. in-memory session): keep the full output inline
         // rather than lose it. Larger context, but never data loss.
-        return tool_result_json(&Ok(output));
+        return (tool_result_json(&Ok(output)), None);
     };
     match store.put(&output.content) {
         Ok(handle_id) => {
@@ -1331,14 +1454,19 @@ fn success_tool_result_json(store: Option<&dyn ToolOutputStore>, mut output: Too
                 "outputHandle".to_string(),
                 json!({ "id": handle_id, "bytes": total_bytes, "lines": total_lines }),
             );
-            tool_result_json(&Ok(output))
+            let info = OutputHandleInfo {
+                id: handle_id,
+                bytes: total_bytes,
+                lines: total_lines,
+            };
+            (tool_result_json(&Ok(output)), Some(info))
         }
         Err(error) => {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 "tool output handle store failed; inlining full output"
             );
-            tool_result_json(&Ok(output))
+            (tool_result_json(&Ok(output)), None)
         }
     }
 }

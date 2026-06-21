@@ -60,6 +60,38 @@ pub(crate) enum UiEvent {
     ProviderTurnStarted {
         turn_id: String,
     },
+    ProviderTurnCompleted {
+        turn_id: String,
+    },
+    ProviderTurnCancelled {
+        turn_id: String,
+    },
+    ProviderTurnError {
+        turn_id: String,
+        message: String,
+    },
+    ToolLifecycle {
+        provider_turn_id: String,
+        call_id: String,
+        name: String,
+        state: crate::nexus::ToolEventState,
+    },
+    OutputHandleStored {
+        provider_turn_id: String,
+        call_id: String,
+        handle_id: String,
+        bytes: usize,
+        lines: usize,
+    },
+    CompactionApplied {
+        compaction_id: String,
+        covered_from: String,
+        covered_to: String,
+        covered_messages: usize,
+        original_tokens_estimate: u64,
+        summary_tokens_estimate: u64,
+        budget: u64,
+    },
     AssistantText(String),
     AssistantTextDelta(String),
     AssistantTextEnd(String),
@@ -110,6 +142,56 @@ impl UiEvent {
     pub(crate) fn from_agent_event(event: AgentEvent) -> Self {
         match event {
             AgentEvent::ProviderTurnStarted { turn_id } => UiEvent::ProviderTurnStarted { turn_id },
+            AgentEvent::ProviderTurnCompleted { turn_id } => {
+                UiEvent::ProviderTurnCompleted { turn_id }
+            }
+            AgentEvent::ProviderTurnCancelled { turn_id } => {
+                UiEvent::ProviderTurnCancelled { turn_id }
+            }
+            AgentEvent::ProviderTurnError { turn_id, message } => {
+                UiEvent::ProviderTurnError { turn_id, message }
+            }
+            AgentEvent::ToolLifecycle {
+                provider_turn_id,
+                call_id,
+                name,
+                state,
+            } => UiEvent::ToolLifecycle {
+                provider_turn_id,
+                call_id,
+                name,
+                state,
+            },
+            AgentEvent::OutputHandleStored {
+                provider_turn_id,
+                call_id,
+                handle_id,
+                bytes,
+                lines,
+            } => UiEvent::OutputHandleStored {
+                provider_turn_id,
+                call_id,
+                handle_id,
+                bytes,
+                lines,
+            },
+            AgentEvent::CompactionApplied {
+                compaction_id,
+                covered_from,
+                covered_to,
+                covered_messages,
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                budget,
+            } => UiEvent::CompactionApplied {
+                compaction_id,
+                covered_from,
+                covered_to,
+                covered_messages,
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                budget,
+            },
             AgentEvent::AssistantText(text) => UiEvent::AssistantText(text),
             AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
             AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),

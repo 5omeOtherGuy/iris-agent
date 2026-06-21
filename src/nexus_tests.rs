@@ -151,13 +151,28 @@ fn submit_turn_emits_non_gated_tool_sequence() -> Result<()> {
     block_on(harness.submit_turn("read note", &frontend, &frontend, &CancellationToken::new()))?;
 
     let events = frontend.events.borrow();
-    assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
-    assert!(matches!(events[1], AgentEvent::ToolProposed(_)));
-    assert!(matches!(events[2], AgentEvent::ToolStarted(_)));
-    assert!(matches!(events[3], AgentEvent::ToolResult { .. }));
-    assert!(matches!(events[4], AgentEvent::ProviderTurnStarted { .. }));
-    assert!(matches!(events[5], AgentEvent::AssistantText(_)));
-    assert!(matches!(events[6], AgentEvent::TurnComplete));
+    let display_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                AgentEvent::ToolLifecycle { .. } | AgentEvent::ProviderTurnCompleted { .. }
+            )
+        })
+        .collect();
+    assert!(matches!(
+        display_events[0],
+        AgentEvent::ProviderTurnStarted { .. }
+    ));
+    assert!(matches!(display_events[1], AgentEvent::ToolProposed(_)));
+    assert!(matches!(display_events[2], AgentEvent::ToolStarted(_)));
+    assert!(matches!(display_events[3], AgentEvent::ToolResult { .. }));
+    assert!(matches!(
+        display_events[4],
+        AgentEvent::ProviderTurnStarted { .. }
+    ));
+    assert!(matches!(display_events[5], AgentEvent::AssistantText(_)));
+    assert!(matches!(display_events[6], AgentEvent::TurnComplete));
     // read is never gated: the approval gate must not be consulted.
     assert!(frontend.events_at_review.borrow().is_none());
     Ok(())
@@ -186,17 +201,51 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
     let at_review = at_review
         .as_ref()
         .expect("write is gated; the gate must be consulted");
-    assert!(matches!(
-        at_review.last(),
-        Some(AgentEvent::DiffPreview { .. })
-    ));
+    assert!(
+        at_review
+            .iter()
+            .position(|event| matches!(event, AgentEvent::DiffPreview { .. }))
+            .is_some_and(
+                |diff_at| at_review[diff_at + 1..].iter().any(|event| matches!(
+                    event,
+                    AgentEvent::ToolLifecycle {
+                        state: ToolEventState::ApprovalRequested,
+                        ..
+                    }
+                ))
+            )
+    );
 
     let events = frontend.events.borrow();
+    let lifecycle_states: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolLifecycle { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert!(lifecycle_states.starts_with(&[
+        ToolEventState::Proposed,
+        ToolEventState::ApprovalRequested,
+        ToolEventState::Approved,
+    ]));
     assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
-    assert!(matches!(events[1], AgentEvent::DiffPreview { .. }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::DiffPreview { .. }))
+    );
     // ToolStarted is emitted after approval resolves, before execution.
-    assert!(matches!(events[2], AgentEvent::ToolStarted(_)));
-    assert!(matches!(events[3], AgentEvent::ToolResult { .. }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolStarted(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolResult { .. }))
+    );
     assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "new\n");
     Ok(())
 }
@@ -220,18 +269,32 @@ fn malformed_denial_skips_diff_preview() -> Result<()> {
             .all(|event| !matches!(event, AgentEvent::DiffPreview { .. }))
     );
     assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
-    assert!(matches!(events[1], AgentEvent::ToolDenied(_)));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolDenied(_)))
+    );
     // Malformed args must not preflight: the gate saw only the provider-turn
-    // correlation event before deciding.
+    // correlation event plus approval-request metadata before deciding.
     assert!(
         frontend
             .events_at_review
             .borrow()
             .as_ref()
-            .is_some_and(|events| matches!(
-                events.as_slice(),
-                [AgentEvent::ProviderTurnStarted { .. }]
-            ))
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .all(|event| !matches!(event, AgentEvent::DiffPreview { .. }))
+                    && events.iter().any(|event| {
+                        matches!(
+                            event,
+                            AgentEvent::ToolLifecycle {
+                                state: ToolEventState::ApprovalRequested,
+                                ..
+                            }
+                        )
+                    })
+            })
     );
     assert!(!workspace.path.join("out.txt").exists());
     Ok(())
@@ -796,6 +859,34 @@ fn provider_turn_started_events_identify_each_model_round_trip() -> Result<()> {
         })
         .collect();
     assert_eq!(turn_ids, ["turn_00000000", "turn_00000001"]);
+    let completed_turn_ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ProviderTurnCompleted { turn_id } => Some(turn_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completed_turn_ids, ["turn_00000000", "turn_00000001"]);
+    let tool_states: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolLifecycle {
+                provider_turn_id,
+                call_id,
+                state,
+                ..
+            } => Some((provider_turn_id.as_str(), call_id.as_str(), *state)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_states,
+        [
+            ("turn_00000000", "call_1", ToolEventState::Proposed),
+            ("turn_00000000", "call_1", ToolEventState::Started),
+            ("turn_00000000", "call_1", ToolEventState::Succeeded),
+        ]
+    );
     assert_eq!(
         harness.agent.messages()[1].provider_turn_id.as_deref(),
         Some("turn_00000000")
@@ -1723,6 +1814,36 @@ fn oversized_tool_output_is_stored_behind_a_handle_and_compacted_in_context() ->
         tool_result.content.contains("TAIL-END-MARKER"),
         "tail preview kept"
     );
+    let handle_events: Vec<_> = frontend
+        .events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::OutputHandleStored {
+                provider_turn_id,
+                call_id,
+                handle_id,
+                bytes,
+                lines,
+            } => Some((
+                provider_turn_id.clone(),
+                call_id.clone(),
+                handle_id.clone(),
+                *bytes,
+                *lines,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handle_events.len(), 1, "one handle event");
+    assert_eq!(handle_events[0].0, "turn_00000000");
+    assert_eq!(handle_events[0].1, "call_1");
+    assert_eq!(handle_events[0].3, body.len());
+    assert_eq!(handle_events[0].4, body.lines().count());
+    assert!(
+        !format!("{handle_events:?}").contains("MIDDLE-SECRET-MARKER"),
+        "handle event must carry metadata only, not the full body"
+    );
     assert!(tool_result.content.contains("outputHandle"));
     assert!(
         tool_result.content.len() < body.len(),
@@ -1862,14 +1983,16 @@ fn offload_threshold_is_inclusive_inline_at_limit_offloads_above() -> Result<()>
     let store = crate::handles::HandleStore::with_dir(dir.path.join("outputs"));
 
     let at_limit = ToolOutput::text("a".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES));
-    let at_json = success_tool_result_json(Some(&store), at_limit);
+    let (at_json, at_handle) = success_tool_result_json(Some(&store), at_limit);
+    assert!(at_handle.is_none());
     assert!(
         !at_json.contains("outputHandle"),
         "a result exactly at the threshold stays inline"
     );
 
     let over_limit = ToolOutput::text("a".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 1));
-    let over_json = success_tool_result_json(Some(&store), over_limit);
+    let (over_json, over_handle) = success_tool_result_json(Some(&store), over_limit);
+    assert!(over_handle.is_some());
     assert!(
         over_json.contains("outputHandle"),
         "one byte over the threshold offloads"
@@ -1879,7 +2002,8 @@ fn offload_threshold_is_inclusive_inline_at_limit_offloads_above() -> Result<()>
 
 #[test]
 fn empty_output_stays_inline() {
-    let out = success_tool_result_json(None, ToolOutput::text(""));
+    let (out, handle) = success_tool_result_json(None, ToolOutput::text(""));
+    assert!(handle.is_none());
     assert!(out.contains("\"ok\":true"));
     assert!(!out.contains("outputHandle"));
 }
@@ -1896,7 +2020,9 @@ fn offload_falls_back_to_inline_when_the_store_errors() {
     }
 
     let body = "Z".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 100);
-    let out = success_tool_result_json(Some(&FailingStore), ToolOutput::text(body.clone()));
+    let (out, handle) =
+        success_tool_result_json(Some(&FailingStore), ToolOutput::text(body.clone()));
+    assert!(handle.is_none());
     assert!(
         out.contains(&body),
         "full output preserved inline on store failure"
@@ -2132,7 +2258,13 @@ fn streamed_events_reach_observer_in_order() -> Result<()> {
     assert_eq!(events[1], AgentEvent::AssistantTextDelta("Hel".to_string()));
     assert_eq!(events[2], AgentEvent::AssistantTextDelta("lo".to_string()));
     assert_eq!(events[3], AgentEvent::AssistantTextEnd("Hello".to_string()));
-    assert_eq!(events[4], AgentEvent::TurnComplete);
+    assert_eq!(
+        events[4],
+        AgentEvent::ProviderTurnCompleted {
+            turn_id: "turn_00000000".to_string()
+        }
+    );
+    assert_eq!(events[5], AgentEvent::TurnComplete);
     assert_eq!(harness.agent.messages().last().unwrap().content, "Hello");
     Ok(())
 }
@@ -2184,6 +2316,77 @@ fn cancellation_during_provider_stream_exits_promptly_with_valid_state() -> Resu
             .borrow()
             .iter()
             .any(|e| matches!(e, AgentEvent::Notice(m) if m.contains("interrupted")))
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_before_tools_proposes_remaining_calls_before_cancelling() -> Result<()> {
+    struct CancelParentTool {
+        parent: CancellationToken,
+    }
+    impl Tool for CancelParentTool {
+        fn name(&self) -> &str {
+            "trip"
+        }
+        fn description(&self) -> &str {
+            "cancels parent turn"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                self.parent.cancel();
+                Ok(ToolOutput::text("tripped"))
+            })
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: None,
+        reasoning: Vec::new(),
+        tool_calls: vec![
+            call("call_1", "trip", json!({})),
+            call("call_2", "read", json!({ "path": "b.txt" })),
+        ],
+    })]);
+    let token = CancellationToken::new();
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(CancelParentTool {
+            parent: token.clone(),
+        })]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &token))?;
+
+    let states: Vec<_> = frontend
+        .events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolLifecycle { call_id, state, .. } => Some((call_id.clone(), *state)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("call_1".to_string(), ToolEventState::Proposed),
+            ("call_1".to_string(), ToolEventState::Started),
+            ("call_1".to_string(), ToolEventState::Cancelled),
+            ("call_2".to_string(), ToolEventState::Proposed),
+            ("call_2".to_string(), ToolEventState::Cancelled),
+        ]
     );
     Ok(())
 }
@@ -2944,6 +3147,73 @@ fn over_budget_session_auto_compacts_at_turn_boundary() -> Result<()> {
         !seen[1].iter().any(|m| m.content == prompt_a),
         "covered turns must not be replayed as standalone messages"
     );
+    Ok(())
+}
+
+#[test]
+fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        &"P".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    block_on(harness.submit_turn(
+        &"Q".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    let events = frontend.events.borrow();
+    let compaction = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CompactionApplied {
+                compaction_id,
+                covered_from,
+                covered_to,
+                covered_messages,
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                budget,
+            } => Some((
+                compaction_id,
+                covered_from,
+                covered_to,
+                *covered_messages,
+                *original_tokens_estimate,
+                *summary_tokens_estimate,
+                *budget,
+            )),
+            _ => None,
+        })
+        .expect("compaction event");
+    assert!(!compaction.0.is_empty());
+    assert!(!compaction.1.is_empty());
+    assert!(!compaction.2.is_empty());
+    assert_eq!(compaction.3, 2);
+    assert!(compaction.4 > compaction.5);
+    assert_eq!(compaction.6, 50);
     Ok(())
 }
 
