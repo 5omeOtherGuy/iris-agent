@@ -278,13 +278,16 @@ fn anthropic_thinking(model: &str, reasoning: Option<ReasoningEffort>) -> Option
         return adaptive.then_some(ThinkingPlan::Disabled);
     }
     if adaptive {
+        // Map the iris level one notch up Anthropic's low|medium|high|xhigh|max
+        // effort scale, so iris `xhigh` reaches Anthropic's top `max` effort and
+        // iris `minimal` reaches its lowest non-off `low`. (Codex maps the iris
+        // names through unchanged; this upshift is Anthropic-specific.)
         let effort = match level {
-            ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-            // Opus 4.6 names its top effort "max"; 4.7/4.8 use "xhigh".
-            ReasoningEffort::XHigh if model == "claude-opus-4-6" => "max",
-            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Minimal => "low",
+            ReasoningEffort::Low => "medium",
+            ReasoningEffort::Medium => "high",
+            ReasoningEffort::High => "xhigh",
+            ReasoningEffort::XHigh => "max",
             ReasoningEffort::Off => unreachable!("off returns above"),
         };
         return Some(ThinkingPlan::Adaptive { effort });
@@ -767,6 +770,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
 
         // Sonnet 4.6 is adaptive: effort via output_config, adaptive thinking,
         // and max_tokens left at the base (no budget bump, no budget_tokens).
+        // iris High maps one notch up to Anthropic effort "xhigh".
         let body = build_anthropic_request(
             "claude-sonnet-4-6",
             "P",
@@ -778,7 +782,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             body["thinking"],
             json!({ "type": "adaptive", "display": "summarized" })
         );
-        assert_eq!(body["output_config"], json!({ "effort": "high" }));
+        assert_eq!(body["output_config"], json!({ "effort": "xhigh" }));
         assert_eq!(
             body["max_tokens"],
             json!(MAX_TOKENS),
@@ -786,18 +790,26 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         );
         assert!(body["thinking"].get("budget_tokens").is_none());
 
-        // Opus 4.8 accepts xhigh -> effort "xhigh".
-        let opus = build_anthropic_request(
-            "claude-opus-4-8",
-            "P",
-            &messages,
-            &tools,
-            Some(ReasoningEffort::XHigh),
-        );
-        assert_eq!(opus["output_config"], json!({ "effort": "xhigh" }));
-        assert_eq!(opus["thinking"]["type"], json!("adaptive"));
+        // The full iris -> Anthropic upshift on an adaptive model: each iris level
+        // lands one notch up the low|medium|high|xhigh|max effort scale.
+        for (level, expected) in [
+            (ReasoningEffort::Minimal, "low"),
+            (ReasoningEffort::Low, "medium"),
+            (ReasoningEffort::Medium, "high"),
+            (ReasoningEffort::High, "xhigh"),
+            (ReasoningEffort::XHigh, "max"),
+        ] {
+            let req =
+                build_anthropic_request("claude-opus-4-8", "P", &messages, &tools, Some(level));
+            assert_eq!(
+                req["output_config"],
+                json!({ "effort": expected }),
+                "{level:?} -> {expected}"
+            );
+            assert_eq!(req["thinking"]["type"], json!("adaptive"));
+        }
 
-        // Opus 4.6 names its top effort "max".
+        // Opus 4.6 follows the same uniform upshift (xhigh -> "max").
         let opus6 = build_anthropic_request(
             "claude-opus-4-6",
             "P",
