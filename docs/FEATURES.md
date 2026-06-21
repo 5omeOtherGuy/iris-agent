@@ -1,6 +1,7 @@
 # Iris — Feature List
 
-> Status (2026-06-17): Milestone 2 foundations in progress. Labels:
+> Status (2026-06-21): Milestone 2 foundations are implemented; the remaining
+> Milestone 2 gate is benchmark proof plus consumer slices. Labels:
 > **[Implemented]** · **[Partial]** · **[Planned · MVP]** · **[Planned]** ·
 > **[Research]**. This file is
 > a capability inventory, not a build sequence; use [`ROADMAP.md`](ROADMAP.md) for
@@ -9,14 +10,17 @@
 ## Core CLI and agent loop
 
 - **CLI entrypoint** — `cargo run` starts Iris. [Implemented]
-- **Interactive terminal session** — persistent full-screen TUI on real TTYs,
-  with transcript, textarea editor, spinner, slash palette, `/exit` and `/quit`;
-  text REPL fallback for pipes/CI or TUI startup failure. [Implemented]
+- **Interactive terminal session** — inline-viewport TUI on real TTYs with
+  native terminal scrollback, transcript, textarea editor, spinner, slash
+  palette, modal selectors, live bash exec cells, streamed Markdown rendering,
+  `/exit` and `/quit`; text REPL fallback for pipes/CI or TUI startup failure.
+  [Implemented]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process, plus linear session resume from persisted transcripts.
   [Partial]
 - **Provider-neutral turn/message shape** — `ChatProvider`, `AssistantTurn`,
-  `ToolCall`, `Message`, and `Role` in Nexus. [Partial]
+  `ToolCall`, `Message`, `Role`, and provider-neutral assistant-reasoning rows
+  in Nexus. [Partial]
 - **Provider error reporting** — provider errors print to stderr and the REPL
   continues. [Partial]
 - **Streaming responses** — incremental assistant text output via the async
@@ -33,9 +37,10 @@
   [Implemented]
 - **Session transcript persistence** — best-effort JSONL read/write store:
   `SessionLog` appends v2 transcript entries with stable ids, `parentId`, and
-  token estimates; `SessionStore` lists/finds/opens sessions, rebuilds context
-  through compaction summaries, and `iris resume <id>` continues the same
-  log. Branching/rollback and an in-session resume picker are planned later.
+  token estimates, plus compaction and model-selection audit entries;
+  `SessionStore` lists/finds/opens sessions, rebuilds context through
+  compaction summaries, and `iris resume <id>` continues the same log.
+  Branching/rollback and an in-session resume picker are planned later.
   [Partial]
 
 ## Providers and auth
@@ -47,13 +52,16 @@
   cancellation-aware across attempts/backoff/SSE lines). [Partial]
 - **Anthropic Messages provider** — uses the Claude Code subscription OAuth lane
   (bearer token, no `x-api-key`), Anthropic Messages SSE, Claude Code identity
-  system block, tool schemas, streamed text, and tool-call assembly. Credentials
-  come from the Iris auth store or an existing Claude Code login. [Partial]
+  system block, subscription model matrix, tool schemas, streamed text,
+  tool-call assembly, normalized reasoning budgets/effort, redacted diagnostics,
+  and same-origin reasoning replay. Credentials come from the Iris auth store or
+  an existing Claude Code login. [Partial]
 - **Antigravity provider** — uses Google OAuth for Gemini Code Assist
   (`v1internal:streamGenerateContent?alt=sse`), project-id discovery/persistence,
-  Gemini content/tool mapping, streamed text, and tool-call assembly. The public
-  installed-app client ID is decoded at runtime; `ANTIGRAVITY_CLIENT_SECRET` is
-  supplied at runtime or injected when building Iris. [Partial]
+  Gemini content/tool mapping, streamed text, tool-call assembly, and normalized
+  thinking config. The public installed-app client ID is decoded at runtime;
+  `ANTIGRAVITY_CLIENT_SECRET` is supplied at runtime or injected when building
+  Iris. [Partial]
 - **OpenAI Codex OAuth auth-file support** — reads `~/.iris/auth.json` or
   `IRIS_AUTH_PATH`, refreshes expired access tokens, extracts account ID from the
   JWT payload, and rewrites refreshed credentials atomically with restricted Unix
@@ -69,16 +77,29 @@
   through `iris login openai-codex`. [Partial]
 - **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
   settings; supported provider ids are `openai-codex`, `anthropic`, and
-  `antigravity`. Project-local settings may override only `defaultModel`; global
-  settings own provider/base-url so a cloned repo cannot redirect bearer tokens.
+  `antigravity`. Project-local settings may override only `defaultModel`,
+  `defaultReasoning`, and `contextTokenBudget`; global settings own provider,
+  base-url, and model-cycle scope so a cloned repo cannot redirect bearer tokens
+  or silently change which provider a session cycles to.
   OpenAI Codex additionally supports `IRIS_MODEL` and `IRIS_CODEX_BASE_URL` env
-  overrides. `contextTokenBudget` configures the auto-compaction threshold.
+  overrides. `contextTokenBudget` configures the auto-compaction threshold,
+  `defaultReasoning` sets startup thinking/effort, and `enabledModels` scopes
+  Ctrl+P model cycling from global/user config only.
   [Partial]
+- **Runtime model and reasoning switching** — `/model`, `/reasoning`, TUI
+  provider/model/effort pickers, Ctrl+P/Shift+Ctrl+P model cycling,
+  Shift+Tab effort cycling, `/settings`, `/scoped-models`, and session-local or
+  persisted defaults at safe turn boundaries. [Implemented]
+- **TUI auth selectors** — `/login` and `/logout` modals show no-secret provider
+  status and drive existing OAuth/subscription flows where available. [Implemented]
+- **Model catalog** — hand-maintained provider/model list for picker display and
+  authenticated-model filtering, including current Codex, Anthropic subscription,
+  and Antigravity entries. [Implemented]
 - **Additional providers** — OpenAI API, local, or OpenAI-compatible backends.
   [Planned]
 - **Provider capability matrix** — per-model context window, cache support,
   tool-call format, reasoning controls, JSON reliability, and image support.
-  [Planned]
+  [Partial]
 
 ## Agent Kernel MVP tools
 
@@ -144,7 +165,7 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 - **Context token estimates and budget trigger** — session entries persist
   conservative token estimates, reopened sessions report rebuilt context tokens,
-  and `contextTokenBudget` triggers turn-boundary auto-compaction. [Partial]
+  and `contextTokenBudget` triggers turn-boundary auto-compaction. [Implemented]
 - **Token budget planner** — allocates context across system prompt, tools,
   history, files, summaries, and current task. [Planned]
 - **Context ledger** — records why each context item is included and supports
@@ -155,7 +176,7 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   [Partial]
 - **Handle-returning tool outputs** — large successful tool outputs return a
   compact head/tail preview, structured `outputHandle` metadata, and a handle to
-  full content. [Partial]
+  full content. [Implemented]
 - **Handle dereferencing** — retrieve stored content by handle on demand.
   [Planned]
 - **Micro-summary schema** — deterministic schema for counts, truncation, size,
@@ -178,22 +199,35 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 ## Compaction
 
 - **Durable compaction entries** — JSONL `compaction` entries replace covered
-  message-id ranges with summary messages during read/resume rebuild. [Partial]
+  message-id ranges with summary messages during read/resume rebuild. [Implemented]
 - **Auto-compaction** — when context estimates exceed `contextTokenBudget`, the
   Wayland harness compacts at safe turn boundaries with a deterministic bounded
   excerpt summary, retaining recent context and preserving tool-call/result
   pairs. Provider-quality summaries, manual `/compact`, and branch-aware
-  compaction are planned later. [Partial]
+  compaction are planned later. [Implemented]
 - **Hierarchical compaction** — layered raw turns, compacted older turns, task
   facts, file-change facts, decisions/blockers, and project memory. [Research]
 - **Freshness rules** — mark summaries stale when underlying files change.
   [Research]
 - **Verification probes** — measure compaction recall and quality. [Research]
 
+## Prompt assembly
+
+- **Fragment-based system prompt** — Wayland assembles provider-visible
+  instructions from shipped defaults materialized into `~/.iris/fragments`,
+  repo `.iris/fragments`, project docs (`AGENTS.md`/`CLAUDE.md`), runtime
+  context, and generated live-tool blocks. [Implemented]
+- **Fragment frontmatter** — fragments use `name` for XML tags and numeric
+  `slot` ordering (`slot: 0` disables); selector keys are parse-tolerated but
+  not active yet. [Partial]
+- **Named slots and selector schema** — replace numeric slots with named slots
+  and drive prompt/tool inclusion from resolved provider/model/thinking/mode.
+  [Planned]
+
 ## Modes
 
-- **Mode switching** — switch model and thinking/effort level mid-session.
-  [Planned]
+- **Mode switching** — switch named mode profiles mid-session. Runtime
+  provider/model/thinking switching exists separately today. [Planned]
 - **Switch reuse** — reuse assembled context on switch and change only
   mode-specific prompt/tool segments when possible. [Planned]
 - **Mode profiles** — prompt shape, tool set, compaction policy, and model

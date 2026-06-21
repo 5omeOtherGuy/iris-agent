@@ -1,16 +1,19 @@
 # Iris — Roadmap
 
-> Status (2026-06-17): Milestone 1 and the async-hard runtime completion are
-> done. Iris has a text-only session loop, selectable Mimir providers
-> (`openai-codex`, `anthropic`, and `antigravity`), streamed response parsing,
-> workspace-scoped tools, terminal approval gates with diff previews,
-> provider/model settings, and a best-effort JSONL read/write session-store
-> foundation. Nexus
-> now runs a tokio async loop with turn-level cancellation:
-> the provider is an async stream raced against cancellation, tools are async
-> with child tokens, concurrency-safe tools run in parallel while everything else
-> stays exclusive, and the transcript stays valid on abort. The next runtime work
-> is Milestone 2 (token/context). This roadmap defines build order and acceptance
+> Status (2026-06-21): Milestone 1, the async-hard runtime completion, and the
+> Milestone 2 foundations are done. Iris has an inline-viewport TUI with native
+> scrollback plus a text fallback, selectable Mimir providers (`openai-codex`,
+> `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
+> response parsing, workspace-scoped tools, terminal approval gates with diff
+> previews, fragment-based system-prompt assembly, provider/model/reasoning/
+> context settings, linear session resume, JSONL session persistence, handle-
+> backed large tool outputs, token estimates, and turn-boundary auto-compaction.
+> Nexus runs a tokio async loop with turn-level cancellation: the provider is an
+> async stream raced against cancellation, tools are async with child tokens,
+> concurrency-safe tools run in parallel while everything else stays exclusive,
+> and the transcript stays valid on abort. The active Milestone 2 gate is proof:
+> benchmark that the token/handle/compaction path reduces prompt tokens without
+> reducing task success. This roadmap defines build order and acceptance
 > criteria. `FEATURES.md` remains the capability inventory; this document says
 > what to build first.
 
@@ -52,14 +55,15 @@ building token/context systems on top of it.
 Implemented today:
 
 - CLI entrypoint that starts Iris from `cargo run`.
-- Text-only Nexus session loop with in-memory conversation state, `/exit` /
-  `/quit`, and provider-error recovery, driven through a `Ui` front-end seam
-  (`src/ui/`, `src/cli.rs`).
+- Inline-viewport TUI with native terminal scrollback, textarea editing,
+  slash/modals, streamed Markdown rendering, live bash exec cells, and a text
+  fallback for pipes/CI, driven through a `Ui` front-end seam (`src/ui/`,
+  `src/cli.rs`).
 - Incremental terminal streaming of assistant text via the async
   `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, rendered as
   `UiEvent` deltas.
-- Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and
-  `Role` types.
+- Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`,
+  `Role`, and assistant-reasoning continuity types.
 - Async tokio agent loop with a per-turn `CancellationToken`: provider stream /
   tool / approval reads raced against cancellation, async tools with child
   tokens, safe-parallel batching of concurrency-safe tools, and a valid
@@ -77,29 +81,39 @@ Implemented today:
 - Atomic same-directory file replacement helper used by `write` and `edit`.
 - Text-only `read` rejects binary/NUL-containing and invalid UTF-8 files instead
   of rendering lossy text.
+- Runtime `/model` and `/reasoning` switching at safe turn boundaries, with TUI
+  provider/model/effort pickers, scoped model cycling, `/settings`, `/login`,
+  and `/logout`.
 - Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
   subscription OAuth reuse, and Antigravity Google OAuth.
 - OpenAI Codex browser and device-code login flows; Antigravity browser PKCE
   login; Anthropic instructions for reusing an existing Claude Code login.
 - OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini Code Assist
-  request/response handling, including tool schemas and streamed-response
-  parsing.
-- Harness-owned system-prompt / project-instruction assembly
-  ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56)): the Tier-2
-  Wayland `system_prompt::assemble` builds base instructions + runtime context +
-  the workspace-root `AGENTS.md` (path-safe, missing-file tolerant) in one place;
-  fresh and resumed sessions feed the same assembled string through the existing
-  provider request path. Nested/ancestor/global `AGENTS.md`, skills, and prompt
-  templates are deferred (skills/templates are issue #57).
+  request/response handling, including tool schemas, streamed-response parsing,
+  and normalized reasoning/thinking controls where supported; Anthropic also
+  preserves same-origin reasoning continuity in flattened transcripts.
+- Harness-owned fragment/slot system-prompt / project-instruction assembly
+  ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56),
+  [#74](https://github.com/5omeOtherGuy/iris-agent/pull/74)): the Tier-2
+  Wayland `system_prompt::assemble` builds shipped/user/repo fragments +
+  generated live-tool blocks + dynamic project docs (`AGENTS.md`/`CLAUDE.md`) +
+  runtime context in one place; fresh and resumed sessions feed the same
+  assembled string through the provider request path. Skills/templates remain
+  deferred (issue #57); named slots and selector-driven assembly remain open
+  (#76/#73).
+- Milestone 2 foundations: structured metadata, token estimates,
+  handle-backed large tool outputs, session-scoped content-addressed sidecars,
+  and turn-boundary auto-compaction.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.
 
 Not implemented yet:
 
-- Persistent approval policies, session `/resume` and transcript-tree branching,
-  modes, subagents, context ledger, content handles, git automation, and GitHub
-  integration.
+- Persistent approval policies, in-session `/resume` picker and transcript-tree
+  branching/rollback, modes, subagents, context ledger/planner, handle
+  dereference UI/tool, token-efficiency benchmark proof, git automation, and
+  GitHub integration.
 
 ## Runtime completion — finish Nexus before Milestone 2 [SHIPPED 2026-06-17]
 
@@ -597,13 +611,16 @@ Potential scope:
 - Focused config file for provider/model/tool policy. [Shipped (provider/model):
   `src/config.rs` loads JSON settings from `~/.iris/settings.json` (global,
   override via `IRIS_CONFIG_PATH`) and `<cwd>/.iris/settings.json` (project).
-  Project-local settings may override only `defaultModel`; global/user settings
-  own `defaultProvider` (validated; supported ids: `openai-codex`, `anthropic`,
-  `antigravity`) and `baseUrl` so a cloned repo cannot redirect bearer tokens.
+  Project-local settings may override only `defaultModel`, `defaultReasoning`,
+  and `contextTokenBudget`; global/user settings own `defaultProvider`
+  (validated; supported ids: `openai-codex`, `anthropic`, `antigravity`),
+  `baseUrl`, and `enabledModels` so a cloned repo cannot redirect bearer tokens
+  or silently change the provider/model cycle scope.
   OpenAI Codex keeps its existing env override precedence for `IRIS_MODEL` and
   `IRIS_CODEX_BASE_URL`; Anthropic and Antigravity use settings/defaults for
-  model/base-url. Unknown keys are ignored, a malformed file errors with its
-  path. Tool/approval policy
+  model/base-url. Runtime `/model` and `/reasoning` switching can persist new
+  global defaults, and `/scoped-models` can persist `enabledModels`. Unknown
+  keys are ignored, a malformed file errors with its path. Tool/approval policy
   is deliberately out of scope: pi's settings encode none either, and
   cross-session approval persistence is tracked under
   [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14).]

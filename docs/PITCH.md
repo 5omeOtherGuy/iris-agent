@@ -2,16 +2,18 @@
 
 **A fast, token-efficient coding agent for your terminal.**
 
-> **Status (2026-06-17): Milestone 2 foundations in progress.** Iris currently
-> has a persistent full-screen TUI with text fallback, selectable Mimir providers
-> (`openai-codex`, `anthropic`, `antigravity`), streamed response parsing,
+> **Status (2026-06-21): Milestone 2 foundations are implemented.** Iris
+> currently has an inline-viewport TUI with native scrollback plus a text
+> fallback, selectable Mimir providers (`openai-codex`, `anthropic`,
+> `antigravity`), runtime model/reasoning switching, streamed response parsing,
 > workspace-scoped built-in tools, approval gates with diff previews,
-> provider/model/context-budget settings, linear session resume, best-effort
-> JSONL transcripts, session-scoped large-output handles, and turn-boundary
-> auto-compaction. Nexus runs a tokio async loop with turn-level cancellation:
-> async provider streams, per-tool child cancellation, and safe-parallel
-> execution of concurrency-safe tools. The next runtime work is proving the
-> Milestone 2 token/context foundations with measurement.
+> fragment-based system-prompt assembly, provider/model/reasoning/context-budget
+> settings, linear session resume, JSONL transcripts, session-scoped large-output
+> handles, token estimates, and turn-boundary auto-compaction. Nexus runs a
+> tokio async loop with turn-level cancellation: async provider streams,
+> per-tool child cancellation, and safe-parallel execution of concurrency-safe
+> tools. The active milestone gate is proving the token/context foundations with
+> measurement.
 > Efficiency claims (token savings, cache hits, cheaper switching, compaction
 > quality) are **design goals to be backed by benchmarks**
 > before they are used as selling points. Read future capability sections below
