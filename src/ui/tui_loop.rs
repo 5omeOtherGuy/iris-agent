@@ -37,6 +37,7 @@ use crate::nexus::{
     AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ToolCall,
 };
 use crate::ui::UiEvent;
+use crate::ui::footer::Footer;
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
@@ -118,6 +119,7 @@ async fn session_loop<P: ChatProvider>(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     tui.screen.apply_event(UiEvent::SessionStarted);
+    refresh_footer(tui, harness, switch);
     tui.draw()?;
     // Draw the inline viewport before starting the blocking input reader. The
     // first draw commits the banner through Ratatui, which may still need a
@@ -129,6 +131,9 @@ async fn session_loop<P: ChatProvider>(
     let login_backend: Arc<dyn LoginBackend> = Arc::new(OAuthLoginBackend);
 
     loop {
+        // Rebuild the status line before each user action so it reflects the
+        // prior turn's context growth and any model/effort switch.
+        refresh_footer(tui, harness, switch);
         match idle_phase(tui, &mut input_rx, &mut tick).await? {
             IdleOutcome::Exit => break,
             IdleOutcome::OpenModelPicker => {
@@ -207,6 +212,32 @@ fn apply_notices(tui: &mut TuiUi, lines: Vec<String>) {
     for line in lines {
         tui.screen.apply_event(UiEvent::Notice(line));
     }
+}
+
+/// Rebuild the bottom status-line snapshot from the current workspace, context
+/// estimate, and active model selection, and install it on the screen. Called at
+/// each inter-turn boundary (no terminal I/O of its own); the next draw renders
+/// it.
+fn refresh_footer<P: ChatProvider>(
+    tui: &mut TuiUi,
+    harness: &Harness<P>,
+    switch: &Option<ModelSwitch<'_, P>>,
+) {
+    let model = switch.as_ref().map(|sw| {
+        let selection = sw.selection();
+        format!("{}/{}", selection.provider.as_str(), selection.model)
+    });
+    let context_window = model
+        .as_deref()
+        .and_then(crate::mimir::model_catalog::ctx_window);
+    let footer = Footer::build(
+        harness.workspace(),
+        harness.context_tokens(),
+        context_window,
+        harness.auto_compaction_enabled(),
+        model,
+    );
+    tui.screen.set_footer(footer);
 }
 
 /// Route a submitted `/` command to its picker/handler. Returns whether the line

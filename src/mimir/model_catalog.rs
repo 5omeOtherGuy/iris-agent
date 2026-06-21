@@ -161,6 +161,32 @@ pub(crate) fn ctx_label(qualified: &str) -> Option<&'static str> {
         .map(|(_, _, _, ctx)| *ctx)
 }
 
+/// Numeric context-window cap for a `provider/modelId`, parsed from the catalog
+/// label (`"300k"` -> `300_000`, `"1M"` -> `1_000_000`). `None` for an unknown
+/// model or an unparseable label. Used by the TUI status line to compute context
+/// usage as a percentage; the label remains the source of truth (it is a soft,
+/// hand-maintained routing cap, not an enforced limit).
+pub(crate) fn ctx_window(qualified: &str) -> Option<u64> {
+    parse_window_label(ctx_label(qualified)?)
+}
+
+/// Parse a context-window label (`"300k"`, `"1M"`, `"128000"`) into a token
+/// count. Case-insensitive on the `k`/`m` suffix; fractional values (`"1.5M"`)
+/// round down.
+fn parse_window_label(label: &str) -> Option<u64> {
+    let label = label.trim();
+    let (digits, multiplier) = match label.chars().last() {
+        Some('k' | 'K') => (&label[..label.len() - 1], 1_000.0),
+        Some('m' | 'M') => (&label[..label.len() - 1], 1_000_000.0),
+        _ => (label, 1.0),
+    };
+    let value: f64 = digits.trim().parse().ok()?;
+    if value < 0.0 {
+        return None;
+    }
+    Some((value * multiplier) as u64)
+}
+
 /// Human-friendly display name for a `provider/modelId`, shown in the `/model`
 /// picker footer ("Model Name: ..."). Falls back to the bare model id for
 /// anything not in the catalog.
@@ -296,6 +322,27 @@ mod tests {
         assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-fable-5"), Some("1M"));
         assert_eq!(ctx_label("openai-codex/gpt-9-mystery"), None);
+    }
+
+    #[test]
+    fn ctx_window_parses_catalog_labels_to_token_counts() {
+        assert_eq!(ctx_window("openai-codex/gpt-5.5"), Some(300_000));
+        assert_eq!(ctx_window("anthropic/claude-sonnet-4-6"), Some(200_000));
+        assert_eq!(ctx_window("anthropic/claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(ctx_window("antigravity/gemini-3.1-pro"), Some(1_000_000));
+        // Unknown model -> no label -> no window.
+        assert_eq!(ctx_window("openai-codex/gpt-9-mystery"), None);
+    }
+
+    #[test]
+    fn parse_window_label_handles_suffixes_and_garbage() {
+        assert_eq!(parse_window_label("300k"), Some(300_000));
+        assert_eq!(parse_window_label("1M"), Some(1_000_000));
+        assert_eq!(parse_window_label("128000"), Some(128_000));
+        assert_eq!(parse_window_label("1.5M"), Some(1_500_000));
+        assert_eq!(parse_window_label(""), None);
+        assert_eq!(parse_window_label("lots"), None);
+        assert_eq!(parse_window_label("-5k"), None);
     }
 
     #[test]

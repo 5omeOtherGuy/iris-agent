@@ -15,6 +15,12 @@
   palette, modal selectors, live bash exec cells, streamed Markdown rendering,
   `/exit` and `/quit`; text REPL fallback for pipes/CI or TUI startup failure.
   [Implemented]
+- **Status line (footer)** — pi-style two-line status block pinned at the bottom
+  of the TUI: working directory (HOME-abbreviated) + git branch, then context
+  usage (`pct%/window`, color-escalating, with an `(auto)` auto-compaction
+  indicator) and the active `provider/model`, right-aligned. Context size is the
+  per-message token *estimate*; cumulative provider token/cost figures await real
+  usage capture (Milestone 2). [Partial]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process, plus linear session resume from persisted transcripts.
   [Partial]

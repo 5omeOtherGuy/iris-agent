@@ -6,6 +6,7 @@ use crate::nexus::{
     AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ToolCall,
 };
 
+pub(crate) mod footer;
 pub(crate) mod login;
 pub(crate) mod markdown;
 pub(crate) mod modal;

@@ -35,6 +35,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::nexus::{ApprovalDecision, ToolCall};
 use crate::tool_display::{exploration_summary, is_exploration_tool, run_target, summarize};
+use crate::ui::footer::Footer;
 use crate::ui::modal::Modal;
 use crate::ui::slash::{self, Palette, SlashCommand};
 use crate::ui::{TurnErrorKind, UiEvent};
@@ -101,6 +102,11 @@ fn err_style() -> Style {
 fn dim_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
+/// Status-line context-usage warning tier (70-90% of the window): yellow, not
+/// bold, so it sits between the dim default and the bold prompt/error styles.
+fn warn_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
 fn prompt_style() -> Style {
     Style::default()
         .fg(Color::Yellow)
@@ -131,6 +137,24 @@ fn format_duration(duration: std::time::Duration) -> String {
 }
 fn banner_style() -> Style {
     Style::default().fg(Color::Magenta)
+}
+
+/// Format a token count compactly for the status line, matching pi's footer
+/// (`formatTokens`): `<1k` exact, `<10k` one decimal (`1.4k`), `<1M` rounded
+/// (`272k`), then `M` with the same one-decimal / rounded split.
+fn format_tokens(count: u64) -> String {
+    let n = count as f64;
+    if count < 1_000 {
+        count.to_string()
+    } else if count < 10_000 {
+        format!("{:.1}k", n / 1_000.0)
+    } else if count < 1_000_000 {
+        format!("{}k", (n / 1_000.0).round() as u64)
+    } else if count < 10_000_000 {
+        format!("{:.1}M", n / 1_000_000.0)
+    } else {
+        format!("{}M", (n / 1_000_000.0).round() as u64)
+    }
 }
 
 /// Display width of a string as the terminal renders it, reused for word-wrap.
@@ -1018,6 +1042,10 @@ pub(crate) struct Screen {
     /// The active picker/dialog, when one is open. While present it replaces the
     /// editor area and the loop routes keys to it instead of the editor.
     pub(crate) modal: Option<Modal>,
+    /// Persistent bottom status line (cwd/branch, context usage, model). `None`
+    /// until the loop supplies a snapshot, so tests that build a bare `Screen`
+    /// render no footer.
+    footer: Option<Footer>,
 }
 
 impl Screen {
@@ -1029,6 +1057,7 @@ impl Screen {
             spinner: Spinner::default(),
             approval_hint: None,
             modal: None,
+            footer: None,
         }
     }
 
@@ -1210,6 +1239,112 @@ impl Screen {
             .unwrap_or(u16::MAX)
             .max(1)
     }
+
+    // --- status line (footer) ---
+
+    /// Install the latest status-line snapshot. The loop rebuilds it at each
+    /// state change (session start, turn boundary, model switch) and the next
+    /// draw renders it; `None` (the default) renders nothing.
+    pub(crate) fn set_footer(&mut self, footer: Footer) {
+        self.footer = Some(footer);
+    }
+
+    /// Rows reserved for the bottom status line: two lines once a snapshot
+    /// exists (cwd/branch, then context + model), otherwise none.
+    fn footer_height(&self) -> u16 {
+        if self.footer.is_some() { 2 } else { 0 }
+    }
+
+    /// Render the pi-style two-line status block: `~/cwd (branch)` on the first
+    /// line; context usage on the left and the active model right-aligned on the
+    /// second. Empty when no snapshot has been installed.
+    fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(footer) = &self.footer else {
+            return Vec::new();
+        };
+        let w = usize::from(width.max(1));
+
+        // Line 1: working directory + git branch.
+        let mut path = footer.cwd.clone();
+        if let Some(branch) = &footer.branch {
+            path.push_str(" (");
+            path.push_str(branch);
+            path.push(')');
+        }
+        let path_line = Line::from(Span::styled(truncate_to_columns(&path, w), dim_style()));
+
+        // Line 2 (left): context usage, colored by how full the window is.
+        let (ctx_text, ctx_style) = context_segment(footer);
+        let mut spans = vec![Span::styled(ctx_text.clone(), ctx_style)];
+
+        // Line 2 (right): active model, right-aligned when it fits with a 2-col
+        // gap; dropped (rather than wrapped/truncated) on a narrow terminal.
+        if let Some(model) = &footer.model {
+            let left_w = display_width(&ctx_text);
+            let right_w = display_width(model);
+            if left_w + 2 + right_w <= w {
+                spans.push(Span::styled(" ".repeat(w - left_w - right_w), dim_style()));
+                spans.push(Span::styled(model.clone(), dim_style()));
+            }
+        }
+
+        vec![path_line, Line::from(spans)]
+    }
+}
+
+/// Build the context-usage segment for the status line: `pct%/window (auto)`
+/// when the model's window is known, otherwise the bare estimated token count.
+/// The color escalates with usage (dim < 70% < yellow < 90% < red), mirroring
+/// pi's footer.
+fn context_segment(footer: &Footer) -> (String, Style) {
+    let auto = if footer.auto_compact { " (auto)" } else { "" };
+    match footer.context_window {
+        Some(window) if window > 0 => {
+            let percent = (footer.context_tokens as f64 / window as f64) * 100.0;
+            let style = if percent > 90.0 {
+                err_style()
+            } else if percent > 70.0 {
+                warn_style()
+            } else {
+                dim_style()
+            };
+            (
+                format!("{percent:.1}%/{}{auto}", format_tokens(window)),
+                style,
+            )
+        }
+        // Window unknown (a model outside the catalog): show the estimate alone
+        // rather than a percentage of an unknown denominator.
+        _ => (
+            format!("{}{auto}", format_tokens(footer.context_tokens)),
+            dim_style(),
+        ),
+    }
+}
+
+/// Truncate `text` to at most `max` display columns, appending a single-column
+/// ellipsis when shortened. Width-aware (unlike [`truncate_chars`]) so wide
+/// glyphs do not overflow the status row.
+fn truncate_to_columns(text: &str, max: usize) -> String {
+    if display_width(text) <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cw = char_width(ch);
+        if used + cw > budget {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// Colorize a unified diff into styled transcript rows. Every file-header pair
@@ -1353,13 +1488,21 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
     // Bottom-anchored, clamped to the fixed viewport. The editor and a status
     // row are reserved FIRST so a tall slash palette can never starve the
     // editor out of the layout; the palette then takes only what remains, and
-    // the active-block region absorbs any slack at the top.
+    // the active-block region absorbs any slack at the top. The persistent
+    // status line (footer) sits below the editor and is reserved alongside it.
     const MIN_EDITOR_H: u16 = 3; // one text row + top/bottom border
-    let palette_h = palette_wanted.min(area.height.saturating_sub(MIN_EDITOR_H).saturating_sub(1));
+    let footer_wanted = screen.footer_height();
+    // Editor + status row + footer are the protected bottom region.
+    let reserved = footer_wanted.saturating_add(1); // status row
+    let palette_h = palette_wanted.min(
+        area.height
+            .saturating_sub(MIN_EDITOR_H)
+            .saturating_sub(reserved),
+    );
     let max_editor_h = area
         .height
         .saturating_sub(palette_h)
-        .saturating_sub(1)
+        .saturating_sub(reserved)
         .max(1);
     let editor_h = (editor_rows + 2).min(max_editor_h).max(1);
     let desired_status_h = screen.status_height(area.width);
@@ -1367,21 +1510,32 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
         .height
         .saturating_sub(editor_h)
         .saturating_sub(palette_h)
+        .saturating_sub(footer_wanted)
         .max(1);
     let status_h = desired_status_h.min(max_status_h);
     let status_lines = screen.status_lines(area.width);
+    // Footer takes whatever is left after the higher-priority rows; on a tiny
+    // terminal it collapses before the editor/status do.
+    let footer_h = footer_wanted.min(
+        area.height
+            .saturating_sub(editor_h)
+            .saturating_sub(palette_h)
+            .saturating_sub(status_h),
+    );
 
     let chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(status_h),
         Constraint::Length(palette_h),
         Constraint::Length(editor_h),
+        Constraint::Length(footer_h),
     ])
     .split(area);
     let active_area = chunks[0];
     let status_area = chunks[1];
     let palette_area = chunks[2];
     let editor_area = chunks[3];
+    let footer_area = chunks[4];
 
     // Active in-flight block: show its tail so the newest live output (a
     // streaming reply or the most recent tool block) stays visible until it is
@@ -1409,6 +1563,13 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
 
     // The TextArea draws its own border (set in `fresh_editor`) and cursor.
     frame.render_widget(&screen.editor, editor_area);
+
+    if footer_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Text::from(screen.footer_lines(footer_area.width))),
+            footer_area,
+        );
+    }
 }
 
 /// Render the active transcript on top and the open modal in a bordered box at
@@ -2570,6 +2731,89 @@ mod tests {
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
         // The editor placeholder is hidden while the modal is open.
         assert!(!rendered.contains("Type a message"), "{rendered}");
+        Ok(())
+    }
+
+    fn footer(cwd: &str, tokens: u64, window: Option<u64>) -> Footer {
+        Footer {
+            cwd: cwd.to_string(),
+            branch: Some("main".to_string()),
+            context_tokens: tokens,
+            context_window: window,
+            auto_compact: true,
+            model: Some("openai-codex/gpt-5.5".to_string()),
+        }
+    }
+
+    #[test]
+    fn format_tokens_matches_pi_tiers() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_400), "1.4k");
+        assert_eq!(format_tokens(17_000), "17k");
+        assert_eq!(format_tokens(272_000), "272k");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn context_segment_shows_percentage_when_window_known() {
+        let (text, style) = context_segment(&footer("~/x", 18_496, Some(272_000)));
+        assert_eq!(text, "6.8%/272k (auto)");
+        // 6.8% is well under the 70% warn threshold -> dim.
+        assert_eq!(style, dim_style());
+    }
+
+    #[test]
+    fn context_segment_escalates_color_with_usage() {
+        let (_, warn) = context_segment(&footer("~/x", 200_000, Some(272_000)));
+        assert_eq!(warn, warn_style(), "73.5% should warn");
+        let (_, danger) = context_segment(&footer("~/x", 260_000, Some(272_000)));
+        assert_eq!(danger, err_style(), "95.6% should be an error color");
+    }
+
+    #[test]
+    fn context_segment_falls_back_to_token_count_without_a_window() {
+        let (text, style) = context_segment(&footer("~/x", 1_400, None));
+        assert_eq!(text, "1.4k (auto)");
+        assert_eq!(style, dim_style());
+    }
+
+    #[test]
+    fn footer_renders_cwd_branch_context_and_model() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(60, LIVE_VIEWPORT_ROWS))?;
+        let mut screen = Screen::new();
+        screen.set_footer(footer("~/projects/iris", 18_496, Some(272_000)));
+        terminal.draw(|f| render(f, &mut screen))?;
+
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("~/projects/iris (main)"), "{rendered}");
+        assert!(rendered.contains("6.8%/272k (auto)"), "{rendered}");
+        assert!(rendered.contains("openai-codex/gpt-5.5"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn footer_drops_the_model_when_it_cannot_fit() -> Result<()> {
+        // Narrow terminal: context segment fits, the right-aligned model does not.
+        let mut terminal = Terminal::new(TestBackend::new(20, LIVE_VIEWPORT_ROWS))?;
+        let mut screen = Screen::new();
+        screen.set_footer(footer("~/p", 18_496, Some(272_000)));
+        terminal.draw(|f| render(f, &mut screen))?;
+
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("6.8%/272k (auto)"), "{rendered}");
+        assert!(!rendered.contains("openai-codex/gpt-5.5"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn no_footer_renders_no_status_line() -> Result<()> {
+        let mut terminal = Terminal::new(TestBackend::new(60, LIVE_VIEWPORT_ROWS))?;
+        let mut screen = Screen::new();
+        terminal.draw(|f| render(f, &mut screen))?;
+        // A bare screen (no snapshot installed) shows no context percentage.
+        assert!(!buffer_text(&terminal).contains("(auto)"));
         Ok(())
     }
 

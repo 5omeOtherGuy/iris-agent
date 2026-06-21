@@ -150,6 +150,25 @@ impl<P: ChatProvider> Harness<P> {
         self.agent.replace_provider(provider);
     }
 
+    /// The workspace root tools and the status line run against.
+    pub(crate) fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
+    /// Estimated provider-visible context size, in tokens, for the status line.
+    /// Uses the same per-message estimate convention the store persists and
+    /// auto-compaction budgets against, so the displayed figure matches the
+    /// number that triggers compaction.
+    pub(crate) fn context_tokens(&self) -> u64 {
+        context_tokens(self.agent.messages())
+    }
+
+    /// Whether auto-compaction is armed (a context budget is configured). Shown
+    /// as the `(auto)` indicator in the status line, mirroring pi's footer.
+    pub(crate) fn auto_compaction_enabled(&self) -> bool {
+        self.budget.is_some()
+    }
+
     /// Record a runtime mode switch as a first-class `modelSelection` entry in
     /// the transcript log. Best-effort (no-op without an attached log), mirroring
     /// message persistence: a switch is still applied even if it cannot be
