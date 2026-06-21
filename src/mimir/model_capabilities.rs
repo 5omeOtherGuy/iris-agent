@@ -15,10 +15,13 @@
 //! - openai-codex (gpt-5.5): full set incl. `xhigh`
 //!   (`models.generated.ts` `thinkingLevelMap: {off:null, xhigh:xhigh}`; the
 //!   Responses `reasoning.effort` enum accepts `minimal..xhigh`).
-//! - anthropic: the adaptive-thinking Opus 4.6/4.7/4.8 and Sonnet 4.6 models
-//!   accept the full iris set off..`xhigh`; the adapter upshifts each level onto
-//!   Anthropic's `low|medium|high|xhigh|max` effort scale (iris `xhigh` -> `max`).
-//!   Unknown/older budget-based ids top out at `high` (`xhigh` clamps to `high`).
+//! - anthropic: every Claude Code subscription model in
+//!   [`crate::mimir::anthropic_models`] accepts the full iris set off..`xhigh`.
+//!   Adaptive models (Opus 4.7/4.8, Fable 5) upshift each level onto Anthropic's
+//!   `low|medium|high|xhigh|max` effort scale (iris `xhigh` -> `max`); manual-
+//!   budget models (Haiku 4.5, Sonnet 4.6, Opus 4.6) map each level to a thinking
+//!   token budget and so must not reject `xhigh`. Unknown/older non-subscription
+//!   ids top out at `high` (`xhigh` clamps to `high`).
 //! - antigravity (gemini-3.5-flash): `off..high`; `xhigh` clamps to `high`
 //!   (gemini-pi `FLASH_THINKING = {minimal,low,medium,high}`, `xhigh -> null`).
 
@@ -44,18 +47,18 @@ pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [R
     }
 }
 
-/// Anthropic supported levels, keyed by model. The adaptive-thinking Opus
-/// 4.6/4.7/4.8 and Sonnet 4.6 models accept the full iris set off..`xhigh`: the
-/// adapter maps each level one notch up Anthropic's `low|medium|high|xhigh|max`
-/// effort scale (iris `xhigh` -> Anthropic `max`). Unknown/older budget-based
-/// ids stay conservative and top out at `high` (`xhigh` clamps to `high`).
+/// Anthropic supported levels, keyed by model. Every Claude Code subscription
+/// model (manual-budget Haiku 4.5 / Sonnet 4.6 / Opus 4.6 and adaptive Opus
+/// 4.7/4.8 / Fable 5) accepts the full iris set off..`xhigh`; the provider maps
+/// each level into the model's thinking encoding (`xhigh` -> Anthropic `max`
+/// effort, or the `xhigh` 32768 budget). Unknown/older non-subscription ids stay
+/// conservative and top out at `high` (`xhigh` clamps to `high`).
 fn anthropic_supported_levels(model: &str) -> &'static [ReasoningEffort] {
     use ReasoningEffort::{High, Low, Medium, Minimal, Off, XHigh};
-    match model {
-        "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "claude-sonnet-4-6" => {
-            &[Off, Minimal, Low, Medium, High, XHigh]
-        }
-        _ => &[Off, Minimal, Low, Medium, High],
+    if crate::mimir::anthropic_models::is_subscription_model(model) {
+        &[Off, Minimal, Low, Medium, High, XHigh]
+    } else {
+        &[Off, Minimal, Low, Medium, High]
     }
 }
 
