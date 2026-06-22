@@ -210,11 +210,14 @@ impl<W: Write> TerminalSurface<W> {
             return Ok(RenderKind::Append);
         }
 
-        // Shrinking or changing above the visible previous viewport cannot be
-        // patched safely without risking stale rows; replay from Iris-owned state.
-        // Changes that extend below the viewport are safe to write through the
-        // bottom of the terminal and let the terminal scroll naturally.
-        if new_len < previous_len || first_changed < self.state.previous_viewport_top {
+        // Non-append length changes (for example opening slash/settings chrome
+        // above the editor) must not be patched line-by-line: the changed range
+        // can extend below the visible terminal footprint, and writing it with
+        // CRLF would make the terminal scroll and copy the visible viewport into
+        // native scrollback. Repaint the visible slice in place instead.
+        // Changes above the previous viewport need the same coherent replay to
+        // avoid stale rows after resize/history reflow.
+        if new_len != previous_len || first_changed < self.state.previous_viewport_top {
             self.write_full(lines.to_vec(), width, height, true)?;
             return Ok(RenderKind::FullRedraw);
         }
@@ -573,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_growth_before_bottom_chrome_patches_without_full_redraw() -> io::Result<()> {
+    fn non_append_growth_replays_visible_slice_without_scrolling() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         let initial = vec![
             Line::from("transcript 1"),
@@ -599,10 +602,15 @@ mod tests {
         ];
         let stats = surface.render(size(20, 5), &next)?;
 
-        assert_eq!(stats.kind, RenderKind::Diff);
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
         let out = output(&surface);
-        assert!(!out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
-        assert!(strip_ansi(&out).contains("transcript 6"), "{out:?}");
+        assert!(out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("transcript 4"), "{plain:?}");
+        assert!(plain.contains("transcript 6"), "{plain:?}");
+        assert!(plain.contains("chrome 2"), "{plain:?}");
+        assert!(!plain.contains("transcript 1"), "{plain:?}");
+        assert_eq!(plain.matches("\r\n").count(), 4, "{plain:?}");
         Ok(())
     }
 
