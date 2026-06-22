@@ -9,12 +9,14 @@
 //! Scope: Iris authenticates every provider by OAuth/subscription, so the
 //! "Use an API key" branch shows `No API key providers available.` and no
 //! API-key input dialog is built (a deliberate deferral -- see the task report).
-//! Anthropic has no standalone OAuth flow; selecting it returns an instruction to
-//! sign in via Claude Code rather than a fake login.
+//! Anthropic runs a real OAuth PKCE browser login (with a manual paste
+//! fallback), the same shape as the other subscription providers.
 
 use anyhow::Result;
 use reqwest::blocking::Client;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::mimir::auth;
 use crate::mimir::auth::storage::{AuthStore, CredentialKind};
@@ -160,15 +162,21 @@ pub(crate) enum LoginUpdate {
 pub(crate) enum LoginOutcome {
     /// Credentials were stored.
     LoggedIn,
-    /// Informational guidance; nothing was stored (e.g. Anthropic -> Claude Code).
-    Instruction(String),
 }
 
 /// Runs a blocking OAuth login for a provider, pushing dialog updates. Abstracted
 /// so the TUI loop drives the real flow on a blocking task while tests inject a
-/// deterministic fake.
+/// deterministic fake. `cancel` lets the loop abort the blocking callback wait
+/// (releasing the port); `manual_rx` feeds a pasted authorization code / redirect
+/// URL for providers that support a manual fallback (Anthropic).
 pub(crate) trait LoginBackend: Send + Sync + 'static {
-    fn login(&self, provider: ProviderId, on_update: &dyn Fn(LoginUpdate)) -> Result<LoginOutcome>;
+    fn login(
+        &self,
+        provider: ProviderId,
+        cancel: &CancellationToken,
+        manual_rx: Option<&Receiver<String>>,
+        on_update: &dyn Fn(LoginUpdate),
+    ) -> Result<LoginOutcome>;
 }
 
 /// The production backend: drives the existing `mimir::auth` browser OAuth
@@ -176,15 +184,25 @@ pub(crate) trait LoginBackend: Send + Sync + 'static {
 pub(crate) struct OAuthLoginBackend;
 
 impl LoginBackend for OAuthLoginBackend {
-    fn login(&self, provider: ProviderId, on_update: &dyn Fn(LoginUpdate)) -> Result<LoginOutcome> {
+    fn login(
+        &self,
+        provider: ProviderId,
+        cancel: &CancellationToken,
+        manual_rx: Option<&Receiver<String>>,
+        on_update: &dyn Fn(LoginUpdate),
+    ) -> Result<LoginOutcome> {
         // The URL is auto-opened (see `apply_login_update`); the hint covers the
         // headless / no-opener fallback. Ctrl/Cmd+click is unreliable here
         // because the bordered modal cannot carry an OSC-8 hyperlink.
         let open_hint = "Opening your browser. If it does not open, copy the URL above to sign in.";
+        // A generous timeout covers the browser round-trip plus the bounded
+        // callback wait the helpers enforce internally.
+        let client = Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
         match provider {
             ProviderId::OpenAiCodex => {
-                let client = Client::builder().timeout(Duration::from_secs(120)).build()?;
-                auth::openai_codex::login_browser(&client, |info| {
+                auth::openai_codex::login_browser(&client, cancel, |info| {
                     on_update(LoginUpdate::AuthUrl {
                         url: info.url.clone(),
                         hint: open_hint.to_string(),
@@ -197,8 +215,7 @@ impl LoginBackend for OAuthLoginBackend {
                 Ok(LoginOutcome::LoggedIn)
             }
             ProviderId::Antigravity => {
-                let client = Client::builder().timeout(Duration::from_secs(120)).build()?;
-                auth::antigravity::login_browser(&client, |url| {
+                auth::antigravity::login_browser(&client, cancel, |url| {
                     on_update(LoginUpdate::AuthUrl {
                         url: url.to_string(),
                         hint: open_hint.to_string(),
@@ -207,13 +224,18 @@ impl LoginBackend for OAuthLoginBackend {
                 })?;
                 Ok(LoginOutcome::LoggedIn)
             }
-            // Anthropic reuses an existing Claude Code login; there is no
-            // standalone Iris OAuth flow to run.
-            ProviderId::Anthropic => Ok(LoginOutcome::Instruction(
-                "Anthropic uses your existing Claude Code login. Sign in with the Claude Code CLI; \
-                 Iris reads its OAuth token."
-                    .to_string(),
-            )),
+            ProviderId::Anthropic => {
+                auth::anthropic::login_browser(&client, cancel, manual_rx, |url| {
+                    on_update(LoginUpdate::AuthUrl {
+                        url: url.to_string(),
+                        hint: open_hint.to_string(),
+                    });
+                    on_update(LoginUpdate::Progress(
+                        "Waiting for the browser callback, or paste the code below...".to_string(),
+                    ));
+                })?;
+                Ok(LoginOutcome::LoggedIn)
+            }
         }
     }
 }
@@ -257,7 +279,6 @@ fn browser_open_command(os: &str, url: &str) -> (&'static str, Vec<String>) {
 pub(crate) fn login_complete_lines(provider: ProviderId, outcome: &LoginOutcome) -> Vec<String> {
     match outcome {
         LoginOutcome::LoggedIn => vec![format!("Logged in to {}", provider.display_name())],
-        LoginOutcome::Instruction(text) => vec![text.clone()],
     }
 }
 
@@ -384,6 +405,8 @@ mod tests {
         fn login(
             &self,
             provider: ProviderId,
+            _cancel: &CancellationToken,
+            _manual_rx: Option<&Receiver<String>>,
             on_update: &dyn Fn(LoginUpdate),
         ) -> Result<LoginOutcome> {
             on_update(LoginUpdate::AuthUrl {
@@ -405,9 +428,12 @@ mod tests {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let updates_c = updates.clone();
         let outcome = backend
-            .login(ProviderId::OpenAiCodex, &move |u| {
-                updates_c.lock().unwrap().push(u)
-            })
+            .login(
+                ProviderId::OpenAiCodex,
+                &CancellationToken::new(),
+                None,
+                &move |u| updates_c.lock().unwrap().push(u),
+            )
             .unwrap();
         assert_eq!(outcome, LoginOutcome::LoggedIn);
         assert_eq!(seen.lock().unwrap().as_slice(), &[ProviderId::OpenAiCodex]);

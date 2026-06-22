@@ -1,19 +1,19 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::Rng;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::mimir::auth::device_code::{DeviceCodePoll, poll_device_code};
+use crate::mimir::auth::oauth_callback::{
+    CallbackConfig, CallbackServer, LOGIN_TIMEOUT, create_pkce, random_url_token,
+};
 use crate::mimir::auth::storage::{AuthStore, OAuthCredentials};
 use crate::telemetry;
 
@@ -26,7 +26,9 @@ const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/
 const DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const BROWSER_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
-const BROWSER_CALLBACK_ADDR: &str = "127.0.0.1:1455";
+const BROWSER_CALLBACK_PORT: u16 = 1455;
+const BROWSER_CALLBACK_PATH: &str = "/auth/callback";
+const PROVIDER_LABEL: &str = "OpenAI Codex";
 const SCOPE: &str = "openid profile email offline_access";
 const DEVICE_CODE_TIMEOUT_SECONDS: u64 = 15 * 60;
 const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth";
@@ -97,9 +99,12 @@ pub(crate) struct BrowserLoginInfo {
     pub(crate) redirect_uri: String,
 }
 
-pub(crate) fn login_browser(client: &Client, on_auth: impl FnOnce(BrowserLoginInfo)) -> Result<()> {
-    let listener = TcpListener::bind(BROWSER_CALLBACK_ADDR)
-        .context("failed to start OpenAI Codex OAuth callback server")?;
+pub(crate) fn login_browser(
+    client: &Client,
+    cancel: &CancellationToken,
+    on_auth: impl FnOnce(BrowserLoginInfo),
+) -> Result<()> {
+    let server = CallbackServer::bind(BROWSER_CALLBACK_PORT, PROVIDER_LABEL)?;
     let pkce = create_pkce();
     let state = random_url_token(16);
     let url = authorization_url(&pkce.challenge, &state)?;
@@ -109,9 +114,20 @@ pub(crate) fn login_browser(client: &Client, on_auth: impl FnOnce(BrowserLoginIn
         redirect_uri: BROWSER_REDIRECT_URI.to_string(),
     });
 
-    let code = wait_for_browser_code(listener, &state)?;
+    let config = CallbackConfig {
+        expected_state: &state,
+        callback_path: BROWSER_CALLBACK_PATH,
+        success_message: "OpenAI authentication completed. You can close this window.",
+        provider_label: PROVIDER_LABEL,
+    };
+    let code = server.wait_for_code(&config, Instant::now() + LOGIN_TIMEOUT, cancel, None)?;
     let credentials =
         exchange_authorization_code(client, &code, &pkce.verifier, BROWSER_REDIRECT_URI)?;
+    // A cancel that lands after the code arrived but before persistence must not
+    // store credentials behind a dismissed dialog.
+    if cancel.is_cancelled() {
+        bail!("OpenAI Codex login cancelled");
+    }
     AuthStore::from_env()?.set_oauth_credentials(AUTH_PROVIDER, credentials)
 }
 
@@ -136,27 +152,6 @@ pub(crate) fn login_device_code(
     AuthStore::from_env()?.set_oauth_credentials(AUTH_PROVIDER, credentials)
 }
 
-#[derive(Debug, Clone)]
-struct Pkce {
-    verifier: String,
-    challenge: String,
-}
-
-fn create_pkce() -> Pkce {
-    let verifier = random_url_token(32);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    Pkce {
-        verifier,
-        challenge,
-    }
-}
-
-fn random_url_token(byte_len: usize) -> String {
-    let mut bytes = vec![0_u8; byte_len];
-    rand::rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
 fn authorization_url(challenge: &str, state: &str) -> Result<String> {
     let mut url = Url::parse(AUTHORIZE_URL)?;
     url.query_pairs_mut()
@@ -171,89 +166,6 @@ fn authorization_url(challenge: &str, state: &str) -> Result<String> {
         .append_pair("codex_cli_simplified_flow", "true")
         .append_pair("originator", "iris");
     Ok(url.to_string())
-}
-
-fn wait_for_browser_code(listener: TcpListener, expected_state: &str) -> Result<String> {
-    for stream in listener.incoming() {
-        let mut stream = stream.context("failed to receive OpenAI Codex OAuth callback")?;
-        let request = read_http_request(&mut stream)?;
-        match parse_callback_request(&request, expected_state)? {
-            Some(code) => {
-                write_callback_response(
-                    &mut stream,
-                    200,
-                    "OpenAI authentication completed. You can close this window.",
-                )?;
-                return Ok(code);
-            }
-            None => {
-                write_callback_response(&mut stream, 404, "Not found.")?;
-            }
-        }
-    }
-    bail!("OpenAI Codex OAuth callback server stopped before receiving a code")
-}
-
-fn read_http_request(stream: &mut TcpStream) -> Result<String> {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    loop {
-        let len = stream
-            .read(&mut buffer)
-            .context("failed to read OpenAI Codex OAuth callback")?;
-        if len == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..len]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    Ok(String::from_utf8_lossy(&request).into_owned())
-}
-
-fn write_callback_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
-    let reason = if status == 200 { "OK" } else { "Not Found" };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(response.as_bytes())
-        .context("failed to write OpenAI Codex OAuth callback response")
-}
-
-fn parse_callback_request(request: &str, expected_state: &str) -> Result<Option<String>> {
-    let request_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("missing OAuth callback request line"))?;
-    let target = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("missing OAuth callback target"))?;
-    let url = if target.starts_with('/') {
-        Url::parse(&format!("http://localhost{target}"))?
-    } else {
-        Url::parse(target)?
-    };
-    if url.path() != "/auth/callback" {
-        return Ok(None);
-    }
-    let mut code = None;
-    let mut state = None;
-    for (key, value) in url.query_pairs() {
-        match key.as_ref() {
-            "code" => code = Some(value.into_owned()),
-            "state" => state = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-    if state.as_deref() != Some(expected_state) {
-        bail!("OAuth state mismatch");
-    }
-    code.map(Some)
-        .ok_or_else(|| anyhow!("missing OAuth authorization code"))
 }
 
 #[derive(Debug, Clone)]
@@ -280,7 +192,7 @@ fn start_device_auth(client: &Client) -> Result<DeviceAuthInfo> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
-        match telemetry::sanitize_external_body(&body) {
+        match telemetry::sanitize_oauth_body(&body) {
             Some(detail) => bail!("OpenAI Codex device code request failed ({status}): {detail}"),
             None => bail!("OpenAI Codex device code request failed ({status})"),
         }
@@ -352,7 +264,7 @@ fn poll_device_auth_once(
         Some("deviceauth_authorization_pending") => Ok(DeviceCodePoll::Pending),
         Some("slow_down") => Ok(DeviceCodePoll::SlowDown),
         _ => Ok(DeviceCodePoll::Failed(
-            match telemetry::sanitize_external_body(&body) {
+            match telemetry::sanitize_oauth_body(&body) {
                 Some(detail) => format!("OpenAI Codex device auth failed ({status}): {detail}"),
                 None => format!("OpenAI Codex device auth failed ({status})"),
             },
@@ -515,44 +427,6 @@ mod tests {
             Some("state")
         );
         Ok(())
-    }
-
-    #[test]
-    fn parses_browser_callback_request() -> Result<()> {
-        let request =
-            "GET /auth/callback?code=abc123&state=state123 HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        assert_eq!(
-            parse_callback_request(request, "state123")?,
-            Some("abc123".to_string())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn parses_absolute_browser_callback_request() -> Result<()> {
-        let request = "GET http://localhost:1455/auth/callback?code=abc123&state=state123 HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        assert_eq!(
-            parse_callback_request(request, "state123")?,
-            Some("abc123".to_string())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ignores_unrelated_browser_requests() -> Result<()> {
-        let request = "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        assert_eq!(parse_callback_request(request, "state123")?, None);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_browser_callback_state_mismatch() {
-        let request =
-            "GET /auth/callback?code=abc123&state=wrong HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let error = parse_callback_request(request, "state123")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("state mismatch"));
     }
 
     #[test]

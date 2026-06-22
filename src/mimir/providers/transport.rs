@@ -95,6 +95,7 @@ pub(super) fn classify_http_status(status: u16) -> HttpClass {
 /// refreshed); `send` performs one attempt. Termination is guaranteed: reauth
 /// fires at most once.
 pub(super) fn run_with_reauth<T>(
+    provider: &str,
     cancel: &CancellationToken,
     mut get_token: impl FnMut(bool) -> Result<T>,
     mut send: impl FnMut(&T) -> Attempt,
@@ -107,7 +108,7 @@ pub(super) fn run_with_reauth<T>(
         }
         let token = get_token(force_refresh).map_err(|error| {
             tracing::error!(error = %format!("{error:#}"), "failed to obtain access token");
-            crate::errors::AuthError::new("authentication failed")
+            auth_error(provider, &error)
         })?;
         if cancel.is_cancelled() {
             bail!("turn cancelled");
@@ -117,7 +118,7 @@ pub(super) fn run_with_reauth<T>(
             Attempt::Reauth(error) => {
                 if reauth_used {
                     tracing::error!(error = %format!("{error:#}"), "auth rejected after refresh");
-                    return Err(crate::errors::AuthError::new("authentication failed").into());
+                    return Err(auth_error(provider, &error).into());
                 }
                 if cancel.is_cancelled() {
                     bail!("turn cancelled");
@@ -129,6 +130,22 @@ pub(super) fn run_with_reauth<T>(
             Attempt::Fatal(error) => return Err(error),
         }
     }
+}
+
+/// Build an [`AuthError`](crate::errors::AuthError) that preserves the safe cause
+/// chain (Mimir's auth errors already drop raw token/response bodies and Keychain
+/// output) and records the failing provider so the CLI/TUI can render the right
+/// re-login hint. The runtime stays free of the CLI command string itself (a
+/// Tier-4 detail); the generic message is used only when no cause text exists.
+fn auth_error(provider: &str, cause: &anyhow::Error) -> crate::errors::AuthError {
+    let detail = format!("{cause:#}");
+    let detail = detail.trim();
+    let message = if detail.is_empty() {
+        format!("{provider} authentication failed")
+    } else {
+        format!("{provider} authentication failed: {detail}")
+    };
+    crate::errors::AuthError::for_provider(provider, message)
 }
 
 /// Iterate SSE events from a blocking reader. Events are separated by a blank
@@ -186,6 +203,7 @@ mod tests {
         let mut sends = 0u32;
         let cancel = CancellationToken::new();
         let turn = run_with_reauth(
+            "test",
             &cancel,
             |force| {
                 tokens.push(force);
@@ -218,6 +236,7 @@ mod tests {
         cancel.cancel();
         let mut token_loads = 0;
         let result = run_with_reauth(
+            "test",
             &cancel,
             |_force| {
                 token_loads += 1;
@@ -233,12 +252,74 @@ mod tests {
     fn reauth_twice_is_auth_error() {
         let cancel = CancellationToken::new();
         let result = run_with_reauth(
+            "test",
             &cancel,
             |_force| Ok(()),
             |&()| Attempt::Reauth(anyhow!("401")),
         );
         let error = result.unwrap_err();
         assert!(error.downcast_ref::<crate::errors::AuthError>().is_some());
+    }
+
+    #[test]
+    fn auth_error_preserves_provider_and_safe_cause() {
+        let cancel = CancellationToken::new();
+        let result = run_with_reauth(
+            "anthropic",
+            &cancel,
+            |_force| Ok(()),
+            |&()| Attempt::Reauth(anyhow!("HTTP 401 token rejected")),
+        );
+        let error = result.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("anthropic"), "provider named: {message}");
+        assert!(
+            message.contains("HTTP 401 token rejected"),
+            "safe cause preserved: {message}"
+        );
+        // The CLI command string is a Tier-4 detail and must NOT be baked into
+        // the runtime error; the failing provider is carried structurally.
+        assert!(
+            !message.contains("iris login"),
+            "no CLI command in runtime: {message}"
+        );
+        let auth = error
+            .downcast_ref::<crate::errors::AuthError>()
+            .expect("auth error");
+        assert_eq!(auth.provider(), Some("anthropic"));
+    }
+
+    #[test]
+    fn auth_error_includes_token_load_cause_and_login_hint() {
+        let cancel = CancellationToken::new();
+        let result = run_with_reauth::<()>(
+            "antigravity",
+            &cancel,
+            |_force| Err(anyhow!("Claude Code credentials could not be read")),
+            |&()| {
+                Attempt::Done(Box::new(AssistantTurn {
+                    text: Some("unused".to_string()),
+                    reasoning: Vec::new(),
+                    tool_calls: Vec::new(),
+                    response_id: None,
+                    usage: None,
+                }))
+            },
+        );
+        let error = result.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("antigravity"), "{message}");
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(
+            !message.contains("iris login"),
+            "no CLI command in runtime: {message}"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<crate::errors::AuthError>()
+                .and_then(crate::errors::AuthError::provider),
+            Some("antigravity")
+        );
     }
 
     #[test]

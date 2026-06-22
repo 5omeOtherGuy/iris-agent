@@ -81,6 +81,7 @@ impl ChatProvider for AntigravityProvider {
         Ok(spawn_stream(
             move |sink, cancel| {
                 run_with_reauth(
+                    "antigravity",
                     cancel,
                     |force| {
                         if force {

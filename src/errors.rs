@@ -9,18 +9,37 @@
 /// Authentication could not be established or was rejected by the provider.
 ///
 /// Surfaced to the user with a re-login hint and mapped to a dedicated exit
-/// code. The wrapped message already includes the underlying cause chain.
+/// code. The wrapped message already includes the underlying cause chain. The
+/// optional `provider` records which provider failed so the presentation layer
+/// (CLI/TUI) can format the right re-login hint -- the runtime never embeds the
+/// CLI command itself, keeping this type free of Tier-4 command detail.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(crate) struct AuthError {
     message: String,
+    provider: Option<String>,
 }
 
 impl AuthError {
     pub(crate) fn new(cause: impl std::fmt::Display) -> Self {
         Self {
             message: cause.to_string(),
+            provider: None,
         }
+    }
+
+    /// Like [`AuthError::new`], but records the failing provider id so callers
+    /// can render a provider-specific re-login hint at the UI boundary.
+    pub(crate) fn for_provider(provider: impl Into<String>, cause: impl std::fmt::Display) -> Self {
+        Self {
+            message: cause.to_string(),
+            provider: Some(provider.into()),
+        }
+    }
+
+    /// The failing provider id, when known.
+    pub(crate) fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 }
 

@@ -148,6 +148,7 @@ impl ChatProvider for AnthropicProvider {
                 // refresh could hand the rejected token straight back.
                 let mut last_token: Option<String> = None;
                 run_with_reauth(
+                    "anthropic",
                     cancel,
                     |force| {
                         let token = if force {

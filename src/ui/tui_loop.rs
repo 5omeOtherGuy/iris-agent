@@ -582,16 +582,13 @@ enum LoginResolution {
 }
 
 /// Run a blocking OAuth login on a blocking task while keeping the dialog live:
-/// auth-URL / progress updates flow over a channel and Esc/Ctrl+C cancels.
-/// ponytail: cancel stops *waiting* and dismisses the dialog, but the adopted
-/// blocking helper is parked in `TcpListener::incoming()` on the OAuth callback
-/// port and cannot be force-aborted. So until the user's browser hits the
-/// callback (or the process exits) the orphaned thread keeps that port bound
-/// (a re-login attempt can fail to bind) and a late callback can still store
-/// credentials after the UI reported "Login cancelled" - harmless for the
-/// user's own account. Upgrade path: thread a cancel token into the auth
-/// helpers' accept loop and make the listener non-blocking with a deadline so
-/// cancel releases the port immediately.
+/// auth-URL / progress updates flow over a channel; Esc/Ctrl+C cancels and the
+/// shared [`CancellationToken`] is tripped so the bounded, non-blocking callback
+/// helper notices it within a poll tick, returns, and releases the port. The
+/// loop then awaits the blocking task before reporting "cancelled", so a late
+/// browser callback can never persist credentials behind a dismissed dialog.
+/// Anthropic additionally accepts a pasted authorization code / redirect URL,
+/// forwarded to the helper over a manual-input channel.
 async fn run_login(
     provider: crate::mimir::selection::ProviderId,
     tui: &mut TuiUi,
@@ -599,15 +596,21 @@ async fn run_login(
     tick: &mut tokio::time::Interval,
     login_backend: &Arc<dyn LoginBackend>,
 ) -> Result<()> {
+    use crate::mimir::selection::ProviderId;
+
     let name = provider.display_name().to_string();
-    let mut dialog = LoginDialog::new(&name);
+    let manual = matches!(provider, ProviderId::Anthropic);
+    let mut dialog = LoginDialog::new(&name, manual);
     tui.screen.open_modal(Modal::LoginDialog(dialog.clone()));
     tui.draw()?;
 
     let (upd_tx, mut upd_rx) = unbounded_channel::<LoginUpdate>();
+    let (manual_tx, manual_rx) = std::sync::mpsc::channel::<String>();
+    let cancel = CancellationToken::new();
     let backend = Arc::clone(login_backend);
+    let task_cancel = cancel.clone();
     let join = tokio::task::spawn_blocking(move || {
-        backend.login(provider, &move |update| {
+        backend.login(provider, &task_cancel, Some(&manual_rx), &move |update| {
             let _ = upd_tx.send(update);
         })
     });
@@ -624,7 +627,14 @@ async fn run_login(
             maybe = input_rx.recv() => {
                 match maybe {
                     Some(event) if is_modal_cancel(&event) => break LoginResolution::Cancelled,
-                    Some(_) => {}
+                    Some(event) => {
+                        if dialog.accepts_manual_input()
+                            && apply_manual_key(&mut dialog, &event, &manual_tx)
+                        {
+                            tui.screen.open_modal(Modal::LoginDialog(dialog.clone()));
+                            tui.draw()?;
+                        }
+                    }
                     None => break LoginResolution::Cancelled,
                 }
             }
@@ -638,12 +648,58 @@ async fn run_login(
             vec![format!("Failed to login to {name}: {error:#}")]
         }
         LoginResolution::Done(Err(join_error)) => vec![format!("Login task failed: {join_error}")],
-        LoginResolution::Cancelled => vec!["Login cancelled".to_string()],
+        LoginResolution::Cancelled => {
+            // Trip the token so the bounded callback helper stops waiting and
+            // releases the port, then await the task so a late callback cannot
+            // persist credentials after we report "cancelled".
+            cancel.cancel();
+            dialog.push_line("Cancelling...".to_string());
+            tui.screen.open_modal(Modal::LoginDialog(dialog.clone()));
+            tui.draw()?;
+            let _ = join.await;
+            vec!["Login cancelled".to_string()]
+        }
     };
     apply_notices(tui, lines);
     tui.screen.close_modal();
     tui.draw()?;
     Ok(())
+}
+
+/// Apply a keystroke to the manual-paste buffer of an Anthropic login dialog.
+/// Returns whether the dialog changed (and so should be redrawn). On Enter the
+/// buffered code/redirect URL is sent to the blocking helper.
+fn apply_manual_key(
+    dialog: &mut LoginDialog,
+    event: &Event,
+    manual_tx: &std::sync::mpsc::Sender<String>,
+) -> bool {
+    let Event::Key(key) = event else {
+        return false;
+    };
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            let input = dialog.take_input();
+            if input.trim().is_empty() {
+                return true;
+            }
+            let _ = manual_tx.send(input);
+            dialog.push_line("Submitting pasted authorization...".to_string());
+            true
+        }
+        KeyCode::Backspace => {
+            dialog.backspace();
+            true
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            dialog.push_char(ch);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Update the login dialog body from a backend callback.
