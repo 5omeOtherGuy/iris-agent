@@ -239,17 +239,38 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
 /// to a read-only display accessor on `Harness`.
 fn footer_cwd() -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME")
+    let display = if let Some(home) = std::env::var_os("HOME")
         && !home.is_empty()
         && let Ok(rel) = cwd.strip_prefix(std::path::Path::new(&home))
     {
-        return if rel.as_os_str().is_empty() {
+        if rel.as_os_str().is_empty() {
             "~".to_string()
         } else {
             format!("~/{}", rel.display())
-        };
+        }
+    } else {
+        cwd.display().to_string()
+    };
+
+    match footer_branch(&cwd) {
+        Some(branch) => format!("{display} ({branch})"),
+        None => display,
     }
-    cwd.display().to_string()
+}
+
+fn footer_branch(cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("branch")
+        .arg("--show-current")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
 }
 
 /// Route a submitted `/` command to its picker/handler. Returns whether the line

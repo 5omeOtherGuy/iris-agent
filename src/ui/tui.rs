@@ -35,7 +35,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::nexus::{ApprovalDecision, ToolCall};
+use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{
     exploration_active_summary, exploration_summary, is_exploration_tool, run_target, summarize,
 };
@@ -81,6 +81,12 @@ const MAX_TOOL_OUTPUT_ROWS: usize = 8;
 /// this from a live terminal-bg probe; Iris keeps a constant to avoid that
 /// machinery). Presentation-only.
 const USER_BG: Color = Color::Rgb(50, 50, 56);
+const X_PADDING: usize = 2;
+const BOX_X_PADDING: usize = X_PADDING;
+const TEXT_X_PADDING: usize = X_PADDING;
+const TEXT_COLUMN_X_PADDING: usize = BOX_X_PADDING + TEXT_X_PADDING;
+const BOX_X_PADDING_U16: u16 = X_PADDING as u16;
+const TEXT_X_PADDING_U16: u16 = X_PADDING as u16;
 
 /// A turn must run at least this long before the elapsed clause appears in the
 /// active-turn status and the turn-end rule is labelled `Worked for ...` (Codex
@@ -315,17 +321,54 @@ impl TranscriptRow {
             out.push(hrule_line(&self.text, width));
             return;
         }
+        let boxed = self.background.is_some();
+        let box_width = if boxed {
+            width.saturating_sub(BOX_X_PADDING * 2).max(1)
+        } else {
+            width
+        };
+        let content_padding = row_text_padding(self);
+        let render_width = box_width
+            .saturating_sub(content_padding.saturating_mul(2))
+            .max(1);
         let start = out.len();
         match &self.line {
-            Some(line) if self.word_wrap => push_wrapped_line_wordwise(line, width, out),
-            Some(line) => push_wrapped_line(line, width, self.continuation_prefix, out),
-            None => push_wrapped_row(&self.text, self.style, width, self.continuation_prefix, out),
+            Some(line) if self.word_wrap => push_wrapped_line_wordwise(line, render_width, out),
+            Some(line) => push_wrapped_line(line, render_width, self.continuation_prefix, out),
+            None => push_wrapped_row(
+                &self.text,
+                self.style,
+                render_width,
+                self.continuation_prefix,
+                out,
+            ),
+        }
+        if content_padding > 0 {
+            for physical in &mut out[start..] {
+                pad_line_left(physical, content_padding);
+            }
         }
         if let Some(bg) = self.background {
             for physical in &mut out[start..] {
-                apply_full_width_bg(physical, bg, width);
+                apply_width_bg(physical, bg, box_width);
+                pad_line_left(physical, BOX_X_PADDING);
+                pad_line_right(physical, BOX_X_PADDING);
             }
         }
+    }
+}
+
+fn pad_line_left(line: &mut Line<'static>, padding: usize) {
+    if padding > 0 {
+        line.spans
+            .insert(0, Span::styled(" ".repeat(padding), line.style));
+    }
+}
+
+fn pad_line_right(line: &mut Line<'static>, padding: usize) {
+    if padding > 0 {
+        line.spans
+            .push(Span::styled(" ".repeat(padding), line.style));
     }
 }
 
@@ -351,11 +394,13 @@ fn hrule_line(label: &str, width: usize) -> Line<'static> {
     ))
 }
 
-/// Apply a full-width background fill to one already-wrapped physical line: set
-/// the line's base style so every span inherits the bg, then pad to `width` with
-/// a trailing space span (ratatui only colours the cells a span occupies).
-fn apply_full_width_bg(line: &mut Line<'static>, bg: Color, width: usize) {
-    line.style = line.style.bg(bg);
+/// Apply a background fill to one already-wrapped physical line, then pad to
+/// `width` with a trailing background span (ratatui only colours the cells a
+/// span occupies).
+fn apply_width_bg(line: &mut Line<'static>, bg: Color, width: usize) {
+    for span in &mut line.spans {
+        span.style = span.style.bg(bg);
+    }
     let used = display_width(&line_text(line));
     if used < width {
         line.spans.push(Span::styled(
@@ -369,9 +414,18 @@ fn apply_full_width_bg(line: &mut Line<'static>, bg: Color, width: usize) {
 /// top-level blocks. Distinguished from a Markdown-internal blank line (which
 /// carries a styled `line`) and from a turn-rule row so block grouping remains
 /// stable while the terminal surface replays from Iris state.
-#[cfg(test)]
 fn is_separator_row(row: &TranscriptRow) -> bool {
-    !row.hrule && row.text.is_empty() && row.line.is_none()
+    !row.hrule && row.text.is_empty() && row.line.is_none() && row.background.is_none()
+}
+
+fn row_text_padding(row: &TranscriptRow) -> usize {
+    if row.background.is_some() {
+        usize::from(!row.text.is_empty()) * TEXT_X_PADDING
+    } else if is_separator_row(row) {
+        0
+    } else {
+        TEXT_COLUMN_X_PADDING
+    }
 }
 
 fn push_span_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
@@ -522,12 +576,12 @@ struct Transcript {
 
 impl Transcript {
     /// Append a blank separator row before a new top-level block, unless the
-    /// transcript is empty or already ends in a blank row.
+    /// transcript is empty or already ends in a real separator row.
     fn push_blank(&mut self) {
         self.exploring_open = false;
         match self.rows.last() {
             None => {}
-            Some(last) if last.text.is_empty() => {}
+            Some(last) if is_separator_row(last) => {}
             _ => self
                 .rows
                 .push(TranscriptRow::new(String::new(), Style::default())),
@@ -570,6 +624,7 @@ impl Transcript {
             && !text.is_empty()
         {
             self.push_markdown(&text);
+            self.push_blank();
         }
     }
 
@@ -953,6 +1008,7 @@ impl Transcript {
                 if !text.is_empty() {
                     self.push_blank();
                     self.push_markdown(&text);
+                    self.push_blank();
                 }
             }
             UiEvent::AssistantText(text) => {
@@ -960,6 +1016,7 @@ impl Transcript {
                 if !text.is_empty() {
                     self.push_blank();
                     self.push_markdown(&text);
+                    self.push_blank();
                 }
             }
             UiEvent::SessionStarted => {
@@ -1123,7 +1180,9 @@ impl Transcript {
 
     fn render(&mut self, width: u16) -> Vec<Line<'static>> {
         let width = usize::from(width);
-        self.last_width = width;
+        self.last_width = width
+            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+            .max(1);
         let mut rows = Vec::new();
         for row in &self.rows {
             row.render(width, &mut rows);
@@ -1264,15 +1323,62 @@ struct Footer {
     model: String,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
+    /// Latest provider-reported usage, if the provider surfaced it.
+    usage: Option<ProviderUsage>,
 }
 
-/// Render the idle footer: model+effort accented, cwd in green, dim `·` between.
-fn footer_line(footer: &Footer) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(footer.model.clone(), Style::default().fg(Color::Cyan)),
-        Span::styled(" \u{b7} ", dim_style()),
-        Span::styled(footer.cwd.clone(), Style::default().fg(Color::Green)),
-    ])
+fn footer_lines(footer: &Footer, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let model = truncate_to_width(&footer.model, width);
+    let model_width = display_width(&model);
+    let usage = footer.usage.as_ref().map(footer_usage_text);
+    let usage = usage.as_deref().unwrap_or_default();
+    let usage_max = width.saturating_sub(model_width).saturating_sub(1);
+    let usage = if usage_max > 0 {
+        truncate_to_width(usage, usage_max)
+    } else {
+        String::new()
+    };
+    let usage_width = display_width(&usage);
+    let pad = width
+        .saturating_sub(usage_width)
+        .saturating_sub(model_width);
+
+    let mut second = Vec::new();
+    if !usage.is_empty() {
+        second.push(Span::styled(usage, dim_style()));
+    }
+    second.push(Span::raw(" ".repeat(pad)));
+    second.push(Span::styled(model, Style::default().fg(Color::Cyan)));
+
+    vec![
+        Line::from(Span::styled(
+            truncate_to_width(&footer.cwd, width),
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(second),
+    ]
+}
+
+fn footer_usage_text(usage: &ProviderUsage) -> String {
+    let mut text = format!("{} tokens", compact_count(usage.total_tokens));
+    if usage.cache_read_input_tokens > 0 {
+        text.push_str(&format!(
+            " ({} cached)",
+            compact_count(usage.cache_read_input_tokens)
+        ));
+    }
+    text
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 /// Active-turn status spans: `{spinner} Working ({elapsed} · esc to interrupt)`.
@@ -1402,6 +1508,13 @@ impl Screen {
         if is_turn_work(&event) {
             self.turn_did_work = true;
         }
+        if let UiEvent::ProviderTurnCompleted {
+            usage: Some(usage), ..
+        } = &event
+            && let Some(footer) = &mut self.footer
+        {
+            footer.usage = Some(usage.clone());
+        }
         self.transcript.apply(event);
     }
 
@@ -1463,7 +1576,8 @@ impl Screen {
     /// Set (or refresh) the idle footer from the live model selection. The loop
     /// calls this whenever the model/effort changes; `cwd` is home-relativized.
     pub(crate) fn set_footer(&mut self, model: String, cwd: String) {
-        self.footer = Some(Footer { model, cwd });
+        let usage = self.footer.as_ref().and_then(|footer| footer.usage.clone());
+        self.footer = Some(Footer { model, cwd, usage });
     }
 
     pub(crate) fn start_turn(&mut self) {
@@ -1530,7 +1644,7 @@ impl Screen {
                 self.spinner.elapsed(),
             ))]
         } else if let Some(footer) = &self.footer {
-            vec![footer_line(footer)]
+            footer_lines(footer, usize::from(width))
         } else {
             vec![Line::from(Span::styled(IDLE_HINT, dim_style()))]
         }
@@ -1701,16 +1815,20 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     // editor out of the layout; the palette then takes only what remains, and
     // the active-block region absorbs any slack at the top.
     const MIN_EDITOR_H: u16 = 3; // one text row + a shaded pad row above and below
-    let palette_h = palette_wanted.min(area.height.saturating_sub(MIN_EDITOR_H).saturating_sub(1));
+    let desired_status_h = screen.status_height(area.width);
+    let palette_h = palette_wanted.min(
+        area.height
+            .saturating_sub(MIN_EDITOR_H)
+            .saturating_sub(desired_status_h),
+    );
     let max_editor_h = area
         .height
         .saturating_sub(palette_h)
-        .saturating_sub(1)
+        .saturating_sub(desired_status_h)
         .max(1);
     // Reserve a shaded pad row above and below the text so the input reads as a
     // box matching committed user-message blocks.
     let editor_h = (editor_rows + 2).min(max_editor_h).max(1);
-    let desired_status_h = screen.status_height(area.width);
     let max_status_h = area
         .height
         .saturating_sub(editor_h)
@@ -1722,14 +1840,14 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     let chrome_h = status_h.saturating_add(palette_h).saturating_add(editor_h);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
-        Constraint::Length(status_h),
         Constraint::Length(palette_h),
         Constraint::Length(editor_h),
+        Constraint::Length(status_h),
     ])
     .split(chrome_area);
-    let status_area = chunks[0];
-    let palette_area = chunks[1];
-    let editor_area = chunks[2];
+    let palette_area = chunks[0];
+    let editor_area = chunks[1];
+    let status_area = chunks[2];
 
     let mut buf = Buffer::empty(chrome_area);
     Paragraph::new(Text::from(status_lines)).render(status_area, &mut buf);
@@ -1743,21 +1861,32 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         );
     }
 
-    // Paint the full editor rectangle with the same shaded background used for
+    // Paint an inset editor rectangle with the same shaded background used for
     // committed user-message blocks, then draw the TextArea into the middle,
     // leaving a shaded pad row above and below (when the box is tall enough).
+    let box_area = Rect {
+        x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),
+        y: editor_area.y,
+        width: editor_area
+            .width
+            .saturating_sub(BOX_X_PADDING_U16 * 2)
+            .max(1),
+        height: editor_area.height,
+    };
     Block::default()
         .style(Style::default().bg(USER_BG))
-        .render(editor_area, &mut buf);
+        .render(box_area, &mut buf);
     let pad = u16::from(editor_area.height >= 3);
     let text_area = Rect {
-        x: editor_area.x,
+        x: box_area.x + TEXT_X_PADDING_U16.min(box_area.width.saturating_sub(1)),
         y: editor_area.y + pad,
-        width: editor_area.width,
+        width: box_area.width.saturating_sub(TEXT_X_PADDING_U16 * 2).max(1),
         height: editor_area.height.saturating_sub(pad * 2).max(1),
     };
     (&screen.editor).render(text_area, &mut buf);
-    buffer_to_lines(&buf)
+    let mut lines = buffer_to_lines(&buf);
+    lines.insert(usize::from(palette_h), Line::default());
+    lines
 }
 
 /// Render the open modal in a bordered box at the document bottom, in place of
@@ -1945,11 +2074,29 @@ mod tests {
             .collect()
     }
 
+    fn background_width(line: &Line<'static>, bg: Color) -> usize {
+        line.spans
+            .iter()
+            .filter(|span| span.style.bg == Some(bg))
+            .map(|span| display_width(span.content.as_ref()))
+            .sum()
+    }
+
     fn line_matching<'a>(
         lines: &'a [Line<'static>],
         predicate: impl Fn(&Line<'static>) -> bool,
     ) -> &'a Line<'static> {
         lines.iter().find(|line| predicate(line)).expect("line")
+    }
+
+    fn span_matching<'a>(
+        line: &'a Line<'static>,
+        predicate: impl Fn(&Span<'static>) -> bool,
+    ) -> &'a Span<'static> {
+        line.spans
+            .iter()
+            .find(|span| predicate(span))
+            .expect("span")
     }
 
     fn rendered_lines(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -1990,7 +2137,7 @@ mod tests {
         assert_eq!(screen.wrapped_lines(80).len(), 1);
         screen.apply(UiEvent::AssistantTextEnd("Hello".to_string()));
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
-        assert_eq!(texts, vec!["Hello".to_string()]);
+        assert_eq!(texts, vec!["Hello".to_string(), String::new()]);
     }
 
     #[test]
@@ -2014,7 +2161,7 @@ mod tests {
         ));
         let lines = screen.wrapped_lines(80);
         // Heading is bold.
-        let title = line_matching(&lines, |l| line_text(l) == "Title");
+        let title = line_matching(&lines, |l| line_text(l).trim_start() == "Title");
         assert!(
             title
                 .spans
@@ -2030,8 +2177,8 @@ mod tests {
                 .any(|s| s.content.as_ref() == "`cargo test`" && s.style.fg == Some(Color::Cyan))
         );
         // Bullets render with dash markers.
-        assert!(lines.iter().any(|l| line_text(l) == "- one"));
-        assert!(lines.iter().any(|l| line_text(l) == "- two"));
+        assert!(lines.iter().any(|l| line_text(l).trim_start() == "- one"));
+        assert!(lines.iter().any(|l| line_text(l).trim_start() == "- two"));
     }
 
     #[test]
@@ -2045,10 +2192,10 @@ mod tests {
         assert!(
             render_document(&mut screen, Size::new(80, 12))
                 .iter()
-                .any(|line| line_text(line) == "Title")
+                .any(|line| line_text(line).trim_start() == "Title")
         );
 
-        let title = line_matching(&live, |l| line_text(l) == "Title");
+        let title = line_matching(&live, |l| line_text(l).trim_start() == "Title");
         assert!(
             title
                 .spans
@@ -2062,11 +2209,14 @@ mod tests {
                 .iter()
                 .any(|s| s.content.as_ref() == "`cargo test`" && s.style.fg == Some(Color::Cyan))
         );
-        assert!(live.iter().any(|l| line_text(l) == "- one"));
+        assert!(live.iter().any(|l| line_text(l).trim_start() == "- one"));
 
         screen.apply(UiEvent::AssistantTextEnd(markdown.to_string()));
         let finalized = screen.wrapped_lines(80);
-        assert_eq!(line_signature(&live), line_signature(&finalized));
+        assert_eq!(
+            line_signature(&live),
+            line_signature(&finalized[..live.len()])
+        );
         assert_eq!(
             line_signature(&finalized),
             line_signature(&screen.wrapped_lines(80))
@@ -2131,8 +2281,91 @@ mod tests {
     fn long_transcript_line_wraps_to_multiple_rows() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("alpha beta gamma delta".to_string()));
-        assert_eq!(screen.transcript.rows.len(), 1);
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|row| row.text == "alpha beta gamma delta")
+        );
         assert!(screen.wrapped_lines(12).len() >= 2);
+    }
+
+    #[test]
+    fn assistant_reply_gets_text_padding_and_blank_rows() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantText("alpha beta".to_string()));
+        let lines = screen.wrapped_lines(16);
+
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            vec![
+                "    alpha".to_string(),
+                "    beta".to_string(),
+                String::new()
+            ]
+        );
+        assert!(lines.iter().all(|line| line.style.bg.is_none()));
+    }
+
+    #[test]
+    fn assistant_reply_after_user_box_gets_unshaded_top_padding() {
+        let mut screen = Screen::new();
+        screen.commit_user("HI");
+        screen.apply(UiEvent::AssistantText(
+            "Hi! What are you working on?".to_string(),
+        ));
+        let lines = screen.wrapped_lines(80);
+
+        let reply_idx = lines
+            .iter()
+            .position(|line| line_text(line).contains("Hi! What"))
+            .expect("assistant reply");
+        let gap = &lines[reply_idx - 1];
+        assert_eq!(line_text(gap), "");
+        assert_eq!(gap.style.bg, None);
+        assert!(line_text(&lines[reply_idx]).starts_with("    Hi! What"));
+        assert_eq!(lines[reply_idx].style.bg, None);
+    }
+
+    #[test]
+    fn transcript_outputs_align_to_user_text_column() {
+        let mut screen = Screen::new();
+        screen.commit_user("Hi");
+        screen.apply(UiEvent::AssistantText(
+            "Hey! What are you working on?".to_string(),
+        ));
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("read", json!({ "path": "src/ui/tui.rs" })),
+            content: "ignored file body".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "true" })),
+            content: String::new(),
+            exit_code: None,
+            duration: None,
+        });
+        let lines = screen.wrapped_lines(80);
+        let text_column = line_text(
+            lines
+                .iter()
+                .find(|line| line_text(line).contains("Hi"))
+                .expect("user line"),
+        )
+        .find("Hi")
+        .expect("user text");
+
+        for needle in ["Hey!", "\u{2022} Explored", "\u{2022} Ran true"] {
+            let rendered = line_text(
+                lines
+                    .iter()
+                    .find(|line| line_text(line).contains(needle))
+                    .expect(needle),
+            );
+            assert_eq!(rendered.find(needle).expect(needle), text_column);
+        }
     }
 
     #[test]
@@ -2162,19 +2395,21 @@ mod tests {
         });
         let lines = screen.wrapped_lines(80);
         let output = line_matching(&lines, |line| line_text(line).contains("red plain"));
-        assert_eq!(line_text(output), "  └ red plain");
-        assert_eq!(output.spans[0].content.as_ref(), "  └ ");
-        assert_eq!(output.spans[0].style, dim_style());
-        assert_eq!(output.spans[1].content.as_ref(), "red");
-        assert_eq!(output.spans[1].style, Style::default().fg(Color::Red));
-        assert_eq!(output.spans[2].content.as_ref(), " plain");
-        assert_eq!(output.spans[2].style.fg, Some(Color::DarkGray));
+        assert_eq!(line_text(output), "      └ red plain");
+        assert_eq!(output.spans[0].content.as_ref(), "    ");
+        assert_eq!(output.spans[0].style, Style::default());
+        assert_eq!(output.spans[1].content.as_ref(), "  └ ");
+        assert_eq!(output.spans[1].style, dim_style());
+        assert_eq!(output.spans[2].content.as_ref(), "red");
+        assert_eq!(output.spans[2].style, Style::default().fg(Color::Red));
+        assert_eq!(output.spans[3].content.as_ref(), " plain");
+        assert_eq!(output.spans[3].style.fg, Some(Color::DarkGray));
     }
 
     #[test]
-    fn committed_user_block_carries_full_width_background() {
-        // The shaded user block must keep its full-width background in the
-        // replayable transcript document, not only while being edited live.
+    fn committed_user_block_carries_inset_background() {
+        // The shaded user block stays replayable, with the background inset
+        // from the terminal edges and text padded inside the box.
         let mut screen = Screen::new();
         screen.commit_user("hello");
         let lines = screen.wrapped_lines(20);
@@ -2182,13 +2417,16 @@ mod tests {
             .iter()
             .find(|l| line_text(l).contains("hello"))
             .expect("user row rendered from state");
-        assert_eq!(row.style.bg, Some(USER_BG));
+        assert_eq!(row.style.bg, None);
         assert_eq!(display_width(&line_text(row)), 20);
+        assert_eq!(background_width(row, USER_BG), 16);
+        assert_eq!(row.spans.first().unwrap().style.bg, None);
+        assert_eq!(row.spans.last().unwrap().style.bg, None);
         assert!(
             row.spans
                 .iter()
                 .all(|s| s.style.bg.is_none() || s.style.bg == Some(USER_BG)),
-            "every span inherits or sets the shaded background: {row:?}"
+            "only the inset box carries the shaded background: {row:?}"
         );
     }
 
@@ -2320,7 +2558,7 @@ mod tests {
         });
         let texts: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
         // First output line shown under the head gutter; last line shown in tail.
-        assert!(texts.iter().any(|t| t == "  └ line 0"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "      └ line 0"), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("line 19")), "{texts:?}");
         // The middle is elided with an accurate count, and the block stays
         // within the physical-row budget (+ marker).
@@ -2386,13 +2624,13 @@ mod tests {
         );
         let lines = screen.wrapped_lines(80);
         let line = line_matching(&lines, |line| line_text(line).contains("You approved"));
-        assert_eq!(line.spans[0].content.as_ref(), "✔");
-        assert_eq!(line.spans[0].style, ok_style());
+        let marker = span_matching(line, |span| span.content.as_ref() == "✔");
+        assert_eq!(marker.style, ok_style());
         assert_eq!(
-            line.spans[1].content.as_ref(),
+            line.spans[2].content.as_ref(),
             " You approved iris to run echo hi this time"
         );
-        assert_eq!(line.spans[1].style, Style::default());
+        assert_eq!(line.spans[2].style, Style::default());
     }
 
     #[test]
@@ -2498,9 +2736,13 @@ mod tests {
             .iter()
             .find(|line| line.contains("Search"))
             .expect("search row");
-        assert!(first.starts_with("  └ "), "{lines:?}");
+        assert!(first.starts_with("      └ "), "{lines:?}");
         assert!(
-            lines.iter().filter(|line| line.starts_with("    ")).count() > 0,
+            lines
+                .iter()
+                .filter(|line| line.starts_with("        "))
+                .count()
+                > 0,
             "wrapped search row lost continuation gutter: {lines:?}"
         );
     }
@@ -2518,9 +2760,13 @@ mod tests {
             duration: None,
         });
         let lines: Vec<String> = screen.wrapped_lines(34).iter().map(line_text).collect();
-        assert!(lines.iter().any(|line| line.starts_with("• Ran node -e")));
-        assert!(lines.iter().any(|line| line.starts_with("  │ ")));
-        assert!(lines.iter().any(|line| line == "  └ (no output)"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("    • Ran node -e"))
+        );
+        assert!(lines.iter().any(|line| line.starts_with("      │ ")));
+        assert!(lines.iter().any(|line| line == "      └ (no output)"));
     }
 
     #[test]
@@ -2536,11 +2782,13 @@ mod tests {
             duration: None,
         });
         let lines = screen.wrapped_lines(80);
-        let continuation = line_matching(&lines, |line| line_text(line).starts_with("  │ "));
-        assert_eq!(continuation.spans.len(), 2);
-        assert_eq!(continuation.spans[0].content.as_ref(), "  │ ");
-        assert_eq!(continuation.spans[0].style, dim_style());
-        assert_eq!(continuation.spans[1].style, tool_header_style());
+        let continuation = line_matching(&lines, |line| line_text(line).starts_with("      │ "));
+        assert_eq!(continuation.spans.len(), 3);
+        assert_eq!(continuation.spans[0].content.as_ref(), "    ");
+        assert_eq!(continuation.spans[0].style, Style::default());
+        assert_eq!(continuation.spans[1].content.as_ref(), "  │ ");
+        assert_eq!(continuation.spans[1].style, dim_style());
+        assert_eq!(continuation.spans[2].style, tool_header_style());
     }
 
     #[test]
@@ -2885,8 +3133,18 @@ mod tests {
             !rendered.contains("┌ message"),
             "bordered editor frame should be gone: {rendered}"
         );
-        // The bottom row of the editor box is a shaded pad row filling the width.
-        let bottom = lines.last().expect("at least one rendered row");
+        let first_editor = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|s| s.style.bg == Some(USER_BG)))
+            .expect("editor box row");
+        assert_eq!(line_text(&lines[first_editor - 1]), "");
+        // The editor box sits above the bottom status row; its bottom pad row
+        // is shaded.
+        let bottom = lines
+            .iter()
+            .rev()
+            .find(|line| line.spans.iter().any(|s| s.style.bg == Some(USER_BG)))
+            .expect("editor box row");
         assert!(
             bottom.spans.iter().any(|s| s.style.bg == Some(USER_BG)),
             "editor pad row should be shaded: {bottom:?}"
@@ -2902,11 +3160,10 @@ mod tests {
         screen.editor.insert_str("abcdefghijklmnopqrst");
 
         let rendered = rendered_text(&mut screen, 18, 8);
-        // The borderless editor uses the full 18-cell frame width, so a 20-cell
-        // word should use two visible rows instead of horizontally scrolling to
-        // the tail of the line.
-        assert!(rendered.contains("abcdefghijklmnopqr"));
-        assert!(rendered.contains("st"));
+        // The editor reserves two text columns on each side, so a 20-cell word
+        // wraps inside a 14-cell text area instead of scrolling right.
+        assert!(rendered.contains("    abcdefghij"));
+        assert!(rendered.contains("    klmnopqrst"));
     }
 
     #[test]
@@ -2940,10 +3197,44 @@ mod tests {
         // No footer wired: the keybind hint shows.
         assert!(line_text(&screen.status_lines(80)[0]).contains("enter send"));
         screen.set_footer("gpt-5.5 xhigh".to_string(), "~".to_string());
-        let text = line_text(&screen.status_lines(80)[0]);
-        assert!(text.contains("gpt-5.5 xhigh"), "{text}");
-        assert!(text.contains('~'), "{text}");
-        assert!(!text.contains("enter send"), "{text}");
+        let lines = screen.status_lines(80);
+        assert_eq!(lines.len(), 2);
+        let cwd = line_text(&lines[0]);
+        let model = line_text(&lines[1]);
+        assert!(cwd.contains('~'), "{cwd}");
+        assert!(model.contains("gpt-5.5 xhigh"), "{model}");
+        assert!(!cwd.contains("enter send"), "{cwd}");
+        assert!(!model.contains("enter send"), "{model}");
+    }
+
+    #[test]
+    fn footer_shows_real_provider_usage_when_reported() {
+        let mut screen = Screen::new();
+        screen.set_footer("opus-4.8 xhigh".to_string(), "~/repo (branch)".to_string());
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: Some("resp_1".to_string()),
+            usage: Some(ProviderUsage {
+                provider: "anthropic".to_string(),
+                model: "opus-4.8".to_string(),
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read_input_tokens: 64,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 5,
+                total_tokens: 120,
+                cache_creation: None,
+            }),
+        });
+
+        let second = line_text(&screen.status_lines(80)[1]);
+        assert!(second.contains("120 tokens (64 cached)"), "{second}");
+        assert!(second.contains("opus-4.8 xhigh"), "{second}");
+
+        screen.set_footer("opus-4.8 high".to_string(), "~/repo (branch)".to_string());
+        let refreshed = line_text(&screen.status_lines(80)[1]);
+        assert!(refreshed.contains("120 tokens (64 cached)"), "{refreshed}");
+        assert!(refreshed.contains("opus-4.8 high"), "{refreshed}");
     }
 
     #[test]
@@ -2974,15 +3265,25 @@ mod tests {
         screen.commit_user("hello\nworld");
         let lines = screen.wrapped_lines(20);
         let first = line_matching(&lines, |l| line_text(l).contains("hello"));
-        // No prompt glyph: the text opens at column zero; the whole row is shaded
-        // and padded to the full width.
-        assert_eq!(first.spans[0].content.as_ref(), "hello");
-        assert_eq!(first.style.bg, Some(USER_BG));
+        // No prompt glyph: the text is inset inside an inset shaded box.
+        assert_eq!(first.spans[0].content.as_ref(), "  ");
+        assert_eq!(first.spans[0].style.bg, None);
+        assert_eq!(first.spans[1].content.as_ref(), "  ");
+        assert_eq!(first.spans[1].style.bg, Some(USER_BG));
+        assert_eq!(first.spans[2].content.as_ref(), "hello");
+        assert_eq!(first.spans[2].style.bg, Some(USER_BG));
+        assert_eq!(first.style.bg, None);
         assert_eq!(display_width(&line_text(first)), 20);
-        // Continuation input line is unindented and stays shaded.
+        assert_eq!(background_width(first, USER_BG), 16);
+        // Continuation input line gets the same text inset and stays shaded.
         let second = line_matching(&lines, |l| line_text(l).contains("world"));
-        assert_eq!(second.spans[0].content.as_ref(), "world");
-        assert_eq!(second.style.bg, Some(USER_BG));
+        assert_eq!(second.spans[0].content.as_ref(), "  ");
+        assert_eq!(second.spans[0].style.bg, None);
+        assert_eq!(second.spans[1].content.as_ref(), "  ");
+        assert_eq!(second.spans[1].style.bg, Some(USER_BG));
+        assert_eq!(second.spans[2].content.as_ref(), "world");
+        assert_eq!(second.spans[2].style.bg, Some(USER_BG));
+        assert_eq!(second.style.bg, None);
         // The block is a box: a shaded pad row brackets the text above and below.
         let hello_idx = lines
             .iter()
@@ -2990,9 +3291,11 @@ mod tests {
             .expect("hello row");
         let above = &lines[hello_idx - 1];
         let below = &lines[hello_idx + 2]; // hello, world, then the pad row
-        assert_eq!(above.style.bg, Some(USER_BG));
+        assert_eq!(above.style.bg, None);
+        assert_eq!(background_width(above, USER_BG), 16);
         assert!(line_text(above).trim().is_empty());
-        assert_eq!(below.style.bg, Some(USER_BG));
+        assert_eq!(below.style.bg, None);
+        assert_eq!(background_width(below, USER_BG), 16);
         assert!(line_text(below).trim().is_empty());
     }
 
@@ -3172,11 +3475,8 @@ mod tests {
             "Running header not replaced in place"
         );
         let header = line_matching(&lines, |l| line_text(l).contains("Ran echo hi"));
-        assert_eq!(header.spans[0].content.as_ref(), "\u{2022}");
-        assert_eq!(
-            header.spans[0].style,
-            ok_style().add_modifier(Modifier::BOLD)
-        );
+        let bullet = span_matching(header, |span| span.content.as_ref() == "\u{2022}");
+        assert_eq!(bullet.style, ok_style().add_modifier(Modifier::BOLD));
         assert!(
             line_text(header).contains("(1.2s)"),
             "duration suffix missing: {}",
@@ -3200,11 +3500,8 @@ mod tests {
         let header = line_matching(&lines, |l| line_text(l).contains("Ran false"));
         // Codex parity: a failed command (non-zero exit) keeps the bullet glyph,
         // colored red and bold; `✗` is reserved for true tool errors.
-        assert_eq!(header.spans[0].content.as_ref(), "\u{2022}");
-        assert_eq!(
-            header.spans[0].style,
-            err_style().add_modifier(Modifier::BOLD)
-        );
+        let bullet = span_matching(header, |span| span.content.as_ref() == "\u{2022}");
+        assert_eq!(bullet.style, err_style().add_modifier(Modifier::BOLD));
         assert!(line_text(header).contains("(50ms)"));
     }
 
