@@ -224,11 +224,14 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
         return;
     };
     let selection = sw.selection();
+    let effort = selection
+        .reasoning
+        .map(|effort| effort.as_str().to_string());
     let model = match selection.reasoning {
         Some(effort) => format!("{} {}", selection.model, effort.as_str()),
         None => selection.model.clone(),
     };
-    tui.screen.set_footer(model, footer_cwd());
+    tui.screen.set_footer(model, effort, footer_cwd());
 }
 
 /// The working directory for the footer, home-relativized to `~`/`~/sub`.
