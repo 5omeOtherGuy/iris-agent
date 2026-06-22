@@ -35,7 +35,9 @@ use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::nexus::{ApprovalDecision, ToolCall};
-use crate::tool_display::{exploration_summary, is_exploration_tool, run_target, summarize};
+use crate::tool_display::{
+    exploration_active_summary, exploration_summary, is_exploration_tool, run_target, summarize,
+};
 use crate::ui::modal::Modal;
 use crate::ui::slash::{self, Palette, SlashCommand};
 use crate::ui::{TurnErrorKind, UiEvent};
@@ -260,22 +262,6 @@ impl TranscriptRow {
             text: text.into(),
             style,
             continuation_prefix: None,
-            line: None,
-            word_wrap: false,
-            background: None,
-            hrule: false,
-        }
-    }
-
-    fn with_continuation(
-        text: impl Into<String>,
-        style: Style,
-        continuation_prefix: &'static str,
-    ) -> Self {
-        Self {
-            text: text.into(),
-            style,
-            continuation_prefix: Some(continuation_prefix),
             line: None,
             word_wrap: false,
             background: None,
@@ -515,6 +501,11 @@ struct ActiveExec {
     body_start: usize,
 }
 
+struct ActiveExploration {
+    call_id: String,
+    row: usize,
+}
+
 /// Transcript state and width-aware rendering, separate from editor/spinner UI.
 #[derive(Default)]
 struct Transcript {
@@ -524,6 +515,7 @@ struct Transcript {
     streaming: Option<String>,
     /// The open live exec cell, if a streaming tool is running.
     active_exec: Option<ActiveExec>,
+    active_explorations: Vec<ActiveExploration>,
     exploring_open: bool,
     /// Last width the transcript was rendered/flushed at, so width-aware
     /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
@@ -568,10 +560,9 @@ impl Transcript {
 
     fn push_continued(&mut self, text: &str, style: Style, continuation_prefix: &'static str) {
         for line in text.split('\n') {
-            self.rows.push(TranscriptRow::with_continuation(
-                line,
-                style,
-                continuation_prefix,
+            self.rows.push(TranscriptRow::with_line(
+                Line::from(Span::styled(line.to_string(), style)),
+                Some(continuation_prefix),
             ));
         }
     }
@@ -883,6 +874,9 @@ impl Transcript {
 
     fn push_explored_result(&mut self, call: &ToolCall) {
         self.finish_stream();
+        if self.finish_exploration(call, false) {
+            return;
+        }
         if !self.exploring_open {
             self.push_blank();
             self.push("• Explored", tool_header_style());
@@ -893,6 +887,56 @@ impl Transcript {
             dim_style(),
             "    ",
         );
+    }
+
+    fn push_explored_start(&mut self, call: &ToolCall) {
+        self.finish_stream();
+        if !self.exploring_open {
+            self.push_blank();
+            self.push("• Explored", tool_header_style());
+            self.exploring_open = true;
+        }
+        let row = self.rows.len();
+        self.push_continued(
+            &format!("  └ {}", exploration_active_summary(call)),
+            dim_style(),
+            "    ",
+        );
+        self.active_explorations.push(ActiveExploration {
+            call_id: call.id.clone(),
+            row,
+        });
+    }
+
+    fn finish_exploration(&mut self, call: &ToolCall, failed: bool) -> bool {
+        let Some(pos) = self
+            .active_explorations
+            .iter()
+            .position(|active| active.call_id == call.id)
+        else {
+            return false;
+        };
+        let active = self.active_explorations.remove(pos);
+        let marker = if failed { "\u{2717} " } else { "" };
+        if let Some(row) = self.rows.get_mut(active.row) {
+            *row = TranscriptRow::with_line(
+                Line::from(Span::styled(
+                    format!("  └ {marker}{}", exploration_summary(call)),
+                    if failed { err_style() } else { dim_style() },
+                )),
+                Some("    "),
+            );
+        }
+        true
+    }
+
+    fn push_explored_error(&mut self, call: &ToolCall, message: &str) -> bool {
+        self.finish_stream();
+        if !self.finish_exploration(call, true) {
+            return false;
+        }
+        self.push_continued(&format!("    error: {message}"), err_style(), "    ");
+        true
     }
 
     /// Apply one semantic event to the transcript rows.
@@ -940,11 +984,8 @@ impl Transcript {
                 self.finish_stream();
             }
             UiEvent::ToolStarted(call) => {
-                // Exploration tools (read/grep/find/ls) stay grouped under
-                // `Explored` and render nothing until their result; only a
-                // non-exploration tool opens a live `Running` exec cell.
                 if is_exploration_tool(&call) {
-                    self.finish_stream();
+                    self.push_explored_start(&call);
                 } else {
                     self.begin_exec(call);
                 }
@@ -1008,7 +1049,8 @@ impl Transcript {
                     .is_some_and(|a| a.call.id == call.id)
                 {
                     self.finalize_active_error(&call, &message);
-                } else {
+                } else if !is_exploration_tool(&call) || !self.push_explored_error(&call, &message)
+                {
                     self.push_tool_error(&call, &message);
                 }
             }
@@ -1367,6 +1409,9 @@ impl Screen {
         // never exceeds the active block's start, so this stays non-negative.
         if let Some(active) = self.transcript.active_exec.as_mut() {
             active.body_start = active.body_start.saturating_sub(commit_point);
+        }
+        for active in &mut self.transcript.active_explorations {
+            active.row = active.row.saturating_sub(commit_point);
         }
         let mut out = Vec::new();
         for row in &drained {
@@ -2433,6 +2478,72 @@ mod tests {
                 "  └ Read note.txt".to_string(),
                 "  └ Search needle in src".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn exploration_tool_start_names_target_live_and_finalizes_in_place() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let read = call_args("read", json!({ "path": "src/ui/tui.rs" }));
+
+        screen.apply(UiEvent::ToolStarted(read.clone()));
+        let live: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            live,
+            vec![
+                "• Explored".to_string(),
+                "  └ Reading src/ui/tui.rs".to_string(),
+            ]
+        );
+        let committed: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
+        assert!(
+            !committed.iter().any(|line| line.contains("Reading")),
+            "live exploration row committed too early: {committed:?}"
+        );
+
+        screen.apply(UiEvent::ToolResult {
+            call: read,
+            content: "ignored file body".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        let done: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            done,
+            vec![
+                "• Explored".to_string(),
+                "  └ Read src/ui/tui.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn long_exploration_rows_keep_gutter_when_wrapped() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args(
+                "grep",
+                json!({
+                    "pattern": "bordered editor|editor box|editor borders|borderless|shaded editor",
+                    "path": "src/ui",
+                    "glob": "tui.rs",
+                }),
+            ),
+            content: "ignored grep body".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        let lines: Vec<String> = screen.wrapped_lines(36).iter().map(line_text).collect();
+        let first = lines
+            .iter()
+            .find(|line| line.contains("Search"))
+            .expect("search row");
+        assert!(first.starts_with("  └ "), "{lines:?}");
+        assert!(
+            lines.iter().filter(|line| line.starts_with("    ")).count() > 0,
+            "wrapped search row lost continuation gutter: {lines:?}"
         );
     }
 
