@@ -15,6 +15,7 @@
 //! unit-testable via ratatui's `TestBackend` without a TTY.
 
 use std::io::{self, Stdout};
+use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::Result;
@@ -67,9 +68,25 @@ const MAX_INSERT_ROWS: usize = 500;
 
 /// Flood guard: cap a tool result at this many physical (wrapped) rows in the
 /// transcript so a few very long lines cannot flood the viewport/scrollback.
+/// Tuned to Codex's compact exec cell: a finalized result keeps a head and a
+/// tail slice with a `… +N lines` marker between (see [`Transcript::push_tool_output`]).
 /// The model still receives the full output; only the terminal preview is
 /// bounded, and the omitted logical-line count is reported.
-const MAX_TOOL_OUTPUT_ROWS: usize = 24;
+const MAX_TOOL_OUTPUT_ROWS: usize = 8;
+
+/// Background fill for a committed user-message block, Codex's shaded prompt
+/// cell. A fixed subtle lift above a dark terminal background (Codex computes
+/// this from a live terminal-bg probe; Iris keeps a constant to avoid that
+/// machinery). Presentation-only.
+const USER_BG: Color = Color::Rgb(50, 50, 56);
+
+/// Prompt glyph that opens a user-message block (Codex parity: `›`).
+const USER_PREFIX: &str = "\u{203a} ";
+
+/// A turn must run at least this long before the elapsed clause appears in the
+/// active-turn status and the turn-end rule is labelled `Worked for ...` (Codex
+/// parity: quick turns stay quiet).
+const ELAPSED_DISPLAY_THRESHOLD_SECS: u64 = 60;
 
 /// Secondary guard: truncate any single output line to this many characters
 /// before wrapping, so one pathological line cannot dominate the row budget.
@@ -89,9 +106,6 @@ const SPINNER_FRAMES: &[&str] = &[
     "\u{2807}", "\u{280f}",
 ];
 
-fn user_style() -> Style {
-    Style::default().fg(Color::Cyan)
-}
 fn ok_style() -> Style {
     Style::default().fg(Color::Green)
 }
@@ -110,12 +124,15 @@ fn tool_header_style() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
 }
 
-/// Bullet glyph + style for a finalized exec cell: a green bullet on success
-/// (`Some(0)` or no reported status) and a red cross on a non-zero exit.
+/// Bullet glyph + style for a finalized exec cell: a bold green bullet on success
+/// (`Some(0)` or no reported status) and a bold red bullet on a non-zero exit,
+/// matching Codex's exec marker (`•`.green().bold() / `•`.red().bold()). A true
+/// tool error or cancellation uses `✗` instead (see `push_tool_error` /
+/// `finalize_active_error`).
 fn exec_status(exit_code: Option<i32>) -> (&'static str, Style) {
     match exit_code {
-        Some(0) | None => ("\u{2022}", ok_style()),
-        Some(_) => ("\u{2717}", err_style()),
+        Some(0) | None => ("\u{2022}", ok_style().add_modifier(Modifier::BOLD)),
+        Some(_) => ("\u{2022}", err_style().add_modifier(Modifier::BOLD)),
     }
 }
 
@@ -127,6 +144,24 @@ fn format_duration(duration: std::time::Duration) -> String {
         format!("{:.1}s", duration.as_secs_f64())
     } else {
         format!("{ms}ms")
+    }
+}
+
+/// Format an elapsed turn duration compactly (Codex's `fmt_elapsed_compact`):
+/// `45s`, `1m 11s`, `1h 03m 09s`. Used by the active-turn status and the
+/// turn-end "Worked for" rule.
+fn format_elapsed_compact(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!(
+            "{}h {:02}m {:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     }
 }
 fn banner_style() -> Style {
@@ -154,6 +189,41 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
 }
 
+/// Truncate `text` to at most `max` terminal columns (display width), stopping on
+/// a char boundary. Unlike [`truncate_chars`], this accounts for wide/CJK glyphs
+/// so the result never exceeds `max` columns.
+fn truncate_to_width(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in text.chars() {
+        let w = char_width(c);
+        if used + w > max {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
+}
+
+/// Clamp one logical tool-output line so it wraps to at most `max_rows` physical
+/// rows at `width` (accounting for the 4-column gutter), appending an ellipsis
+/// when content is dropped. This keeps the head/tail fold a HARD physical-row cap
+/// even when a single line (e.g. a minified blob) would otherwise wrap to far
+/// more rows than its slice budget.
+fn clamp_output_line(raw: &str, width: usize, max_rows: usize) -> String {
+    let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
+    let usable = width.saturating_sub(4).max(1);
+    let max_cols = usable.saturating_mul(max_rows.max(1));
+    if display_width(&line) <= max_cols {
+        return line;
+    }
+    format!(
+        "{}\u{2026}",
+        truncate_to_width(&line, max_cols.saturating_sub(1))
+    )
+}
+
 /// Estimate the physical rows a tool-output line occupies after wrapping to
 /// `width`, accounting for the 4-column gutter prefix. At least one row. ANSI
 /// escapes are counted as visible width (a conservative over-estimate that only
@@ -176,6 +246,12 @@ struct TranscriptRow {
     /// gutter/ANSI tool-output rows keep char-wrap so their leading-space
     /// prefixes are never collapsed.
     word_wrap: bool,
+    /// Full-width background fill applied to every physical row this logical row
+    /// wraps to (Codex's shaded user-message cell). `None` for ordinary rows.
+    background: Option<Color>,
+    /// A horizontal-rule row (Codex's turn separator). When set, `text` is the
+    /// optional centered label and the row renders as `─ label ─────` to width.
+    hrule: bool,
 }
 
 impl TranscriptRow {
@@ -186,6 +262,8 @@ impl TranscriptRow {
             continuation_prefix: None,
             line: None,
             word_wrap: false,
+            background: None,
+            hrule: false,
         }
     }
 
@@ -200,6 +278,8 @@ impl TranscriptRow {
             continuation_prefix: Some(continuation_prefix),
             line: None,
             word_wrap: false,
+            background: None,
+            hrule: false,
         }
     }
 
@@ -210,6 +290,8 @@ impl TranscriptRow {
             continuation_prefix,
             line: Some(line),
             word_wrap: false,
+            background: None,
+            hrule: false,
         }
     }
 
@@ -221,14 +303,45 @@ impl TranscriptRow {
             continuation_prefix: None,
             line: Some(line),
             word_wrap: true,
+            background: None,
+            hrule: false,
         }
     }
 
+    /// A full-width horizontal-rule row with an optional centered label.
+    fn rule(label: String) -> Self {
+        Self {
+            text: label,
+            style: dim_style(),
+            continuation_prefix: None,
+            line: None,
+            word_wrap: false,
+            background: None,
+            hrule: true,
+        }
+    }
+
+    /// Paint this row's wrapped lines with a full-width background fill.
+    fn with_bg(mut self, color: Color) -> Self {
+        self.background = Some(color);
+        self
+    }
+
     fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
+        if self.hrule {
+            out.push(hrule_line(&self.text, width));
+            return;
+        }
+        let start = out.len();
         match &self.line {
             Some(line) if self.word_wrap => push_wrapped_line_wordwise(line, width, out),
             Some(line) => push_wrapped_line(line, width, self.continuation_prefix, out),
             None => push_wrapped_row(&self.text, self.style, width, self.continuation_prefix, out),
+        }
+        if let Some(bg) = self.background {
+            for physical in &mut out[start..] {
+                apply_full_width_bg(physical, bg, width);
+            }
         }
     }
 }
@@ -240,12 +353,41 @@ fn line_text(line: &Line<'_>) -> String {
         .collect()
 }
 
+/// Build a dim full-width horizontal rule, optionally wrapping a centered label
+/// (`─ Worked for 2m 12s ───────`). Codex's `FinalMessageSeparator`.
+fn hrule_line(label: &str, width: usize) -> Line<'static> {
+    let width = width.max(1);
+    if label.is_empty() {
+        return Line::from(Span::styled("\u{2500}".repeat(width), dim_style()));
+    }
+    let text = truncate_to_width(&format!("\u{2500} {label} \u{2500}"), width);
+    let fill = width.saturating_sub(display_width(&text));
+    Line::from(Span::styled(
+        format!("{text}{}", "\u{2500}".repeat(fill)),
+        dim_style(),
+    ))
+}
+
+/// Apply a full-width background fill to one already-wrapped physical line: set
+/// the line's base style so every span inherits the bg, then pad to `width` with
+/// a trailing space span (ratatui only colours the cells a span occupies).
+fn apply_full_width_bg(line: &mut Line<'static>, bg: Color, width: usize) {
+    line.style = line.style.bg(bg);
+    let used = display_width(&line_text(line));
+    if used < width {
+        line.spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(bg),
+        ));
+    }
+}
+
 /// A block-separator row: the empty plain row `push_blank` inserts between
 /// top-level blocks. Distinguished from a Markdown-internal blank line (which
-/// carries a styled `line`) so only true block boundaries split scrollback
-/// commits.
+/// carries a styled `line`) and from a turn-rule row so only true block
+/// boundaries split scrollback commits.
 fn is_separator_row(row: &TranscriptRow) -> bool {
-    row.text.is_empty() && row.line.is_none()
+    !row.hrule && row.text.is_empty() && row.line.is_none()
 }
 
 fn push_span_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
@@ -642,30 +784,64 @@ impl Transcript {
             self.push("  └ (no output)", dim_style());
             return;
         }
-        // Flood-safe: wrap each output line to the transcript width FIRST, then
-        // cap the total *physical* rows so a handful of very long lines cannot
-        // flood the viewport/scrollback. The omitted count is logical lines.
-        // This is the HEAD-capped rendering used for a finalized result (matches
-        // the established `• Ran` look); the live cell uses the tail variant.
+        // Flood-safe AND compact (Codex parity): wrap each line to the transcript
+        // width FIRST, then keep a head slice and a tail slice that together fit
+        // the physical-row budget, with a `… +N lines` marker between. Showing
+        // the tail keeps a command's final/summary line visible instead of only
+        // its head. The omitted count is logical lines. The live cell still uses
+        // the tail-only variant while output is still growing.
         let width = self.wrap_width();
-        let total_logical = content.lines().count();
-        let mut physical = 0usize;
-        let mut shown = 0usize;
-        for raw in content.lines() {
-            let rows =
-                wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width);
-            // Always show at least the first line (head); otherwise stop once
-            // the next line would exceed the physical-row budget.
-            if shown > 0 && physical + rows > MAX_TOOL_OUTPUT_ROWS {
+        let lines: Vec<&str> = content.lines().collect();
+        let cost = |raw: &str| {
+            wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width)
+        };
+        let total_rows: usize = lines.iter().map(|raw| cost(raw)).sum();
+        if total_rows <= MAX_TOOL_OUTPUT_ROWS {
+            for (i, raw) in lines.iter().enumerate() {
+                self.push_output_line(raw, i == 0);
+            }
+            return;
+        }
+        // One row is reserved for the ellipsis marker; the rest splits in half.
+        let budget = MAX_TOOL_OUTPUT_ROWS.saturating_sub(1).max(1);
+        let head_budget = budget / 2;
+        let tail_budget = budget - head_budget;
+        let mut head_rows = 0usize;
+        let mut head_end = 0usize;
+        // Always keep at least the first line so a single over-budget line never
+        // collapses the cell to just a marker (and so the head gutter is always
+        // emitted); only later lines are gated on the head budget.
+        while head_end < lines.len() {
+            let rows = cost(lines[head_end]);
+            if head_end > 0 && head_rows + rows > head_budget {
                 break;
             }
-            self.push_output_line(raw, shown == 0);
-            physical += rows;
-            shown += 1;
+            head_rows += rows;
+            head_end += 1;
         }
-        let hidden = total_logical.saturating_sub(shown);
+        let mut tail_rows = 0usize;
+        let mut tail_start = lines.len();
+        while tail_start > head_end {
+            let rows = cost(lines[tail_start - 1]);
+            if tail_rows + rows > tail_budget {
+                break;
+            }
+            tail_rows += rows;
+            tail_start -= 1;
+        }
+        // Clamp each shown line to its slice budget so a single over-budget line
+        // (kept for visibility) cannot blow past the physical-row cap.
+        for (i, raw) in lines[..head_end].iter().enumerate() {
+            let clamped = clamp_output_line(raw, width, head_budget);
+            self.push_output_line(&clamped, i == 0);
+        }
+        let hidden = tail_start - head_end;
         if hidden > 0 {
             self.push(&format!("    … +{hidden} lines"), dim_style());
+        }
+        for raw in &lines[tail_start..] {
+            let clamped = clamp_output_line(raw, width, tail_budget);
+            self.push_output_line(&clamped, false);
         }
     }
 
@@ -698,8 +874,10 @@ impl Transcript {
         }
         for (offset, raw) in lines[start..].iter().enumerate() {
             // Use the head gutter for the very first visible row only when no
-            // earlier-lines note took it.
-            self.push_output_line(raw, start == 0 && offset == 0);
+            // earlier-lines note took it. Clamp each shown line so one very long
+            // line cannot blow past the physical-row cap.
+            let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
+            self.push_output_line(&clamped, start == 0 && offset == 0);
         }
     }
 
@@ -779,8 +957,9 @@ impl Transcript {
                 {
                     if let Some(active) = self.active_exec.as_mut() {
                         active.output.push_str(&chunk);
-                        // Bound the re-rendered buffer to its tail; only ~24 rows
-                        // ever show and the full output arrives with the result.
+                        // Bound the re-rendered buffer to its tail; only a few
+                        // rows (MAX_TOOL_OUTPUT_ROWS) ever show and the full
+                        // output arrives with the result.
                         if active.output.len() > MAX_EXEC_STREAM_BYTES {
                             let cut = active.output.len() - MAX_EXEC_STREAM_BYTES;
                             let cut = active.output.ceil_char_boundary(cut);
@@ -858,12 +1037,34 @@ impl Transcript {
         }
     }
 
-    /// Commit a submitted prompt into the transcript as a user line.
+    /// Commit a submitted prompt into the transcript as a shaded user block
+    /// (Codex parity): a `›` prompt glyph opens the first line, continuations are
+    /// indented two columns, and every wrapped row gets a full-width background.
     fn commit_user(&mut self, text: &str) {
         self.push_blank();
-        for line in text.split('\n') {
-            self.push(&format!("> {line}"), user_style());
+        for (i, line) in text.split('\n').enumerate() {
+            let prefix = if i == 0 { USER_PREFIX } else { "  " };
+            let spans = vec![
+                Span::styled(prefix, dim_style().add_modifier(Modifier::BOLD)),
+                Span::raw(line.to_string()),
+            ];
+            self.rows
+                .push(TranscriptRow::with_line(Line::from(spans), Some("  ")).with_bg(USER_BG));
         }
+    }
+
+    /// Append Codex's turn-end separator: a dim full-width rule, labelled
+    /// `Worked for <elapsed>` only when the turn ran longer than a minute.
+    fn push_turn_rule(&mut self, elapsed: Option<Duration>) {
+        self.finish_stream();
+        self.push_blank();
+        let label = match elapsed {
+            Some(d) if d.as_secs() >= ELAPSED_DISPLAY_THRESHOLD_SECS => {
+                format!("Worked for {}", format_elapsed_compact(d.as_secs()))
+            }
+            _ => String::new(),
+        };
+        self.rows.push(TranscriptRow::rule(label));
     }
 
     fn render(&mut self, width: u16) -> Vec<Line<'static>> {
@@ -947,11 +1148,14 @@ fn ansi_spans(text: &str, default_style: Style) -> Vec<Span<'static>> {
 }
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
-/// session redraws nothing on a tick (no flicker, no busy CPU).
+/// session redraws nothing on a tick (no flicker, no busy CPU). `started`
+/// timestamps the turn so the status row can show elapsed time and the turn-end
+/// rule can report "Worked for ...".
 #[derive(Default)]
 struct Spinner {
     active: bool,
     frame: usize,
+    started: Option<Instant>,
 }
 
 struct ApprovalHint {
@@ -963,10 +1167,16 @@ impl Spinner {
     fn start(&mut self) {
         self.active = true;
         self.frame = 0;
+        self.started = Some(Instant::now());
     }
 
     fn stop(&mut self) {
         self.active = false;
+    }
+
+    /// Wall-clock time since the turn began, or `None` before the first turn.
+    fn elapsed(&self) -> Option<Duration> {
+        self.started.map(|start| start.elapsed())
     }
 
     /// Advance one frame; a no-op when idle so ticks cause no redraw at rest.
@@ -980,6 +1190,55 @@ impl Spinner {
     fn glyph(&self) -> &'static str {
         SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()]
     }
+}
+
+/// Idle status footer (Codex's bottom bar): `model effort · cwd`.
+struct Footer {
+    /// Model + effort, already joined (e.g. `gpt-5.5 xhigh`).
+    model: String,
+    /// Working directory, home-relativized to `~` where possible.
+    cwd: String,
+}
+
+/// Render the idle footer: model+effort accented, cwd in green, dim `·` between.
+fn footer_line(footer: &Footer) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(footer.model.clone(), Style::default().fg(Color::Cyan)),
+        Span::styled(" \u{b7} ", dim_style()),
+        Span::styled(footer.cwd.clone(), Style::default().fg(Color::Green)),
+    ])
+}
+
+/// Active-turn status spans: `{spinner} Working ({elapsed} · esc to interrupt)`.
+/// Codex parity: the elapsed clause is shown from the first second (`0s`), and
+/// the interrupt hint is always present.
+fn working_spans(glyph: &str, elapsed: Option<Duration>) -> Vec<Span<'static>> {
+    let secs = elapsed.map_or(0, |d| d.as_secs());
+    let suffix = format!(
+        " ({} \u{b7} esc to interrupt)",
+        format_elapsed_compact(secs)
+    );
+    vec![
+        Span::styled(format!("{glyph} "), prompt_style()),
+        Span::styled("Working", dim_style()),
+        Span::styled(suffix, dim_style()),
+    ]
+}
+
+/// Whether an event represents concrete turn work (a tool ran). Gates the
+/// Codex turn-end separator so purely conversational turns get no empty divider.
+fn is_turn_work(event: &UiEvent) -> bool {
+    matches!(
+        event,
+        UiEvent::ToolProposed(_)
+            | UiEvent::ToolStarted(_)
+            | UiEvent::ToolAutoApproved(_)
+            | UiEvent::DiffPreview { .. }
+            | UiEvent::ToolDenied(_)
+            | UiEvent::ToolResult { .. }
+            | UiEvent::ToolOutputDelta { .. }
+            | UiEvent::ToolError { .. }
+    )
 }
 
 /// Build a styled, empty editor: bordered box, dim placeholder, a reversed
@@ -1022,9 +1281,17 @@ pub(crate) struct Screen {
     spinner: Spinner,
     /// Short status-row hint while a gated tool awaits the user's decision.
     approval_hint: Option<ApprovalHint>,
+    /// Idle status-row footer (model / effort / cwd), Codex's bottom bar. The
+    /// loop refreshes it from the live model selection; `None` falls back to the
+    /// keybind hint (e.g. before a provider is selected).
+    footer: Option<Footer>,
     /// The active picker/dialog, when one is open. While present it replaces the
     /// editor area and the loop routes keys to it instead of the editor.
     pub(crate) modal: Option<Modal>,
+    /// Whether the active turn ran any tool (Codex's "concrete work" gate). The
+    /// turn-end separator is emitted only when this is set, so a purely
+    /// conversational turn shows no empty divider. Reset at `start_turn`.
+    turn_did_work: bool,
 }
 
 impl Screen {
@@ -1035,7 +1302,9 @@ impl Screen {
             palette: Palette::default(),
             spinner: Spinner::default(),
             approval_hint: None,
+            footer: None,
             modal: None,
+            turn_did_work: false,
         }
     }
 
@@ -1066,6 +1335,9 @@ impl Screen {
 
     /// Apply one semantic event to the transcript.
     pub(crate) fn apply(&mut self, event: UiEvent) {
+        if is_turn_work(&event) {
+            self.turn_did_work = true;
+        }
         self.transcript.apply(event);
     }
 
@@ -1153,14 +1425,29 @@ impl Screen {
 
     // --- spinner / turn state ---
 
+    /// Set (or refresh) the idle footer from the live model selection. The loop
+    /// calls this whenever the model/effort changes; `cwd` is home-relativized.
+    pub(crate) fn set_footer(&mut self, model: String, cwd: String) {
+        self.footer = Some(Footer { model, cwd });
+    }
+
     pub(crate) fn start_turn(&mut self) {
         self.spinner.start();
         self.approval_hint = None;
+        self.turn_did_work = false;
     }
 
     pub(crate) fn end_turn(&mut self) {
+        let elapsed = self.spinner.elapsed();
         self.spinner.stop();
         self.approval_hint = None;
+        // Codex parity: only a turn that did concrete work (ran a tool) gets the
+        // turn-end separator; a purely conversational turn shows no empty rule.
+        // The rule is labelled with the elapsed time only once a turn ran longer
+        // than a minute.
+        if self.turn_did_work {
+            self.transcript.push_turn_rule(elapsed);
+        }
     }
 
     /// Advance the spinner one frame. Returns whether anything animated (so the
@@ -1198,15 +1485,17 @@ impl Screen {
         self.approval_hint = None;
     }
 
-    /// Status row content: approval hint > spinner > idle hint.
+    /// Status row content: approval hint > active spinner > footer > idle hint.
     fn status_lines(&self, width: u16) -> Vec<Line<'static>> {
         if let Some(hint) = &self.approval_hint {
             approval_status_lines(hint, usize::from(width))
         } else if self.spinner.active {
-            vec![Line::from(vec![
-                Span::styled(format!("{} ", self.spinner.glyph()), prompt_style()),
-                Span::styled("working", dim_style()),
-            ])]
+            vec![Line::from(working_spans(
+                self.spinner.glyph(),
+                self.spinner.elapsed(),
+            ))]
+        } else if let Some(footer) = &self.footer {
+            vec![footer_line(footer)]
         } else {
             vec![Line::from(Span::styled(IDLE_HINT, dim_style()))]
         }
@@ -1877,6 +2166,75 @@ mod tests {
     }
 
     #[test]
+    fn committed_user_block_carries_full_width_background() {
+        // The shaded user block must keep its full-width background once it is
+        // committed to native scrollback (the lines handed to `insert_before`),
+        // not only in the live viewport.
+        let mut screen = Screen::new();
+        screen.commit_user("hello");
+        let committed = screen.take_scrollback(20);
+        let row = committed
+            .iter()
+            .find(|l| line_text(l).contains("hello"))
+            .expect("user row committed to scrollback");
+        assert_eq!(row.style.bg, Some(USER_BG));
+        assert_eq!(display_width(&line_text(row)), 20);
+        assert!(
+            row.spans
+                .iter()
+                .all(|s| s.style.bg.is_none() || s.style.bg == Some(USER_BG)),
+            "every span inherits or sets the shaded background: {row:?}"
+        );
+    }
+
+    #[test]
+    fn single_over_budget_line_stays_within_row_cap() {
+        // A single very long line must not blow past the physical-row cap: it is
+        // clamped (with an ellipsis) to its slice budget instead of wrapping to
+        // dozens of rows. Checked at narrow and normal widths.
+        for width in [20u16, 80u16] {
+            let mut screen = Screen::new();
+            let _ = screen.wrapped_lines(width);
+            screen.apply(UiEvent::ToolResult {
+                call: call_args("bash", json!({ "command": "blob" })),
+                content: "x".repeat(2000),
+                exit_code: None,
+                duration: None,
+            });
+            let texts: Vec<String> = screen.wrapped_lines(width).iter().map(line_text).collect();
+            let output_rows = texts.iter().filter(|t| t.contains('x')).count();
+            assert!(
+                (1..=MAX_TOOL_OUTPUT_ROWS).contains(&output_rows),
+                "width {width}: {output_rows} rows out of 1..={MAX_TOOL_OUTPUT_ROWS}: {texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|t| t.contains("+0 lines")),
+                "width {width}: spurious +0 marker: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_single_over_budget_line_stays_within_row_cap() {
+        // The live streaming cell must also clamp one very long line to the cap.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = screen.wrapped_lines(20);
+        let call = call_args("bash", json!({ "command": "blob" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "y".repeat(2000),
+        });
+        let texts: Vec<String> = screen.wrapped_lines(20).iter().map(line_text).collect();
+        let rows = texts.iter().filter(|t| t.contains('y')).count();
+        assert!(
+            (1..=MAX_TOOL_OUTPUT_ROWS).contains(&rows),
+            "{rows} rows out of 1..={MAX_TOOL_OUTPUT_ROWS}: {texts:?}"
+        );
+    }
+
+    #[test]
     fn ansi_tool_output_hard_wraps_without_dropping_chars() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolResult {
@@ -1908,9 +2266,10 @@ mod tests {
     fn tool_output_caps_by_physical_rows_even_under_logical_line_limit() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80); // prime last_width
-        // 8 logical lines (under the old 12-logical-line fold cap), each ~400
-        // columns => ~6 wrapped rows each => ~48 physical rows if uncapped.
-        // The physical-row cap must bound it and report the omitted lines.
+        // 8 logical lines, each ~400 columns => ~6 wrapped rows each => ~48
+        // physical rows if uncapped. Each line alone exceeds the head/tail
+        // budgets, but the head always keeps at least the first line, so one
+        // line survives and the rest (7) are reported as omitted.
         let long = "x".repeat(400);
         let content = std::iter::repeat_n(long, 8).collect::<Vec<_>>().join("\n");
         screen.apply(UiEvent::ToolResult {
@@ -1921,16 +2280,54 @@ mod tests {
         });
         let lines = screen.wrapped_lines(80);
         let output_rows = lines.iter().filter(|l| line_text(l).contains('x')).count();
-        // 8 logical lines, each estimated at 6 physical rows; the 24-row cap
-        // admits exactly 4 of them (4*6 = 24) and reports the other 4 omitted.
         assert!(
             output_rows <= MAX_TOOL_OUTPUT_ROWS,
             "output not row-capped: {output_rows} physical rows"
         );
+        // The visibility guarantee: even when the first line alone exceeds the
+        // head budget, it is still shown (never collapsed to only a marker).
         assert!(
-            lines.iter().any(|l| line_text(l).contains("… +4 lines")),
-            "expected an accurate '… +4 lines' omitted-line indicator: {lines:?}",
+            output_rows >= 1,
+            "first line must always survive: {lines:?}"
         );
+        assert!(
+            lines.iter().any(|l| line_text(l).contains("… +7 lines")),
+            "expected an accurate '… +7 lines' omitted-line indicator: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn tool_output_keeps_head_and_tail_with_middle_elided() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80); // prime last_width
+        // 20 short lines exceed the compact row budget, so a head slice and a
+        // tail slice survive with a `… +N lines` marker between (Codex parity:
+        // the final/summary line stays visible).
+        let content = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "seq" })),
+            content,
+            exit_code: None,
+            duration: None,
+        });
+        let texts: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
+        // First output line shown under the head gutter; last line shown in tail.
+        assert!(texts.iter().any(|t| t == "  └ line 0"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("line 19")), "{texts:?}");
+        // The middle is elided with an accurate count, and the block stays
+        // within the physical-row budget (+ marker).
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("… +") && t.contains("lines")),
+            "{texts:?}"
+        );
+        // Truncated: far fewer than the 20 input lines survive (the cap is 8).
+        let shown = texts.iter().filter(|t| t.contains("line ")).count();
+        assert!(shown <= MAX_TOOL_OUTPUT_ROWS, "{texts:?}");
     }
 
     #[test]
@@ -2643,7 +3040,8 @@ mod tests {
         screen.start_turn();
         terminal.draw(|f| render(f, &mut screen))?;
         let before = buffer_text(&terminal);
-        assert!(before.contains("working"));
+        assert!(before.contains("Working"));
+        assert!(before.contains("esc to interrupt"));
 
         // A tick advances the spinner glyph (animation), idle does not.
         let glyph0 = SPINNER_FRAMES[0];
@@ -2661,8 +3059,110 @@ mod tests {
             idle.contains("enter send"),
             "idle hint replaces the spinner"
         );
-        assert!(!idle.contains("working"), "spinner cleared on turn end");
+        assert!(!idle.contains("Working"), "spinner cleared on turn end");
         Ok(())
+    }
+
+    #[test]
+    fn footer_replaces_idle_hint_when_set() {
+        let mut screen = Screen::new();
+        // No footer wired: the keybind hint shows.
+        assert!(line_text(&screen.status_lines(80)[0]).contains("enter send"));
+        screen.set_footer("gpt-5.5 xhigh".to_string(), "~".to_string());
+        let text = line_text(&screen.status_lines(80)[0]);
+        assert!(text.contains("gpt-5.5 xhigh"), "{text}");
+        assert!(text.contains('~'), "{text}");
+        assert!(!text.contains("enter send"), "{text}");
+    }
+
+    #[test]
+    fn working_status_shows_elapsed_from_the_first_second() {
+        // Codex parity: elapsed is shown immediately (`0s`), not gated on a
+        // minute, and the interrupt hint is always present.
+        let early: String = working_spans("\u{280b}", Some(Duration::from_secs(5)))
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(early.contains("Working"), "{early}");
+        assert!(early.contains("5s \u{b7} esc to interrupt"), "{early}");
+        let zero: String = working_spans("\u{280b}", None)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(zero.contains("0s \u{b7} esc to interrupt"), "{zero}");
+        let over: String = working_spans("\u{280b}", Some(Duration::from_secs(71)))
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(over.contains("1m 11s \u{b7} esc to interrupt"), "{over}");
+    }
+
+    #[test]
+    fn user_message_renders_shaded_block_with_prompt_glyph() {
+        let mut screen = Screen::new();
+        screen.commit_user("hello\nworld");
+        let lines = screen.wrapped_lines(20);
+        let first = line_matching(&lines, |l| line_text(l).contains("hello"));
+        // The prompt glyph opens the block; the whole row is shaded and padded
+        // to the full width.
+        assert_eq!(first.spans[0].content.as_ref(), USER_PREFIX);
+        assert_eq!(first.style.bg, Some(USER_BG));
+        assert_eq!(display_width(&line_text(first)), 20);
+        // Continuation input line indents two columns and stays shaded.
+        let second = line_matching(&lines, |l| line_text(l).contains("world"));
+        assert_eq!(second.spans[0].content.as_ref(), "  ");
+        assert_eq!(second.style.bg, Some(USER_BG));
+    }
+
+    #[test]
+    fn end_turn_appends_dim_turn_rule_after_tool_work() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        // A tool ran, so this is "concrete work" and earns the turn rule.
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        screen.end_turn();
+        // A short turn (<60s) closes with a plain full-width rule (no label).
+        let lines = screen.wrapped_lines(20);
+        let rule = line_matching(&lines, |l| line_text(l).starts_with('\u{2500}'));
+        assert_eq!(line_text(rule), "\u{2500}".repeat(20));
+        assert_eq!(rule.spans[0].style, dim_style());
+    }
+
+    #[test]
+    fn conversational_turn_emits_no_turn_rule() {
+        // Codex parity: a turn that ran no tool (text-only answer) shows no
+        // empty divider.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::AssistantText("done".to_string()));
+        screen.end_turn();
+        let lines = screen.wrapped_lines(20);
+        assert!(
+            !lines.iter().any(|l| line_text(l).starts_with('\u{2500}')),
+            "no turn rule expected for a conversational turn: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn elapsed_format_and_labelled_rule() {
+        assert_eq!(format_elapsed_compact(45), "45s");
+        assert_eq!(format_elapsed_compact(71), "1m 11s");
+        assert_eq!(format_elapsed_compact(132), "2m 12s");
+        assert_eq!(format_elapsed_compact(3669), "1h 01m 09s");
+        // A labelled rule embeds the text and fills to width with dashes.
+        let line = hrule_line("Worked for 2m 12s", 40);
+        let text = line_text(&line);
+        assert!(
+            text.starts_with("\u{2500} Worked for 2m 12s \u{2500}"),
+            "{text}"
+        );
+        assert_eq!(display_width(&text), 40);
+        assert_eq!(line.spans[0].style, dim_style());
     }
 
     #[test]
@@ -2792,7 +3292,10 @@ mod tests {
         );
         let header = line_matching(&lines, |l| line_text(l).contains("Ran echo hi"));
         assert_eq!(header.spans[0].content.as_ref(), "\u{2022}");
-        assert_eq!(header.spans[0].style, ok_style());
+        assert_eq!(
+            header.spans[0].style,
+            ok_style().add_modifier(Modifier::BOLD)
+        );
         assert!(
             line_text(header).contains("(1.2s)"),
             "duration suffix missing: {}",
@@ -2801,7 +3304,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_cell_nonzero_exit_shows_red_cross_bullet() {
+    fn exec_cell_nonzero_exit_shows_red_bold_bullet() {
         let mut screen = Screen::new();
         screen.start_turn();
         let call = call_args("bash", json!({ "command": "false" }));
@@ -2814,8 +3317,13 @@ mod tests {
         });
         let lines = screen.wrapped_lines(80);
         let header = line_matching(&lines, |l| line_text(l).contains("Ran false"));
-        assert_eq!(header.spans[0].content.as_ref(), "\u{2717}");
-        assert_eq!(header.spans[0].style, err_style());
+        // Codex parity: a failed command (non-zero exit) keeps the bullet glyph,
+        // colored red and bold; `✗` is reserved for true tool errors.
+        assert_eq!(header.spans[0].content.as_ref(), "\u{2022}");
+        assert_eq!(
+            header.spans[0].style,
+            err_style().add_modifier(Modifier::BOLD)
+        );
         assert!(line_text(header).contains("(50ms)"));
     }
 
