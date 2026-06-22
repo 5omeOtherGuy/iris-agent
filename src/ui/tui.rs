@@ -1579,7 +1579,7 @@ fn diff_rows(diff: &str) -> Vec<TranscriptRow> {
 /// cannot emit an over-wide row without the terminal clipping its tail.
 /// Returns at least one row (possibly empty) so a blank logical line still
 /// occupies a row.
-fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     if width == 0 || display_width(text) <= width {
         return vec![text.to_string()];
     }
