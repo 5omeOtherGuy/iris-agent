@@ -3,8 +3,8 @@
 **A fast, token-efficient coding agent for your terminal.**
 
 > **Status (2026-06-21): Milestone 2 foundations are implemented.** Iris
-> currently has an inline-viewport TUI with native scrollback plus a text
-> fallback, selectable Mimir providers (`openai-codex`, `anthropic`,
+> currently has a terminal-surface TUI with Iris-owned transcript replay plus a
+> text fallback, selectable Mimir providers (`openai-codex`, `anthropic`,
 > `antigravity`), runtime model/reasoning switching, streamed response parsing,
 > workspace-scoped built-in tools, approval gates with diff previews,
 > fragment-based system-prompt assembly, provider/model/reasoning/context-budget

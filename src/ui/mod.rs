@@ -13,6 +13,7 @@ pub(crate) mod modal;
 pub(crate) mod picker;
 pub(crate) mod selector;
 pub(crate) mod slash;
+pub(crate) mod terminal_surface;
 
 /// True when `lines[i]` begins a unified-diff file header: a `--- ` line
 /// immediately followed by a `+++ ` line and a `@@` hunk. The `@@` guard keeps

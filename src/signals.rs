@@ -26,12 +26,12 @@ static RESTORE_TERMINAL_ON_FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 // it without allocation. Null until the TUI captures it at startup.
 static SAVED_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 
-// Async-signal-safe terminal cleanup for a TUI force-quit path: show cursor,
-// disable common mouse/bracketed-paste modes, and leave the alternate screen.
+// Async-signal-safe terminal cleanup for a TUI force-quit path: show cursor and
+// disable common mouse/bracketed-paste modes.
 // This is deliberately raw ANSI bytes so the signal handler can use `write(2)`
 // instead of running crossterm/Drop code.
 const TUI_FORCE_QUIT_RESTORE: &[u8] =
-    b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<1u\x1b[?1049l";
+    b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<1u";
 
 /// Install the SIGINT handler. Call once at startup.
 pub(crate) fn install() {
@@ -140,7 +140,9 @@ pub(crate) fn disable_terminal_restore_on_force_quit() {
 /// read loop, not a signal, is in control.
 pub(crate) fn interrupt_from_terminal() {
     if record_interrupt(&INTERRUPTED) {
+        restore_terminal_from_signal();
         crate::process_group::kill_all_from_signal();
+        std::process::exit(130);
     }
 }
 
