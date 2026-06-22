@@ -318,11 +318,7 @@ impl TranscriptRow {
 
     fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
         if self.hrule {
-            let rule_width = width.saturating_sub(BOX_X_PADDING * 2).max(1);
-            let mut line = hrule_line(&self.text, rule_width);
-            pad_line_left(&mut line, BOX_X_PADDING);
-            pad_line_right(&mut line, BOX_X_PADDING);
-            out.push(line);
+            out.push(inset_rule_line(width, &self.text));
             return;
         }
         let boxed = self.background.is_some();
@@ -413,6 +409,14 @@ fn hrule_line(label: &str, width: usize) -> Line<'static> {
         format!("{text}{}", "\u{2500}".repeat(fill)),
         dim_style(),
     ))
+}
+
+fn inset_rule_line(width: usize, label: &str) -> Line<'static> {
+    let rule_width = width.saturating_sub(BOX_X_PADDING * 2).max(1);
+    let mut line = hrule_line(label, rule_width);
+    pad_line_left(&mut line, BOX_X_PADDING);
+    pad_line_right(&mut line, BOX_X_PADDING);
+    line
 }
 
 /// Apply a background fill to one already-wrapped physical line, then pad to
@@ -1975,22 +1979,42 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     let status_h = desired_status_h.min(max_status_h);
     let status_lines = screen.status_lines(area.width);
 
-    let chrome_h = status_h.saturating_add(menu_h).saturating_add(editor_h);
+    let divider_h = u16::from(
+        status_h > 0
+            && area.height
+                > menu_h
+                    .saturating_add(working_h)
+                    .saturating_add(editor_h)
+                    .saturating_add(status_h),
+    );
+    let chrome_h = status_h
+        .saturating_add(menu_h)
+        .saturating_add(editor_h)
+        .saturating_add(divider_h);
     let chrome_h = chrome_h.saturating_add(working_h);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(menu_h),
         Constraint::Length(working_h),
         Constraint::Length(editor_h),
+        Constraint::Length(divider_h),
         Constraint::Length(status_h),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
     let working_area = chunks[1];
     let editor_area = chunks[2];
-    let status_area = chunks[3];
+    let divider_area = chunks[3];
+    let status_area = chunks[4];
 
     let mut buf = Buffer::empty(chrome_area);
+    if divider_h > 0 {
+        Paragraph::new(Text::from(vec![inset_rule_line(
+            usize::from(area.width),
+            "",
+        )]))
+        .render(divider_area, &mut buf);
+    }
     Paragraph::new(Text::from(status_lines)).render(status_area, &mut buf);
 
     if menu_h > 0 {
@@ -3263,19 +3287,23 @@ mod tests {
             "bordered editor frame should be gone: {rendered}"
         );
         // The editor box sits above the bottom status row; its bottom pad row
-        // is shaded.
-        let bottom = lines
+        // is shaded, followed immediately by an inset divider and then status.
+        let bottom_idx = lines
             .iter()
-            .rev()
-            .find(|line| line.spans.iter().any(|s| s.style.bg == Some(USER_BG)))
+            .rposition(|line| line.spans.iter().any(|s| s.style.bg == Some(USER_BG)))
             .expect("editor box row");
+        let bottom = &lines[bottom_idx];
         assert!(
             bottom.spans.iter().any(|s| s.style.bg == Some(USER_BG)),
             "editor pad row should be shaded: {bottom:?}"
         );
+        let divider = &lines[bottom_idx + 1];
+        assert_eq!(line_text(divider), format!("  {}  ", "\u{2500}".repeat(36)));
+        assert_eq!(divider.spans[1].style.fg, Some(Color::DarkGray));
+        assert_ne!(divider.spans[1].style.bg, Some(USER_BG));
         // Idle status hint is shown when no turn runs (the long hint is
         // truncated at this narrow test width, so assert its leading words).
-        assert!(rendered.contains("enter send"));
+        assert!(line_text(&lines[bottom_idx + 2]).contains("enter send"));
     }
 
     #[test]
