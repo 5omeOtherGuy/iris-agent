@@ -1042,6 +1042,7 @@ mod tests {
     fn call() -> ToolCall {
         ToolCall {
             id: "call_1".to_string(),
+            thought_signature: None,
             name: "bash".to_string(),
             arguments: serde_json::json!({ "command": "echo hi" }),
         }

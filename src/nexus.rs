@@ -1366,6 +1366,11 @@ pub(crate) struct ToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) arguments: Value,
+    // Opaque provider continuity token for this call (e.g. Gemini's
+    // `thoughtSignature`). Echoed back verbatim in the next request's history so
+    // thinking models accept the tool round-trip; `None` for providers that do
+    // not emit one. Nexus never interprets it.
+    pub(crate) thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1429,7 +1434,9 @@ impl Message {
             content: call.arguments.to_string(),
             tool_call_id: Some(call.id.clone()),
             tool_name: Some(call.name.clone()),
-            continuity: None,
+            // Carry the provider's opaque per-call continuity (e.g. Gemini
+            // `thoughtSignature`) so it survives persistence and is echoed back.
+            continuity: call.thought_signature.clone(),
             provider_turn_id: None,
             redacted: false,
             origin: None,

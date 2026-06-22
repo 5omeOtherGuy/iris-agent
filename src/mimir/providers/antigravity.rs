@@ -287,7 +287,20 @@ fn build_contents(messages: &[Message]) -> Vec<Value> {
                         .unwrap_or_else(|_| json!({})),
                 });
                 insert_optional_id(&mut function_call, message.tool_call_id.as_deref());
-                ("model", json!({ "functionCall": function_call }))
+                let mut part = json!({ "functionCall": function_call });
+                // Echo the captured `thoughtSignature` (stored opaquely as the
+                // message's continuity) as a sibling of `functionCall` in the
+                // same part, exactly where Gemini returned it.
+                if let Some(signature) = message
+                    .continuity
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|signature| !signature.is_empty())
+                    && let Some(map) = part.as_object_mut()
+                {
+                    map.insert("thoughtSignature".to_string(), json!(signature));
+                }
+                ("model", part)
             }
             Role::Tool => {
                 let mut function_response = json!({
@@ -408,10 +421,19 @@ impl GeminiStreamParser {
                     .unwrap_or_default()
                     .to_string();
                 let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                // Gemini 3 attaches `thoughtSignature` as a sibling of
+                // `functionCall` on the part (only on the first of parallel
+                // calls). It must be echoed back verbatim in history or the next
+                // request is rejected with a 400, so capture it on the call.
+                let thought_signature = part
+                    .get("thoughtSignature")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 self.tool_calls.push(ToolCall {
                     id,
                     name,
                     arguments,
+                    thought_signature,
                 });
             } else if let Some(text) = part.get("text").and_then(Value::as_str) {
                 self.text.push_str(text);
@@ -495,6 +517,54 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"re
             "generated id when functionCall.id absent"
         );
         assert_eq!(call.arguments, json!({ "path": "a.rs" }));
+    }
+
+    #[test]
+    fn function_call_captures_thought_signature_when_present() {
+        let body = "\
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"ls\",\"args\":{}},\"thoughtSignature\":\"sig-abc\"}]}}]}
+
+";
+        let turn = parse_antigravity_sse(body).expect("stream should parse");
+        let call = &turn.tool_calls[0];
+        assert_eq!(call.thought_signature.as_deref(), Some("sig-abc"));
+    }
+
+    #[test]
+    fn tool_call_continuity_round_trips_thought_signature_into_request() {
+        // A captured signature rides on the tool call's `thought_signature` and
+        // is stored as the assistant-tool-call message's continuity.
+        let call = ToolCall {
+            id: "fc_1".to_string(),
+            name: "ls".to_string(),
+            arguments: json!({ "path": "." }),
+            thought_signature: Some("sig-xyz".to_string()),
+        };
+        let message = Message::assistant_tool_call(&call);
+        assert_eq!(message.continuity.as_deref(), Some("sig-xyz"));
+
+        let contents = build_contents(std::slice::from_ref(&message));
+        let part = &contents[0]["parts"][0];
+        // Echoed as a sibling of `functionCall`, in the exact part, per the
+        // Gemini thought-signature contract.
+        assert_eq!(part["functionCall"]["name"], json!("ls"));
+        assert_eq!(part["thoughtSignature"], json!("sig-xyz"));
+    }
+
+    #[test]
+    fn tool_call_without_signature_omits_thought_signature_field() {
+        let call = ToolCall {
+            id: "fc_1".to_string(),
+            name: "ls".to_string(),
+            arguments: json!({}),
+            thought_signature: None,
+        };
+        let contents = build_contents(&[Message::assistant_tool_call(&call)]);
+        let part = &contents[0]["parts"][0];
+        assert!(
+            part.get("thoughtSignature").is_none(),
+            "no signature -> no thoughtSignature key"
+        );
     }
 
     #[test]

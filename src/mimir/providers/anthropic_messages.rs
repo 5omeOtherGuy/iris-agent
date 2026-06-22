@@ -1013,6 +1013,7 @@ fn finalize_tool(block: ToolBlock) -> Result<ToolCall> {
     };
     Ok(ToolCall {
         id: block.id,
+        thought_signature: None,
         name: block.name,
         arguments,
     })
