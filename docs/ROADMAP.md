@@ -1,13 +1,15 @@
 # Iris — Roadmap
 
-> Status (2026-06-21): Milestone 1, the async-hard runtime completion, and the
+> Status (2026-06-22): Milestone 1, the async-hard runtime completion, and the
 > Milestone 2 foundations are done. Iris has a terminal-surface TUI with
 > Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`,
 > `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
 > response parsing, workspace-scoped tools, terminal approval gates with diff
 > previews, fragment-based system-prompt assembly, provider/model/reasoning/
-> context settings, linear session resume, JSONL session persistence, handle-
-> backed large tool outputs, token estimates, and turn-boundary auto-compaction.
+> context/cache settings, linear session resume, JSONL session persistence,
+> handle-backed large tool outputs, token estimates, turn-boundary
+> auto-compaction, and default-off provider-native prompt-cache/context-
+> management controls.
 > Nexus runs a tokio async loop with turn-level cancellation: the provider is an
 > async stream raced against cancellation, tools are async with child tokens,
 > concurrency-safe tools run in parallel while everything else stays exclusive,
@@ -85,14 +87,22 @@ Implemented today:
 - Runtime `/model` and `/reasoning` switching at safe turn boundaries, with TUI
   provider/model/effort pickers, scoped model cycling, `/settings`, `/login`,
   and `/logout`.
+- Default-off provider-native prompt-cache settings and diagnostics: OpenAI
+  prompt-cache keys/24h retention, Anthropic `cache_control`, provider
+  usage/cache metadata, and cache-break warnings only when the stable prefix
+  provably changed.
+- Anthropic-only server-side context-management clear edits, with provider-side
+  compact rejected until Iris can persist and replay provider compaction blocks.
 - Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
   subscription OAuth reuse, and Antigravity Google OAuth.
 - OpenAI Codex browser and device-code login flows; Antigravity browser PKCE
-  login; Anthropic instructions for reusing an existing Claude Code login.
+  login; Anthropic browser PKCE login plus Claude Code credential reuse; shared
+  cancellable loopback OAuth callback plumbing with manual-paste fallback.
 - OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini Code Assist
   request/response handling, including tool schemas, streamed-response parsing,
-  and normalized reasoning/thinking controls where supported; Anthropic also
-  preserves same-origin reasoning continuity in flattened transcripts.
+  and normalized reasoning/thinking controls where supported; Anthropic preserves
+  same-origin reasoning continuity in flattened transcripts, and Antigravity
+  round-trips Gemini tool-call `thoughtSignature` continuity.
 - Harness-owned fragment/slot system-prompt / project-instruction assembly
   ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56),
   [#74](https://github.com/5omeOtherGuy/iris-agent/pull/74)): the Tier-2
@@ -117,8 +127,8 @@ Not implemented yet:
 
 - Persistent approval policies, in-session `/resume` picker and transcript-tree
   branching/rollback, modes, subagents, context ledger/planner, handle
-  dereference UI/tool, token-efficiency benchmark proof, git automation, and
-  GitHub integration.
+  dereference UI/tool, provider-side compact replay, token-efficiency benchmark
+  proof, git automation, and GitHub integration.
 
 ## Runtime completion — finish Nexus before Milestone 2 [SHIPPED 2026-06-17]
 
