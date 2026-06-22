@@ -2,14 +2,15 @@
 
 **A fast, token-efficient coding agent for your terminal.**
 
-> **Status (2026-06-21): Milestone 2 foundations are implemented.** Iris
+> **Status (2026-06-22): Milestone 2 foundations are implemented.** Iris
 > currently has a terminal-surface TUI with Iris-owned transcript replay plus a
 > text fallback, selectable Mimir providers (`openai-codex`, `anthropic`,
 > `antigravity`), runtime model/reasoning switching, streamed response parsing,
 > workspace-scoped built-in tools, approval gates with diff previews,
 > fragment-based system-prompt assembly, provider/model/reasoning/context-budget
 > settings, linear session resume, JSONL transcripts, session-scoped large-output
-> handles, token estimates, and turn-boundary auto-compaction. Nexus runs a
+> handles, token estimates, turn-boundary auto-compaction, and default-off
+> provider-native prompt-cache/context-management controls. Nexus runs a
 > tokio async loop with turn-level cancellation: async provider streams,
 > per-tool child cancellation, and safe-parallel execution of concurrency-safe
 > tools. The active milestone gate is proving the token/context foundations with
@@ -72,8 +73,10 @@ hit/miss and cost-avoided surfaced so the savings are visible. When context must
 shrink, the aim is to do it well: layered compaction with **freshness rules** so a
 summary made before a file changed isn't trusted blindly, and **verification
 probes so compaction quality can be measured rather than asserted.** The current
-runtime has a deterministic turn-boundary auto-compaction foundation; quality
-summaries and compaction benchmarks are still future work.
+runtime has a deterministic turn-boundary auto-compaction foundation plus
+default-off public prompt-cache hints for OpenAI/Anthropic and Anthropic
+clear-edit context-management opt-ins; quality summaries, provider compact replay,
+and compaction benchmarks are still future work.
 
 ## Modes that switch cheaply
 
@@ -161,8 +164,10 @@ is proven, not before.
 Iris is being built provider-agnostic from the core, with provider-specific
 optimizations where they matter — cache layout, tool-call formats, reasoning
 controls. Today it ships OpenAI Codex Responses, Anthropic Messages on the Claude
-Code OAuth lane, and Antigravity/Gemini Code Assist. The capability matrix is
-still planned so each backend can become a first-class citizen rather than a
+Code OAuth lane, and Antigravity/Gemini Code Assist, including provider-specific
+continuity requirements such as Anthropic signed/redacted thinking and Gemini
+tool-call `thoughtSignature` replay. The capability matrix is still planned so
+each backend can become a first-class citizen rather than a
 lowest-common-denominator adapter.
 
 ## Why Iris, and what it is not

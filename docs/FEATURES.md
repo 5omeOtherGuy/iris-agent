@@ -1,6 +1,6 @@
 # Iris — Feature List
 
-> Status (2026-06-21): Milestone 2 foundations are implemented; the remaining
+> Status (2026-06-22): Milestone 2 foundations are implemented; the remaining
 > Milestone 2 gate is benchmark proof plus consumer slices. Labels:
 > **[Implemented]** · **[Partial]** · **[Planned · MVP]** · **[Planned]** ·
 > **[Research]**. This file is
@@ -54,20 +54,23 @@
   (bearer token, no `x-api-key`), Anthropic Messages SSE, Claude Code identity
   system block, subscription model matrix, tool schemas, streamed text,
   tool-call assembly, normalized reasoning budgets/effort, redacted diagnostics,
-  and same-origin reasoning replay. Credentials come from the Iris auth store or
-  an existing Claude Code login. [Partial]
+  same-origin reasoning replay, cache-control markers when enabled, and supported
+  context-management clear edits. Credentials come from the Iris auth store or an
+  existing Claude Code login. [Partial]
 - **Antigravity provider** — uses Google OAuth for Gemini Code Assist
   (`v1internal:streamGenerateContent?alt=sse`), project-id discovery/persistence,
   Gemini content/tool mapping, streamed text, tool-call assembly, and normalized
-  thinking config. The public installed-app client ID is decoded at runtime;
-  `ANTIGRAVITY_CLIENT_SECRET` is supplied at runtime or injected when building
-  Iris. [Partial]
+  thinking config. Gemini tool-call `thoughtSignature` values are persisted and
+  replayed so follow-up requests after tool use stay valid. The public installed-
+  app client ID is decoded at runtime; `ANTIGRAVITY_CLIENT_SECRET` is supplied at
+  runtime or injected when building Iris. [Partial]
 - **OpenAI Codex OAuth auth-file support** — reads `~/.iris/auth.json` or
   `IRIS_AUTH_PATH`, refreshes expired access tokens, extracts account ID from the
   JWT payload, and rewrites refreshed credentials atomically with restricted Unix
   permissions. [Partial]
-- **Anthropic Claude Code credential reuse** — reads `~/.claude/.credentials.json`
-  (or `CLAUDE_CONFIG_DIR/.credentials.json`) when the Iris auth store does not
+- **Anthropic Claude Code credential reuse and login** — runs browser PKCE OAuth
+  with manual paste fallback, reads `~/.claude/.credentials.json` (or
+  `CLAUDE_CONFIG_DIR/.credentials.json`) when the Iris auth store does not
   already hold Anthropic credentials, and writes rotated tokens back to the same
   source without reshaping or dropping sibling keys. [Partial]
 - **Antigravity Google OAuth login** — browser PKCE OAuth callback flow through
@@ -86,6 +89,16 @@
   `defaultReasoning` sets startup thinking/effort, and `enabledModels` scopes
   Ctrl+P model cycling from global/user config only.
   [Partial]
+- **Provider-native prompt cache controls** — global-only `promptCacheRetention`
+  supports `none` (default), `short`, and `long`. OpenAI receives
+  `prompt_cache_key` and optional 24h retention; Anthropic receives
+  `cache_control` markers with optional 1h TTL. Iris records provider usage/cache
+  metadata and warns only on proven stable-prefix breaks, not ordinary cold
+  caches. [Partial]
+- **Anthropic context-management opt-in** — global-only
+  `anthropicContextManagement` supports the public clear-tool-use and
+  clear-thinking edits; provider-side compact is rejected until Iris can persist
+  and replay compaction blocks safely. [Partial]
 - **Runtime model and reasoning switching** — `/model`, `/reasoning`, TUI
   provider/model/effort pickers, Ctrl+P/Shift+Ctrl+P model cycling,
   Shift+Tab effort cycling, `/settings`, `/scoped-models`, and session-local or
@@ -183,10 +196,12 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   and confidence. [Planned]
 - **Handle lifecycle** — session-scoped retention with ref-counting or
   pin-on-reference. [Planned]
-- **Prompt segment caching** — reuse stable prompt segments where providers expose
-  cache behavior. [Planned]
-- **Cache-aware prompt layout** — order stable vs. changing prompt parts per
-  provider and report cache hit/miss where APIs expose it. [Planned]
+- **Prompt segment caching** — default-off provider-native cache hints for stable
+  prompt segments where providers expose public controls; local KV caching and
+  private/provider-specific continuity tricks remain deferred. [Partial]
+- **Cache-aware prompt layout** — providers receive stable prompt/tool prefixes,
+  prompt-cache opt-ins, provider usage/cache metadata, and proven cache-break
+  diagnostics. More explicit layout planning remains planned. [Partial]
 - **Diff-aware file context** — prioritize git diff, touched files, nearby symbols,
   and recent edits over whole files. [Planned]
 - **Provider-specific tool surface planner** — Nexus separates the

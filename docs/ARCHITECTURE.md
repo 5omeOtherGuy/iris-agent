@@ -1,6 +1,6 @@
 # Iris — Architecture: Three-Tier Split
 
-> Status (2026-06-21): target architecture, realized in the runtime. Iris
+> Status (2026-06-22): target architecture, realized in the runtime. Iris
 > ships today as one binary with the tier boundaries enforced in-module, and the
 > async-hard agent loop (below) is shipped. This document defines the ownership
 > tiers Iris is converging on, modeled on pi's
@@ -93,7 +93,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 |---|---|
 | Harness wrapping the bare agent: owns the execution env + session, injects `ToolEnv`, persists the transcript post-turn | `wayland/mod.rs` (`Harness`) |
 | Session transcript persistence/read store | `session.rs` |
-| Settings / configuration loading | `config.rs` |
+| Settings / configuration loading, including global-only provider/base-url/scoped-model/cache/context-management controls and project-safe model/reasoning/context-budget overrides | `config.rs` |
 | Workspace path safety (the FS/Shell sandbox surface) | `tools/path.rs`, `tools/bash/sandbox.rs` |
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
@@ -124,8 +124,8 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 | Tool implementations: `read` `write` `edit` `bash` `grep` `find` `ls` | `tools/*` (impls) |
 | Plugin runtime + registration, if a plugin system is ever added: executor (WASM/Extism or subprocess), manifest parsing, registry wiring | _exploratory (issue #18)_ |
 | Trusted approval-preview diff rendering | `tools/mod.rs` (`diff_preview`) → Tier 3 |
-| Provider adapters (translate OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini wire formats → contracts), packaged as **Mimir** (the AI/provider package; see [`NAMING.md`](NAMING.md)) | `mimir/providers/*` |
-| Auth flows + token store (Mimir) | `mimir/auth/*` |
+| Provider adapters (translate OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini wire formats → contracts), packaged as **Mimir** (the AI/provider package; see [`NAMING.md`](NAMING.md)); provider-native prompt-cache/context-management request knobs stay inside these adapters | `mimir/providers/*` |
+| Auth flows + token store (Mimir), including shared cancellable loopback OAuth callback plumbing | `mimir/auth/*` |
 
 Depends on Tier 1 (contracts) and Tier 2 (harness).
 
@@ -204,6 +204,15 @@ a destructive call, or refuse bash-always stays in Nexus (Tier 1) per
 `AGENTS.md`. The *knowledge* of whether a given tool mutates or a given bash
 command is destructive rides with the tool as `Tool`-trait methods (Tier 3), so
 core never matches on tool names.
+
+Provider-native optimization follows the same ownership rule. Nexus carries only
+provider-neutral messages, opaque continuity strings, provider usage metadata,
+and typed events. Mimir decides whether OpenAI receives prompt-cache keys or 24h
+retention, whether Anthropic receives `cache_control` or supported
+`context_management` edits, and whether Gemini tool calls need a
+`thoughtSignature` echoed back. User-controlled knobs for these behaviors are
+global settings because they can affect privacy, cost, or provider routing; repo
+settings cannot enable them.
 
 ## Packaging
 
