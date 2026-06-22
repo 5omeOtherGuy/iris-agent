@@ -18,7 +18,6 @@
 use std::env;
 
 use anyhow::Result;
-use serde::Deserialize;
 
 use crate::config::Settings;
 use crate::errors::UsageError;
@@ -245,7 +244,7 @@ impl PromptCacheRetention {
 /// the request and betas stay byte-identical unless a user explicitly enables
 /// an edit. Each present edit maps to a documented Anthropic edit type; the
 /// required betas are derived from the emitted payload by the Anthropic adapter.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ContextManagement {
     /// `clear_tool_uses_20250919`: drop old tool-use/result pairs past a token
@@ -258,7 +257,7 @@ pub(crate) struct ContextManagement {
     pub(crate) compact: Option<Compact>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClearToolUses {
     pub(crate) trigger_input_tokens: Option<u64>,
@@ -266,7 +265,7 @@ pub(crate) struct ClearToolUses {
     pub(crate) clear_at_least_input_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClearThinking {
     pub(crate) trigger_input_tokens: Option<u64>,
@@ -276,7 +275,7 @@ pub(crate) struct ClearThinking {
     pub(crate) keep_thinking_turns: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Compact {
     pub(crate) trigger_input_tokens: Option<u64>,
@@ -484,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn context_management_parses_typed_edits_and_rejects_malformed() {
+    fn context_management_parses_typed_edits_and_rejects_malformed_or_unsupported() {
         let mut s = settings(None, None, None, None);
         assert!(
             !ModelSelection::resolve(&s)

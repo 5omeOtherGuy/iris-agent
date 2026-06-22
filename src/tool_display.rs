@@ -94,6 +94,25 @@ pub(crate) fn exploration_summary(call: &ToolCall) -> String {
     }
 }
 
+pub(crate) fn exploration_active_summary(call: &ToolCall) -> String {
+    let summary = exploration_summary(call);
+    match call.name.as_str() {
+        "read" => summary
+            .strip_prefix("Read ")
+            .map_or(summary.clone(), |rest| format!("Reading {rest}")),
+        "grep" => summary
+            .strip_prefix("Search ")
+            .map_or(summary.clone(), |rest| format!("Searching {rest}")),
+        "find" => summary
+            .strip_prefix("Find ")
+            .map_or(summary.clone(), |rest| format!("Finding {rest}")),
+        "ls" => summary
+            .strip_prefix("List ")
+            .map_or(summary.clone(), |rest| format!("Listing {rest}")),
+        _ => summary,
+    }
+}
+
 /// Fold a tool-output body to a bounded preview plus a hidden-line count.
 ///
 /// Line-bounded first (keep at most [`MAX_DISPLAY_LINES`] source lines), then a
@@ -411,6 +430,21 @@ mod tests {
         assert_eq!(
             exploration_summary(&call("grep", json!({ "pattern": "needle", "path": "src" }))),
             "Search needle in src"
+        );
+    }
+
+    #[test]
+    fn exploration_active_summary_uses_progress_verbs() {
+        assert_eq!(
+            exploration_active_summary(&call("read", json!({ "path": "src/main.rs" }))),
+            "Reading src/main.rs"
+        );
+        assert_eq!(
+            exploration_active_summary(&call(
+                "grep",
+                json!({ "pattern": "needle", "path": "src" })
+            )),
+            "Searching needle in src"
         );
     }
 

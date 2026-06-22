@@ -418,7 +418,7 @@ mod tests {
         // A cloned project must not enable server-side context edits.
         fs::write(
             &project,
-            r#"{ "anthropicContextManagement": { "compact": { "triggerInputTokens": 1 } } }"#,
+            r#"{ "anthropicContextManagement": { "clearToolUses": { "keepToolUses": 1 } } }"#,
         )
         .unwrap();
 

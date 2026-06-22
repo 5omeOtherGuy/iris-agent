@@ -118,6 +118,7 @@ async fn session_loop<P: ChatProvider>(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     tui.screen.apply_event(UiEvent::SessionStarted);
+    refresh_footer(tui, switch);
     tui.draw()?;
     // Draw the inline viewport before starting the blocking input reader. The
     // first draw commits the banner through Ratatui, which may still need a
@@ -129,6 +130,10 @@ async fn session_loop<P: ChatProvider>(
     let login_backend: Arc<dyn LoginBackend> = Arc::new(OAuthLoginBackend);
 
     loop {
+        // Keep the status footer current: a model/effort change handled in the
+        // previous iteration (chord, picker, or modal) is reflected before the
+        // next idle draw.
+        refresh_footer(tui, switch);
         match idle_phase(tui, &mut input_rx, &mut tick).await? {
             IdleOutcome::Exit => break,
             IdleOutcome::OpenModelPicker => {
@@ -183,6 +188,10 @@ async fn session_loop<P: ChatProvider>(
                 }
             }
         }
+        // A model/effort switch (Ctrl+P, Shift+Tab, or a `/model` `/reasoning`
+        // command) lands in this iteration; refresh the footer so the trailing
+        // draw reflects the new selection immediately, not on the next keypress.
+        refresh_footer(tui, switch);
         tui.draw()?;
         // A command/keybinding may have opened a picker/dialog. Run it to
         // completion here, where harness + switch are in scope; switches land at
@@ -207,6 +216,42 @@ fn apply_notices(tui: &mut TuiUi, lines: Vec<String>) {
     for line in lines {
         tui.screen.apply_event(UiEvent::Notice(line));
     }
+}
+
+/// Refresh the idle status footer (Codex's `model effort · cwd` bar) from the
+/// live model selection. A no-op when no model switch is wired (the footer then
+/// stays unset and the keybind hint shows instead).
+fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<'_, P>>) {
+    let Some(sw) = switch.as_ref() else {
+        return;
+    };
+    let selection = sw.selection();
+    let model = match selection.reasoning {
+        Some(effort) => format!("{} {}", selection.model, effort.as_str()),
+        None => selection.model.clone(),
+    };
+    tui.screen.set_footer(model, footer_cwd());
+}
+
+/// The working directory for the footer, home-relativized to `~`/`~/sub`.
+///
+/// Presentation-only: this reads the process working directory, which equals the
+/// workspace root today, so it is not a tier boundary concern (it enforces
+/// nothing). If Iris later supports remote/alternate workspace roots, switch this
+/// to a read-only display accessor on `Harness`.
+fn footer_cwd() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+        && let Ok(rel) = cwd.strip_prefix(std::path::Path::new(&home))
+    {
+        return if rel.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rel.display())
+        };
+    }
+    cwd.display().to_string()
 }
 
 /// Route a submitted `/` command to its picker/handler. Returns whether the line
@@ -439,6 +484,9 @@ async fn run_modal_phase<P: ChatProvider>(
                             outcome, harness, tui, input_rx, tick, switch, login_backend,
                         )
                         .await?;
+                        // The picker may have switched model/effort; refresh the
+                        // footer before drawing so it never shows a stale model.
+                        refresh_footer(tui, switch);
                         tui.draw()?;
                     }
                     None => tui.draw()?,
