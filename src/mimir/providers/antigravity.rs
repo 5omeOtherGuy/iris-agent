@@ -136,7 +136,7 @@ impl AntigravityProvider {
                 return Attempt::Fatal(error);
             }
             return match parser.finish() {
-                Ok(turn) => Attempt::Done(turn),
+                Ok(turn) => Attempt::Done(Box::new(turn)),
                 Err(error) => Attempt::Fatal(error),
             };
         }

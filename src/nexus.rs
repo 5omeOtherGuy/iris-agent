@@ -71,8 +71,13 @@ pub(crate) enum AgentEvent {
         turn_id: String,
     },
     /// One provider/model round trip completed with a terminal provider event.
+    /// `response_id` is the provider's opaque response id when reported; `usage`
+    /// carries provider token/cache accounting. Both are safe metadata and keep
+    /// provider diagnostics observable without surfacing request/response bodies.
     ProviderTurnCompleted {
         turn_id: String,
+        response_id: Option<String>,
+        usage: Option<ProviderUsage>,
     },
     /// One provider/model round trip was interrupted before completion.
     ProviderTurnCancelled {
@@ -668,8 +673,8 @@ impl<P: ChatProvider> Agent<P> {
                         text,
                         reasoning,
                         tool_calls,
-                        response_id: _,
-                        usage: _,
+                        response_id,
+                        usage,
                     } = turn;
                     for block in reasoning {
                         self.messages.push(
@@ -692,6 +697,8 @@ impl<P: ChatProvider> Agent<P> {
 
                     obs.on_event(AgentEvent::ProviderTurnCompleted {
                         turn_id: provider_turn_id.clone(),
+                        response_id,
+                        usage,
                     })?;
                     if tool_calls.is_empty() {
                         tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
@@ -1273,6 +1280,22 @@ pub(crate) struct ProviderUsage {
     pub(crate) cache_write_input_tokens: u64,
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
+    /// Provider breakdown of cache-creation (write) tokens by retention class,
+    /// when reported. Anthropic surfaces this as `usage.cache_creation`
+    /// (`ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`); providers
+    /// that do not report a breakdown leave this `None`. The component totals
+    /// are already summed into `cache_write_input_tokens`.
+    pub(crate) cache_creation: Option<CacheCreation>,
+}
+
+/// Per-retention breakdown of prompt-cache-creation (write) input tokens, as
+/// reported by Anthropic's `usage.cache_creation` detail. Surfaced alongside
+/// the `cache_write_input_tokens` total so diagnostics can attribute writes to
+/// the 5-minute vs 1-hour cache tier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CacheCreation {
+    pub(crate) ephemeral_5m_input_tokens: u64,
+    pub(crate) ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

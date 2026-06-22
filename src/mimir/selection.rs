@@ -185,10 +185,12 @@ impl ReasoningEffort {
     }
 }
 
-/// Prompt-cache retention preference shared by provider adapters. `Short` is
-/// the normal provider-default prompt cache behavior; `Long` opts into the
-/// provider's safe longer-lived cache marker only where Iris knows the wire
-/// shape, and `None` disables provider request cache hints entirely.
+/// Prompt-cache retention preference shared by provider adapters. `Short` opts
+/// into the provider default ephemeral cache (Anthropic 5-minute `cache_control`
+/// / OpenAI `prompt_cache_key`); `Long` opts into the provider's longer-lived
+/// cache marker (Anthropic `ttl: "1h"` / OpenAI `prompt_cache_retention:
+/// "24h"`); `None` (the default) disables every provider request cache hint so
+/// the request stays byte-identical to pre-cache behavior unless a user opts in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptCacheRetention {
     None,
@@ -197,10 +199,11 @@ pub(crate) enum PromptCacheRetention {
 }
 
 impl PromptCacheRetention {
-    /// Default cache retention. Anthropic maps this to 5-minute ephemeral cache
-    /// control; OpenAI maps it to the normal prompt-cache key behavior with no
-    /// forced long retention.
-    pub(crate) const DEFAULT: PromptCacheRetention = PromptCacheRetention::Short;
+    /// Default cache retention: `None` (off). Prompt caching is a public
+    /// server-side opt-in, so the default emits no cache request fields and
+    /// preserves existing request behavior and cost for users who did not
+    /// enable it.
+    pub(crate) const DEFAULT: PromptCacheRetention = PromptCacheRetention::None;
 
     #[cfg(test)]
     pub(crate) const ALL: [PromptCacheRetention; 3] = [
@@ -235,6 +238,70 @@ impl PromptCacheRetention {
     }
 }
 
+/// Anthropic server-side context-management opt-in (`context_management.edits`),
+/// deserialized from the global `anthropicContextManagement` setting. An empty
+/// value (the default) is disabled, so no `context_management` is emitted and
+/// the request and betas stay byte-identical unless a user explicitly enables
+/// an edit. Each present edit maps to a documented Anthropic edit type; the
+/// required betas are derived from the emitted payload by the Anthropic adapter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextManagement {
+    /// `clear_tool_uses_20250919`: drop old tool-use/result pairs past a token
+    /// trigger, keeping the most recent.
+    pub(crate) clear_tool_uses: Option<ClearToolUses>,
+    /// `clear_thinking_20251015`: drop extended-thinking blocks from older turns.
+    pub(crate) clear_thinking: Option<ClearThinking>,
+    /// `compact_20260112`: parsed only so Iris can reject it until the provider
+    /// response `compaction` block can be persisted and replayed safely.
+    pub(crate) compact: Option<Compact>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClearToolUses {
+    pub(crate) trigger_input_tokens: Option<u64>,
+    pub(crate) keep_tool_uses: Option<u64>,
+    pub(crate) clear_at_least_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClearThinking {
+    pub(crate) trigger_input_tokens: Option<u64>,
+    /// Recent thinking turns to keep. When unset, Iris omits `keep` and lets the
+    /// Anthropic beta use its API default rather than sending a Claude-Code-only
+    /// `"all"` sentinel.
+    pub(crate) keep_thinking_turns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Compact {
+    pub(crate) trigger_input_tokens: Option<u64>,
+    pub(crate) instructions: Option<String>,
+}
+
+impl ContextManagement {
+    /// Whether any supported context-management edit is configured. When false
+    /// the adapter emits no `context_management` field and no extra betas.
+    /// Compact is intentionally excluded: Iris rejects it until compaction
+    /// blocks can be represented in the transcript and replayed on later turns.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.clear_tool_uses.is_some() || self.clear_thinking.is_some()
+    }
+
+    pub(crate) fn validate_supported(&self) -> Result<()> {
+        if self.compact.is_some() {
+            return Err(UsageError::new(
+                "anthropicContextManagement.compact is not supported yet; compact responses require transcript replay support",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 /// The resolved user choice: provider + model + base URL + optional reasoning.
 /// `reasoning: None` means no preference, so adapters omit every reasoning field
 /// and emit byte-identical requests to today's behavior.
@@ -245,6 +312,9 @@ pub(crate) struct ModelSelection {
     pub(crate) base_url: String,
     pub(crate) reasoning: Option<ReasoningEffort>,
     pub(crate) cache_retention: PromptCacheRetention,
+    /// Anthropic-only context-management opt-in; empty/default for other
+    /// providers and when unconfigured.
+    pub(crate) context_management: ContextManagement,
 }
 
 impl ModelSelection {
@@ -254,7 +324,8 @@ impl ModelSelection {
     /// - base_url: provider env (`IRIS_CODEX_BASE_URL` only today) ->
     ///   `settings.base_url` -> per-provider default
     /// - reasoning: `settings.default_reasoning` -> else `None`
-    /// - cache retention: `settings.prompt_cache_retention` -> `short`
+    /// - cache retention: `settings.prompt_cache_retention` -> `none` (off)
+    /// - context management: `settings.anthropic_context_management` -> empty
     ///
     /// `settings.base_url` is already global-only (the security invariant is
     /// enforced in `Settings::merged_with`), so resolve never re-derives it from
@@ -276,12 +347,24 @@ impl ModelSelection {
             Some(value) => PromptCacheRetention::parse(value)?,
             None => PromptCacheRetention::DEFAULT,
         };
+        let context_management = match &settings.anthropic_context_management {
+            Some(value) => {
+                serde_json::from_value::<ContextManagement>(value.clone()).map_err(|error| {
+                    UsageError::new(format!(
+                        "invalid anthropicContextManagement config: {error}"
+                    ))
+                })?
+            }
+            None => ContextManagement::default(),
+        };
+        context_management.validate_supported()?;
         Ok(ModelSelection {
             provider,
             model,
             base_url,
             reasoning,
             cache_retention,
+            context_management,
         })
     }
 }
@@ -331,6 +414,7 @@ mod tests {
             context_token_budget: None,
             default_reasoning: reasoning.map(str::to_string),
             prompt_cache_retention: None,
+            anthropic_context_management: None,
             enabled_models: None,
         }
     }
@@ -352,7 +436,8 @@ mod tests {
         assert_eq!(resolved.model, "gpt-5.5");
         assert_eq!(resolved.base_url, "https://chatgpt.com/backend-api");
         assert_eq!(resolved.reasoning, None);
-        assert_eq!(resolved.cache_retention, PromptCacheRetention::Short);
+        assert_eq!(resolved.cache_retention, PromptCacheRetention::None);
+        assert!(!resolved.context_management.is_enabled());
 
         // Settings values win over defaults.
         let s = settings(
@@ -398,8 +483,52 @@ mod tests {
     }
 
     #[test]
+    fn context_management_parses_typed_edits_and_rejects_malformed_or_unsupported() {
+        let mut s = settings(None, None, None, None);
+        assert!(
+            !ModelSelection::resolve(&s)
+                .unwrap()
+                .context_management
+                .is_enabled(),
+            "unconfigured context management stays disabled"
+        );
+
+        s.anthropic_context_management = Some(serde_json::json!({
+            "clearToolUses": { "triggerInputTokens": 100000, "keepToolUses": 3 },
+            "clearThinking": { "triggerInputTokens": 90000, "keepThinkingTurns": 2 },
+        }));
+        let cm = ModelSelection::resolve(&s).unwrap().context_management;
+        assert!(cm.is_enabled());
+        let clear = cm.clear_tool_uses.expect("clear_tool_uses");
+        assert_eq!(clear.trigger_input_tokens, Some(100000));
+        assert_eq!(clear.keep_tool_uses, Some(3));
+        let thinking = cm.clear_thinking.expect("clear_thinking");
+        assert_eq!(thinking.trigger_input_tokens, Some(90000));
+        assert_eq!(thinking.keep_thinking_turns, Some(2));
+        assert!(cm.compact.is_none());
+
+        s.anthropic_context_management = Some(serde_json::json!({
+            "compact": { "triggerInputTokens": 150000, "instructions": "preserve decisions" }
+        }));
+        let err = ModelSelection::resolve(&s).unwrap_err().to_string();
+        assert!(err.contains("compact is not supported yet"), "{err}");
+
+        s.anthropic_context_management = Some(serde_json::json!({ "clearToolUses": 7 }));
+        let err = ModelSelection::resolve(&s).unwrap_err().to_string();
+        assert!(err.contains("invalid anthropicContextManagement"), "{err}");
+    }
+
+    #[test]
     fn cache_retention_parses_defaults_and_rejects_unknown_values() {
         let mut s = settings(None, None, None, None);
+        // Default is off: prompt caching is opt-in, so an unconfigured session
+        // emits no cache request fields.
+        assert_eq!(
+            ModelSelection::resolve(&s).unwrap().cache_retention,
+            PromptCacheRetention::None
+        );
+
+        s.prompt_cache_retention = Some("short".to_string());
         assert_eq!(
             ModelSelection::resolve(&s).unwrap().cache_retention,
             PromptCacheRetention::Short

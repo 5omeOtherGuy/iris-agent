@@ -297,6 +297,7 @@ fn build_provider(
                 reasoning,
                 system_prompt,
                 selection.cache_retention,
+                selection.context_management.clone(),
             )?,
         ),
         ProviderId::Antigravity => {

@@ -65,7 +65,7 @@ pub(super) fn spawn_stream(
 
 /// Outcome of a single HTTP attempt, classified for [`run_with_reauth`].
 pub(super) enum Attempt {
-    Done(AssistantTurn),
+    Done(Box<AssistantTurn>),
     /// Auth rejected (401/403): force one token refresh, then retry once.
     Reauth(anyhow::Error),
     /// Anything else non-retryable here: surface immediately.
@@ -113,7 +113,7 @@ pub(super) fn run_with_reauth<T>(
             bail!("turn cancelled");
         }
         match send(&token) {
-            Attempt::Done(turn) => return Ok(turn),
+            Attempt::Done(turn) => return Ok(*turn),
             Attempt::Reauth(error) => {
                 if reauth_used {
                     tracing::error!(error = %format!("{error:#}"), "auth rejected after refresh");
@@ -196,13 +196,13 @@ mod tests {
                 if sends == 1 {
                     Attempt::Reauth(anyhow!("401"))
                 } else {
-                    Attempt::Done(AssistantTurn {
+                    Attempt::Done(Box::new(AssistantTurn {
                         text: Some("ok".to_string()),
                         reasoning: Vec::new(),
                         tool_calls: Vec::new(),
                         response_id: None,
                         usage: None,
-                    })
+                    }))
                 }
             },
         )

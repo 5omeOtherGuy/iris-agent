@@ -13,90 +13,183 @@ pub(crate) mod antigravity;
 pub(crate) mod openai_codex_responses;
 mod transport;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
-use crate::nexus::ProviderUsage;
+use crate::nexus::{Message, Tools};
 
-const MIN_PROMPT_CACHE_INPUT_TOKENS: u64 = 1024;
-
-/// Provider-local prompt-cache diagnostics shared by adapters. It warns only
-/// after a cacheable request has already happened (or after Anthropic reported a
-/// cache write) and a later comparable request still has zero cache reads.
-#[derive(Debug, Default)]
-struct CacheUsageDiagnostics {
-    cacheable_requests: u64,
-    saw_cache_write: bool,
-    warned: bool,
+/// Stable-prefix fingerprint of a provider request: the request parts that
+/// should stay byte-stable across turns for server-side prompt caching to reuse
+/// them. `head` hashes the system instructions + tool declarations; `messages`
+/// is the per-message content hash in order. A later request can reuse the
+/// prefix cached by an earlier one only when `head` is unchanged AND the earlier
+/// message-hash list is an exact prefix of the new one (the normal append case).
+/// Any divergence -- a shrunk/rewritten history (compaction, edit, reorder) or a
+/// changed instruction/tool head -- proves the cached prefix changed and the
+/// next request cannot reuse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefixFingerprint {
+    head: u64,
+    messages: Vec<u64>,
 }
 
-impl CacheUsageDiagnostics {
-    fn record(&mut self, caching_enabled: bool, usage: &ProviderUsage) -> bool {
-        if !caching_enabled {
-            return false;
+impl PrefixFingerprint {
+    fn new(instructions: &str, tools: &Tools, messages: &[Message]) -> Self {
+        let mut head = DefaultHasher::new();
+        instructions.hash(&mut head);
+        for tool in tools.iter() {
+            tool.name().hash(&mut head);
+            tool.description().hash(&mut head);
+            tool.parameters().to_string().hash(&mut head);
         }
-        let cacheable = usage.input_tokens >= MIN_PROMPT_CACHE_INPUT_TOKENS
-            || usage.cache_write_input_tokens > 0
-            || usage.cache_read_input_tokens > 0;
-        if !cacheable {
-            return false;
+        let messages = messages.iter().map(hash_message).collect();
+        Self {
+            head: head.finish(),
+            messages,
         }
-        let should_warn = !self.warned
-            && usage.cache_read_input_tokens == 0
-            && (self.saw_cache_write || self.cacheable_requests > 0);
-        self.cacheable_requests = self.cacheable_requests.saturating_add(1);
-        self.saw_cache_write |= usage.cache_write_input_tokens > 0;
-        if should_warn {
-            self.warned = true;
-        }
-        should_warn
     }
 
-    fn record_locked(
-        diagnostics: &Mutex<Self>,
+    /// Whether `self` proves the cached prefix established by `prev` changed: a
+    /// different head, a shorter history, or any earlier message that no longer
+    /// matches. A pure append (prev is an exact prefix of self) is NOT a change,
+    /// so a normal next turn never warns.
+    fn breaks(&self, prev: &PrefixFingerprint) -> bool {
+        self.head != prev.head
+            || self.messages.len() < prev.messages.len()
+            || self.messages[..prev.messages.len()] != prev.messages[..]
+    }
+}
+
+fn hash_message(message: &Message) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    message.role.as_str().hash(&mut hasher);
+    message.content.hash(&mut hasher);
+    message.tool_call_id.hash(&mut hasher);
+    message.tool_name.hash(&mut hasher);
+    message.continuity.hash(&mut hasher);
+    message.redacted.hash(&mut hasher);
+    if let Some(origin) = &message.origin {
+        origin.provider.hash(&mut hasher);
+        origin.api.hash(&mut hasher);
+        origin.model.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Provider-local prompt-cache prefix diagnostics. Holds the previous request's
+/// stable-prefix fingerprint so an adapter can warn ONLY when it can prove the
+/// cached prefix changed between turns (compaction rewrote history, or the
+/// model/tools/instructions changed). A cold cache, an expired cache entry, or
+/// the first request never warns, so the warning is a proven cache break rather
+/// than an inference from a zero cache-read count.
+#[derive(Debug, Default)]
+struct PromptCachePrefix {
+    last: Option<PrefixFingerprint>,
+}
+
+impl PromptCachePrefix {
+    /// Record the request about to be sent and return whether to warn. Warns
+    /// only when caching is enabled, a prior request established a cacheable
+    /// prefix, and the new request provably breaks it. State is tracked only
+    /// while caching is enabled, so toggling caching off leaves no stale prefix.
+    fn observe(&mut self, caching_enabled: bool, fingerprint: PrefixFingerprint) -> bool {
+        if !caching_enabled {
+            self.last = None;
+            return false;
+        }
+        let warn = self
+            .last
+            .as_ref()
+            .is_some_and(|prev| fingerprint.breaks(prev));
+        self.last = Some(fingerprint);
+        warn
+    }
+
+    /// Lock-guarded [`observe`](Self::observe) that builds the fingerprint from
+    /// the request inputs. Returns true when the adapter should emit a
+    /// prompt-break warning for this turn.
+    fn observe_locked(
+        prefix: &Mutex<Self>,
         caching_enabled: bool,
-        usage: &ProviderUsage,
+        instructions: &str,
+        tools: &Tools,
+        messages: &[Message],
     ) -> bool {
-        diagnostics
+        let fingerprint = PrefixFingerprint::new(instructions, tools, messages);
+        prefix
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record(caching_enabled, usage)
+            .observe(caching_enabled, fingerprint)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nexus::{Message, Tools};
 
-    fn usage(input_tokens: u64, cache_read: u64, cache_write: u64) -> ProviderUsage {
-        ProviderUsage {
-            provider: "p".to_string(),
-            model: "m".to_string(),
-            input_tokens,
-            output_tokens: 5,
-            cache_read_input_tokens: cache_read,
-            cache_write_input_tokens: cache_write,
-            reasoning_output_tokens: 0,
-            total_tokens: input_tokens + 5,
-        }
+    fn msg(content: &str) -> Message {
+        Message::user(content)
     }
 
     #[test]
-    fn cache_diagnostics_warn_after_prior_cache_write_or_repeat_miss() {
-        let mut diagnostics = CacheUsageDiagnostics::default();
-        assert!(!diagnostics.record(true, &usage(2_000, 0, 3)));
-        assert!(diagnostics.record(true, &usage(2_000, 0, 0)));
-        assert!(!diagnostics.record(true, &usage(2_000, 0, 0)), "warn once");
+    fn append_only_growth_is_not_a_prefix_break() {
+        let tools = Tools::new(Vec::new());
+        let turn1 = PrefixFingerprint::new("sys", &tools, &[msg("a")]);
+        // The next turn appends the assistant reply + a new user prompt; the
+        // earlier messages are unchanged, so the cached prefix still applies.
+        let turn2 = PrefixFingerprint::new(
+            "sys",
+            &tools,
+            &[msg("a"), Message::assistant("reply"), msg("b")],
+        );
+        assert!(!turn2.breaks(&turn1), "append must not look like a break");
+    }
 
-        let mut repeated = CacheUsageDiagnostics::default();
-        assert!(!repeated.record(true, &usage(2_000, 0, 0)));
-        assert!(repeated.record(true, &usage(2_000, 0, 0)));
+    #[test]
+    fn rewritten_or_shrunk_history_is_a_proven_break() {
+        let tools = Tools::new(Vec::new());
+        let turn1 = PrefixFingerprint::new("sys", &tools, &[msg("a"), msg("b"), msg("c")]);
+        // Compaction replaces the head with a summary -> earlier hashes diverge.
+        let compacted = PrefixFingerprint::new("sys", &tools, &[msg("summary"), msg("c")]);
+        assert!(compacted.breaks(&turn1));
+        // A changed instruction head is also a break even with identical messages.
+        let new_head = PrefixFingerprint::new("different", &tools, &[msg("a"), msg("b"), msg("c")]);
+        assert!(new_head.breaks(&turn1));
+    }
 
-        let mut short = CacheUsageDiagnostics::default();
-        assert!(!short.record(true, &usage(100, 0, 0)));
-        assert!(!short.record(true, &usage(100, 0, 0)));
+    #[test]
+    fn observe_warns_only_on_proven_break_when_caching_enabled() {
+        let tools = Tools::new(Vec::new());
+        let mut prefix = PromptCachePrefix::default();
+        // First request: nothing to compare, never warns.
+        assert!(!prefix.observe(true, PrefixFingerprint::new("s", &tools, &[msg("a")])));
+        // Append: still a cache hit, no warning.
+        assert!(!prefix.observe(
+            true,
+            PrefixFingerprint::new("s", &tools, &[msg("a"), msg("b")])
+        ));
+        // Compaction rewrites the prefix: proven break -> warn.
+        assert!(prefix.observe(true, PrefixFingerprint::new("s", &tools, &[msg("sum")])));
+    }
 
-        let mut disabled = CacheUsageDiagnostics::default();
-        assert!(!disabled.record(false, &usage(2_000, 0, 3)));
-        assert!(!disabled.record(false, &usage(2_000, 0, 0)));
+    #[test]
+    fn observe_never_warns_when_caching_disabled() {
+        let tools = Tools::new(Vec::new());
+        let mut prefix = PromptCachePrefix::default();
+        assert!(!prefix.observe(false, PrefixFingerprint::new("s", &tools, &[msg("a")])));
+        // Even a clear prefix break does not warn while caching is off, and no
+        // stale fingerprint is retained.
+        assert!(!prefix.observe(false, PrefixFingerprint::new("s", &tools, &[msg("x")])));
+        assert!(prefix.last.is_none());
+    }
+
+    #[test]
+    fn role_aware_hash_distinguishes_same_text_different_role() {
+        assert_ne!(
+            hash_message(&Message::user("x")),
+            hash_message(&Message::assistant("x"))
+        );
     }
 }

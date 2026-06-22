@@ -881,7 +881,7 @@ fn provider_turn_started_events_identify_each_model_round_trip() -> Result<()> {
     let completed_turn_ids: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ProviderTurnCompleted { turn_id } => Some(turn_id.as_str()),
+            AgentEvent::ProviderTurnCompleted { turn_id, .. } => Some(turn_id.as_str()),
             _ => None,
         })
         .collect();
@@ -918,6 +918,54 @@ fn provider_turn_started_events_identify_each_model_round_trip() -> Result<()> {
         harness.agent.messages()[3].provider_turn_id.as_deref(),
         Some("turn_00000001")
     );
+    Ok(())
+}
+
+#[test]
+fn provider_completion_event_carries_response_id_and_usage() -> Result<()> {
+    let workspace = test_workspace()?;
+    let usage = ProviderUsage {
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        input_tokens: 10,
+        output_tokens: 3,
+        cache_read_input_tokens: 4,
+        cache_write_input_tokens: 2,
+        reasoning_output_tokens: 0,
+        total_tokens: 13,
+        cache_creation: Some(CacheCreation {
+            ephemeral_5m_input_tokens: 2,
+            ephemeral_1h_input_tokens: 0,
+        }),
+    };
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: Some("done".to_string()),
+        reasoning: Vec::new(),
+        tool_calls: Vec::new(),
+        response_id: Some("msg_1".to_string()),
+        usage: Some(usage.clone()),
+    })]);
+    let mut harness = test_harness(provider, &workspace.path, Tools::new(Vec::new()));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let completed = frontend
+        .events
+        .borrow()
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ProviderTurnCompleted {
+                turn_id,
+                response_id,
+                usage,
+            } => Some((turn_id.clone(), response_id.clone(), usage.clone())),
+            _ => None,
+        })
+        .expect("completion event");
+    assert_eq!(completed.0, "turn_00000000");
+    assert_eq!(completed.1.as_deref(), Some("msg_1"));
+    assert_eq!(completed.2, Some(usage));
     Ok(())
 }
 
@@ -2342,7 +2390,9 @@ fn streamed_events_reach_observer_in_order() -> Result<()> {
     assert_eq!(
         events[4],
         AgentEvent::ProviderTurnCompleted {
-            turn_id: "turn_00000000".to_string()
+            turn_id: "turn_00000000".to_string(),
+            response_id: None,
+            usage: None,
         }
     );
     assert_eq!(events[5], AgentEvent::TurnComplete);

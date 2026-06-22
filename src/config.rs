@@ -57,9 +57,16 @@ pub(crate) struct Settings {
     pub(crate) default_reasoning: Option<String>,
     /// Prompt cache retention (`none|short|long`). Global-only because a cloned
     /// project must not silently increase how long provider-side prompt material
-    /// may live. Parsed by `mimir::selection`; absent -> provider default
-    /// (`short` for Anthropic, normal prompt-cache-key behavior for OpenAI).
+    /// may live, or add cache-write cost, without the user opting in. Parsed by
+    /// `mimir::selection`; absent -> `none` (off, byte-identical request).
     pub(crate) prompt_cache_retention: Option<String>,
+    /// Anthropic server-side context-management opt-in
+    /// (`context_management.edits`). Stored as a raw JSON object and parsed into
+    /// typed edits by `mimir::selection`; absent/empty -> disabled (no
+    /// `context_management` field, no extra betas). Global-only: server-side
+    /// context edits change request behavior and cost, so an untrusted project
+    /// file must not enable them.
+    pub(crate) anthropic_context_management: Option<Value>,
     /// Ordered `provider/model` ids that scope Ctrl+P cycling (the persisted
     /// `/scoped-models` selection). Like provider/base-url this controls which
     /// providers a session talks to, so it is global-only: a cloned repo cannot
@@ -109,6 +116,9 @@ impl Settings {
             // Prompt cache retention can affect privacy/cost, so keep it
             // global-only like provider/base-url and scoped model sets.
             prompt_cache_retention: self.prompt_cache_retention,
+            // Context management changes request behavior/cost server-side, so
+            // it is likewise global-only and never taken from project config.
+            anthropic_context_management: self.anthropic_context_management,
             // Scoped models gate which providers a session cycles through, so
             // (like provider/base-url) they are global-only and never taken from
             // untrusted project config.
@@ -393,6 +403,31 @@ mod tests {
         let settings = Settings::load_from(Some(&global), &project).unwrap();
 
         assert_eq!(settings.prompt_cache_retention.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn anthropic_context_management_is_global_only() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{ "anthropicContextManagement": { "clearThinking": {} } }"#,
+        )
+        .unwrap();
+        // A cloned project must not enable server-side context edits.
+        fs::write(
+            &project,
+            r#"{ "anthropicContextManagement": { "clearToolUses": { "keepToolUses": 1 } } }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+
+        assert_eq!(
+            settings.anthropic_context_management,
+            Some(serde_json::json!({ "clearThinking": {} }))
+        );
     }
 
     #[test]
