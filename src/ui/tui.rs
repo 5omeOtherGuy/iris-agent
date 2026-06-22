@@ -31,7 +31,7 @@ use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as te
 use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Paragraph, Widget};
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -54,8 +54,8 @@ const IDLE_HINT: &str =
 /// internally (keeps the transcript from being squeezed by a huge paste).
 const MAX_EDITOR_ROWS: u16 = 10;
 
-/// Slash popup height cap (including its border).
-const MAX_PALETTE_ROWS: u16 = 8;
+/// Above-editor menu height cap, including the blank row above and below.
+const MAX_MENU_ROWS: u16 = 16;
 
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
@@ -1506,8 +1506,8 @@ pub(crate) struct Screen {
     /// loop refreshes it from the live model selection; `None` falls back to the
     /// keybind hint (e.g. before a provider is selected).
     footer: Option<Footer>,
-    /// The active picker/dialog, when one is open. While present it replaces the
-    /// editor area and the loop routes keys to it instead of the editor.
+    /// The active picker/dialog, when one is open. While present it renders
+    /// above the editor and the loop routes keys to it instead of the editor.
     pub(crate) modal: Option<Modal>,
     /// Whether the active turn ran any tool (Codex's "concrete work" gate). The
     /// turn-end separator is emitted only when this is set, so a purely
@@ -1531,7 +1531,7 @@ impl Screen {
 
     // --- modal/picker ---
 
-    /// Open a picker/dialog, replacing the editor until it closes.
+    /// Open a picker/dialog above the editor until it closes.
     pub(crate) fn open_modal(&mut self, modal: Modal) {
         self.modal = Some(modal);
     }
@@ -1849,9 +1849,22 @@ fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selec
     Paragraph::new(Text::from(rows)).render(inner, buf);
 }
 
+fn render_plain_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static>>) {
+    let inner = Rect {
+        x: area.x + u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX),
+        y: area.y + u16::from(area.height > 1),
+        width: area
+            .width
+            .saturating_sub(u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX))
+            .max(1),
+        height: area.height.saturating_sub(2).max(1),
+    };
+    Paragraph::new(Text::from(lines)).render(inner, buf);
+}
+
 /// Render the full logical document for the current terminal size: all
-/// transcript rows retained in Iris state, plus bottom-pinned modal or
-/// status/palette/editor chrome. The terminal surface decides how much of this
+/// transcript rows retained in Iris state, plus bottom-pinned
+/// menu/status/editor chrome. The terminal surface decides how much of this
 /// document can be patched and when it must be fully replayed.
 fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
     if size.height == 0 || size.width < 1 {
@@ -1860,11 +1873,7 @@ fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
     let width = size.width.max(1);
     let height = size.height.max(1);
     let mut transcript = screen.wrapped_lines(width);
-    let chrome = if screen.modal.is_some() {
-        render_modal_chrome(screen, width, height)
-    } else {
-        render_editor_chrome(screen, width, height)
-    };
+    let chrome = render_editor_chrome(screen, width, height);
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
     let min_transcript_rows = usize::from(target_rows).saturating_sub(chrome.len());
     if transcript.len() < min_transcript_rows {
@@ -1884,22 +1893,30 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
 
     let editor_rows = editor_visual_rows(&screen.editor, area.width);
     let input_text = screen.editor_text();
-    let palette_active = screen.palette.is_active(&input_text);
+    let modal_lines = screen.modal.as_ref().map(|modal| {
+        modal.render(u16::try_from(content_width(usize::from(area.width))).unwrap_or(u16::MAX))
+    });
+    let palette_active = modal_lines.is_none() && screen.palette.is_active(&input_text);
     let palette_matches: Vec<&SlashCommand> = if palette_active {
         slash::matches(&input_text)
     } else {
         Vec::new()
     };
-    let palette_wanted = if palette_active {
-        (palette_matches.len() as u16 + 2).min(MAX_PALETTE_ROWS)
+    let menu_wanted = if let Some(lines) = &modal_lines {
+        u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(MAX_MENU_ROWS)
+    } else if palette_active {
+        (palette_matches.len() as u16 + 2).min(MAX_MENU_ROWS)
     } else {
         0
     };
 
     // Bottom-anchored, clamped to the fixed viewport. The editor and a status
-    // row are reserved FIRST so a tall slash palette can never starve the
-    // editor out of the layout; the palette then takes only what remains, and
-    // the active-block region absorbs any slack at the top.
+    // row are reserved FIRST so a tall menu can never starve the editor out of
+    // the layout; the menu then takes only what remains, and the active-block
+    // region absorbs any slack at the top.
     const MIN_EDITOR_H: u16 = 3; // one text row + a shaded pad row above and below
     let desired_status_h = screen.status_height(area.width);
     let working_lines = screen.working_lines(area.width);
@@ -1914,7 +1931,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     } else {
         0
     };
-    let palette_h = palette_wanted.min(
+    let menu_h = menu_wanted.min(
         area.height
             .saturating_sub(MIN_EDITOR_H)
             .saturating_sub(desired_status_h)
@@ -1922,7 +1939,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     );
     let max_editor_h = area
         .height
-        .saturating_sub(palette_h)
+        .saturating_sub(menu_h)
         .saturating_sub(desired_status_h)
         .saturating_sub(working_h)
         .max(1);
@@ -1932,22 +1949,22 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     let max_status_h = area
         .height
         .saturating_sub(editor_h)
-        .saturating_sub(palette_h)
+        .saturating_sub(menu_h)
         .max(1);
     let status_h = desired_status_h.min(max_status_h);
     let status_lines = screen.status_lines(area.width);
 
-    let chrome_h = status_h.saturating_add(palette_h).saturating_add(editor_h);
+    let chrome_h = status_h.saturating_add(menu_h).saturating_add(editor_h);
     let chrome_h = chrome_h.saturating_add(working_h);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
-        Constraint::Length(palette_h),
+        Constraint::Length(menu_h),
         Constraint::Length(working_h),
         Constraint::Length(editor_h),
         Constraint::Length(status_h),
     ])
     .split(chrome_area);
-    let palette_area = chunks[0];
+    let menu_area = chunks[0];
     let working_area = chunks[1];
     let editor_area = chunks[2];
     let status_area = chunks[3];
@@ -1955,13 +1972,17 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     let mut buf = Buffer::empty(chrome_area);
     Paragraph::new(Text::from(status_lines)).render(status_area, &mut buf);
 
-    if palette_h > 0 {
-        render_palette(
-            &mut buf,
-            palette_area,
-            &palette_matches,
-            screen.palette.selected(),
-        );
+    if menu_h > 0 {
+        if let Some(lines) = modal_lines {
+            render_plain_menu_lines(&mut buf, menu_area, lines);
+        } else {
+            render_palette(
+                &mut buf,
+                menu_area,
+                &palette_matches,
+                screen.palette.selected(),
+            );
+        }
     }
     if working_h > 0 {
         Paragraph::new(Text::from(working_lines)).render(working_area, &mut buf);
@@ -1990,34 +2011,6 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         height: editor_area.height.saturating_sub(pad * 2).max(1),
     };
     (&screen.editor).render(text_area, &mut buf);
-    buffer_to_lines(&buf)
-}
-
-/// Render the open modal in a bordered box at the document bottom, in place of
-/// the editor/palette/status rows. The transcript remains outside this chrome
-/// and is replayable from [`Screen`] state.
-fn render_modal_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
-    let Some(modal) = &screen.modal else {
-        return Vec::new();
-    };
-    let lines = modal.render(width.saturating_sub(2));
-    let body_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    // content rows + top/bottom border, clamped to the visible terminal height.
-    let max_modal_h = height.max(1);
-    // Prefer at least 3 rows (border + one line), but never exceed the available
-    // height: on a tiny terminal `max_modal_h` can be 1-2, so cap last. Using
-    // `clamp(3, max_modal_h)` here would panic when max < min.
-    let modal_h = body_rows.saturating_add(2).max(3).min(max_modal_h);
-    let modal_area = Rect::new(0, 0, width, modal_h);
-    let mut buf = Buffer::empty(modal_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(prompt_style())
-        .title(Span::styled(format!(" {} ", modal.title()), prompt_style()));
-    let inner = block.inner(modal_area);
-    block.render(modal_area, &mut buf);
-    Paragraph::new(Text::from(lines)).render(inner, &mut buf);
     buffer_to_lines(&buf)
 }
 
@@ -3098,14 +3091,14 @@ mod tests {
                 .state()
                 .previous_lines
                 .join("\n")
-                .contains("Select model")
+                .contains("GPT 5.5")
         );
 
         screen.close_modal();
         let stats = surface.render(Size::new(60, 14), &rendered_lines(&mut screen, 60, 14))?;
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert_ne!(stats.kind, RenderKind::Unchanged);
-        assert!(!replay.contains("Select model"), "{replay:?}");
+        assert!(!replay.contains("GPT 5.5"), "{replay:?}");
         assert!(replay.contains("message"), "{replay:?}");
         Ok(())
     }
@@ -3168,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn open_modal_renders_picker_frame_in_place_of_editor() {
+    fn open_modal_renders_plain_picker_above_editor() {
         use crate::mimir::model_catalog::CatalogModel;
         use crate::mimir::selection::ProviderId;
         use crate::ui::modal::{Modal, ModelPicker};
@@ -3193,13 +3186,15 @@ mod tests {
         )));
 
         let rendered = rendered_text(&mut screen, 60, 14);
-        // Transcript still on top; the modal frame replaces the editor below.
+        // Transcript still on top; the menu renders above the editor.
         assert!(rendered.contains("prior reply"), "{rendered}");
-        assert!(rendered.contains("Select model"), "{rendered}");
         assert!(rendered.contains("GPT 5.5"), "{rendered}");
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
-        // The editor placeholder is hidden while the modal is open.
-        assert!(!rendered.contains("Type a message"), "{rendered}");
+        assert!(rendered.contains("Type a message"), "{rendered}");
+        let model_idx = rendered.find("GPT 5.5").expect("model row");
+        let editor_idx = rendered.find("Type a message").expect("editor row");
+        assert!(model_idx < editor_idx, "{rendered}");
+        assert!(!rendered.contains("Select model"), "{rendered}");
     }
 
     #[test]
@@ -3217,8 +3212,9 @@ mod tests {
 
         let rendered = rendered_text(&mut screen, 80, 16);
         assert!(rendered.contains("Haiku 4.5"), "{rendered}");
-        assert!(rendered.contains("xHigh effort"), "{rendered}");
+        assert!(rendered.contains("xhigh effort"), "{rendered}");
         assert!(rendered.contains("Enter to set as default"), "{rendered}");
+        assert!(rendered.contains("Type a message"), "{rendered}");
     }
 
     #[test]

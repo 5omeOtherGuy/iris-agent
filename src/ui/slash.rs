@@ -3,8 +3,8 @@
 //! A small data-driven registry replaces the former two-string `is_exit_command`
 //! match: the TUI palette filters this list as the user types `/`, and the
 //! non-TTY text path consults [`is_exit`] for the same commands. Commands are
-//! registered here ONLY when a real backing action exists; `/exit` and `/quit`
-//! end the session, `/model` and `/reasoning` route to the shared model-switch
+//! registered here ONLY when a real backing action exists; `/exit` ends the
+//! session, `/model` and `/reasoning` route to the shared model-switch
 //! handler (`crate::cli::handle_model_command`). Adding a command with no action
 //! would lie to the user, so the list stays honest and short.
 
@@ -34,11 +34,6 @@ pub(crate) struct SlashCommand {
 pub(crate) const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/exit",
-        description: "End the session",
-        action: SlashAction::Exit,
-    },
-    SlashCommand {
-        name: "/quit",
         description: "End the session",
         action: SlashAction::Exit,
     },
@@ -175,11 +170,11 @@ mod tests {
 
     #[test]
     fn matches_filters_by_prefix_case_insensitively() {
-        assert_eq!(matches("/").len(), 8);
+        assert_eq!(matches("/").len(), 7);
         let ex = matches("/EX");
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name, "/exit");
-        assert_eq!(matches("/q")[0].name, "/quit");
+        assert!(matches("/q").is_empty());
         assert_eq!(matches("/m")[0].name, "/model");
         assert_eq!(matches("/r")[0].name, "/reasoning");
         assert!(matches("/zzz").is_empty());
@@ -189,9 +184,9 @@ mod tests {
     #[test]
     fn is_exit_is_registry_backed() {
         assert!(is_exit("/exit"));
-        assert!(is_exit("  /quit  "));
         // Case-insensitive so a /EXIT typed past the palette still exits.
         assert!(is_exit("/EXIT"));
+        assert!(!is_exit("/quit"));
         assert!(!is_exit("/export"));
         assert!(!is_exit("exit"));
     }
@@ -202,12 +197,12 @@ mod tests {
         p.sync("/");
         assert!(p.is_active("/"));
         assert_eq!(p.selected(), 0);
-        // Registry order ends with /logout (8 commands). Down walks to the last
+        // Registry order ends with /logout. Down walks to the last
         // row, then clamps there.
         for _ in 0..20 {
             p.down("/");
         }
-        assert_eq!(p.selected(), 7);
+        assert_eq!(p.selected(), 6);
         assert_eq!(p.accept("/").unwrap().name, "/logout");
         // Up returns toward the top.
         p.up();

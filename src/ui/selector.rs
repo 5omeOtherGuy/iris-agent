@@ -22,7 +22,7 @@ pub(crate) struct SelectorItem {
     /// Secondary, dimmer text shown after the label (provider badge, a level
     /// description, an auth status, ...).
     pub(crate) detail: Option<String>,
-    /// Trailing marker drawn at the row end (e.g. the current-model `✓`).
+    /// Trailing marker drawn at the row end (e.g. `current`).
     pub(crate) trailing: Option<String>,
     /// Optional enabled-column glyph for checkmark lists (scoped-models). `None`
     /// hides the column entirely.
