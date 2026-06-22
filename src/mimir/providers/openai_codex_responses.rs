@@ -72,7 +72,7 @@ pub(crate) struct OpenAiCodexResponsesProvider {
     system_prompt: String,
     prompt_cache_key: String,
     cache_retention: PromptCacheRetention,
-    cache_diagnostics: Arc<Mutex<super::CacheUsageDiagnostics>>,
+    cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     tokens: OpenAiCodexTokenStore,
 }
 
@@ -101,7 +101,7 @@ impl OpenAiCodexResponsesProvider {
             system_prompt: system_prompt.to_string(),
             prompt_cache_key: prompt_cache_key.to_string(),
             cache_retention,
-            cache_diagnostics: Arc::new(Mutex::new(super::CacheUsageDiagnostics::default())),
+            cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             tokens: OpenAiCodexTokenStore::from_env()?,
         })
     }
@@ -117,6 +117,22 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
         // Build the request eagerly so setup errors (e.g. a bad base URL) surface
         // synchronously and nothing borrowed from `self`/`messages`/`tools` is
         // captured by the blocking task.
+        // Prompt-break diagnostic: warn only when Iris can prove the cached
+        // prefix changed since the previous turn (compaction/history edit or a
+        // changed instruction/tool head), never on a cold-cache or first turn.
+        if super::PromptCachePrefix::observe_locked(
+            &self.cache_prefix,
+            self.cache_retention.caching_enabled(),
+            &self.system_prompt,
+            tools,
+            messages,
+        ) {
+            tracing::warn!(
+                provider = PROVIDER_ID,
+                model = %self.model,
+                "prompt cache prefix changed since the previous request; the cached prefix will not be reused this turn"
+            );
+        }
         let request = build_codex_request(
             &self.model,
             &self.system_prompt,
@@ -124,6 +140,8 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             tools,
             self.reasoning,
             Some(&self.prompt_cache_key),
+            // store:false, so Iris never supplies previous_response_id in prod.
+            None,
             self.cache_retention,
         );
         let url = resolve_codex_url(&self.base_url)?;
@@ -325,6 +343,9 @@ impl OpenAiCodexResponsesProvider {
     }
 
     fn record_usage(&self, usage: &ProviderUsage) {
+        // Surface usage and the two distinct cache facts the diagnostics must
+        // separate: whether Iris SENT a cacheable request (request-side opt-in)
+        // vs whether the provider REPORTED a cache hit (cache_read > 0).
         tracing::info!(
             provider = %usage.provider,
             model = %usage.model,
@@ -334,20 +355,10 @@ impl OpenAiCodexResponsesProvider {
             cache_write_input_tokens = usage.cache_write_input_tokens,
             reasoning_output_tokens = usage.reasoning_output_tokens,
             total_tokens = usage.total_tokens,
+            cacheable_request_sent = self.cache_retention.caching_enabled(),
+            cache_hit = usage.cache_read_input_tokens > 0,
             "provider token usage"
         );
-        let should_warn = super::CacheUsageDiagnostics::record_locked(
-            &self.cache_diagnostics,
-            self.cache_retention.caching_enabled(),
-            usage,
-        );
-        if should_warn {
-            tracing::warn!(
-                provider = %usage.provider,
-                model = %usage.model,
-                "prompt caching is enabled but repeated cacheable OpenAI requests reported zero cache reads"
-            );
-        }
     }
 }
 
@@ -401,6 +412,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_codex_request(
     model: &str,
     instructions: &str,
@@ -408,6 +420,7 @@ fn build_codex_request(
     tools: &Tools,
     reasoning: Option<ReasoningEffort>,
     prompt_cache_key: Option<&str>,
+    previous_response_id: Option<&str>,
     cache_retention: PromptCacheRetention,
 ) -> Value {
     // The Codex adapter owns conversion between Nexus messages and Responses wire JSON.
@@ -426,10 +439,26 @@ fn build_codex_request(
         "tools": tool_declarations(tools),
         "text": { "verbosity": "low" },
     });
-    if cache_retention.caching_enabled()
-        && let Some(key) = prompt_cache_key.and_then(clamp_openai_prompt_cache_key)
+    if cache_retention.caching_enabled() {
+        if let Some(key) = prompt_cache_key.and_then(clamp_openai_prompt_cache_key) {
+            body["prompt_cache_key"] = json!(key);
+        }
+        // Long retention opts into the 24h prompt-cache lifetime (pi-mono
+        // `getPromptCacheRetention`); short/none leave the default in-memory
+        // (~minutes) lifetime, so no field is sent.
+        if cache_retention == PromptCacheRetention::Long {
+            body["prompt_cache_retention"] = json!("24h");
+        }
+    }
+    // `previous_response_id` requires server-side response storage (store:true).
+    // Iris sends store:false, so production never supplies one; the field is
+    // emitted only when a caller explicitly provides it (documented shape), so a
+    // stored-response deployment can opt in later without changing the builder.
+    if let Some(previous) = previous_response_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
     {
-        body["prompt_cache_key"] = json!(key);
+        body["previous_response_id"] = json!(previous);
     }
     // Reasoning is inserted only when a preference is set. Encrypted reasoning
     // is requested whenever reasoning is active or same-origin continuity is
@@ -893,6 +922,8 @@ fn extract_openai_usage(value: &Value, model: &str) -> Option<ProviderUsage> {
         cache_write_input_tokens: 0,
         reasoning_output_tokens,
         total_tokens,
+        // OpenAI Responses does not break cache creation down by tier.
+        cache_creation: None,
     })
 }
 

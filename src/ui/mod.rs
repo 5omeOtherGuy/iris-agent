@@ -3,7 +3,8 @@ use std::cell::RefCell;
 use anyhow::Result;
 
 use crate::nexus::{
-    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ToolCall,
+    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ProviderUsage,
+    ToolCall,
 };
 
 pub(crate) mod login;
@@ -62,6 +63,8 @@ pub(crate) enum UiEvent {
     },
     ProviderTurnCompleted {
         turn_id: String,
+        response_id: Option<String>,
+        usage: Option<ProviderUsage>,
     },
     ProviderTurnCancelled {
         turn_id: String,
@@ -142,9 +145,15 @@ impl UiEvent {
     pub(crate) fn from_agent_event(event: AgentEvent) -> Self {
         match event {
             AgentEvent::ProviderTurnStarted { turn_id } => UiEvent::ProviderTurnStarted { turn_id },
-            AgentEvent::ProviderTurnCompleted { turn_id } => {
-                UiEvent::ProviderTurnCompleted { turn_id }
-            }
+            AgentEvent::ProviderTurnCompleted {
+                turn_id,
+                response_id,
+                usage,
+            } => UiEvent::ProviderTurnCompleted {
+                turn_id,
+                response_id,
+                usage,
+            },
             AgentEvent::ProviderTurnCancelled { turn_id } => {
                 UiEvent::ProviderTurnCancelled { turn_id }
             }
@@ -292,6 +301,34 @@ mod tests {
     fn maps_tool_started_to_ui_event() {
         let mapped = UiEvent::from_agent_event(AgentEvent::ToolStarted(call()));
         assert_eq!(mapped, UiEvent::ToolStarted(call()));
+    }
+
+    #[test]
+    fn maps_provider_completion_metadata_to_ui_event() {
+        let usage = ProviderUsage {
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_input_tokens: 64,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 5,
+            total_tokens: 120,
+            cache_creation: None,
+        };
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: Some("resp_1".to_string()),
+            usage: Some(usage.clone()),
+        });
+        assert_eq!(
+            mapped,
+            UiEvent::ProviderTurnCompleted {
+                turn_id: "turn_1".to_string(),
+                response_id: Some("resp_1".to_string()),
+                usage: Some(usage),
+            }
+        );
     }
 
     #[test]

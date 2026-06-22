@@ -151,7 +151,7 @@ pub(crate) fn join_levels(levels: &[ReasoningEffort]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mimir::selection::PromptCacheRetention;
+    use crate::mimir::selection::{ContextManagement, PromptCacheRetention};
 
     fn selection(provider: ProviderId, reasoning: Option<ReasoningEffort>) -> ModelSelection {
         ModelSelection {
@@ -160,6 +160,7 @@ mod tests {
             base_url: "https://example".to_string(),
             reasoning,
             cache_retention: PromptCacheRetention::Short,
+            context_management: ContextManagement::default(),
         }
     }
 
@@ -213,6 +214,7 @@ mod tests {
                 base_url: "https://example".to_string(),
                 reasoning: Some(ReasoningEffort::XHigh),
                 cache_retention: PromptCacheRetention::Short,
+                context_management: ContextManagement::default(),
             };
             assert!(validate(&sel).is_ok(), "{model} should accept xhigh");
             assert_eq!(

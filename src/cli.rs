@@ -175,6 +175,7 @@ pub(crate) fn candidate_for(
         base_url,
         reasoning,
         cache_retention: current.cache_retention,
+        context_management: current.context_management.clone(),
     }
 }
 
@@ -449,6 +450,7 @@ mod tests {
             base_url: "https://example".to_string(),
             reasoning: None,
             cache_retention: selection::PromptCacheRetention::Short,
+            context_management: selection::ContextManagement::default(),
         }
     }
 

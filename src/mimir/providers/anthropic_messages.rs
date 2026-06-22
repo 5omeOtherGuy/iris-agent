@@ -24,10 +24,10 @@ use super::transport::{
 };
 use crate::mimir::anthropic_models::{self, ThinkingMode};
 use crate::mimir::auth::anthropic::AnthropicTokenStore;
-use crate::mimir::selection::{PromptCacheRetention, ReasoningEffort};
+use crate::mimir::selection::{ContextManagement, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
-    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ProviderUsage,
-    ReasoningBlock, Role, ToolCall, Tools,
+    AssistantTurn, CacheCreation, ChatProvider, Message, ModelOrigin, ProviderStream,
+    ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
 };
 
 /// Base output-token allowance, treated as the visible-output ask
@@ -50,6 +50,7 @@ const BASE_ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 /// no thinking does not need it.
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 /// Appended only when the payload carries a `fallbacks` array (Fable 5 refusal
 /// fallback). The header date is authoritative as written; adopted from
 /// minimalcc-pi `SERVER_SIDE_FALLBACK_BETA`.
@@ -71,7 +72,8 @@ pub(crate) struct AnthropicProvider {
     reasoning: Option<ReasoningEffort>,
     system_prompt: String,
     cache_retention: PromptCacheRetention,
-    cache_diagnostics: Arc<Mutex<super::CacheUsageDiagnostics>>,
+    context_management: ContextManagement,
+    cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     tokens: AnthropicTokenStore,
 }
 
@@ -86,7 +88,9 @@ impl AnthropicProvider {
         reasoning: Option<ReasoningEffort>,
         system_prompt: &str,
         cache_retention: PromptCacheRetention,
+        context_management: ContextManagement,
     ) -> Result<Self> {
+        context_management.validate_supported()?;
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(120))
@@ -96,7 +100,8 @@ impl AnthropicProvider {
             reasoning,
             system_prompt: system_prompt.to_string(),
             cache_retention,
-            cache_diagnostics: Arc::new(Mutex::new(super::CacheUsageDiagnostics::default())),
+            context_management,
+            cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             tokens: AnthropicTokenStore::from_env()?,
         })
     }
@@ -111,6 +116,19 @@ impl ChatProvider for AnthropicProvider {
     ) -> Result<ProviderStream<'a>> {
         // Build the request eagerly so nothing borrowed from `self`/`messages`/
         // `tools` is captured by the blocking task (only an owned `Value` is).
+        if super::PromptCachePrefix::observe_locked(
+            &self.cache_prefix,
+            self.cache_retention.caching_enabled(),
+            &self.system_prompt,
+            tools,
+            messages,
+        ) {
+            tracing::warn!(
+                provider = PROVIDER_ID,
+                model = %self.model,
+                "prompt cache prefix changed since the previous request; the cached prefix will not be reused this turn"
+            );
+        }
         let request = build_anthropic_request(
             &self.model,
             &self.system_prompt,
@@ -118,6 +136,7 @@ impl ChatProvider for AnthropicProvider {
             tools,
             self.reasoning,
             self.cache_retention,
+            &self.context_management,
         );
         let provider = self.clone();
         let cancel = cancel.clone();
@@ -202,7 +221,7 @@ impl AnthropicProvider {
                     if let Some(usage) = &turn.usage {
                         self.record_usage(usage);
                     }
-                    Attempt::Done(turn)
+                    Attempt::Done(Box::new(turn))
                 }
                 Err(error) => Attempt::Fatal(anyhow!("{error} [{}]", diag(last))),
             };
@@ -229,6 +248,14 @@ impl AnthropicProvider {
     }
 
     fn record_usage(&self, usage: &ProviderUsage) {
+        let cache_creation_5m = usage
+            .cache_creation
+            .as_ref()
+            .map_or(0, |creation| creation.ephemeral_5m_input_tokens);
+        let cache_creation_1h = usage
+            .cache_creation
+            .as_ref()
+            .map_or(0, |creation| creation.ephemeral_1h_input_tokens);
         tracing::info!(
             provider = %usage.provider,
             model = %usage.model,
@@ -236,21 +263,13 @@ impl AnthropicProvider {
             output_tokens = usage.output_tokens,
             cache_read_input_tokens = usage.cache_read_input_tokens,
             cache_write_input_tokens = usage.cache_write_input_tokens,
+            cache_creation_5m_input_tokens = cache_creation_5m,
+            cache_creation_1h_input_tokens = cache_creation_1h,
             total_tokens = usage.total_tokens,
+            cacheable_request_sent = self.cache_retention.caching_enabled(),
+            cache_hit = usage.cache_read_input_tokens > 0,
             "provider token usage"
         );
-        let should_warn = super::CacheUsageDiagnostics::record_locked(
-            &self.cache_diagnostics,
-            self.cache_retention.caching_enabled(),
-            usage,
-        );
-        if should_warn {
-            tracing::warn!(
-                provider = %usage.provider,
-                model = %usage.model,
-                "prompt caching is enabled but repeated Anthropic requests reported zero cache reads after cacheable state"
-            );
-        }
     }
 }
 
@@ -388,7 +407,19 @@ fn anthropic_beta(request: &Value) -> String {
         betas.push(',');
         betas.push_str(EXTENDED_CACHE_TTL_BETA);
     }
+    if request_contains_context_management(request) {
+        betas.push(',');
+        betas.push_str(CONTEXT_MANAGEMENT_BETA);
+    }
     betas
+}
+
+fn request_contains_context_management(request: &Value) -> bool {
+    request
+        .get("context_management")
+        .and_then(|context| context.get("edits"))
+        .and_then(Value::as_array)
+        .is_some_and(|edits| !edits.is_empty())
 }
 
 fn request_contains_one_hour_cache(value: &Value) -> bool {
@@ -413,6 +444,7 @@ fn build_anthropic_request(
     tools: &Tools,
     reasoning: Option<ReasoningEffort>,
     cache_retention: PromptCacheRetention,
+    context_management: &ContextManagement,
 ) -> Value {
     let meta = anthropic_models::find(model);
     let thinking_mode = meta
@@ -467,6 +499,7 @@ fn build_anthropic_request(
         body["tools"] = Value::Array(declarations);
     }
     apply_anthropic_cache_control(&mut body, cache_retention);
+    apply_context_management(&mut body, context_management);
     body
 }
 
@@ -513,6 +546,43 @@ fn anthropic_cache_control(retention: PromptCacheRetention) -> Option<Value> {
         PromptCacheRetention::Short => Some(json!({ "type": "ephemeral" })),
         PromptCacheRetention::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
     }
+}
+
+fn apply_context_management(body: &mut Value, context_management: &ContextManagement) {
+    if !context_management.is_enabled() {
+        return;
+    }
+    let mut edits = Vec::new();
+    if let Some(clear) = &context_management.clear_tool_uses {
+        let mut edit = json!({ "type": "clear_tool_uses_20250919" });
+        if let Some(value) = clear.trigger_input_tokens {
+            edit["trigger"] = typed_value("input_tokens", value);
+        }
+        if let Some(value) = clear.keep_tool_uses {
+            edit["keep"] = typed_value("tool_uses", value);
+        }
+        if let Some(value) = clear.clear_at_least_input_tokens {
+            edit["clear_at_least"] = typed_value("input_tokens", value);
+        }
+        edits.push(edit);
+    }
+    if let Some(clear) = &context_management.clear_thinking {
+        let mut edit = json!({ "type": "clear_thinking_20251015" });
+        if let Some(value) = clear.trigger_input_tokens {
+            edit["trigger"] = typed_value("input_tokens", value);
+        }
+        if let Some(value) = clear.keep_thinking_turns {
+            edit["keep"] = typed_value("thinking_turns", value);
+        }
+        edits.push(edit);
+    }
+    if !edits.is_empty() {
+        body["context_management"] = json!({ "edits": edits });
+    }
+}
+
+fn typed_value(kind: &str, value: u64) -> Value {
+    json!({ "type": kind, "value": value })
 }
 
 fn manual_budget(level: ReasoningEffort) -> u32 {
@@ -709,6 +779,7 @@ impl AnthropicStreamParser {
                 cache_write_input_tokens: 0,
                 reasoning_output_tokens: 0,
                 total_tokens: 0,
+                cache_creation: None,
             },
             raw_input_tokens: 0,
             usage_seen: false,
@@ -874,6 +945,29 @@ impl AnthropicStreamParser {
             .and_then(Value::as_u64)
         {
             self.usage.cache_write_input_tokens = tokens;
+        }
+        if let Some(cache_creation) = usage.get("cache_creation") {
+            let creation = self
+                .usage
+                .cache_creation
+                .get_or_insert_with(CacheCreation::default);
+            if let Some(tokens) = cache_creation
+                .get("ephemeral_5m_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                creation.ephemeral_5m_input_tokens = tokens;
+            }
+            if let Some(tokens) = cache_creation
+                .get("ephemeral_1h_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                creation.ephemeral_1h_input_tokens = tokens;
+            }
+            if self.usage.cache_write_input_tokens == 0 {
+                self.usage.cache_write_input_tokens = creation
+                    .ephemeral_5m_input_tokens
+                    .saturating_add(creation.ephemeral_1h_input_tokens);
+            }
         }
         self.usage.input_tokens = self
             .raw_input_tokens
@@ -1149,6 +1243,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &Tools::new(Vec::new()),
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         let headers = anthropic_headers("fake-oauth-token", &request).unwrap();
         assert_eq!(auth_kind_label(&headers), "oauth_bearer");
@@ -1210,6 +1305,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &Tools::new(Vec::new()),
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
 
         let system = request["system"].as_array().expect("system is array");
@@ -1243,6 +1339,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &tools,
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
 
         let expected = json!({ "type": "ephemeral" });
@@ -1275,6 +1372,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &tools,
             None,
             PromptCacheRetention::None,
+            &ContextManagement::default(),
         );
         assert!(!json_contains_key(&none, "cache_control"));
 
@@ -1285,6 +1383,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             &tools,
             None,
             PromptCacheRetention::Long,
+            &ContextManagement::default(),
         );
         let system = long["system"].as_array().expect("system array");
         assert_eq!(
@@ -1292,6 +1391,66 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             json!({ "type": "ephemeral", "ttl": "1h" })
         );
         assert!(anthropic_beta(&long).contains(EXTENDED_CACHE_TTL_BETA));
+    }
+
+    #[test]
+    fn context_management_edits_and_betas_are_explicit_opt_ins() {
+        let messages = [Message::user("manage history")];
+        let tools = crate::tools::built_in_tools();
+        let disabled = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "IRIS PROMPT",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::None,
+            &ContextManagement::default(),
+        );
+        assert!(disabled.get("context_management").is_none());
+        assert!(!anthropic_beta(&disabled).contains(CONTEXT_MANAGEMENT_BETA));
+
+        let context_management = ContextManagement {
+            clear_tool_uses: Some(crate::mimir::selection::ClearToolUses {
+                trigger_input_tokens: Some(30_000),
+                keep_tool_uses: Some(4),
+                clear_at_least_input_tokens: Some(10_000),
+            }),
+            clear_thinking: Some(crate::mimir::selection::ClearThinking {
+                trigger_input_tokens: Some(80_000),
+                keep_thinking_turns: Some(2),
+            }),
+            compact: None,
+        };
+        let enabled = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "IRIS PROMPT",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::None,
+            &context_management,
+        );
+        assert_eq!(
+            enabled["context_management"],
+            json!({
+                "edits": [
+                    {
+                        "type": "clear_tool_uses_20250919",
+                        "trigger": { "type": "input_tokens", "value": 30000 },
+                        "keep": { "type": "tool_uses", "value": 4 },
+                        "clear_at_least": { "type": "input_tokens", "value": 10000 }
+                    },
+                    {
+                        "type": "clear_thinking_20251015",
+                        "trigger": { "type": "input_tokens", "value": 80000 },
+                        "keep": { "type": "thinking_turns", "value": 2 }
+                    }
+                ]
+            })
+        );
+        let beta = anthropic_beta(&enabled);
+        assert!(beta.contains(CONTEXT_MANAGEMENT_BETA), "{beta}");
+        assert!(!beta.contains("compact-2026-01-12"), "{beta}");
     }
 
     fn json_contains_key(value: &Value, key: &str) -> bool {
@@ -1307,7 +1466,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     #[test]
     fn parses_usage_from_message_start_and_delta_without_breaking_text() {
         let body = "\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":50,\"output_tokens\":0,\"cache_read_input_tokens\":11,\"cache_creation_input_tokens\":22}}}\n\n
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":50,\"output_tokens\":0,\"cache_read_input_tokens\":11,\"cache_creation_input_tokens\":22,\"cache_creation\":{\"ephemeral_5m_input_tokens\":12,\"ephemeral_1h_input_tokens\":10}}}}\n\n
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n
@@ -1323,6 +1482,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cache_read_input_tokens, 13);
         assert_eq!(usage.cache_write_input_tokens, 22);
+        let creation = usage.cache_creation.expect("cache creation detail");
+        assert_eq!(creation.ephemeral_5m_input_tokens, 12);
+        assert_eq!(creation.ephemeral_1h_input_tokens, 10);
         assert_eq!(usage.total_tokens, 92);
     }
 
@@ -1340,6 +1502,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(none.get("thinking").is_none(), "None omits thinking");
         assert!(none.get("output_config").is_none());
@@ -1354,6 +1517,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::Off),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(off.get("thinking").is_none(), "Off omits thinking");
         assert_eq!(off["max_tokens"], json!(MAX_TOKENS));
@@ -1366,6 +1530,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert_eq!(
             high["thinking"],
@@ -1390,6 +1555,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::XHigh),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert_eq!(
             xhigh["thinking"],
@@ -1412,6 +1578,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 &tools,
                 Some(level),
                 PromptCacheRetention::Short,
+                &ContextManagement::default(),
             );
             assert_eq!(
                 body["thinking"],
@@ -1436,6 +1603,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert_eq!(
             body["thinking"],
@@ -1465,6 +1633,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 &tools,
                 Some(level),
                 PromptCacheRetention::Short,
+                &ContextManagement::default(),
             );
             assert_eq!(
                 req["output_config"],
@@ -1482,6 +1651,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(none.get("thinking").is_none());
         assert!(none.get("output_config").is_none());
@@ -1493,6 +1663,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::Off),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(off.get("thinking").is_none(), "adaptive Off omits thinking");
         assert!(off.get("output_config").is_none());
@@ -1509,6 +1680,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::Medium),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert_eq!(
             body["model"],
@@ -1533,6 +1705,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert_eq!(fable["model"], json!("claude-fable-5"));
         assert_eq!(fable["thinking"]["type"], json!("adaptive"));
@@ -1548,6 +1721,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::Off),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(fable_off.get("thinking").is_none());
         assert_eq!(
@@ -1563,6 +1737,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(opus.get("fallbacks").is_none());
     }
@@ -1688,6 +1863,7 @@ data: {\"type\":\"message_stop\"}
             &Tools::new(Vec::new()),
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         let assistant = &request["messages"].as_array().unwrap()[1];
         let blocks = assistant["content"].as_array().unwrap();
@@ -1786,6 +1962,7 @@ data: {\"type\":\"message_stop\"}
             &tools,
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         let headers = anthropic_headers("fake-oauth-token", &body).expect("headers");
 
@@ -1816,6 +1993,7 @@ data: {\"type\":\"message_stop\"}
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         let manual_beta = beta_of(&manual);
         assert!(manual_beta.contains(BASE_ANTHROPIC_BETA));
@@ -1833,6 +2011,7 @@ data: {\"type\":\"message_stop\"}
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(!beta_of(&adaptive).contains(INTERLEAVED_THINKING_BETA));
 
@@ -1844,6 +2023,7 @@ data: {\"type\":\"message_stop\"}
             &tools,
             None,
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert_eq!(beta_of(&plain), BASE_ANTHROPIC_BETA);
     }
@@ -1860,6 +2040,7 @@ data: {\"type\":\"message_stop\"}
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         let fable_beta = anthropic_beta(&fable);
         assert!(
@@ -1876,6 +2057,7 @@ data: {\"type\":\"message_stop\"}
             &tools,
             Some(ReasoningEffort::High),
             PromptCacheRetention::Short,
+            &ContextManagement::default(),
         );
         assert!(!anthropic_beta(&opus).contains(SERVER_SIDE_FALLBACK_BETA));
     }

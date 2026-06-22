@@ -277,6 +277,7 @@ fn builds_codex_request_from_conversation() {
         &crate::tools::built_in_tools(),
         None,
         Some("session-1"),
+        None,
         PromptCacheRetention::Short,
     );
     assert_eq!(request["model"], "gpt-test");
@@ -327,6 +328,7 @@ fn builds_codex_request_from_tool_messages() {
         &crate::tools::built_in_tools(),
         None,
         Some("session-1"),
+        None,
         PromptCacheRetention::Short,
     );
 
@@ -536,7 +538,8 @@ fn rejects_response_without_text() {
 #[test]
 fn reasoning_none_produces_todays_exact_body() {
     // The default (no preference) request must be byte-identical to today's: no
-    // `reasoning` key at all, `text.verbosity` still "low".
+    // `reasoning` key and no prompt-cache request keys; `text.verbosity` still
+    // "low".
     let instructions = test_system_prompt();
     let tools = crate::tools::built_in_tools();
     let messages = [Message::user("hello")];
@@ -547,7 +550,8 @@ fn reasoning_none_produces_todays_exact_body() {
         &tools,
         None,
         Some("session-1"),
-        PromptCacheRetention::Short,
+        None,
+        PromptCacheRetention::None,
     );
     let expected = json!({
         "model": "gpt-test",
@@ -557,10 +561,11 @@ fn reasoning_none_produces_todays_exact_body() {
         "input": none["input"].clone(),
         "tools": none["tools"].clone(),
         "text": { "verbosity": "low" },
-        "prompt_cache_key": "session-1",
     });
     assert_eq!(none, expected);
     assert!(none.get("reasoning").is_none(), "None must omit reasoning");
+    assert!(none.get("prompt_cache_key").is_none());
+    assert!(none.get("prompt_cache_retention").is_none());
 }
 
 #[test]
@@ -576,6 +581,7 @@ fn reasoning_level_adds_effort_and_off_omits() {
         &tools,
         Some(ReasoningEffort::High),
         Some("session-1"),
+        None,
         PromptCacheRetention::Short,
     );
     assert_eq!(high["reasoning"], json!({ "effort": "high" }));
@@ -590,6 +596,7 @@ fn reasoning_level_adds_effort_and_off_omits() {
         &tools,
         Some(ReasoningEffort::XHigh),
         Some("session-1"),
+        None,
         PromptCacheRetention::Short,
     );
     assert_eq!(xhigh["reasoning"], json!({ "effort": "xhigh" }));
@@ -602,6 +609,7 @@ fn reasoning_level_adds_effort_and_off_omits() {
         &tools,
         Some(ReasoningEffort::Off),
         Some("session-1"),
+        None,
         PromptCacheRetention::Short,
     );
     assert!(off.get("reasoning").is_none(), "Off omits reasoning");
@@ -621,6 +629,7 @@ fn prompt_cache_key_is_clamped_to_64_unicode_scalars_and_omitted_when_disabled()
         &tools,
         None,
         Some(&long_key),
+        None,
         PromptCacheRetention::Short,
     );
     let key = cached["prompt_cache_key"].as_str().expect("cache key");
@@ -634,9 +643,12 @@ fn prompt_cache_key_is_clamped_to_64_unicode_scalars_and_omitted_when_disabled()
         &tools,
         None,
         Some("session1"),
+        None,
         PromptCacheRetention::Long,
     );
     assert_eq!(long["prompt_cache_key"], json!("session1"));
+    assert_eq!(long["prompt_cache_retention"], json!("24h"));
+    assert!(cached.get("prompt_cache_retention").is_none());
 
     let disabled = build_codex_request(
         "gpt-test",
@@ -645,9 +657,47 @@ fn prompt_cache_key_is_clamped_to_64_unicode_scalars_and_omitted_when_disabled()
         &tools,
         None,
         Some("session-1"),
+        None,
         PromptCacheRetention::None,
     );
     assert!(disabled.get("prompt_cache_key").is_none());
+    assert!(disabled.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn codex_long_cache_and_previous_response_fields_are_explicit_opt_ins() {
+    let instructions = test_system_prompt();
+    let tools = crate::tools::built_in_tools();
+    let messages = [Message::user("hello")];
+
+    let request = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        Some(ReasoningEffort::High),
+        Some("session-1"),
+        Some("resp_previous"),
+        PromptCacheRetention::Long,
+    );
+
+    assert_eq!(request["prompt_cache_key"], json!("session-1"));
+    assert_eq!(request["prompt_cache_retention"], json!("24h"));
+    assert_eq!(request["previous_response_id"], json!("resp_previous"));
+    assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+
+    let omitted = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        None,
+        Some("session-1"),
+        Some("   "),
+        PromptCacheRetention::Short,
+    );
+    assert!(omitted.get("previous_response_id").is_none());
+    assert!(omitted.get("prompt_cache_retention").is_none());
 }
 
 #[test]
@@ -667,6 +717,7 @@ fn reasoning_continuity_replay_requests_encrypted_reasoning() {
         &tools,
         None,
         Some("session-1"),
+        None,
         PromptCacheRetention::Short,
     );
 
