@@ -25,27 +25,45 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::Url;
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
+use crate::mimir::auth::oauth_callback::{
+    CallbackConfig, CallbackServer, LOGIN_TIMEOUT, create_pkce,
+};
 use crate::mimir::auth::storage::{AuthStore, OAuthCredentials};
 
 /// Auth-store provider key for Claude Code subscription OAuth credentials.
 pub(crate) const AUTH_PROVIDER: &str = "anthropic";
 
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
-/// Scopes requested when the stored credential records none. Mirrors the scopes
-/// Claude Code itself asks for.
+const PROVIDER_LABEL: &str = "Anthropic";
+const CALLBACK_PORT: u16 = 53692;
+const CALLBACK_PATH: &str = "/callback";
+const CALLBACK_REDIRECT_URI: &str = "http://localhost:53692/callback";
+/// Scopes requested at login (includes the login-only `org:create_api_key`).
+const LOGIN_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+/// Scopes requested when a stored credential records none. Mirrors the runtime
+/// scopes Claude Code uses on refresh.
 const DEFAULT_SCOPES: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
-/// macOS login-Keychain service that Claude Code stores its credential under.
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+/// Base macOS login-Keychain service Claude Code stores its credential under.
+/// A non-default `CLAUDE_CONFIG_DIR` appends a hashed suffix (see
+/// [`claude_code_keychain_service`]).
+const KEYCHAIN_SERVICE_BASE: &str = "Claude Code-credentials";
+/// Account fallback when no login username is resolvable (matches Claude Code).
+const KEYCHAIN_ACCOUNT_FALLBACK: &str = "claude-code-user";
 /// Refresh this far ahead of expiry so an in-flight request never races the
 /// token going stale.
 const REFRESH_MARGIN_MS: u128 = 300_000;
@@ -60,10 +78,15 @@ const NO_EXPIRY: u128 = u128::MAX;
 enum CredentialSource {
     IrisStore,
     ClaudeCodeFile(PathBuf),
-    /// Loaded from the macOS Keychain because the credential file was
-    /// unreadable. A refresh is persisted to the standard credential-file path
-    /// (the `PathBuf`) so subsequent requests read it from disk.
-    ClaudeCodeKeychain(PathBuf),
+    /// Loaded from the macOS login Keychain because the credential file was
+    /// unreadable. A refresh is written back to the SAME Keychain service/account
+    /// entry (never synthesized to `~/.claude/.credentials.json`); if the
+    /// Keychain write fails, the rotated token is saved to the Iris auth store as
+    /// a recovery copy instead of being dropped.
+    ClaudeCodeKeychain {
+        service: String,
+        account: String,
+    },
 }
 
 /// Parsed Claude Code OAuth token-refresh response (no expiry math; that is
@@ -82,6 +105,10 @@ struct Seams<'a> {
     /// Target OS string (`std::env::consts::OS`): gates the Keychain fallback.
     platform: &'a str,
     now_ms: u128,
+    /// Login username used as the Keychain account (Claude Code convention).
+    username: &'a str,
+    /// Resolved Keychain service name (base, plus a `CLAUDE_CONFIG_DIR` hash).
+    keychain_service: &'a str,
     run_security: &'a dyn Fn(&[&str]) -> Result<String>,
     exchange:
         &'a dyn Fn(&str /* refresh_token */, &str /* scope */) -> Result<RefreshResponse>,
@@ -118,12 +145,16 @@ impl AnthropicTokenStore {
     /// token endpoint) and resolve a bearer token.
     fn resolve(&self, client: &Client, force: bool, previous: Option<&str>) -> Result<String> {
         let path = claude_code_credentials_path()?;
+        let username = keychain_account();
+        let keychain_service = claude_code_keychain_service();
         let run_security = |args: &[&str]| run_macos_security(args);
         let exchange =
             |refresh_token: &str, scope: &str| exchange_refresh_token(client, refresh_token, scope);
         let seams = Seams {
             platform: env::consts::OS,
             now_ms: now_millis(),
+            username: &username,
+            keychain_service: &keychain_service,
             run_security: &run_security,
             exchange: &exchange,
         };
@@ -167,10 +198,18 @@ impl AnthropicTokenStore {
                 ))
             }
             Err(_) if seams.platform == "macos" => {
-                let credentials = load_from_keychain(path, seams.run_security)?;
+                let credentials = load_from_keychain(
+                    path,
+                    seams.username,
+                    seams.keychain_service,
+                    seams.run_security,
+                )?;
                 Ok((
                     credentials,
-                    CredentialSource::ClaudeCodeKeychain(path.to_path_buf()),
+                    CredentialSource::ClaudeCodeKeychain {
+                        service: seams.keychain_service.to_string(),
+                        account: seams.username.to_string(),
+                    },
                 ))
             }
             Err(_) => Err(credential_error(
@@ -190,7 +229,7 @@ impl AnthropicTokenStore {
         loaded: &OAuthCredentials,
         seams: &Seams,
     ) -> Result<String> {
-        let current = self.reread(source);
+        let current = self.reread(source, seams);
         let base = current.as_ref().unwrap_or(loaded);
 
         // Another refresh already landed: reuse its token instead of exchanging.
@@ -220,7 +259,7 @@ impl AnthropicTokenStore {
         // Persist only if nobody else wrote a newer fresh token meanwhile. A
         // forced refresh additionally refuses the rejected `previous` token, so
         // an external writer that reintroduced it cannot make us hand it back.
-        if let Some(token) = self.reread(source).and_then(|concurrent| {
+        if let Some(token) = self.reread(source, seams).and_then(|concurrent| {
             let token = fresh_changed(&concurrent, &token_before, seams.now_ms)?;
             match previous {
                 Some(prev) if token == prev => None,
@@ -229,30 +268,93 @@ impl AnthropicTokenStore {
         }) {
             return Ok(token);
         }
-        self.persist(source, &refreshed)?;
+        self.persist(source, &refreshed, seams)?;
         Ok(refreshed.access)
     }
 
     /// Re-read the persistence target for a source (the auth store, or the
     /// credential file -- Keychain refreshes are written to that file). Failure
     /// is "no current credential", not an error: callers fall back to `loaded`.
-    fn reread(&self, source: &CredentialSource) -> Option<OAuthCredentials> {
+    fn reread(&self, source: &CredentialSource, seams: &Seams) -> Option<OAuthCredentials> {
         match source {
             CredentialSource::IrisStore => self.storage.oauth_credentials(AUTH_PROVIDER).ok(),
-            CredentialSource::ClaudeCodeFile(path) | CredentialSource::ClaudeCodeKeychain(path) => {
+            CredentialSource::ClaudeCodeFile(path) => {
                 let raw = fs::read_to_string(path).ok()?;
                 parse_credentials_json(&raw, path).ok()
+            }
+            CredentialSource::ClaudeCodeKeychain { service, account } => {
+                let raw = (seams.run_security)(&[
+                    "find-generic-password",
+                    "-a",
+                    account,
+                    "-w",
+                    "-s",
+                    service,
+                ])
+                .ok()?;
+                parse_credentials_json(&raw, Path::new("keychain")).ok()
             }
         }
     }
 
-    fn persist(&self, source: &CredentialSource, credentials: &OAuthCredentials) -> Result<()> {
+    fn persist(
+        &self,
+        source: &CredentialSource,
+        credentials: &OAuthCredentials,
+        seams: &Seams,
+    ) -> Result<()> {
         match source {
             CredentialSource::IrisStore => self
                 .storage
                 .set_oauth_credentials(AUTH_PROVIDER, credentials.clone()),
-            CredentialSource::ClaudeCodeFile(path) | CredentialSource::ClaudeCodeKeychain(path) => {
-                write_claude_code_file(path, credentials)
+            CredentialSource::ClaudeCodeFile(path) => write_claude_code_file(path, credentials),
+            CredentialSource::ClaudeCodeKeychain { service, account } => {
+                self.persist_to_keychain(service, account, credentials, seams)
+            }
+        }
+    }
+
+    /// Write a rotated Keychain-sourced credential back to the SAME Keychain
+    /// service/account entry, preserving the stored document's other keys. If
+    /// the Keychain write fails after a successful refresh, save a recovery copy
+    /// to the Iris auth store so the rotated refresh token is never dropped, and
+    /// warn; subsequent loads then prefer the Iris store.
+    fn persist_to_keychain(
+        &self,
+        service: &str,
+        account: &str,
+        credentials: &OAuthCredentials,
+        seams: &Seams,
+    ) -> Result<()> {
+        // Cover the whole write path (re-read + merge + write) with the recovery
+        // fallback: a merge failure (e.g. a malformed existing Keychain blob)
+        // after a successful refresh must not drop the rotated refresh token.
+        let write = (|| -> Result<()> {
+            let existing = (seams.run_security)(&[
+                "find-generic-password",
+                "-a",
+                account,
+                "-w",
+                "-s",
+                service,
+            ])
+            .ok();
+            let payload = merge_claude_code_document(existing.as_deref(), credentials)?;
+            let args = keychain_write_args(account, service, &payload);
+            (seams.run_security)(&args).map(|_| ())
+        })();
+        match write {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.storage
+                    .set_oauth_credentials(AUTH_PROVIDER, credentials.clone())
+                    .context(
+                        "Claude Code Keychain update failed, and the rotated token could not be saved as a recovery copy in the Iris auth store; run Claude Code login again",
+                    )?;
+                tracing::warn!(
+                    "Claude Code Keychain credential update failed; saved a recovery copy to the Iris auth store"
+                );
+                Ok(())
             }
         }
     }
@@ -264,8 +366,9 @@ impl AnthropicTokenStore {
             CredentialSource::IrisStore => {
                 format!("iris-store:{}", self.storage.path().display())
             }
-            CredentialSource::ClaudeCodeFile(path) | CredentialSource::ClaudeCodeKeychain(path) => {
-                format!("claude-file:{}", path.display())
+            CredentialSource::ClaudeCodeFile(path) => format!("claude-file:{}", path.display()),
+            CredentialSource::ClaudeCodeKeychain { service, account } => {
+                format!("claude-keychain:{account}:{service}")
             }
         }
     }
@@ -274,23 +377,59 @@ impl AnthropicTokenStore {
     fn source_path(&self, source: &CredentialSource) -> PathBuf {
         match source {
             CredentialSource::IrisStore => self.storage.path().to_path_buf(),
-            CredentialSource::ClaudeCodeFile(path) | CredentialSource::ClaudeCodeKeychain(path) => {
-                path.clone()
+            CredentialSource::ClaudeCodeFile(path) => path.clone(),
+            CredentialSource::ClaudeCodeKeychain { .. } => {
+                PathBuf::from("the macOS login Keychain")
             }
         }
     }
 }
 
-/// Whether a Claude Code credential file exists to bootstrap from. Used by the
-/// model catalog to mark Anthropic available even when Iris's own auth store has
-/// no stored credential. Only checks for the file's presence -- it never reads,
-/// parses, or exposes the secret, and (ponytail) does not probe the macOS
-/// Keychain, which would exec `/usr/bin/security` and could trigger an unlock
-/// prompt on every status render.
+/// Whether Claude Code credentials exist to bootstrap from -- the credential
+/// file, or (macOS only) the login Keychain entry. Used by the model catalog to
+/// mark Anthropic available even when Iris's own auth store has no stored
+/// credential. It never reads, parses, or exposes the secret.
 pub(crate) fn claude_code_credentials_available() -> bool {
-    claude_code_credentials_path()
+    if claude_code_credentials_path()
         .map(|path| path.exists())
         .unwrap_or(false)
+    {
+        return true;
+    }
+    claude_code_keychain_available()
+}
+
+/// macOS only: whether the Claude Code Keychain entry is present. Cached for the
+/// life of the process (via [`OnceLock`]) so the `/login` badges and `/model`
+/// catalog never exec `/usr/bin/security` more than once -- not on every render.
+/// The probe omits `-w`, so it reads only the entry's presence (the command's
+/// exit status), never the secret, and does not trigger a Keychain unlock
+/// prompt.
+fn claude_code_keychain_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        keychain_available_with(
+            env::consts::OS,
+            &keychain_account(),
+            &claude_code_keychain_service(),
+            &|args| run_macos_security(args),
+        )
+    })
+}
+
+/// Seam-driven core of the Keychain availability probe (no real `security` in
+/// tests). Non-macOS is always unavailable; on macOS a successful presence probe
+/// (exit 0) marks it available.
+fn keychain_available_with(
+    platform: &str,
+    account: &str,
+    service: &str,
+    run_security: &dyn Fn(&[&str]) -> Result<String>,
+) -> bool {
+    if platform != "macos" {
+        return false;
+    }
+    run_security(&["find-generic-password", "-a", account, "-s", service]).is_ok()
 }
 
 fn claude_code_credentials_path() -> Result<PathBuf> {
@@ -359,16 +498,73 @@ fn parse_claude_code_credentials(value: &Value, path: &Path) -> Result<OAuthCred
 /// `security` failure and a malformed blob redact to a login hint.
 fn load_from_keychain(
     path: &Path,
+    account: &str,
+    service: &str,
     run_security: &dyn Fn(&[&str]) -> Result<String>,
 ) -> Result<OAuthCredentials> {
-    let raw =
-        run_security(&["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"]).map_err(|_| {
+    let raw = run_security(&["find-generic-password", "-a", account, "-w", "-s", service])
+        .map_err(|_| {
             credential_error(
                 path,
                 "Claude Code credentials could not be read from the macOS Keychain",
             )
         })?;
     parse_credentials_json(&raw, path)
+}
+
+/// Resolve the Claude Code Keychain service name. The default is
+/// `Claude Code-credentials`; when `CLAUDE_CONFIG_DIR` is set to a non-empty
+/// value, Claude Code appends `-` plus the first 8 hex chars of the SHA-256 of
+/// the resolved config-dir path, so Iris must do the same to find the same
+/// Keychain entry.
+fn claude_code_keychain_service() -> String {
+    claude_code_keychain_service_for(env::var("CLAUDE_CONFIG_DIR").ok().as_deref())
+}
+
+/// Pure core of [`claude_code_keychain_service`]: derive the Keychain service
+/// name from an explicit `CLAUDE_CONFIG_DIR` value. Split out so tests exercise
+/// the hashing without mutating process-global environment (which races other
+/// parallel tests).
+fn claude_code_keychain_service_for(config_dir: Option<&str>) -> String {
+    match config_dir {
+        Some(dir) if !dir.trim().is_empty() => {
+            let suffix: String = Sha256::digest(dir.trim().as_bytes())
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{KEYCHAIN_SERVICE_BASE}-{suffix}")
+        }
+        _ => KEYCHAIN_SERVICE_BASE.to_string(),
+    }
+}
+
+/// The Keychain account Claude Code uses: the login username, with a stable
+/// fallback so a missing `USER` does not break the lookup entirely.
+fn keychain_account() -> String {
+    env::var("USER")
+        .ok()
+        .or_else(|| env::var("LOGNAME").ok())
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| KEYCHAIN_ACCOUNT_FALLBACK.to_string())
+}
+
+/// Build the `security add-generic-password` argv that upserts the Claude Code
+/// Keychain credential. Pure so the construction is unit-tested; the runner
+/// executes `/usr/bin/security` directly (no shell), so the JSON payload is a
+/// single fixed argv element and is never interpreted by a shell.
+fn keychain_write_args<'a>(account: &'a str, service: &'a str, payload: &'a str) -> [&'a str; 8] {
+    [
+        "add-generic-password",
+        "-U",
+        "-a",
+        account,
+        "-s",
+        service,
+        "-w",
+        payload,
+    ]
 }
 
 /// Space-joined stored scopes, falling back to the Claude Code defaults when the
@@ -443,13 +639,16 @@ fn build_refreshed(
 /// preserved, and the file's existing shape (nested vs flat) is kept. Atomic
 /// (tmp + rename) and 0600 -- a stale refresh token here would lock the user out
 /// of Claude Code, so this must never drop or reshape their config.
-fn write_claude_code_file(path: &Path, credentials: &OAuthCredentials) -> Result<()> {
-    // Preserve the whole existing document; default to a nested envelope only
-    // when the file is absent or not a JSON object.
-    let mut document = match fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    {
+/// Merge the rotated credential fields into an existing Claude Code credential
+/// document (nested `claudeAiOauth` or flat), preserving every other key the
+/// user has and the document's existing shape. A missing/non-object `existing`
+/// yields a fresh nested envelope. Shared by the file and Keychain write-backs so
+/// neither drops or reshapes the stored config.
+fn merge_claude_code_document(
+    existing: Option<&str>,
+    credentials: &OAuthCredentials,
+) -> Result<String> {
+    let mut document = match existing.and_then(|raw| serde_json::from_str::<Value>(raw).ok()) {
         Some(value) if value.is_object() => value,
         _ => json!({ "claudeAiOauth": {} }),
     };
@@ -469,11 +668,17 @@ fn write_claude_code_file(path: &Path, credentials: &OAuthCredentials) -> Result
     target.insert("refreshToken".to_string(), json!(credentials.refresh));
     target.insert("expiresAt".to_string(), json!(credentials.expires as u64));
     // Only write scopes when the refresh observed them, otherwise leave the
-    // file's existing scopes untouched (in-place preservation above).
+    // existing scopes untouched (in-place preservation above).
     if let Some(scopes) = credentials.extra.get("scopes") {
         target.insert("scopes".to_string(), scopes.clone());
     }
-    let raw = serde_json::to_string_pretty(&document)?;
+    Ok(serde_json::to_string_pretty(&document)?)
+}
+
+fn write_claude_code_file(path: &Path, credentials: &OAuthCredentials) -> Result<()> {
+    // Preserve the whole existing document; default to a nested envelope only
+    // when the file is absent or not a JSON object.
+    let raw = merge_claude_code_document(fs::read_to_string(path).ok().as_deref(), credentials)?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -492,13 +697,14 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     ))
 }
 
-/// Create (or truncate) a file containing secret material and write `contents`.
-/// On Unix the file is created with 0600 from the start, closing the TOCTOU
-/// window where a default-umask (0644) temp file briefly exposes the token to
-/// other local users before a later chmod.
+/// Create a fresh file containing secret material and write `contents`. Callers
+/// pass a unique temp path and rename it into place, so `create_new` guarantees
+/// a brand-new file created with 0600 from the start (on Unix) -- closing the
+/// TOCTOU window where a default-umask (0644) file, or one whose permissions an
+/// attacker pre-seeded, briefly exposes the token to other local users.
 fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options
@@ -588,6 +794,118 @@ fn parse_refresh_response(body: &Value) -> Result<RefreshResponse> {
     })
 }
 
+/// Run the Anthropic OAuth PKCE browser login, persist the credential to the
+/// Iris auth store, and report the authorization URL through `on_auth`.
+/// `manual_rx` (optional) lets a front-end feed a pasted authorization code or
+/// full redirect URL (browser on another machine, or after a callback timeout);
+/// `cancel` makes the callback wait abortable so a dismissed dialog releases the
+/// port promptly and a late callback never persists credentials.
+pub(crate) fn login_browser(
+    client: &Client,
+    cancel: &CancellationToken,
+    manual_rx: Option<&Receiver<String>>,
+    on_auth: impl FnOnce(&str),
+) -> Result<()> {
+    let server = CallbackServer::bind(CALLBACK_PORT, PROVIDER_LABEL)?;
+    let pkce = create_pkce();
+    // Anthropic uses the PKCE verifier as the OAuth `state` (the Claude Code /
+    // pi-mono flow): the token exchange echoes `state`, and the returned code
+    // can arrive as `code#state`. The verifier therefore appears in the auth
+    // URL, so it is treated as secret by the OAuth-body redactor.
+    let state = pkce.verifier.clone();
+    let url = authorization_url(&pkce.challenge, &state)?;
+
+    on_auth(&url);
+
+    let config = CallbackConfig {
+        expected_state: &state,
+        callback_path: CALLBACK_PATH,
+        success_message: "Anthropic authentication completed. You can close this window.",
+        provider_label: PROVIDER_LABEL,
+    };
+    let code = server.wait_for_code(&config, Instant::now() + LOGIN_TIMEOUT, cancel, manual_rx)?;
+    let credentials = exchange_authorization_code(client, &code, &state, &pkce.verifier)?;
+    // A cancel that lands after the code arrived must not persist credentials
+    // behind a dismissed dialog.
+    if cancel.is_cancelled() {
+        bail!("Anthropic login cancelled");
+    }
+    AuthStore::from_env()?.set_oauth_credentials(AUTH_PROVIDER, credentials)
+}
+
+fn authorization_url(challenge: &str, state: &str) -> Result<String> {
+    let mut url = Url::parse(AUTHORIZE_URL)?;
+    url.query_pairs_mut()
+        .append_pair("code", "true")
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", CALLBACK_REDIRECT_URI)
+        .append_pair("scope", LOGIN_SCOPES)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state);
+    Ok(url.to_string())
+}
+
+/// Exchange an authorization code for OAuth credentials and persist-ready form.
+/// The response body is never surfaced in an error (highest-risk surface).
+fn exchange_authorization_code(
+    client: &Client,
+    code: &str,
+    state: &str,
+    verifier: &str,
+) -> Result<OAuthCredentials> {
+    let response = client
+        .post(TOKEN_URL)
+        .header("anthropic-beta", OAUTH_BETA)
+        .json(&json!({
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "code": code,
+            "state": state,
+            "redirect_uri": CALLBACK_REDIRECT_URI,
+            "code_verifier": verifier,
+        }))
+        .send()
+        .map_err(|_| anyhow!("Anthropic OAuth token exchange failed"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let _ = response.text();
+        return Err(anyhow!(
+            "Anthropic OAuth token exchange failed with HTTP {}",
+            status.as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .map_err(|_| anyhow!("Anthropic OAuth token exchange response is malformed"))?;
+    let parsed = parse_refresh_response(&body)?;
+    Ok(build_login_credentials(&parsed, now_millis()))
+}
+
+/// Build a fresh credential from a login/exchange response (no prior credential
+/// to merge against). Defaults to the login scopes when the response omits them.
+fn build_login_credentials(response: &RefreshResponse, now_ms: u128) -> OAuthCredentials {
+    let mut extra = Map::new();
+    let scope = response
+        .scope
+        .clone()
+        .unwrap_or_else(|| LOGIN_SCOPES.to_string());
+    let scopes: Vec<Value> = scope
+        .split_whitespace()
+        .map(|scope| Value::String(scope.to_string()))
+        .collect();
+    if !scopes.is_empty() {
+        extra.insert("scopes".to_string(), Value::Array(scopes));
+    }
+    OAuthCredentials {
+        access: response.access.clone(),
+        refresh: response.refresh.clone().unwrap_or_default(),
+        expires: now_ms + u128::from(response.expires_in_secs) * 1000,
+        extra,
+    }
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -670,6 +988,9 @@ mod tests {
         value["claudeAiOauth"].clone()
     }
 
+    const ACCOUNT: &str = "tester";
+    const SERVICE: &str = "Claude Code-credentials";
+
     fn seams<'a>(
         platform: &'a str,
         run_security: &'a dyn Fn(&[&str]) -> Result<String>,
@@ -678,6 +999,8 @@ mod tests {
         Seams {
             platform,
             now_ms: NOW,
+            username: ACCOUNT,
+            keychain_service: SERVICE,
             run_security,
             exchange,
         }
@@ -1128,9 +1451,11 @@ mod tests {
                 args,
                 [
                     "find-generic-password",
+                    "-a",
+                    "tester",
+                    "-w",
                     "-s",
-                    "Claude Code-credentials",
-                    "-w"
+                    "Claude Code-credentials"
                 ]
             );
             Ok(blob.clone())
@@ -1168,12 +1493,22 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_keychain_credential_is_persisted_to_the_file_path() -> Result<()> {
+    fn refreshed_keychain_credential_is_written_back_to_keychain() -> Result<()> {
         let dir = unique_dir("keychain-refresh");
         let store = store_without_iris_creds(&dir);
         let path = dir.join(".credentials.json"); // absent: Keychain is the source
         let blob = serde_json::to_string(&nested_credentials(json!({ "expiresAt": NOW - 1 })))?;
-        let run_security = |_: &[&str]| Ok(blob.clone());
+        let writes = Mutex::new(Vec::<Vec<String>>::new());
+        let run_security = |args: &[&str]| -> Result<String> {
+            if args.first() == Some(&"add-generic-password") {
+                writes
+                    .lock()
+                    .unwrap()
+                    .push(args.iter().map(|arg| arg.to_string()).collect());
+                return Ok(String::new());
+            }
+            Ok(blob.clone())
+        };
         let exchange = |refresh_token: &str, _: &str| {
             assert_eq!(refresh_token, "fake-refresh-token");
             Ok(RefreshResponse {
@@ -1191,17 +1526,205 @@ mod tests {
             &seams("macos", &run_security, &exchange),
         )?;
         assert_eq!(token, "kc-refreshed");
-        // The refreshed Keychain credential is written to the standard file path.
+        // A Keychain-sourced refresh writes back to the Keychain, never the file.
         assert!(
-            path.exists(),
-            "refreshed keychain credential must land on disk"
+            !path.exists(),
+            "keychain refresh must not synthesize the credentials file"
         );
-        let saved = read_oauth(&path);
-        assert_eq!(saved["accessToken"], json!("kc-refreshed"));
-        assert_eq!(saved["refreshToken"], json!("fake-refresh-token"));
-        assert_eq!(saved["expiresAt"], json!((NOW + 1800 * 1000) as u64));
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "exactly one keychain write-back");
+        let args = &writes[0];
+        assert_eq!(args[0], "add-generic-password");
+        assert!(
+            args.contains(&"tester".to_string()),
+            "account in args: {args:?}"
+        );
+        assert!(
+            args.contains(&"Claude Code-credentials".to_string()),
+            "service in args: {args:?}"
+        );
+        let payload = args.last().unwrap();
+        assert!(
+            payload.contains("kc-refreshed"),
+            "rotated token written back"
+        );
+        assert!(payload.contains("fake-refresh-token"), "refresh preserved");
         fs::remove_dir_all(&dir).ok();
         Ok(())
+    }
+
+    #[test]
+    fn keychain_write_failure_saves_recovery_copy_to_iris_store() -> Result<()> {
+        let dir = unique_dir("keychain-fallback");
+        let store = store_without_iris_creds(&dir);
+        let path = dir.join(".credentials.json"); // absent: keychain source
+        let blob = serde_json::to_string(&nested_credentials(json!({ "expiresAt": NOW - 1 })))?;
+        let run_security = |args: &[&str]| -> Result<String> {
+            if args.first() == Some(&"add-generic-password") {
+                return Err(anyhow!("keychain write denied"));
+            }
+            Ok(blob.clone())
+        };
+        let exchange = |_: &str, _: &str| {
+            Ok(RefreshResponse {
+                access: "kc-rot".to_string(),
+                refresh: Some("kc-rot-refresh".to_string()),
+                expires_in_secs: 1800,
+                scope: None,
+            })
+        };
+
+        let token = store.resolve_with(
+            false,
+            None,
+            &path,
+            &seams("macos", &run_security, &exchange),
+        )?;
+        // The rotated token is never dropped: it lands in the Iris auth store.
+        assert_eq!(token, "kc-rot");
+        let recovered = store.storage.oauth_credentials(AUTH_PROVIDER)?;
+        assert_eq!(recovered.access, "kc-rot");
+        assert_eq!(recovered.refresh, "kc-rot-refresh");
+        assert!(!path.exists());
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn keychain_merge_failure_also_recovers_to_iris_store() -> Result<()> {
+        let dir = unique_dir("keychain-merge-fail");
+        let store = store_without_iris_creds(&dir);
+        let path = dir.join(".credentials.json"); // absent: keychain source
+        // The initial load reads a valid (near-expiry) blob, but the write-back
+        // re-read returns a malformed document whose `claudeAiOauth` is not an
+        // object, so the in-place merge fails *after* a successful refresh.
+        let load_blob =
+            serde_json::to_string(&nested_credentials(json!({ "expiresAt": NOW - 1 })))?;
+        let calls = AtomicUsize::new(0);
+        let run_security = |args: &[&str]| -> Result<String> {
+            if args.first() == Some(&"add-generic-password") {
+                panic!("write must not be attempted when the merge fails");
+            }
+            // First read = load (valid); second read = write-back re-read (bad).
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(load_blob.clone())
+            } else {
+                Ok(r#"{"claudeAiOauth": "not-an-object"}"#.to_string())
+            }
+        };
+        let exchange = |_: &str, _: &str| {
+            Ok(RefreshResponse {
+                access: "merge-rot".to_string(),
+                refresh: Some("merge-rot-refresh".to_string()),
+                expires_in_secs: 1800,
+                scope: None,
+            })
+        };
+
+        let token = store.resolve_with(
+            false,
+            None,
+            &path,
+            &seams("macos", &run_security, &exchange),
+        )?;
+        // The rotated token survives even though the Keychain merge failed.
+        assert_eq!(token, "merge-rot");
+        let recovered = store.storage.oauth_credentials(AUTH_PROVIDER)?;
+        assert_eq!(recovered.access, "merge-rot");
+        assert_eq!(recovered.refresh, "merge-rot-refresh");
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    // ---- keychain service naming / write-args / availability ----------------
+
+    #[test]
+    fn keychain_service_uses_config_dir_hash_suffix() {
+        // Drives the pure helper with an explicit value -- no process-global env
+        // mutation, so this is safe under parallel test execution.
+        assert_eq!(
+            claude_code_keychain_service_for(None),
+            "Claude Code-credentials"
+        );
+        assert_eq!(
+            claude_code_keychain_service_for(Some("   ")),
+            "Claude Code-credentials",
+            "blank config dir is treated as unset"
+        );
+        let service = claude_code_keychain_service_for(Some("/home/alice/.claude"));
+        let suffix = service
+            .strip_prefix("Claude Code-credentials-")
+            .expect("hashed suffix");
+        assert_eq!(suffix.len(), 8, "first 8 hex chars");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            service,
+            claude_code_keychain_service_for(Some("/home/alice/.claude")),
+            "deterministic"
+        );
+    }
+
+    #[test]
+    fn keychain_write_args_use_fixed_flags_and_no_shell() {
+        let args = keychain_write_args("alice", "Claude Code-credentials", "{\"x\":1}");
+        assert_eq!(
+            args,
+            [
+                "add-generic-password",
+                "-U",
+                "-a",
+                "alice",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+                "{\"x\":1}"
+            ]
+        );
+    }
+
+    #[test]
+    fn keychain_availability_probe_is_macos_only_and_seamed() {
+        let present = |_: &[&str]| Ok(String::new());
+        let absent = |_: &[&str]| Err(anyhow!("no such item"));
+        assert!(keychain_available_with("macos", "tester", "svc", &present));
+        assert!(!keychain_available_with("macos", "tester", "svc", &absent));
+        assert!(
+            !keychain_available_with("linux", "tester", "svc", &present),
+            "never probes off macOS"
+        );
+    }
+
+    // ---- login URL + credential build ---------------------------------------
+
+    #[test]
+    fn anthropic_authorization_url_has_pkce_and_login_scopes() -> Result<()> {
+        let url = Url::parse(&authorization_url("chal", "st")?)?;
+        let pairs: HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(url.as_str().split('?').next(), Some(AUTHORIZE_URL));
+        assert_eq!(pairs["code"].as_ref(), "true");
+        assert_eq!(pairs["response_type"].as_ref(), "code");
+        assert_eq!(pairs["redirect_uri"].as_ref(), CALLBACK_REDIRECT_URI);
+        assert_eq!(pairs["code_challenge"].as_ref(), "chal");
+        assert_eq!(pairs["code_challenge_method"].as_ref(), "S256");
+        assert_eq!(pairs["state"].as_ref(), "st");
+        assert!(pairs["scope"].contains("org:create_api_key"));
+        assert!(pairs["scope"].contains("user:inference"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_login_credentials_defaults_scopes_and_sets_expiry() {
+        let response = RefreshResponse {
+            access: "acc".to_string(),
+            refresh: Some("ref".to_string()),
+            expires_in_secs: 3600,
+            scope: None,
+        };
+        let creds = build_login_credentials(&response, NOW);
+        assert_eq!(creds.access, "acc");
+        assert_eq!(creds.refresh, "ref");
+        assert_eq!(creds.expires, NOW + 3600 * 1000);
+        assert_eq!(scopes_for(&creds), LOGIN_SCOPES);
     }
 
     // ---- redaction -----------------------------------------------------------

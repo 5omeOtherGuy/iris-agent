@@ -1036,13 +1036,20 @@ impl ProviderSelect {
 pub(crate) struct LoginDialog {
     provider_name: String,
     lines: Vec<String>,
+    /// Whether the dialog accepts a pasted authorization code / redirect URL
+    /// (Anthropic, whose browser callback may need a manual fallback).
+    manual: bool,
+    /// Buffered manual-paste input (only collected when `manual`).
+    input: String,
 }
 
 impl LoginDialog {
-    pub(crate) fn new(provider_name: &str) -> Self {
+    pub(crate) fn new(provider_name: &str, manual: bool) -> Self {
         LoginDialog {
             provider_name: provider_name.to_string(),
             lines: vec!["Starting login...".to_string()],
+            manual,
+            input: String::new(),
         }
     }
 
@@ -1054,6 +1061,28 @@ impl LoginDialog {
     /// Append a progress line.
     pub(crate) fn push_line(&mut self, line: String) {
         self.lines.push(line);
+    }
+
+    /// Whether this dialog collects a pasted authorization code / redirect URL.
+    pub(crate) fn accepts_manual_input(&self) -> bool {
+        self.manual
+    }
+
+    /// Append a typed character to the manual-paste buffer.
+    pub(crate) fn push_char(&mut self, ch: char) {
+        if self.manual {
+            self.input.push(ch);
+        }
+    }
+
+    /// Delete the last character of the manual-paste buffer.
+    pub(crate) fn backspace(&mut self) {
+        self.input.pop();
+    }
+
+    /// Take and clear the current manual-paste buffer (on submit).
+    pub(crate) fn take_input(&mut self) -> String {
+        std::mem::take(&mut self.input)
     }
 
     fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
@@ -1075,6 +1104,15 @@ impl LoginDialog {
         let wrap_at = usize::from(width).max(1);
         for line in &self.lines {
             for row in crate::ui::tui::wrap_to_width(line, wrap_at) {
+                out.push(Line::from(Span::raw(row)));
+            }
+        }
+        if self.manual {
+            out.push(Line::from(Span::styled(
+                "Or paste the authorization code / full redirect URL, then Enter:",
+                dim(),
+            )));
+            for row in crate::ui::tui::wrap_to_width(&format!("> {}", self.input), wrap_at) {
                 out.push(Line::from(Span::raw(row)));
             }
         }
@@ -1474,16 +1512,40 @@ mod tests {
 
     #[test]
     fn login_dialog_cancel_closes() {
-        let mut dialog = LoginDialog::new("openai-codex");
+        let mut dialog = LoginDialog::new("openai-codex", false);
         dialog.set_lines(vec!["Open: https://example".to_string()]);
         assert_eq!(dialog.handle_key(ModalKey::CtrlC), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn manual_login_dialog_buffers_edits_and_takes_input() {
+        let mut dialog = LoginDialog::new("anthropic", true);
+        assert!(dialog.accepts_manual_input());
+        // Backspacing an empty buffer is a no-op (no underflow/panic).
+        dialog.backspace();
+        for ch in "abX".chars() {
+            dialog.push_char(ch);
+        }
+        dialog.backspace(); // drops 'X'
+        dialog.push_char('c');
+        assert_eq!(dialog.take_input(), "abc");
+        // take_input clears the buffer.
+        assert_eq!(dialog.take_input(), "");
+    }
+
+    #[test]
+    fn non_manual_login_dialog_ignores_typed_characters() {
+        let mut dialog = LoginDialog::new("openai-codex", false);
+        assert!(!dialog.accepts_manual_input());
+        dialog.push_char('x');
+        assert_eq!(dialog.take_input(), "");
     }
 
     #[test]
     fn login_dialog_wraps_long_url_within_width_without_dropping_characters() {
         let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com&scope=a+b+c";
         let line = format!("Open: {url}");
-        let mut dialog = LoginDialog::new("antigravity");
+        let mut dialog = LoginDialog::new("antigravity", false);
         dialog.set_lines(vec![line.clone()]);
 
         let width = 40_u16;

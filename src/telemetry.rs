@@ -34,6 +34,13 @@ const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
 
 const MAX_BODY_CHARS: usize = 500;
 
+/// Exact (case-insensitive) keys treated as sensitive only by the OAuth-body
+/// sanitizer: a bare authorization `code` and the `state` (which, for Anthropic,
+/// is the PKCE verifier). These are deliberately NOT redacted by
+/// [`sanitize_external_body`], where a `code` is usually a useful diagnostic
+/// error code worth keeping.
+const OAUTH_EXACT_SENSITIVE_KEYS: &[&str] = &["code", "state", "device_code", "user_code"];
+
 /// Whether tracing should avoid stderr because the TUI owns the terminal.
 pub(crate) fn set_tui_active(active: bool) {
     TUI_ACTIVE.store(active, Ordering::Relaxed);
@@ -111,25 +118,45 @@ pub(crate) fn redact_secret(secret: &str) -> String {
 /// unstructured secrets, PII, or conversation-adjacent text. The JSON result is
 /// truncated so messages and logs stay readable.
 pub(crate) fn sanitize_external_body(body: &str) -> Option<String> {
+    sanitize_body_with(body, &[])
+}
+
+/// Like [`sanitize_external_body`], but additionally redacts bare authorization
+/// `code`/`state` keys. Use this whenever an OAuth token-exchange or callback
+/// response body could be surfaced in an error or log, so an authorization code
+/// (or the Anthropic PKCE-verifier `state`) is never leaked.
+pub(crate) fn sanitize_oauth_body(body: &str) -> Option<String> {
+    sanitize_body_with(body, OAUTH_EXACT_SENSITIVE_KEYS)
+}
+
+fn sanitize_body_with(body: &str, exact_keys: &[&str]) -> Option<String> {
     let mut value: Value = serde_json::from_str(body).ok()?;
-    redact_json(&mut value);
+    redact_json(&mut value, exact_keys);
     Some(truncate(&value.to_string(), MAX_BODY_CHARS))
 }
 
-fn redact_json(value: &mut Value) {
+fn redact_json(value: &mut Value, exact_keys: &[&str]) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
-                if is_sensitive_key(key) {
+                if is_sensitive_key(key) || is_exact_sensitive_key(key, exact_keys) {
                     *child = Value::String("<redacted>".to_string());
                 } else {
-                    redact_json(child);
+                    redact_json(child, exact_keys);
                 }
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(redact_json),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_json(item, exact_keys)),
         _ => {}
     }
+}
+
+fn is_exact_sensitive_key(key: &str, exact_keys: &[&str]) -> bool {
+    exact_keys
+        .iter()
+        .any(|exact| key.eq_ignore_ascii_case(exact))
 }
 
 fn is_sensitive_key(key: &str) -> bool {
@@ -178,6 +205,35 @@ mod tests {
         // Non-sensitive diagnostic fields are preserved.
         assert!(rendered.contains("invalid"));
         assert!(rendered.contains("bad"));
+    }
+
+    #[test]
+    fn oauth_sanitizer_redacts_bare_code_and_state_but_external_keeps_error_code() {
+        let body = r#"{"code":"auth-code-xyz","state":"verifier-secret","device_code":"dev-secret","user_code":"WXYZ-1234","error":{"code":"invalid"}}"#;
+        // The OAuth-specific sanitizer redacts the bare authorization code/state
+        // plus the device-flow device_code/user_code.
+        let oauth = sanitize_oauth_body(body).expect("json body");
+        assert!(!oauth.contains("auth-code-xyz"), "code redacted: {oauth}");
+        assert!(
+            !oauth.contains("verifier-secret"),
+            "state redacted: {oauth}"
+        );
+        assert!(
+            !oauth.contains("dev-secret"),
+            "device_code redacted: {oauth}"
+        );
+        assert!(!oauth.contains("WXYZ-1234"), "user_code redacted: {oauth}");
+        assert!(oauth.contains("<redacted>"));
+        // The general sanitizer leaves diagnostic error codes intact.
+        let external = sanitize_external_body(body).expect("json body");
+        assert!(
+            external.contains("invalid"),
+            "error code preserved: {external}"
+        );
+        assert!(
+            external.contains("auth-code-xyz"),
+            "external sanitizer is unchanged for bare code: {external}"
+        );
     }
 
     #[test]

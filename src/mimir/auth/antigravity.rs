@@ -3,22 +3,22 @@
 //! and its project id are persisted together (the project id under
 //! `extra["projectId"]`).
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::Rng;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
+use crate::mimir::auth::oauth_callback::{
+    CallbackConfig, CallbackServer, LOGIN_TIMEOUT, create_pkce, random_url_token,
+};
 use crate::mimir::auth::storage::{AuthStore, OAuthCredentials};
 
 /// Auth-store provider key for Antigravity Google OAuth credentials.
@@ -44,8 +44,9 @@ const COMPILED_CLIENT_SECRET: Option<&str> = option_env!("ANTIGRAVITY_CLIENT_SEC
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
-const CALLBACK_ADDR: &str = "127.0.0.1:51121";
+const CALLBACK_PORT: u16 = 51121;
 const CALLBACK_PATH: &str = "/oauth-callback";
+const PROVIDER_LABEL: &str = "Antigravity";
 const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 const LOAD_CODE_ASSIST_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const CODE_ASSIST_USER_AGENT: &str = "google-api-nodejs-client/9.15.1";
@@ -145,52 +146,41 @@ fn project_id_from_extra(credentials: &OAuthCredentials) -> Option<String> {
 /// Run the Google OAuth PKCE browser login, persist the credentials, and
 /// discover the Antigravity project id. `on_auth` receives the authorization
 /// URL to open.
-pub(crate) fn login_browser(client: &Client, on_auth: impl FnOnce(&str)) -> Result<()> {
+pub(crate) fn login_browser(
+    client: &Client,
+    cancel: &CancellationToken,
+    on_auth: impl FnOnce(&str),
+) -> Result<()> {
     // Fail fast on a missing client secret before opening the browser, rather
     // than after the user has already authorized.
     client_secret()?;
-    let listener = TcpListener::bind(CALLBACK_ADDR)
-        .context("failed to start Antigravity OAuth callback server")?;
+    let server = CallbackServer::bind(CALLBACK_PORT, PROVIDER_LABEL)?;
     let pkce = create_pkce();
     // OAuth state is public (it appears in the auth URL); keep it independent
     // from the private PKCE verifier used later for the token exchange.
-    let state = create_oauth_state();
+    let state = random_url_token(32);
     let url = authorization_url(&pkce.challenge, &state)?;
 
     on_auth(&url);
 
-    let code = wait_for_browser_code(listener, &state)?;
+    let config = CallbackConfig {
+        expected_state: &state,
+        callback_path: CALLBACK_PATH,
+        success_message: "Antigravity authentication completed. You can close this window.",
+        provider_label: PROVIDER_LABEL,
+    };
+    let code = server.wait_for_code(&config, Instant::now() + LOGIN_TIMEOUT, cancel, None)?;
     let mut credentials = exchange_authorization_code(client, &code, &pkce.verifier)?;
     let project_id = discover_project(client, &credentials.access)?;
     credentials
         .extra
         .insert(PROJECT_ID_KEY.to_string(), Value::String(project_id));
-    AuthStore::from_env()?.set_oauth_credentials(AUTH_PROVIDER, credentials)
-}
-
-#[derive(Debug, Clone)]
-struct Pkce {
-    verifier: String,
-    challenge: String,
-}
-
-fn create_pkce() -> Pkce {
-    let verifier = random_url_token(32);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    Pkce {
-        verifier,
-        challenge,
+    // A cancel that lands after authorization must not persist credentials
+    // behind a dismissed dialog.
+    if cancel.is_cancelled() {
+        bail!("Antigravity login cancelled");
     }
-}
-
-fn create_oauth_state() -> String {
-    random_url_token(32)
-}
-
-fn random_url_token(byte_len: usize) -> String {
-    let mut bytes = vec![0_u8; byte_len];
-    rand::rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+    AuthStore::from_env()?.set_oauth_credentials(AUTH_PROVIDER, credentials)
 }
 
 fn authorization_url(challenge: &str, state: &str) -> Result<String> {
@@ -206,87 +196,6 @@ fn authorization_url(challenge: &str, state: &str) -> Result<String> {
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent");
     Ok(url.to_string())
-}
-
-fn wait_for_browser_code(listener: TcpListener, expected_state: &str) -> Result<String> {
-    for stream in listener.incoming() {
-        let mut stream = stream.context("failed to receive Antigravity OAuth callback")?;
-        let request = read_http_request(&mut stream)?;
-        match parse_callback_request(&request, expected_state)? {
-            Some(code) => {
-                write_callback_response(
-                    &mut stream,
-                    200,
-                    "Antigravity authentication completed. You can close this window.",
-                )?;
-                return Ok(code);
-            }
-            None => write_callback_response(&mut stream, 404, "Not found.")?,
-        }
-    }
-    bail!("Antigravity OAuth callback server stopped before receiving a code")
-}
-
-fn read_http_request(stream: &mut TcpStream) -> Result<String> {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    loop {
-        let len = stream
-            .read(&mut buffer)
-            .context("failed to read Antigravity OAuth callback")?;
-        if len == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..len]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    Ok(String::from_utf8_lossy(&request).into_owned())
-}
-
-fn write_callback_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
-    let reason = if status == 200 { "OK" } else { "Not Found" };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(response.as_bytes())
-        .context("failed to write Antigravity OAuth callback response")
-}
-
-fn parse_callback_request(request: &str, expected_state: &str) -> Result<Option<String>> {
-    let request_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("missing OAuth callback request line"))?;
-    let target = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("missing OAuth callback target"))?;
-    let url = if target.starts_with('/') {
-        Url::parse(&format!("http://localhost{target}"))?
-    } else {
-        Url::parse(target)?
-    };
-    if url.path() != CALLBACK_PATH {
-        return Ok(None);
-    }
-    let mut code = None;
-    let mut state = None;
-    for (key, value) in url.query_pairs() {
-        match key.as_ref() {
-            "code" => code = Some(value.into_owned()),
-            "state" => state = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-    if state.as_deref() != Some(expected_state) {
-        bail!("OAuth state mismatch");
-    }
-    code.map(Some)
-        .ok_or_else(|| anyhow!("missing OAuth authorization code"))
 }
 
 /// Resolve the installed-app client secret, preferring a runtime override over
@@ -491,13 +400,6 @@ mod tests {
     }
 
     #[test]
-    fn oauth_state_is_distinct_from_pkce_verifier() {
-        let pkce = create_pkce();
-        let state = create_oauth_state();
-        assert_ne!(state, pkce.verifier, "state must not leak the verifier");
-    }
-
-    #[test]
     fn builds_authorization_url_with_pkce_and_offline_access() -> Result<()> {
         let url = Url::parse(&authorization_url("challenge", "verifier")?)?;
         let pairs = url
@@ -511,34 +413,6 @@ mod tests {
         assert_eq!(pairs["state"].as_ref(), "verifier");
         assert_eq!(pairs["access_type"].as_ref(), "offline");
         assert_eq!(pairs["prompt"].as_ref(), "consent");
-        Ok(())
-    }
-
-    #[test]
-    fn parses_callback_code_when_state_matches() -> Result<()> {
-        let request =
-            "GET /oauth-callback?code=abc123&state=verifier HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        assert_eq!(
-            parse_callback_request(request, "verifier")?,
-            Some("abc123".to_string())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_callback_state_mismatch() {
-        let request =
-            "GET /oauth-callback?code=abc123&state=wrong HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let error = parse_callback_request(request, "verifier")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("state mismatch"));
-    }
-
-    #[test]
-    fn ignores_unrelated_callback_requests() -> Result<()> {
-        let request = "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        assert_eq!(parse_callback_request(request, "verifier")?, None);
         Ok(())
     }
 

@@ -7,6 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use nexus::{Agent, ChatProvider};
 use reqwest::blocking::Client;
+use tokio_util::sync::CancellationToken;
 
 mod approval;
 mod cli;
@@ -31,11 +32,17 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
-            if error.downcast_ref::<errors::AuthError>().is_some() {
+            if let Some(auth) = error.downcast_ref::<errors::AuthError>() {
+                // Prefer the provider that actually failed (carried on the typed
+                // error) so the hint never points at the wrong provider; fall
+                // back to the configured default when it is unknown.
+                let provider = auth
+                    .provider()
+                    .map(str::to_string)
+                    .unwrap_or_else(configured_provider);
                 eprintln!(
-                    "hint: run `{}` login {} to authenticate",
+                    "hint: run `{}` login {provider} to authenticate",
                     command_name(),
-                    configured_provider()
                 );
             }
             ExitCode::from(errors::exit_code(&error))
@@ -338,16 +345,19 @@ fn update_agent() -> Result<()> {
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {
     let client = Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(300))
         .build()?;
+    let cancel = CancellationToken::new();
 
     match method {
-        LoginMethod::Browser => mimir::auth::openai_codex::login_browser(&client, |auth| {
-            println!("OpenAI Codex browser login");
-            println!("Open: {}", auth.url);
-            crate::ui::login::open_in_browser(&auth.url);
-            println!("Waiting for callback at {} ...", auth.redirect_uri);
-        })?,
+        LoginMethod::Browser => {
+            mimir::auth::openai_codex::login_browser(&client, &cancel, |auth| {
+                println!("OpenAI Codex browser login");
+                println!("Open: {}", auth.url);
+                crate::ui::login::open_in_browser(&auth.url);
+                println!("Waiting for callback at {} ...", auth.redirect_uri);
+            })?
+        }
         LoginMethod::DeviceCode => mimir::auth::openai_codex::login_device_code(&client, |code| {
             println!("OpenAI Codex device-code login");
             println!("Open: {}", code.verification_uri);
@@ -363,9 +373,10 @@ fn login_openai_codex(method: LoginMethod) -> Result<()> {
 
 fn login_antigravity() -> Result<()> {
     let client = Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(300))
         .build()?;
-    mimir::auth::antigravity::login_browser(&client, |url| {
+    let cancel = CancellationToken::new();
+    mimir::auth::antigravity::login_browser(&client, &cancel, |url| {
         println!("Antigravity (Google account) login");
         println!("Open: {url}");
         crate::ui::login::open_in_browser(url);
@@ -376,11 +387,29 @@ fn login_antigravity() -> Result<()> {
 }
 
 fn login_anthropic() -> Result<()> {
-    // ponytail: no dedicated Anthropic login. The Claude Code subscription lane
-    // reuses an existing Claude Code OAuth login; Iris reads that credential.
-    // Add a manual-code-paste OAuth flow here if standalone login is needed.
-    println!("Anthropic uses your existing Claude Code login.");
-    println!("Sign in once with the Claude Code CLI; Iris reads its OAuth token.");
+    let client = Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()?;
+    let cancel = CancellationToken::new();
+    // A background stdin reader feeds a pasted authorization code / full redirect
+    // URL to the callback wait, so login works even when the browser is on
+    // another machine or the loopback callback cannot be received.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() && !line.trim().is_empty() {
+            let _ = tx.send(line);
+        }
+    });
+    mimir::auth::anthropic::login_browser(&client, &cancel, Some(&rx), |url| {
+        println!("Anthropic browser login");
+        println!("Open: {url}");
+        crate::ui::login::open_in_browser(url);
+        println!(
+            "Waiting for the browser callback... or paste the authorization code / full redirect URL and press Enter."
+        );
+    })?;
+    println!("Logged in to anthropic.");
     Ok(())
 }
 
@@ -392,7 +421,7 @@ fn print_help() {
     eprintln!("  iris login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
     eprintln!("  iris login antigravity            Login with Google account OAuth");
-    eprintln!("  iris login anthropic              Show Claude Code login instructions");
+    eprintln!("  iris login anthropic              Login with Anthropic OAuth (browser)");
     eprintln!("  iris update                       Update Iris from GitHub");
 }
 
