@@ -188,6 +188,10 @@ async fn session_loop<P: ChatProvider>(
                 }
             }
         }
+        // A model/effort switch (Ctrl+P, Shift+Tab, or a `/model` `/reasoning`
+        // command) lands in this iteration; refresh the footer so the trailing
+        // draw reflects the new selection immediately, not on the next keypress.
+        refresh_footer(tui, switch);
         tui.draw()?;
         // A command/keybinding may have opened a picker/dialog. Run it to
         // completion here, where harness + switch are in scope; switches land at
@@ -230,9 +234,15 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
 }
 
 /// The working directory for the footer, home-relativized to `~`/`~/sub`.
+///
+/// Presentation-only: this reads the process working directory, which equals the
+/// workspace root today, so it is not a tier boundary concern (it enforces
+/// nothing). If Iris later supports remote/alternate workspace roots, switch this
+/// to a read-only display accessor on `Harness`.
 fn footer_cwd() -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
         && let Ok(rel) = cwd.strip_prefix(std::path::Path::new(&home))
     {
         return if rel.as_os_str().is_empty() {
@@ -474,6 +484,9 @@ async fn run_modal_phase<P: ChatProvider>(
                             outcome, harness, tui, input_rx, tick, switch, login_backend,
                         )
                         .await?;
+                        // The picker may have switched model/effort; refresh the
+                        // footer before drawing so it never shows a stale model.
+                        refresh_footer(tui, switch);
                         tui.draw()?;
                     }
                     None => tui.draw()?,
