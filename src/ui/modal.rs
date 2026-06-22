@@ -1069,11 +1069,16 @@ impl LoginDialog {
             Span::styled("Login to ", dim()),
             Span::raw(self.provider_name.clone()),
         ])];
+        // Wrap each body line (notably the long OAuth URL) to the modal width so
+        // it is shown in full and stays copyable, instead of being clipped by the
+        // non-wrapping Paragraph that draws the modal.
+        let wrap_at = usize::from(width).max(1);
         for line in &self.lines {
-            out.push(Line::from(Span::raw(line.clone())));
+            for row in crate::ui::tui::wrap_to_width(line, wrap_at) {
+                out.push(Line::from(Span::raw(row)));
+            }
         }
         out.push(Line::from(Span::styled("Esc to cancel", dim())));
-        let _ = width;
         out
     }
 }
@@ -1472,5 +1477,36 @@ mod tests {
         let mut dialog = LoginDialog::new("openai-codex");
         dialog.set_lines(vec!["Open: https://example".to_string()]);
         assert_eq!(dialog.handle_key(ModalKey::CtrlC), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn login_dialog_wraps_long_url_within_width_without_dropping_characters() {
+        let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com&scope=a+b+c";
+        let line = format!("Open: {url}");
+        let mut dialog = LoginDialog::new("antigravity");
+        dialog.set_lines(vec![line.clone()]);
+
+        let width = 40_u16;
+        let rendered = dialog.render(width);
+        let texts: Vec<String> = rendered
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        // Every rendered row fits the modal width (no clipping by the box). Test
+        // data is ASCII, so char count equals display columns.
+        for text in &texts {
+            assert!(
+                text.chars().count() <= usize::from(width),
+                "row exceeds width: {text:?}"
+            );
+        }
+        // The complete URL survives wrapping (char-wrapped, contiguous), so the
+        // copy/paste fallback is the full, working URL rather than a clipped one.
+        let joined: String = texts.join("");
+        assert!(
+            joined.contains(url),
+            "wrapped rows must contain the full URL"
+        );
     }
 }

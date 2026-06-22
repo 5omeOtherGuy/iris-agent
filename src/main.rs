@@ -345,11 +345,13 @@ fn login_openai_codex(method: LoginMethod) -> Result<()> {
         LoginMethod::Browser => mimir::auth::openai_codex::login_browser(&client, |auth| {
             println!("OpenAI Codex browser login");
             println!("Open: {}", auth.url);
+            crate::ui::login::open_in_browser(&auth.url);
             println!("Waiting for callback at {} ...", auth.redirect_uri);
         })?,
         LoginMethod::DeviceCode => mimir::auth::openai_codex::login_device_code(&client, |code| {
             println!("OpenAI Codex device-code login");
             println!("Open: {}", code.verification_uri);
+            crate::ui::login::open_in_browser(&code.verification_uri);
             println!("Code: {}", code.user_code);
             println!("Waiting for authorization...");
         })?,
@@ -366,6 +368,7 @@ fn login_antigravity() -> Result<()> {
     mimir::auth::antigravity::login_browser(&client, |url| {
         println!("Antigravity (Google account) login");
         println!("Open: {url}");
+        crate::ui::login::open_in_browser(url);
         println!("Waiting for callback...");
     })?;
     println!("Logged in to antigravity.");

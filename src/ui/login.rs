@@ -177,18 +177,17 @@ pub(crate) struct OAuthLoginBackend;
 
 impl LoginBackend for OAuthLoginBackend {
     fn login(&self, provider: ProviderId, on_update: &dyn Fn(LoginUpdate)) -> Result<LoginOutcome> {
-        let click_hint = if cfg!(target_os = "macos") {
-            "Cmd+click to open"
-        } else {
-            "Ctrl+click to open"
-        };
+        // The URL is auto-opened (see `apply_login_update`); the hint covers the
+        // headless / no-opener fallback. Ctrl/Cmd+click is unreliable here
+        // because the bordered modal cannot carry an OSC-8 hyperlink.
+        let open_hint = "Opening your browser. If it does not open, copy the URL above to sign in.";
         match provider {
             ProviderId::OpenAiCodex => {
                 let client = Client::builder().timeout(Duration::from_secs(120)).build()?;
                 auth::openai_codex::login_browser(&client, |info| {
                     on_update(LoginUpdate::AuthUrl {
                         url: info.url.clone(),
-                        hint: click_hint.to_string(),
+                        hint: open_hint.to_string(),
                     });
                     on_update(LoginUpdate::Progress(format!(
                         "Waiting for callback at {} ...",
@@ -202,7 +201,7 @@ impl LoginBackend for OAuthLoginBackend {
                 auth::antigravity::login_browser(&client, |url| {
                     on_update(LoginUpdate::AuthUrl {
                         url: url.to_string(),
-                        hint: click_hint.to_string(),
+                        hint: open_hint.to_string(),
                     });
                     on_update(LoginUpdate::Progress("Waiting for callback...".to_string()));
                 })?;
@@ -216,6 +215,41 @@ impl LoginBackend for OAuthLoginBackend {
                     .to_string(),
             )),
         }
+    }
+}
+
+/// Best-effort: open `url` in the user's default browser. The OAuth dialogs also
+/// display the URL, so failures (headless host, no opener on PATH) are ignored
+/// rather than surfaced -- the user can still copy the URL manually. The child is
+/// fully detached from our stdio so it cannot corrupt the raw-mode TUI.
+pub(crate) fn open_in_browser(url: &str) {
+    let (program, args) = browser_open_command(std::env::consts::OS, url);
+    let _ = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Platform command + args that open `url` in the default browser. Split out as a
+/// pure function so the per-OS argument shape is unit-testable without spawning.
+fn browser_open_command(os: &str, url: &str) -> (&'static str, Vec<String>) {
+    match os {
+        "macos" => ("open", vec![url.to_owned()]),
+        // `start` is a cmd builtin; the empty "" is the window-title argument so
+        // a quoted URL is not consumed as the window title.
+        "windows" => (
+            "cmd",
+            vec![
+                "/C".to_owned(),
+                "start".to_owned(),
+                String::new(),
+                url.to_owned(),
+            ],
+        ),
+        // Linux/BSD and anything else: the freedesktop opener.
+        _ => ("xdg-open", vec![url.to_owned()]),
     }
 }
 
@@ -277,6 +311,33 @@ mod tests {
                 .all(|r| !r.badge.contains(SECRET) && !r.name.contains(SECRET))
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn browser_open_command_is_platform_correct_and_carries_full_url() {
+        let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&scope=x+y";
+        let (mac_prog, mac_args) = browser_open_command("macos", url);
+        assert_eq!(mac_prog, "open");
+        assert_eq!(mac_args, vec![url.to_string()]);
+
+        let (win_prog, win_args) = browser_open_command("windows", url);
+        assert_eq!(win_prog, "cmd");
+        // Empty title arg guards against a quoted URL being read as the title.
+        assert_eq!(
+            win_args,
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                String::new(),
+                url.to_string()
+            ]
+        );
+
+        let (nix_prog, nix_args) = browser_open_command("linux", url);
+        assert_eq!(nix_prog, "xdg-open");
+        assert_eq!(nix_args, vec![url.to_string()]);
+        // The full URL is always the final argument, never truncated.
+        assert_eq!(nix_args.last().map(String::as_str), Some(url));
     }
 
     #[test]

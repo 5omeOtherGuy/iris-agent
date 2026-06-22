@@ -650,6 +650,10 @@ async fn run_login(
 fn apply_login_update(dialog: &mut LoginDialog, update: LoginUpdate) {
     match update {
         LoginUpdate::AuthUrl { url, hint } => {
+            // The modal cannot carry a clickable hyperlink and a long URL wraps
+            // in the box, so open the browser for the user; the wrapped URL stays
+            // as a copy/paste fallback.
+            crate::ui::login::open_in_browser(&url);
             dialog.set_lines(vec![format!("Open: {url}"), hint]);
         }
         LoginUpdate::Progress(line) => dialog.push_line(line),
