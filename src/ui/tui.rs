@@ -82,9 +82,6 @@ const MAX_TOOL_OUTPUT_ROWS: usize = 8;
 /// machinery). Presentation-only.
 const USER_BG: Color = Color::Rgb(50, 50, 56);
 
-/// Prompt glyph that opens a user-message block (Codex parity: `›`).
-const USER_PREFIX: &str = "\u{203a} ";
-
 /// A turn must run at least this long before the elapsed clause appears in the
 /// active-turn status and the turn-end rule is labelled `Worked for ...` (Codex
 /// parity: quick turns stay quiet).
@@ -1085,21 +1082,28 @@ impl Transcript {
         self.exploring_open = self.rows.iter().any(|row| row.text == "• Explored");
     }
 
-    /// Commit a submitted prompt into the transcript as a shaded user block
-    /// (Codex parity): a `›` prompt glyph opens the first line, continuations are
-    /// indented two columns, and every wrapped row gets a full-width background.
+    /// Commit a submitted prompt into the transcript as a shaded user block: no
+    /// prompt glyph, every text row (and its wraps) carries a full-width shaded
+    /// background, and one shaded blank row above and below the text pad the
+    /// block into a box matching the editor's three-row input box.
     fn commit_user(&mut self, text: &str) {
         self.push_blank();
-        for (i, line) in text.split('\n').enumerate() {
-            let prefix = if i == 0 { USER_PREFIX } else { "  " };
-            let spans = vec![
-                Span::styled(prefix, dim_style().add_modifier(Modifier::BOLD)),
-                Span::raw(line.to_string()),
-            ];
+        self.push_user_pad();
+        for line in text.split('\n') {
+            let spans = vec![Span::raw(line.to_string())];
             self.rows
-                .push(TranscriptRow::with_line(Line::from(spans), Some("  ")).with_bg(USER_BG));
+                .push(TranscriptRow::with_line(Line::from(spans), None).with_bg(USER_BG));
         }
+        self.push_user_pad();
         self.trim_history();
+    }
+
+    /// Push one shaded full-width pad row: an empty styled line (so it is not a
+    /// block separator) painted to full width with the user background.
+    fn push_user_pad(&mut self) {
+        self.rows.push(
+            TranscriptRow::with_line(Line::from(Span::raw(String::new())), None).with_bg(USER_BG),
+        );
     }
 
     /// Append Codex's turn-end separator: a dim full-width rule, labelled
@@ -1303,25 +1307,23 @@ fn is_turn_work(event: &UiEvent) -> bool {
     )
 }
 
-/// Build a styled, empty editor: bordered box, dim placeholder, a reversed
-/// block cursor the widget draws itself (no hardware cursor needed).
+/// Build a styled, empty editor: borderless shaded input row, dim placeholder,
+/// and a reversed block cursor the widget draws itself (no hardware cursor
+/// needed). The shaded backing and the pad rows above/below are painted by
+/// `render` so the whole editor box matches committed user-message blocks,
+/// including cells not occupied by text.
 fn fresh_editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
-    editor.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(dim_style())
-            .title(Span::styled(" message ", dim_style())),
-    );
     editor.set_cursor_line_style(Style::default());
     editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    editor.set_placeholder_style(dim_style());
     editor.set_placeholder_text("Type a message, / for commands, Enter to send");
     editor
 }
 
 fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
-    let inner_width = usize::from(width.saturating_sub(2).max(1)); // editor borders
+    let inner_width = usize::from(width.max(1)); // borderless: full frame width
     editor
         .lines()
         .iter()
@@ -1698,13 +1700,15 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     // row are reserved FIRST so a tall slash palette can never starve the
     // editor out of the layout; the palette then takes only what remains, and
     // the active-block region absorbs any slack at the top.
-    const MIN_EDITOR_H: u16 = 3; // one text row + top/bottom border
+    const MIN_EDITOR_H: u16 = 3; // one text row + a shaded pad row above and below
     let palette_h = palette_wanted.min(area.height.saturating_sub(MIN_EDITOR_H).saturating_sub(1));
     let max_editor_h = area
         .height
         .saturating_sub(palette_h)
         .saturating_sub(1)
         .max(1);
+    // Reserve a shaded pad row above and below the text so the input reads as a
+    // box matching committed user-message blocks.
     let editor_h = (editor_rows + 2).min(max_editor_h).max(1);
     let desired_status_h = screen.status_height(area.width);
     let max_status_h = area
@@ -1739,8 +1743,20 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         );
     }
 
-    // The TextArea draws its own border (set in `fresh_editor`) and cursor.
-    (&screen.editor).render(editor_area, &mut buf);
+    // Paint the full editor rectangle with the same shaded background used for
+    // committed user-message blocks, then draw the TextArea into the middle,
+    // leaving a shaded pad row above and below (when the box is tall enough).
+    Block::default()
+        .style(Style::default().bg(USER_BG))
+        .render(editor_area, &mut buf);
+    let pad = u16::from(editor_area.height >= 3);
+    let text_area = Rect {
+        x: editor_area.x,
+        y: editor_area.y + pad,
+        width: editor_area.width,
+        height: editor_area.height.saturating_sub(pad * 2).max(1),
+    };
+    (&screen.editor).render(text_area, &mut buf);
     buffer_to_lines(&buf)
 }
 
@@ -2695,7 +2711,8 @@ mod tests {
         }
 
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
-        assert_eq!(replay.matches(" message ").count(), 1, "{replay:?}");
+        // The borderless editor draws its placeholder exactly once: no duplicated
+        // editor shadow lingering from a previous, larger frame.
         assert_eq!(replay.matches("Type a message").count(), 1, "{replay:?}");
         Ok(())
     }
@@ -2858,10 +2875,22 @@ mod tests {
         screen.apply(UiEvent::AssistantText("hello world".to_string()));
         screen.editor.insert_str("hi");
 
-        let rendered = rendered_text(&mut screen, 40, 8);
+        let lines = rendered_lines(&mut screen, 40, 8);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("hello world"));
-        // The editor text sits inside the bordered box near the bottom.
+        // The editor text sits in the shaded input box near the bottom; the old
+        // bordered frame is gone.
         assert!(rendered.contains("hi"));
+        assert!(
+            !rendered.contains("┌ message"),
+            "bordered editor frame should be gone: {rendered}"
+        );
+        // The bottom row of the editor box is a shaded pad row filling the width.
+        let bottom = lines.last().expect("at least one rendered row");
+        assert!(
+            bottom.spans.iter().any(|s| s.style.bg == Some(USER_BG)),
+            "editor pad row should be shaded: {bottom:?}"
+        );
         // Idle status hint is shown when no turn runs (the long hint is
         // truncated at this narrow test width, so assert its leading words).
         assert!(rendered.contains("enter send"));
@@ -2873,11 +2902,11 @@ mod tests {
         screen.editor.insert_str("abcdefghijklmnopqrst");
 
         let rendered = rendered_text(&mut screen, 18, 8);
-        // The editor inner width is 16 cells (18-wide frame minus borders), so
-        // a 20-cell word should use two visible rows instead of horizontally
-        // scrolling to the tail of the line.
-        assert!(rendered.contains("abcdefghijklmnop"));
-        assert!(rendered.contains("qrst"));
+        // The borderless editor uses the full 18-cell frame width, so a 20-cell
+        // word should use two visible rows instead of horizontally scrolling to
+        // the tail of the line.
+        assert!(rendered.contains("abcdefghijklmnopqr"));
+        assert!(rendered.contains("st"));
     }
 
     #[test]
@@ -2940,20 +2969,31 @@ mod tests {
     }
 
     #[test]
-    fn user_message_renders_shaded_block_with_prompt_glyph() {
+    fn user_message_renders_shaded_box_without_prompt_glyph() {
         let mut screen = Screen::new();
         screen.commit_user("hello\nworld");
         let lines = screen.wrapped_lines(20);
         let first = line_matching(&lines, |l| line_text(l).contains("hello"));
-        // The prompt glyph opens the block; the whole row is shaded and padded
-        // to the full width.
-        assert_eq!(first.spans[0].content.as_ref(), USER_PREFIX);
+        // No prompt glyph: the text opens at column zero; the whole row is shaded
+        // and padded to the full width.
+        assert_eq!(first.spans[0].content.as_ref(), "hello");
         assert_eq!(first.style.bg, Some(USER_BG));
         assert_eq!(display_width(&line_text(first)), 20);
-        // Continuation input line indents two columns and stays shaded.
+        // Continuation input line is unindented and stays shaded.
         let second = line_matching(&lines, |l| line_text(l).contains("world"));
-        assert_eq!(second.spans[0].content.as_ref(), "  ");
+        assert_eq!(second.spans[0].content.as_ref(), "world");
         assert_eq!(second.style.bg, Some(USER_BG));
+        // The block is a box: a shaded pad row brackets the text above and below.
+        let hello_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains("hello"))
+            .expect("hello row");
+        let above = &lines[hello_idx - 1];
+        let below = &lines[hello_idx + 2]; // hello, world, then the pad row
+        assert_eq!(above.style.bg, Some(USER_BG));
+        assert!(line_text(above).trim().is_empty());
+        assert_eq!(below.style.bg, Some(USER_BG));
+        assert!(line_text(below).trim().is_empty());
     }
 
     #[test]
