@@ -1103,10 +1103,7 @@ mod tests {
 
         // The signature survives a full resume so the next request can echo it.
         let session = open_by_id(&store, &id);
-        assert_eq!(
-            session.messages[0].continuity.as_deref(),
-            Some("sig-xyz")
-        );
+        assert_eq!(session.messages[0].continuity.as_deref(), Some("sig-xyz"));
     }
 
     /// Locate a session by id in the listing and open it -- the by-id read flow
