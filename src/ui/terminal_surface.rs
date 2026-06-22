@@ -218,12 +218,49 @@ impl<W: Write> TerminalSurface<W> {
         // Changes above the previous viewport need the same coherent replay to
         // avoid stale rows after resize/history reflow.
         if new_len != previous_len || first_changed < self.state.previous_viewport_top {
-            self.write_full(lines.to_vec(), width, height, true)?;
+            let new_viewport_top = viewport_top(new_len, height);
+            if new_viewport_top > self.state.previous_viewport_top {
+                self.write_scrolling_replay(lines, width, height, new_viewport_top)?;
+            } else {
+                self.write_full(lines.to_vec(), width, height, true)?;
+            }
             return Ok(RenderKind::FullRedraw);
         }
 
         self.write_visible_diff(lines, width, height, first_changed, last_changed)?;
         Ok(RenderKind::Diff)
+    }
+
+    fn write_scrolling_replay(
+        &mut self,
+        lines: &[String],
+        width: u16,
+        height: u16,
+        new_viewport_top: usize,
+    ) -> io::Result<()> {
+        let mut buffer = String::from(BEGIN_SYNC);
+        buffer.push_str(DISABLE_AUTOWRAP);
+        move_to_row(
+            &mut buffer,
+            &mut self.state.hardware_cursor_row,
+            self.state.previous_viewport_top,
+            self.state.previous_viewport_top,
+        );
+        buffer.push('\r');
+        for (offset, line) in lines[self.state.previous_viewport_top..].iter().enumerate() {
+            if offset > 0 {
+                buffer.push_str("\r\n");
+                self.state.hardware_cursor_row += 1;
+            }
+            buffer.push_str(line);
+        }
+        buffer.push_str(ENABLE_AUTOWRAP);
+        buffer.push_str(END_SYNC);
+        write!(self.writer, "{buffer}")?;
+        self.writer.flush()?;
+        self.remember(lines.to_vec(), width, height, lines.len().saturating_sub(1));
+        self.state.previous_viewport_top = new_viewport_top;
+        Ok(())
     }
 
     fn write_append(
@@ -576,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn non_append_growth_replays_visible_slice_without_scrolling() -> io::Result<()> {
+    fn non_append_growth_replays_from_previous_viewport_to_preserve_scrollback() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         let initial = vec![
             Line::from("transcript 1"),
@@ -604,13 +641,13 @@ mod tests {
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
         let out = output(&surface);
-        assert!(out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
+        assert!(!out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
         let plain = strip_ansi(&out);
-        assert!(plain.contains("transcript 4"), "{plain:?}");
+        assert!(plain.contains("transcript 3"), "{plain:?}");
         assert!(plain.contains("transcript 6"), "{plain:?}");
         assert!(plain.contains("chrome 2"), "{plain:?}");
         assert!(!plain.contains("transcript 1"), "{plain:?}");
-        assert_eq!(plain.matches("\r\n").count(), 4, "{plain:?}");
+        assert_eq!(surface.state().previous_viewport_top, 3);
         Ok(())
     }
 

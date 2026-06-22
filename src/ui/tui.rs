@@ -1359,7 +1359,9 @@ fn pad_content_lines(lines: &mut [Line<'static>]) {
 }
 
 fn footer_lines(footer: &Footer, width: usize) -> Vec<Line<'static>> {
-    let width = content_width(width);
+    let width = width
+        .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+        .max(1);
     let model = truncate_to_width(&footer.model, width);
     let model_width = display_width(&model);
     let usage = footer.usage.as_ref().map(footer_usage_text);
@@ -3335,6 +3337,8 @@ mod tests {
         assert!(cwd.starts_with("    "), "{cwd}");
         assert!(cwd.contains('~'), "{cwd}");
         assert!(model.contains("gpt-5.5 xhigh"), "{model}");
+        assert_eq!(display_width(&model), 76, "{model}");
+        assert!(model.ends_with("gpt-5.5 xhigh"), "{model}");
         assert!(!cwd.contains("enter send"), "{cwd}");
         assert!(!model.contains("enter send"), "{model}");
     }
