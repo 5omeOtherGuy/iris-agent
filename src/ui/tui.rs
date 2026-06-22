@@ -379,6 +379,23 @@ fn line_text(line: &Line<'_>) -> String {
         .collect()
 }
 
+fn truncate_line(line: &mut Line<'static>, max: usize) {
+    let max = max.max(1);
+    let mut used = 0;
+    let mut spans = Vec::new();
+    for span in std::mem::take(&mut line.spans) {
+        if used >= max {
+            break;
+        }
+        let content = truncate_to_width(span.content.as_ref(), max - used);
+        used += display_width(&content);
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    line.spans = spans;
+}
+
 /// Build a dim full-width horizontal rule, optionally wrapping a centered label
 /// (`─ Worked for 2m 12s ───────`). Codex's `FinalMessageSeparator`.
 fn hrule_line(label: &str, width: usize) -> Line<'static> {
@@ -1321,14 +1338,28 @@ impl Spinner {
 struct Footer {
     /// Model + effort, already joined (e.g. `gpt-5.5 xhigh`).
     model: String,
+    /// Reasoning effort display token (e.g. `high`), when configured.
+    effort: Option<String>,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
     /// Latest provider-reported usage, if the provider surfaced it.
     usage: Option<ProviderUsage>,
 }
 
+fn content_width(width: usize) -> usize {
+    width.saturating_sub(TEXT_COLUMN_X_PADDING).max(1)
+}
+
+fn pad_content_lines(lines: &mut [Line<'static>]) {
+    for line in lines {
+        if !line_text(line).is_empty() {
+            pad_line_left(line, TEXT_COLUMN_X_PADDING);
+        }
+    }
+}
+
 fn footer_lines(footer: &Footer, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
+    let width = content_width(width);
     let model = truncate_to_width(&footer.model, width);
     let model_width = display_width(&model);
     let usage = footer.usage.as_ref().map(footer_usage_text);
@@ -1381,20 +1412,41 @@ fn compact_count(value: u64) -> String {
     }
 }
 
-/// Active-turn status spans: `{spinner} Working ({elapsed} · esc to interrupt)`.
-/// Codex parity: the elapsed clause is shown from the first second (`0s`), and
-/// the interrupt hint is always present.
-fn working_spans(glyph: &str, elapsed: Option<Duration>) -> Vec<Span<'static>> {
+/// Active-turn indicator: `{spinner} Working… ({elapsed} · ↓ {tokens} tokens · thinking with {effort} effort)`.
+fn working_spans(
+    glyph: &str,
+    elapsed: Option<Duration>,
+    footer: Option<&Footer>,
+) -> Vec<Span<'static>> {
     let secs = elapsed.map_or(0, |d| d.as_secs());
-    let suffix = format!(
-        " ({} \u{b7} esc to interrupt)",
-        format_elapsed_compact(secs)
-    );
+    let mut details = vec![format_elapsed_compact(secs)];
+    if let Some(usage) = footer.and_then(|footer| footer.usage.as_ref()) {
+        details.push(format!(
+            "\u{2193} {} tokens",
+            compact_count(usage.total_tokens)
+        ));
+    }
+    if let Some(effort) = footer.and_then(|footer| footer.effort.as_ref()) {
+        details.push(format!("thinking with {effort} effort"));
+    }
+    let suffix = format!(" ({})", details.join(" \u{b7} "));
     vec![
         Span::styled(format!("{glyph} "), prompt_style()),
-        Span::styled("Working", dim_style()),
+        Span::styled("Working\u{2026}", dim_style()),
         Span::styled(suffix, dim_style()),
     ]
+}
+
+fn working_lines(
+    glyph: &str,
+    elapsed: Option<Duration>,
+    footer: Option<&Footer>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut line = Line::from(working_spans(glyph, elapsed, footer));
+    truncate_line(&mut line, content_width(width));
+    pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
+    vec![Line::default(), line, Line::default()]
 }
 
 /// Whether an event represents concrete turn work (a tool ran). Gates the
@@ -1575,9 +1627,14 @@ impl Screen {
 
     /// Set (or refresh) the idle footer from the live model selection. The loop
     /// calls this whenever the model/effort changes; `cwd` is home-relativized.
-    pub(crate) fn set_footer(&mut self, model: String, cwd: String) {
+    pub(crate) fn set_footer(&mut self, model: String, effort: Option<String>, cwd: String) {
         let usage = self.footer.as_ref().and_then(|footer| footer.usage.clone());
-        self.footer = Some(Footer { model, cwd, usage });
+        self.footer = Some(Footer {
+            model,
+            effort,
+            cwd,
+            usage,
+        });
     }
 
     pub(crate) fn start_turn(&mut self) {
@@ -1634,26 +1691,39 @@ impl Screen {
         self.approval_hint = None;
     }
 
-    /// Status row content: approval hint > active spinner > footer > idle hint.
+    /// Status row content: approval hint > footer > idle hint.
     fn status_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if let Some(hint) = &self.approval_hint {
-            approval_status_lines(hint, usize::from(width))
-        } else if self.spinner.active {
-            vec![Line::from(working_spans(
-                self.spinner.glyph(),
-                self.spinner.elapsed(),
-            ))]
+        let mut lines = if let Some(hint) = &self.approval_hint {
+            approval_status_lines(hint, content_width(usize::from(width)))
         } else if let Some(footer) = &self.footer {
             footer_lines(footer, usize::from(width))
         } else {
-            vec![Line::from(Span::styled(IDLE_HINT, dim_style()))]
-        }
+            vec![Line::from(Span::styled(
+                truncate_to_width(IDLE_HINT, content_width(usize::from(width))),
+                dim_style(),
+            ))]
+        };
+        pad_content_lines(&mut lines);
+        lines
     }
 
     fn status_height(&self, width: u16) -> u16 {
         u16::try_from(self.status_lines(width).len())
             .unwrap_or(u16::MAX)
             .max(1)
+    }
+
+    fn working_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if self.spinner.active && self.approval_hint.is_none() {
+            working_lines(
+                self.spinner.glyph(),
+                self.spinner.elapsed(),
+                self.footer.as_ref(),
+                usize::from(width),
+            )
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -1738,26 +1808,42 @@ pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
 /// Render the slash popup into an offscreen Ratatui buffer: a bordered list with
 /// the selected row highlighted.
 fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selected: usize) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(dim_style())
-        .title(Span::styled(" commands ", dim_style()));
-    let inner = block.inner(area);
-    block.render(area, buf);
+    let inner = Rect {
+        x: area.x + u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX),
+        y: area.y + u16::from(area.height > 1),
+        width: area
+            .width
+            .saturating_sub(u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX))
+            .max(1),
+        height: area.height.saturating_sub(2).max(1),
+    };
     let mut rows = Vec::new();
+    let command_width = matches
+        .iter()
+        .map(|cmd| display_width(cmd.name))
+        .max()
+        .unwrap_or(0);
     for (i, cmd) in matches.iter().enumerate() {
-        let name_style = if i == selected {
+        let selected_row = i == selected;
+        let name_style = if selected_row {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default()
         };
+        let description_style = if selected_row {
+            Style::default().fg(Color::Cyan)
+        } else {
+            dim_style()
+        };
+        let gap = command_width
+            .saturating_sub(display_width(cmd.name))
+            .saturating_add(2);
         rows.push(Line::from(vec![
-            Span::styled(format!(" {} ", cmd.name), name_style),
-            Span::raw(" "),
-            Span::styled(cmd.description, dim_style()),
+            Span::styled(cmd.name.to_string(), name_style),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(cmd.description, description_style),
         ]));
     }
     Paragraph::new(Text::from(rows)).render(inner, buf);
@@ -1816,15 +1902,29 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     // the active-block region absorbs any slack at the top.
     const MIN_EDITOR_H: u16 = 3; // one text row + a shaded pad row above and below
     let desired_status_h = screen.status_height(area.width);
+    let working_lines = screen.working_lines(area.width);
+    let desired_working_h = u16::try_from(working_lines.len()).unwrap_or(u16::MAX);
+    let working_h = if desired_working_h > 0
+        && area.height
+            >= MIN_EDITOR_H
+                .saturating_add(desired_status_h)
+                .saturating_add(desired_working_h)
+    {
+        desired_working_h
+    } else {
+        0
+    };
     let palette_h = palette_wanted.min(
         area.height
             .saturating_sub(MIN_EDITOR_H)
-            .saturating_sub(desired_status_h),
+            .saturating_sub(desired_status_h)
+            .saturating_sub(working_h),
     );
     let max_editor_h = area
         .height
         .saturating_sub(palette_h)
         .saturating_sub(desired_status_h)
+        .saturating_sub(working_h)
         .max(1);
     // Reserve a shaded pad row above and below the text so the input reads as a
     // box matching committed user-message blocks.
@@ -1838,16 +1938,19 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     let status_lines = screen.status_lines(area.width);
 
     let chrome_h = status_h.saturating_add(palette_h).saturating_add(editor_h);
+    let chrome_h = chrome_h.saturating_add(working_h);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(palette_h),
+        Constraint::Length(working_h),
         Constraint::Length(editor_h),
         Constraint::Length(status_h),
     ])
     .split(chrome_area);
     let palette_area = chunks[0];
-    let editor_area = chunks[1];
-    let status_area = chunks[2];
+    let working_area = chunks[1];
+    let editor_area = chunks[2];
+    let status_area = chunks[3];
 
     let mut buf = Buffer::empty(chrome_area);
     Paragraph::new(Text::from(status_lines)).render(status_area, &mut buf);
@@ -1859,6 +1962,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             &palette_matches,
             screen.palette.selected(),
         );
+    }
+    if working_h > 0 {
+        Paragraph::new(Text::from(working_lines)).render(working_area, &mut buf);
     }
 
     // Paint an inset editor rectangle with the same shaded background used for
@@ -1884,9 +1990,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         height: editor_area.height.saturating_sub(pad * 2).max(1),
     };
     (&screen.editor).render(text_area, &mut buf);
-    let mut lines = buffer_to_lines(&buf);
-    lines.insert(usize::from(palette_h), Line::default());
-    lines
+    buffer_to_lines(&buf)
 }
 
 /// Render the open modal in a bordered box at the document bottom, in place of
@@ -3133,11 +3237,6 @@ mod tests {
             !rendered.contains("┌ message"),
             "bordered editor frame should be gone: {rendered}"
         );
-        let first_editor = lines
-            .iter()
-            .position(|line| line.spans.iter().any(|s| s.style.bg == Some(USER_BG)))
-            .expect("editor box row");
-        assert_eq!(line_text(&lines[first_editor - 1]), "");
         // The editor box sits above the bottom status row; its bottom pad row
         // is shaded.
         let bottom = lines
@@ -3169,24 +3268,56 @@ mod tests {
     #[test]
     fn frame_shows_spinner_while_turn_active() {
         let mut screen = Screen::new();
+        screen.set_footer(
+            "opus-4.8 high".to_string(),
+            Some("high".to_string()),
+            "~/repo (branch)".to_string(),
+        );
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: Some("resp_1".to_string()),
+            usage: Some(ProviderUsage {
+                provider: "anthropic".to_string(),
+                model: "opus-4.8".to_string(),
+                input_tokens: 300,
+                output_tokens: 104,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 30,
+                total_tokens: 404,
+                cache_creation: None,
+            }),
+        });
         screen.start_turn();
-        let before = rendered_text(&mut screen, 40, 8);
-        assert!(before.contains("Working"));
-        assert!(before.contains("esc to interrupt"));
+        let before = rendered_lines(&mut screen, 64, 10);
+        let working_idx = before
+            .iter()
+            .position(|line| line_text(line).contains("Working"))
+            .expect("working indicator");
+        assert!(line_text(&before[working_idx - 1]).trim().is_empty());
+        assert!(line_text(&before[working_idx + 1]).trim().is_empty());
+        let working = line_text(&before[working_idx]);
+        assert!(
+            working.starts_with("    \u{280b} Working\u{2026}"),
+            "{working}"
+        );
+        assert!(working.contains("0s"), "{working}");
+        assert!(working.contains("\u{2193} 404 tokens"), "{working}");
+        assert!(working.contains("thinking with high effort"), "{working}");
 
         // A tick advances the spinner glyph (animation), idle does not.
         let glyph0 = SPINNER_FRAMES[0];
-        assert!(before.contains(glyph0));
+        assert!(working.contains(glyph0));
         assert!(screen.tick());
-        let after = rendered_text(&mut screen, 40, 8);
+        let after = rendered_text(&mut screen, 64, 10);
         assert!(after.contains(SPINNER_FRAMES[1]));
 
         screen.end_turn();
         assert!(!screen.tick());
         let idle = rendered_text(&mut screen, 40, 8);
         assert!(
-            idle.contains("enter send"),
-            "idle hint replaces the spinner"
+            idle.contains("opus-4.8 high"),
+            "footer replaces the spinner"
         );
         assert!(!idle.contains("Working"), "spinner cleared on turn end");
     }
@@ -3196,11 +3327,16 @@ mod tests {
         let mut screen = Screen::new();
         // No footer wired: the keybind hint shows.
         assert!(line_text(&screen.status_lines(80)[0]).contains("enter send"));
-        screen.set_footer("gpt-5.5 xhigh".to_string(), "~".to_string());
+        screen.set_footer(
+            "gpt-5.5 xhigh".to_string(),
+            Some("xhigh".to_string()),
+            "~".to_string(),
+        );
         let lines = screen.status_lines(80);
         assert_eq!(lines.len(), 2);
         let cwd = line_text(&lines[0]);
         let model = line_text(&lines[1]);
+        assert!(cwd.starts_with("    "), "{cwd}");
         assert!(cwd.contains('~'), "{cwd}");
         assert!(model.contains("gpt-5.5 xhigh"), "{model}");
         assert!(!cwd.contains("enter send"), "{cwd}");
@@ -3210,7 +3346,11 @@ mod tests {
     #[test]
     fn footer_shows_real_provider_usage_when_reported() {
         let mut screen = Screen::new();
-        screen.set_footer("opus-4.8 xhigh".to_string(), "~/repo (branch)".to_string());
+        screen.set_footer(
+            "opus-4.8 xhigh".to_string(),
+            Some("xhigh".to_string()),
+            "~/repo (branch)".to_string(),
+        );
         screen.apply(UiEvent::ProviderTurnCompleted {
             turn_id: "turn_1".to_string(),
             response_id: Some("resp_1".to_string()),
@@ -3228,35 +3368,38 @@ mod tests {
         });
 
         let second = line_text(&screen.status_lines(80)[1]);
+        assert!(second.starts_with("    "), "{second}");
         assert!(second.contains("120 tokens (64 cached)"), "{second}");
         assert!(second.contains("opus-4.8 xhigh"), "{second}");
 
-        screen.set_footer("opus-4.8 high".to_string(), "~/repo (branch)".to_string());
+        screen.set_footer(
+            "opus-4.8 high".to_string(),
+            Some("high".to_string()),
+            "~/repo (branch)".to_string(),
+        );
         let refreshed = line_text(&screen.status_lines(80)[1]);
         assert!(refreshed.contains("120 tokens (64 cached)"), "{refreshed}");
         assert!(refreshed.contains("opus-4.8 high"), "{refreshed}");
     }
 
     #[test]
-    fn working_status_shows_elapsed_from_the_first_second() {
-        // Codex parity: elapsed is shown immediately (`0s`), not gated on a
-        // minute, and the interrupt hint is always present.
-        let early: String = working_spans("\u{280b}", Some(Duration::from_secs(5)))
+    fn working_indicator_shows_elapsed_from_the_first_second() {
+        let early: String = working_spans("\u{280b}", Some(Duration::from_secs(5)), None)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
-        assert!(early.contains("Working"), "{early}");
-        assert!(early.contains("5s \u{b7} esc to interrupt"), "{early}");
-        let zero: String = working_spans("\u{280b}", None)
+        assert!(early.contains("Working\u{2026}"), "{early}");
+        assert!(early.contains("5s"), "{early}");
+        let zero: String = working_spans("\u{280b}", None, None)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
-        assert!(zero.contains("0s \u{b7} esc to interrupt"), "{zero}");
-        let over: String = working_spans("\u{280b}", Some(Duration::from_secs(71)))
+        assert!(zero.contains("0s"), "{zero}");
+        let over: String = working_spans("\u{280b}", Some(Duration::from_secs(71)), None)
             .iter()
             .map(|s| s.content.to_string())
             .collect();
-        assert!(over.contains("1m 11s \u{b7} esc to interrupt"), "{over}");
+        assert!(over.contains("1m 11s"), "{over}");
     }
 
     #[test]
@@ -3353,11 +3496,30 @@ mod tests {
     #[test]
     fn frame_shows_slash_palette_when_typing_command() {
         let mut screen = Screen::new();
-        screen.editor.insert_str("/e");
+        screen.editor.insert_str("/");
         screen.sync_palette();
-        let rendered = rendered_text(&mut screen, 40, 10);
+        let lines = rendered_lines(&mut screen, 80, 12);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("/exit"));
-        assert!(!rendered.contains("/quit"), "filtered to /exit only");
+        let exit = line_matching(&lines, |line| line_text(line).contains("/exit"));
+        assert!(line_text(exit).starts_with("    /exit"), "{exit:?}");
+        assert!(
+            exit.spans
+                .iter()
+                .all(|span| !matches!(span.style.bg, Some(Color::Cyan) | Some(USER_BG)))
+        );
+        assert!(exit.spans.iter().any(|span| {
+            span.content.as_ref().contains("End the session") && span.style.fg == Some(Color::Cyan)
+        }));
+        let model = line_matching(&lines, |line| line_text(line).contains("/model"));
+        assert_eq!(
+            line_text(exit).find("End the session"),
+            line_text(model).find("Show or switch provider/model")
+        );
+        assert_ne!(model.spans[0].style.fg, Some(Color::Cyan));
+        assert!(model.spans.iter().any(|span| {
+            span.content.as_ref().contains("Show") && span.style.fg != Some(Color::Cyan)
+        }));
     }
 
     #[test]
