@@ -318,7 +318,11 @@ impl TranscriptRow {
 
     fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
         if self.hrule {
-            out.push(hrule_line(&self.text, width));
+            let rule_width = width.saturating_sub(BOX_X_PADDING * 2).max(1);
+            let mut line = hrule_line(&self.text, rule_width);
+            pad_line_left(&mut line, BOX_X_PADDING);
+            pad_line_right(&mut line, BOX_X_PADDING);
+            out.push(line);
             return;
         }
         let boxed = self.background.is_some();
@@ -3481,11 +3485,17 @@ mod tests {
             duration: None,
         });
         screen.end_turn();
-        // A short turn (<60s) closes with a plain full-width rule (no label).
+        // A short turn (<60s) closes with an inset rule that matches the
+        // editor/user-message box width.
         let lines = screen.wrapped_lines(20);
-        let rule = line_matching(&lines, |l| line_text(l).starts_with('\u{2500}'));
-        assert_eq!(line_text(rule), "\u{2500}".repeat(20));
-        assert_eq!(rule.spans[0].style, dim_style());
+        let rule = line_matching(&lines, |l| line_text(l).contains('\u{2500}'));
+        assert_eq!(line_text(rule), format!("  {}  ", "\u{2500}".repeat(16)));
+        assert_eq!(display_width(&line_text(rule)), 20);
+        assert_eq!(rule.spans[0].content.as_ref(), "  ");
+        assert_eq!(rule.spans[0].style, Style::default());
+        assert_eq!(rule.spans[1].style, dim_style());
+        assert_eq!(rule.spans[2].content.as_ref(), "  ");
+        assert_eq!(rule.spans[2].style, Style::default());
     }
 
     #[test]
