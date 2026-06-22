@@ -448,6 +448,7 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
             reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
+                thought_signature: None,
                 name: "read".to_string(),
                 arguments: json!({ "path": "note.txt" }),
             }],
@@ -492,6 +493,7 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
             reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
+                thought_signature: None,
                 name: "read".to_string(),
                 arguments: json!({ "path": "note.txt" }),
             }],
@@ -531,6 +533,7 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
             reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
+                thought_signature: None,
                 name: "unknown".to_string(),
                 arguments: json!({}),
             }],
@@ -569,6 +572,7 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
             reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
+                thought_signature: None,
                 name: "read".to_string(),
                 arguments: json!({ "path": "note.txt" }),
             }],
@@ -612,6 +616,7 @@ fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
             reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
+                thought_signature: None,
                 name: "unknown".to_string(),
                 arguments: json!({}),
             }],
@@ -764,6 +769,7 @@ fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
             reasoning: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
+                thought_signature: None,
                 name: "read".to_string(),
                 arguments: json!({ "not_path": "note.txt" }),
             }],
@@ -848,6 +854,7 @@ fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
         reasoning: Vec::new(),
         tool_calls: vec![ToolCall {
             id: "call_1".to_string(),
+            thought_signature: None,
             name: name.to_string(),
             arguments,
         }],
@@ -982,11 +989,13 @@ fn completed_turn_records_reasoning_and_all_tool_calls_before_results() -> Resul
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
+                    thought_signature: None,
                     name: "read".to_string(),
                     arguments: json!({ "path": "a.txt" }),
                 },
                 ToolCall {
                     id: "call_2".to_string(),
+                    thought_signature: None,
                     name: "read".to_string(),
                     arguments: json!({ "path": "b.txt" }),
                 },
@@ -1472,11 +1481,13 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
+                    thought_signature: None,
                     name: "write".to_string(),
                     arguments: json!({ "path": "a.txt", "content": "a" }),
                 },
                 ToolCall {
                     id: "call_2".to_string(),
+                    thought_signature: None,
                     name: "write".to_string(),
                     arguments: json!({ "path": "b.txt", "content": "b" }),
                 },
@@ -1545,11 +1556,13 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
+                    thought_signature: None,
                     name: "approvable".to_string(),
                     arguments: json!({}),
                 },
                 ToolCall {
                     id: "call_2".to_string(),
+                    thought_signature: None,
                     name: "approvable".to_string(),
                     arguments: json!({}),
                 },
@@ -1695,11 +1708,13 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".to_string(),
+                    thought_signature: None,
                     name: "bash".to_string(),
                     arguments: json!({ "command": "echo first" }),
                 },
                 ToolCall {
                     id: "call_2".to_string(),
+                    thought_signature: None,
                     name: "bash".to_string(),
                     arguments: json!({ "command": "echo second" }),
                 },
@@ -2358,6 +2373,7 @@ impl ApprovalGate for BlockingApprovalGate {
 fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
     ToolCall {
         id: id.to_string(),
+        thought_signature: None,
         name: name.to_string(),
         arguments,
     }
@@ -3065,6 +3081,7 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
     log.append(&Message::user("run the tool"))?;
     let call = ToolCall {
         id: "call_1".to_string(),
+        thought_signature: None,
         name: "read".to_string(),
         arguments: serde_json::json!({ "path": "a.txt" }),
     };
@@ -3137,11 +3154,13 @@ fn resume_repairs_all_dangling_tool_calls_before_the_next_turn() -> Result<()> {
     for call in [
         ToolCall {
             id: "call_1".to_string(),
+            thought_signature: None,
             name: "read".to_string(),
             arguments: serde_json::json!({ "path": "a.txt" }),
         },
         ToolCall {
             id: "call_2".to_string(),
+            thought_signature: None,
             name: "read".to_string(),
             arguments: serde_json::json!({ "path": "b.txt" }),
         },

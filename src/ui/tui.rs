@@ -1894,6 +1894,7 @@ mod tests {
     fn call_args(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "call_1".to_string(),
+            thought_signature: None,
             name: name.to_string(),
             arguments,
         }

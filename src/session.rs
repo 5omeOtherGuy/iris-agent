@@ -400,6 +400,15 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
     if let Some(name) = &message.tool_name {
         inner["toolName"] = json!(name);
     }
+    // AssistantToolCall rows carry an opaque provider continuity (e.g. Gemini's
+    // `thoughtSignature`) that must survive resume so the tool round-trip is not
+    // rejected on the next request. Persist it the same opaque way as reasoning
+    // continuity; the read path already restores `continuity` for any role.
+    if message.role == Role::AssistantToolCall
+        && let Some(continuity) = &message.continuity
+    {
+        inner["continuity"] = json!(continuity);
+    }
     if message.role == Role::AssistantReasoning {
         inner["redacted"] = json!(message.redacted);
         if let Some(continuity) = &message.continuity {
@@ -1062,6 +1071,7 @@ mod tests {
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
         let call = ToolCall {
             id: "call_1".to_string(),
+            thought_signature: None,
             name: "read".to_string(),
             arguments: json!({ "path": "a.txt" }),
         };
@@ -1071,6 +1081,32 @@ mod tests {
         assert_eq!(entry["role"], "assistant_tool_call");
         assert_eq!(entry["toolCallId"], "call_1");
         assert_eq!(entry["toolName"], "read");
+    }
+
+    #[test]
+    fn tool_call_entry_round_trips_thought_signature_continuity() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "ls".to_string(),
+            arguments: json!({ "path": "." }),
+            thought_signature: Some("sig-xyz".to_string()),
+        };
+        log.append(&Message::assistant_tool_call(&call)).unwrap();
+        drop(log);
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let entry = &lines(&store.find(&id).unwrap().unwrap().path)[1]["message"];
+        assert_eq!(entry["continuity"], "sig-xyz");
+
+        // The signature survives a full resume so the next request can echo it.
+        let session = open_by_id(&store, &id);
+        assert_eq!(
+            session.messages[0].continuity.as_deref(),
+            Some("sig-xyz")
+        );
     }
 
     /// Locate a session by id in the listing and open it -- the by-id read flow

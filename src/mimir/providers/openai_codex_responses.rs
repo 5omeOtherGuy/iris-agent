@@ -940,6 +940,7 @@ fn extract_tool_calls(value: &Value) -> Vec<ToolCall> {
 
 fn extract_tool_call(value: &Value) -> Option<ToolCall> {
     (value.get("type").and_then(Value::as_str) == Some("function_call")).then(|| ToolCall {
+        thought_signature: None,
         id: value
             .get("call_id")
             .or_else(|| value.get("id"))
