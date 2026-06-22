@@ -252,6 +252,7 @@ impl<W: Write> TerminalSurface<W> {
                 buffer.push_str("\r\n");
                 self.state.hardware_cursor_row += 1;
             }
+            buffer.push_str("\x1b[2K");
             buffer.push_str(line);
         }
         buffer.push_str(ENABLE_AUTOWRAP);
@@ -648,6 +649,43 @@ mod tests {
         assert!(plain.contains("chrome 2"), "{plain:?}");
         assert!(!plain.contains("transcript 1"), "{plain:?}");
         assert_eq!(surface.state().previous_viewport_top, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn scrolling_replay_clears_stale_cells_before_shorter_rows() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let grey = Style::default().bg(Color::Rgb(50, 50, 56));
+        let initial = vec![
+            Line::from("history 1"),
+            Line::from("history 2"),
+            Line::from("history 3"),
+            Line::from("history 4"),
+            Line::from(vec![Span::styled("old shaded editor row", grey)]),
+            Line::from("old working details (17s tokens effort)"),
+        ];
+        surface.render(size(80, 4), &initial)?;
+        surface.writer_mut().clear();
+
+        let next = vec![
+            Line::from("history 1"),
+            Line::from("history 2"),
+            Line::from("history 3"),
+            Line::from("history 4"),
+            Line::from("new explored"),
+            Line::from("short"),
+            Line::from("editor"),
+        ];
+        let stats = surface.render(size(80, 4), &next)?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        let out = output(&surface);
+        assert!(out.matches("\x1b[2K").count() >= 5, "{out:?}");
+        assert!(
+            !strip_ansi(&out).contains("old shaded editor row"),
+            "{out:?}"
+        );
+        assert!(!strip_ansi(&out).contains("working details"), "{out:?}");
         Ok(())
     }
 
