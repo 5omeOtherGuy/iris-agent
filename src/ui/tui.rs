@@ -1808,26 +1808,42 @@ pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
 /// Render the slash popup into an offscreen Ratatui buffer: a bordered list with
 /// the selected row highlighted.
 fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selected: usize) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(dim_style())
-        .title(Span::styled(" commands ", dim_style()));
-    let inner = block.inner(area);
-    block.render(area, buf);
+    let inner = Rect {
+        x: area.x + u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX),
+        y: area.y + u16::from(area.height > 1),
+        width: area
+            .width
+            .saturating_sub(u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX))
+            .max(1),
+        height: area.height.saturating_sub(2).max(1),
+    };
     let mut rows = Vec::new();
+    let command_width = matches
+        .iter()
+        .map(|cmd| display_width(cmd.name))
+        .max()
+        .unwrap_or(0);
     for (i, cmd) in matches.iter().enumerate() {
-        let name_style = if i == selected {
+        let selected_row = i == selected;
+        let name_style = if selected_row {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default()
         };
+        let description_style = if selected_row {
+            Style::default().fg(Color::Cyan)
+        } else {
+            dim_style()
+        };
+        let gap = command_width
+            .saturating_sub(display_width(cmd.name))
+            .saturating_add(2);
         rows.push(Line::from(vec![
-            Span::styled(format!(" {} ", cmd.name), name_style),
-            Span::raw(" "),
-            Span::styled(cmd.description, dim_style()),
+            Span::styled(cmd.name.to_string(), name_style),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(cmd.description, description_style),
         ]));
     }
     Paragraph::new(Text::from(rows)).render(inner, buf);
@@ -3480,11 +3496,30 @@ mod tests {
     #[test]
     fn frame_shows_slash_palette_when_typing_command() {
         let mut screen = Screen::new();
-        screen.editor.insert_str("/e");
+        screen.editor.insert_str("/");
         screen.sync_palette();
-        let rendered = rendered_text(&mut screen, 40, 10);
+        let lines = rendered_lines(&mut screen, 80, 12);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("/exit"));
-        assert!(!rendered.contains("/quit"), "filtered to /exit only");
+        let exit = line_matching(&lines, |line| line_text(line).contains("/exit"));
+        assert!(line_text(exit).starts_with("    /exit"), "{exit:?}");
+        assert!(
+            exit.spans
+                .iter()
+                .all(|span| !matches!(span.style.bg, Some(Color::Cyan) | Some(USER_BG)))
+        );
+        assert!(exit.spans.iter().any(|span| {
+            span.content.as_ref().contains("End the session") && span.style.fg == Some(Color::Cyan)
+        }));
+        let model = line_matching(&lines, |line| line_text(line).contains("/model"));
+        assert_eq!(
+            line_text(exit).find("End the session"),
+            line_text(model).find("Show or switch provider/model")
+        );
+        assert_ne!(model.spans[0].style.fg, Some(Color::Cyan));
+        assert!(model.spans.iter().any(|span| {
+            span.content.as_ref().contains("Show") && span.style.fg != Some(Color::Cyan)
+        }));
     }
 
     #[test]
