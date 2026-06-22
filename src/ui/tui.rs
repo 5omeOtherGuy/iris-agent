@@ -1874,14 +1874,23 @@ fn render_plain_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static
 /// transcript rows retained in Iris state, plus bottom-pinned
 /// menu/status/editor chrome. The terminal surface decides how much of this
 /// document can be patched and when it must be fully replayed.
+#[cfg(test)]
 fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
+    render_document_with_chrome_tail(screen, size).0
+}
+
+fn render_document_with_chrome_tail(
+    screen: &mut Screen,
+    size: Size,
+) -> (Vec<Line<'static>>, usize) {
     if size.height == 0 || size.width < 1 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let width = size.width.max(1);
     let height = size.height.max(1);
     let mut transcript = screen.wrapped_lines(width);
     let chrome = render_editor_chrome(screen, width, height);
+    let chrome_len = chrome.len();
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
     let min_transcript_rows = usize::from(target_rows).saturating_sub(chrome.len());
     if transcript.len() < min_transcript_rows {
@@ -1893,7 +1902,7 @@ fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
         transcript = padded;
     }
     transcript.extend(chrome);
-    transcript
+    (transcript, chrome_len)
 }
 
 fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -2091,8 +2100,9 @@ impl TuiUi {
     pub(crate) fn draw(&mut self) -> Result<()> {
         let (width, height) = terminal_size()?;
         let size = Size::new(width.max(1), height.max(1));
-        let document = render_document(&mut self.screen, size);
-        self.surface.render(size, &document)?;
+        let (document, chrome_tail) = render_document_with_chrome_tail(&mut self.screen, size);
+        self.surface
+            .render_with_volatile_tail(size, &document, chrome_tail)?;
         Ok(())
     }
 
