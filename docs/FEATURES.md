@@ -10,8 +10,8 @@
 ## Core CLI and agent loop
 
 - **CLI entrypoint** — `cargo run` starts Iris. [Implemented]
-- **Interactive terminal session** — inline-viewport TUI on real TTYs with
-  native terminal scrollback, transcript, textarea editor, spinner, slash
+- **Interactive terminal session** — terminal-surface TUI on real TTYs with an
+  Iris-owned transcript replay/diff renderer, textarea editor, spinner, slash
   palette, modal selectors, live bash exec cells, streamed Markdown rendering,
   `/exit` and `/quit`; text REPL fallback for pipes/CI or TUI startup failure.
   [Implemented]

@@ -1,8 +1,8 @@
 # Iris — Roadmap
 
 > Status (2026-06-21): Milestone 1, the async-hard runtime completion, and the
-> Milestone 2 foundations are done. Iris has an inline-viewport TUI with native
-> scrollback plus a text fallback, selectable Mimir providers (`openai-codex`,
+> Milestone 2 foundations are done. Iris has a terminal-surface TUI with
+> Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`,
 > `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
 > response parsing, workspace-scoped tools, terminal approval gates with diff
 > previews, fragment-based system-prompt assembly, provider/model/reasoning/
@@ -55,10 +55,10 @@ building token/context systems on top of it.
 Implemented today:
 
 - CLI entrypoint that starts Iris from `cargo run`.
-- Inline-viewport TUI with native terminal scrollback, textarea editing,
-  slash/modals, streamed Markdown rendering, live bash exec cells, and a text
-  fallback for pipes/CI, driven through a `Ui` front-end seam (`src/ui/`,
-  `src/cli.rs`).
+- Terminal-surface TUI with Iris-owned transcript replay/diff rendering,
+  textarea editing, slash/modals, streamed Markdown rendering, live bash exec
+  cells, and a text fallback for pipes/CI, driven through a `Ui` front-end seam
+  (`src/ui/`, `src/cli.rs`).
 - Incremental terminal streaming of assistant text via the async
   `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, rendered as
   `UiEvent` deltas.
@@ -518,24 +518,28 @@ Potential scope:
   bounded preview with a `(+N more lines)` indicator, a session always-allow
   approval policy for file tools enforced in Nexus (`bash` still prompts every
   time), and paste-safe multi-line prompt input
-  (bracketed paste + `\` continuation). Full-screen TUI shipped later on top
-  of this: raw-mode alternate screen, persistent transcript, textarea editor,
+  (bracketed paste + `\` continuation). The TUI shipped later on top of this:
+  raw-mode terminal interaction, persistent transcript, textarea editor,
   spinner, slash palette, and Ctrl-C/input edge-case handling, with text UI as
   the non-TTY/piped fallback. Inline-Viewport Native Scrollback
   ([#86](https://github.com/5omeOtherGuy/iris-agent/pull/86), shipped
   2026-06-20) then re-architected the interactive TUI off the alternate screen:
-  finalized transcript blocks are committed into the terminal's native
+  finalized transcript blocks were committed into the terminal's native
   scrollback (selectable/copyable, scrolled by the real terminal) via ratatui's
   `Viewport::Inline` + `Terminal::insert_before`, above a small fixed live
-  viewport (`take_scrollback` keeps the current block live mid-turn and flushes
+  viewport (`take_scrollback` kept the current block live mid-turn and flushed
   everything at idle). The manual scroll offset and its PageUp/PageDown/
-  Ctrl+Home/End + mouse-wheel handlers were removed (the terminal owns
+  Ctrl+Home/End + mouse-wheel handlers were removed (the terminal owned
   scroll/select/copy). The same slice fixed multi-file diff headers (drop every
   `---`/`+++` pair), removed the false `ctrl + t` transcript hint, made wrapping
   URL/long-token-safe (fits -> own row; over-long -> hard-break, never clipped),
   added flood-safe row-capped tool output, and added markdown rendering for
   assistant text via pulldown-cmark (`src/ui/markdown.rs`, raw/inline HTML text
-  preserved). A later shortcut-parity pass aligned the TUI editor/model controls
+  preserved). A later terminal-surface pass superseded the Ratatui inline
+  lifecycle in production: transcript history stays in `Screen` state, Ratatui
+  remains a primitives/widget dependency, and resize redraws replay from Iris
+  state instead of Ratatui's inline viewport lifecycle. A later shortcut-parity
+  pass aligned the TUI editor/model controls
   with pi defaults: Shift+Enter (plus Ctrl+Enter/Ctrl+J fallbacks) inserts a
   newline, Alt+Enter submits, Ctrl+L opens the model selector, Ctrl+P/
   Shift+Ctrl+P cycles scoped models, Shift+Tab cycles reasoning, and editor

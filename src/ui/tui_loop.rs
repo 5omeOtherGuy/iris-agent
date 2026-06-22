@@ -1,4 +1,4 @@
-//! The persistent async event loop that drives the full-screen TUI (Tier 3).
+//! The persistent async event loop that drives the terminal-surface TUI (Tier 3).
 //!
 //! One `tokio::select!` on the existing current-thread runtime multiplexes four
 //! sources: terminal input (a dedicated OS thread feeding a channel, since
@@ -53,8 +53,8 @@ const TICK: Duration = Duration::from_millis(100);
 /// Ctrl-C cancels even while a synchronous tool blocks the executor thread.
 type CurrentTurn = Arc<Mutex<Option<CancellationToken>>>;
 
-/// Run the interactive full-screen session to completion on `runtime`, then
-/// restore the terminal. `tui` already owns the alternate screen + raw mode.
+/// Run the interactive terminal-surface session to completion on `runtime`, then
+/// restore the terminal. `tui` already owns raw mode and paste/key flags.
 pub(crate) fn run<P: ChatProvider>(
     harness: &mut Harness<P>,
     runtime: &Runtime,
@@ -120,10 +120,8 @@ async fn session_loop<P: ChatProvider>(
     tui.screen.apply_event(UiEvent::SessionStarted);
     refresh_footer(tui, switch);
     tui.draw()?;
-    // Draw the inline viewport before starting the blocking input reader. The
-    // first draw commits the banner through Ratatui, which may still need a
-    // terminal cursor-position probe on some backends; a concurrent event::read
-    // can steal that response and make startup fail.
+    // Draw once before starting the blocking input reader so the banner is
+    // visible immediately and the terminal surface has its initial dimensions.
     spawn_input_thread(input_tx, current_turn.clone());
 
     // The production OAuth backend; `/login` drives it on a blocking task.
@@ -945,7 +943,7 @@ fn handle_running_event(
 ) -> bool {
     match event {
         // Mouse capture is off; the terminal scrolls its own scrollback. Resize
-        // still triggers a redraw of the live viewport.
+        // still triggers a redraw of the terminal surface.
         Event::Resize(..) => true,
         Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

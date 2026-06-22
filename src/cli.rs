@@ -248,7 +248,7 @@ fn current_selection_lines(selection: &ModelSelection) -> Vec<String> {
 }
 
 /// Entry point for the interactive session. Selects the front-end exactly as the
-/// former `ui::tui::stdio()` did -- the persistent full-screen TUI when both
+/// former `ui::tui::stdio()` did -- the persistent terminal-surface TUI when both
 /// stdin and stdout are terminals, otherwise the blocking text UI for pipes/CI
 /// -- and runs the matching driver.
 pub(crate) fn run_interactive<P: ChatProvider>(
@@ -267,8 +267,8 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     run_session(harness, &mut ui, switch)
 }
 
-/// Drive the full-screen TUI: owns a Tier-3 current-thread runtime, hands it to
-/// the async event loop, and bounds shutdown like the text driver does.
+/// Drive the terminal-surface TUI: owns a Tier-3 current-thread runtime, hands
+/// it to the async event loop, and bounds shutdown like the text driver does.
 fn run_tui<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: TuiUi,

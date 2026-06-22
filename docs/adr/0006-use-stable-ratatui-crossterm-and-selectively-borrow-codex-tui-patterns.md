@@ -12,6 +12,8 @@ Iris needs a full-screen terminal UI, but Nexus must remain independent of rende
 
 We build an Iris-native TUI on stable crates.io Ratatui and Crossterm. We selectively borrow UI patterns from Codex, such as transcript layout and markdown/code rendering ideas, but do not copy its fork-heavy TUI stack wholesale.
 
+Ratatui is a UI-primitives dependency, not the production terminal driver. Iris owns the terminal surface lifecycle in `src/ui/terminal_surface.rs`: previous rendered lines, synchronized output, append/diff updates, and full replay from `Screen` state on resize or unsafe shrink. Production TUI code does not delegate terminal lifecycle to Ratatui `Terminal`, `Viewport::Inline`, `Terminal::draw`, `Terminal::insert_before`, or an alternate screen.
+
 ## Alternatives Considered
 
 ### Copy Codex TUI wholesale
@@ -29,16 +31,24 @@ We build an Iris-native TUI on stable crates.io Ratatui and Crossterm. We select
 - **Cons**: Unstable dependency surface and unnecessary coupling.
 - **Why not**: Stable crates.io releases are sufficient for Iris's TUI needs.
 
+### Delegate the live surface to Ratatui `Terminal` inline viewports
+- **Pros**: Less Iris-owned terminal diff code.
+- **Cons**: Inline viewport construction fixes lifecycle policy too early, couples scrollback commits to Ratatui backend behavior, and makes resize replay depend on terminal probing/viewport internals instead of Iris state.
+- **Why not**: Iris needs resize and transcript replay to be explicit, testable, and owned by the Tier-3 TUI seam.
+
 ## Consequences
 
 ### Positive
 - Keeps UI code sized to Iris.
 - Avoids vendoring Codex internals and forked dependencies.
 - Preserves the Nexus-to-UI seam.
+- Keeps transcript replay in Iris state, so resize redraws are coherent without asking Ratatui to recover hidden viewport state.
 
 ### Negative
 - Iris must reimplement some terminal polish itself.
 - Codex UI behavior cannot be copied mechanically.
+- Iris now owns terminal line-diff correctness for the TUI surface.
 
 ### Risks
 - Terminal input/rendering can leak back into Nexus; mitigate by keeping rendering behind UI events and approval seams.
+- Terminal escape-sequence bugs can corrupt the visible surface; mitigate with narrow `TerminalSurface` tests for first render, append, diff, resize replay, shrink clearing, and width bounds.

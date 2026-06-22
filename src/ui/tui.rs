@@ -1,36 +1,37 @@
-//! Full-screen terminal front-end state and rendering (Tier 3) built on ratatui.
+//! Terminal front-end state and rendering (Tier 3) built on Iris-owned terminal
+//! surface lifecycle plus Ratatui UI primitives.
 //!
-//! Layering: ratatui owns the cell buffer, the frame diff, and width-aware
-//! layout; `ratatui-textarea` owns the editor buffer (multiline + undo/redo +
-//! kill-ring + word-nav) over that same buffer; this module is the thin layer on
-//! top. [`Screen`] holds the UI state (transcript, editor, spinner, slash
-//! palette) and renders it into a frame; [`TuiUi`] owns the terminal lifecycle
-//! (one persistent alternate-screen + raw-mode session). The async input/render
-//! loop that drives them lives in [`crate::ui::tui_loop`].
+//! Layering: [`Screen`] owns all replayable UI state (transcript, editor,
+//! spinner, slash palette, modal). Ratatui remains a text/style/layout/widget
+//! toolkit (`Line`, `Span`, `Buffer`, `Layout`, `Paragraph`, and
+//! `ratatui-textarea`), but [`TuiUi`] no longer delegates terminal lifecycle,
+//! diffing, terminal-surface replay, or resize behavior to Ratatui `Terminal`. The
+//! production terminal surface lives in [`crate::ui::terminal_surface`] and
+//! redraws from this Iris-owned state on resize.
 //!
 //! Concurrency / cancellation: raw mode is entered ONCE for the whole session,
 //! so Ctrl-C arrives as a key event, never SIGINT; the loop (not this module)
 //! reads keys and cancels the turn token. This module performs no terminal
-//! reads and holds no channels, so its state transitions and frame output are
-//! unit-testable via ratatui's `TestBackend` without a TTY.
+//! reads and holds no channels, so its state transitions and logical document
+//! output are unit-testable without a TTY.
 
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::Result;
-use ratatui::backend::{Backend, ClearType, CrosstermBackend};
+use ratatui::buffer::Buffer;
+use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -40,6 +41,7 @@ use crate::tool_display::{
 };
 use crate::ui::modal::Modal;
 use crate::ui::slash::{self, Palette, SlashCommand};
+use crate::ui::terminal_surface::TerminalSurface;
 use crate::ui::{TurnErrorKind, UiEvent};
 
 const BANNER_LINES: &[&str] = &["iris", "terminal-first coding agent", "Type /exit to quit."];
@@ -55,18 +57,16 @@ const MAX_EDITOR_ROWS: u16 = 10;
 /// Slash popup height cap (including its border).
 const MAX_PALETTE_ROWS: u16 = 8;
 
-/// Height of the persistent inline live viewport (the small region that
-/// repaints every frame: active in-flight block tail + status + palette +
-/// editor). Everything finalized is committed above it into the terminal's
-/// native scrollback via `insert_before`. ratatui's inline viewport height is
-/// fixed at construction, so this reserves enough room for the `/model` modal
-/// mockup plus the current catalog while keeping normal editor slack bounded.
-const LIVE_VIEWPORT_ROWS: u16 = 16;
+/// Compact inline footprint for a short session. Once the transcript grows past
+/// this, Iris naturally scrolls with the terminal; before then it stays near the
+/// bottom instead of immediately occupying the whole terminal height.
+const MIN_INLINE_DOCUMENT_ROWS: u16 = 16;
 
-/// Cap on rows committed in a single `insert_before` call, so one finalized
-/// block never allocates an unbounded scratch buffer; larger blocks are
-/// committed in successive chunks (order preserved).
-const MAX_INSERT_ROWS: usize = 500;
+/// Safety valve for long-running sessions: keep rendering and retained
+/// transcript state bounded. The terminal's own scrollback already contains
+/// earlier emitted rows; Iris keeps the recent tail for resize replay.
+const MAX_TRANSCRIPT_ROWS: usize = 10_000;
+const MAX_STREAMING_MARKDOWN_BYTES: usize = 64 * 1024;
 
 /// Flood guard: cap a tool result at this many physical (wrapped) rows in the
 /// transcript so a few very long lines cannot flood the viewport/scrollback.
@@ -370,8 +370,9 @@ fn apply_full_width_bg(line: &mut Line<'static>, bg: Color, width: usize) {
 
 /// A block-separator row: the empty plain row `push_blank` inserts between
 /// top-level blocks. Distinguished from a Markdown-internal blank line (which
-/// carries a styled `line`) and from a turn-rule row so only true block
-/// boundaries split scrollback commits.
+/// carries a styled `line`) and from a turn-rule row so block grouping remains
+/// stable while the terminal surface replays from Iris state.
+#[cfg(test)]
 fn is_separator_row(row: &TranscriptRow) -> bool {
     !row.hrule && row.text.is_empty() && row.line.is_none()
 }
@@ -492,9 +493,8 @@ fn push_wrapped_row(
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
 /// exclusive, so at most one is ever open. `body_start` is the row index of the
-/// block body (its `Running`/`Ran` header); `take_scrollback` keeps it valid
-/// across scrollback drains. `output` is the bounded live tail re-rendered (and
-/// flood-capped) under the gutter on each delta.
+/// block body (its `Running`/`Ran` header). `output` is the bounded live tail
+/// re-rendered (and flood-capped) under the gutter on each delta.
 struct ActiveExec {
     call: ToolCall,
     output: String,
@@ -738,14 +738,6 @@ impl Transcript {
         } else {
             self.last_width
         }
-    }
-
-    /// Index of the last block separator (a blank `push_blank` row), or 0 if
-    /// none. Rows before it form complete blocks safe to commit to scrollback;
-    /// the rows from it onward are the current, still-growable block (so an
-    /// `Explored` group or a streamed message can keep appending to it).
-    fn last_separator_index(&self) -> usize {
-        self.rows.iter().rposition(is_separator_row).unwrap_or(0)
     }
 
     /// Push one gutter-prefixed tool-output line, preserving ANSI styling and
@@ -1077,6 +1069,20 @@ impl Transcript {
                 self.finish_stream();
             }
         }
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        if self.rows.len() <= MAX_TRANSCRIPT_ROWS
+            || self.streaming.is_some()
+            || self.active_exec.is_some()
+            || !self.active_explorations.is_empty()
+        {
+            return;
+        }
+        let remove = self.rows.len() - MAX_TRANSCRIPT_ROWS;
+        self.rows.drain(..remove);
+        self.exploring_open = self.rows.iter().any(|row| row.text == "• Explored");
     }
 
     /// Commit a submitted prompt into the transcript as a shaded user block
@@ -1093,6 +1099,7 @@ impl Transcript {
             self.rows
                 .push(TranscriptRow::with_line(Line::from(spans), Some("  ")).with_bg(USER_BG));
         }
+        self.trim_history();
     }
 
     /// Append Codex's turn-end separator: a dim full-width rule, labelled
@@ -1107,6 +1114,7 @@ impl Transcript {
             _ => String::new(),
         };
         self.rows.push(TranscriptRow::rule(label));
+        self.trim_history();
     }
 
     fn render(&mut self, width: u16) -> Vec<Line<'static>> {
@@ -1117,12 +1125,24 @@ impl Transcript {
             row.render(width, &mut rows);
         }
         if let Some(text) = &self.streaming {
-            for line in crate::ui::markdown::render_markdown(text) {
+            let text = streaming_markdown_preview(text);
+            for line in crate::ui::markdown::render_markdown(&text) {
                 TranscriptRow::markdown(line).render(width, &mut rows);
             }
         }
         rows
     }
+}
+
+fn streaming_markdown_preview(text: &str) -> String {
+    if text.len() <= MAX_STREAMING_MARKDOWN_BYTES {
+        return text.to_string();
+    }
+    let start = text.ceil_char_boundary(text.len() - MAX_STREAMING_MARKDOWN_BYTES);
+    format!(
+        "… streaming preview truncated; showing latest content …\n{}",
+        &text[start..]
+    )
 }
 
 fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
@@ -1311,8 +1331,7 @@ fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
 }
 
 /// UI state plus its rendering. Holds no terminal handle and no channels, so its
-/// behavior is unit-testable without a TTY and its frame output is testable via
-/// ratatui's `TestBackend`.
+/// behavior and rendered logical document are unit-testable without a TTY.
 pub(crate) struct Screen {
     transcript: Transcript,
     /// Multiline editor buffer (undo/redo, kill-ring, word-nav) owned by
@@ -1370,7 +1389,8 @@ impl Screen {
     // --- transcript ---
 
     /// Apply one semantic event to the transcript. The loop calls this for every
-    /// Nexus event; committed history is moved to native scrollback on draw.
+    /// Nexus event; history remains in Iris state so the terminal surface can
+    /// replay/reflow it after a resize.
     pub(crate) fn apply_event(&mut self, event: UiEvent) {
         self.apply(event);
     }
@@ -1388,41 +1408,9 @@ impl Screen {
         self.transcript.commit_user(text);
     }
 
-    // --- scrollback commit ---
-
-    /// Drain the finalized transcript rows, wrapped to `width`, for committing
-    /// into the terminal's native scrollback. While a turn is active the
-    /// current (still-growing) block stays live in the viewport; between turns
-    /// everything is finalized so the viewport holds only the editor/status.
-    pub(crate) fn take_scrollback(&mut self, width: u16) -> Vec<Line<'static>> {
-        let w = usize::from(width.max(1));
-        self.transcript.last_width = w;
-        let commit_point = if self.spinner.active {
-            self.transcript.last_separator_index()
-        } else {
-            self.transcript.rows.len()
-        };
-        let drained: Vec<TranscriptRow> = self.transcript.rows.drain(..commit_point).collect();
-        // The drain shifts every surviving row down by `commit_point`; keep the
-        // open exec cell's body anchor pointing at its (now-relocated) header so
-        // in-place finalize/relayout still target the right rows. `commit_point`
-        // never exceeds the active block's start, so this stays non-negative.
-        if let Some(active) = self.transcript.active_exec.as_mut() {
-            active.body_start = active.body_start.saturating_sub(commit_point);
-        }
-        for active in &mut self.transcript.active_explorations {
-            active.row = active.row.saturating_sub(commit_point);
-        }
-        let mut out = Vec::new();
-        for row in &drained {
-            row.render(w, &mut out);
-        }
-        out
-    }
-
-    /// Render the live (not-yet-finalized) transcript rows plus any in-flight
-    /// stream, wrapped to `width`. This is the bounded active-block content
-    /// shown in the viewport above the editor.
+    /// Render all transcript rows plus any in-flight stream, wrapped to `width`.
+    /// Finalized history is intentionally retained here; the terminal surface
+    /// owns append/diff/full-replay decisions instead of draining UI state.
     fn wrapped_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         self.transcript.render(width)
     }
@@ -1631,14 +1619,15 @@ fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// Render the slash popup: a bordered list with the selected row highlighted.
-fn render_palette(frame: &mut Frame, area: Rect, matches: &[&SlashCommand], selected: usize) {
+/// Render the slash popup into an offscreen Ratatui buffer: a bordered list with
+/// the selected row highlighted.
+fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selected: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(dim_style())
         .title(Span::styled(" commands ", dim_style()));
     let inner = block.inner(area);
-    frame.render_widget(block, area);
+    block.render(area, buf);
     let mut rows = Vec::new();
     for (i, cmd) in matches.iter().enumerate() {
         let name_style = if i == selected {
@@ -1655,27 +1644,41 @@ fn render_palette(frame: &mut Frame, area: Rect, matches: &[&SlashCommand], sele
             Span::styled(cmd.description, dim_style()),
         ]));
     }
-    frame.render_widget(Paragraph::new(Text::from(rows)), inner);
+    Paragraph::new(Text::from(rows)).render(inner, buf);
 }
 
-/// Render the small live viewport: the active in-flight block (its tail) on
-/// top, a status/spinner row, an optional slash popup, then the bordered editor
-/// pinned at the bottom. Finalized history is NOT drawn here -- it already lives
-/// in the terminal's native scrollback above this viewport (see
-/// [`TuiUi::draw`]). The editor/palette are clamped to the fixed viewport
-/// height; the editor scrolls internally beyond its visible rows.
-fn render(frame: &mut Frame, screen: &mut Screen) {
-    let area = frame.area();
-    if area.height == 0 || area.width < 1 {
-        return;
+/// Render the full logical document for the current terminal size: all
+/// transcript rows retained in Iris state, plus bottom-pinned modal or
+/// status/palette/editor chrome. The terminal surface decides how much of this
+/// document can be patched and when it must be fully replayed.
+fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
+    if size.height == 0 || size.width < 1 {
+        return Vec::new();
     }
+    let width = size.width.max(1);
+    let height = size.height.max(1);
+    let mut transcript = screen.wrapped_lines(width);
+    let chrome = if screen.modal.is_some() {
+        render_modal_chrome(screen, width, height)
+    } else {
+        render_editor_chrome(screen, width, height)
+    };
+    let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
+    let min_transcript_rows = usize::from(target_rows).saturating_sub(chrome.len());
+    if transcript.len() < min_transcript_rows {
+        let mut padded = Vec::with_capacity(min_transcript_rows + chrome.len());
+        padded.extend(
+            std::iter::repeat_with(Line::default).take(min_transcript_rows - transcript.len()),
+        );
+        padded.extend(transcript);
+        transcript = padded;
+    }
+    transcript.extend(chrome);
+    transcript
+}
 
-    // A picker/dialog replaces the editor area entirely: the active transcript
-    // stays on top, the modal occupies the bottom, framed in its own border.
-    if screen.modal.is_some() {
-        render_with_modal(frame, screen, area);
-        return;
-    }
+fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
+    let area = Rect::new(0, 0, width, height);
 
     let editor_rows = editor_visual_rows(&screen.editor, area.width);
     let input_text = screen.editor_text();
@@ -1712,36 +1715,24 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
     let status_h = desired_status_h.min(max_status_h);
     let status_lines = screen.status_lines(area.width);
 
+    let chrome_h = status_h.saturating_add(palette_h).saturating_add(editor_h);
+    let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
-        Constraint::Min(0),
         Constraint::Length(status_h),
         Constraint::Length(palette_h),
         Constraint::Length(editor_h),
     ])
-    .split(area);
-    let active_area = chunks[0];
-    let status_area = chunks[1];
-    let palette_area = chunks[2];
-    let editor_area = chunks[3];
+    .split(chrome_area);
+    let status_area = chunks[0];
+    let palette_area = chunks[1];
+    let editor_area = chunks[2];
 
-    // Active in-flight block: show its tail so the newest live output (a
-    // streaming reply or the most recent tool block) stays visible until it is
-    // finalized into scrollback.
-    if active_area.height > 0 {
-        let lines = screen.wrapped_lines(active_area.width);
-        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        let scroll = total.saturating_sub(active_area.height);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
-            active_area,
-        );
-    }
-
-    frame.render_widget(Paragraph::new(Text::from(status_lines)), status_area);
+    let mut buf = Buffer::empty(chrome_area);
+    Paragraph::new(Text::from(status_lines)).render(status_area, &mut buf);
 
     if palette_h > 0 {
         render_palette(
-            frame,
+            &mut buf,
             palette_area,
             &palette_matches,
             screen.palette.selected(),
@@ -1749,137 +1740,91 @@ fn render(frame: &mut Frame, screen: &mut Screen) {
     }
 
     // The TextArea draws its own border (set in `fresh_editor`) and cursor.
-    frame.render_widget(&screen.editor, editor_area);
+    (&screen.editor).render(editor_area, &mut buf);
+    buffer_to_lines(&buf)
 }
 
-/// Render the active transcript on top and the open modal in a bordered box at
-/// the bottom, in place of the editor/palette/status rows. The modal box is
-/// sized to its content and may use the whole live viewport when needed.
-fn render_with_modal(frame: &mut Frame, screen: &mut Screen, area: Rect) {
+/// Render the open modal in a bordered box at the document bottom, in place of
+/// the editor/palette/status rows. The transcript remains outside this chrome
+/// and is replayable from [`Screen`] state.
+fn render_modal_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
     let Some(modal) = &screen.modal else {
-        return;
+        return Vec::new();
     };
-    let lines = modal.render(area.width.saturating_sub(2));
+    let lines = modal.render(width.saturating_sub(2));
     let body_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    // content rows + top/bottom border, clamped to the live viewport.
-    let max_modal_h = area.height.max(1);
+    // content rows + top/bottom border, clamped to the visible terminal height.
+    let max_modal_h = height.max(1);
     // Prefer at least 3 rows (border + one line), but never exceed the available
     // height: on a tiny terminal `max_modal_h` can be 1-2, so cap last. Using
     // `clamp(3, max_modal_h)` here would panic when max < min.
     let modal_h = body_rows.saturating_add(2).max(3).min(max_modal_h);
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(modal_h)]).split(area);
-    let active_area = chunks[0];
-    let modal_area = chunks[1];
-
-    if active_area.height > 0 {
-        let active_lines = screen.transcript.render(active_area.width);
-        let total = u16::try_from(active_lines.len()).unwrap_or(u16::MAX);
-        let scroll = total.saturating_sub(active_area.height);
-        frame.render_widget(
-            Paragraph::new(Text::from(active_lines)).scroll((scroll, 0)),
-            active_area,
-        );
-    }
+    let modal_area = Rect::new(0, 0, width, modal_h);
+    let mut buf = Buffer::empty(modal_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(prompt_style())
         .title(Span::styled(format!(" {} ", modal.title()), prompt_style()));
     let inner = block.inner(modal_area);
-    frame.render_widget(block, modal_area);
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    block.render(modal_area, &mut buf);
+    Paragraph::new(Text::from(lines)).render(inner, &mut buf);
+    buffer_to_lines(&buf)
 }
 
-/// Commit finalized transcript `lines` into the terminal's native scrollback,
-/// above the inline live viewport, in row-bounded chunks (order preserved).
-/// Generic over the backend so it is exercisable with `TestBackend`.
-fn insert_lines_before<B: Backend>(
-    terminal: &mut Terminal<B>,
-    lines: Vec<Line<'static>>,
-) -> Result<(), B::Error> {
-    for chunk in lines.chunks(MAX_INSERT_ROWS) {
-        let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
-        let text = Text::from(chunk.to_vec());
-        terminal.insert_before(height, move |buf| {
-            Paragraph::new(text).render(buf.area, buf);
-        })?;
+fn buffer_to_lines(buf: &Buffer) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for y in 0..buf.area.height {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            let style = cell.style();
+            if let Some(last) = spans.last_mut()
+                && last.style == style
+            {
+                last.content.to_mut().push_str(cell.symbol());
+                continue;
+            }
+            spans.push(Span::styled(cell.symbol().to_string(), style));
+        }
+        out.push(Line::from(spans));
     }
-    Ok(())
+    out
 }
 
-fn render_without_autoresize<B: Backend>(
-    terminal: &mut Terminal<B>,
-    screen: &mut Screen,
-) -> Result<(), B::Error> {
-    {
-        let mut frame = terminal.get_frame();
-        render(&mut frame, screen);
-    }
-    terminal.apply_buffer_with_cursor(None)?;
-    Ok(())
-}
-
-/// Terminal driver: owns the ratatui terminal and the persistent raw-mode +
-/// inline-viewport lifecycle for the whole interactive session. It does NOT
-/// enter the alternate screen: finalized history is committed into the
-/// terminal's native scrollback (selectable, copyable, scrolled by the real
-/// terminal) above a small inline live viewport. Reads no input itself;
+/// Terminal driver: owns raw mode, paste/key flags, cursor visibility, terminal
+/// size reads, and the Iris terminal surface for the whole interactive session.
+/// It does NOT enter the alternate screen and does not use Ratatui `Terminal`:
 /// [`crate::ui::tui_loop`] feeds it events and calls [`TuiUi::draw`].
 pub(crate) struct TuiUi {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    surface: TerminalSurface<Stdout>,
     pub(crate) screen: Screen,
-    native_scrollback: bool,
-    allow_resize_probe: bool,
-    last_size: Size,
     active: bool,
 }
 
 impl TuiUi {
-    /// Enter raw mode ONCE and create an inline viewport for the session, plus
-    /// bracketed paste and modified-key reporting. Mouse capture is deliberately NOT enabled so the
-    /// terminal's own scroll/select/copy works over the native scrollback the
-    /// inline viewport writes into. Restored on `drop`/`shutdown`, and by the
-    /// signal handler's emergency escape on a force-quit.
+    /// Enter raw mode ONCE, enable bracketed paste + modified-key reporting,
+    /// hide the hardware cursor, and create the Iris terminal surface. Mouse
+    /// capture is deliberately NOT enabled so the terminal owns scroll/select/
+    /// copy over the normal screen scrollback. Restored on `drop`/`shutdown`,
+    /// and by the signal handler's emergency escape on a force-quit.
     pub(crate) fn new() -> Result<Self> {
         // Capture cooked-mode termios before raw mode so the force-quit signal
         // handler can restore the tty even though Drop will not run then.
         crate::signals::save_termios_for_force_quit();
         enable_raw_mode()?;
-        let backend = CrosstermBackend::new(io::stdout());
-        let options = TerminalOptions {
-            viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
-        };
-        let (terminal, native_scrollback) = match Terminal::with_options(backend, options) {
-            Ok(terminal) => (terminal, true),
-            Err(error) if is_cursor_position_timeout(&error) => {
-                // ponytail: full-screen TUI fallback. Native scrollback needs
-                // an inline cursor probe; if this terminal cannot answer it,
-                // keep the TUI alive and let the in-frame transcript hold
-                // history. Upgrade path: switch input to an interruptible
-                // event stream so inline resize probes can be serialized.
-                match Terminal::new(CrosstermBackend::new(io::stdout())) {
-                    Ok(terminal) => (terminal, false),
-                    Err(error) => {
-                        let _ = disable_raw_mode();
-                        return Err(error.into());
-                    }
-                }
-            }
-            Err(error) => {
-                let _ = disable_raw_mode();
-                return Err(error.into());
-            }
-        };
-        let last_size = terminal.size()?;
+        let mut stdout = io::stdout();
         if let Err(error) = execute!(
-            io::stdout(),
+            stdout,
             EnableBracketedPaste,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            Hide,
         ) {
             let _ = execute!(
-                io::stdout(),
+                stdout,
                 DisableBracketedPaste,
                 PopKeyboardEnhancementFlags,
+                Show,
             );
             let _ = disable_raw_mode();
             return Err(error.into());
@@ -1887,66 +1832,38 @@ impl TuiUi {
         crate::signals::enable_terminal_restore_on_force_quit();
         crate::telemetry::set_tui_active(true);
         Ok(Self {
-            terminal,
+            surface: TerminalSurface::new(stdout),
             screen: Screen::new(),
-            native_scrollback,
-            allow_resize_probe: true,
-            last_size,
             active: true,
         })
     }
 
-    fn fallback_to_fullscreen(&mut self) -> Result<()> {
-        // ponytail: once inline would need a post-startup cursor probe (resize),
-        // stop using native scrollback and keep the Ratatui UI alive in-frame.
-        // Upgrade path: serialize terminal probes with input reads.
-        self.terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        self.native_scrollback = false;
-        self.allow_resize_probe = false;
-        self.last_size = self.terminal.size()?;
-        Ok(())
-    }
-
     pub(crate) fn draw(&mut self) -> Result<()> {
-        // Ratatui's inline autoresize recomputes the viewport from a terminal
-        // cursor-position probe. That is safe before the input reader starts,
-        // but after startup `event::read()` can steal the CPR response. Avoid
-        // `Terminal::draw()` here because it autoresizes internally every pass.
-        let size = self.terminal.size()?;
-        if self.native_scrollback && !self.allow_resize_probe && size != self.last_size {
-            self.fallback_to_fullscreen()?;
-        }
-        if !self.native_scrollback || self.allow_resize_probe {
-            self.terminal.autoresize()?;
-            self.last_size = self.terminal.size()?;
-        }
-        self.allow_resize_probe = false;
-        let width = self.terminal.size()?.width;
-        if self.native_scrollback {
-            let committed = self.screen.take_scrollback(width);
-            insert_lines_before(&mut self.terminal, committed)?;
-        }
-        render_without_autoresize(&mut self.terminal, &mut self.screen)?;
+        let (width, height) = terminal_size()?;
+        let size = Size::new(width.max(1), height.max(1));
+        let document = render_document(&mut self.screen, size);
+        self.surface.render(size, &document)?;
         Ok(())
     }
 
     fn restore(&mut self) {
         if self.active {
-            // Clear the live viewport and drop the cursor onto a fresh line so
-            // the shell prompt resumes below, not over the editor box. No
-            // alternate screen was entered, so committed scrollback stays put.
-            let area = self.terminal.get_frame().area();
-            let backend = self.terminal.backend_mut();
-            let _ = backend.set_cursor_position(area.as_position());
-            let _ = backend.clear_region(ClearType::AfterCursor);
-            let _ = backend.set_cursor_position((0, area.y + area.height.saturating_sub(1)));
-            let _ = disable_raw_mode();
+            // Replace the interactive chrome with transcript-only content so
+            // the shell prompt resumes below conversation history, not below a
+            // stale editor box.
+            if let Ok((width, height)) = terminal_size() {
+                let size = Size::new(width.max(1), height.max(1));
+                let transcript = self.screen.wrapped_lines(size.width);
+                let _ = self.surface.render(size, &transcript);
+            }
+            let _ = self.surface.finish();
             let _ = execute!(
-                io::stdout(),
+                self.surface.writer_mut(),
                 DisableBracketedPaste,
                 PopKeyboardEnhancementFlags,
+                Show,
             );
-            let _ = backend.show_cursor();
+            let _ = disable_raw_mode();
             crate::signals::disable_terminal_restore_on_force_quit();
             crate::telemetry::set_tui_active(false);
             self.active = false;
@@ -1964,16 +1881,10 @@ impl Drop for TuiUi {
     }
 }
 
-fn is_cursor_position_timeout(error: &io::Error) -> bool {
-    error
-        .to_string()
-        .contains("cursor position could not be read")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
+    use crate::ui::terminal_surface::{RenderKind, TerminalSurface};
     use serde_json::json;
 
     fn call(name: &str) -> ToolCall {
@@ -2022,6 +1933,35 @@ mod tests {
         predicate: impl Fn(&Line<'static>) -> bool,
     ) -> &'a Line<'static> {
         lines.iter().find(|line| predicate(line)).expect("line")
+    }
+
+    fn rendered_lines(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
+        render_document(screen, Size::new(width, height))
+    }
+
+    fn rendered_text(screen: &mut Screen, width: u16, height: u16) -> String {
+        rendered_lines(screen, width, height)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::new();
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     #[test]
@@ -2085,7 +2025,11 @@ mod tests {
 
         let live = screen.wrapped_lines(80);
         assert!(screen.transcript.rows.is_empty());
-        assert!(screen.take_scrollback(80).is_empty());
+        assert!(
+            render_document(&mut screen, Size::new(80, 12))
+                .iter()
+                .any(|line| line_text(line) == "Title")
+        );
 
         let title = line_matching(&live, |l| line_text(l) == "Title");
         assert!(
@@ -2106,10 +2050,10 @@ mod tests {
         screen.apply(UiEvent::AssistantTextEnd(markdown.to_string()));
         let finalized = screen.wrapped_lines(80);
         assert_eq!(line_signature(&live), line_signature(&finalized));
-
-        let committed = screen.take_scrollback(80);
-        assert_eq!(line_signature(&finalized), line_signature(&committed));
-        assert!(screen.take_scrollback(80).is_empty());
+        assert_eq!(
+            line_signature(&finalized),
+            line_signature(&screen.wrapped_lines(80))
+        );
     }
 
     #[test]
@@ -2212,16 +2156,15 @@ mod tests {
 
     #[test]
     fn committed_user_block_carries_full_width_background() {
-        // The shaded user block must keep its full-width background once it is
-        // committed to native scrollback (the lines handed to `insert_before`),
-        // not only in the live viewport.
+        // The shaded user block must keep its full-width background in the
+        // replayable transcript document, not only while being edited live.
         let mut screen = Screen::new();
         screen.commit_user("hello");
-        let committed = screen.take_scrollback(20);
-        let row = committed
+        let lines = screen.wrapped_lines(20);
+        let row = lines
             .iter()
             .find(|l| line_text(l).contains("hello"))
-            .expect("user row committed to scrollback");
+            .expect("user row rendered from state");
         assert_eq!(row.style.bg, Some(USER_BG));
         assert_eq!(display_width(&line_text(row)), 20);
         assert!(
@@ -2398,8 +2341,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_hint_wraps_in_narrow_frame() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(48, 10))?;
+    fn approval_hint_wraps_in_narrow_frame() {
         let mut screen = Screen::new();
         screen.show_approval(
             &call_args(
@@ -2411,13 +2353,11 @@ mod tests {
             ),
             false,
         );
-        terminal.draw(|f| render(f, &mut screen))?;
-        let rendered = buffer_text(&terminal);
+        let rendered = rendered_text(&mut screen, 48, 10);
         assert!(rendered.contains("approve printf 'global:"));
         assert!(rendered.contains("  │ "));
         assert!(rendered.contains("(timeout 120s)"));
         assert!(rendered.contains("[N] deny"), "{rendered}");
-        Ok(())
     }
 
     #[test]
@@ -2496,10 +2436,11 @@ mod tests {
                 "  └ Reading src/ui/tui.rs".to_string(),
             ]
         );
-        let committed: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
         assert!(
-            !committed.iter().any(|line| line.contains("Reading")),
-            "live exploration row committed too early: {committed:?}"
+            screen
+                .wrapped_lines(80)
+                .iter()
+                .any(|line| line_text(line).contains("Reading src/ui/tui.rs"))
         );
 
         screen.apply(UiEvent::ToolResult {
@@ -2654,327 +2595,148 @@ mod tests {
     }
 
     #[test]
-    fn take_scrollback_commits_finalized_blocks_and_keeps_current_block_live() {
+    fn transcript_history_stays_in_state_for_replay_after_turn_end() {
         let mut screen = Screen::new();
-        // Active turn: the most recent block stays live for grouping/streaming.
         screen.start_turn();
         screen.apply(UiEvent::AssistantText("first answer".to_string()));
         screen.apply(UiEvent::Notice("a note".to_string()));
-        // Two blocks exist; committing keeps the last (current) block live.
-        let committed: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
-        assert!(committed.iter().any(|l| l == "first answer"));
-        assert!(
-            !committed.iter().any(|l| l.contains("a note")),
-            "current block must stay live during a turn: {committed:?}"
-        );
-        // The live viewport still shows the current block.
+        screen.end_turn();
+
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("first answer"), "{rendered:?}");
+        assert!(rendered.contains("a note"), "{rendered:?}");
+        assert!(rendered.contains("message"), "editor missing: {rendered:?}");
         assert!(
             screen
-                .wrapped_lines(80)
+                .transcript
+                .rows
                 .iter()
-                .any(|l| line_text(l).contains("a note"))
-        );
-        // Ending the turn finalizes everything; nothing remains live.
-        screen.end_turn();
-        let rest: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
-        assert!(rest.iter().any(|l| l.contains("a note")));
-        assert!(
-            screen.wrapped_lines(80).is_empty(),
-            "viewport empty at idle"
+                .any(|row| row.text.contains("first answer")),
+            "finalized history must remain in Iris state"
         );
     }
 
-    /// Replicate `TuiUi::draw` against a generic backend so the full
-    /// commit-then-render path is exercisable with `TestBackend`.
-    fn draw_step<B: Backend>(terminal: &mut Terminal<B>, screen: &mut Screen) -> Result<()>
-    where
-        B::Error: std::error::Error + Send + Sync + 'static,
-    {
-        draw_step_with_scrollback(terminal, screen, true)
-    }
-
-    fn draw_step_with_scrollback<B>(
-        terminal: &mut Terminal<B>,
-        screen: &mut Screen,
-        native_scrollback: bool,
-    ) -> Result<()>
-    where
-        B: Backend,
-        B::Error: std::error::Error + Send + Sync + 'static,
-    {
-        let width = terminal.size()?.width;
-        if native_scrollback {
-            let committed = screen.take_scrollback(width);
-            insert_lines_before(terminal, committed)?;
-        }
-        render_without_autoresize(terminal, screen)?;
-        Ok(())
-    }
-
-    struct CursorProbeFailBackend {
-        inner: TestBackend,
-        fail_cursor_probe: bool,
-        size_override: Option<ratatui::layout::Size>,
-    }
-
-    impl CursorProbeFailBackend {
-        fn new(width: u16, height: u16) -> Self {
-            Self {
-                inner: TestBackend::new(width, height),
-                fail_cursor_probe: false,
-                size_override: None,
-            }
-        }
-    }
-
-    impl Backend for CursorProbeFailBackend {
-        type Error = io::Error;
-
-        fn draw<'a, I>(&mut self, content: I) -> std::result::Result<(), Self::Error>
-        where
-            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
-        {
-            self.inner.draw(content).map_err(|err| match err {})
-        }
-
-        fn append_lines(&mut self, n: u16) -> std::result::Result<(), Self::Error> {
-            self.inner.append_lines(n).map_err(|err| match err {})
-        }
-
-        fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
-            self.inner.hide_cursor().map_err(|err| match err {})
-        }
-
-        fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
-            self.inner.show_cursor().map_err(|err| match err {})
-        }
-
-        fn get_cursor_position(
-            &mut self,
-        ) -> std::result::Result<ratatui::layout::Position, Self::Error> {
-            if self.fail_cursor_probe {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "cursor position could not be read",
-                ));
-            }
-            self.inner.get_cursor_position().map_err(|err| match err {})
-        }
-
-        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
-            &mut self,
-            position: P,
-        ) -> std::result::Result<(), Self::Error> {
-            self.inner
-                .set_cursor_position(position)
-                .map_err(|err| match err {})
-        }
-
-        fn clear(&mut self) -> std::result::Result<(), Self::Error> {
-            self.inner.clear().map_err(|err| match err {})
-        }
-
-        fn clear_region(&mut self, clear_type: ClearType) -> std::result::Result<(), Self::Error> {
-            self.inner
-                .clear_region(clear_type)
-                .map_err(|err| match err {})
-        }
-
-        fn size(&self) -> std::result::Result<ratatui::layout::Size, Self::Error> {
-            Ok(self
-                .size_override
-                .unwrap_or_else(|| self.inner.size().expect("test backend size")))
-        }
-
-        fn window_size(
-            &mut self,
-        ) -> std::result::Result<ratatui::backend::WindowSize, Self::Error> {
-            Ok(ratatui::backend::WindowSize {
-                columns_rows: self.size()?,
-                pixels: ratatui::layout::Size::ZERO,
-            })
-        }
-
-        fn flush(&mut self) -> std::result::Result<(), Self::Error> {
-            self.inner.flush().map_err(|err| match err {})
-        }
-
-        fn scroll_region_up(
-            &mut self,
-            region: std::ops::Range<u16>,
-            line_count: u16,
-        ) -> std::result::Result<(), Self::Error> {
-            self.inner
-                .scroll_region_up(region, line_count)
-                .map_err(|err| match err {})
-        }
-
-        fn scroll_region_down(
-            &mut self,
-            region: std::ops::Range<u16>,
-            line_count: u16,
-        ) -> std::result::Result<(), Self::Error> {
-            self.inner
-                .scroll_region_down(region, line_count)
-                .map_err(|err| match err {})
-        }
-    }
-
     #[test]
-    fn draw_after_startup_does_not_probe_cursor_even_if_size_changes() -> Result<()> {
-        let mut backend = CursorProbeFailBackend::new(40, 14);
-        backend.set_cursor_position(ratatui::layout::Position::new(0, 13))?;
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
-            },
-        )?;
-        terminal.backend_mut().fail_cursor_probe = true;
-        terminal.backend_mut().size_override = Some(ratatui::layout::Size::new(41, 14));
-
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::SessionStarted);
-        screen.commit_user("after startup");
-        screen.start_turn();
-        screen.apply(UiEvent::AssistantText("still rendering".to_string()));
-
-        draw_step(&mut terminal, &mut screen)?;
-        Ok(())
-    }
-
-    fn visible_and_scrollback_text(terminal: &Terminal<TestBackend>) -> String {
-        let backend = terminal.backend();
-        let mut out = String::new();
-        for cell in backend.scrollback().content.iter() {
-            out.push_str(cell.symbol());
-        }
-        out.push('\n');
-        out.push_str(&buffer_text(terminal));
-        out
-    }
-
-    #[test]
-    fn full_draw_path_commits_history_and_keeps_live_viewport() -> Result<()> {
-        let mut backend = TestBackend::new(40, 14);
-        backend.set_cursor_position(ratatui::layout::Position::new(0, 13))?;
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
-            },
-        )?;
+    fn surface_draw_path_replays_history_from_state() -> std::io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
         let mut screen = Screen::new();
 
-        // A turn: user prompt, a streamed/markdown assistant answer, a tool
-        // result. Draw after each event like the loop does.
         screen.commit_user("hello there");
         screen.start_turn();
-        draw_step(&mut terminal, &mut screen)?;
+        surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
         screen.apply(UiEvent::AssistantText("# Done\n\nall good".to_string()));
-        draw_step(&mut terminal, &mut screen)?;
+        surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
         screen.apply(UiEvent::ToolResult {
             call: call_args("bash", json!({ "command": "echo hi" })),
             content: "hi".to_string(),
             exit_code: None,
             duration: None,
         });
-        draw_step(&mut terminal, &mut screen)?;
         screen.end_turn();
-        draw_step(&mut terminal, &mut screen)?;
+        surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
 
-        // Finalized history reached native scrollback (committed above the
-        // viewport), and the live viewport now shows only the editor box.
-        let everything = visible_and_scrollback_text(&terminal);
-        assert!(
-            everything.contains("hello there"),
-            "user line missing: {everything:?}"
-        );
-        assert!(everything.contains("Done"), "assistant heading missing");
-        assert!(everything.contains("Ran echo hi"), "tool block missing");
-        let viewport = buffer_text(&terminal);
-        assert!(
-            viewport.contains("message"),
-            "editor box not in live viewport: {viewport:?}"
-        );
-        // Finalized history must have LEFT the live model (committed to
-        // scrollback, not merely duplicated): at idle the transcript holds no
-        // live rows and the active region renders nothing. (`viewport` above is
-        // the whole backend buffer, which legitimately still shows committed
-        // history above the inline viewport, so it is not the right surface for
-        // a negative check.)
-        assert!(
-            screen.transcript.rows.is_empty(),
-            "finalized rows were not drained out of the live viewport"
-        );
-        assert!(
-            screen.wrapped_lines(40).is_empty(),
-            "live active region still renders finalized content"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn fullscreen_tui_fallback_keeps_history_in_frame() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(40, 14))?;
-        let mut screen = Screen::new();
-
-        screen.apply(UiEvent::SessionStarted);
-        draw_step_with_scrollback(&mut terminal, &mut screen, false)?;
-        assert!(buffer_text(&terminal).contains("iris"));
-        assert!(
-            !screen.transcript.rows.is_empty(),
-            "full-screen fallback must not drain history into native scrollback"
-        );
-
-        screen.commit_user("hello there");
-        screen.start_turn();
-        screen.apply(UiEvent::AssistantText("ok".to_string()));
-        screen.end_turn();
-        draw_step_with_scrollback(&mut terminal, &mut screen, false)?;
-
-        let frame = buffer_text(&terminal);
-        assert!(
-            frame.contains("hello there"),
-            "user line missing: {frame:?}"
-        );
-        assert!(frame.contains("ok"), "assistant text missing: {frame:?}");
+        let replay = surface.state().previous_lines.join("\n");
+        assert!(replay.contains("hello there"), "{replay:?}");
+        assert!(replay.contains("Done"), "{replay:?}");
+        assert!(replay.contains("Ran echo hi"), "{replay:?}");
+        assert!(replay.contains("message"), "{replay:?}");
         assert!(
             screen
                 .transcript
                 .rows
                 .iter()
                 .any(|row| row.text.contains("hello")),
-            "history should remain live in full-screen fallback"
+            "draw must not drain transcript state"
         );
         Ok(())
     }
 
     #[test]
-    fn finalized_lines_reach_native_scrollback_via_insert_before() -> Result<()> {
-        // Inline viewport at the bottom of a short screen; committing more lines
-        // than fit above it pushes the overflow into native scrollback.
-        let mut backend = TestBackend::new(16, 6);
-        backend.set_cursor_position(ratatui::layout::Position::new(0, 5))?;
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(2),
-            },
-        )?;
-        let lines: Vec<Line<'static>> = (0..6).map(|i| Line::from(format!("history{i}"))).collect();
-        insert_lines_before(&mut terminal, lines)?;
-        let scrollback = terminal.backend().scrollback();
-        let text: String = scrollback
-            .content
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
+    fn width_resize_reflows_transcript_from_state() -> std::io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantText(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".to_string(),
+        ));
+
+        surface.render(Size::new(30, 5), &rendered_lines(&mut screen, 30, 5))?;
+        let wide_rows = surface.state().previous_lines.len();
+        surface.writer_mut().clear();
+        let stats = surface.render(Size::new(12, 5), &rendered_lines(&mut screen, 12, 5))?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
         assert!(
-            text.contains("history0"),
-            "first line not in scrollback: {text:?}"
+            surface.state().previous_lines.len() > wide_rows,
+            "narrow width should wrap/reflow the replayed transcript"
         );
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|row| row.text.contains("alpha beta")),
+            "source transcript must remain intact after resize"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_resize_does_not_duplicate_editor_shadow() -> std::io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::SessionStarted);
+
+        for (width, height) in [(50, 14), (32, 10), (60, 16), (32, 10)] {
+            surface.render(
+                Size::new(width, height),
+                &rendered_lines(&mut screen, width, height),
+            )?;
+        }
+
+        let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
+        assert_eq!(replay.matches(" message ").count(), 1, "{replay:?}");
+        assert_eq!(replay.matches("Type a message").count(), 1, "{replay:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn shrinking_palette_and_modal_content_clears_old_rows() -> std::io::Result<()> {
+        use crate::mimir::model_catalog::CatalogModel;
+        use crate::mimir::selection::ProviderId;
+        use crate::ui::modal::{Modal, ModelPicker};
+
+        let mut surface = TerminalSurface::new(Vec::new());
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Model(ModelPicker::new(
+            vec![
+                CatalogModel {
+                    provider: ProviderId::OpenAiCodex,
+                    id: "gpt-5.5".to_string(),
+                },
+                CatalogModel {
+                    provider: ProviderId::Anthropic,
+                    id: "claude-sonnet-4-6".to_string(),
+                },
+            ],
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.5",
+            crate::mimir::selection::ReasoningEffort::Medium,
+        )));
+        surface.render(Size::new(60, 14), &rendered_lines(&mut screen, 60, 14))?;
+        assert!(
+            surface
+                .state()
+                .previous_lines
+                .join("\n")
+                .contains("Select model")
+        );
+
+        screen.close_modal();
+        let stats = surface.render(Size::new(60, 14), &rendered_lines(&mut screen, 60, 14))?;
+        let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
+        assert_ne!(stats.kind, RenderKind::Unchanged);
+        assert!(!replay.contains("Select model"), "{replay:?}");
+        assert!(replay.contains("message"), "{replay:?}");
         Ok(())
     }
 
@@ -3013,28 +2775,14 @@ mod tests {
         assert_eq!(screen.editor_text(), "alpha\n");
     }
 
-    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
-        let buf = terminal.backend().buffer();
-        let area = buf.area;
-        let mut out = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                out.push_str(buf.cell((x, y)).map_or(" ", |c| c.symbol()));
-            }
-            out.push('\n');
-        }
-        out
-    }
-
     #[test]
-    fn modal_render_survives_a_tiny_terminal() -> Result<()> {
+    fn modal_render_survives_a_tiny_terminal() {
         use crate::mimir::model_catalog::CatalogModel;
         use crate::mimir::selection::ProviderId;
         use crate::ui::modal::{Modal, ModelPicker};
 
         // A 3-row (and 2-row) terminal must not panic on the modal height clamp.
         for height in [2u16, 3, 4] {
-            let mut terminal = Terminal::new(TestBackend::new(40, height))?;
             let mut screen = Screen::new();
             screen.open_modal(Modal::Model(ModelPicker::new(
                 vec![CatalogModel {
@@ -3045,18 +2793,16 @@ mod tests {
                 "openai-codex/gpt-5.5",
                 crate::mimir::selection::ReasoningEffort::Medium,
             )));
-            terminal.draw(|f| render(f, &mut screen))?;
+            let _ = rendered_lines(&mut screen, 40, height);
         }
-        Ok(())
     }
 
     #[test]
-    fn open_modal_renders_picker_frame_in_place_of_editor() -> Result<()> {
+    fn open_modal_renders_picker_frame_in_place_of_editor() {
         use crate::mimir::model_catalog::CatalogModel;
         use crate::mimir::selection::ProviderId;
         use crate::ui::modal::{Modal, ModelPicker};
 
-        let mut terminal = Terminal::new(TestBackend::new(60, 14))?;
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("prior reply".to_string()));
         let models = vec![
@@ -3075,9 +2821,8 @@ mod tests {
             "openai-codex/gpt-5.5",
             crate::mimir::selection::ReasoningEffort::Medium,
         )));
-        terminal.draw(|f| render(f, &mut screen))?;
 
-        let rendered = buffer_text(&terminal);
+        let rendered = rendered_text(&mut screen, 60, 14);
         // Transcript still on top; the modal frame replaces the editor below.
         assert!(rendered.contains("prior reply"), "{rendered}");
         assert!(rendered.contains("Select model"), "{rendered}");
@@ -3085,15 +2830,13 @@ mod tests {
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
         // The editor placeholder is hidden while the modal is open.
         assert!(!rendered.contains("Type a message"), "{rendered}");
-        Ok(())
     }
 
     #[test]
-    fn open_modal_has_room_for_model_picker_footer() -> Result<()> {
+    fn open_modal_has_room_for_model_picker_footer() {
         use crate::mimir::model_catalog;
         use crate::ui::modal::{Modal, ModelPicker};
 
-        let mut terminal = Terminal::new(TestBackend::new(80, LIVE_VIEWPORT_ROWS))?;
         let mut screen = Screen::new();
         screen.open_modal(Modal::Model(ModelPicker::new(
             model_catalog::all(),
@@ -3101,56 +2844,46 @@ mod tests {
             "anthropic/claude-opus-4-8",
             crate::mimir::selection::ReasoningEffort::XHigh,
         )));
-        terminal.draw(|f| render(f, &mut screen))?;
 
-        let rendered = buffer_text(&terminal);
+        let rendered = rendered_text(&mut screen, 80, 16);
         assert!(rendered.contains("Haiku 4.5"), "{rendered}");
         assert!(rendered.contains("xHigh effort"), "{rendered}");
         assert!(rendered.contains("Enter to set as default"), "{rendered}");
-        Ok(())
     }
 
     #[test]
-    fn frame_pins_editor_box_below_transcript() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
+    fn frame_pins_editor_box_below_transcript() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("hello world".to_string()));
         screen.editor.insert_str("hi");
-        terminal.draw(|f| render(f, &mut screen))?;
 
-        let rendered = buffer_text(&terminal);
+        let rendered = rendered_text(&mut screen, 40, 8);
         assert!(rendered.contains("hello world"));
         // The editor text sits inside the bordered box near the bottom.
         assert!(rendered.contains("hi"));
         // Idle status hint is shown when no turn runs (the long hint is
         // truncated at this narrow test width, so assert its leading words).
         assert!(rendered.contains("enter send"));
-        Ok(())
     }
 
     #[test]
-    fn long_editor_line_wraps_instead_of_scrolling_right() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(18, 8))?;
+    fn long_editor_line_wraps_instead_of_scrolling_right() {
         let mut screen = Screen::new();
         screen.editor.insert_str("abcdefghijklmnopqrst");
-        terminal.draw(|f| render(f, &mut screen))?;
 
-        let rendered = buffer_text(&terminal);
+        let rendered = rendered_text(&mut screen, 18, 8);
         // The editor inner width is 16 cells (18-wide frame minus borders), so
         // a 20-cell word should use two visible rows instead of horizontally
         // scrolling to the tail of the line.
         assert!(rendered.contains("abcdefghijklmnop"));
         assert!(rendered.contains("qrst"));
-        Ok(())
     }
 
     #[test]
-    fn frame_shows_spinner_while_turn_active() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(40, 8))?;
+    fn frame_shows_spinner_while_turn_active() {
         let mut screen = Screen::new();
         screen.start_turn();
-        terminal.draw(|f| render(f, &mut screen))?;
-        let before = buffer_text(&terminal);
+        let before = rendered_text(&mut screen, 40, 8);
         assert!(before.contains("Working"));
         assert!(before.contains("esc to interrupt"));
 
@@ -3158,20 +2891,17 @@ mod tests {
         let glyph0 = SPINNER_FRAMES[0];
         assert!(before.contains(glyph0));
         assert!(screen.tick());
-        terminal.draw(|f| render(f, &mut screen))?;
-        let after = buffer_text(&terminal);
+        let after = rendered_text(&mut screen, 40, 8);
         assert!(after.contains(SPINNER_FRAMES[1]));
 
         screen.end_turn();
         assert!(!screen.tick());
-        terminal.draw(|f| render(f, &mut screen))?;
-        let idle = buffer_text(&terminal);
+        let idle = rendered_text(&mut screen, 40, 8);
         assert!(
             idle.contains("enter send"),
             "idle hint replaces the spinner"
         );
         assert!(!idle.contains("Working"), "spinner cleared on turn end");
-        Ok(())
     }
 
     #[test]
@@ -3277,20 +3007,17 @@ mod tests {
     }
 
     #[test]
-    fn frame_shows_slash_palette_when_typing_command() -> Result<()> {
-        let mut terminal = Terminal::new(TestBackend::new(40, 10))?;
+    fn frame_shows_slash_palette_when_typing_command() {
         let mut screen = Screen::new();
         screen.editor.insert_str("/e");
         screen.sync_palette();
-        terminal.draw(|f| render(f, &mut screen))?;
-        let rendered = buffer_text(&terminal);
+        let rendered = rendered_text(&mut screen, 40, 10);
         assert!(rendered.contains("/exit"));
         assert!(!rendered.contains("/quit"), "filtered to /exit only");
-        Ok(())
     }
 
     #[test]
-    fn tool_started_opens_running_cell_live_not_in_scrollback() {
+    fn tool_started_opens_running_cell_in_replay_state() {
         let mut screen = Screen::new();
         screen.start_turn();
         let call = call_args("bash", json!({ "command": "echo hi" }));
@@ -3301,11 +3028,13 @@ mod tests {
             live.iter().any(|l| l.contains("\u{2022} Running echo hi")),
             "running header not live: {live:?}"
         );
-        // While the turn runs, the Running block stays live (not committed).
-        let committed: Vec<String> = screen.take_scrollback(80).iter().map(line_text).collect();
         assert!(
-            !committed.iter().any(|l| l.contains("Running")),
-            "running cell committed to scrollback too early: {committed:?}"
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|row| row.text.contains("Running echo hi")),
+            "running cell must remain in Iris replay state"
         );
     }
 
@@ -3463,45 +3192,41 @@ mod tests {
     }
 
     #[test]
-    fn streamed_exec_cell_lands_in_scrollback_after_finalize() -> Result<()> {
-        let mut backend = TestBackend::new(40, 14);
-        backend.set_cursor_position(ratatui::layout::Position::new(0, 13))?;
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(LIVE_VIEWPORT_ROWS),
-            },
-        )?;
+    fn streamed_exec_cell_replays_from_state_after_finalize() -> std::io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
         let mut screen = Screen::new();
         screen.commit_user("run it");
         screen.start_turn();
-        draw_step(&mut terminal, &mut screen)?;
+        surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
         let call = call_args("bash", json!({ "command": "echo hi" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
-        draw_step(&mut terminal, &mut screen)?;
+        surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
         screen.apply(UiEvent::ToolOutputDelta {
             call_id: call.id.clone(),
             chunk: "hi\n".to_string(),
         });
-        draw_step(&mut terminal, &mut screen)?;
+        surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
         screen.apply(UiEvent::ToolResult {
             call: call.clone(),
             content: "hi".to_string(),
             exit_code: Some(0),
             duration: Some(std::time::Duration::from_millis(10)),
         });
-        draw_step(&mut terminal, &mut screen)?;
         screen.end_turn();
-        draw_step(&mut terminal, &mut screen)?;
-        // The finalized exec cell reached native scrollback and left the live model.
-        let everything = visible_and_scrollback_text(&terminal);
+        surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
+
+        let everything = surface.state().previous_lines.join("\n");
         assert!(
             everything.contains("Ran echo hi"),
-            "finalized exec cell missing from scrollback: {everything:?}"
+            "finalized exec cell missing from terminal replay: {everything:?}"
         );
         assert!(
-            screen.transcript.rows.is_empty(),
-            "exec rows not drained out of the live viewport"
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|row| row.text.contains("Ran echo hi")),
+            "exec rows must remain replayable from Iris state"
         );
         Ok(())
     }
