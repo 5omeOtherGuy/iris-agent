@@ -19,3 +19,4 @@
 | [0015](0015-assign-fragments-to-config-defined-named-slots.md) | Assign fragments to config-defined named slots instead of numeric slots | proposed | 2026-06-18 |
 | [0016](0016-preserve-provider-reasoning-continuity-in-flattened-transcripts.md) | Preserve provider reasoning continuity in flattened transcripts | accepted | 2026-06-20 |
 | [0017](0017-centralize-model-selection-and-switch-at-turn-boundaries.md) | Centralize model selection and switch at turn boundaries | accepted | 2026-06-21 |
+| [0022](0022-project-tool-declarations-per-provider-and-prefer-native-tools.md) | Project tool declarations per provider and prefer native tools | accepted | 2026-06-21 |
