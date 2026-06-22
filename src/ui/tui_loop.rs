@@ -1229,17 +1229,17 @@ mod tests {
     fn slash_tab_completes_then_esc_dismisses() {
         let mut screen = Screen::new();
         handle_idle_event(&mut screen, key(KeyCode::Char('/')));
-        handle_idle_event(&mut screen, key(KeyCode::Char('q')));
+        handle_idle_event(&mut screen, key(KeyCode::Char('e')));
         // Tab completes to the full command.
         handle_idle_event(&mut screen, key(KeyCode::Tab));
-        assert_eq!(screen.editor_text(), "/quit");
+        assert_eq!(screen.editor_text(), "/exit");
         // Esc dismisses; a later Enter then submits the literal text, which the
         // session loop routes to exit via the registry.
         handle_idle_event(&mut screen, key(KeyCode::Esc));
         assert!(!screen.palette.is_active(&screen.editor_text()));
         match handle_idle_event(&mut screen, key(KeyCode::Enter)) {
             IdleKey::Submit(text) => assert!(slash::is_exit(&text)),
-            _ => panic!("expected submit of /quit"),
+            _ => panic!("expected submit of /exit"),
         }
     }
 

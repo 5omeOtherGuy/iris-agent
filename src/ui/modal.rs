@@ -1,8 +1,8 @@
 //! Picker/dialog state machine (Tier 3, presentation-only).
 //!
 //! Every `/model`, `/scoped-models`, `/settings`, `/login`, and `/logout`
-//! surface is a [`Modal`] that temporarily replaces the editor area. A modal owns
-//! its [`Selector`] (or, for the OAuth dialog, just display lines), turns key
+//! surface is a [`Modal`] rendered above the editor. A modal owns its
+//! [`Selector`] (or, for the OAuth dialog, just display lines), turns key
 //! events into a [`ModalOutcome`], and renders itself into ratatui `Line`s. It
 //! performs no side effects: confirming a row returns a [`ModalAction`] the event
 //! loop applies at the safe inter-turn boundary (model/effort switch, settings
@@ -20,11 +20,11 @@ use crate::mimir::model_catalog::{self, CatalogModel};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::ui::selector::{Selector, SelectorItem};
 
-/// Max rows shown in a model/scoped list. Seven current catalog rows plus the
-/// footer fit in the live viewport; future extra rows scroll.
-const MODEL_ROWS: usize = 7;
-const SCOPED_ROWS: usize = 8;
-const PROVIDER_ROWS: usize = 8;
+/// Max rows shown in above-editor menus before windowing. Keep enough room for
+/// footer controls plus the editor/status chrome on a compact terminal.
+const MODEL_ROWS: usize = 5;
+const SCOPED_ROWS: usize = 5;
+const PROVIDER_ROWS: usize = 5;
 
 /// A key the loop forwards to the active modal. A neutral subset of crossterm
 /// keys so modal handling is unit-testable without constructing terminal events.
@@ -143,22 +143,6 @@ impl Modal {
             Modal::LoginDialog(dialog) => dialog.render(width),
         }
     }
-
-    /// One-line title for the modal frame.
-    pub(crate) fn title(&self) -> &'static str {
-        match self {
-            Modal::Model(_) => "Select model",
-            Modal::Scoped(_) => "Model Configuration",
-            Modal::Effort(_) => "Thinking Level",
-            Modal::Settings(_) => "Settings",
-            Modal::LoginMethod(_) => "Select authentication method",
-            Modal::Providers(picker) => match picker.purpose {
-                ProviderPurpose::Login => "Select provider to configure",
-                ProviderPurpose::Logout => "Select provider to logout",
-            },
-            Modal::LoginDialog(_) => "Login",
-        }
-    }
 }
 
 // --- shared rendering helpers ---
@@ -194,16 +178,15 @@ fn render_selector(selector: &Selector, empty: &str, out: &mut Vec<Line<'static>
     }
     for row in selector.visible() {
         let mut spans = Vec::new();
-        let marker = if row.selected { "→ " } else { "  " };
         let base = if row.selected {
             accent()
         } else {
             Style::default()
         };
-        spans.push(Span::styled(marker, base));
+        let secondary = if row.selected { accent() } else { dim() };
         if let Some(enabled) = row.item.enabled {
             spans.push(Span::styled(
-                if enabled { "✓ " } else { "✗ " },
+                if enabled { "[x] " } else { "[ ] " },
                 if enabled {
                     Style::default().fg(Color::Green)
                 } else {
@@ -214,14 +197,11 @@ fn render_selector(selector: &Selector, empty: &str, out: &mut Vec<Line<'static>
         spans.push(Span::styled(row.item.label.clone(), base));
         if let Some(detail) = &row.item.detail {
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("[{detail}]"), dim()));
+            spans.push(Span::styled(format!("[{detail}]"), secondary));
         }
         if let Some(trailing) = &row.item.trailing {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                trailing.clone(),
-                Style::default().fg(Color::Green),
-            ));
+            spans.push(Span::styled(trailing.clone(), secondary));
         }
         out.push(Line::from(spans));
     }
@@ -345,31 +325,12 @@ impl ModelPicker {
         }
     }
 
-    /// The label column text: "Default" for the persisted default model, else its
-    /// display name.
-    fn label_for(&self, model: &CatalogModel) -> String {
-        if model.qualified() == self.default {
-            "Default".to_string()
-        } else {
-            model_catalog::display_name(&model.qualified())
-        }
-    }
-
     fn render(&self, width: u16) -> Vec<Line<'static>> {
         let mut out = Vec::new();
-        out.push(Line::from(Span::styled(
-            "Switch between models from registered providers.",
-            dim(),
-        )));
-        out.push(Line::from(""));
 
         // Column widths so the label and name columns line up.
-        let label_w = self
-            .models
-            .iter()
-            .map(|m| self.label_for(m).len())
-            .max()
-            .unwrap_or(0);
+        let default_w = "Default".len();
+        let current_w = "current".len();
         let name_w = self
             .models
             .iter()
@@ -385,29 +346,32 @@ impl ModelPicker {
             } else {
                 Style::default()
             };
-            let mut spans = vec![Span::styled(
-                if row.selected { "\u{276f} " } else { "  " },
-                base,
-            )];
-            if qualified == self.current {
-                spans.push(Span::styled("\u{2714} ", Style::default().fg(Color::Green)));
+            let secondary = if row.selected { accent() } else { dim() };
+            let mut spans = Vec::new();
+            let default = if qualified == self.default {
+                "Default"
             } else {
-                spans.push(Span::raw("  "));
-            }
-            let label = model.map(|m| self.label_for(m)).unwrap_or_default();
+                ""
+            };
+            let current = if qualified == self.current {
+                "current"
+            } else {
+                ""
+            };
             let name = model_catalog::display_name(&qualified);
-            spans.push(Span::styled(format!("{label:<label_w$}  "), base));
-            spans.push(Span::raw(format!("{name:<name_w$}  ")));
+            spans.push(Span::styled(format!("{default:<default_w$}  "), base));
+            spans.push(Span::styled(format!("{current:<current_w$}  "), base));
+            spans.push(Span::styled(format!("{name:<name_w$}  "), base));
             if let Some(ctx) = model_catalog::ctx_label(&qualified) {
-                spans.push(Span::styled(format!("[ctx:{ctx}]  "), dim()));
+                spans.push(Span::styled(format!("[ctx:{ctx}]  "), secondary));
             }
             if let Some(m) = model {
                 spans.push(Span::styled(
                     format!("[{}] ", m.provider.display_name()),
-                    dim(),
+                    secondary,
                 ));
             }
-            spans.push(Span::styled("[sub]", dim()));
+            spans.push(Span::styled("[sub]", secondary));
             out.push(Line::from(spans));
         }
         if self.selector.is_scrolled() {
@@ -419,10 +383,10 @@ impl ModelPicker {
 
         out.push(Line::from(""));
         out.push(Line::from(vec![
-            Span::styled("\u{25c9} ", accent()),
-            Span::raw(effort_label(self.display_effort())),
+            Span::styled("Reasoning  ", dim()),
+            Span::raw(self.display_effort().as_str()),
             Span::styled(" effort ", dim()),
-            Span::styled("\u{2190}/\u{2192} to adjust", muted()),
+            Span::styled("left/right to adjust", muted()),
         ]));
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
@@ -431,18 +395,6 @@ impl ModelPicker {
         )));
         let _ = width;
         out
-    }
-}
-
-/// Human-facing reasoning level name for the inline effort control.
-fn effort_label(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Off => "Off",
-        ReasoningEffort::Minimal => "Minimal",
-        ReasoningEffort::Low => "Low",
-        ReasoningEffort::Medium => "Medium",
-        ReasoningEffort::High => "High",
-        ReasoningEffort::XHigh => "xHigh",
     }
 }
 
@@ -740,10 +692,6 @@ impl ScopedModels {
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
         let mut out = Vec::new();
-        out.push(Line::from(Span::styled(
-            "Session-only. Ctrl+S to save to settings.",
-            dim(),
-        )));
         render_selector(&self.selector, "No matching models", &mut out);
         let count = if self.enabled.is_none() {
             "all enabled".to_string()
@@ -785,7 +733,7 @@ impl EffortPicker {
                 let mut item =
                     SelectorItem::new(level.as_str(), level.as_str()).detail(level.description());
                 if *level == current {
-                    item = item.trailing("✓");
+                    item = item.trailing("current");
                 }
                 item
             })
@@ -823,10 +771,7 @@ impl EffortPicker {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = vec![Line::from(Span::styled(
-            "Select reasoning depth for thinking-capable models",
-            dim(),
-        ))];
+        let mut out = Vec::new();
         render_selector(&self.selector, "No levels", &mut out);
         let _ = width;
         out
@@ -869,7 +814,7 @@ impl SettingsMenu {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = vec![Line::from(Span::styled("Settings", dim()))];
+        let mut out = Vec::new();
         render_selector(&self.selector, "No settings", &mut out);
         let _ = width;
         out
@@ -929,10 +874,7 @@ impl MethodSelect {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = vec![Line::from(Span::styled(
-            "Select authentication method:",
-            dim(),
-        ))];
+        let mut out = Vec::new();
         render_selector(&self.selector, "No methods", &mut out);
         let _ = width;
         out
@@ -1019,11 +961,7 @@ impl ProviderSelect {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let title = match self.purpose {
-            ProviderPurpose::Login => "Select provider to configure:",
-            ProviderPurpose::Logout => "Select provider to logout:",
-        };
-        let mut out = vec![Line::from(Span::styled(title, dim()))];
+        let mut out = Vec::new();
         render_selector(&self.selector, &self.empty, &mut out);
         let _ = width;
         out
@@ -1194,25 +1132,23 @@ mod tests {
             ReasoningEffort::High,
         );
         let text = render_text(&picker);
-        // Subtitle, cursor, active check, Default label, ctx/provider/sub badges.
-        assert!(
-            text.contains("Switch between models from registered providers."),
-            "{text}"
-        );
-        assert!(text.contains('\u{276f}'), "{text}"); // cursor
-        assert!(text.contains('\u{2714}'), "{text}"); // active check
+        // Text columns, active/default labels, ctx/provider/sub badges.
         assert!(text.contains("Default"), "{text}");
+        assert!(text.contains("current"), "{text}");
         assert!(text.contains("[ctx:300k]"), "{text}");
         assert!(text.contains("[OpenAI]"), "{text}");
         assert!(text.contains("[sub]"), "{text}");
         // Inline effort + footer.
-        assert!(text.contains("High effort"), "{text}");
-        assert!(text.contains("\u{2190}/\u{2192} to adjust"), "{text}");
+        assert!(text.contains("high effort"), "{text}");
+        assert!(text.contains("left/right to adjust"), "{text}");
         assert!(
             text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
             "{text}"
         );
-        // The old search prompt and scope header are gone.
+        // The old search prompt, title, and symbolic selection markers are gone.
+        assert!(!text.contains("Switch between models"), "{text}");
+        assert!(!text.contains('\u{276f}'), "{text}");
+        assert!(!text.contains('\u{2714}'), "{text}");
         assert!(!text.contains("tab scope"), "{text}");
         assert!(!text.contains("Model Name:"), "{text}");
     }
@@ -1232,11 +1168,7 @@ mod tests {
         );
         let text = render_text(&picker);
 
-        assert!(
-            text.contains("Switch between models from registered providers."),
-            "{text}"
-        );
-        assert!(text.contains("❯ ✔ Default"), "{text}");
+        assert!(text.contains("Default  current  Opus 4.8"), "{text}");
         assert!(text.contains("Opus 4.8"), "{text}");
         assert!(text.contains("Sonnet 4.6"), "{text}");
         assert!(text.contains("Haiku 4.5"), "{text}");
@@ -1246,7 +1178,10 @@ mod tests {
         assert!(text.contains("[ctx:300k]"), "{text}");
         assert!(text.contains("[Anthropic] [sub]"), "{text}");
         assert!(text.contains("[OpenAI] [sub]"), "{text}");
-        assert!(text.contains("◉ xHigh effort ←/→ to adjust"), "{text}");
+        assert!(
+            text.contains("Reasoning  xhigh effort left/right to adjust"),
+            "{text}"
+        );
         assert!(
             text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
             "{text}"
@@ -1264,11 +1199,11 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::Medium,
         );
-        assert!(render_text(&picker).contains("Medium effort"));
+        assert!(render_text(&picker).contains("medium effort"));
         picker.handle_key(ModalKey::Right);
-        assert!(render_text(&picker).contains("High effort"));
+        assert!(render_text(&picker).contains("high effort"));
         picker.handle_key(ModalKey::Left);
-        assert!(render_text(&picker).contains("Medium effort"));
+        assert!(render_text(&picker).contains("medium effort"));
     }
 
     #[test]
@@ -1286,17 +1221,17 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::XHigh,
         );
-        assert!(render_text(&picker).contains("xHigh effort"));
+        assert!(render_text(&picker).contains("xhigh effort"));
         picker.handle_key(ModalKey::Down); // onto gemini (caps at high)
-        assert!(render_text(&picker).contains("High effort"));
+        assert!(render_text(&picker).contains("high effort"));
         picker.handle_key(ModalKey::Up); // back to gpt-5.5
-        assert!(render_text(&picker).contains("xHigh effort"));
+        assert!(render_text(&picker).contains("xhigh effort"));
     }
 
     #[test]
     fn model_picker_marks_active_and_labels_default_separately() {
-        // Session-only switch: active (sonnet) differs from the persisted default
-        // (gpt-5.5). The check marks the active row; "Default" labels the default.
+        // Session-only switch: active (sonnet) differs from the persisted
+        // default (gpt-5.5). Text columns mark both independently.
         let picker = ModelPicker::new(
             models(),
             "anthropic/claude-sonnet-4-6",
@@ -1316,7 +1251,7 @@ mod tests {
             .expect("a Default row");
         assert!(default_row.contains("GPT 5.5"), "{default_row}");
         assert!(
-            !default_row.contains('\u{2714}'),
+            !default_row.contains("current"),
             "default is not active: {default_row}"
         );
         let active_row = picker
@@ -1328,7 +1263,7 @@ mod tests {
                     .map(|s| s.content.to_string())
                     .collect::<String>()
             })
-            .find(|l| l.contains('\u{2714}'))
+            .find(|l| l.contains("current"))
             .expect("an active row");
         assert!(active_row.contains("Sonnet 4.6"), "{active_row}");
     }
