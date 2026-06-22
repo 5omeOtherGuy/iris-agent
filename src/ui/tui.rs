@@ -1260,10 +1260,12 @@ fn approval_status_lines(hint: &ApprovalHint, width: usize) -> Vec<Line<'static>
     target.extend(ansi_spans(&hint.target, Style::default()));
     let mut lines = Vec::new();
     push_wrapped_line(&Line::from(target), width, Some("  │ "), &mut lines);
-    lines.push(Line::from(vec![
-        Span::styled("  │ ", dim_style()),
-        Span::styled(hint.options, dim_style()),
-    ]));
+    push_wrapped_line(
+        &Line::from(Span::styled(hint.options, dim_style())),
+        width,
+        Some("  │ "),
+        &mut lines,
+    );
     lines
 }
 
@@ -1347,7 +1349,9 @@ struct Footer {
 }
 
 fn content_width(width: usize) -> usize {
-    width.saturating_sub(TEXT_COLUMN_X_PADDING).max(1)
+    width
+        .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+        .max(1)
 }
 
 fn pad_content_lines(lines: &mut [Line<'static>]) {
@@ -1359,9 +1363,7 @@ fn pad_content_lines(lines: &mut [Line<'static>]) {
 }
 
 fn footer_lines(footer: &Footer, width: usize) -> Vec<Line<'static>> {
-    let width = width
-        .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
-        .max(1);
+    let width = content_width(width);
     let model = truncate_to_width(&footer.model, width);
     let model_width = display_width(&model);
     let usage = footer.usage.as_ref().map(footer_usage_text);
@@ -1815,7 +1817,9 @@ fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selec
         y: area.y + u16::from(area.height > 1),
         width: area
             .width
-            .saturating_sub(u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX))
+            .saturating_sub(
+                u16::try_from(TEXT_COLUMN_X_PADDING.saturating_mul(2)).unwrap_or(u16::MAX),
+            )
             .max(1),
         height: area.height.saturating_sub(2).max(1),
     };
@@ -1857,7 +1861,9 @@ fn render_plain_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static
         y: area.y + u16::from(area.height > 1),
         width: area
             .width
-            .saturating_sub(u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX))
+            .saturating_sub(
+                u16::try_from(TEXT_COLUMN_X_PADDING.saturating_mul(2)).unwrap_or(u16::MAX),
+            )
             .max(1),
         height: area.height.saturating_sub(2).max(1),
     };
@@ -2707,10 +2713,17 @@ mod tests {
             ),
             false,
         );
-        let rendered = rendered_text(&mut screen, 48, 10);
+        let status_lines = screen.status_lines(48);
+        assert!(
+            status_lines
+                .iter()
+                .all(|line| display_width(&line_text(line)) <= 44),
+            "{status_lines:?}"
+        );
+        let rendered = rendered_text(&mut screen, 48, 12);
         assert!(rendered.contains("approve printf 'global:"));
         assert!(rendered.contains("  │ "));
-        assert!(rendered.contains("(timeout 120s)"));
+        assert!(rendered.contains("120s)"), "{rendered}");
         assert!(rendered.contains("[N] deny"), "{rendered}");
     }
 
@@ -3287,7 +3300,7 @@ mod tests {
             }),
         });
         screen.start_turn();
-        let before = rendered_lines(&mut screen, 64, 10);
+        let before = rendered_lines(&mut screen, 80, 10);
         let working_idx = before
             .iter()
             .position(|line| line_text(line).contains("Working"))
@@ -3299,6 +3312,8 @@ mod tests {
             working.starts_with("    \u{280b} Working\u{2026}"),
             "{working}"
         );
+        let working_status = line_text(&screen.working_lines(80)[1]);
+        assert!(display_width(&working_status) <= 76, "{working_status}");
         assert!(working.contains("0s"), "{working}");
         assert!(working.contains("\u{2193} 404 tokens"), "{working}");
         assert!(working.contains("thinking with high effort"), "{working}");
@@ -3324,7 +3339,9 @@ mod tests {
     fn footer_replaces_idle_hint_when_set() {
         let mut screen = Screen::new();
         // No footer wired: the keybind hint shows.
-        assert!(line_text(&screen.status_lines(80)[0]).contains("enter send"));
+        let idle_hint = line_text(&screen.status_lines(80)[0]);
+        assert!(idle_hint.contains("enter send"));
+        assert!(display_width(&idle_hint) <= 76, "{idle_hint}");
         screen.set_footer(
             "gpt-5.5 xhigh".to_string(),
             Some("xhigh".to_string()),
