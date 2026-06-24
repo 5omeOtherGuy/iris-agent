@@ -46,6 +46,51 @@ fn sgr(ansi: bool, code: &str, text: &str) -> String {
     }
 }
 
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn visible_width(input: &str) -> usize {
+    strip_ansi(input).chars().count()
+}
+
+fn truncate_plain(input: &str, max: usize) -> String {
+    strip_ansi(input).chars().take(max).collect()
+}
+
+fn wrap_plain(input: &str, width: usize) -> Vec<String> {
+    if visible_width(input) <= width.max(1) {
+        return vec![input.to_string()];
+    }
+    let input = strip_ansi(input);
+    if input.is_empty() {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        if current.chars().count() >= width.max(1) {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    rows.push(current);
+    rows
+}
+
 pub(crate) struct TextUi<R, W, E> {
     input: R,
     out: W,
@@ -120,17 +165,42 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
         Ok(())
     }
 
-    /// Render a left-gutter frame: a titled top rule, gutter-prefixed body
-    /// lines, and a closing rule. Open on the right so arbitrary-width content
-    /// needs no width math or truncation, and degrades cleanly without color.
+    /// Render a square single-line frame. Keep this visually aligned with the
+    /// TUI panels; rounded frames become unreadable when copied back into the
+    /// terminal transcript and wrapped by Markdown.
     fn write_frame(&mut self, title: &str, body: &[String]) -> Result<()> {
         let ansi = self.ansi;
         let bar = |glyph: &str| sgr(ansi, "2", glyph);
-        writeln!(self.out, "{} {}", bar("\u{256d}\u{2500}"), title)?;
+        const WIDTH: usize = 96;
+        let title = truncate_plain(title, WIDTH.saturating_sub(4));
+        let title_cell = format!(" {title} ");
+        let top_fill = WIDTH.saturating_sub(2 + title_cell.chars().count());
+        writeln!(
+            self.out,
+            "{}{}{}",
+            bar("┌"),
+            bar(&title_cell),
+            bar(&format!("{}┐", "─".repeat(top_fill)))
+        )?;
         for line in body {
-            writeln!(self.out, "{} {}", bar("\u{2502}"), line)?;
+            for physical in wrap_plain(line, WIDTH.saturating_sub(4)) {
+                writeln!(
+                    self.out,
+                    "{} {}{} {}",
+                    bar("│"),
+                    physical,
+                    " ".repeat(WIDTH.saturating_sub(4 + visible_width(&physical))),
+                    bar("│")
+                )?;
+            }
         }
-        writeln!(self.out, "{}", bar("\u{2570}\u{2500}"))?;
+        writeln!(
+            self.out,
+            "{}{}{}",
+            bar("└"),
+            bar(&"─".repeat(WIDTH - 2)),
+            bar("┘")
+        )?;
         Ok(())
     }
 

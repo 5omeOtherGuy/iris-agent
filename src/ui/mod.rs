@@ -8,7 +8,6 @@ use crate::nexus::{
 };
 
 pub(crate) mod login;
-pub(crate) mod markdown;
 pub(crate) mod modal;
 pub(crate) mod picker;
 pub(crate) mod selector;
