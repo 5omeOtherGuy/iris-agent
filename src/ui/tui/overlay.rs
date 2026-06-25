@@ -32,7 +32,7 @@ use crate::ui::slash::{self, Palette, SlashCommand};
 
 use super::component::Component;
 use super::wrap::display_width;
-use super::{TEXT_COLUMN_X_PADDING, dim_style};
+use super::{TEXT_COLUMN_X_PADDING_U16, dim_style};
 
 /// Which layer currently owns keyboard input.
 ///
@@ -112,13 +112,11 @@ impl Component for PaletteView<'_> {
 /// `render_plain_menu_lines`; `Paragraph` clips overflow exactly as before.
 pub(super) fn render_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static>>) {
     let inner = Rect {
-        x: area.x + u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX),
+        x: area.x + TEXT_COLUMN_X_PADDING_U16,
         y: area.y + u16::from(area.height > 1),
         width: area
             .width
-            .saturating_sub(
-                u16::try_from(TEXT_COLUMN_X_PADDING.saturating_mul(2)).unwrap_or(u16::MAX),
-            )
+            .saturating_sub(TEXT_COLUMN_X_PADDING_U16.saturating_mul(2))
             .max(1),
         height: area.height.saturating_sub(2).max(1),
     };

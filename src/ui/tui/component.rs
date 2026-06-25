@@ -39,6 +39,14 @@ use super::wrap::display_width;
 pub(crate) trait Component {
     /// Render this component to styled lines for `width` columns.
     fn render(&self, width: usize) -> Vec<Line<'static>>;
+
+    /// Append this component's lines to `out`. The default allocates via
+    /// [`Component::render`]; hot composite paths (the transcript renders up to
+    /// `MAX_TRANSCRIPT_ROWS` rows per frame) override this to append directly and
+    /// avoid a per-call `Vec`, matching the pre-abstraction push loops.
+    fn render_into(&self, width: usize, out: &mut Vec<Line<'static>>) {
+        out.extend(self.render(width));
+    }
 }
 
 /// Composite an ordered sequence of borrowed components into one line list.
@@ -53,7 +61,7 @@ pub(crate) fn composite<'a>(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for child in children {
-        out.extend(child.render(width));
+        child.render_into(width, &mut out);
     }
     out
 }
@@ -81,7 +89,15 @@ impl Container {
 
 impl Component for Container {
     fn render(&self, width: usize) -> Vec<Line<'static>> {
-        composite(self.children.iter().map(Box::as_ref), width)
+        let mut out = Vec::new();
+        self.render_into(width, &mut out);
+        out
+    }
+
+    fn render_into(&self, width: usize, out: &mut Vec<Line<'static>>) {
+        for child in &self.children {
+            child.render_into(width, out);
+        }
     }
 }
 
@@ -238,6 +254,10 @@ mod tests {
         assert_eq!(lines[1].spans.len(), 3);
         assert_eq!(lines[1].spans[1].content.as_ref(), "cd");
         assert_eq!(lines[1].spans[2].content.as_ref(), "ef");
+        // The split spans inherit the original span's style (a regression here
+        // would silently drop styling on either side of the cursor).
+        assert_eq!(lines[1].spans[1].style.fg, Some(Color::Green));
+        assert_eq!(lines[1].spans[2].style.fg, Some(Color::Green));
     }
 
     #[test]

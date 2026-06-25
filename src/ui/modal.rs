@@ -1419,6 +1419,22 @@ mod tests {
     }
 
     #[test]
+    fn modal_renders_through_component_trait_with_width_clamp() {
+        use crate::ui::tui::Component;
+        let modal = Modal::Effort(EffortPicker::new(
+            vec![ReasoningEffort::Low, ReasoningEffort::High],
+            ReasoningEffort::Low,
+        ));
+        // The Component impl forwards to Modal::render after clamping usize->u16.
+        assert_eq!(Component::render(&modal, 40), Modal::render(&modal, 40));
+        // An out-of-u16-range width clamps to u16::MAX rather than overflowing.
+        assert_eq!(
+            Component::render(&modal, usize::from(u16::MAX) + 100),
+            Modal::render(&modal, u16::MAX)
+        );
+    }
+
+    #[test]
     fn settings_menu_opens_effort_picker() {
         let mut menu = SettingsMenu::new(ReasoningEffort::Medium);
         assert_eq!(

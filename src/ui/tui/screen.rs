@@ -335,9 +335,15 @@ impl Screen {
     /// (`render_editor_chrome`); precedence is Editor < Palette < Modal,
     /// mirroring pi-mono's overlay focus stack.
     pub(crate) fn focus(&self) -> FocusTarget {
+        self.focus_for(&self.editor_text())
+    }
+
+    /// [`Screen::focus`] given a precomputed editor snapshot, so hot callers that
+    /// already hold the input text do not re-`join` the editor buffer.
+    pub(crate) fn focus_for(&self, input: &str) -> FocusTarget {
         if self.modal.is_some() {
             FocusTarget::Modal
-        } else if self.palette.is_active(&self.editor_text()) {
+        } else if self.palette.is_active(input) {
             FocusTarget::Palette
         } else {
             FocusTarget::Editor
@@ -557,10 +563,11 @@ impl Screen {
 }
 
 /// A composition-root section wrapping already-materialized lines as a
-/// [`Component`], so the root assembles the document through [`Container`] like
-/// pi-mono's `TUI extends Container`. `render` clones the section's lines (the
-/// same O(n) order the terminal-surface diff already pays each frame); the
-/// section sizes are bounded by `MAX_TRANSCRIPT_ROWS` and the viewport.
+/// [`Component`], so the root assembles the bottom tail through [`Container`]
+/// like pi-mono's `TUI extends Container`. `render` clones the section's lines,
+/// so it is used only for the viewport-bounded tail (working indicator +
+/// composer chrome); the large transcript is moved into the document, never
+/// wrapped here.
 struct LinesSection(Vec<Line<'static>>);
 
 impl Component for LinesSection {
@@ -612,21 +619,26 @@ pub(super) fn render_document_with_chrome_tail(
         padded.extend(transcript);
         transcript = padded;
     }
-    // Assemble the final document through the root container: transcript,
-    // working-indicator block, then composer chrome -- the composition root no
-    // longer hand-concatenates sections, mirroring pi-mono's `TUI extends
-    // Container` (`tui.ts#L265`). Each section is already materialized, so the
-    // container's ordered compositing produces the same line list.
-    let mut root = Container::new();
-    root.add_child(Box::new(LinesSection(transcript)));
-    root.add_child(Box::new(LinesSection(working_block)));
-    root.add_child(Box::new(LinesSection(chrome)));
-    let mut document = root.render(usize::from(width));
+    // The transcript is the scrolling base, moved into the document and never
+    // cloned. The bottom-pinned tail -- working indicator then composer chrome
+    // (which carries the docked overlays) -- is composited through the root
+    // Container, mirroring pi-mono's `TUI extends Container` (`tui.ts#L265`).
+    // Both tail sections are bounded by the viewport height, not the transcript
+    // length, so the container's only per-frame copy is small and constant.
+    let mut tail = Container::new();
+    tail.add_child(Box::new(LinesSection(working_block)));
+    tail.add_child(Box::new(LinesSection(chrome)));
+    let mut document = transcript;
+    document.extend(tail.render(usize::from(width)));
     // Locate-and-strip any focus cursor marker before the document reaches the
-    // terminal surface. No shipped component emits one yet (the editor draws its
-    // own block cursor), so this is the real seam the deferred hardware-cursor
-    // work plugs into; today it is a defensive no-op strip.
-    let _cursor = take_cursor_position(&mut document);
+    // terminal surface. The cursor only ever lives in the composer chrome, so
+    // the scan is bounded to the volatile tail instead of the whole (possibly
+    // long) document. No shipped component emits a marker yet (the editor draws
+    // its own block cursor), so this is a no-op strip today and the real seam the
+    // deferred hardware-cursor work plugs into; a real consumer would offset the
+    // returned row by `tail_start`.
+    let tail_start = document.len().saturating_sub(volatile_tail);
+    let _ = take_cursor_position(&mut document[tail_start..]);
     (document, volatile_tail)
 }
 
@@ -922,7 +934,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     // rendered through the `Component` contract. The inner render width equals
     // the inset width `render_menu_lines` paints into, so output is unchanged.
     let menu_inner_width = content_width(usize::from(area.width));
-    let menu_lines: Option<Vec<Line<'static>>> = match screen.focus() {
+    let menu_lines: Option<Vec<Line<'static>>> = match screen.focus_for(&input_text) {
         FocusTarget::Modal => screen
             .modal
             .as_ref()

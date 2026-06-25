@@ -95,10 +95,11 @@ overlays until Iris has a floating UI to justify them.
   rendering stays in Tier-3.
 
 ### Negative
-- The root `Container` clones each already-materialized section once per frame
-  (same O(n) order the terminal-surface diff already pays, bounded by
-  `MAX_TRANSCRIPT_ROWS`); a borrowed/streaming composite can replace it if it
-  ever matters.
+- The root `Container` composes only the viewport-bounded tail (working
+  indicator + composer chrome, which holds the docked overlays); the large
+  transcript is moved into the document, not cloned, and transcript rows
+  composite through `render_into` with no per-row allocation. The remaining
+  per-frame copy is small and constant-bounded.
 - Two pi-mono hooks (`handleInput`, `invalidate`) and the floating overlay
   compositor are intentionally absent until a real caller exists.
 

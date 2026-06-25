@@ -848,8 +848,9 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     let input = screen.editor_text();
 
     // Explicit focus routing (Editor < Palette < Modal). Modals run in their own
-    // phase, so idle focus is only ever Editor or Palette here.
-    let focus = screen.focus();
+    // phase, so idle focus is only ever Editor or Palette here. Reuse the input
+    // snapshot already computed above instead of re-joining the editor buffer.
+    let focus = screen.focus_for(&input);
 
     // Global picker chords work regardless of editor contents (but not while the
     // slash palette is steering Up/Down/Enter): Ctrl+L opens the model picker,

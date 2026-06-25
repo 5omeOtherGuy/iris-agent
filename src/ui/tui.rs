@@ -111,6 +111,7 @@ const TEXT_X_PADDING: usize = X_PADDING;
 const TEXT_COLUMN_X_PADDING: usize = BOX_X_PADDING + TEXT_X_PADDING;
 const BOX_X_PADDING_U16: u16 = X_PADDING as u16;
 const TEXT_X_PADDING_U16: u16 = X_PADDING as u16;
+const TEXT_COLUMN_X_PADDING_U16: u16 = TEXT_COLUMN_X_PADDING as u16;
 
 /// Secondary guard: truncate any single output line to this many characters
 /// before wrapping, so one pathological line cannot dominate the row budget.

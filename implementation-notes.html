@@ -122,11 +122,21 @@ scope unit. Not a step log.</p>
   <li><b>TerminalSurface seam:</b> untouched. The abstraction only produces the
   final <code>Vec&lt;Line&gt;</code>; diff/append/replay/resize stay in
   <code>terminal_surface.rs</code> (existing terminal-surface tests still pass).</li>
-  <li><b>Tradeoff (reviewer-facing):</b> <code>LinesSection::render</code> clones
-  its already-materialized lines, so the root container does one extra O(n)
-  full-document copy per frame. This is the same order as the per-frame diff and
-  is bounded by <code>MAX_TRANSCRIPT_ROWS</code>; a borrowed/streaming composite
-  can replace it if profiling ever shows it matters. Documented in ADR-0024.</li>
+  <li><b>Performance (post-review):</b> the first pass wrapped the whole document
+  (incl. transcript) in cloning <code>LinesSection</code>s, an avoidable O(n)
+  full-document copy per frame. Fixed after wave-1 review: the transcript is
+  MOVED into the document as the scrolling base; only the viewport-bounded tail
+  (working indicator + chrome) is composed through the root <code>Container</code>.
+  Separately, <code>Component::render_into</code> was added so the transcript's
+  borrowed <code>composite</code> over thousands of rows allocates no per-row
+  <code>Vec</code> (matches the pre-abstraction push loop).</li>
+  <li><b>Cursor-marker scan bounded.</b> <code>take_cursor_position</code> runs on
+  the volatile tail only (the cursor only ever lives in the composer chrome), not
+  the full document.</li>
+  <li><b>Focus allocation.</b> <code>Screen::focus_for(&amp;input)</code> lets the
+  hot callers (idle key handler, chrome render) reuse their existing editor-text
+  snapshot instead of re-joining the buffer; <code>focus()</code> remains for the
+  non-hot modal-phase gates.</li>
 </ul>
 
 <h2>Unit 4 — Tool panels: DEFERRED (named follow-up)</h2>
