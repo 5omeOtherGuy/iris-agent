@@ -145,15 +145,6 @@ fn tool_header_style() -> Style {
     Style::default()
 }
 
-/// Render instrument-panel runtime as a fixed clock field (`00:01:48s`).
-fn format_panel_duration(duration: std::time::Duration) -> String {
-    let secs = duration.as_secs();
-    let hours = secs / 3600;
-    let minutes = (secs % 3600) / 60;
-    let seconds = secs % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}s")
-}
-
 /// Format an elapsed turn duration compactly for the working indicator:
 /// `<10s` gets tenths, seconds stay terse until one minute, then clock-like only
 /// at minute/hour granularity.
@@ -991,6 +982,60 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn single_line_modification_highlights_changed_token() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call("edit"),
+            diff: "--- a/n.txt\n+++ b/n.txt\n@@ -1 +1 @@\n-foo bar baz\n+foo qux baz\n".to_string(),
+        });
+        let added = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|row| row.text.contains("+  |  foo qux baz"))
+            .expect("addition row");
+        let Some(ChromeRow::Body { line, .. }) = added.chrome.as_ref() else {
+            panic!("expected body row");
+        };
+        let reversed = ratatui::style::Modifier::REVERSED;
+        let changed: Vec<&str> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(reversed))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(changed, vec!["qux"], "only the changed token is emphasised");
+        // The unchanged tokens must not be emphasised.
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.content.contains("baz") && !s.style.add_modifier.contains(reversed))
+        );
+    }
+
+    #[test]
+    fn multi_line_modification_skips_intra_line_highlight() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call("edit"),
+            diff: "--- a/n.txt\n+++ b/n.txt\n@@ -1,2 +1,2 @@\n-aa\n-bb\n+cc\n+dd\n".to_string(),
+        });
+        let reversed = ratatui::style::Modifier::REVERSED;
+        let any_reversed = screen
+            .transcript
+            .rows
+            .iter()
+            .any(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::Body { line, .. }) => line
+                    .spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(reversed)),
+                _ => false,
+            });
+        assert!(!any_reversed, "multi-line edits should not token-highlight");
     }
 
     #[test]
@@ -1859,8 +1904,8 @@ mod tests {
 
         let rendered = rendered_text(&mut screen, 100, 12);
         assert!(rendered.contains("EXPLORE"), "{rendered}");
-        assert!(rendered.contains("00:00:04s"), "{rendered}");
-        assert!(!rendered.contains("00:00:00s"), "{rendered}");
+        assert!(rendered.contains("4.0s"), "{rendered}");
+        assert!(!rendered.contains("0.0s"), "{rendered}");
     }
 
     #[test]
@@ -2666,6 +2711,7 @@ mod tests {
 
     #[test]
     fn elapsed_format_and_labelled_rule() {
+        assert_eq!(format_elapsed_compact(Duration::from_millis(500)), "0.5s");
         assert_eq!(format_elapsed_compact(Duration::from_secs(45)), "45s");
         assert_eq!(format_elapsed_compact(Duration::from_secs(71)), "1:11");
         assert_eq!(format_elapsed_compact(Duration::from_secs(132)), "2:12");
@@ -2818,8 +2864,8 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("SHELL"), "{rendered}");
-        assert!(!rendered.contains("00:00:00s"), "{rendered}");
-        assert!(rendered.contains("00:00:02s"), "{rendered}");
+        assert!(!rendered.contains("0.0s"), "{rendered}");
+        assert!(rendered.contains("2.0s"), "{rendered}");
     }
 
     #[test]

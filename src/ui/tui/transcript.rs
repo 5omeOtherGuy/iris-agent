@@ -22,7 +22,7 @@ use super::wrap::{
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TOOL_OUTPUT_LINE_CHARS,
     MAX_TOOL_OUTPUT_ROWS, MAX_TRANSCRIPT_ROWS, PANEL_BODY_CHROME_WIDTH, TEXT_COLUMN_X_PADDING,
-    dim_style, err_style, format_panel_duration, ok_style, panel_style, tool_header_style,
+    dim_style, err_style, format_elapsed_compact, ok_style, panel_style, tool_header_style,
     turn_divider_label,
 };
 
@@ -240,7 +240,7 @@ impl Transcript {
     fn push_hidden_affordance(&mut self, hidden: usize, earlier: bool) {
         let noun = if earlier { "earlier lines" } else { "lines" };
         let left = format!("… {hidden} {noun} hidden");
-        let hint = "ctrl+o toggles panel";
+        let hint = "ctrl+o to expand";
         let width = self
             .wrap_width()
             .saturating_sub(PANEL_BODY_CHROME_WIDTH)
@@ -255,16 +255,16 @@ impl Transcript {
     fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
         let elapsed = if spec.state == PanelState::Running {
             spec.started
-                .map(|started| format_panel_duration(started.elapsed()))
-                .unwrap_or_else(|| "00:00:00s".to_string())
+                .map(|started| format_elapsed_compact(started.elapsed()))
+                .unwrap_or_else(|| "0.0s".to_string())
         } else {
             spec.duration
-                .map(format_panel_duration)
+                .map(format_elapsed_compact)
                 .or_else(|| {
                     spec.started
-                        .map(|started| format_panel_duration(started.elapsed()))
+                        .map(|started| format_elapsed_compact(started.elapsed()))
                 })
-                .unwrap_or_else(|| "00:00:00s".to_string())
+                .unwrap_or_else(|| "0.0s".to_string())
         };
         let plain = format!("{} {}", spec.state.plain_prefix(), spec.plain_meta);
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
@@ -834,8 +834,8 @@ impl Transcript {
 
     fn explore_header_right(state: PanelState, duration: Option<Duration>) -> Vec<(String, Style)> {
         let elapsed = duration
-            .map(format_panel_duration)
-            .unwrap_or_else(|| "00:00:00s".to_string());
+            .map(format_elapsed_compact)
+            .unwrap_or_else(|| "0.0s".to_string());
         vec![
             ("●".to_string(), state.dot_style()),
             (format!("{:<13}", state.label()), panel_style()),
