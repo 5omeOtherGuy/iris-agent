@@ -6,24 +6,37 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::ui::markdown::render_markdown;
+use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 
 use super::rows::TranscriptRow;
 use super::transcript::streaming_markdown_preview;
 use super::wrap::line_text;
 use super::{panel_style, prompt_style};
 
-const ASSISTANT_TEXT_PREFIX: &str = "  ";
+pub(super) const ASSISTANT_TEXT_PREFIX: &str = "  ";
 
-pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
-    for (index, line) in render_markdown(text).into_iter().enumerate() {
+/// Columns the markdown table layout may use: the assistant content area minus
+/// the leading marker/continuation prefix that `assistant_row` prepends, so a
+/// full-width table line plus its prefix still fits the render width.
+fn markdown_width(content_width: usize) -> usize {
+    content_width
+        .saturating_sub(ASSISTANT_TEXT_PREFIX.len())
+        .max(1)
+}
+
+pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, text: &str) {
+    let theme = MarkdownTheme::default();
+    let lines = render_markdown_themed(text, &theme, markdown_width(width));
+    for (index, line) in lines.into_iter().enumerate() {
         rows.push(assistant_row(line, index == 0));
     }
 }
 
 pub(super) fn render_streaming_assistant(width: usize, text: &str, out: &mut Vec<Line<'static>>) {
     let text = streaming_markdown_preview(text);
-    for (index, line) in render_markdown(&text).into_iter().enumerate() {
+    let theme = MarkdownTheme::default();
+    let lines = render_markdown_themed(&text, &theme, markdown_width(width));
+    for (index, line) in lines.into_iter().enumerate() {
         assistant_row(line, index == 0).render(width, out);
     }
 }

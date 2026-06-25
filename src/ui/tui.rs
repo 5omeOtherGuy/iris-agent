@@ -2074,6 +2074,79 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_renders_collapsed_thinking_block_by_default() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "First I check the **config**, then the cache.".to_string(),
+            redacted: false,
+        });
+        let collapsed = rendered_text(&mut screen, 80, 14);
+        // Collapsed: label visible, body hidden, collapsed arrow shown.
+        assert!(collapsed.contains("Thinking..."), "{collapsed}");
+        assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(
+            !collapsed.contains("then the cache"),
+            "reasoning body should be hidden while collapsed: {collapsed}"
+        );
+    }
+
+    #[test]
+    fn reasoning_thinking_block_expands_to_show_trace() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "Inspect the config then the cache.".to_string(),
+            redacted: false,
+        });
+        // Thinking panel is the latest panel for a reasoning-only turn.
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 14);
+        assert!(expanded.contains("▾"), "{expanded}");
+        assert!(
+            expanded.contains("Inspect the config then the cache."),
+            "expanded trace missing: {expanded}"
+        );
+    }
+
+    #[test]
+    fn redacted_reasoning_never_renders_trace_text() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantReasoning {
+            // A redacted block carries no text downstream; this guards against a
+            // future regression that would render recovered text.
+            text: String::new(),
+            redacted: true,
+        });
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 14);
+        assert!(expanded.contains("Thinking..."), "{expanded}");
+        assert!(
+            expanded.contains("withheld"),
+            "redacted placeholder missing: {expanded}"
+        );
+    }
+
+    #[test]
+    fn reasoning_renders_before_assistant_text() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "planning".to_string(),
+            redacted: false,
+        });
+        screen.apply(UiEvent::AssistantText("Here is the answer.".to_string()));
+        let out = rendered_text(&mut screen, 80, 16);
+        let thinking_at = out.find("Thinking...").expect("thinking label");
+        let answer_at = out.find("Here is the answer.").expect("answer");
+        assert!(
+            thinking_at < answer_at,
+            "thinking block should precede the answer: {out}"
+        );
+    }
+
+    #[test]
     fn hidden_output_affordance_includes_count_and_ctrl_o_hint() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);

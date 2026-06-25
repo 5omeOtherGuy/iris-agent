@@ -128,6 +128,18 @@ pub(crate) enum AgentEvent {
     AssistantText(String),
     AssistantTextDelta(String),
     AssistantTextEnd(String),
+    /// One block of model reasoning ("thinking") surfaced for display. Reasoning
+    /// arrives as whole blocks at turn completion (the provider stream does not
+    /// expose incremental reasoning deltas here), so this is emitted once per
+    /// block, not as a stream. Display-only: emitting it never changes what is
+    /// stored (the reasoning row is still persisted, ADR-0016) or sent to the
+    /// provider. A `redacted` block carries no text -- the provider withheld it,
+    /// so the original reasoning text is never reconstructed or rendered; the
+    /// front-end shows only that redacted reasoning occurred.
+    AssistantReasoning {
+        text: String,
+        redacted: bool,
+    },
     ToolProposed(ToolCall),
     /// A tool is about to execute (emitted once per call, immediately before the
     /// run, on both the exclusive and parallel paths). Lets a front-end open a
@@ -689,6 +701,21 @@ impl<P: ChatProvider> Agent<P> {
                         || !tool_calls.is_empty()
                         || !reasoning.is_empty();
                     for block in reasoning {
+                        // Surface reasoning for display WITHOUT changing storage:
+                        // the row is still persisted below exactly as before
+                        // (ADR-0016 continuity/redacted handling is untouched).
+                        // Redacted blocks never carry their text downstream.
+                        if block.redacted {
+                            obs.on_event(AgentEvent::AssistantReasoning {
+                                text: String::new(),
+                                redacted: true,
+                            })?;
+                        } else if !block.text.is_empty() {
+                            obs.on_event(AgentEvent::AssistantReasoning {
+                                text: block.text.clone(),
+                                redacted: false,
+                            })?;
+                        }
                         self.messages.push(
                             Message::assistant_reasoning_block(block)
                                 .with_provider_turn_id(&provider_turn_id),

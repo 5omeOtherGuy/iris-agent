@@ -430,6 +430,11 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             UiEvent::AssistantTextEnd(_) => {
                 self.finish_assistant_stream()?;
             }
+            UiEvent::AssistantReasoning { .. } => {
+                // The non-interactive text fallback intentionally does not render
+                // reasoning/thinking blocks: that is a TUI surface. Ignored here
+                // so the fallback's output is unchanged.
+            }
             UiEvent::ToolProposed(_call) => {
                 // Non-gated tools (read/grep/find/ls) show only their result row;
                 // claim the block separator here so it is not double-counted.

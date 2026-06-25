@@ -2,181 +2,138 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Anthropic OAuth stream robustness - implementation notes</title>
+<title>Implementation notes: markdown + reasoning parity</title>
 </head>
 <body>
-<h1>Anthropic Messages OAuth stream robustness &mdash; implementation notes</h1>
-<p>Branch <code>anthropic-stream-robustness</code>. Records decisions not explicit in the
-spec, tradeoffs, and reviewer context. Not a step log.</p>
+<h1>Implementation notes — markdown enrichment + reasoning/thinking blocks</h1>
 
-<h2>Verified failure being fixed</h2>
-<p><code>Anthropic stream ended before content_block_stop [status=200 ...]</code>. The parser
-only emits this when <code>message_stop</code> arrives while <code>open_tools</code> or
-<code>open_reasoning</code> is non-empty; plain text blocks cannot trigger it.</p>
-
-<h2>Key decisions</h2>
+<h2>Base / working state</h2>
 <ul>
-<li><b>Duplicate-delta prevention (scope item 5) &mdash; chosen strategy: gate retry on
-"no visible text emitted this attempt", NOT per-attempt buffering.</b>
-Rationale: buffering every attempt would kill live token streaming on the happy path
-(every turn, not just retried ones). Instead the parser carries an explicit
-<code>emitted_visible_text</code> flag (set only when a non-empty <code>text_delta</code>
-is successfully forwarded to the sink). A malformed status-200 stream is retried only
-when no visible text was emitted on that attempt. Because tool input
-(<code>input_json_delta</code>) and reasoning (<code>thinking_delta</code>/<code>signature_delta</code>)
-are buffered internally and never streamed live, the verified tool-only / thinking-only
-malformed turns always qualify for retry. If visible text was already streamed and then
-the stream malformed, we do NOT retry; we surface the typed protocol error (DoD permits
-"retried/recovered OR fails with a typed sanitized protocol error"). A retried attempt by
-definition emitted no text, so the next attempt starts with no prior visible text and
-duplicate user-visible deltas are impossible.
-<br><b>Caveat for reviewers:</b> this predicate is safe only because <code>text_delta</code>
-is the ONLY live event today. If reasoning/tool deltas ever stream live, the predicate must
-be revisited.</li>
-
-<li><b>Transport retry placement (scope item 3):</b> added a new shared
-<code>run_with_retry</code> alongside the existing <code>run_with_reauth</code> rather than
-generalizing the latter. Antigravity stays on <code>run_with_reauth</code> with identical
-behavior; only Anthropic uses the retry loop. <code>classify_http_status</code> (Reauth/Fatal)
-is left untouched for Antigravity; a separate <code>classify_http_status_retryable</code>
-(Reauth/Retry/Fatal) is added for Anthropic. <code>Attempt::Retry</code> is added to the shared
-enum; <code>run_with_reauth</code> treats it as fatal for exhaustiveness (Antigravity never
-produces it).</li>
-
-<li><b>Backoff constants:</b> mirrored from Codex (<code>MAX_TRANSIENT_RETRIES=3</code>,
-<code>BASE_BACKOFF=500ms</code>, <code>MAX_BACKOFF=8s</code>, up to 250ms jitter, integer
-<code>Retry-After</code> seconds honored). Intentional small duplication with Codex: Codex
-predates the shared transport module and keeps its own copy (see transport.rs module note);
-unifying both is out of scope.</li>
-
-<li><b>Typed protocol error:</b> <code>StreamProtocolAnomaly</code> carries only block-shape
-metadata (message_stop seen, open tool/reasoning counts, open block indexes, last event
-type) &mdash; never streamed content. It is attached via <code>anyhow::Error::new(..)</code>
-and the safe request diagnostics are added with <code>.context(..)</code> so the typed error
-stays downcastable for classification (per oracle review). Network send errors and 429/5xx
-also become <code>Attempt::Retry</code>; the transient budget is shared across all three and
-is not reset by the one-shot reauth.</li>
-
-<li><b>max_tokens (scope item 8):</b> base <code>max_tokens</code> changed from a fixed 8192
-to the selected model's <code>output_cap</code> (<code>DEFAULT_OUTPUT_CAP=64000</code> for
-unknown models). For manual-budget thinking, <code>resolve_manual_thinking(output_cap, budget,
-output_cap)</code> keeps <code>budget_tokens &lt; max_tokens</code>, so the invariant holds and
-<code>max_tokens=output_cap</code>. This directly removes the 8192 truncation that produced
-silently-dropped <code>stop_reason=max_tokens</code>.</li>
-
-<li><b>stop_reason (scope items 6/7):</b> parsed from <code>message_delta.delta.stop_reason</code>,
-mapped to a provider-neutral <code>CompletionReason</code> enum (EndTurn, ToolUse,
-MaxOutputTokens, ContextWindowExceeded, StopSequence, Paused, Refusal, Other).
-<b>Decision change:</b> <code>Other</code> is a unit variant (not <code>Other(String)</code>).
-Keeping the enum small and <code>Copy</code> avoids tripping clippy's
-<code>large_enum_variant</code> lint once <code>completion_reason</code> is embedded in
-<code>AssistantTurn</code> (which flows through <code>ProviderEvent::Completed</code> /
-<code>StreamResult::Completed</code>); the alternative was boxing <code>AssistantTurn</code>
-in three enums across six files, a larger blast radius. The raw unknown stop-reason token
-is still surfaced for diagnostics via a <code>tracing::debug</code> line at parse time
-(the token is an enumerated wire value, never response content), so observability is
-preserved without storing it. Truncation reasons
-(MaxOutputTokens / ContextWindowExceeded) additionally emit a <code>tracing::warn</code> so they
-are not silently dropped. Stored on <code>AssistantTurn</code> and propagated to
-<code>AgentEvent::ProviderTurnCompleted</code>.</li>
-
-<li><b>UiEvent left unchanged:</b> <code>completion_reason</code> is added to the Nexus
-<code>AgentEvent::ProviderTurnCompleted</code> (the provider-neutral metadata event) but NOT to
-<code>UiEvent::ProviderTurnCompleted</code>, since no UI surface renders it yet. The
-<code>ui/mod.rs</code> mapping drops it. This keeps the change minimal and leaves typed
-completion metadata available for later continuation/fallback work, per the goal.</li>
+  <li>Primary checkout was in <strong>detached HEAD at <code>d1d9bce</code></strong> =
+      <code>origin/main</code> (<code>6b48611</code>) + 1 unmerged commit
+      (<em>feat(tui): compact tool durations, expand hint, intra-line diff highlights</em>,
+      touching <code>src/ui/tui.rs</code>, <code>src/ui/tui/panel.rs</code>,
+      <code>src/ui/tui/transcript.rs</code>). <code>git fetch</code> succeeded; no new remote commits.</li>
+  <li>Per <code>AGENTS.md</code> I branched from a clean base:
+      <code>git worktree add ../iris-md-reasoning -b feat/markdown-reasoning origin/main</code>
+      (base <strong><code>6b48611</code></strong>). I did NOT build on the unmerged
+      <code>d1d9bce</code>; its transcript.rs deltas are unrelated to this task and would be
+      re-derived/merged separately.</li>
+  <li>All cited <read_first> files matched the prompt's snapshot at <code>6b48611</code>
+      (line numbers verified against the live files).</li>
+  <li>Both <code>~/vendor/pi-mono</code> reference paths exist and were read.</li>
+  <li>Untracked <code>mydiff.txt</code> in the primary checkout is not part of this task; left untouched.</li>
 </ul>
 
-<h2>Review follow-up fixes (second pass)</h2>
+<h2>Part A — markdown</h2>
 <ul>
-<li><b>Retry-gate invariant hardened (review item 1):</b> the duplicate-delta predicate is
-unchanged in behavior, but the doc comment on <code>protocol_anomaly_retryable</code> now
-states an explicit INVARIANT: any future live UI event (live reasoning or tool deltas) MUST
-set the same <code>emitted_visible_text</code> gate, or the retry policy must change. Added
-<code>malformed_stream_after_visible_text_is_not_retryable</code> covering the
-<code>content_block_stop</code> variant after a real <code>text_delta</code> (the prior
-tests only covered the missing-<code>message_stop</code> variant).</li>
-
-<li><b>Truncation is now user-visible (review item 2):</b> a provider-neutral
-<code>completion_reason_notice(CompletionReason)</code> lives in <code>nexus.rs</code> and the
-provider loop emits <code>AgentEvent::Notice</code> right after
-<code>ProviderTurnCompleted</code> when the reason is <code>MaxOutputTokens</code> or
-<code>ContextWindowExceeded</code>. <b>Decision:</b> wording is model-neutral ("The model hit
-its maximum output-token limit..." / "...context-window limit...") rather than the
-Anthropic-specific "Claude ..." phrasing the request suggested, because the notice is emitted
-from provider-neutral Nexus completion metadata and the runtime must not hard-code a
-provider/model name (ADR-0003 / tier boundaries). The existing <code>tracing::warn</code> in
-the Anthropic adapter is retained. Notices ride the existing
-<code>AgentEvent::Notice -&gt; UiEvent::Notice</code> path; no new event type.</li>
-
-<li><b>Empty completed turns with a valid stop reason (review item 3):</b>
-<code>AnthropicStreamParser::finish</code> now treats a terminal stream with no
-text/reasoning/tool calls as a valid empty completion when a <code>stop_reason</code> was
-present (<code>completion_reason.is_some()</code>); a contentless stream with NO stop reason
-still errors as before. The presence of the stop reason (any mapped value, including
-<code>Other</code> for unknown-but-present tokens) is the gate, since a stop reason is the
-provider's terminal completion signal.</li>
-
-<li><b>Stale-doc fixes (review item 4):</b> the module headers in <code>transport.rs</code>
-and <code>anthropic_messages.rs</code> no longer claim "no transient backoff"; they now
-describe <code>run_with_retry</code> (Anthropic) vs <code>run_with_reauth</code>
-(Antigravity, reauth-only).</li>
+  <li><strong>Theme as patch-composed Styles (not pi-mono's style functions).</strong>
+      <code>MarkdownTheme</code> holds ratatui <code>Style</code> fields plus a <code>base</code>
+      style that is <code>patch</code>-merged under every emitted span (the Rust analogue of
+      pi-mono's <code>defaultTextStyle</code>). Emphasis stacks by patching (heading/bold/italic/
+      strikethrough/quote). <code>MarkdownTheme::default()</code> is constructed so the patched
+      result equals the previous hardcoded <code>dim()</code>/<code>fg(Cyan)</code> output exactly,
+      keeping every existing snapshot byte-identical. Verified by the full pre-existing test set
+      plus <code>default_theme_matches_legacy_inline_code_color</code>.</li>
+  <li><strong>Highlight hook</strong> is <code>Option&lt;Rc&lt;dyn Fn(&amp;str, Option&lt;&amp;str&gt;)
+      -&gt; Vec&lt;Line&gt;&gt;&gt;</code> (no bundled highlighter). To call it I had to buffer the
+      fenced block (capture lang at <code>Start(CodeBlock)</code>, accumulate text, render at
+      <code>End</code>) instead of the old per-<code>Text</code>-event emission. Default (no hook)
+      path preserved; one behavioral nicety: internal blank lines inside code are now kept
+      (the old per-chunk logic dropped them); only the trailing-newline empty segment is dropped.
+      No existing test covered internal blanks.</li>
+  <li><strong>Link styling seam.</strong> <code>theme.link</code> is patched onto link-label spans;
+      default is a no-op <code>Style</code> so output is unchanged, and the seam is proven by
+      <code>link_theme_seam_styles_label</code>. The visible destination is still appended.
+      Raw OSC-8 emission is deferred (see below).</li>
+  <li><strong>Tables need a width but the renderer is width-agnostic by design.</strong> Iris stores
+      pre-rendered rows and re-wraps them per frame; markdown runs once at append time. Tables are the
+      one block that cannot be re-wrapped line-by-line without corrupting the box, so I threaded a
+      table-layout <code>width</code> into <code>render_markdown_themed</code>. <code>pane.rs</code>
+      passes <code>content_width - ASSISTANT_TEXT_PREFIX</code> so a full-width table line plus the
+      <code>"\u25cf "</code>/<code>"  "</code> marker prefix still fits the frame and the downstream
+      word-wrapper is a no-op on table lines. <code>transcript.rs</code> uses <code>last_width</code>
+      (fallback <code>DEFAULT_RENDER_WIDTH=80</code> before the first frame).</li>
+  <li><strong>Table layout.</strong> Column widths = natural cell widths when they fit
+      <code>width - (3*cols+1)</code> border overhead, else proportional shrink with a floor of 1 and
+      rounding-drift fixup (<code>fit_columns</code>). Cells wrap (<code>wrap_plain</code>, word-wrap +
+      hard-break of over-long words) so every physical line fits; row height = tallest cell. Alignment
+      from <code>pulldown_cmark::Alignment</code>. If <code>width</code> is too narrow for a stable box,
+      it falls back to pipe-joined plain rows (<code>narrow_table_falls_back_to_plain_rows</code>).
+      Cells collect <em>plain</em> text (inline emphasis inside cells not preserved) to keep width math
+      and wrapping simple — a deliberate scope cut.</li>
+  <li><strong>Known limitation (documented, not fixed):</strong> because table layout is computed once
+      at append time, a table does not reflow on terminal resize; narrowing can let the generic wrapper
+      break a previously-fitting box. This matches the existing retained-panel behavior. Non-table
+      markdown reflows normally (it is word-wrapped at render time).</li>
+  <li><code>render_markdown(text)</code> (default theme + default width) is now used only by tests, so
+      it is <code>#[cfg(test)]</code> to keep <code>clippy -D warnings</code> clean; production callers
+      use <code>render_markdown_themed</code>.</li>
 </ul>
 
-<h2>Review follow-up fixes (third pass &mdash; 6 reviewer findings)</h2>
+<h2>Part B — reasoning / thinking blocks</h2>
 <ul>
-<li><b>Mid-stream read failure is now retryable when safe (finding 1):</b> a
-<code>for_each_sse_event</code> failure in <code>send_once</code> previously always returned
-<code>Attempt::Fatal</code>, even though a pre-stream <code>send()</code> failure was already
-retried. A mid-stream connection drop/timeout is transient and is now retried on the SAME
-gate as a protocol anomaly: only when <code>!cancel.is_cancelled() && !emitted_visible_text</code>,
-so a retry can never duplicate user-visible output and cancellation is never swallowed.
-<b>No new unit test:</b> there is no HTTP-mock harness for <code>send_once</code> (provider
-tests operate at the parser level), and the decisive predicate is the already-tested
-<code>emitted_visible_text</code> gate plus the shared cancellation token; building a mock
-server purely for this path would dwarf the fix.</li>
-
-<li><b>Defensive redaction of serde errors (finding 2):</b> both
-<code>serde_json::from_str</code> sites (<code>ingest_event</code> SSE frame,
-<code>finalize_tool</code> tool JSON) now drop the serde error via <code>map_err(|_| ...)</code>
-and return a fixed message. Both deserialize to an untyped <code>Value</code>, so serde only
-produces positional syntax errors (never the input bytes) &mdash; this is belt-and-suspenders,
-not a live leak. Removing the last <code>Result::context</code> call made the <code>anyhow::Context</code>
-import unused; it was dropped.</li>
-
-<li><b>force_refresh in run_with_reauth (finding 3):</b> investigated the suggested
-"reset for consistency with <code>retry_loop</code>" and found a reset is actually DEAD CODE
-here (clippy <code>unused_assignments</code>): this loop's only loop-back is the <code>Reauth</code>
-arm, which immediately sets <code>force_refresh = true</code>, so a reset to <code>false</code>
-is never read on any path. Kept the original (no reset) and documented WHY it correctly differs
-from <code>retry_loop</code> (whose <code>Retry</code> arm loops without touching the flag and
-thus genuinely needs the reset). No behavior change.</li>
-
-<li><b>Empty-turn test coverage (finding 4):</b>
-<code>empty_turn_with_valid_stop_reason_completes</code> now also iterates <code>pause_turn</code>
-and <code>refusal</code>, the other contentless stop reasons <code>finish()</code> accepts.</li>
-
-<li><b>Content-less refusal notice (finding 5):</b> <code>completion_reason_notice</code> now
-takes <code>had_visible_content</code> and returns "The model declined to respond." for a
-<code>Refusal</code> that produced no text/reasoning/tool calls. A refusal that DID carry an
-explanation emits no extra notice (the user already sees it). <code>had_visible_content</code>
-is captured in the agent loop before <code>reasoning</code> is consumed. Wording stays
-provider/model-neutral. Tested both ways in <code>nexus_tests.rs</code>.</li>
-
-<li><b>Diagnostics key consistency (finding 6):</b> <code>StreamProtocolAnomaly</code>'s Display
-now uses the <code>last_event=</code> key (was <code>last_event_type=</code>) to match
-<code>AnthropicDiagnostics</code> and the original failure log, so logs are searchable on one
-field.</li>
+  <li><strong>New event is a DISPLAY event, block-level.</strong> <code>AgentEvent::AssistantReasoning
+      { text, redacted }</code> sits with <code>AssistantText</code> (which already carries model text),
+      not the ADR-0020 observability family — so carrying reasoning text is consistent. It is block-level
+      (emitted once per <code>ReasoningBlock</code>) because reasoning is assembled into whole blocks at
+      turn completion; the provider stream exposes no reasoning deltas on this path. See ADR-0024.</li>
+  <li><strong>Storage stays intact (ADR-0016).</strong> Emission was added <em>before</em> the unchanged
+      <code>Message::assistant_reasoning_block(block)</code> push at nexus.rs; the row, its
+      <code>continuity</code>, <code>redacted</code> flag, and <code>ModelOrigin</code> are written
+      exactly as before. Test <code>completed_turn_records_reasoning_and_all_tool_calls_before_results</code>
+      (pre-existing) still passes; new tests assert the row content is preserved alongside emission.</li>
+  <li><strong>Redacted handling.</strong> A redacted block is emitted with empty <code>text</code> +
+      <code>redacted: true</code> — the opaque content is still stored for replay but never leaves Nexus
+      as text and is never rendered (<code>redacted_reasoning_emits_event_without_leaking_text</code>,
+      <code>redacted_reasoning_never_renders_trace_text</code>). The TUI shows a
+      "[reasoning withheld by provider]" placeholder.</li>
+  <li><strong>Thinking block reuses the existing panel + ctrl+o toggle.</strong> Rendered as a panel
+      titled <code>THINKING</code> with a <code>Thinking...</code> right-label, <code>expanded:false</code>
+      by default. The existing collapse render-loop hides the body until the existing
+      <code>toggle_latest_panel</code> (ctrl+o) expands it — no new affordance. Default-collapsed mirrors
+      pi-mono's <code>hideThinkingBlock</code> default and keeps thinking quiet by default. The trace is
+      markdown-rendered with <code>MarkdownTheme::thinking()</code> (dim+italic base). Reasoning events are
+      emitted before the assistant-text event, so the block renders above the answer
+      (<code>reasoning_renders_before_assistant_text</code>).</li>
+  <li><strong>Stop reasons (B8) were already implemented and are preserved, not re-built.</strong> The
+      requested surfacing — reuse <code>completion_reason_notice</code> — already exists at nexus.rs:
+      MaxOutputTokens / ContextWindowExceeded / content-less Refusal emit a <code>Notice</code> after the
+      assistant content (tested), aborted via the interrupt notice, error via the turn-error path. My
+      changes keep this ordering (reasoning -&gt; text -&gt; completion notice). Adding a redundant
+      stop-reason channel would be over-engineering, so none was added.</li>
+  <li><strong>Text fallback (<code>ui/text.rs</code>) ignores reasoning</strong> by design (different
+      surface, out of scope); the arm is explicit so the exhaustive match compiles and the fallback's
+      output is unchanged.</li>
 </ul>
 
-<h2>Deferred (explicitly out of the smallest-correct scope)</h2>
+<h2>Deferrals (named) and what unblocks them</h2>
 <ul>
-<li><b>Automatic in-stream continuation / non-streaming fallback</b> (scope item 12): not
-implemented. Recovering a malformed stream <em>after</em> visible text without a UI rewind
-event would require buffering all live deltas (regressing streaming UX for every turn) or a
-new Nexus "discard partial" event. Both exceed the smallest correct fix. Typed error
-classification, bounded retry/recovery, safe diagnostics, stop-reason propagation, and the
-max-token cap correction are all implemented (not deferred).</li>
+  <li><strong>Raw OSC-8 hyperlink emission</strong> — deferred. Iris's terminal surface strips control
+      sequences and has no OSC-8 passthrough; that is the text-engine task. This change provides link
+      styling + the <code>theme.link</code> seam only. Unblocked when the text engine adds OSC-8
+      passthrough.</li>
+  <li><strong>Bundled syntax highlighting</strong> — deferred (a dependency decision). The
+      <code>highlight_code</code> hook ships with no built-in implementation; default fenced blocks stay
+      dimmed. Unblocked by a decision to add a highlighter crate that wires a closure into the theme.</li>
+  <li><strong>Images / terminal graphics; the Component / theme object model; markdown in the text
+      fallback</strong> — out of scope (separate tasks/surfaces).</li>
+  <li><strong>Streaming reasoning deltas</strong> — not applicable here; reasoning arrives block-level.
+      Unblocked if a provider/stream surfaces incremental reasoning.</li>
+  <li><strong>Table reflow on resize</strong> — see Part A limitation; unblocked by re-running markdown on
+      resize or storing table source for re-layout.</li>
+</ul>
+
+<h2>Reviewer-facing regression risks</h2>
+<ul>
+  <li>Default markdown output parity rests on <code>MarkdownTheme::default()</code> matching the old
+      hardcoded styles and on the code-block buffering change; covered by the full original snapshot set.</li>
+  <li>Width threading: a miscomputed table width could let the wrapper break a box. Guarded by
+      <code>table_lines_fit_render_width</code>.</li>
+  <li>Enabling <code>ENABLE_TABLES</code>/<code>STRIKETHROUGH</code> changes how stray <code>|</code> /
+      <code>~</code> parse; existing prose tests have none and still pass.</li>
+  <li>The new exhaustive <code>UiEvent</code> arm had to be added in <code>ui/mod.rs</code> mapping and
+      <code>ui/text.rs</code>; both done.</li>
 </ul>
 </body>
 </html>

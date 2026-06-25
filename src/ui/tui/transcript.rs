@@ -7,7 +7,15 @@ use ratatui::text::{Line, Span};
 
 use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{is_exploration_tool, run_target};
+use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use crate::ui::{TurnErrorKind, UiEvent};
+
+/// Collapsed-state label for a reasoning panel (mirrors pi-mono's
+/// `hiddenThinkingLabel`).
+const THINKING_LABEL: &str = "Thinking...";
+/// Placeholder for reasoning the provider withheld; the original text is never
+/// available and is never rendered.
+const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
 
 use super::pane;
 use super::panel::{
@@ -99,7 +107,56 @@ impl Transcript {
     }
 
     fn push_assistant_text(&mut self, text: &str) {
-        pane::push_assistant_rows(&mut self.rows, text);
+        let width = self.markdown_content_width();
+        pane::push_assistant_rows(&mut self.rows, width, text);
+    }
+
+    /// Content width used for width-aware markdown (tables) at append time.
+    /// Falls back to a default before the first frame has set `last_width`.
+    fn markdown_content_width(&self) -> usize {
+        if self.last_width == 0 {
+            crate::ui::markdown::DEFAULT_RENDER_WIDTH
+        } else {
+            self.last_width
+        }
+    }
+
+    /// Render a model reasoning ("thinking") trace as a collapsible panel.
+    ///
+    /// The panel is collapsed by default, showing only a `Thinking...` label;
+    /// the existing `ctrl+o` panel toggle (`toggle_latest_panel`) expands it to
+    /// the markdown-rendered trace, styled dim + italic. A `redacted` block has
+    /// no recoverable text, so a placeholder is shown and the original reasoning
+    /// is never rendered. Mirrors pi-mono's hide/show thinking block.
+    fn push_thinking_block(&mut self, text: &str, redacted: bool) {
+        self.begin_block();
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Header {
+                expanded: false,
+                title: "THINKING",
+                meta: String::new(),
+                right: vec![(THINKING_LABEL.to_string(), dim_style())],
+            },
+            THINKING_LABEL.to_string(),
+            dim_style(),
+        ));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        if redacted {
+            self.push_panel_body(REDACTED_THINKING_BODY, dim_style());
+        } else {
+            let theme = MarkdownTheme::thinking();
+            let width = self.markdown_content_width();
+            for line in render_markdown_themed(text, &theme, width) {
+                let plain = line_text(&line);
+                self.rows.push(TranscriptRow::chrome_with_text(
+                    ChromeRow::Body { line, bg: None },
+                    plain,
+                    dim_style(),
+                ));
+            }
+        }
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
     }
 
     pub(super) fn push_turn_divider(
@@ -1118,6 +1175,14 @@ impl Transcript {
                     self.push_blank();
                     self.push_assistant_text(&text);
                     self.push_blank();
+                }
+            }
+            UiEvent::AssistantReasoning { text, redacted } => {
+                // Reasoning arrives before the assistant text of the same turn,
+                // so the thinking panel renders above the answer.
+                self.finish_stream();
+                if redacted || !text.is_empty() {
+                    self.push_thinking_block(&text, redacted);
                 }
             }
             UiEvent::SessionStarted => {
