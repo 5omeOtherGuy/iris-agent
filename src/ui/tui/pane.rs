@@ -30,7 +30,24 @@ pub(super) fn render_streaming_assistant(width: usize, text: &str, out: &mut Vec
 
 pub(super) fn push_user_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
     for line in text.split('\n') {
-        rows.push(TranscriptRow::new(line.to_string(), panel_style()));
+        rows.push(user_row(line));
+    }
+}
+
+fn user_row(text: &str) -> TranscriptRow {
+    if text.is_empty() {
+        return TranscriptRow::new(String::new(), panel_style());
+    }
+
+    TranscriptRow {
+        text: text.to_string(),
+        style: panel_style(),
+        continuation_prefix: Some(ASSISTANT_TEXT_PREFIX),
+        line: None,
+        word_wrap: true,
+        background: None,
+        hrule: false,
+        chrome: None,
     }
 }
 

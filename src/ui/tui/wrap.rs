@@ -266,6 +266,27 @@ pub(super) fn push_wrapped_line_wordwise(
     }
 }
 
+pub(super) fn push_wrapped_row_with_prefix(
+    text: &str,
+    style: Style,
+    width: usize,
+    prefix: &'static str,
+    out: &mut Vec<Line<'static>>,
+) {
+    let prefix_width = display_width(prefix);
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    for physical in wrap_to_width(text, content_width) {
+        let mut spans = Vec::new();
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, dim_style()));
+        }
+        if !physical.is_empty() {
+            spans.push(Span::styled(physical, style));
+        }
+        out.push(Line::from(spans));
+    }
+}
+
 pub(super) fn push_wrapped_row(
     text: &str,
     style: Style,
