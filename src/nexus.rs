@@ -879,76 +879,75 @@ impl<P: ChatProvider> Agent<P> {
         provider_turn_id: &str,
     ) -> Result<ToolOutcome> {
         emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Proposed)?;
-        if let Some(tool) = self
-            .tools
-            .by_name(&call.name)
-            .filter(|t| t.requires_approval())
-        {
-            // A destructive call (e.g. `rm`) always re-prompts, even when its
-            // tool was "always allowed" this session: a blanket bash allow must
-            // not silently auto-run data-losing commands.
-            let destructive = tool.is_destructive(&call.arguments);
-            let session_allowed = self.session_allowed.contains(&call.name);
-            let auto_approved = session_allowed && !destructive && tool.supports_allow_always();
-            if auto_approved {
-                obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
-                emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
-            }
+        if let Some(tool) = self.tools.by_name(&call.name) {
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
                 obs.on_event(AgentEvent::DiffPreview {
                     call: call.clone(),
                     diff,
                 })?;
             }
-            if !auto_approved {
-                if destructive && session_allowed {
-                    obs.on_event(AgentEvent::Notice(
-                        "destructive command: approval required even though this tool is allow-always"
-                            .to_string(),
-                    ))?;
+            if !tool.requires_approval() {
+                obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+            } else {
+                // A destructive call (e.g. `rm`) always re-prompts, even when its
+                // tool was "always allowed" this session: a blanket bash allow must
+                // not silently auto-run data-losing commands.
+                let destructive = tool.is_destructive(&call.arguments);
+                let session_allowed = self.session_allowed.contains(&call.name);
+                let auto_approved = session_allowed && !destructive && tool.supports_allow_always();
+                if auto_approved {
+                    obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
+                    emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
                 }
-                // Race the approval against cancellation so a pending prompt
-                // does not pin the turn open after a Ctrl-C. Cancellation is
-                // recorded as a cancelled call (not a denial) so the transcript
-                // reflects user intent rather than a refusal.
-                emit_tool_lifecycle(
-                    obs,
-                    provider_turn_id,
-                    call,
-                    ToolEventState::ApprovalRequested,
-                )?;
-                let decision = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
-                    decision = gate.review(call, tool.supports_allow_always()) => decision?,
-                };
-                // A blocking front-end prompt (real terminal) cannot observe
-                // the token mid-read, so it may still return a decision after a
-                // Ctrl-C landed. Treat the turn cancellation as authoritative so
-                // a late Allow/Deny neither runs the tool nor mutates the
-                // session allow-policy.
-                if token.is_cancelled() {
-                    return Ok(ToolOutcome::Cancelled);
-                }
-                match decision {
-                    ApprovalDecision::Deny => {
-                        tracing::warn!(tool = %call.name, "tool call denied by user");
-                        return Ok(ToolOutcome::Denied);
+                if !auto_approved {
+                    if destructive && session_allowed {
+                        let message = "destructive command: approval required even though this tool is allow-always";
+                        obs.on_event(AgentEvent::Notice(message.to_string()))?;
                     }
-                    ApprovalDecision::AllowAlways => {
-                        if tool.supports_allow_always() {
-                            tracing::info!(tool = %call.name, "tool always-allowed this session");
-                            self.session_allowed.insert(call.name.clone());
-                        } else {
-                            obs.on_event(AgentEvent::Notice(format!(
-                                "always-allow is disabled for `{}`; it requires approval each time.",
-                                call.name
-                            )))?;
+                    // Race the approval against cancellation so a pending prompt
+                    // does not pin the turn open after a Ctrl-C. Cancellation is
+                    // recorded as a cancelled call (not a denial) so the transcript
+                    // reflects user intent rather than a refusal.
+                    emit_tool_lifecycle(
+                        obs,
+                        provider_turn_id,
+                        call,
+                        ToolEventState::ApprovalRequested,
+                    )?;
+                    let decision = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
+                        decision = gate.review(call, tool.supports_allow_always()) => decision?,
+                    };
+                    // A blocking front-end prompt (real terminal) cannot observe
+                    // the token mid-read, so it may still return a decision after a
+                    // Ctrl-C landed. Treat the turn cancellation as authoritative so
+                    // a late Allow/Deny neither runs the tool nor mutates the
+                    // session allow-policy.
+                    if token.is_cancelled() {
+                        return Ok(ToolOutcome::Cancelled);
+                    }
+                    match decision {
+                        ApprovalDecision::Deny => {
+                            tracing::warn!(tool = %call.name, "tool call denied by user");
+                            return Ok(ToolOutcome::Denied);
                         }
+                        ApprovalDecision::AllowAlways => {
+                            if tool.supports_allow_always() {
+                                tracing::info!(tool = %call.name, "tool always-allowed this session");
+                                self.session_allowed.insert(call.name.clone());
+                            } else {
+                                let message = format!(
+                                    "always-allow is disabled for `{}`; it requires approval each time.",
+                                    call.name
+                                );
+                                obs.on_event(AgentEvent::Notice(message))?;
+                            }
+                        }
+                        ApprovalDecision::Allow => {}
                     }
-                    ApprovalDecision::Allow => {}
+                    emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
                 }
-                emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
             }
         } else {
             obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
