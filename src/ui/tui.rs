@@ -2378,8 +2378,11 @@ fn content_width(width: usize) -> usize {
 
 fn compact_count(value: u64) -> String {
     fn trim_decimal(text: String) -> String {
-        text.strip_suffix(".0")
-            .map_or_else(|| text.clone(), std::borrow::ToOwned::to_owned)
+        if let Some(stripped) = text.strip_suffix(".0") {
+            stripped.to_string()
+        } else {
+            text
+        }
     }
 
     if value >= 1_000_000 {
