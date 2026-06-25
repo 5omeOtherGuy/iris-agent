@@ -528,6 +528,30 @@ mod tests {
     }
 
     #[test]
+    fn assistant_paragraph_starts_align_with_wrapped_text() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantText(
+            "First paragraph has enough words to wrap onto another display row.\n\nSecond paragraph also has enough words to wrap onto another display row."
+                .to_string(),
+        ));
+        let lines = screen.wrapped_lines(48);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("      Second paragraph")),
+            "paragraph start lost assistant text-column alignment: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("      to wrap onto another display row.")),
+            "wrapped paragraph line lost assistant text-column alignment: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn adjacent_user_and_assistant_turns_are_plain_with_one_separator() {
         let mut screen = Screen::new();
         screen.commit_user("HI");
