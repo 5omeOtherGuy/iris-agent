@@ -26,9 +26,12 @@ use tokio_util::sync::CancellationToken;
 use super::CANCEL_POLL_INTERVAL;
 use super::sandbox;
 
-/// Default per-job output ring capacity (bytes). Matches the one-shot output
-/// cap so a job cannot grow memory without bound.
-const DEFAULT_JOB_CAPACITY: usize = super::DEFAULT_MAX_BYTES;
+/// Default per-job output ring capacity (bytes). This is a peak-memory bound on
+/// a background job's retained output, NOT a display cap: it is intentionally
+/// decoupled from `DEFAULT_MAX_BYTES` (the 50KB inline display window) so
+/// lowering the display cap does not shrink how much job output is captured. A
+/// job cannot grow memory without bound; the ring keeps the most recent ~1MB.
+const DEFAULT_JOB_CAPACITY: usize = 1_000_000;
 
 /// Cap on retained finished jobs. Bounds registry memory if the model starts
 /// many jobs without finalizing them; the oldest finished jobs are evicted.

@@ -18,7 +18,6 @@ mod jobs;
 mod sandbox;
 mod session;
 
-const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 // How long a bounded wait (session marker read, job finalize) may block before
 // re-checking the turn cancellation token. Small enough that a Ctrl-C is
 // observed promptly, large enough not to busy-poll.
@@ -32,19 +31,19 @@ const BASH_DRAIN_TIMEOUT_SECS: u64 = 5;
 // threads stop forwarding (so the channel and the accumulator Vecs stop growing)
 // once this is reached, but keep draining the pipe to EOF so a flooding child
 // (`yes`, `cat /dev/zero`) never blocks and its exit status is still collected.
-// The display window is `DEFAULT_MAX_BYTES` (1 MiB); 4 MiB per stream leaves a
+// The display window is `DEFAULT_MAX_BYTES` (50 KiB); 4 MiB per stream leaves a
 // comfortable tail for that while bounding peak capture to ~8 MiB across both
-// streams.
+// streams. This stays a memory-safety rail and is intentionally unchanged.
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
+pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. No timeout by default; set `timeout` (seconds) to bound a call. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
             "command": { "type": "string", "description": "Bash command to execute" },
-            "timeout": { "type": "integer", "description": "Timeout in seconds (default 120; set 0 to disable)" },
+            "timeout": { "type": "integer", "description": "Timeout in seconds (optional; no timeout when unset)" },
             "session": { "type": "string", "description": "Persistent shell session id; state (cd/env/vars) persists across calls with the same id" },
             "job": { "type": "string", "description": "Background job id for poll/finalize/cancel" },
             "action": { "type": "string", "enum": ["run", "reset", "close", "start", "poll", "finalize", "cancel", "list"], "description": "Action (default run): run/reset/close a session, or start/poll/finalize/cancel/list background jobs" }
@@ -131,11 +130,9 @@ pub(super) fn execute(
         }
         "finalize" => {
             let id = job.as_deref().context("bash finalize requires 'job'")?;
-            let wait = match timeout {
-                Some(0) => None,
-                Some(secs) => Some(Duration::from_secs(secs)),
-                None => Some(Duration::from_secs(DEFAULT_BASH_TIMEOUT_SECS)),
-            };
+            // No default wait: unset (or 0) blocks until the job completes
+            // (cancellation-aware); a positive value bounds the wait.
+            let wait = timeout.filter(|&secs| secs > 0).map(Duration::from_secs);
             render_job(id, state.jobs.finalize(id, wait, cancel)?)
         }
         "cancel" => {
@@ -171,8 +168,11 @@ fn run_session(
     let command = command
         .filter(|c| !c.trim().is_empty())
         .context("bash session run requires a command")?;
-    let timeout_secs = timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
-    let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+    // No default per-command timeout: unset (or 0) means no caller limit
+    // (matching pi-mono). The session still enforces its wedge-safety hard cap
+    // (`SESSION_HARD_CAP`) internally. A positive value is the per-call limit.
+    let timeout = timeout.filter(|&secs| secs > 0).map(Duration::from_secs);
+    let timeout_secs = timeout.map_or(0, |d| d.as_secs());
     // ponytail: session-path LIVE streaming is deferred (issue #90 follow-up).
     // The persistent shell interleaves a `__IRIS_DONE_<nonce>` completion marker
     // in the same stdout stream, so forwarding raw chunks would leak the
@@ -320,8 +320,13 @@ fn bash(
     if input.command.trim().is_empty() {
         bail!("bash command must not be empty");
     }
-    let timeout_secs = input.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
-    let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+    // No default timeout: unset (or 0) means run with no time limit (matching
+    // pi-mono); a positive value is the per-call limit in seconds.
+    let timeout = input
+        .timeout
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs);
+    let timeout_secs = timeout.map_or(0, |d| d.as_secs());
 
     let mut command = Command::new(resolve_shell());
     command
@@ -721,6 +726,28 @@ mod tests {
         .unwrap()
         .text;
         assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn bash_unset_timeout_imposes_no_default_limit() {
+        // With no `timeout`, the command runs to completion with no default
+        // time limit (pi-mono parity): a quick command succeeds and reports no
+        // timeout footer.
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let run = bash(
+            &root,
+            &BashInput {
+                command: "echo ok".into(),
+                timeout: None,
+            },
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(run.text.contains("ok"), "out: {}", run.text);
+        assert!(!run.text.contains("timed out"), "out: {}", run.text);
+        assert_eq!(run.exit_code, Some(0));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use crate::ui::markdown::render_markdown;
 
-use super::rows::TranscriptRow;
+use super::rows::{FoldVis, TranscriptRow};
 use super::transcript::streaming_markdown_preview;
 use super::wrap::line_text;
 use super::{panel_style, prompt_style};
@@ -21,11 +21,16 @@ pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
     }
 }
 
-pub(super) fn render_streaming_assistant(width: usize, text: &str, out: &mut Vec<Line<'static>>) {
+/// Build the transient transcript rows for the in-flight streamed assistant
+/// text. The transcript composites these through the shared `Component` path
+/// after committed history, then commits them once on `AssistantTextEnd`.
+pub(super) fn streaming_assistant_rows(text: &str) -> Vec<TranscriptRow> {
     let text = streaming_markdown_preview(text);
-    for (index, line) in render_markdown(&text).into_iter().enumerate() {
-        assistant_row(line, index == 0).render(width, out);
-    }
+    render_markdown(&text)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| assistant_row(line, index == 0))
+        .collect()
 }
 
 pub(super) fn push_user_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
@@ -44,6 +49,7 @@ fn user_row(text: &str) -> TranscriptRow {
         style: panel_style(),
         continuation_prefix: Some(ASSISTANT_TEXT_PREFIX),
         line: None,
+        fold: FoldVis::Always,
         word_wrap: true,
         background: None,
         hrule: false,
@@ -65,6 +71,7 @@ fn assistant_row(mut line: Line<'static>, first: bool) -> TranscriptRow {
         style: panel_style(),
         continuation_prefix: Some(ASSISTANT_TEXT_PREFIX),
         line: Some(line),
+        fold: FoldVis::Always,
         word_wrap: true,
         background: None,
         hrule: false,

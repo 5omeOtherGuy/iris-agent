@@ -10,8 +10,9 @@
 //! Two control flows are offered: `run_with_reauth` (one-shot reauth only, used
 //! by Antigravity) and `run_with_retry` (bounded exponential backoff for
 //! transient network/429/5xx/stream anomalies plus the one-shot reauth, used by
-//! Anthropic). The transient budget is bounded by `MAX_TRANSIENT_RETRIES` and is
-//! not reset by the reauth.
+//! Anthropic). The transient budget is bounded by the shared
+//! [`RetryPolicy`](crate::mimir::retry::RetryPolicy) and is not reset by the
+//! reauth.
 
 use std::io::BufRead;
 use std::thread::sleep;
@@ -22,15 +23,8 @@ use futures::channel::mpsc;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
+use crate::mimir::retry::RetryPolicy;
 use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream};
-
-/// Bounded transient-retry budget for [`run_with_retry`]. Reauth fires at most
-/// once and never resets this budget. Mirrors the Codex adapter's constants
-/// (`openai_codex_responses.rs`), which predates this shared module and keeps its
-/// own copy; unifying the two is out of scope here.
-const MAX_TRANSIENT_RETRIES: u32 = 3;
-const BASE_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
 /// Provider-internal seam for incremental assistant text. The streamed SSE
 /// parser pushes deltas here; the live provider forwards them onto the
@@ -181,17 +175,19 @@ pub(super) fn run_with_reauth<T>(
 /// forcibly refreshed after an auth rejection); `send` performs one attempt.
 ///
 /// Termination is guaranteed: reauth fires at most once, transient retries are
-/// bounded by `MAX_TRANSIENT_RETRIES`, the reauth does NOT reset the transient
+/// bounded by `policy.max_retries`, the reauth does NOT reset the transient
 /// budget, and every other branch returns. Backoff sleeps are sliced so a
 /// cancelled turn stops promptly instead of waiting out the full delay.
 pub(super) fn run_with_retry<T>(
     provider: &str,
+    policy: &RetryPolicy,
     cancel: &CancellationToken,
     get_token: impl FnMut(bool) -> Result<T>,
     send: impl FnMut(&T) -> Attempt,
 ) -> Result<AssistantTurn> {
     retry_loop(
         provider,
+        policy,
         get_token,
         send,
         // Sleep in slices so a turn-level cancel interrupts retry backoff.
@@ -206,6 +202,7 @@ pub(super) fn run_with_retry<T>(
 /// after each backoff sleep).
 fn retry_loop<T>(
     provider: &str,
+    policy: &RetryPolicy,
     mut get_token: impl FnMut(bool) -> Result<T>,
     mut send: impl FnMut(&T) -> Attempt,
     mut sleep: impl FnMut(Duration),
@@ -245,12 +242,12 @@ fn retry_loop<T>(
             Attempt::Retry(error, retry_after) => {
                 // The transient budget is shared across network/429/5xx/stream
                 // anomalies and is NOT reset by the one-shot reauth.
-                if transient_retries >= MAX_TRANSIENT_RETRIES {
+                if transient_retries >= policy.max_retries {
                     tracing::error!(error = %format!("{error:#}"), retries = transient_retries, "transient error; retries exhausted");
                     return Err(error);
                 }
                 transient_retries += 1;
-                let delay = backoff_delay(transient_retries, retry_after, BASE_BACKOFF);
+                let delay = policy.backoff_delay(transient_retries, retry_after);
                 tracing::warn!(
                     error = %format!("{error:#}"),
                     attempt = transient_retries,
@@ -262,24 +259,6 @@ fn retry_loop<T>(
             Attempt::Fatal(error) => return Err(error),
         }
     }
-}
-
-/// Compute the delay before the next transient retry. Honors a server
-/// `Retry-After` hint when present (bounded against pathological values);
-/// otherwise exponential backoff from `base` doubling per retry, clamped to
-/// `MAX_BACKOFF`. Either way up to 250ms of jitter is added so concurrent
-/// requests in the same rate-limit window do not retry in lockstep.
-fn backoff_delay(retry: u32, retry_after: Option<Duration>, base: Duration) -> Duration {
-    let jitter = Duration::from_millis(rand::random::<u64>() % 250);
-    if let Some(after) = retry_after {
-        return after.min(MAX_BACKOFF.saturating_mul(4)) + jitter;
-    }
-    let shift = retry.saturating_sub(1).min(10);
-    let exp = base
-        .checked_mul(1u32 << shift)
-        .unwrap_or(MAX_BACKOFF)
-        .min(MAX_BACKOFF);
-    exp + jitter
 }
 
 /// Parse an integer-seconds `Retry-After` header. The HTTP-date form is
@@ -552,6 +531,7 @@ mod tests {
         let mut slept = Vec::new();
         let turn = retry_loop(
             "test",
+            &RetryPolicy::default(),
             |_force| Ok(()),
             |&()| {
                 sends += 1;
@@ -572,10 +552,12 @@ mod tests {
 
     #[test]
     fn retry_loop_exhausts_budget_and_returns_last_error() {
+        let max = RetryPolicy::default().max_retries;
         let mut sends = 0u32;
         let mut slept = 0u32;
         let result = retry_loop(
             "test",
+            &RetryPolicy::default(),
             |_force| Ok(()),
             |&()| {
                 sends += 1;
@@ -586,19 +568,21 @@ mod tests {
         );
         let error = result.unwrap_err();
         assert!(error.to_string().contains("protocol anomaly"), "{error}");
-        // 3 retries (with sleeps) then the 4th attempt exhausts the budget.
-        assert_eq!(sends, MAX_TRANSIENT_RETRIES + 1);
-        assert_eq!(slept, MAX_TRANSIENT_RETRIES);
+        // `max` retries (with sleeps) then one more attempt exhausts the budget.
+        assert_eq!(sends, max + 1);
+        assert_eq!(slept, max);
     }
 
     #[test]
     fn reauth_does_not_reset_the_transient_budget() {
         // One reauth interleaved with transient retries must not grant extra
         // transient attempts: total sends stay bounded.
+        let max = RetryPolicy::default().max_retries;
         let mut sends = 0u32;
         let mut tokens = Vec::new();
         let result = retry_loop(
             "test",
+            &RetryPolicy::default(),
             |force| {
                 tokens.push(force);
                 Ok(())
@@ -614,8 +598,8 @@ mod tests {
             || false,
         );
         assert!(result.is_err());
-        // 1 reauth attempt + (MAX_TRANSIENT_RETRIES retries) + 1 exhausting attempt.
-        assert_eq!(sends, MAX_TRANSIENT_RETRIES + 2);
+        // 1 reauth attempt + (`max` retries) + 1 exhausting attempt.
+        assert_eq!(sends, max + 2);
         assert!(!tokens[0], "first token is cached");
         assert!(tokens[1], "reauth forces one refresh");
     }
@@ -628,6 +612,7 @@ mod tests {
         let mut sends = 0u32;
         let result = retry_loop(
             "test",
+            &RetryPolicy::default(),
             |_force| Ok(()),
             |&()| {
                 sends += 1;
@@ -649,22 +634,9 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
-    #[test]
-    fn backoff_delay_honors_retry_after_and_grows_exponentially() {
-        // Exponential growth from the base, clamped to MAX_BACKOFF.
-        let d1 = backoff_delay(1, None, BASE_BACKOFF);
-        let d2 = backoff_delay(2, None, BASE_BACKOFF);
-        assert!(d1 >= BASE_BACKOFF && d1 < BASE_BACKOFF + Duration::from_millis(250));
-        assert!(d2 >= BASE_BACKOFF * 2);
-        let big = backoff_delay(20, None, BASE_BACKOFF);
-        assert!(big <= MAX_BACKOFF + Duration::from_millis(250));
-        // A server Retry-After hint wins (plus jitter), bounded against
-        // pathological values.
-        let hint = backoff_delay(1, Some(Duration::from_secs(2)), BASE_BACKOFF);
-        assert!(hint >= Duration::from_secs(2) && hint < Duration::from_secs(3));
-        let pathological = backoff_delay(1, Some(Duration::from_secs(86400)), BASE_BACKOFF);
-        assert!(pathological <= MAX_BACKOFF * 4 + Duration::from_millis(250));
-    }
+    // Backoff growth/clamping/`Retry-After` behavior is covered by
+    // `mimir::retry::tests` since the computation moved to the shared
+    // `RetryPolicy`.
 
     #[test]
     fn parse_retry_after_reads_integer_seconds_only() {

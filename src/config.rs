@@ -72,6 +72,38 @@ pub(crate) struct Settings {
     /// providers a session talks to, so it is global-only: a cloned repo cannot
     /// silently change the cycle scope.
     pub(crate) enabled_models: Option<Vec<String>>,
+    /// Optional graceful soft cap on tool round-trips per turn. Absent (the
+    /// default) leaves the agent loop unbounded: it runs while the model emits
+    /// tool calls and stops naturally, with cancellation as the runaway guard.
+    /// When set, the loop ends the turn with a Notice after this many
+    /// round-trips. Not a security-sensitive redirect (unlike provider/base-url),
+    /// and the built-in default is already unbounded, so a project override
+    /// cannot make a run more permissive than the default -- it can only impose
+    /// (or raise/lower) a local loop bound. Project-tunable like
+    /// [`Settings::context_token_budget`].
+    pub(crate) max_tool_roundtrips: Option<usize>,
+    /// Provider retry/backoff tuning (max retries, base/max backoff). Absent
+    /// subfields fall back to the built-in defaults via
+    /// [`Settings::retry_settings`]. Global-only: retry volume affects provider
+    /// request load and cost, so an untrusted project file must not crank it up
+    /// (same reasoning as `prompt_cache_retention`).
+    pub(crate) retry: Option<RetrySettings>,
+}
+
+/// Raw provider retry/backoff config (all fields optional). Resolved into the
+/// shared `mimir` retry policy by [`Settings::retry_settings`] +
+/// [`crate::mimir::selection::ModelSelection::resolve`], which fills any absent
+/// subfield with the built-in default. Kept as plain config data here so the
+/// settings layer does not depend on the provider transport.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RetrySettings {
+    /// Maximum transient retries before giving up.
+    pub(crate) max_retries: Option<u32>,
+    /// Base backoff in milliseconds, doubled per retry.
+    pub(crate) base_delay_ms: Option<u64>,
+    /// Backoff ceiling in milliseconds.
+    pub(crate) max_delay_ms: Option<u64>,
 }
 
 /// Default context token budget when none is configured. A conservative ceiling
@@ -123,7 +155,28 @@ impl Settings {
             // (like provider/base-url) they are global-only and never taken from
             // untrusted project config.
             enabled_models: self.enabled_models,
+            // A turn cap is not a security-sensitive redirect and the default is
+            // already unbounded, so a project override cannot make a run more
+            // permissive than the default; project value wins, else global.
+            max_tool_roundtrips: project.max_tool_roundtrips.or(self.max_tool_roundtrips),
+            // Retry tuning affects provider load/cost, so keep it global-only
+            // like prompt cache retention; never taken from project config.
+            retry: self.retry,
         }
+    }
+
+    /// Configured tool round-trip soft cap, or `None` (unbounded) when unset.
+    /// The host installs it on the agent so a reached cap ends the turn with a
+    /// graceful Notice instead of a fatal error.
+    pub(crate) fn max_tool_roundtrips(&self) -> Option<usize> {
+        self.max_tool_roundtrips
+    }
+
+    /// Raw retry settings (or an all-default empty set when unconfigured). The
+    /// selection layer resolves these into the shared retry policy, filling any
+    /// absent subfield with the built-in default.
+    pub(crate) fn retry_settings(&self) -> RetrySettings {
+        self.retry.clone().unwrap_or_default()
     }
 
     /// Configured context token budget, or the built-in default when unset. The
@@ -390,6 +443,57 @@ mod tests {
         let configured = Settings::load_from(None, &project).unwrap();
         assert_eq!(configured.context_token_budget, Some(64_000));
         assert_eq!(configured.context_token_budget(), 64_000);
+    }
+
+    #[test]
+    fn max_tool_roundtrips_defaults_to_unbounded_and_a_project_may_set_it() {
+        let dir = temp_dir();
+        // Unset -> None (unbounded loop).
+        let defaulted = Settings::load_from(
+            Some(&dir.path.join("none.json")),
+            &dir.path.join("none.json"),
+        )
+        .unwrap();
+        assert_eq!(defaulted.max_tool_roundtrips(), None);
+
+        // A project may set the soft cap (it can only narrow a run).
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "maxToolRoundtrips": 100 }"#).unwrap();
+        fs::write(&project, r#"{ "maxToolRoundtrips": 20 }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(settings.max_tool_roundtrips(), Some(20));
+    }
+
+    #[test]
+    fn retry_settings_parse_and_default_and_are_global_only() {
+        let dir = temp_dir();
+        // Unset -> an all-default (empty) raw set.
+        let defaulted = Settings::load_from(
+            Some(&dir.path.join("none.json")),
+            &dir.path.join("none.json"),
+        )
+        .unwrap();
+        assert_eq!(defaulted.retry_settings(), RetrySettings::default());
+
+        // Present -> parsed; global-only (a cloned project cannot crank it up).
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{ "retry": { "maxRetries": 5, "baseDelayMs": 1000, "maxDelayMs": 30000 } }"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{ "retry": { "maxRetries": 99, "baseDelayMs": 1 } }"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        let retry = settings.retry_settings();
+        assert_eq!(retry.max_retries, Some(5));
+        assert_eq!(retry.base_delay_ms, Some(1000));
+        assert_eq!(retry.max_delay_ms, Some(30000));
     }
 
     #[test]

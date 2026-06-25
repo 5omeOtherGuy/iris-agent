@@ -1,4 +1,5 @@
 use super::*;
+use crate::mimir::retry::RetryPolicy;
 use crate::mimir::selection::PromptCacheRetention;
 use crate::nexus::ModelOrigin;
 use std::cell::Cell;
@@ -39,9 +40,11 @@ fn test_system_prompt() -> String {
 
 #[test]
 fn retry_loop_exhausts_transient_then_returns_error() {
+    let max = RetryPolicy::default().max_retries;
     let sends = Cell::new(0u32);
     let sleeps = Cell::new(0u32);
     let result = run_retry_loop(
+        &RetryPolicy::default(),
         |_force| Ok(fake_token()),
         |_token| {
             sends.set(sends.get() + 1);
@@ -53,8 +56,8 @@ fn retry_loop_exhausts_transient_then_returns_error() {
     assert!(result.is_err());
     assert!(!is_auth_error(&result.unwrap_err()));
     // One initial attempt plus MAX retries, sleeping before each retry.
-    assert_eq!(sends.get(), MAX_TRANSIENT_RETRIES + 1);
-    assert_eq!(sleeps.get(), MAX_TRANSIENT_RETRIES);
+    assert_eq!(sends.get(), max + 1);
+    assert_eq!(sleeps.get(), max);
 }
 
 #[test]
@@ -63,6 +66,7 @@ fn retry_loop_stops_immediately_when_cancelled() {
     // cancelled turn issues no request and does not retry.
     let sends = Cell::new(0u32);
     let result = run_retry_loop(
+        &RetryPolicy::default(),
         |_force| Ok(fake_token()),
         |_token| {
             sends.set(sends.get() + 1);
@@ -80,6 +84,7 @@ fn retry_loop_reauths_exactly_once_then_succeeds() {
     let forces: Cell<Vec<bool>> = Cell::new(Vec::new());
     let sends = Cell::new(0u32);
     let result = run_retry_loop(
+        &RetryPolicy::default(),
         |force| {
             let mut seen = forces.take();
             seen.push(force);
@@ -105,6 +110,7 @@ fn retry_loop_reauths_exactly_once_then_succeeds() {
 #[test]
 fn retry_loop_second_auth_rejection_returns_auth_error() {
     let result = run_retry_loop(
+        &RetryPolicy::default(),
         |_force| Ok(fake_token()),
         |_token| Attempt::Reauth(anyhow!("401")),
         |_delay| {},
@@ -118,6 +124,7 @@ fn retry_loop_second_auth_rejection_returns_auth_error() {
 fn retry_loop_force_refresh_failure_returns_auth_error() {
     let sends = Cell::new(0u32);
     let result = run_retry_loop(
+        &RetryPolicy::default(),
         |force| {
             if force {
                 Err(anyhow!("refresh failed"))
@@ -140,9 +147,10 @@ fn retry_loop_force_refresh_failure_returns_auth_error() {
 #[test]
 fn retry_loop_reauth_does_not_reset_transient_budget() {
     // Retry, Retry, Reauth, Retry, Retry: with the budget retained the
-    // fifth send exhausts MAX_TRANSIENT_RETRIES (=3) and returns.
+    // fifth send exhausts the default max retries (=3) and returns.
     let sends = Cell::new(0u32);
     let result = run_retry_loop(
+        &RetryPolicy::default(),
         |_force| Ok(fake_token()),
         |_token| {
             sends.set(sends.get() + 1);
@@ -164,6 +172,7 @@ fn retry_loop_passes_retry_after_delay_to_sleeper() {
     let delays: Cell<Vec<Duration>> = Cell::new(Vec::new());
     let sends = Cell::new(0u32);
     let _ = run_retry_loop(
+        &RetryPolicy::default(),
         |_force| Ok(fake_token()),
         |_token| {
             sends.set(sends.get() + 1);
@@ -200,33 +209,8 @@ fn classifies_http_status_into_retry_policy() {
     assert_eq!(classify_http_status(422), HttpClass::Fatal);
 }
 
-#[test]
-fn backoff_delay_grows_exponentially_within_jitter_bounds() {
-    let base = Duration::from_millis(500);
-    let jitter = Duration::from_millis(250);
-    // retry 1 -> base, retry 2 -> 2x base, retry 3 -> 4x base, each + jitter.
-    for (retry, expected) in [(1u32, 500u64), (2, 1000), (3, 2000)] {
-        let delay = backoff_delay(retry, None, base);
-        assert!(delay >= Duration::from_millis(expected), "retry {retry}");
-        assert!(
-            delay < Duration::from_millis(expected) + jitter,
-            "retry {retry}"
-        );
-    }
-}
-
-#[test]
-fn backoff_delay_is_clamped_to_max() {
-    let delay = backoff_delay(20, None, Duration::from_millis(500));
-    assert!(delay <= MAX_BACKOFF + Duration::from_millis(250));
-}
-
-#[test]
-fn backoff_delay_honors_retry_after_hint() {
-    let delay = backoff_delay(1, Some(Duration::from_secs(2)), Duration::from_millis(500));
-    assert!(delay >= Duration::from_secs(2));
-    assert!(delay < Duration::from_secs(2) + Duration::from_millis(250));
-}
+// Backoff growth/clamping/`Retry-After` behavior is covered by
+// `mimir::retry::tests` since the computation moved to the shared `RetryPolicy`.
 
 #[test]
 fn parse_retry_after_reads_integer_seconds() {
