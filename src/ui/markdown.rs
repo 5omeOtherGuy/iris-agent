@@ -4,9 +4,10 @@
 //! emphasis, code, lists, and quotes read the way the model intends. This is a
 //! deliberately small mapper over `pulldown-cmark`'s event stream -- NOT a full
 //! renderer. It covers headings, bold, italic, inline code, fenced code blocks
-//! (dimmed + indented, no syntax highlighting), bullet/ordered lists, and
-//! blockquotes. Tables, links/OSC-8 hyperlinks, images, and syntax highlighting
-//! are intentionally out of scope (see ROADMAP / the TUI re-architecture spec).
+//! (dimmed + indented, no syntax highlighting), bullet/ordered lists,
+//! blockquotes, and visible link destinations. Tables, OSC-8 hyperlinks,
+//! images, and syntax highlighting are intentionally out of scope (see ROADMAP /
+//! the TUI re-architecture spec).
 //!
 //! Output is `Vec<Line<'static>>`; the caller wraps each line to the transcript
 //! width (so this layer is width-agnostic and stays testable without a frame).
@@ -19,7 +20,7 @@ use ratatui::text::{Line, Span};
 const INDENT: &str = "  ";
 
 fn dim() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 fn inline_code_style() -> Style {
@@ -49,8 +50,15 @@ struct Renderer {
     quote: u32,
     heading: bool,
     in_code_block: bool,
+    links: Vec<LinkState>,
     /// Prefix (indent + marker / quote markers) for the line being built.
     prefix: String,
+}
+
+#[derive(Default)]
+struct LinkState {
+    dest: String,
+    label: String,
 }
 
 impl Renderer {
@@ -86,6 +94,10 @@ impl Renderer {
                 self.flush();
                 self.in_code_block = true;
             }
+            Tag::Link { dest_url, .. } => self.links.push(LinkState {
+                dest: dest_url.to_string(),
+                label: String::new(),
+            }),
             Tag::List(start) => {
                 // Flush the parent item's text before its nested list overwrites
                 // the line prefix (e.g. "- top" before "  - nested").
@@ -126,6 +138,7 @@ impl Renderer {
                 self.in_code_block = false;
                 self.blank();
             }
+            TagEnd::Link => self.end_link(),
             TagEnd::List(_) => {
                 self.lists.pop();
                 self.prefix = INDENT.repeat(self.lists.len());
@@ -167,7 +180,7 @@ impl Renderer {
             style = style.add_modifier(Modifier::ITALIC);
         }
         if self.quote > 0 {
-            style = style.fg(Color::DarkGray);
+            style = style.add_modifier(Modifier::DIM);
         }
         style
     }
@@ -176,7 +189,20 @@ impl Renderer {
         if content.is_empty() {
             return;
         }
+        for link in &mut self.links {
+            link.label.push_str(&content);
+        }
         self.spans.push(Span::styled(content, style));
+    }
+
+    fn end_link(&mut self) {
+        let Some(link) = self.links.pop() else {
+            return;
+        };
+        if link.dest.is_empty() || link.label.contains(&link.dest) {
+            return;
+        }
+        self.push_span(format!(" ({})", link.dest), dim());
     }
 
     fn code_block_prefix(&self) -> String {
@@ -327,7 +353,7 @@ mod tests {
             assert!(
                 line.spans
                     .iter()
-                    .all(|s| s.style.fg == Some(Color::DarkGray)),
+                    .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
                 "code not dim / was highlighted"
             );
         }
@@ -407,7 +433,7 @@ mod tests {
             .iter()
             .find(|s| s.content.as_ref().contains("quoted"))
             .expect("quote body");
-        assert_eq!(body.style.fg, Some(Color::DarkGray));
+        assert!(body.style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -429,6 +455,30 @@ mod tests {
         assert_eq!(
             rendered("just a sentence"),
             vec!["just a sentence".to_string()]
+        );
+    }
+
+    #[test]
+    fn inline_link_keeps_visible_destination() {
+        assert_eq!(
+            rendered("Read [the guide](https://example.com/docs)."),
+            vec!["Read the guide (https://example.com/docs).".to_string()]
+        );
+    }
+
+    #[test]
+    fn link_destination_is_not_duplicated_when_label_is_destination() {
+        assert_eq!(
+            rendered("Visit <https://example.com/docs>"),
+            vec!["Visit https://example.com/docs".to_string()]
+        );
+    }
+
+    #[test]
+    fn reference_link_keeps_resolved_destination() {
+        assert_eq!(
+            rendered("See [spec][s].\n\n[s]: https://example.com/spec"),
+            vec!["See spec (https://example.com/spec).".to_string()]
         );
     }
 }

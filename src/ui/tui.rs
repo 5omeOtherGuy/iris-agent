@@ -35,6 +35,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[cfg(test)]
+use crate::mimir::model_catalog;
 use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{
     display_path, exploration_summary, is_exploration_tool, run_target, summarize,
@@ -52,9 +54,9 @@ const MAX_EDITOR_ROWS: u16 = 10;
 
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
-const MIN_EDITOR_H: u16 = 5;
+const MIN_EDITOR_H: u16 = 6;
+const EDITOR_VERTICAL_CHROME_ROWS: u16 = 5;
 const GLOBAL_STATUS_H: u16 = 1;
-
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
 /// bottom instead of immediately occupying the whole terminal height.
@@ -77,14 +79,12 @@ const PANEL_BODY_SIDE_PADDING: usize = 1;
 const PANEL_BODY_BORDER_WIDTH: usize = 2;
 const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_BORDER_WIDTH + PANEL_BODY_SIDE_PADDING * 2;
 
-const BORDER: Color = Color::Rgb(82, 84, 86);
-const TEXT: Color = Color::Rgb(205, 205, 199);
-const MUTED: Color = Color::Rgb(125, 126, 123);
-const ORANGE: Color = Color::Rgb(255, 111, 31);
-const GREEN: Color = Color::Rgb(109, 196, 119);
-const RED: Color = Color::Rgb(221, 93, 69);
-const DIFF_ADD_BG: Color = Color::Rgb(25, 45, 31);
-const DIFF_DEL_BG: Color = Color::Rgb(55, 31, 30);
+const BORDER: Color = Color::Gray;
+const ORANGE: Color = Color::Yellow;
+const GREEN: Color = Color::Green;
+const RED: Color = Color::Red;
+const DIFF_ADD_BG: Color = Color::Indexed(22);
+const DIFF_DEL_BG: Color = Color::Indexed(52);
 const COMPOSER_HINT: &str = "↵ to send  •  shift+↵ for new line  •  / for commands";
 
 const X_PADDING: usize = 2;
@@ -122,23 +122,13 @@ fn err_style() -> Style {
     Style::default().fg(RED)
 }
 fn dim_style() -> Style {
-    Style::default().fg(MUTED)
+    Style::default().add_modifier(Modifier::DIM)
 }
 fn prompt_style() -> Style {
     Style::default().fg(ORANGE)
 }
 fn tool_header_style() -> Style {
-    Style::default().fg(TEXT)
-}
-
-fn status_dot_style(running: bool, failed: bool) -> Style {
-    if failed && !running {
-        err_style()
-    } else if running {
-        prompt_style()
-    } else {
-        ok_style()
-    }
+    Style::default()
 }
 
 /// Render instrument-panel runtime as a fixed clock field (`00:01:48s`).
@@ -431,7 +421,7 @@ fn border_style() -> Style {
 }
 
 fn panel_style() -> Style {
-    Style::default().fg(TEXT)
+    Style::default()
 }
 
 fn panel_outer_padding(width: usize) -> usize {
@@ -811,6 +801,7 @@ struct ActiveExploration {
     started: Instant,
     duration: Option<Duration>,
     failed: bool,
+    cancelled: bool,
     done: bool,
 }
 
@@ -851,12 +842,58 @@ fn explore_body(call: &ToolCall) -> String {
     exploration_summary(call)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelState {
+    Running,
+    Done,
+    Error,
+    Cancelled,
+}
+
+impl PanelState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => " RUNNING",
+            Self::Done => " DONE",
+            Self::Error => " ERROR",
+            Self::Cancelled => " CANCELLED",
+        }
+    }
+
+    fn dot_style(self) -> Style {
+        match self {
+            Self::Running => prompt_style(),
+            Self::Done => ok_style(),
+            Self::Error => err_style(),
+            Self::Cancelled => dim_style(),
+        }
+    }
+
+    fn plain_prefix(self) -> &'static str {
+        match self {
+            Self::Running => "• Running",
+            Self::Done => "• Ran",
+            Self::Error => "✗ Ran",
+            Self::Cancelled => "• Cancelled",
+        }
+    }
+}
+
+fn panel_state(running: bool, failed: bool) -> PanelState {
+    if running {
+        PanelState::Running
+    } else if failed {
+        PanelState::Error
+    } else {
+        PanelState::Done
+    }
+}
+
 struct PanelHeaderSpec<'a> {
     title: &'static str,
     meta: &'a str,
     plain_meta: &'a str,
-    running: bool,
-    failed: bool,
+    state: PanelState,
     duration: Option<std::time::Duration>,
     started: Option<Instant>,
 }
@@ -945,7 +982,7 @@ impl Transcript {
                     if failed {
                         " DENIED      "
                     } else {
-                        " RECORDED    "
+                        " APPROVED    "
                     }
                     .to_string(),
                     panel_style(),
@@ -995,6 +1032,18 @@ impl Transcript {
         }
     }
 
+    fn push_tool_cancelled(&mut self, call: &ToolCall) {
+        self.begin_block();
+        if call.name == "bash" {
+            let target = run_target(call);
+            self.push_shell_header(PanelState::Cancelled, None, None, &target);
+            self.push_panel_body(&format!("$ {target}"), panel_style());
+        } else {
+            self.push_generic_tool_header(call, PanelState::Cancelled, None, None);
+        }
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+    }
+
     fn push_panel_body(&mut self, text: &str, style: Style) {
         for line in text.split('\n') {
             let line = strip_ansi_for_text(line);
@@ -1009,15 +1058,23 @@ impl Transcript {
         }
     }
 
-    fn push_panel_header(&mut self, spec: PanelHeaderSpec<'_>) {
-        let state = if spec.running {
-            " RUNNING"
-        } else if spec.failed {
-            " ERROR"
-        } else {
-            " DONE"
-        };
-        let elapsed = if spec.running {
+    fn push_hidden_affordance(&mut self, hidden: usize, earlier: bool) {
+        let noun = if earlier { "earlier lines" } else { "lines" };
+        let left = format!("… {hidden} {noun} hidden");
+        let hint = "ctrl+o toggles panel";
+        let width = self
+            .wrap_width()
+            .saturating_sub(PANEL_BODY_CHROME_WIDTH)
+            .max(1);
+        let gap = width
+            .saturating_sub(display_width(&left))
+            .saturating_sub(display_width(hint))
+            .max(1);
+        self.push_panel_body(&format!("{left}{}{hint}", " ".repeat(gap)), dim_style());
+    }
+
+    fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
+        let elapsed = if spec.state == PanelState::Running {
             spec.started
                 .map(|started| format_panel_duration(started.elapsed()))
                 .unwrap_or_else(|| "00:00:00s".to_string())
@@ -1030,22 +1087,16 @@ impl Transcript {
                 })
                 .unwrap_or_else(|| "00:00:00s".to_string())
         };
-        let plain = if spec.running {
-            format!("• Running {}", spec.plain_meta)
-        } else if spec.failed {
-            format!("✗ Ran {}", spec.plain_meta)
-        } else {
-            format!("• Ran {}", spec.plain_meta)
-        };
+        let plain = format!("{} {}", spec.state.plain_prefix(), spec.plain_meta);
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Header {
-                expanded: true,
+                expanded,
                 title: spec.title,
                 meta: spec.meta.to_string(),
                 right: vec![
-                    ("●".to_string(), status_dot_style(spec.running, spec.failed)),
-                    (state.to_string(), panel_style()),
+                    ("●".to_string(), spec.state.dot_style()),
+                    (spec.state.label().to_string(), panel_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
             },
@@ -1055,10 +1106,13 @@ impl Transcript {
         self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
     }
 
+    fn push_panel_header(&mut self, spec: PanelHeaderSpec<'_>) {
+        self.push_panel_header_with_expanded(spec, true);
+    }
+
     fn push_shell_header(
         &mut self,
-        running: bool,
-        failed: bool,
+        state: PanelState,
         duration: Option<std::time::Duration>,
         started: Option<Instant>,
         target: &str,
@@ -1067,8 +1121,7 @@ impl Transcript {
             title: "SHELL",
             meta: "bash",
             plain_meta: target,
-            running,
-            failed,
+            state,
             duration,
             started,
         });
@@ -1084,7 +1137,7 @@ impl Transcript {
         error: Option<&str>,
     ) {
         let target = run_target(call);
-        self.push_shell_header(running, failed, duration, None, &target);
+        self.push_shell_header(panel_state(running, failed), duration, None, &target);
         self.push_panel_body(&format!("$ {target}"), panel_style());
         if !content.is_empty() {
             self.push_tool_output(content);
@@ -1103,8 +1156,7 @@ impl Transcript {
     fn push_generic_tool_header(
         &mut self,
         call: &ToolCall,
-        running: bool,
-        failed: bool,
+        state: PanelState,
         duration: Option<std::time::Duration>,
         started: Option<Instant>,
     ) {
@@ -1113,8 +1165,7 @@ impl Transcript {
             title: tool_panel_title(call),
             meta: &meta,
             plain_meta: &meta,
-            running,
-            failed,
+            state,
             duration,
             started,
         });
@@ -1129,7 +1180,7 @@ impl Transcript {
         duration: Option<std::time::Duration>,
         error: Option<&str>,
     ) {
-        self.push_generic_tool_header(call, running, failed, duration, None);
+        self.push_generic_tool_header(call, panel_state(running, failed), duration, None);
         if !content.is_empty() {
             self.push_tool_output(content);
         } else if error.is_none() {
@@ -1149,7 +1200,7 @@ impl Transcript {
         let body_start = self.rows.len();
         let started = Instant::now();
         let target = run_target(&call);
-        self.push_shell_header(true, false, None, Some(started), &target);
+        self.push_shell_header(PanelState::Running, None, Some(started), &target);
         self.push_panel_body(&format!("$ {target}"), panel_style());
         self.push_panel_body("$ █", panel_style());
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
@@ -1165,7 +1216,7 @@ impl Transcript {
         self.begin_block();
         let body_start = self.rows.len();
         let started = Instant::now();
-        self.push_generic_tool_header(&call, true, false, None, Some(started));
+        self.push_generic_tool_header(&call, PanelState::Running, None, Some(started));
         self.push_panel_body("running…", dim_style());
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.active_tool = Some(ActiveTool {
@@ -1186,8 +1237,37 @@ impl Transcript {
         self.panel_end_from(active.body_start)
     }
 
-    fn replace_active_tool_panel(&mut self, active: &ActiveTool, replacement: Vec<TranscriptRow>) {
+    fn panel_expanded_in(&self, start: usize, end: usize) -> bool {
+        self.rows[start..end]
+            .iter()
+            .find_map(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::Header { expanded, .. }) => Some(*expanded),
+                _ => None,
+            })
+            .unwrap_or(true)
+    }
+
+    fn preserve_panel_expanded(replacement: &mut [TranscriptRow], expanded: bool) {
+        if let Some(row_expanded) =
+            replacement
+                .iter_mut()
+                .find_map(|row| match row.chrome.as_mut() {
+                    Some(ChromeRow::Header { expanded, .. }) => Some(expanded),
+                    _ => None,
+                })
+        {
+            *row_expanded = expanded;
+        }
+    }
+
+    fn replace_active_tool_panel(
+        &mut self,
+        active: &ActiveTool,
+        mut replacement: Vec<TranscriptRow>,
+    ) {
         let end = self.active_tool_panel_end(active);
+        let expanded = self.panel_expanded_in(active.body_start, end);
+        Self::preserve_panel_expanded(&mut replacement, expanded);
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -1195,8 +1275,14 @@ impl Transcript {
         self.panel_end_from(active.body_start)
     }
 
-    fn replace_active_exec_panel(&mut self, active: &ActiveExec, replacement: Vec<TranscriptRow>) {
+    fn replace_active_exec_panel(
+        &mut self,
+        active: &ActiveExec,
+        mut replacement: Vec<TranscriptRow>,
+    ) {
         let end = self.active_exec_panel_end(active);
+        let expanded = self.panel_expanded_in(active.body_start, end);
+        Self::preserve_panel_expanded(&mut replacement, expanded);
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -1214,7 +1300,7 @@ impl Transcript {
         started: Instant,
     ) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
-            this.push_generic_tool_header(call, false, false, duration, Some(started));
+            this.push_generic_tool_header(call, PanelState::Done, duration, Some(started));
             if !content.is_empty() {
                 this.push_tool_output(content);
             } else {
@@ -1231,8 +1317,15 @@ impl Transcript {
         started: Instant,
     ) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
-            this.push_generic_tool_header(call, false, true, None, Some(started));
+            this.push_generic_tool_header(call, PanelState::Error, None, Some(started));
             this.push_panel_body(&format!("error: {message}"), err_style());
+            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        })
+    }
+
+    fn cancelled_tool_rows(&mut self, call: &ToolCall, started: Instant) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            this.push_generic_tool_header(call, PanelState::Cancelled, None, Some(started));
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
     }
@@ -1268,6 +1361,19 @@ impl Transcript {
         true
     }
 
+    fn finalize_active_tool_cancelled(&mut self, call: &ToolCall) -> bool {
+        let Some(active) = self.active_tool.take() else {
+            return false;
+        };
+        if active.call.id != call.id {
+            self.active_tool = Some(active);
+            return false;
+        }
+        let rows = self.cancelled_tool_rows(call, active.started);
+        self.replace_active_tool_panel(&active, rows);
+        true
+    }
+
     fn clear_active_tool_for_preview(&mut self, call: &ToolCall) {
         if self
             .active_tool
@@ -1282,7 +1388,7 @@ impl Transcript {
     fn running_exec_rows(&mut self, active: &ActiveExec) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
             let target = run_target(&active.call);
-            this.push_shell_header(true, false, None, Some(active.started), &target);
+            this.push_shell_header(PanelState::Running, None, Some(active.started), &target);
             this.push_panel_body(&format!("$ {target}"), panel_style());
             this.push_tool_output_tail(&active.output);
             this.push_panel_body("$ █", panel_style());
@@ -1301,7 +1407,7 @@ impl Transcript {
         self.collect_rows(|this| {
             let target = run_target(call);
             let failed = exit_code.is_some_and(|code| code != 0);
-            this.push_shell_header(false, failed, duration, Some(started), &target);
+            this.push_shell_header(panel_state(false, failed), duration, Some(started), &target);
             this.push_panel_body(&format!("$ {target}"), panel_style());
             this.push_tool_output(content);
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
@@ -1317,12 +1423,29 @@ impl Transcript {
     ) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
             let target = run_target(call);
-            this.push_shell_header(false, true, None, Some(started), &target);
+            this.push_shell_header(PanelState::Error, None, Some(started), &target);
             this.push_panel_body(&format!("$ {target}"), panel_style());
             if !streamed_output.is_empty() {
                 this.push_tool_output_tail(streamed_output);
             }
             this.push_panel_body(&format!("error: {message}"), err_style());
+            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        })
+    }
+
+    fn cancelled_exec_rows(
+        &mut self,
+        call: &ToolCall,
+        streamed_output: &str,
+        started: Instant,
+    ) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            let target = run_target(call);
+            this.push_shell_header(PanelState::Cancelled, None, Some(started), &target);
+            this.push_panel_body(&format!("$ {target}"), panel_style());
+            if !streamed_output.is_empty() {
+                this.push_tool_output_tail(streamed_output);
+            }
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
     }
@@ -1372,6 +1495,19 @@ impl Transcript {
         }
         let rows = self.errored_exec_rows(call, message, &active.output, active.started);
         self.replace_active_exec_panel(&active, rows);
+    }
+
+    fn finalize_active_cancelled(&mut self, call: &ToolCall) -> bool {
+        let Some(active) = self.active_exec.take() else {
+            return false;
+        };
+        if active.call.id != call.id {
+            self.active_exec = Some(active);
+            return false;
+        }
+        let rows = self.cancelled_exec_rows(call, &active.output, active.started);
+        self.replace_active_exec_panel(&active, rows);
+        true
     }
 
     /// The width to assume when shaping rows during `apply` (before a frame has
@@ -1473,7 +1609,7 @@ impl Transcript {
         }
         let hidden = tail_start - head_end;
         if hidden > 0 {
-            self.push_panel_body(&format!("… +{hidden} lines"), dim_style());
+            self.push_hidden_affordance(hidden, false);
         }
         for raw in &lines[tail_start..] {
             let clamped = clamp_output_line(raw, width, tail_budget);
@@ -1506,7 +1642,7 @@ impl Transcript {
         }
         let start = lines.len() - take;
         if start > 0 {
-            self.push_panel_body(&format!("… +{start} earlier lines"), dim_style());
+            self.push_hidden_affordance(start, true);
         }
         for (offset, raw) in lines[start..].iter().enumerate() {
             // Use the head gutter for the very first visible row only when no
@@ -1517,24 +1653,13 @@ impl Transcript {
         }
     }
 
-    fn explore_header_right(
-        running: bool,
-        failed: bool,
-        duration: Option<Duration>,
-    ) -> Vec<(String, Style)> {
-        let state = if running {
-            " RUNNING     "
-        } else if failed {
-            " ERROR       "
-        } else {
-            " DONE        "
-        };
+    fn explore_header_right(state: PanelState, duration: Option<Duration>) -> Vec<(String, Style)> {
         let elapsed = duration
             .map(format_panel_duration)
             .unwrap_or_else(|| "00:00:00s".to_string());
         vec![
-            ("●".to_string(), status_dot_style(running, failed)),
-            (state.to_string(), panel_style()),
+            ("●".to_string(), state.dot_style()),
+            (format!("{:<13}", state.label()), panel_style()),
             (format!("{elapsed}  "), dim_style()),
         ]
     }
@@ -1576,30 +1701,42 @@ impl Transcript {
     fn set_explore_header(
         &mut self,
         call: &ToolCall,
-        running: bool,
-        failed: bool,
+        state: PanelState,
         duration: Option<Duration>,
     ) {
         let Some(header) = self.current_explore_header_row() else {
             return;
         };
-        let meta = match self.rows[header].chrome.as_ref() {
-            Some(ChromeRow::Header { meta, .. }) => meta.clone(),
-            _ => explore_panel_meta(call),
+        let (meta, expanded) = match self.rows[header].chrome.as_ref() {
+            Some(ChromeRow::Header { meta, expanded, .. }) => (meta.clone(), *expanded),
+            _ => (explore_panel_meta(call), true),
         };
         self.rows[header] = TranscriptRow::chrome(ChromeRow::Header {
-            expanded: true,
+            expanded,
             title: "EXPLORE",
             meta,
-            right: Self::explore_header_right(running, failed, duration),
+            right: Self::explore_header_right(state, duration),
         });
     }
 
     fn update_explore_header_from_active(&mut self, call: &ToolCall) {
         let running = self.active_explorations.iter().any(|active| !active.done);
         let failed = self.active_explorations.iter().any(|active| active.failed);
+        let cancelled = self
+            .active_explorations
+            .iter()
+            .any(|active| active.cancelled);
         let duration = self.active_exploration_duration(running);
-        self.set_explore_header(call, running, failed && !running, duration);
+        let state = if running {
+            PanelState::Running
+        } else if failed {
+            PanelState::Error
+        } else if cancelled {
+            PanelState::Cancelled
+        } else {
+            PanelState::Done
+        };
+        self.set_explore_header(call, state, duration);
         if !running {
             self.active_explorations.clear();
         }
@@ -1617,7 +1754,7 @@ impl Transcript {
     fn push_explore_body(&mut self, call: &ToolCall, failed: bool, duration: Option<Duration>) {
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
-            self.set_explore_header(call, false, failed, duration);
+            self.set_explore_header(call, panel_state(false, failed), duration);
         } else {
             self.push_blank();
             self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
@@ -1625,7 +1762,7 @@ impl Transcript {
                 expanded: true,
                 title: "EXPLORE",
                 meta: explore_panel_meta(call),
-                right: Self::explore_header_right(false, failed, duration),
+                right: Self::explore_header_right(panel_state(false, failed), duration),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
@@ -1647,7 +1784,14 @@ impl Transcript {
 
     fn push_explored_result(&mut self, call: &ToolCall, duration: Option<Duration>) {
         self.finish_stream();
-        if self.finish_exploration(call, explore_body(call), dim_style(), duration, false) {
+        if self.finish_exploration(
+            call,
+            explore_body(call),
+            dim_style(),
+            duration,
+            false,
+            false,
+        ) {
             return;
         }
         self.push_explore_body(call, false, duration);
@@ -1665,7 +1809,7 @@ impl Transcript {
                 expanded: true,
                 title: "EXPLORE",
                 meta: explore_panel_meta(call),
-                right: Self::explore_header_right(true, false, Some(Duration::ZERO)),
+                right: Self::explore_header_right(PanelState::Running, Some(Duration::ZERO)),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
@@ -1687,6 +1831,7 @@ impl Transcript {
             started,
             duration: None,
             failed: false,
+            cancelled: false,
             done: false,
         });
         self.update_explore_header_from_active(call);
@@ -1717,6 +1862,7 @@ impl Transcript {
         style: Style,
         duration: Option<Duration>,
         failed: bool,
+        cancelled: bool,
     ) -> bool {
         let Some(pos) = self
             .active_explorations
@@ -1728,6 +1874,7 @@ impl Transcript {
         let row = self.active_explorations[pos].row;
         self.active_explorations[pos].duration = duration;
         self.active_explorations[pos].failed = failed;
+        self.active_explorations[pos].cancelled = cancelled;
         self.active_explorations[pos].done = true;
         let replaced = self.replace_explore_body_at(row, text, style);
         debug_assert!(replaced);
@@ -1737,7 +1884,19 @@ impl Transcript {
 
     fn push_explored_error(&mut self, call: &ToolCall, message: &str) -> bool {
         self.finish_stream();
-        self.finish_exploration(call, format!("error: {message}"), err_style(), None, true)
+        self.finish_exploration(
+            call,
+            format!("error: {message}"),
+            err_style(),
+            None,
+            true,
+            false,
+        )
+    }
+
+    fn push_explored_cancelled(&mut self, call: &ToolCall) -> bool {
+        self.finish_stream();
+        self.finish_exploration(call, explore_body(call), dim_style(), None, false, true)
     }
 
     /// Apply one semantic event to the transcript rows.
@@ -1873,6 +2032,18 @@ impl Transcript {
                     self.push_tool_error(&call, &message);
                 }
             }
+            UiEvent::ToolCancelled(call) => {
+                if self
+                    .active_exec
+                    .as_ref()
+                    .is_some_and(|a| a.call.id == call.id)
+                {
+                    self.finalize_active_cancelled(&call);
+                } else if self.finalize_active_tool_cancelled(&call) {
+                } else if !is_exploration_tool(&call) || !self.push_explored_cancelled(&call) {
+                    self.push_tool_cancelled(&call);
+                }
+            }
             UiEvent::Notice(message) => {
                 self.begin_block();
                 self.push(&format!("note: {message}"), dim_style());
@@ -1950,6 +2121,34 @@ impl Transcript {
         false
     }
 
+    fn toggle_latest_panel(&mut self) -> bool {
+        let Some(header) = self
+            .rows
+            .iter()
+            .rposition(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Header { .. })))
+        else {
+            return false;
+        };
+        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[header].chrome.as_mut() {
+            *expanded = !*expanded;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn latest_panel_collapsed(&self) -> bool {
+        self.rows
+            .iter()
+            .rev()
+            .find_map(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::Header { expanded, .. }) => Some(!*expanded),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
     /// Commit a submitted prompt into the transcript as plain pane text.
     /// This is display-only; the raw prompt still goes to Nexus unchanged
     /// through the loop.
@@ -1965,8 +2164,22 @@ impl Transcript {
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
             .max(1);
         let mut rows = Vec::new();
+        let mut collapsed = false;
         for row in &self.rows {
-            row.render(width, &mut rows);
+            match row.chrome.as_ref() {
+                Some(ChromeRow::Header {
+                    expanded: false, ..
+                }) => {
+                    collapsed = true;
+                    row.render(width, &mut rows);
+                }
+                Some(ChromeRow::Separator | ChromeRow::Body { .. }) if collapsed => {}
+                Some(ChromeRow::Bottom) => {
+                    row.render(width, &mut rows);
+                    collapsed = false;
+                }
+                _ => row.render(width, &mut rows),
+            }
         }
         if let Some(text) = &self.streaming {
             pane::render_streaming_assistant(width, text, &mut rows);
@@ -2149,6 +2362,8 @@ struct Footer {
     model: String,
     /// Reasoning effort display token, when configured.
     effort: Option<String>,
+    /// Context-window label sourced from the model catalog, when known.
+    context: Option<String>,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
     /// Latest provider-reported usage, if the provider surfaced it.
@@ -2256,7 +2471,7 @@ fn fresh_editor() -> TextArea<'static> {
     editor.set_cursor_line_style(Style::default());
     editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     editor.set_placeholder_style(dim_style());
-    editor.set_placeholder_text("Give iris a task...");
+    editor.set_placeholder_text("Give Iris a task...");
     editor
 }
 
@@ -2397,11 +2612,37 @@ impl Screen {
 
     /// Set (or refresh) the idle footer from the live model selection. The loop
     /// calls this whenever the model/effort changes; `cwd` is home-relativized.
+    #[cfg(test)]
     pub(crate) fn set_footer(&mut self, model: String, effort: Option<String>, cwd: String) {
+        let (display_model, lookup_model) = model
+            .split_once('/')
+            .map(|(_, bare)| (bare.to_string(), model.clone()))
+            .unwrap_or_else(|| {
+                (
+                    model.clone(),
+                    format!(
+                        "{}/{}",
+                        crate::mimir::selection::ProviderId::DEFAULT.as_str(),
+                        model
+                    ),
+                )
+            });
+        let context = model_catalog::ctx_label(&lookup_model).map(str::to_string);
+        self.set_footer_with_context(display_model, effort, context, cwd);
+    }
+
+    pub(crate) fn set_footer_with_context(
+        &mut self,
+        model: String,
+        effort: Option<String>,
+        context: Option<String>,
+        cwd: String,
+    ) {
         let usage = self.footer.as_ref().and_then(|footer| footer.usage.clone());
         self.footer = Some(Footer {
             model,
             effort,
+            context,
             cwd,
             usage,
         });
@@ -2453,6 +2694,15 @@ impl Screen {
 
     pub(crate) fn clear_approval(&mut self) {
         self.approval_hint = None;
+    }
+
+    pub(crate) fn toggle_latest_panel(&mut self) -> bool {
+        self.transcript.toggle_latest_panel()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_panel_collapsed(&self) -> bool {
+        self.transcript.latest_panel_collapsed()
     }
 
     fn working_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -2672,10 +2922,12 @@ fn render_document_with_chrome_tail(
     let width = size.width.max(1);
     let height = size.height.max(1);
     let mut transcript = screen.wrapped_lines(width);
+    let working = screen.working_lines(width);
     let chrome = render_editor_chrome(screen, width, height);
     let chrome_len = chrome.len();
+    let volatile_tail = chrome_len + working.len();
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
-    let min_transcript_rows = usize::from(target_rows).saturating_sub(chrome.len());
+    let min_transcript_rows = usize::from(target_rows).saturating_sub(chrome.len() + working.len());
     if transcript.len() < min_transcript_rows {
         let mut padded = Vec::with_capacity(min_transcript_rows + chrome.len());
         padded.extend(
@@ -2684,40 +2936,139 @@ fn render_document_with_chrome_tail(
         padded.extend(transcript);
         transcript = padded;
     }
+    transcript.extend(working);
     transcript.extend(chrome);
-    (transcript, chrome_len)
+    (transcript, volatile_tail)
 }
 
 fn global_status_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
     let footer = screen.footer.as_ref()?;
-    let (cwd, branch) = split_cwd_branch(&footer.cwd);
+    let clean_cwd = strip_ansi_for_text(&footer.cwd);
+    let (cwd, branch) = split_cwd_branch(&clean_cwd);
+    let model = strip_ansi_for_text(&footer.model);
+    let model_flag = (!screen.spinner.active)
+        .then_some(footer.effort.as_ref())
+        .flatten()
+        .map(|effort| strip_ansi_for_text(effort));
+    let fields = status_fields_for_width(
+        usize::from(width),
+        &model,
+        model_flag.as_deref(),
+        footer.context.as_deref(),
+        &cwd,
+        branch.as_deref(),
+    );
     let mut spans = vec![
-        Span::raw(" ".repeat(BOX_X_PADDING)),
+        Span::raw(" ".repeat(statusline_indent(usize::from(width)))),
         Span::styled("● ", prompt_style()),
-        Span::styled("MODE ", panel_style()),
-        Span::styled("code", dim_style()),
-        rail_sep(),
-        Span::styled("MODEL ", panel_style()),
-        Span::styled(strip_ansi_for_text(&footer.model), dim_style()),
     ];
-    if !screen.spinner.active
-        && let Some(effort) = &footer.effort
-    {
-        spans.push(rail_sep());
-        spans.push(Span::styled("EFFORT ", panel_style()));
-        spans.push(Span::styled(strip_ansi_for_text(effort), dim_style()));
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            spans.push(rail_sep());
+        }
+        spans.push(Span::styled(format!("{} ", field.label), panel_style()));
+        spans.push(Span::styled(field.value.clone(), tool_header_style()));
     }
-    spans.push(rail_sep());
-    spans.push(Span::styled("CWD ", panel_style()));
-    spans.push(Span::styled(strip_ansi_for_text(&cwd), dim_style()));
-    if let Some(branch) = branch {
-        spans.push(rail_sep());
-        spans.push(Span::styled("BRANCH ", panel_style()));
-        spans.push(Span::styled(strip_ansi_for_text(&branch), dim_style()));
-    }
-    let mut line = Line::from(std::mem::take(&mut spans));
+    let mut line = Line::from(spans);
     truncate_line(&mut line, usize::from(width).max(1));
     Some(line)
+}
+
+#[derive(Clone)]
+struct StatusField {
+    label: &'static str,
+    value: String,
+}
+
+fn statusline_indent(width: usize) -> usize {
+    TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1))
+}
+
+fn status_fields_for_width(
+    width: usize,
+    model: &str,
+    model_flag: Option<&str>,
+    context: Option<&str>,
+    cwd: &str,
+    branch: Option<&str>,
+) -> Vec<StatusField> {
+    let candidates = [
+        (true, true, true, true, true),
+        (true, true, true, true, false),
+        (true, false, true, true, false),
+        (true, false, true, false, false),
+        (true, false, false, false, false),
+        (false, false, false, false, false),
+    ];
+    candidates
+        .into_iter()
+        .map(
+            |(include_model, include_model_flag, include_context, include_cwd, include_branch)| {
+                build_status_fields(
+                    if include_model { model } else { "" },
+                    (include_model && include_model_flag)
+                        .then_some(model_flag)
+                        .flatten(),
+                    include_context.then_some(context).flatten(),
+                    include_cwd.then_some(cwd),
+                    include_branch.then_some(branch).flatten(),
+                )
+            },
+        )
+        .find(|fields| statusline_width(fields, width) <= width || fields.len() <= 1)
+        .unwrap_or_else(|| build_status_fields("", None, None, None, None))
+}
+
+fn build_status_fields(
+    model: &str,
+    model_flag: Option<&str>,
+    context: Option<&str>,
+    cwd: Option<&str>,
+    branch: Option<&str>,
+) -> Vec<StatusField> {
+    let mut fields = vec![StatusField {
+        label: "MODE",
+        value: "code".to_string(),
+    }];
+    if !model.is_empty() {
+        let value = if let Some(flag) = model_flag.filter(|flag| !flag.is_empty()) {
+            format!("{model} {flag}")
+        } else {
+            model.to_string()
+        };
+        fields.push(StatusField {
+            label: "MODEL",
+            value,
+        });
+    }
+    if let Some(context) = context.filter(|context| !context.is_empty()) {
+        fields.push(StatusField {
+            label: "CTX",
+            value: context.to_string(),
+        });
+    }
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+        fields.push(StatusField {
+            label: "CWD",
+            value: cwd.to_string(),
+        });
+    }
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        fields.push(StatusField {
+            label: "BRANCH",
+            value: branch.to_string(),
+        });
+    }
+    fields
+}
+
+fn statusline_width(fields: &[StatusField], terminal_width: usize) -> usize {
+    let content = fields
+        .iter()
+        .map(|field| format!("{} {}", field.label, field.value))
+        .collect::<Vec<_>>()
+        .join("  ┊  ");
+    statusline_indent(terminal_width) + display_width("● ") + display_width(&content)
 }
 
 fn rail_sep() -> Span<'static> {
@@ -2736,7 +3087,7 @@ fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
 #[derive(Clone, Copy)]
 struct ChromeHeights {
     menu: u16,
-    working: u16,
+    global_status: u16,
     editor: u16,
 }
 
@@ -2744,32 +3095,19 @@ fn chrome_heights(
     height: u16,
     menu_wanted: u16,
     desired_global_status_h: u16,
-    desired_working_h: u16,
     editor_rows: u16,
 ) -> ChromeHeights {
     let global_status = desired_global_status_h.min(GLOBAL_STATUS_H);
-    let working = if desired_working_h > 0
-        && height
-            >= MIN_EDITOR_H
-                .saturating_add(global_status)
-                .saturating_add(desired_working_h)
-    {
-        desired_working_h
-    } else {
-        0
-    };
     let menu = menu_wanted.min(
         height
             .saturating_sub(MIN_EDITOR_H)
-            .saturating_sub(global_status)
-            .saturating_sub(working),
+            .saturating_sub(global_status),
     );
     let max_editor_h = height
         .saturating_sub(menu)
         .saturating_sub(global_status)
-        .saturating_sub(working)
         .max(1);
-    let wanted_editor_h = editor_rows.saturating_add(4);
+    let wanted_editor_h = editor_rows.saturating_add(EDITOR_VERTICAL_CHROME_ROWS);
     let editor = if max_editor_h >= MIN_EDITOR_H {
         wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
     } else {
@@ -2777,7 +3115,7 @@ fn chrome_heights(
     };
     ChromeHeights {
         menu,
-        working,
+        global_status,
         editor,
     }
 }
@@ -2820,37 +3158,25 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     };
 
     // Bottom-anchored, clamped to the fixed viewport. The editor owns its hint
-    // row inside the border; there is no bottom status bar in the spec.
-    // Explicit global chrome, when sourced, is outside transcript pane rows,
-    // tool panels, and the composer body. There is no bottom telemetry bar.
+    // row inside the border; there is no bottom telemetry bar.
     let global_status_lines: Vec<Line<'static>> =
         global_status_line(screen, area.width).into_iter().collect();
     let global_status_h = u16::try_from(global_status_lines.len()).unwrap_or(GLOBAL_STATUS_H);
-    let working_lines = screen.working_lines(area.width);
-    let heights = chrome_heights(
-        area.height,
-        menu_wanted,
-        global_status_h,
-        u16::try_from(working_lines.len()).unwrap_or(u16::MAX),
-        editor_rows,
-    );
+    let heights = chrome_heights(area.height, menu_wanted, global_status_h, editor_rows);
     let chrome_h = heights
         .menu
-        .saturating_add(global_status_h)
-        .saturating_add(heights.working)
+        .saturating_add(heights.global_status)
         .saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(heights.menu),
-        Constraint::Length(heights.working),
-        Constraint::Length(global_status_h),
+        Constraint::Length(heights.global_status),
         Constraint::Length(heights.editor),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
-    let working_area = chunks[1];
-    let rail_area = chunks[2];
-    let editor_area = chunks[3];
+    let rail_area = chunks[1];
+    let editor_area = chunks[2];
 
     let mut buf = Buffer::empty(chrome_area);
 
@@ -2866,13 +3192,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             );
         }
     }
-    if global_status_h > 0 {
+    if heights.global_status > 0 {
         Paragraph::new(Text::from(global_status_lines)).render(rail_area, &mut buf);
     }
-    if heights.working > 0 {
-        Paragraph::new(Text::from(working_lines)).render(working_area, &mut buf);
-    }
-
     let box_area = Rect {
         x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),
         y: editor_area.y,
@@ -2888,9 +3210,12 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         .render(box_area, &mut buf);
     let text_area = Rect {
         x: box_area.x + 2.min(box_area.width.saturating_sub(1)),
-        y: editor_area.y + 1,
+        y: editor_area.y + 2.min(editor_area.height.saturating_sub(1)),
         width: box_area.width.saturating_sub(TEXT_X_PADDING_U16 * 2).max(1),
-        height: editor_area.height.saturating_sub(3).max(1),
+        height: editor_area
+            .height
+            .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
+            .max(1),
     };
     if let Some(hint) = &screen.approval_hint {
         let approval_lines = approval_status_lines(hint, usize::from(text_area.width));
@@ -2898,7 +3223,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     } else {
         (&screen.editor).render(text_area, &mut buf);
     }
-    let hint = if screen.approval_hint.is_some() {
+    let hint = if screen.approval_hint.is_some() || editor_area.height < MIN_EDITOR_H {
         Line::default()
     } else {
         Line::from(Span::styled(COMPOSER_HINT, dim_style()))
@@ -2909,7 +3234,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         width: box_area.width.saturating_sub(4).max(1),
         height: 1,
     };
-    Paragraph::new(Text::from(vec![hint])).render(hint_area, &mut buf);
+    if !hint.spans.is_empty() {
+        Paragraph::new(Text::from(vec![hint])).render(hint_area, &mut buf);
+    }
     buffer_to_lines(&buf)
 }
 
@@ -3353,7 +3680,7 @@ mod tests {
         let red = span_matching(output, |span| span.content.as_ref() == "red");
         assert_eq!(red.style, Style::default().fg(Color::Red));
         let plain = span_matching(output, |span| span.content.as_ref() == " plain");
-        assert_eq!(plain.style.fg, Some(MUTED));
+        assert_eq!(plain.style.fg, Some(Color::Reset));
     }
 
     #[test]
@@ -3527,7 +3854,9 @@ mod tests {
             "first line must always survive: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| line_text(l).contains("… +7 lines")),
+            lines
+                .iter()
+                .any(|l| line_text(l).contains("7 lines hidden")),
             "expected an accurate '… +7 lines' omitted-line indicator: {lines:?}",
         );
     }
@@ -3558,7 +3887,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|t| t.contains("… +") && t.contains("lines")),
+                .any(|t| t.contains("…") && t.contains("lines hidden")),
             "{texts:?}"
         );
         // Truncated: far fewer than the 20 input lines survive (the cap is 8).
@@ -3740,6 +4069,8 @@ mod tests {
             .expect("removal row");
         assert_eq!(add.style, ok_style());
         assert_eq!(remove.style, err_style());
+        assert_ne!(add.style.fg, Some(DIFF_ADD_BG));
+        assert_ne!(remove.style.fg, Some(DIFF_DEL_BG));
         assert!(matches!(
             add.chrome.as_ref(),
             Some(ChromeRow::Body {
@@ -3797,7 +4128,7 @@ mod tests {
         assert!(rendered.contains("first answer"), "{rendered:?}");
         assert!(rendered.contains("a note"), "{rendered:?}");
         assert!(
-            rendered.contains("Give iris a task"),
+            rendered.contains("Give Iris a task"),
             "composer missing: {rendered:?}"
         );
         assert!(!rendered.contains("AGENT"), "{rendered:?}");
@@ -3835,7 +4166,7 @@ mod tests {
         assert!(replay.contains("● Done"), "{replay:?}");
         assert!(replay.contains("SHELL"), "{replay:?}");
         assert!(replay.contains("$ echo hi"), "{replay:?}");
-        assert!(replay.contains("Give iris a task"), "{replay:?}");
+        assert!(replay.contains("Give Iris a task"), "{replay:?}");
         assert!(!replay.contains("USER"), "{replay:?}");
         assert!(!replay.contains("AGENT"), "{replay:?}");
         assert!(
@@ -3879,7 +4210,7 @@ mod tests {
     }
 
     #[test]
-    fn global_status_rail_and_composer_match_pane_spec() {
+    fn pane_chrome_renders_composer_statusline() {
         let mut screen = Screen::new();
         screen.set_footer(
             "sonnet 3.5".to_string(),
@@ -3888,17 +4219,89 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 180, 12);
 
-        assert!(rendered.contains("● MODE code  ┊  MODEL sonnet 3.5"));
+        assert!(rendered.contains("    ● MODE code  ┊  MODEL sonnet 3.5 high"));
         assert!(rendered.contains("MODEL sonnet 3.5"));
-        assert!(rendered.contains("EFFORT high"));
+        assert!(!rendered.contains("EFFORT high"));
         assert!(rendered.contains("CWD ~/workspace/user-auth"));
         assert!(rendered.contains("BRANCH feat/rate-limit"));
         assert!(!rendered.contains("CONTEXT 128k"));
         assert!(!rendered.contains("APPROVAL auto"));
         assert!(rendered.contains("┌"));
-        assert!(rendered.contains("Give iris a task..."));
+        assert!(rendered.contains("Give Iris a task..."));
         assert!(!rendered.contains("Ask the agent anything..."));
         assert!(rendered.contains("↵ to send  •  shift+↵ for new line  •  / for commands"));
+    }
+
+    #[test]
+    fn composer_editor_uses_canonical_multiline_shape() {
+        let mut screen = Screen::new();
+        let lines = rendered_lines(&mut screen, 80, 8);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let top = texts
+            .iter()
+            .position(|line| line.contains('┌'))
+            .expect("top border");
+
+        assert!(texts[top + 1].contains("│"), "{texts:?}");
+        assert!(!texts[top + 1].contains("Give Iris"), "{texts:?}");
+        assert!(
+            texts[top + 2].contains("│  Give Iris a task..."),
+            "{texts:?}"
+        );
+        assert!(texts[top + 3].contains("│"), "{texts:?}");
+        assert!(texts[top + 4].contains(COMPOSER_HINT), "{texts:?}");
+        assert!(texts[top + 5].contains('└'), "{texts:?}");
+        assert!(!texts.join("\n").contains("Give iris a task"));
+    }
+
+    #[test]
+    fn composer_statusline_uses_catalog_context_and_aligned_separator() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "openai-codex/gpt-5.4-mini".to_string(),
+            Some("off".to_string()),
+            "~/project".to_string(),
+        );
+        let lines = rendered_lines(&mut screen, 120, 8);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let status = texts
+            .iter()
+            .find(|line| line.contains("● MODE code"))
+            .expect("statusline");
+        let top_border = texts
+            .iter()
+            .find(|line| line.contains('┌'))
+            .expect("top border");
+
+        assert!(
+            status.starts_with(
+                "    ● MODE code  ┊  MODEL gpt-5.4-mini off  ┊  CTX 300k  ┊  CWD ~/project"
+            ),
+            "{status:?}"
+        );
+        assert_eq!(status.find('●'), top_border.find('┌').map(|col| col + 2));
+        assert!(status.contains("  ┊  "));
+        assert!(!status.contains('|'));
+    }
+
+    #[test]
+    fn composer_statusline_drops_lower_priority_fields_when_narrow() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "openai-codex/gpt-5.4-mini".to_string(),
+            Some("off".to_string()),
+            "~/projects/iris (feat/composer-statusline)".to_string(),
+        );
+
+        let status = global_status_line(&screen, 40)
+            .map(|line| line_text(&line))
+            .expect("statusline");
+
+        assert_eq!(status.trim_end(), "    ● MODE code  ┊  MODEL gpt-5.4-mini");
+        assert!(!status.contains(" off"));
+        assert!(!status.contains("CTX"));
+        assert!(!status.contains("CWD"));
+        assert!(!status.contains("BRANCH"));
     }
 
     #[test]
@@ -3921,7 +4324,7 @@ mod tests {
             .expect("status rail remains visible");
         let editor_idx = texts
             .iter()
-            .position(|line| line.contains("Give iris a task"))
+            .position(|line| line.contains("Give Iris a task"))
             .expect("composer remains visible");
         assert!(rail_idx < editor_idx, "{texts:?}");
         assert!(texts[rail_idx].contains("BRANCH feat/pin-rail"));
@@ -3976,8 +4379,13 @@ mod tests {
         assert!(screen.tick());
         let after = rendered_text(&mut screen, 100, 16);
         assert!(after.contains("·●··"), "{after}");
-        let working = screen
-            .working_lines(100)
+        let working_lines = screen.working_lines(100);
+        assert_eq!(
+            working_lines.len(),
+            1,
+            "working indicator is one line: {working_lines:?}"
+        );
+        let working = working_lines
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
@@ -4094,7 +4502,12 @@ mod tests {
     #[test]
     fn completed_panel_headers_use_success_dot_not_running_accent() {
         let mut transcript = Transcript::default();
-        transcript.push_shell_header(false, false, Some(Duration::from_secs(1)), None, "echo hi");
+        transcript.push_shell_header(
+            PanelState::Done,
+            Some(Duration::from_secs(1)),
+            None,
+            "echo hi",
+        );
         let dot_style = transcript
             .rows
             .iter()
@@ -4197,6 +4610,21 @@ mod tests {
             header < error && error < bottom,
             "error must stay inside panel"
         );
+    }
+
+    #[test]
+    fn cancelled_exploration_tool_updates_shared_explore_panel() {
+        let mut screen = Screen::new();
+        let call = call_args("read", json!({ "path": "src/cancelled.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolCancelled(call));
+
+        let rendered = rendered_text(&mut screen, 100, 14);
+        assert!(rendered.contains("EXPLORE"), "{rendered}");
+        assert!(rendered.contains("CANCELLED"), "{rendered}");
+        assert!(!rendered.contains("RUNNING"), "{rendered}");
+        assert_eq!(rendered.matches("EXPLORE").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("CANCELLED").count(), 1, "{rendered}");
     }
 
     #[test]
@@ -4426,18 +4854,106 @@ mod tests {
     }
 
     #[test]
-    fn sourced_global_status_separates_model_and_effort() {
+    fn sourced_global_status_renders_effort_as_model_flag() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            "~/repo".to_string(),
+            "~/repo (branch)".to_string(),
         );
         let rendered = rendered_text(&mut screen, 100, 10);
 
-        assert!(rendered.contains("MODEL gpt-5.5"), "{rendered}");
-        assert!(rendered.contains("EFFORT high"), "{rendered}");
-        assert!(!rendered.contains("MODEL gpt-5.5 high"), "{rendered}");
+        assert!(rendered.contains("MODEL gpt-5.5 high"), "{rendered}");
+        assert!(!rendered.contains("EFFORT high"), "{rendered}");
+    }
+
+    #[test]
+    fn collapsed_live_shell_panel_stays_collapsed_across_updates_and_finalize() {
+        let mut screen = Screen::new();
+        let call = call_args("bash", json!({ "command": "seq" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        assert!(screen.toggle_latest_panel());
+
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "line 1\n".to_string(),
+        });
+        let collapsed_after_delta = rendered_text(&mut screen, 80, 12);
+        assert!(
+            collapsed_after_delta.contains("▸"),
+            "{collapsed_after_delta}"
+        );
+        assert!(
+            !collapsed_after_delta.contains("line 1"),
+            "{collapsed_after_delta}"
+        );
+
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "line 1\nline 2".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        let collapsed_after_result = rendered_text(&mut screen, 80, 12);
+        assert!(
+            collapsed_after_result.contains("▸"),
+            "{collapsed_after_result}"
+        );
+        assert!(
+            !collapsed_after_result.contains("line 2"),
+            "{collapsed_after_result}"
+        );
+    }
+
+    #[test]
+    fn latest_panel_collapses_and_expands_with_body_restored() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "hi".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        let expanded = rendered_text(&mut screen, 80, 12);
+        assert!(expanded.contains("▾"), "{expanded}");
+        assert!(expanded.contains("$ echo hi"), "{expanded}");
+        assert!(expanded.contains("hi"), "{expanded}");
+
+        assert!(screen.toggle_latest_panel());
+        let collapsed = rendered_text(&mut screen, 80, 12);
+        assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(!collapsed.contains("$ echo hi"), "{collapsed}");
+        assert!(!collapsed.contains("├"), "{collapsed}");
+
+        assert!(screen.toggle_latest_panel());
+        let restored = rendered_text(&mut screen, 80, 12);
+        assert!(restored.contains("▾"), "{restored}");
+        assert!(restored.contains("$ echo hi"), "{restored}");
+        assert!(restored.contains("hi"), "{restored}");
+    }
+
+    #[test]
+    fn hidden_output_affordance_includes_count_and_ctrl_o_hint() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        let content = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "seq" })),
+            content,
+            exit_code: None,
+            duration: None,
+        });
+        let lines = screen.wrapped_lines(80);
+        let fold = line_matching(&lines, |line| line_text(line).contains("hidden"));
+        let text = line_text(fold);
+        assert!(text.contains("…"), "{text}");
+        assert!(text.contains("lines hidden"), "{text}");
+        assert!(text.contains("ctrl+o"), "{text}");
+        assert!(display_width(&text) <= 80, "{text}");
     }
 
     #[test]
@@ -4650,7 +5166,7 @@ mod tests {
         }
 
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
-        assert_eq!(replay.matches("Give iris a task").count(), 1, "{replay:?}");
+        assert_eq!(replay.matches("Give Iris a task").count(), 1, "{replay:?}");
         assert!(!replay.contains("Ask the agent anything"), "{replay:?}");
         Ok(())
     }
@@ -4692,7 +5208,7 @@ mod tests {
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert_ne!(stats.kind, RenderKind::Unchanged);
         assert!(!replay.contains("GPT 5.5"), "{replay:?}");
-        assert!(replay.contains("Give iris a task"), "{replay:?}");
+        assert!(replay.contains("Give Iris a task"), "{replay:?}");
         Ok(())
     }
 
@@ -4781,9 +5297,9 @@ mod tests {
         assert!(rendered.contains("prior reply"), "{rendered}");
         assert!(rendered.contains("GPT 5.5"), "{rendered}");
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
-        assert!(rendered.contains("Give iris a task"), "{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
         let model_idx = rendered.find("GPT 5.5").expect("model row");
-        let editor_idx = rendered.find("Give iris a task").expect("composer row");
+        let editor_idx = rendered.find("Give Iris a task").expect("composer row");
         assert!(model_idx < editor_idx, "{rendered}");
         assert!(!rendered.contains("Select model"), "{rendered}");
     }
@@ -4805,7 +5321,7 @@ mod tests {
         assert!(rendered.contains("Haiku 4.5"), "{rendered}");
         assert!(rendered.contains("xhigh effort"), "{rendered}");
         assert!(rendered.contains("Reasoning"), "{rendered}");
-        assert!(rendered.contains("Give iris a task"), "{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
 
     #[test]
@@ -4846,7 +5362,7 @@ mod tests {
             }),
         });
         let rendered = rendered_text(&mut screen, 120, 12);
-        assert!(rendered.contains("opus-4.8 xhigh"), "{rendered}");
+        assert!(rendered.contains("MODEL opus-4.8 xhigh"), "{rendered}");
         assert!(rendered.contains("↑100 ↓20"), "{rendered}");
         assert!(
             !rendered.contains("thinking with xhigh effort"),
@@ -4859,7 +5375,7 @@ mod tests {
             "~/repo (branch)".to_string(),
         );
         let refreshed = rendered_text(&mut screen, 120, 12);
-        assert!(refreshed.contains("opus-4.8 high"), "{refreshed}");
+        assert!(refreshed.contains("MODEL opus-4.8 high"), "{refreshed}");
         assert!(refreshed.contains("↑100 ↓20"), "{refreshed}");
         assert!(
             !refreshed.contains("thinking with high effort"),
@@ -5077,7 +5593,7 @@ mod tests {
     fn finalized_headers_use_started_elapsed_when_duration_is_missing() {
         let mut transcript = Transcript::default();
         let started = Instant::now() - Duration::from_secs(2);
-        transcript.push_shell_header(false, false, None, Some(started), "echo hi");
+        transcript.push_shell_header(PanelState::Done, None, Some(started), "echo hi");
         let rendered = transcript
             .render(100)
             .iter()
@@ -5108,23 +5624,21 @@ mod tests {
     }
 
     #[test]
-    fn fallback_tool_error_renders_message_once() {
+    fn fallback_tool_cancelled_renders_cancelled_without_error_body() {
         let mut screen = Screen::new();
         let call = call_args("bash", json!({ "command": "exit 2" }));
 
-        screen.apply(UiEvent::ToolError {
-            call,
-            message: "cancelled".to_string(),
-        });
+        screen.apply(UiEvent::ToolCancelled(call));
 
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("SHELL"), "{rendered}");
-        assert_eq!(rendered.matches("cancelled").count(), 1, "{rendered}");
-        assert!(rendered.contains("error: cancelled"), "{rendered}");
+        assert!(rendered.contains("CANCELLED"), "{rendered}");
+        assert!(!rendered.contains("ERROR"), "{rendered}");
+        assert!(!rendered.contains("error: cancelled"), "{rendered}");
     }
 
     #[test]
-    fn shell_panel_error_keeps_streamed_output() {
+    fn cancelled_shell_panel_keeps_streamed_output() {
         let mut screen = Screen::new();
         screen.start_turn();
         let call = call_args("bash", json!({ "command": "sleep 9" }));
@@ -5133,17 +5647,15 @@ mod tests {
             call_id: call.id.clone(),
             chunk: "partial line\n".to_string(),
         });
-        screen.apply(UiEvent::ToolError {
-            call: call.clone(),
-            message: "cancelled".to_string(),
-        });
+        screen.apply(UiEvent::ToolCancelled(call.clone()));
         let rendered = rendered_text(&mut screen, 80, 14);
         assert!(rendered.contains("SHELL"), "{rendered}");
-        assert!(rendered.contains("ERROR"), "{rendered}");
+        assert!(rendered.contains("CANCELLED"), "{rendered}");
+        assert!(!rendered.contains("ERROR"), "{rendered}");
         assert!(!rendered.contains("DONE"), "{rendered}");
         assert!(rendered.contains("$ sleep 9"), "{rendered}");
         assert!(rendered.contains("partial line"), "{rendered}");
-        assert!(rendered.contains("error: cancelled"), "{rendered}");
+        assert!(!rendered.contains("error: cancelled"), "{rendered}");
     }
 
     #[test]

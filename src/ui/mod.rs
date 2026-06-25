@@ -126,6 +126,7 @@ pub(crate) enum UiEvent {
         call: ToolCall,
         message: String,
     },
+    ToolCancelled(ToolCall),
     Notice(String),
     TurnError {
         kind: TurnErrorKind,
@@ -225,6 +226,7 @@ impl UiEvent {
                 UiEvent::ToolOutputDelta { call_id, chunk }
             }
             AgentEvent::ToolError { call, message } => UiEvent::ToolError { call, message },
+            AgentEvent::ToolCancelled(call) => UiEvent::ToolCancelled(call),
             AgentEvent::Notice(message) => UiEvent::Notice(message),
             AgentEvent::TurnComplete => UiEvent::TurnComplete,
         }
