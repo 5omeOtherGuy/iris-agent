@@ -149,6 +149,36 @@
       saturating arithmetic.</li>
 </ul>
 
+<h2>Wave-2 review fixes (commit 3)</h2>
+<ul>
+  <li><strong>Nested-table prefix (real bug, fixed).</strong> A GFM table inside a blockquote or
+      list rendered at column 0, dropping the <code>&gt; </code> markers / list indent (confirmed
+      empirically). <code>render_table</code> now computes the block prefix (quote markers +
+      list-continuation spaces), reduces the table layout width by the prefix width, and prepends the
+      styled prefix to every emitted table line. Top-level tables (prefix empty) are unchanged. Tests:
+      <code>blockquoted_table_keeps_quote_prefix</code>, <code>nested_list_table_keeps_indent_and_fits_width</code>.</li>
+  <li><strong>Narrow-table fallback now wraps (fixed).</strong> The pipe-joined fallback previously
+      ignored width; it now wraps each fallback row to the available width so even the fallback never
+      overflows.</li>
+  <li><strong>Verified false positive (no change): thinking-block panel width.</strong> Two reviewers
+      claimed the panel body is <code>W-12</code> vs the <code>W-8</code> used. Checked the code:
+      <code>panel_body_lines</code> uses <code>panel_width(W) - PANEL_BODY_CHROME_WIDTH = (W-4) - 4 =
+      W-8</code>, exactly equal to <code>markdown_content_width()</code> (<code>last_width = W-8</code>).
+      They match; tables in thinking blocks fit. No change.</li>
+  <li><strong>Pre-existing / out of scope (not changed):</strong> <code>panel_end_from</code>
+      terminate-on-missing-Bottom (my panels are always well-formed with a Bottom in one synchronous
+      push, so it cannot loop), the render-loop <code>collapsed</code>-reset for hypothetical nested
+      panels (correct for today's linear panels), <code>ProviderTurnError</code> being display-ignored
+      (unchanged from before), and the streaming markdown re-parse per frame (already per-frame before
+      this work). Inline code ignoring surrounding emphasis and the list-marker-on-first-line behavior
+      are unchanged from the original renderer (the latter is handled by <code>continuation_prefix</code>).</li>
+  <li><strong>Micro-optimizations declined</strong> (per the smallest-correct-change rule): per-row
+      <code>String</code> allocations in table wrap/truncate, <code>MarkdownTheme::default()</code>
+      construction cost, and the single per-code-block <code>Rc</code> clone are negligible relative to
+      the bounded, truncated streaming preview; caching streamed markdown lines is a larger pre-existing
+      optimization left for separate work.</li>
+</ul>
+
 <h2>Reviewer-facing regression risks</h2>
 <ul>
   <li>Default markdown output parity rests on <code>MarkdownTheme::default()</code> matching the old

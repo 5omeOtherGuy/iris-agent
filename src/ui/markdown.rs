@@ -492,7 +492,17 @@ impl<'a> Renderer<'a> {
         self.out.push(Line::default());
     }
 
-    /// Render an accumulated GFM table as width-aware box-drawing lines.
+    /// The leading indent for a block (blockquote markers + list-continuation
+    /// spaces) so a table nested in a quote/list keeps the document structure,
+    /// matching how code blocks are prefixed.
+    fn block_prefix(&self) -> String {
+        let mut prefix = "> ".repeat(self.quote as usize);
+        prefix.push_str(&Self::continuation_prefix(&self.prefix));
+        prefix
+    }
+
+    /// Render an accumulated GFM table as width-aware box-drawing lines, indented
+    /// by the current block prefix (blockquote/list) so nesting is preserved.
     fn render_table(&mut self, table: TableState) {
         let cols = table.header.len();
         if cols == 0 {
@@ -501,6 +511,12 @@ impl<'a> Renderer<'a> {
         let border = self.theme.table_border;
         let header_style = self.theme.base.patch(self.theme.table_header);
         let body_style = self.theme.base;
+
+        let prefix = self.block_prefix();
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let prefix_style = self.theme.base.patch(self.theme.list_bullet);
+        // Width available to the table itself, after the block indent.
+        let table_width = self.width.saturating_sub(prefix_width).max(1);
 
         // Natural width per column from header + body cells.
         let mut natural = vec![0usize; cols];
@@ -515,108 +531,57 @@ impl<'a> Renderer<'a> {
 
         // Border overhead: "│ " + (cols-1) * " │ " + " │" = 3*cols + 1.
         let overhead = cols.saturating_mul(3).saturating_add(1);
-        let available = self.width.saturating_sub(overhead);
+        let available = table_width.saturating_sub(overhead);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
         if available < cols {
-            // Too narrow for a stable box: fall back to pipe-joined plain rows.
-            self.render_table_fallback(&table, body_style, header_style);
-            return;
-        }
-        let widths = fit_columns(&natural, available);
-
-        let make_border = |left: char, mid: char, right: char| -> Line<'static> {
-            let mut s = String::new();
-            s.push(left);
-            for (i, w) in widths.iter().enumerate() {
-                if i > 0 {
-                    s.push(mid);
+            // Too narrow for a stable box: fall back to wrapped pipe-joined rows.
+            render_table_fallback(&table, body_style, header_style, table_width, &mut lines);
+        } else {
+            let widths = fit_columns(&natural, available);
+            let make_border = |left: char, mid: char, right: char| -> Line<'static> {
+                let mut s = String::new();
+                s.push(left);
+                for (i, w) in widths.iter().enumerate() {
+                    if i > 0 {
+                        s.push(mid);
+                    }
+                    s.push('\u{2500}');
+                    s.push_str(&"\u{2500}".repeat(*w));
+                    s.push('\u{2500}');
                 }
-                s.push('\u{2500}');
-                s.push_str(&"\u{2500}".repeat(*w));
-                s.push('\u{2500}');
+                s.push(right);
+                Line::from(Span::styled(s, border))
+            };
+            lines.push(make_border('\u{250c}', '\u{252c}', '\u{2510}'));
+            push_table_row(
+                &table.header,
+                &widths,
+                &table.alignments,
+                header_style,
+                border,
+                &mut lines,
+            );
+            lines.push(make_border('\u{251c}', '\u{253c}', '\u{2524}'));
+            for row in &table.rows {
+                push_table_row(
+                    row,
+                    &widths,
+                    &table.alignments,
+                    body_style,
+                    border,
+                    &mut lines,
+                );
             }
-            s.push(right);
-            Line::from(Span::styled(s, border))
-        };
-
-        self.out
-            .push(make_border('\u{250c}', '\u{252c}', '\u{2510}'));
-        self.push_table_row(
-            &table.header,
-            &widths,
-            &table.alignments,
-            header_style,
-            border,
-        );
-        self.out
-            .push(make_border('\u{251c}', '\u{253c}', '\u{2524}'));
-        for row in &table.rows {
-            self.push_table_row(row, &widths, &table.alignments, body_style, border);
+            lines.push(make_border('\u{2514}', '\u{2534}', '\u{2518}'));
         }
-        self.out
-            .push(make_border('\u{2514}', '\u{2534}', '\u{2518}'));
-    }
 
-    fn push_table_row(
-        &mut self,
-        cells: &[String],
-        widths: &[usize],
-        alignments: &[Alignment],
-        cell_style: Style,
-        border: Style,
-    ) {
-        // Wrap each cell to its column width; the row is as tall as its tallest cell.
-        let wrapped: Vec<Vec<String>> = widths
-            .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                let text = cells.get(i).map(String::as_str).unwrap_or("");
-                wrap_plain(text, *w)
-            })
-            .collect();
-        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
-        let bar = Span::styled("\u{2502}".to_string(), border);
-        for line_idx in 0..height {
-            let mut spans = vec![bar.clone(), Span::raw(" ")];
-            for (i, w) in widths.iter().enumerate() {
-                if i > 0 {
-                    spans.push(Span::raw(" "));
-                    spans.push(bar.clone());
-                    spans.push(Span::raw(" "));
-                }
-                let empty = String::new();
-                let cell = wrapped[i].get(line_idx).unwrap_or(&empty);
-                // Defensive clamp: a glyph wider than a 1-column slot cannot be
-                // split, so guarantee the rendered cell never exceeds its column
-                // and pushes the border out of alignment.
-                let text = truncate_to_width(cell, *w);
-                let align = alignments.get(i).copied().unwrap_or(Alignment::None);
-                let (left, right) = pad_for(UnicodeWidthStr::width(text.as_str()), *w, align);
-                if left > 0 {
-                    spans.push(Span::raw(" ".repeat(left)));
-                }
-                spans.push(Span::styled(text, cell_style));
-                if right > 0 {
-                    spans.push(Span::raw(" ".repeat(right)));
-                }
+        for mut line in lines {
+            if !prefix.is_empty() {
+                line.spans
+                    .insert(0, Span::styled(prefix.clone(), prefix_style));
             }
-            spans.push(Span::raw(" "));
-            spans.push(bar.clone());
-            self.out.push(Line::from(spans));
-        }
-    }
-
-    fn render_table_fallback(
-        &mut self,
-        table: &TableState,
-        body_style: Style,
-        header_style: Style,
-    ) {
-        let render_row = |cells: &[String], style: Style| -> Line<'static> {
-            Line::from(Span::styled(cells.join(" | "), style))
-        };
-        self.out.push(render_row(&table.header, header_style));
-        for row in &table.rows {
-            self.out.push(render_row(row, body_style));
+            self.out.push(line);
         }
     }
 
@@ -627,6 +592,78 @@ impl<'a> Renderer<'a> {
             self.out.pop();
         }
         self.out
+    }
+}
+
+/// Render one table row (wrapping cells to their columns) into `out`. No block
+/// prefix is applied here; the caller prepends it uniformly to every line.
+fn push_table_row(
+    cells: &[String],
+    widths: &[usize],
+    alignments: &[Alignment],
+    cell_style: Style,
+    border: Style,
+    out: &mut Vec<Line<'static>>,
+) {
+    // Wrap each cell to its column width; the row is as tall as its tallest cell.
+    let wrapped: Vec<Vec<String>> = widths
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let text = cells.get(i).map(String::as_str).unwrap_or("");
+            wrap_plain(text, *w)
+        })
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let bar = Span::styled("\u{2502}".to_string(), border);
+    for line_idx in 0..height {
+        let mut spans = vec![bar.clone(), Span::raw(" ")];
+        for (i, w) in widths.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+                spans.push(bar.clone());
+                spans.push(Span::raw(" "));
+            }
+            let empty = String::new();
+            let cell = wrapped[i].get(line_idx).unwrap_or(&empty);
+            // Defensive clamp: a glyph wider than a 1-column slot cannot be
+            // split, so guarantee the rendered cell never exceeds its column
+            // and pushes the border out of alignment.
+            let text = truncate_to_width(cell, *w);
+            let align = alignments.get(i).copied().unwrap_or(Alignment::None);
+            let (left, right) = pad_for(UnicodeWidthStr::width(text.as_str()), *w, align);
+            if left > 0 {
+                spans.push(Span::raw(" ".repeat(left)));
+            }
+            spans.push(Span::styled(text, cell_style));
+            if right > 0 {
+                spans.push(Span::raw(" ".repeat(right)));
+            }
+        }
+        spans.push(Span::raw(" "));
+        spans.push(bar.clone());
+        out.push(Line::from(spans));
+    }
+}
+
+/// Fallback for tables too narrow for a stable box: pipe-joined rows wrapped to
+/// `width` so even the fallback never overflows the available columns.
+fn render_table_fallback(
+    table: &TableState,
+    body_style: Style,
+    header_style: Style,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let mut push_row = |cells: &[String], style: Style| {
+        let joined = cells.join(" | ");
+        for line in wrap_plain(&joined, width) {
+            out.push(Line::from(Span::styled(line, style)));
+        }
+    };
+    push_row(&table.header, header_style);
+    for row in &table.rows {
+        push_row(row, body_style);
     }
 }
 
@@ -1048,6 +1085,40 @@ mod tests {
                 UnicodeWidthStr::width(text_of(line).as_str()) <= width,
                 "table line exceeds width {width}: {:?}",
                 text_of(line)
+            );
+        }
+    }
+
+    #[test]
+    fn blockquoted_table_keeps_quote_prefix() {
+        let md = "> | A | B |\n> | - | - |\n> | 1 | 2 |";
+        let out = rendered(md);
+        assert!(
+            out.iter().all(|l| l.starts_with("> ")),
+            "every blockquoted table line must keep the quote prefix: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains('\u{250c}')),
+            "no box: {out:?}"
+        );
+    }
+
+    #[test]
+    fn nested_list_table_keeps_indent_and_fits_width() {
+        let md = "- item\n\n  | A | B |\n  | - | - |\n  | 1 | 2 |";
+        let width = 40;
+        let lines = render_markdown_themed(md, &MarkdownTheme::default(), width);
+        let table_lines: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|l| l.contains('\u{2502}') || l.contains('\u{250c}') || l.contains('\u{2514}'))
+            .collect();
+        assert!(!table_lines.is_empty(), "no table rendered");
+        for l in &table_lines {
+            assert!(l.starts_with("  "), "table line lost list indent: {l:?}");
+            assert!(
+                UnicodeWidthStr::width(l.as_str()) <= width,
+                "indented table line exceeds width: {l:?}"
             );
         }
     }
