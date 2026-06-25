@@ -497,7 +497,7 @@ impl Transcript {
     ) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
             this.push_generic_tool_header(call, PanelState::Error, None, Some(started));
-            this.push_panel_body(&format!("error: {message}"), err_style());
+            this.push_panel_body(&format!("error: {}", message), err_style());
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
     }
@@ -607,7 +607,7 @@ impl Transcript {
             if !streamed_output.is_empty() {
                 this.push_tool_output_tail(streamed_output);
             }
-            this.push_panel_body(&format!("error: {message}"), err_style());
+            this.push_panel_body(&format!("error: {}", message), err_style());
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
     }
@@ -1065,7 +1065,7 @@ impl Transcript {
         self.finish_stream();
         self.finish_exploration(
             call,
-            format!("error: {message}"),
+            format!("error: {}", message),
             err_style(),
             None,
             true,
@@ -1225,20 +1225,20 @@ impl Transcript {
             }
             UiEvent::Notice(message) => {
                 self.begin_block();
-                self.push(&format!("note: {message}"), dim_style());
+                self.push(&format!("note: {}", message), dim_style());
             }
             UiEvent::TurnError { kind, message } => {
                 self.begin_block();
                 match kind {
                     TurnErrorKind::Auth => {
-                        self.push(&format!("auth error: {message}"), err_style());
+                        self.push(&format!("auth error: {}", message), err_style());
                         self.push(
                             "authentication required; re-run the login command",
                             err_style(),
                         );
                     }
                     TurnErrorKind::Provider => {
-                        self.push(&format!("provider error: {message}"), err_style());
+                        self.push(&format!("provider error: {}", message), err_style());
                     }
                 }
             }
