@@ -850,6 +850,16 @@ fn explore_body(call: &ToolCall) -> String {
     exploration_summary(call)
 }
 
+struct PanelHeaderSpec<'a> {
+    title: &'static str,
+    meta: &'a str,
+    plain_meta: &'a str,
+    running: bool,
+    failed: bool,
+    duration: Option<std::time::Duration>,
+    started: Option<Instant>,
+}
+
 /// Transcript state and width-aware rendering, separate from editor/spinner UI.
 #[derive(Default)]
 struct Transcript {
@@ -998,18 +1008,50 @@ impl Transcript {
         }
     }
 
-    fn push_tool_panel_body(&mut self, text: &str, style: Style) {
-        for line in text.split('\n') {
-            let line = strip_ansi_for_text(line);
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::from(Span::styled(line.clone(), style)),
-                    bg: None,
-                },
-                line,
-                style,
-            ));
-        }
+    fn push_panel_header(&mut self, spec: PanelHeaderSpec<'_>) {
+        let state = if spec.running {
+            " RUNNING"
+        } else if spec.failed {
+            " ERROR"
+        } else {
+            " DONE"
+        };
+        let elapsed = if spec.running {
+            spec.started
+                .map(|started| format_panel_duration(started.elapsed()))
+                .unwrap_or_else(|| "00:00:00s".to_string())
+        } else {
+            spec.duration
+                .map(format_panel_duration)
+                .or_else(|| {
+                    spec.started
+                        .map(|started| format_panel_duration(started.elapsed()))
+                })
+                .unwrap_or_else(|| "00:00:00s".to_string())
+        };
+        let plain = if spec.running {
+            format!("• Running {}", spec.plain_meta)
+        } else if spec.failed {
+            format!("✗ Ran {}", spec.plain_meta)
+        } else {
+            format!("• Ran {}", spec.plain_meta)
+        };
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Header {
+                expanded: true,
+                title: spec.title,
+                meta: spec.meta.to_string(),
+                right: vec![
+                    ("●".to_string(), status_dot_style(spec.running, spec.failed)),
+                    (state.to_string(), panel_style()),
+                    (format!("     {elapsed:>10}  "), dim_style()),
+                ],
+            },
+            plain,
+            tool_header_style(),
+        ));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
     }
 
     fn push_shell_header(
@@ -1020,46 +1062,15 @@ impl Transcript {
         started: Option<Instant>,
         target: &str,
     ) {
-        let state = if running {
-            " RUNNING"
-        } else if failed {
-            " ERROR"
-        } else {
-            " DONE"
-        };
-        let elapsed = if running {
-            started
-                .map(|started| format_panel_duration(started.elapsed()))
-                .unwrap_or_else(|| "00:00:00s".to_string())
-        } else {
-            duration
-                .map(format_panel_duration)
-                .or_else(|| started.map(|started| format_panel_duration(started.elapsed())))
-                .unwrap_or_else(|| "00:00:00s".to_string())
-        };
-        let plain = if running {
-            format!("• Running {target}")
-        } else if failed {
-            format!("✗ Ran {target}")
-        } else {
-            format!("• Ran {target}")
-        };
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
-        self.rows.push(TranscriptRow::chrome_with_text(
-            ChromeRow::Header {
-                expanded: true,
-                title: "SHELL",
-                meta: "bash".to_string(),
-                right: vec![
-                    ("●".to_string(), status_dot_style(running, failed)),
-                    (state.to_string(), panel_style()),
-                    (format!("     {elapsed:>10}  "), dim_style()),
-                ],
-            },
-            plain,
-            tool_header_style(),
-        ));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        self.push_panel_header(PanelHeaderSpec {
+            title: "SHELL",
+            meta: "bash",
+            plain_meta: target,
+            running,
+            failed,
+            duration,
+            started,
+        });
     }
 
     fn push_shell_panel(
@@ -1073,17 +1084,17 @@ impl Transcript {
     ) {
         let target = run_target(call);
         self.push_shell_header(running, failed, duration, None, &target);
-        self.push_tool_panel_body(&format!("$ {target}"), panel_style());
+        self.push_panel_body(&format!("$ {target}"), panel_style());
         if !content.is_empty() {
             self.push_tool_output(content);
         } else if error.is_none() {
-            self.push_tool_panel_body("(no output)", dim_style());
+            self.push_panel_body("(no output)", dim_style());
         }
         if let Some(error) = error {
-            self.push_tool_panel_body(&format!("error: {error}"), err_style());
+            self.push_panel_body(&format!("error: {error}"), err_style());
         }
         if running {
-            self.push_tool_panel_body("$ █", panel_style());
+            self.push_panel_body("$ █", panel_style());
         }
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
     }
@@ -1096,47 +1107,16 @@ impl Transcript {
         duration: Option<std::time::Duration>,
         started: Option<Instant>,
     ) {
-        let state = if running {
-            " RUNNING"
-        } else if failed {
-            " ERROR"
-        } else {
-            " DONE"
-        };
-        let elapsed = if running {
-            started
-                .map(|started| format_panel_duration(started.elapsed()))
-                .unwrap_or_else(|| "00:00:00s".to_string())
-        } else {
-            duration
-                .map(format_panel_duration)
-                .or_else(|| started.map(|started| format_panel_duration(started.elapsed())))
-                .unwrap_or_else(|| "00:00:00s".to_string())
-        };
-        let title = tool_panel_title(call);
         let meta = tool_panel_meta(call);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
-        self.rows.push(TranscriptRow::chrome_with_text(
-            ChromeRow::Header {
-                expanded: true,
-                title,
-                meta: meta.clone(),
-                right: vec![
-                    ("●".to_string(), status_dot_style(running, failed)),
-                    (state.to_string(), panel_style()),
-                    (format!("     {elapsed:>10}  "), dim_style()),
-                ],
-            },
-            if running {
-                format!("• Running {meta}")
-            } else if failed {
-                format!("✗ Ran {meta}")
-            } else {
-                format!("• Ran {meta}")
-            },
-            tool_header_style(),
-        ));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        self.push_panel_header(PanelHeaderSpec {
+            title: tool_panel_title(call),
+            meta: &meta,
+            plain_meta: &meta,
+            running,
+            failed,
+            duration,
+            started,
+        });
     }
 
     fn push_generic_tool_panel(
@@ -1152,10 +1132,10 @@ impl Transcript {
         if !content.is_empty() {
             self.push_tool_output(content);
         } else if error.is_none() {
-            self.push_tool_panel_body("(no output)", dim_style());
+            self.push_panel_body("(no output)", dim_style());
         }
         if let Some(error) = error {
-            self.push_tool_panel_body(&format!("error: {error}"), err_style());
+            self.push_panel_body(&format!("error: {error}"), err_style());
         }
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
     }
@@ -1169,8 +1149,8 @@ impl Transcript {
         let started = Instant::now();
         let target = run_target(&call);
         self.push_shell_header(true, false, None, Some(started), &target);
-        self.push_tool_panel_body(&format!("$ {target}"), panel_style());
-        self.push_tool_panel_body("$ █", panel_style());
+        self.push_panel_body(&format!("$ {target}"), panel_style());
+        self.push_panel_body("$ █", panel_style());
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.active_exec = Some(ActiveExec {
             call,
@@ -1185,7 +1165,7 @@ impl Transcript {
         let body_start = self.rows.len();
         let started = Instant::now();
         self.push_generic_tool_header(&call, true, false, None, Some(started));
-        self.push_tool_panel_body("running…", dim_style());
+        self.push_panel_body("running…", dim_style());
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.active_tool = Some(ActiveTool {
             call,
@@ -1237,7 +1217,7 @@ impl Transcript {
             if !content.is_empty() {
                 this.push_tool_output(content);
             } else {
-                this.push_tool_panel_body("(no output)", dim_style());
+                this.push_panel_body("(no output)", dim_style());
             }
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
@@ -1251,7 +1231,7 @@ impl Transcript {
     ) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
             this.push_generic_tool_header(call, false, true, None, Some(started));
-            this.push_tool_panel_body(&format!("error: {message}"), err_style());
+            this.push_panel_body(&format!("error: {message}"), err_style());
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
     }
@@ -1302,9 +1282,9 @@ impl Transcript {
         self.collect_rows(|this| {
             let target = run_target(&active.call);
             this.push_shell_header(true, false, None, Some(active.started), &target);
-            this.push_tool_panel_body(&format!("$ {target}"), panel_style());
+            this.push_panel_body(&format!("$ {target}"), panel_style());
             this.push_tool_output_tail(&active.output);
-            this.push_tool_panel_body("$ █", panel_style());
+            this.push_panel_body("$ █", panel_style());
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
     }
@@ -1321,7 +1301,7 @@ impl Transcript {
             let target = run_target(call);
             let failed = exit_code.is_some_and(|code| code != 0);
             this.push_shell_header(false, failed, duration, Some(started), &target);
-            this.push_tool_panel_body(&format!("$ {target}"), panel_style());
+            this.push_panel_body(&format!("$ {target}"), panel_style());
             this.push_tool_output(content);
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
@@ -1337,11 +1317,11 @@ impl Transcript {
         self.collect_rows(|this| {
             let target = run_target(call);
             this.push_shell_header(false, true, None, Some(started), &target);
-            this.push_tool_panel_body(&format!("$ {target}"), panel_style());
+            this.push_panel_body(&format!("$ {target}"), panel_style());
             if !streamed_output.is_empty() {
                 this.push_tool_output_tail(streamed_output);
             }
-            this.push_tool_panel_body(&format!("error: {message}"), err_style());
+            this.push_panel_body(&format!("error: {message}"), err_style());
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
     }
@@ -2180,61 +2160,6 @@ fn content_width(width: usize) -> usize {
         .max(1)
 }
 
-#[cfg(test)]
-fn pad_content_lines(lines: &mut [Line<'static>]) {
-    for line in lines {
-        if !line_text(line).is_empty() {
-            pad_line_left(line, TEXT_COLUMN_X_PADDING);
-        }
-    }
-}
-
-#[cfg(test)]
-fn footer_lines(footer: &Footer, width: usize) -> Vec<Line<'static>> {
-    let width = content_width(width);
-    let model = truncate_to_width(&footer.model, width);
-    let model_width = display_width(&model);
-    let usage = footer.usage.as_ref().map(footer_usage_text);
-    let usage = usage.as_deref().unwrap_or_default();
-    let usage_max = width.saturating_sub(model_width).saturating_sub(1);
-    let usage = if usage_max > 0 {
-        truncate_to_width(usage, usage_max)
-    } else {
-        String::new()
-    };
-    let usage_width = display_width(&usage);
-    let pad = width
-        .saturating_sub(usage_width)
-        .saturating_sub(model_width);
-
-    let mut second = Vec::new();
-    if !usage.is_empty() {
-        second.push(Span::styled(usage, dim_style()));
-    }
-    second.push(Span::raw(" ".repeat(pad)));
-    second.push(Span::styled(model, Style::default().fg(Color::Cyan)));
-
-    vec![
-        Line::from(Span::styled(
-            truncate_to_width(&footer.cwd, width),
-            Style::default().fg(Color::Green),
-        )),
-        Line::from(second),
-    ]
-}
-
-#[cfg(test)]
-fn footer_usage_text(usage: &ProviderUsage) -> String {
-    let mut text = format!("{} tokens", compact_count(usage.total_tokens));
-    if usage.cache_read_input_tokens > 0 {
-        text.push_str(&format!(
-            " ({} cached)",
-            compact_count(usage.cache_read_input_tokens)
-        ));
-    }
-    text
-}
-
 fn compact_count(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}m", value as f64 / 1_000_000.0)
@@ -2355,13 +2280,6 @@ impl Screen {
 
     // --- transcript ---
 
-    /// Apply one semantic event to the transcript. The loop calls this for every
-    /// Nexus event; history remains in Iris state so the terminal surface can
-    /// replay/reflow it after a resize.
-    pub(crate) fn apply_event(&mut self, event: UiEvent) {
-        self.apply(event);
-    }
-
     /// Apply one semantic event to the transcript.
     pub(crate) fn apply(&mut self, event: UiEvent) {
         if let UiEvent::ProviderTurnCompleted {
@@ -2447,10 +2365,8 @@ impl Screen {
     }
 
     pub(crate) fn end_turn(&mut self) {
-        let elapsed = self.spinner.elapsed();
         self.spinner.stop();
         self.approval_hint = None;
-        let _ = elapsed;
     }
 
     /// Advance the spinner one frame. Returns whether anything animated (so the
@@ -2486,23 +2402,6 @@ impl Screen {
 
     pub(crate) fn clear_approval(&mut self) {
         self.approval_hint = None;
-    }
-
-    /// Status row content: approval hint > footer > idle hint.
-    #[cfg(test)]
-    fn status_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = if let Some(hint) = &self.approval_hint {
-            approval_status_lines(hint, content_width(usize::from(width)))
-        } else if let Some(footer) = &self.footer {
-            footer_lines(footer, usize::from(width))
-        } else {
-            vec![Line::from(Span::styled(
-                truncate_to_width(COMPOSER_HINT, content_width(usize::from(width))),
-                dim_style(),
-            ))]
-        };
-        pad_content_lines(&mut lines);
-        lines
     }
 
     fn working_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -3620,10 +3519,10 @@ mod tests {
     fn approval_hint_names_tool_target() {
         let mut screen = Screen::new();
         screen.show_approval(&call_args("bash", json!({ "command": "echo hi" })), false);
-        let lines = screen.status_lines(80);
-        assert!(line_text(&lines[0]).contains("approve echo hi"));
-        assert!(line_text(&lines[0]).contains("[y] once"));
-        assert!(line_text(&lines[0]).contains("[N] deny"));
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("approve echo hi"), "{rendered}");
+        assert!(rendered.contains("[y] once"), "{rendered}");
+        assert!(rendered.contains("[N] deny"), "{rendered}");
     }
 
     #[test]
@@ -3662,14 +3561,14 @@ mod tests {
             ),
             false,
         );
-        let status_lines = screen.status_lines(48);
+        let lines = rendered_lines(&mut screen, 48, 12);
         assert!(
-            status_lines
+            lines
                 .iter()
-                .all(|line| display_width(&line_text(line)) <= 44),
-            "{status_lines:?}"
+                .all(|line| display_width(&line_text(line)) <= 48),
+            "{lines:?}"
         );
-        let rendered = rendered_text(&mut screen, 48, 12);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("approve printf 'global:"));
         assert!(rendered.contains("120s)"), "{rendered}");
         assert!(rendered.contains("[N] deny"), "{rendered}");
@@ -4835,19 +4734,27 @@ mod tests {
             }),
         });
 
-        let second = line_text(&screen.status_lines(80)[1]);
-        assert!(second.starts_with("    "), "{second}");
-        assert!(second.contains("120 tokens (64 cached)"), "{second}");
-        assert!(second.contains("opus-4.8 xhigh"), "{second}");
+        screen.start_turn();
+        let rendered = rendered_text(&mut screen, 120, 12);
+        assert!(rendered.contains("opus-4.8 xhigh"), "{rendered}");
+        assert!(rendered.contains("↓ 120 tokens"), "{rendered}");
+        assert!(
+            rendered.contains("thinking with xhigh effort"),
+            "{rendered}"
+        );
 
         screen.set_footer(
             "opus-4.8 high".to_string(),
             Some("high".to_string()),
             "~/repo (branch)".to_string(),
         );
-        let refreshed = line_text(&screen.status_lines(80)[1]);
-        assert!(refreshed.contains("120 tokens (64 cached)"), "{refreshed}");
+        let refreshed = rendered_text(&mut screen, 120, 12);
         assert!(refreshed.contains("opus-4.8 high"), "{refreshed}");
+        assert!(refreshed.contains("↓ 120 tokens"), "{refreshed}");
+        assert!(
+            refreshed.contains("thinking with high effort"),
+            "{refreshed}"
+        );
     }
 
     #[test]

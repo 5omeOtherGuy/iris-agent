@@ -117,7 +117,7 @@ async fn session_loop<P: ChatProvider>(
     let mut tick = interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    tui.screen.apply_event(UiEvent::SessionStarted);
+    tui.screen.apply(UiEvent::SessionStarted);
     refresh_footer(tui, switch);
     tui.draw()?;
     // Draw once before starting the blocking input reader so the banner is
@@ -212,7 +212,7 @@ async fn session_loop<P: ChatProvider>(
 /// Append status/notice lines to the transcript (no draw).
 fn apply_notices(tui: &mut TuiUi, lines: Vec<String>) {
     for line in lines {
-        tui.screen.apply_event(UiEvent::Notice(line));
+        tui.screen.apply(UiEvent::Notice(line));
     }
 }
 
@@ -408,12 +408,12 @@ async fn run_turn<P: ChatProvider>(
                     // The turn may finish in one poll after emitting a burst of
                     // events; drain them so none are lost.
                     while let Ok(event) = event_rx.try_recv() {
-                        tui.screen.apply_event(event);
+                        tui.screen.apply(event);
                     }
                     break res;
                 }
                 Some(event) = event_rx.recv() => {
-                    tui.screen.apply_event(event);
+                    tui.screen.apply(event);
                     tui.draw()?;
                 }
                 Some(request) = appr_rx.recv() => {
@@ -468,7 +468,7 @@ async fn run_turn<P: ChatProvider>(
     drop(pending);
 
     if let Err(error) = result {
-        tui.screen.apply_event(UiEvent::from_turn_error(&error));
+        tui.screen.apply(UiEvent::from_turn_error(&error));
     }
     tui.screen.clear_approval();
     Ok(())

@@ -52,10 +52,6 @@ pub(crate) struct TerminalSurface<W> {
     state: RenderState,
 }
 
-struct RenderedLine {
-    ansi: String,
-}
-
 impl<W: Write> TerminalSurface<W> {
     pub(crate) fn new(writer: W) -> Self {
         Self {
@@ -97,8 +93,7 @@ impl<W: Write> TerminalSurface<W> {
     ) -> io::Result<RenderStats> {
         let width = size.width.max(1);
         let height = size.height.max(1);
-        let rendered = render_lines(lines, width)?;
-        let new_lines: Vec<String> = rendered.into_iter().map(|line| line.ansi).collect();
+        let new_lines = render_lines(lines, width)?;
         let volatile_tail = volatile_tail.min(new_lines.len());
 
         let width_changed = self.state.previous_width != 0 && self.state.previous_width != width;
@@ -448,17 +443,12 @@ impl<W: Write> TerminalSurface<W> {
 
 fn changed_range(previous: &[String], next: &[String]) -> Option<(usize, usize)> {
     let max_len = previous.len().max(next.len());
-    let mut first = None;
-    let mut last = 0usize;
-    for i in 0..max_len {
-        let old = previous.get(i).map(String::as_str);
-        let new = next.get(i).map(String::as_str);
-        if old != new {
-            first.get_or_insert(i);
-            last = i;
-        }
-    }
-    first.map(|first| (first, last))
+    let first = (0..max_len).find(|&i| previous.get(i) != next.get(i))?;
+    let last = (first..max_len)
+        .rev()
+        .find(|&i| previous.get(i) != next.get(i))
+        .unwrap_or(first);
+    Some((first, last))
 }
 
 fn viewport_top(line_count: usize, height: u16) -> usize {
@@ -482,12 +472,12 @@ fn move_to_row(
     *hardware_cursor_row = target;
 }
 
-fn render_lines(lines: &[Line<'static>], width: u16) -> io::Result<Vec<RenderedLine>> {
+fn render_lines(lines: &[Line<'static>], width: u16) -> io::Result<Vec<String>> {
     let max = usize::from(width.max(1));
     lines.iter().map(|line| render_line(line, max)).collect()
 }
 
-fn render_line(line: &Line<'static>, max_width: usize) -> io::Result<RenderedLine> {
+fn render_line(line: &Line<'static>, max_width: usize) -> io::Result<String> {
     // Autowrap is disabled while we write, so an over-wide line would otherwise
     // be silently clipped by the terminal at an arbitrary byte. Clip it here at
     // a display-width boundary instead, preserving ANSI styling and emitting a
@@ -505,7 +495,7 @@ fn render_line(line: &Line<'static>, max_width: usize) -> io::Result<RenderedLin
         }
     }
     out.push_str("\x1b[0m");
-    Ok(RenderedLine { ansi: out })
+    Ok(out)
 }
 
 fn clip_to_width(content: &str, remaining: usize) -> (String, usize) {
