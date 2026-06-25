@@ -10,13 +10,6 @@ use crate::tool_display::run_target;
 use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use crate::ui::{TurnErrorKind, UiEvent};
 
-/// Collapsed-state label for a reasoning panel (mirrors pi-mono's
-/// `hiddenThinkingLabel`).
-const THINKING_LABEL: &str = "Thinking...";
-/// Placeholder for reasoning the provider withheld; the original text is never
-/// available and is never rendered.
-const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
-
 use super::component::{self, Component};
 use super::pane;
 use super::panel::{PanelHeaderSpec, PanelState, diff_table_rows, panel_state};
@@ -29,6 +22,13 @@ use super::{
     TEXT_COLUMN_X_PADDING, dim_style, err_style, format_elapsed_compact, ok_style, panel_style,
     tool_header_style, turn_divider_label,
 };
+
+/// Collapsed-state label for a reasoning panel (mirrors pi-mono's
+/// `hiddenThinkingLabel`).
+const THINKING_LABEL: &str = "Thinking...";
+/// Placeholder for reasoning the provider withheld; the original text is never
+/// available and is never rendered.
+const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
 /// exclusive, so at most one is ever open. `body_start` is the row index of the
@@ -144,7 +144,11 @@ impl Transcript {
             THINKING_LABEL.to_string(),
             dim_style(),
         ));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        // Separator + trace are tagged `WhenExpanded` so the new fold-based
+        // collapse model hides them while collapsed, leaving just the header's
+        // `Thinking...` label; `ctrl+o` (`toggle_latest_panel`) reveals them.
+        self.rows
+            .push(TranscriptRow::chrome(ChromeRow::Separator).with_fold(FoldVis::WhenExpanded));
         if redacted {
             self.rows.push(
                 TranscriptRow::chrome_with_text(
