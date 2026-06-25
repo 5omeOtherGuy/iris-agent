@@ -20,13 +20,14 @@ use crate::ui::slash::{self, Palette, SlashCommand};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::transcript::Transcript;
 use super::wrap::{
-    display_width, line_text, pad_line_left, push_wrapped_line, truncate_line, wrap_to_width,
+    display_width, line_text, pad_line_left, push_wrapped_line, spans_width, truncate_line,
+    truncate_to_width, wrap_to_width,
 };
 use super::{
-    BOX_X_PADDING_U16, COMPOSER_HINT, EDITOR_VERTICAL_CHROME_ROWS, GLOBAL_STATUS_H,
-    MAX_EDITOR_ROWS, MAX_MENU_ROWS, MIN_EDITOR_H, MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING,
-    TEXT_X_PADDING_U16, WORKING_FRAMES, border_style, dim_style, format_elapsed_compact,
-    panel_style, prompt_style, tool_header_style,
+    BOX_X_PADDING_U16, COMPOSER_HINT, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS, MAX_MENU_ROWS,
+    MIN_EDITOR_H, MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING_U16,
+    WORKING_FRAMES, WORKSPACE_LABEL_H, border_style, dim_style, format_elapsed_compact,
+    panel_style, prompt_style,
 };
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -118,8 +119,14 @@ struct Footer {
     context: Option<String>,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
-    /// Latest provider-reported usage, if the provider surfaced it.
+    /// Latest provider-reported usage, if the provider surfaced it. Cleared at
+    /// turn start so the working indicator's per-turn token readout resets.
     usage: Option<ProviderUsage>,
+    /// Most recent total context tokens, used to drive the top-frame context
+    /// meter. Unlike `usage` this persists across turns (so the meter does not
+    /// drop to empty at every turn start) and is cleared only when the model or
+    /// context window changes.
+    context_used_tokens: Option<u64>,
 }
 
 fn content_width(width: usize) -> usize {
@@ -338,6 +345,7 @@ impl Screen {
         } = &event
             && let Some(footer) = &mut self.footer
         {
+            footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
         }
         self.transcript.apply(event);
@@ -426,13 +434,25 @@ impl Screen {
         context: Option<String>,
         cwd: String,
     ) {
-        let usage = self.footer.as_ref().and_then(|footer| footer.usage.clone());
+        let prev = self.footer.as_ref();
+        let same_context =
+            prev.is_some_and(|footer| footer.model == model && footer.context == context);
+        // Carry usage and the meter value across an unchanged model/context;
+        // reset both when the model or context window changes so a prior model's
+        // usage cannot be shown against a new context window.
+        let usage = same_context
+            .then(|| prev.and_then(|footer| footer.usage.clone()))
+            .flatten();
+        let context_used_tokens = same_context
+            .then(|| prev.and_then(|footer| footer.context_used_tokens))
+            .flatten();
         self.footer = Some(Footer {
             model,
             effort,
             context,
             cwd,
             usage,
+            context_used_tokens,
         });
     }
 
@@ -621,138 +641,224 @@ pub(super) fn render_document_with_chrome_tail(
     (transcript, volatile_tail)
 }
 
-pub(super) fn global_status_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
+/// Number of dots in the top-frame context meter; each dot is ~10% usage.
+const CONTEXT_METER_DOTS: u64 = 10;
+
+/// Parse a catalog context-window label (`"300k"`, `"200k"`, `"1M"`) into a
+/// token count. Returns `None` for labels that are not a number with an optional
+/// `k`/`m` suffix.
+fn parse_context_window(label: &str) -> Option<u64> {
+    let trimmed = label.trim();
+    let (digits, multiplier) = match trimmed.chars().last() {
+        Some('k' | 'K') => (&trimmed[..trimmed.len() - 1], 1_000.0),
+        Some('m' | 'M') => (&trimmed[..trimmed.len() - 1], 1_000_000.0),
+        _ => (trimmed, 1.0),
+    };
+    let value: f64 = digits.trim().parse().ok()?;
+    if value < 0.0 {
+        return None;
+    }
+    Some((value * multiplier) as u64)
+}
+
+/// Number of lit dots for `used`/`window` tokens: each dot is ~10% usage, the
+/// last lit dot is the current edge. `0` means no usage (all dots empty).
+fn context_meter_filled(used: u64, window: u64) -> u64 {
+    if used == 0 || window == 0 {
+        return 0;
+    }
+    used.min(window)
+        .saturating_mul(CONTEXT_METER_DOTS)
+        .div_ceil(window)
+        .min(CONTEXT_METER_DOTS)
+}
+
+/// Muted filled dot for already-consumed context (before the current edge).
+fn meter_used_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+/// Render the 10-dot context meter as styled spans: muted filled dots, an orange
+/// edge dot at the current usage boundary, and dim empty dots for the remainder.
+fn context_meter_spans(filled: u64) -> Vec<Span<'static>> {
+    (1..=CONTEXT_METER_DOTS)
+        .map(|dot| {
+            if filled == 0 || dot > filled {
+                Span::styled("○".to_string(), dim_style())
+            } else if dot == filled {
+                Span::styled("●".to_string(), prompt_style())
+            } else {
+                Span::styled("●".to_string(), meter_used_style())
+            }
+        })
+        .collect()
+}
+
+/// Build the editor's top border, which doubles as the primary statusline:
+/// `┌─ ● CODE ─ GPT-5.4 LOW ─ CTX 300K ●●●○○○○○○○ ───┐`. Returns `None` when
+/// there is no footer yet or even the minimum content cannot fit, in which case
+/// the caller leaves the plain `Block` border in place so the frame never breaks.
+pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
     let footer = screen.footer.as_ref()?;
-    let clean_cwd = strip_ansi_for_text(&footer.cwd);
-    let (cwd, branch) = split_cwd_branch(&clean_cwd);
-    let model = strip_ansi_for_text(&footer.model);
-    let model_flag = (!screen.spinner.active)
-        .then_some(footer.effort.as_ref())
-        .flatten()
-        .map(|effort| strip_ansi_for_text(effort));
-    let fields = status_fields_for_width(
-        usize::from(width),
-        &model,
-        model_flag.as_deref(),
-        footer.context.as_deref(),
-        &cwd,
-        branch.as_deref(),
-    );
-    let mut spans = vec![
-        Span::raw(" ".repeat(statusline_indent(usize::from(width)))),
-        Span::styled("● ", prompt_style()),
-    ];
-    for (idx, field) in fields.iter().enumerate() {
-        if idx > 0 {
-            spans.push(rail_sep());
+    let width = usize::from(box_width);
+    // `┌` + `─ ` + content + ` ` + fill + `┐` needs at least the corners plus a
+    // one-character field.
+    if width < 6 {
+        return None;
+    }
+
+    let model = strip_ansi_for_text(&footer.model).to_uppercase();
+    if model.is_empty() {
+        return None;
+    }
+    let effort = footer
+        .effort
+        .as_ref()
+        .map(|effort| strip_ansi_for_text(effort).to_uppercase())
+        .filter(|effort| !effort.is_empty());
+    let context = footer
+        .context
+        .as_ref()
+        .map(|context| strip_ansi_for_text(context).to_uppercase())
+        .filter(|context| !context.is_empty());
+    let meter_filled = context
+        .as_deref()
+        .and_then(parse_context_window)
+        .map(|window| context_meter_filled(footer.context_used_tokens.unwrap_or(0), window));
+
+    let mode_seg = || {
+        vec![
+            Span::styled("● ".to_string(), prompt_style()),
+            Span::raw("CODE"),
+        ]
+    };
+    let model_with_effort = || match &effort {
+        Some(effort) => vec![Span::raw(format!("{model} {effort}"))],
+        None => vec![Span::raw(model.clone())],
+    };
+    let model_only = || vec![Span::raw(model.clone())];
+    let ctx_meter = |with_meter: bool| {
+        context.as_ref().map(|context| {
+            let mut spans = vec![Span::raw(format!("CTX {context}"))];
+            if let (true, Some(filled)) = (with_meter, meter_filled) {
+                spans.push(Span::raw(" "));
+                spans.extend(context_meter_spans(filled));
+            }
+            spans
+        })
+    };
+
+    // Candidates from fullest to minimum. The drop order is monotonic and
+    // matches the spec: drop effort, then the meter, then the CTX label, leaving
+    // the minimum `● CODE ─ MODEL`. Effort never reappears once dropped.
+    let mut candidates: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
+    match (ctx_meter(true), ctx_meter(false)) {
+        (Some(with_meter), Some(without_meter)) => {
+            candidates.push(vec![mode_seg(), model_with_effort(), with_meter.clone()]);
+            candidates.push(vec![mode_seg(), model_only(), with_meter]);
+            candidates.push(vec![mode_seg(), model_only(), without_meter]);
         }
-        spans.push(Span::styled(format!("{} ", field.label), panel_style()));
-        spans.push(Span::styled(field.value.clone(), tool_header_style()));
+        _ => {
+            // No known context window: the fullest form is mode + model + effort.
+            candidates.push(vec![mode_seg(), model_with_effort()]);
+        }
+    }
+    candidates.push(vec![mode_seg(), model_only()]);
+
+    candidates
+        .into_iter()
+        .find_map(|segments| top_border_line(width, segments))
+}
+
+/// Assemble one top-border candidate at `width`, or `None` if its segments do
+/// not fit (`┌─ ` + segments joined by ` ─ ` + ` ` + `─` fill + `┐`).
+fn top_border_line(width: usize, segments: Vec<Vec<Span<'static>>>) -> Option<Line<'static>> {
+    let mut joined: Vec<Span<'static>> = Vec::new();
+    for (idx, segment) in segments.into_iter().enumerate() {
+        if idx > 0 {
+            joined.push(Span::styled(" ─ ".to_string(), border_style()));
+        }
+        joined.extend(segment);
+    }
+    let joined_w = spans_width(&joined);
+    // Fixed cells: `┌`, `─ ` (2), trailing ` ` (1), `┐` => 5.
+    let fill = width.checked_sub(joined_w + 5)?;
+    let mut spans = vec![Span::styled("┌─ ".to_string(), border_style())];
+    spans.extend(joined);
+    spans.push(Span::styled(" ".to_string(), border_style()));
+    if fill > 0 {
+        spans.push(Span::styled("─".repeat(fill), border_style()));
+    }
+    spans.push(Span::styled("┐".to_string(), border_style()));
+    Some(Line::from(spans))
+}
+
+/// Quiet unboxed workspace label rendered below the editor:
+/// `~/projects/iris ┊ git main`. Returns `None` when there is no footer/cwd.
+pub(super) fn workspace_label_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
+    let footer = screen.footer.as_ref()?;
+    let width = usize::from(width);
+    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
+    if cwd.is_empty() {
+        return None;
+    }
+    let indent = TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1));
+    let suffix = branch
+        .as_ref()
+        .map(|branch| format!(" ┊ git {branch}"))
+        .unwrap_or_default();
+    let avail = width
+        .saturating_sub(indent)
+        .saturating_sub(display_width(&suffix))
+        .max(1);
+    let cwd = truncate_cwd_middle(&cwd, avail);
+    let mut spans = vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(cwd, dim_style()),
+    ];
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, dim_style()));
     }
     let mut line = Line::from(spans);
-    truncate_line(&mut line, usize::from(width).max(1));
+    truncate_line(&mut line, width.max(1));
     Some(line)
 }
 
-#[derive(Clone)]
-struct StatusField {
-    label: &'static str,
-    value: String,
-}
-
-fn statusline_indent(width: usize) -> usize {
-    TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1))
-}
-
-fn status_fields_for_width(
-    width: usize,
-    model: &str,
-    model_flag: Option<&str>,
-    context: Option<&str>,
-    cwd: &str,
-    branch: Option<&str>,
-) -> Vec<StatusField> {
-    let candidates = [
-        (true, true, true, true, true),
-        (true, true, true, true, false),
-        (true, false, true, true, false),
-        (true, false, true, false, false),
-        (true, false, false, false, false),
-        (false, false, false, false, false),
-    ];
-    candidates
-        .into_iter()
-        .map(
-            |(include_model, include_model_flag, include_context, include_cwd, include_branch)| {
-                build_status_fields(
-                    if include_model { model } else { "" },
-                    (include_model && include_model_flag)
-                        .then_some(model_flag)
-                        .flatten(),
-                    include_context.then_some(context).flatten(),
-                    include_cwd.then_some(cwd),
-                    include_branch.then_some(branch).flatten(),
-                )
-            },
-        )
-        .find(|fields| statusline_width(fields, width) <= width || fields.len() <= 1)
-        .unwrap_or_else(|| build_status_fields("", None, None, None, None))
-}
-
-fn build_status_fields(
-    model: &str,
-    model_flag: Option<&str>,
-    context: Option<&str>,
-    cwd: Option<&str>,
-    branch: Option<&str>,
-) -> Vec<StatusField> {
-    let mut fields = vec![StatusField {
-        label: "MODE",
-        value: "code".to_string(),
-    }];
-    if !model.is_empty() {
-        let value = if let Some(flag) = model_flag.filter(|flag| !flag.is_empty()) {
-            format!("{model} {flag}")
-        } else {
-            model.to_string()
-        };
-        fields.push(StatusField {
-            label: "MODEL",
-            value,
-        });
+/// Middle-ellipsis truncation that preserves the final path segment (the
+/// repo/project name). Falls back to a left-ellipsized project name when even
+/// `…/<project>` does not fit.
+fn truncate_cwd_middle(cwd: &str, max: usize) -> String {
+    if display_width(cwd) <= max {
+        return cwd.to_string();
     }
-    if let Some(context) = context.filter(|context| !context.is_empty()) {
-        fields.push(StatusField {
-            label: "CTX",
-            value: context.to_string(),
-        });
+    if max == 0 {
+        return String::new();
     }
-    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
-        fields.push(StatusField {
-            label: "CWD",
-            value: cwd.to_string(),
-        });
+    let last = cwd.rsplit('/').next().unwrap_or("");
+    let tail = format!("…/{last}");
+    if display_width(&tail) <= max {
+        let head_budget = max - display_width(&tail);
+        let head = truncate_to_width(cwd, head_budget);
+        format!("{head}{tail}")
+    } else {
+        format!("…{}", take_last_display(last, max.saturating_sub(1)))
     }
-    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
-        fields.push(StatusField {
-            label: "BRANCH",
-            value: branch.to_string(),
-        });
-    }
-    fields
 }
 
-fn statusline_width(fields: &[StatusField], terminal_width: usize) -> usize {
-    let content = fields
-        .iter()
-        .map(|field| format!("{} {}", field.label, field.value))
-        .collect::<Vec<_>>()
-        .join("  ┊  ");
-    statusline_indent(terminal_width) + display_width("● ") + display_width(&content)
-}
-
-fn rail_sep() -> Span<'static> {
-    Span::styled("  ┊  ", dim_style())
+/// Longest suffix of `text` whose display width is `<= max`. (`wrap` only exposes
+/// a prefix variant; the project-name fallback needs the trailing characters.)
+fn take_last_display(text: &str, max: usize) -> String {
+    let mut tail = String::new();
+    let mut used = 0usize;
+    for ch in text.chars().rev() {
+        let width = display_width(ch.encode_utf8(&mut [0u8; 4]));
+        if used + width > max {
+            break;
+        }
+        tail.insert(0, ch);
+        used += width;
+    }
+    tail
 }
 
 fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
@@ -767,26 +873,23 @@ fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
 #[derive(Clone, Copy)]
 struct ChromeHeights {
     menu: u16,
-    global_status: u16,
     editor: u16,
+    workspace: u16,
 }
 
+/// Allocate chrome rows. The editor frame is protected first: the menu yields to
+/// `MIN_EDITOR_H`, then the workspace label yields to both, so a constrained
+/// height drops the workspace label before squeezing the editor frame.
 fn chrome_heights(
     height: u16,
     menu_wanted: u16,
-    desired_global_status_h: u16,
+    workspace_wanted: u16,
     editor_rows: u16,
 ) -> ChromeHeights {
-    let global_status = desired_global_status_h.min(GLOBAL_STATUS_H);
-    let menu = menu_wanted.min(
-        height
-            .saturating_sub(MIN_EDITOR_H)
-            .saturating_sub(global_status),
-    );
-    let max_editor_h = height
-        .saturating_sub(menu)
-        .saturating_sub(global_status)
-        .max(1);
+    let workspace_wanted = workspace_wanted.min(WORKSPACE_LABEL_H);
+    let menu = menu_wanted.min(height.saturating_sub(MIN_EDITOR_H));
+    let workspace = workspace_wanted.min(height.saturating_sub(menu).saturating_sub(MIN_EDITOR_H));
+    let max_editor_h = height.saturating_sub(menu).saturating_sub(workspace).max(1);
     let wanted_editor_h = editor_rows.saturating_add(EDITOR_VERTICAL_CHROME_ROWS);
     let editor = if max_editor_h >= MIN_EDITOR_H {
         wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
@@ -795,8 +898,8 @@ fn chrome_heights(
     };
     ChromeHeights {
         menu,
-        global_status,
         editor,
+        workspace,
     }
 }
 
@@ -837,26 +940,27 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         0
     };
 
-    // Bottom-anchored, clamped to the fixed viewport. The editor owns its hint
-    // row inside the border; there is no bottom telemetry bar.
-    let global_status_lines: Vec<Line<'static>> =
-        global_status_line(screen, area.width).into_iter().collect();
-    let global_status_h = u16::try_from(global_status_lines.len()).unwrap_or(GLOBAL_STATUS_H);
-    let heights = chrome_heights(area.height, menu_wanted, global_status_h, editor_rows);
+    // Bottom-anchored, clamped to the fixed viewport. The runtime statusline is
+    // printed into the editor's top border; the workspace label sits below the
+    // editor as a quiet unboxed line. There is no separate rail and no bottom
+    // telemetry bar.
+    let workspace_line = workspace_label_line(screen, area.width);
+    let workspace_wanted = u16::from(workspace_line.is_some());
+    let heights = chrome_heights(area.height, menu_wanted, workspace_wanted, editor_rows);
     let chrome_h = heights
         .menu
-        .saturating_add(heights.global_status)
-        .saturating_add(heights.editor);
+        .saturating_add(heights.editor)
+        .saturating_add(heights.workspace);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(heights.menu),
-        Constraint::Length(heights.global_status),
         Constraint::Length(heights.editor),
+        Constraint::Length(heights.workspace),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
-    let rail_area = chunks[1];
-    let editor_area = chunks[2];
+    let editor_area = chunks[1];
+    let workspace_area = chunks[2];
 
     let mut buf = Buffer::empty(chrome_area);
 
@@ -871,9 +975,6 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
                 screen.palette.selected(),
             );
         }
-    }
-    if heights.global_status > 0 {
-        Paragraph::new(Text::from(global_status_lines)).render(rail_area, &mut buf);
     }
     let box_area = Rect {
         x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),
@@ -917,6 +1018,18 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     if !hint.spans.is_empty() {
         Paragraph::new(Text::from(vec![hint])).render(hint_area, &mut buf);
     }
+    // Print the statusline into the editor's top border last so it is never
+    // overwritten by the textarea/approval body at very small heights.
+    if heights.editor > 0
+        && let Some(top_border) = composer_top_border(screen, box_area.width)
+    {
+        buf.set_line(box_area.x, box_area.y, &top_border, box_area.width);
+    }
+    if heights.workspace > 0
+        && let Some(line) = workspace_line
+    {
+        Paragraph::new(Text::from(vec![line])).render(workspace_area, &mut buf);
+    }
     buffer_to_lines(&buf)
 }
 
@@ -944,8 +1057,50 @@ fn buffer_to_lines(buf: &Buffer) -> Vec<Line<'static>> {
 mod tests {
     use std::time::Duration;
 
-    use super::{ApprovalHint, approval_status_lines, display_width, line_text, working_lines};
+    use super::{
+        ApprovalHint, CONTEXT_METER_DOTS, approval_status_lines, context_meter_filled,
+        display_width, line_text, parse_context_window, truncate_cwd_middle, working_lines,
+    };
     use crate::ui::tui::WORKING_FRAMES;
+
+    #[test]
+    fn parse_context_window_handles_k_m_and_plain() {
+        assert_eq!(parse_context_window("300k"), Some(300_000));
+        assert_eq!(parse_context_window("300K"), Some(300_000));
+        assert_eq!(parse_context_window("200k"), Some(200_000));
+        assert_eq!(parse_context_window("1M"), Some(1_000_000));
+        assert_eq!(parse_context_window("1m"), Some(1_000_000));
+        assert_eq!(parse_context_window("4096"), Some(4_096));
+        assert_eq!(parse_context_window("unknown"), None);
+        assert_eq!(parse_context_window(""), None);
+    }
+
+    #[test]
+    fn context_meter_filled_is_one_dot_per_ten_percent() {
+        let window = 300_000;
+        assert_eq!(context_meter_filled(0, window), 0);
+        // Any nonzero usage lights at least one dot.
+        assert_eq!(context_meter_filled(1, window), 1);
+        assert_eq!(context_meter_filled(30_000, window), 1);
+        assert_eq!(context_meter_filled(30_001, window), 2);
+        assert_eq!(context_meter_filled(90_000, window), 3);
+        assert_eq!(context_meter_filled(window, window), CONTEXT_METER_DOTS);
+        // Over budget clamps to a full strip, never beyond.
+        assert_eq!(context_meter_filled(window * 2, window), CONTEXT_METER_DOTS);
+        // A zero/unknown window never divides by zero.
+        assert_eq!(context_meter_filled(100, 0), 0);
+    }
+
+    #[test]
+    fn truncate_cwd_middle_preserves_project_name() {
+        let cwd = "~/projects/very/deep/nested/iris-agent";
+        let out = truncate_cwd_middle(cwd, 20);
+        assert!(display_width(&out) <= 20, "{out:?}");
+        assert!(out.ends_with("iris-agent"), "{out:?}");
+        assert!(out.contains('…'), "{out:?}");
+        // Fits untouched when there is room.
+        assert_eq!(truncate_cwd_middle("~/repo", 40), "~/repo");
+    }
 
     #[test]
     fn approval_and_working_lines_stay_bounded_at_tiny_widths() {

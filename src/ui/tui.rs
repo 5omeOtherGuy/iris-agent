@@ -52,7 +52,8 @@ pub(crate) use screen::Screen;
 use screen::{compact_count, render_document_with_chrome_tail};
 #[cfg(test)]
 use screen::{
-    editor_visual_rows, fresh_editor, global_status_line, render_document, working_indicator_line,
+    composer_top_border, editor_visual_rows, fresh_editor, render_document, working_indicator_line,
+    workspace_label_line,
 };
 #[cfg(test)]
 use transcript::Transcript;
@@ -68,7 +69,8 @@ const MAX_EDITOR_ROWS: u16 = 10;
 const MAX_MENU_ROWS: u16 = 16;
 const MIN_EDITOR_H: u16 = 6;
 const EDITOR_VERTICAL_CHROME_ROWS: u16 = 5;
-const GLOBAL_STATUS_H: u16 = 1;
+/// The quiet workspace label rendered below the editor box is a single row.
+const WORKSPACE_LABEL_H: u16 = 1;
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
 /// bottom instead of immediately occupying the whole terminal height.
@@ -1082,14 +1084,20 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 180, 12);
 
-        assert!(rendered.contains("    ● MODE code  ┊  MODEL sonnet 3.5 high"));
-        assert!(rendered.contains("MODEL sonnet 3.5"));
-        assert!(!rendered.contains("EFFORT high"));
-        assert!(rendered.contains("CWD ~/workspace/user-auth"));
-        assert!(rendered.contains("BRANCH feat/rate-limit"));
-        assert!(!rendered.contains("CONTEXT 128k"));
-        assert!(!rendered.contains("APPROVAL auto"));
-        assert!(rendered.contains("┌"));
+        // Runtime status is printed into the editor's top border, not a rail.
+        assert!(
+            rendered.contains("┌─ ● CODE ─ SONNET 3.5 HIGH ─"),
+            "{rendered}"
+        );
+        // Workspace state is a quiet unboxed label below the editor.
+        assert!(
+            rendered.contains("~/workspace/user-auth ┊ git feat/rate-limit"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("MODE code"), "{rendered}");
+        assert!(!rendered.contains("CWD"), "{rendered}");
+        assert!(!rendered.contains("BRANCH"), "{rendered}");
+        assert!(!rendered.contains("APPROVAL auto"), "{rendered}");
         assert!(rendered.contains("Give Iris a task..."));
         assert!(!rendered.contains("Ask the agent anything..."));
         assert!(rendered.contains("↵ to send  •  shift+↵ for new line  •  / for commands"));
@@ -1118,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_statusline_uses_catalog_context_and_aligned_separator() {
+    fn composer_top_border_embeds_status_with_context_meter() {
         let mut screen = Screen::new();
         screen.set_footer(
             "openai-codex/gpt-5.4-mini".to_string(),
@@ -1127,28 +1135,27 @@ mod tests {
         );
         let lines = rendered_lines(&mut screen, 120, 8);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        let status = texts
-            .iter()
-            .find(|line| line.contains("● MODE code"))
-            .expect("statusline");
-        let top_border = texts
+        let top = texts
             .iter()
             .find(|line| line.contains('┌'))
             .expect("top border");
 
+        // Mode/model/effort/context + 10-dot meter, all uppercase, in the frame.
         assert!(
-            status.starts_with(
-                "    ● MODE code  ┊  MODEL gpt-5.4-mini off  ┊  CTX 300k  ┊  CWD ~/project"
-            ),
-            "{status:?}"
+            top.contains("┌─ ● CODE ─ GPT-5.4-MINI OFF ─ CTX 300K ○○○○○○○○○○ ─"),
+            "{top:?}"
         );
-        assert_eq!(status.find('●'), top_border.find('┌').map(|col| col + 2));
-        assert!(status.contains("  ┊  "));
-        assert!(!status.contains('|'));
+        assert!(top.trim_end().ends_with('┐'), "{top:?}");
+        // The top frame uses ─ as filler/separator and never ┊.
+        assert!(!top.contains('┊'), "{top:?}");
+        // Frame never overflows the terminal width.
+        for line in &texts {
+            assert!(display_width(line) <= 120, "{line:?}");
+        }
     }
 
     #[test]
-    fn composer_statusline_drops_lower_priority_fields_when_narrow() {
+    fn composer_top_border_drops_lower_priority_fields_when_narrow() {
         let mut screen = Screen::new();
         screen.set_footer(
             "openai-codex/gpt-5.4-mini".to_string(),
@@ -1156,19 +1163,26 @@ mod tests {
             "~/projects/iris (feat/composer-statusline)".to_string(),
         );
 
-        let status = global_status_line(&screen, 40)
+        // At a constrained box width the frame falls back to the minimum:
+        // mode + model only (effort, meter, and CTX dropped, in that order).
+        let status = composer_top_border(&screen, 30)
             .map(|line| line_text(&line))
-            .expect("statusline");
+            .expect("top border");
 
-        assert_eq!(status.trim_end(), "    ● MODE code  ┊  MODEL gpt-5.4-mini");
-        assert!(!status.contains(" off"));
-        assert!(!status.contains("CTX"));
-        assert!(!status.contains("CWD"));
-        assert!(!status.contains("BRANCH"));
+        assert!(status.contains("┌─ ● CODE ─ GPT-5.4-MINI "), "{status:?}");
+        assert!(status.ends_with('┐'), "{status:?}");
+        assert!(!status.contains("OFF"), "{status:?}");
+        assert!(!status.contains("CTX"), "{status:?}");
+        assert!(!status.contains('○'), "{status:?}");
+        assert!(
+            !status.contains('●') || status.matches('●').count() == 1,
+            "{status:?}"
+        );
+        assert_eq!(display_width(&status), 30, "{status:?}");
     }
 
     #[test]
-    fn global_status_rail_is_pinned_with_composer_chrome_not_scrollback() {
+    fn composer_chrome_is_pinned_not_scrollback() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
@@ -1181,22 +1195,142 @@ mod tests {
 
         let lines = rendered_lines(&mut screen, 180, 12);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        let rail_idx = texts
+        let status_idx = texts
             .iter()
-            .position(|line| line.contains("● MODE code"))
-            .expect("status rail remains visible");
+            .position(|line| line.contains("● CODE"))
+            .expect("top-border statusline remains visible");
         let editor_idx = texts
             .iter()
             .position(|line| line.contains("Give Iris a task"))
             .expect("composer remains visible");
-        assert!(rail_idx < editor_idx, "{texts:?}");
-        assert!(texts[rail_idx].contains("BRANCH feat/pin-rail"));
+        // Status is the editor's top border (above the body); the workspace label
+        // is the last line below the editor.
+        assert!(status_idx < editor_idx, "{texts:?}");
         assert!(
-            !texts
+            texts
                 .last()
-                .is_some_and(|line| line.contains("MODEL") || line.contains("tokens")),
+                .is_some_and(|line| line.contains("~/repo ┊ git feat/pin-rail")),
             "{texts:?}"
         );
+    }
+
+    #[test]
+    fn context_meter_reflects_usage_and_persists_across_turn_start() {
+        let mut screen = Screen::new();
+        // gpt-5.5 has a 300k catalog window.
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("low".to_string()),
+            "~/repo".to_string(),
+        );
+        // No usage yet: meter is all empty.
+        let empty = composer_top_border(&screen, 110)
+            .map(|l| line_text(&l))
+            .expect("top");
+        assert!(empty.contains("CTX 300K ○○○○○○○○○○"), "{empty:?}");
+
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 90_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 90_000,
+                cache_creation: None,
+            }),
+        });
+        screen.end_turn();
+        // 90k/300k => 30% => 3 lit dots (last is the orange edge).
+        let filled = composer_top_border(&screen, 110)
+            .map(|l| line_text(&l))
+            .expect("top");
+        assert!(filled.contains("CTX 300K ●●●○○○○○○○"), "{filled:?}");
+
+        // The meter must NOT drop to empty at the start of the next turn.
+        screen.start_turn();
+        let during = composer_top_border(&screen, 110)
+            .map(|l| line_text(&l))
+            .expect("top");
+        assert!(during.contains("CTX 300K ●●●○○○○○○○"), "{during:?}");
+    }
+
+    #[test]
+    fn context_meter_resets_when_model_changes() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 150_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 150_000,
+                cache_creation: None,
+            }),
+        });
+        let before = composer_top_border(&screen, 110)
+            .map(|l| line_text(&l))
+            .expect("top");
+        assert!(before.contains("CTX 300K ●●●●●○○○○○"), "{before:?}");
+
+        // Switching model clears the meter (prior usage no longer maps).
+        screen.set_footer("gpt-5.4".to_string(), None, "~/repo".to_string());
+        let after = composer_top_border(&screen, 110)
+            .map(|l| line_text(&l))
+            .expect("top");
+        assert!(after.contains("CTX 300K ○○○○○○○○○○"), "{after:?}");
+    }
+
+    #[test]
+    fn workspace_label_truncates_cwd_preserving_project_and_branch() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            None,
+            "~/projects/very/deeply/nested/path/iris-agent (main)".to_string(),
+        );
+        let label = workspace_label_line(&screen, 40)
+            .map(|line| line_text(&line))
+            .expect("workspace label");
+        assert!(display_width(&label) <= 40, "{label:?}");
+        assert!(label.contains("iris-agent"), "{label:?}");
+        assert!(label.contains('…'), "{label:?}");
+        assert!(label.trim_end().ends_with("┊ git main"), "{label:?}");
+    }
+
+    #[test]
+    fn composer_top_border_never_breaks_the_frame_at_any_width() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            "~/projects/iris (main)".to_string(),
+        );
+        for box_width in 6u16..=200 {
+            let Some(line) = composer_top_border(&screen, box_width) else {
+                continue;
+            };
+            let text = line_text(&line);
+            assert_eq!(
+                display_width(&text),
+                usize::from(box_width),
+                "width {box_width}: {text:?}"
+            );
+            assert!(text.starts_with('┌'), "width {box_width}: {text:?}");
+            assert!(text.ends_with('┐'), "width {box_width}: {text:?}");
+            assert!(!text.contains('┊'), "width {box_width}: {text:?}");
+        }
     }
 
     #[test]
@@ -1235,7 +1369,7 @@ mod tests {
             .expect("working indicator");
         let status_idx = texts
             .iter()
-            .position(|line| line.contains("● MODE code"))
+            .position(|line| line.contains("● CODE"))
             .expect("composer statusline");
 
         assert!(
@@ -1745,30 +1879,34 @@ mod tests {
     }
 
     #[test]
-    fn unsourced_global_status_fields_are_not_rendered() {
+    fn unsourced_composer_chrome_has_no_status_or_workspace_label() {
         let mut screen = Screen::new();
         let rendered = rendered_text(&mut screen, 80, 10);
 
-        assert!(!rendered.contains("MODEL model"), "{rendered}");
-        assert!(!rendered.contains("EFFORT -"), "{rendered}");
-        assert!(!rendered.contains("CWD ~"), "{rendered}");
-        assert!(!rendered.contains("BRANCH -"), "{rendered}");
+        // No footer yet: plain editor frame, no embedded status, no workspace label.
+        assert!(!rendered.contains("● CODE"), "{rendered}");
+        assert!(!rendered.contains("┊ git"), "{rendered}");
+        assert!(rendered.contains('┌'), "{rendered}");
     }
 
     #[test]
-    fn sourced_global_status_omits_unknown_effort_and_branch() {
+    fn sourced_top_border_omits_unknown_effort_and_workspace_omits_branch() {
         let mut screen = Screen::new();
         screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
         let rendered = rendered_text(&mut screen, 100, 10);
 
-        assert!(rendered.contains("MODEL gpt-5.5"), "{rendered}");
-        assert!(rendered.contains("CWD ~/repo"), "{rendered}");
-        assert!(!rendered.contains("EFFORT"), "{rendered}");
-        assert!(!rendered.contains("BRANCH"), "{rendered}");
+        // No effort token between the model and the CTX separator.
+        assert!(
+            rendered.contains("● CODE ─ GPT-5.5 ─ CTX 300K"),
+            "{rendered}"
+        );
+        // No branch: a bare cwd label with no git suffix.
+        assert!(rendered.contains("~/repo"), "{rendered}");
+        assert!(!rendered.contains("┊ git"), "{rendered}");
     }
 
     #[test]
-    fn sourced_global_status_renders_effort_as_model_flag() {
+    fn sourced_top_border_renders_effort_after_model() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
@@ -1777,8 +1915,11 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 100, 10);
 
-        assert!(rendered.contains("MODEL gpt-5.5 high"), "{rendered}");
-        assert!(!rendered.contains("EFFORT high"), "{rendered}");
+        assert!(
+            rendered.contains("● CODE ─ GPT-5.5 HIGH ─ CTX 300K"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("~/repo ┊ git branch"), "{rendered}");
     }
 
     #[test]
@@ -2255,7 +2396,7 @@ mod tests {
     fn footer_shows_real_provider_usage_when_reported() {
         let mut screen = Screen::new();
         screen.set_footer(
-            "opus-4.8 xhigh".to_string(),
+            "opus-4.8".to_string(),
             Some("xhigh".to_string()),
             "~/repo (branch)".to_string(),
         );
@@ -2276,7 +2417,7 @@ mod tests {
             }),
         });
         let rendered = rendered_text(&mut screen, 120, 12);
-        assert!(rendered.contains("MODEL opus-4.8 xhigh"), "{rendered}");
+        assert!(rendered.contains("● CODE ─ OPUS-4.8 XHIGH"), "{rendered}");
         assert!(rendered.contains("↑100 ↓20"), "{rendered}");
         assert!(
             !rendered.contains("thinking with xhigh effort"),
@@ -2284,12 +2425,12 @@ mod tests {
         );
 
         screen.set_footer(
-            "opus-4.8 high".to_string(),
+            "opus-4.8".to_string(),
             Some("high".to_string()),
             "~/repo (branch)".to_string(),
         );
         let refreshed = rendered_text(&mut screen, 120, 12);
-        assert!(refreshed.contains("MODEL opus-4.8 high"), "{refreshed}");
+        assert!(refreshed.contains("● CODE ─ OPUS-4.8 HIGH"), "{refreshed}");
         assert!(refreshed.contains("↑100 ↓20"), "{refreshed}");
         assert!(
             !refreshed.contains("thinking with high effort"),
