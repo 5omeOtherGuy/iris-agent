@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::ModelSwitch;
 use crate::mimir::auth::storage::AuthStore;
+use crate::mimir::model_catalog;
 use crate::nexus::{
     AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ToolCall,
 };
@@ -227,8 +228,10 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
     let effort = selection
         .reasoning
         .map(|effort| effort.as_str().to_string());
+    let qualified_model = format!("{}/{}", selection.provider.as_str(), selection.model);
+    let context = model_catalog::ctx_label(&qualified_model).map(str::to_string);
     tui.screen
-        .set_footer(selection.model.clone(), effort, footer_cwd());
+        .set_footer_with_context(selection.model.clone(), effort, context, footer_cwd());
 }
 
 /// The working directory for the footer, home-relativized to `~`/`~/sub`.

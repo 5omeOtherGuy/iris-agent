@@ -35,6 +35,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[cfg(test)]
+use crate::mimir::model_catalog;
 use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{
     display_path, exploration_summary, is_exploration_tool, run_target, summarize,
@@ -52,7 +54,9 @@ const MAX_EDITOR_ROWS: u16 = 10;
 
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
-const MIN_EDITOR_H: u16 = 5;
+const MIN_EDITOR_H: u16 = 6;
+const EDITOR_VERTICAL_CHROME_ROWS: u16 = 5;
+const GLOBAL_STATUS_H: u16 = 1;
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
 /// bottom instead of immediately occupying the whole terminal height.
@@ -2354,11 +2358,13 @@ impl Spinner {
 /// Session rail metadata.
 struct Footer {
     /// Model display token.
-    _model: String,
+    model: String,
     /// Reasoning effort display token, when configured.
     effort: Option<String>,
+    /// Context-window label sourced from the model catalog, when known.
+    context: Option<String>,
     /// Working directory, home-relativized to `~` where possible.
-    _cwd: String,
+    cwd: String,
     /// Latest provider-reported usage, if the provider surfaced it.
     usage: Option<ProviderUsage>,
 }
@@ -2416,7 +2422,7 @@ fn fresh_editor() -> TextArea<'static> {
     editor.set_cursor_line_style(Style::default());
     editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     editor.set_placeholder_style(dim_style());
-    editor.set_placeholder_text("Give iris a task...");
+    editor.set_placeholder_text("Give Iris a task...");
     editor
 }
 
@@ -2557,12 +2563,38 @@ impl Screen {
 
     /// Set (or refresh) the idle footer from the live model selection. The loop
     /// calls this whenever the model/effort changes; `cwd` is home-relativized.
+    #[cfg(test)]
     pub(crate) fn set_footer(&mut self, model: String, effort: Option<String>, cwd: String) {
+        let (display_model, lookup_model) = model
+            .split_once('/')
+            .map(|(_, bare)| (bare.to_string(), model.clone()))
+            .unwrap_or_else(|| {
+                (
+                    model.clone(),
+                    format!(
+                        "{}/{}",
+                        crate::mimir::selection::ProviderId::DEFAULT.as_str(),
+                        model
+                    ),
+                )
+            });
+        let context = model_catalog::ctx_label(&lookup_model).map(str::to_string);
+        self.set_footer_with_context(display_model, effort, context, cwd);
+    }
+
+    pub(crate) fn set_footer_with_context(
+        &mut self,
+        model: String,
+        effort: Option<String>,
+        context: Option<String>,
+        cwd: String,
+    ) {
         let usage = self.footer.as_ref().and_then(|footer| footer.usage.clone());
         self.footer = Some(Footer {
-            _model: model,
+            model,
             effort,
-            _cwd: cwd,
+            context,
+            cwd,
             usage,
         });
     }
@@ -2857,22 +2889,183 @@ fn render_document_with_chrome_tail(
     (transcript, volatile_tail)
 }
 
+fn global_status_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
+    let footer = screen.footer.as_ref()?;
+    let clean_cwd = strip_ansi_for_text(&footer.cwd);
+    let (cwd, branch) = split_cwd_branch(&clean_cwd);
+    let model = strip_ansi_for_text(&footer.model);
+    let model_flag = (!screen.spinner.active)
+        .then_some(footer.effort.as_ref())
+        .flatten()
+        .map(|effort| strip_ansi_for_text(effort));
+    let fields = status_fields_for_width(
+        usize::from(width),
+        &model,
+        model_flag.as_deref(),
+        footer.context.as_deref(),
+        &cwd,
+        branch.as_deref(),
+    );
+    let mut spans = vec![
+        Span::raw(" ".repeat(statusline_indent(usize::from(width)))),
+        Span::styled("● ", prompt_style()),
+    ];
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            spans.push(rail_sep());
+        }
+        spans.push(Span::styled(format!("{} ", field.label), panel_style()));
+        spans.push(Span::styled(field.value.clone(), tool_header_style()));
+    }
+    let mut line = Line::from(spans);
+    truncate_line(&mut line, usize::from(width).max(1));
+    Some(line)
+}
+
+#[derive(Clone)]
+struct StatusField {
+    label: &'static str,
+    value: String,
+}
+
+fn statusline_indent(width: usize) -> usize {
+    TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1))
+}
+
+fn status_fields_for_width(
+    width: usize,
+    model: &str,
+    model_flag: Option<&str>,
+    context: Option<&str>,
+    cwd: &str,
+    branch: Option<&str>,
+) -> Vec<StatusField> {
+    let candidates = [
+        (true, true, true, true, true),
+        (true, true, true, true, false),
+        (true, false, true, true, false),
+        (true, false, true, false, false),
+        (true, false, false, false, false),
+        (false, false, false, false, false),
+    ];
+    candidates
+        .into_iter()
+        .map(
+            |(include_model, include_model_flag, include_context, include_cwd, include_branch)| {
+                build_status_fields(
+                    if include_model { model } else { "" },
+                    (include_model && include_model_flag)
+                        .then_some(model_flag)
+                        .flatten(),
+                    include_context.then_some(context).flatten(),
+                    include_cwd.then_some(cwd),
+                    include_branch.then_some(branch).flatten(),
+                )
+            },
+        )
+        .find(|fields| statusline_width(fields, width) <= width || fields.len() <= 1)
+        .unwrap_or_else(|| build_status_fields("", None, None, None, None))
+}
+
+fn build_status_fields(
+    model: &str,
+    model_flag: Option<&str>,
+    context: Option<&str>,
+    cwd: Option<&str>,
+    branch: Option<&str>,
+) -> Vec<StatusField> {
+    let mut fields = vec![StatusField {
+        label: "MODE",
+        value: "code".to_string(),
+    }];
+    if !model.is_empty() {
+        let value = if let Some(flag) = model_flag.filter(|flag| !flag.is_empty()) {
+            format!("{model} {flag}")
+        } else {
+            model.to_string()
+        };
+        fields.push(StatusField {
+            label: "MODEL",
+            value,
+        });
+    }
+    if let Some(context) = context.filter(|context| !context.is_empty()) {
+        fields.push(StatusField {
+            label: "CTX",
+            value: context.to_string(),
+        });
+    }
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+        fields.push(StatusField {
+            label: "CWD",
+            value: cwd.to_string(),
+        });
+    }
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        fields.push(StatusField {
+            label: "BRANCH",
+            value: branch.to_string(),
+        });
+    }
+    fields
+}
+
+fn statusline_width(fields: &[StatusField], terminal_width: usize) -> usize {
+    let content = fields
+        .iter()
+        .map(|field| format!("{} {}", field.label, field.value))
+        .collect::<Vec<_>>()
+        .join("  ┊  ");
+    statusline_indent(terminal_width) + display_width("● ") + display_width(&content)
+}
+
+fn rail_sep() -> Span<'static> {
+    Span::styled("  ┊  ", dim_style())
+}
+
+fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
+    if let Some((left, right)) = cwd.rsplit_once(" (")
+        && let Some(branch) = right.strip_suffix(')')
+    {
+        return (left.to_string(), Some(branch.to_string()));
+    }
+    (cwd.to_string(), None)
+}
+
 #[derive(Clone, Copy)]
 struct ChromeHeights {
     menu: u16,
+    global_status: u16,
     editor: u16,
 }
 
-fn chrome_heights(height: u16, menu_wanted: u16, editor_rows: u16) -> ChromeHeights {
-    let menu = menu_wanted.min(height.saturating_sub(MIN_EDITOR_H));
-    let max_editor_h = height.saturating_sub(menu).max(1);
-    let wanted_editor_h = editor_rows.saturating_add(4);
+fn chrome_heights(
+    height: u16,
+    menu_wanted: u16,
+    desired_global_status_h: u16,
+    editor_rows: u16,
+) -> ChromeHeights {
+    let global_status = desired_global_status_h.min(GLOBAL_STATUS_H);
+    let menu = menu_wanted.min(
+        height
+            .saturating_sub(MIN_EDITOR_H)
+            .saturating_sub(global_status),
+    );
+    let max_editor_h = height
+        .saturating_sub(menu)
+        .saturating_sub(global_status)
+        .max(1);
+    let wanted_editor_h = editor_rows.saturating_add(EDITOR_VERTICAL_CHROME_ROWS);
     let editor = if max_editor_h >= MIN_EDITOR_H {
         wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
     } else {
         max_editor_h.max(1)
     };
-    ChromeHeights { menu, editor }
+    ChromeHeights {
+        menu,
+        global_status,
+        editor,
+    }
 }
 
 fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -2913,18 +3106,25 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     };
 
     // Bottom-anchored, clamped to the fixed viewport. The editor owns its hint
-    // row inside the border; there is no bottom status bar or duplicated global
-    // status rail in the pane.
-    let heights = chrome_heights(area.height, menu_wanted, editor_rows);
-    let chrome_h = heights.menu.saturating_add(heights.editor);
+    // row inside the border; there is no bottom telemetry bar.
+    let global_status_lines: Vec<Line<'static>> =
+        global_status_line(screen, area.width).into_iter().collect();
+    let global_status_h = u16::try_from(global_status_lines.len()).unwrap_or(GLOBAL_STATUS_H);
+    let heights = chrome_heights(area.height, menu_wanted, global_status_h, editor_rows);
+    let chrome_h = heights
+        .menu
+        .saturating_add(heights.global_status)
+        .saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(heights.menu),
+        Constraint::Length(heights.global_status),
         Constraint::Length(heights.editor),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
-    let editor_area = chunks[1];
+    let rail_area = chunks[1];
+    let editor_area = chunks[2];
 
     let mut buf = Buffer::empty(chrome_area);
 
@@ -2939,6 +3139,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
                 screen.palette.selected(),
             );
         }
+    }
+    if heights.global_status > 0 {
+        Paragraph::new(Text::from(global_status_lines)).render(rail_area, &mut buf);
     }
     let box_area = Rect {
         x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),
@@ -2955,9 +3158,12 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         .render(box_area, &mut buf);
     let text_area = Rect {
         x: box_area.x + 2.min(box_area.width.saturating_sub(1)),
-        y: editor_area.y + 1,
+        y: editor_area.y + 2.min(editor_area.height.saturating_sub(1)),
         width: box_area.width.saturating_sub(TEXT_X_PADDING_U16 * 2).max(1),
-        height: editor_area.height.saturating_sub(3).max(1),
+        height: editor_area
+            .height
+            .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
+            .max(1),
     };
     if let Some(hint) = &screen.approval_hint {
         let approval_lines = approval_status_lines(hint, usize::from(text_area.width));
@@ -2965,7 +3171,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     } else {
         (&screen.editor).render(text_area, &mut buf);
     }
-    let hint = if screen.approval_hint.is_some() {
+    let hint = if screen.approval_hint.is_some() || editor_area.height < MIN_EDITOR_H {
         Line::default()
     } else {
         Line::from(Span::styled(COMPOSER_HINT, dim_style()))
@@ -2976,7 +3182,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         width: box_area.width.saturating_sub(4).max(1),
         height: 1,
     };
-    Paragraph::new(Text::from(vec![hint])).render(hint_area, &mut buf);
+    if !hint.spans.is_empty() {
+        Paragraph::new(Text::from(vec![hint])).render(hint_area, &mut buf);
+    }
     buffer_to_lines(&buf)
 }
 
@@ -3868,7 +4076,7 @@ mod tests {
         assert!(rendered.contains("first answer"), "{rendered:?}");
         assert!(rendered.contains("a note"), "{rendered:?}");
         assert!(
-            rendered.contains("Give iris a task"),
+            rendered.contains("Give Iris a task"),
             "composer missing: {rendered:?}"
         );
         assert!(!rendered.contains("AGENT"), "{rendered:?}");
@@ -3906,7 +4114,7 @@ mod tests {
         assert!(replay.contains("● Done"), "{replay:?}");
         assert!(replay.contains("SHELL"), "{replay:?}");
         assert!(replay.contains("$ echo hi"), "{replay:?}");
-        assert!(replay.contains("Give iris a task"), "{replay:?}");
+        assert!(replay.contains("Give Iris a task"), "{replay:?}");
         assert!(!replay.contains("USER"), "{replay:?}");
         assert!(!replay.contains("AGENT"), "{replay:?}");
         assert!(
@@ -3950,7 +4158,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_chrome_omits_global_status_rail() {
+    fn pane_chrome_renders_composer_statusline() {
         let mut screen = Screen::new();
         screen.set_footer(
             "sonnet 3.5".to_string(),
@@ -3959,20 +4167,93 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 180, 12);
 
-        for forbidden in ["MODE", "MODEL", "EFFORT", "CWD", "BRANCH"] {
-            assert!(
-                !rendered.contains(forbidden),
-                "{forbidden} leaked into pane: {rendered}"
-            );
-        }
+        assert!(rendered.contains("    ● MODE code  ┊  MODEL sonnet 3.5 high"));
+        assert!(rendered.contains("MODEL sonnet 3.5"));
+        assert!(!rendered.contains("EFFORT high"));
+        assert!(rendered.contains("CWD ~/workspace/user-auth"));
+        assert!(rendered.contains("BRANCH feat/rate-limit"));
+        assert!(!rendered.contains("CONTEXT 128k"));
+        assert!(!rendered.contains("APPROVAL auto"));
         assert!(rendered.contains("┌"));
-        assert!(rendered.contains("Give iris a task..."));
+        assert!(rendered.contains("Give Iris a task..."));
         assert!(!rendered.contains("Ask the agent anything..."));
         assert!(rendered.contains("↵ to send  •  shift+↵ for new line  •  / for commands"));
     }
 
     #[test]
-    fn status_rail_does_not_pin_above_composer_when_history_scrolls() {
+    fn composer_editor_uses_canonical_multiline_shape() {
+        let mut screen = Screen::new();
+        let lines = rendered_lines(&mut screen, 80, 8);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let top = texts
+            .iter()
+            .position(|line| line.contains('┌'))
+            .expect("top border");
+
+        assert!(texts[top + 1].contains("│"), "{texts:?}");
+        assert!(!texts[top + 1].contains("Give Iris"), "{texts:?}");
+        assert!(
+            texts[top + 2].contains("│  Give Iris a task..."),
+            "{texts:?}"
+        );
+        assert!(texts[top + 3].contains("│"), "{texts:?}");
+        assert!(texts[top + 4].contains(COMPOSER_HINT), "{texts:?}");
+        assert!(texts[top + 5].contains('└'), "{texts:?}");
+        assert!(!texts.join("\n").contains("Give iris a task"));
+    }
+
+    #[test]
+    fn composer_statusline_uses_catalog_context_and_aligned_separator() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "openai-codex/gpt-5.4-mini".to_string(),
+            Some("off".to_string()),
+            "~/project".to_string(),
+        );
+        let lines = rendered_lines(&mut screen, 120, 8);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let status = texts
+            .iter()
+            .find(|line| line.contains("● MODE code"))
+            .expect("statusline");
+        let top_border = texts
+            .iter()
+            .find(|line| line.contains('┌'))
+            .expect("top border");
+
+        assert!(
+            status.starts_with(
+                "    ● MODE code  ┊  MODEL gpt-5.4-mini off  ┊  CTX 300k  ┊  CWD ~/project"
+            ),
+            "{status:?}"
+        );
+        assert_eq!(status.find('●'), top_border.find('┌').map(|col| col + 2));
+        assert!(status.contains("  ┊  "));
+        assert!(!status.contains('|'));
+    }
+
+    #[test]
+    fn composer_statusline_drops_lower_priority_fields_when_narrow() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "openai-codex/gpt-5.4-mini".to_string(),
+            Some("off".to_string()),
+            "~/projects/iris (feat/composer-statusline)".to_string(),
+        );
+
+        let status = global_status_line(&screen, 40)
+            .map(|line| line_text(&line))
+            .expect("statusline");
+
+        assert_eq!(status.trim_end(), "    ● MODE code  ┊  MODEL gpt-5.4-mini");
+        assert!(!status.contains(" off"));
+        assert!(!status.contains("CTX"));
+        assert!(!status.contains("CWD"));
+        assert!(!status.contains("BRANCH"));
+    }
+
+    #[test]
+    fn global_status_rail_is_pinned_with_composer_chrome_not_scrollback() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
@@ -3983,11 +4264,24 @@ mod tests {
             screen.apply(UiEvent::AssistantText(format!("line {i}")));
         }
 
-        let rendered = rendered_text(&mut screen, 180, 12);
-        assert!(!rendered.contains("● MODE code"), "{rendered}");
-        assert!(!rendered.contains("MODEL gpt-5.5"), "{rendered}");
-        assert!(!rendered.contains("BRANCH feat/pin-rail"), "{rendered}");
-        assert!(rendered.contains("Give iris a task"), "{rendered}");
+        let lines = rendered_lines(&mut screen, 180, 12);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let rail_idx = texts
+            .iter()
+            .position(|line| line.contains("● MODE code"))
+            .expect("status rail remains visible");
+        let editor_idx = texts
+            .iter()
+            .position(|line| line.contains("Give Iris a task"))
+            .expect("composer remains visible");
+        assert!(rail_idx < editor_idx, "{texts:?}");
+        assert!(texts[rail_idx].contains("BRANCH feat/pin-rail"));
+        assert!(
+            !texts
+                .last()
+                .is_some_and(|line| line.contains("MODEL") || line.contains("tokens")),
+            "{texts:?}"
+        );
     }
 
     #[test]
@@ -4055,7 +4349,7 @@ mod tests {
 
         let rendered = rendered_text(&mut screen, 100, 12);
         assert!(!rendered.contains("EFFORT"), "{rendered}");
-        assert!(!rendered.contains("MODEL"), "{rendered}");
+        assert!(rendered.contains("MODEL gpt-5.5"), "{rendered}");
         assert!(rendered.contains("thinking with high effort"), "{rendered}");
     }
 
@@ -4417,7 +4711,30 @@ mod tests {
     }
 
     #[test]
-    fn footer_data_does_not_render_idle_status_rail() {
+    fn unsourced_global_status_fields_are_not_rendered() {
+        let mut screen = Screen::new();
+        let rendered = rendered_text(&mut screen, 80, 10);
+
+        assert!(!rendered.contains("MODEL model"), "{rendered}");
+        assert!(!rendered.contains("EFFORT -"), "{rendered}");
+        assert!(!rendered.contains("CWD ~"), "{rendered}");
+        assert!(!rendered.contains("BRANCH -"), "{rendered}");
+    }
+
+    #[test]
+    fn sourced_global_status_omits_unknown_effort_and_branch() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        let rendered = rendered_text(&mut screen, 100, 10);
+
+        assert!(rendered.contains("MODEL gpt-5.5"), "{rendered}");
+        assert!(rendered.contains("CWD ~/repo"), "{rendered}");
+        assert!(!rendered.contains("EFFORT"), "{rendered}");
+        assert!(!rendered.contains("BRANCH"), "{rendered}");
+    }
+
+    #[test]
+    fn sourced_global_status_renders_effort_as_model_flag() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
@@ -4426,12 +4743,8 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 100, 10);
 
-        for forbidden in ["MODEL", "EFFORT", "CWD", "BRANCH", "gpt-5.5", "~/repo"] {
-            assert!(
-                !rendered.contains(forbidden),
-                "{forbidden} leaked into idle pane: {rendered}"
-            );
-        }
+        assert!(rendered.contains("MODEL gpt-5.5 high"), "{rendered}");
+        assert!(!rendered.contains("EFFORT high"), "{rendered}");
     }
 
     #[test]
@@ -4733,7 +5046,7 @@ mod tests {
         }
 
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
-        assert_eq!(replay.matches("Give iris a task").count(), 1, "{replay:?}");
+        assert_eq!(replay.matches("Give Iris a task").count(), 1, "{replay:?}");
         assert!(!replay.contains("Ask the agent anything"), "{replay:?}");
         Ok(())
     }
@@ -4775,7 +5088,7 @@ mod tests {
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert_ne!(stats.kind, RenderKind::Unchanged);
         assert!(!replay.contains("GPT 5.5"), "{replay:?}");
-        assert!(replay.contains("Give iris a task"), "{replay:?}");
+        assert!(replay.contains("Give Iris a task"), "{replay:?}");
         Ok(())
     }
 
@@ -4864,9 +5177,9 @@ mod tests {
         assert!(rendered.contains("prior reply"), "{rendered}");
         assert!(rendered.contains("GPT 5.5"), "{rendered}");
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
-        assert!(rendered.contains("Give iris a task"), "{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
         let model_idx = rendered.find("GPT 5.5").expect("model row");
-        let editor_idx = rendered.find("Give iris a task").expect("composer row");
+        let editor_idx = rendered.find("Give Iris a task").expect("composer row");
         assert!(model_idx < editor_idx, "{rendered}");
         assert!(!rendered.contains("Select model"), "{rendered}");
     }
@@ -4888,7 +5201,7 @@ mod tests {
         assert!(rendered.contains("Haiku 4.5"), "{rendered}");
         assert!(rendered.contains("xhigh effort"), "{rendered}");
         assert!(rendered.contains("Reasoning"), "{rendered}");
-        assert!(rendered.contains("Give iris a task"), "{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
 
     #[test]
@@ -4930,7 +5243,7 @@ mod tests {
 
         screen.start_turn();
         let rendered = rendered_text(&mut screen, 120, 12);
-        assert!(!rendered.contains("opus-4.8 xhigh"), "{rendered}");
+        assert!(rendered.contains("MODEL opus-4.8 xhigh"), "{rendered}");
         assert!(rendered.contains("↓ 120 tokens"), "{rendered}");
         assert!(
             rendered.contains("thinking with xhigh effort"),
@@ -4943,7 +5256,7 @@ mod tests {
             "~/repo (branch)".to_string(),
         );
         let refreshed = rendered_text(&mut screen, 120, 12);
-        assert!(!refreshed.contains("opus-4.8 high"), "{refreshed}");
+        assert!(refreshed.contains("MODEL opus-4.8 high"), "{refreshed}");
         assert!(refreshed.contains("↓ 120 tokens"), "{refreshed}");
         assert!(
             refreshed.contains("thinking with high effort"),
