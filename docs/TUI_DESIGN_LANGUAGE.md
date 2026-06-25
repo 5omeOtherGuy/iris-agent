@@ -1,415 +1,1096 @@
-# TUI Design Language
+# Iris TUI Pane Design Language & Rendering Spec
 
-This document is the concrete layout contract for the Iris terminal UI. Keep new
-TUI surfaces aligned to these constants instead of inventing local padding.
+## Purpose
 
-## Core Geometry
+This document defines the ground-truth visual and structural design language for the Iris TUI main pane.
 
-```rust
-const USER_BG: Color = Color::Rgb(50, 50, 56);
+It is intended as a guide for coding agents and future design sessions. It does not attempt to fully specify every individual tool output format. Instead, it defines the shared pane grammar that all future tool renderers, transcript messages, working indicators, and input editors must follow.
 
-const X_PADDING: usize = 2;
-const BOX_X_PADDING: usize = X_PADDING;  // terminal edge -> grey box edge
-const TEXT_X_PADDING: usize = X_PADDING; // grey box edge -> text
+The goal is a terminal-native coding-agent interface that feels calm, precise, minimal, mechanical, and readable. The visual direction is inspired by Teenage Engineering-style industrial design: restrained grey palette, functional typography, sparse accent color, clear instrument-like panels, and no unnecessary chrome.
 
-// Terminal edge -> all readable text.
-const TEXT_COLUMN_X_PADDING: usize = BOX_X_PADDING + TEXT_X_PADDING; // 4
+## Design Summary
 
-const BOX_X_PADDING_U16: u16 = X_PADDING as u16;
-const TEXT_X_PADDING_U16: u16 = X_PADDING as u16;
-```
+The pane is a single vertically scrolling transcript column with a fixed multiline composer at the bottom.
 
-All readable transcript/chrome text starts in the same column:
+The transcript contains:
+
+* Plain assistant/agent messages.
+* Plain user messages.
+* Bordered tool output panels.
+* Minimal inline working indicators.
+* Optional future structured sections.
+
+The pane does **not** use chat-style role cards. It does **not** label every message with `USER` or `AGENT`. It does **not** use a bottom telemetry/status bar. It does **not** create framed panels for transient working states.
+
+The visual hierarchy is:
 
 ```text
-terminal x=0
-|-- 2 cols --| grey box edge
-|-- 2 cols --| readable text column (x=4)
+tool panel
+tool panel
+
+  ●   assistant message
+      wrapped assistant line
+
+      user message
+      wrapped user line
+
+  ●   assistant message
+
+tool panel
+
+composer
+```
+
+Only tool outputs and the composer use hard borders.
+
+Natural-language transcript text stays unboxed.
+
+## Core Principles
+
+### 1. Terminal-native, not GUI-like
+
+The pane should look like a refined command-line interface, not a desktop application recreated in text.
+
+Use:
+
+* Monospaced typography.
+* Box-drawing characters.
+* Minimal state labels.
+* Strong alignment.
+* Sparse color.
+* Text-first layouts.
+
+Avoid:
+
+* Tabs.
+* Sidebars.
+* Dense dashboards.
+* Multiple simultaneous status bars.
+* Decorative UI widgets.
+* Overly rich cards for plain messages.
+
+### 2. Tool output gets chrome; conversation does not
+
+Tool calls are mechanical events. They deserve bordered panels.
+
+Conversation text is transcript content. It should remain plain and lightweight.
+
+Good:
+
+```text
+  ●   I listed the available tools and tested bash, read, write, edit, grep,
+      find, and ls in the temporary directory.
+
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│ ▾  EXPLORE  tmp                                              ● DONE        00:00:00s  │
+├───────────────────────────────────────────────────────────────────────────────────────┤
+│    List /home/someotherguy/tmp                                                        │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Bad:
+
+```text
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│  AGENT  │ I listed the available tools...                                             │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3. No explicit `AGENT` / `USER` role labels
+
+The current pane direction removes visible role labels.
+
+Do not render:
+
+```text
+USER      ...
+AGENT ●   ...
+```
+
+Do not render:
+
+```text
+│ USER │ ...
+│ AGENT│ ...
+```
+
+Instead:
+
+* Assistant/agent output uses a small `●` marker.
+* User text appears as plain transcript text aligned to the transcript text column.
+* Tool panels provide their own identity via headers such as `SHELL`, `EXPLORE`, `EDIT`, `APPROVAL`.
+
+This makes the pane feel like a CLI transcript rather than a chat application.
+
+### 4. The `●` marker defines the transcript rhythm
+
+Assistant messages use a small dot marker:
+
+```text
+  ●   Done; I listed the available tools and tested read, write, edit, grep,
+      find, ls, and bash in `/home/someotherguy/tmp`.
 ```
 
 Rules:
 
-```rust
-fn x_for_box() -> u16 { BOX_X_PADDING_U16 }          // 2
-fn x_for_text() -> u16 { TEXT_COLUMN_X_PADDING as u16 } // 4
+* The dot sits in the transcript marker column.
+* Assistant text starts after the dot and spacing.
+* Wrapped assistant lines align with the first text column, not with the dot.
+* The dot should be visually subtle but recognizable.
+* In color-capable themes, the active/current assistant dot may use the accent color; completed/plain assistant dots may be neutral.
 
-fn width_for_box(term_width: u16) -> u16 {
-    term_width.saturating_sub(BOX_X_PADDING_U16 * 2).max(1)
-}
-
-fn width_for_text(term_width: u16) -> u16 {
-    term_width
-        .saturating_sub((TEXT_COLUMN_X_PADDING * 2) as u16)
-        .max(1)
-}
-```
-
-## Transcript Row Padding
-
-Every transcript row is either boxed, unboxed content, or a separator.
-
-```rust
-fn row_text_padding(row: &TranscriptRow) -> usize {
-    if row.background.is_some() {
-        usize::from(!row.text.is_empty()) * TEXT_X_PADDING
-    } else if is_separator_row(row) {
-        0
-    } else {
-        TEXT_COLUMN_X_PADDING
-    }
-}
-```
-
-Meaning:
-
-- Boxed rows paint from `x=2` to `term_width - 2`; their non-empty text starts at
-  `x=4` and ends no later than `term_width - 4`.
-- Unboxed assistant text, tool output, tool summaries, slash menu rows, working
-  indicator text, and footer text start at `x=4` and end no later than
-  `term_width - 4`.
-- Separator rows are truly empty and unpadded.
-
-Do not add per-message padding. Route new transcript output through the row
-model and let `row_text_padding` apply the column.
-
-## Vertical Rhythm
-
-Top-level blocks get one blank separator row before the next block.
-
-```rust
-fn push_blank(&mut self) {
-    self.exploring_open = false;
-    match self.rows.last() {
-        None => {}
-        Some(last) if is_separator_row(last) => {}
-        _ => self
-            .rows
-            .push(TranscriptRow::new(String::new(), Style::default())),
-    }
-}
-```
-
-Boxed blocks own their internal vertical padding. Unboxed blocks do not paint
-their blank rows.
+Recommended shape:
 
 ```text
-[previous block]
-
-  boxed user/editor top pad row
-    readable text
-  boxed user/editor bottom pad row
-
-    unboxed assistant/tool/slash/working/footer text
+  ●   first line
+      wrapped line
+      wrapped line
 ```
 
-## User Message Blocks
+Do not use a framed assistant message.
 
-Submitted user messages render as shaded blocks with no prompt glyph.
+### 5. User messages are plain transcript text
 
-```rust
-fn commit_user(&mut self, text: &str) {
-    self.push_blank();
-    self.push_user_pad();
-    for line in text.split('\n') {
-        let spans = vec![Span::raw(line.to_string())];
-        self.rows
-            .push(TranscriptRow::with_line(Line::from(spans), None).with_bg(USER_BG));
-    }
-    self.push_user_pad();
-}
+User text should not be boxed and should not receive a `USER` label.
 
-fn push_user_pad(&mut self) {
-    self.rows
-        .push(TranscriptRow::with_line(Line::default(), None).with_bg(USER_BG));
-}
-```
-
-Shape:
+Recommended default:
 
 ```text
-  <USER_BG full box width, empty>
-    user text
-  <USER_BG full box width, empty>
+      Repeat
 ```
 
-The box begins at `x=2`; the user text begins at `x=4`.
-
-## Assistant And Tool Output
-
-Assistant replies and rendered tool output are unboxed transcript content. They
-start at `x=4` and rely on block separators for vertical spacing.
-
-```rust
-fn push_unboxed_content(row: TranscriptRow) {
-    // row.background == None
-    // row_text_padding(row) == TEXT_COLUMN_X_PADDING
-}
-```
-
-No colored container. No local `Span::raw("    ")` padding. No prompt glyph.
-
-## Working Indicator
-
-The live working indicator is fixed chrome above the editor. It is unboxed and
-has one blank row above and one blank row below.
-
-```rust
-fn working_lines(
-    glyph: &str,
-    elapsed: Option<Duration>,
-    footer: Option<&Footer>,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let mut line = Line::from(working_spans(glyph, elapsed, footer));
-    truncate_line(&mut line, content_width(width));
-    pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
-    vec![Line::default(), line, Line::default()]
-}
-```
-
-Text format:
-
-```rust
-fn working_spans(
-    glyph: &str,
-    elapsed: Option<Duration>,
-    footer: Option<&Footer>,
-) -> Vec<Span<'static>> {
-    let secs = elapsed.map_or(0, |d| d.as_secs());
-    let mut details = vec![format_elapsed_compact(secs)];
-    if let Some(usage) = footer.and_then(|footer| footer.usage.as_ref()) {
-        details.push(format!(
-            "\u{2193} {} tokens",
-            compact_count(usage.total_tokens)
-        ));
-    }
-    if let Some(effort) = footer.and_then(|footer| footer.effort.as_ref()) {
-        details.push(format!("thinking with {effort} effort"));
-    }
-    let suffix = format!(" ({})", details.join(" \u{b7} "));
-    vec![
-        Span::styled(format!("{glyph} "), prompt_style()),
-        Span::styled("Working\u{2026}", dim_style()),
-        Span::styled(suffix, dim_style()),
-    ]
-}
-```
-
-## Editor Box
-
-The editor is a shaded box matching committed user messages.
-
-```rust
-const MIN_EDITOR_H: u16 = 3; // top pad + one text row + bottom pad
-
-let box_area = Rect {
-    x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),
-    y: editor_area.y,
-    width: editor_area
-        .width
-        .saturating_sub(BOX_X_PADDING_U16 * 2)
-        .max(1),
-    height: editor_area.height,
-};
-
-Block::default()
-    .style(Style::default().bg(USER_BG))
-    .render(box_area, &mut buf);
-
-let pad = u16::from(editor_area.height >= 3);
-let text_area = Rect {
-    x: box_area.x + TEXT_X_PADDING_U16.min(box_area.width.saturating_sub(1)),
-    y: editor_area.y + pad,
-    width: box_area.width.saturating_sub(TEXT_X_PADDING_U16 * 2).max(1),
-    height: editor_area.height.saturating_sub(pad * 2).max(1),
-};
-```
-
-Shape:
+For longer user text:
 
 ```text
-  <USER_BG full box width, empty>
-    Type a message, / for commands, Enter to send
-  <USER_BG full box width, empty>
+      I won’t add the requested TUI-render comments after each output because that
+      would be redundant here. Who are you to decide what is redundant?
 ```
 
-There is no permanent blank row above the editor. During an active turn, the
-working indicator supplies the visual separation between transcript and editor.
+Rules:
 
-## Above-Editor Menus
+* User text aligns to the same transcript text column as assistant message text.
+* No role label.
+* No hard border.
+* No special panel.
+* Use spacing before and after user text to clarify turns.
 
-Slash commands and command-owned menus are plain unboxed chrome above the
-working/editor area. They have no border, no title frame, and no grey
-background.
+If future ambiguity becomes a real problem, a subtle user marker may be introduced later, but do not add one by default in this spec.
 
-```rust
-const MAX_MENU_ROWS: u16 = 16; // includes the blank row above and below
+### 6. Tool panels are indented into the transcript column
 
-let inner = Rect {
-    x: area.x + TEXT_COLUMN_X_PADDING as u16,
-    y: area.y + u16::from(area.height > 1),
-    width: area.width.saturating_sub((TEXT_COLUMN_X_PADDING * 2) as u16).max(1),
-    height: area.height.saturating_sub(2).max(1),
-};
-```
+Tool panels do not start at absolute column zero.
 
-Generic modal/menu rows use the same geometry:
+They are indented so they belong to the same visual transcript system as the `●` marker and text.
 
-```rust
-fn render_plain_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static>>) {
-    let inner = Rect {
-        x: area.x + TEXT_COLUMN_X_PADDING as u16,
-        y: area.y + u16::from(area.height > 1),
-        width: area.width.saturating_sub((TEXT_COLUMN_X_PADDING * 2) as u16).max(1),
-        height: area.height.saturating_sub(2).max(1),
-    };
-    Paragraph::new(Text::from(lines)).render(inner, buf);
-}
-```
-
-Slash palette rows align command descriptions to one column:
-
-```rust
-let command_width = matches
-    .iter()
-    .map(|cmd| display_width(cmd.name))
-    .max()
-    .unwrap_or(0);
-
-for (i, cmd) in matches.iter().enumerate() {
-    let selected = i == selected_index;
-    let name_style = if selected {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    let description_style = if selected {
-        Style::default().fg(Color::Cyan)
-    } else {
-        dim_style()
-    };
-    let gap = command_width
-        .saturating_sub(display_width(cmd.name))
-        .saturating_add(2);
-
-    Line::from(vec![
-        Span::styled(cmd.name.to_string(), name_style),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(cmd.description, description_style),
-    ]);
-}
-```
-
-Expected shape:
+Recommended pattern:
 
 ```text
-    /exit           End the session
-    /model          Show or switch provider/model
-    /reasoning      Set reasoning effort [off|minimal|low|medium|high|xhigh]
-    /scoped-models  Enable/disable models for Ctrl+P cycling
-    /settings       Open settings menu
-    /login          Configure provider authentication
-    /logout         Remove provider authentication
+    ┌───────────────────────────────────────────────────────────────────────────────────┐
+    │ ▾  EXPLORE  tmp                                          ● DONE        00:00:00s  │
+    ├───────────────────────────────────────────────────────────────────────────────────┤
+    │    Find *.txt in /home/someotherguy/tmp                                           │
+    │    List /home/someotherguy/tmp                                                    │
+    └───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Selection is color only:
+This makes tool panels feel like transcript events, not full-screen cards.
 
-- selected command: cyan + bold
-- selected description: cyan
-- unselected command: default foreground
-- unselected description: dim
-- no selected-row background
-- no leading space before `/`
+### 7. Composer aligns with tool panels
 
-Model/settings/login/logout menus follow the same rule: selected rows are
-foreground color only, unselected primary labels use the default foreground, and
-secondary details are dim. The editor remains visible below every menu.
+The editor/composer is also indented into the same content column.
 
-## Footer Statusline
+It should align with the left edge and width of tool panels.
 
-The footer is unboxed and text-column aligned below the editor, inset from both terminal edges.
-
-```rust
-fn footer_lines(footer: &Footer, width: usize) -> Vec<Line<'static>> {
-    let width = content_width(width);
-    let model = truncate_to_width(&footer.model, width);
-    let model_width = display_width(&model);
-    let usage = footer.usage.as_ref().map(footer_usage_text);
-    let usage = usage.as_deref().unwrap_or_default();
-    let usage_max = width.saturating_sub(model_width).saturating_sub(1);
-    let usage = if usage_max > 0 {
-        truncate_to_width(usage, usage_max)
-    } else {
-        String::new()
-    };
-    let usage_width = display_width(&usage);
-    let pad = width
-        .saturating_sub(usage_width)
-        .saturating_sub(model_width);
-
-    let mut second = Vec::new();
-    if !usage.is_empty() {
-        second.push(Span::styled(usage, dim_style()));
-    }
-    second.push(Span::raw(" ".repeat(pad)));
-    second.push(Span::styled(model, Style::default().fg(Color::Cyan)));
-
-    vec![
-        Line::from(Span::styled(
-            truncate_to_width(&footer.cwd, width),
-            Style::default().fg(Color::Green),
-        )),
-        Line::from(second),
-    ]
-}
-
-fn pad_content_lines(lines: &mut [Line<'static>]) {
-    for line in lines {
-        if !line_text(line).is_empty() {
-            pad_line_left(line, TEXT_COLUMN_X_PADDING);
-        }
-    }
-}
-```
-
-Shape:
+Recommended:
 
 ```text
-    ~/projects/iris-agent (branch)
-    12.4k tokens                                      opus-4.5 high
+    ┌──────────────────────────────────────────────────────────────────────────────────┐
+    │                                                                                  │
+    │  Give iris a task...                                                             │
+    │                                                                                  │
+    │ ↵ to send  •  shift+↵ for new line  •  / for commands                            │
+    └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Bottom Chrome Order
+The composer is not a one-line prompt. It is a multiline editor.
 
-Bottom chrome is always reserved in this order:
+## Pane Anatomy
+
+The main pane has three conceptual regions:
+
+```text
+scrolling transcript
+minimal inline working indicator, when active
+fixed multiline composer
+```
+
+There is no bottom telemetry/status bar.
+
+A compact top status line may exist elsewhere in the product, but it is outside the scope of this pane spec. The pane itself should not duplicate global state.
+
+## Transcript Layout Grid
+
+Use a small fixed left gutter and a content column.
+
+Recommended conceptual columns:
+
+```text
+columns 0..1    outer padding / terminal margin
+column 2        assistant marker column
+columns 3..5    marker-to-text gap
+column 6        transcript text column
+column 4        tool/composer left edge, depending on renderer constraints
+```
+
+The exact numeric columns may vary by terminal width, but the visual relationship must hold:
+
+* Assistant marker appears slightly left of assistant text.
+* Assistant wrapped lines align under assistant text.
+* User text aligns with assistant text.
+* Tool panels and composer are indented so they feel attached to the same transcript column.
+* Tool panel interior content has its own padding.
+
+## Natural-Language Message Rendering
+
+### Assistant message
+
+Assistant messages render as plain text with a dot marker.
+
+```text
+  ●   You’re right — I should have followed that instruction exactly.
+      I can continue and do it your way; send the next step.
+```
+
+Rules:
+
+* Start with `●`.
+* Use no `AGENT` label.
+* Wrap to pane width.
+* Wrapped lines align with text, not marker.
+* Preserve paragraph breaks.
+* Do not box the message.
+* Do not use Markdown-style bullets unless the assistant content itself requires it.
+
+### User message
+
+User messages render as plain text without a marker by default.
+
+```text
+      user text
+      wrapped user text
+```
+
+Rules:
+
+* Use no `USER` label.
+* No border.
+* No role card.
+* Align with transcript text column.
+* Preserve user line breaks when meaningful.
+* Use blank lines to separate user turns from assistant turns.
+
+### Paragraph spacing
+
+Use one blank line between major transcript blocks.
+
+Good:
+
+```text
+  ●   First assistant paragraph.
+      Wrapped line.
+
+      User reply.
+
+  ●   Second assistant paragraph.
+```
+
+Avoid cramped transcript output where messages and panels run together without breathing room.
+
+## Tool Panel System
+
+Tool panels are the primary structured output primitive.
+
+A tool panel consists of:
+
+```text
+top border
+header row
+optional separator row
+body rows
+bottom border
+```
+
+Header-only panels are allowed for tools with no meaningful body.
+
+Every rendered row must be exactly the same width.
+
+Never append a separator to a header row. Never produce malformed mixed rows.
+
+Bad:
+
+```text
+│ ▾  EDIT ... │ ├────────────────────────────────────────────────────────────
+```
+
+Good:
+
+```text
+│ ▾  EDIT ...                                                ● RUNNING 00:00:13s │
+├────────────────────────────────────────────────────────────────────────────────┤
+```
+
+### Panel indentation
+
+All tool panels are indented from the terminal edge.
+
+The panel indentation should match the composer indentation.
+
+Recommended:
+
+```text
+    ┌──
+    │
+    └──
+```
+
+### Panel header format
+
+Canonical framed tool header:
+
+```text
+│ ▾  TOOL  meta                                             ● STATE       00:00:00s  │
+```
+
+Fields:
+
+```text
+▾          expanded disclosure marker
+TOOL       uppercase tool family
+meta       target, scope, path, or short summary
+●          state dot
+STATE      state label
+00:00:00s  fixed-width elapsed duration
+```
+
+Do not use `T+` in pane-level framed tool headers unless explicitly reintroduced later. Current pane-level duration format is:
+
+```text
+00:00:00s
+00:00:13s
+00:01:48s
+01:12:09s
+```
+
+Use one duration format consistently across all framed tool panels.
+
+### Disclosure marker
+
+Use:
+
+```text
+▾ expanded
+▸ collapsed
+```
+
+Collapsed tool panels show only the header and border.
+
+Expanded tool panels show separator and body.
+
+### State labels
+
+Canonical states:
+
+```text
+RUNNING
+DONE
+ERROR
+CANCELLED
+APPROVED
+DENIED
+```
+
+Optional future states:
+
+```text
+QUEUED
+TIMEOUT
+SKIPPED
+```
+
+Use only states that correspond to real execution state.
+
+### State dot
+
+The state dot is part of the mechanical readout.
+
+Use the same glyph:
+
+```text
+●
+```
+
+Color by state where color is available:
+
+* `RUNNING`: orange accent
+* `DONE`: muted success / neutral
+* `ERROR`: muted red
+* `CANCELLED`: muted gray
+* `APPROVED`: success or neutral
+* `DENIED`: red or amber
+
+The state label must remain visible so the interface works without color.
+
+## Tool Taxonomy
+
+### EXPLORE
+
+`EXPLORE` is the container for read/search/list/find-style inspection.
+
+Operations that belong inside `EXPLORE`:
+
+* read file
+* grep/search
+* list directory
+* find files
+* inspect definitions
+* scan project structure
+* locate symbols
+* summarize relevant files
+
+Do not create top-level `READ`, `GREP`, `LS`, or `FIND` panels for normal agent workflow.
+
+Instead, render these as body lines inside an `EXPLORE` panel.
+
+Good:
+
+```text
+    ┌───────────────────────────────────────────────────────────────────────────────────┐
+    │ ▾  EXPLORE  tmp                                          ● DONE        00:00:00s  │
+    ├───────────────────────────────────────────────────────────────────────────────────┤
+    │    Find *.txt in /home/someotherguy/tmp                                           │
+    │    List /home/someotherguy/tmp                                                    │
+    └───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Bad:
+
+```text
+    ┌───────────────────────────────────────────────────────────────────────────────────┐
+    │ ▾  READ  /home/someotherguy/tmp/file.txt                 ● DONE        00:00:00s  │
+    └───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Top-level `READ` may only be considered if the product later introduces a user-facing primary read action. For current agent workflow, `READ` belongs to `EXPLORE`.
+
+### SHELL
+
+`SHELL` is for command execution.
+
+It remains a top-level panel.
+
+The shell panel uses the same framed panel grammar as other tools:
+
+```text
+    ┌───────────────────────────────────────────────────────────────────────────────────┐
+    │ ▾  SHELL                                                ● DONE        00:00:00s  │
+    ├───────────────────────────────────────────────────────────────────────────────────┤
+    │    $ command                                                         timeout 120s │
+    │      output                                                                        │
+    └───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Shell-specific command/output rules should follow the shell output rendering spec, but the shell panel must still obey this pane-level spec:
+
+* indented panel
+* no bottom status bar
+* consistent header duration
+* no framed working panel
+* body content aligned with tool body padding
+
+### EDIT
+
+`EDIT` is for file mutations and patch previews.
+
+It remains a top-level panel.
+
+`EDIT` panels should visually focus on the changed lines, not on verbose metadata.
+
+Expected body style:
+
+* old line column
+* new line column
+* change marker column
+* code column
+* muted unchanged rows
+* distinct added/removed styling in color-capable themes
+
+The `EDIT` header should identify the target file.
+
+Do not use `DIFF` as the top-level tool family when the event semantically represents an edit. Diff rendering is the body presentation of an `EDIT`.
+
+Good:
+
+```text
+│ ▾  EDIT  ~/project/src/ui/tui.rs                         ● DONE        00:00:00s  │
+```
+
+Bad:
+
+```text
+│ ▾  DIFF  ~/project/src/ui/tui.rs                         ● DONE        00:00:00s  │
+```
+
+### APPROVAL
+
+`APPROVAL` is for authorization/permission review output.
+
+It remains a top-level panel when the approval event is meaningful to the transcript.
+
+Examples:
+
+* automatic approval review
+* request approved
+* request denied
+* risk summary
+* authorization summary
+
+`APPROVAL` panels should be compact. They should not overwhelm the transcript.
+
+### WORKING
+
+Working state is **not** a framed panel.
+
+Do not render:
+
+```text
+    ┌───────────────────────────────────────────────────────────────────────────────────┐
+    │ ▾  WORKING                                             ● RUNNING     00:06:00s  │
+    ├───────────────────────────────────────────────────────────────────────────────────┤
+    │    esc to interrupt                                                               │
+    └───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Working state is an inline status readout.
+
+Recommended shape:
+
+```text
+  ⠋  1m 27s  •  esc to interrupt  •  ↑177k  ↓5.7k
+```
+
+The word `Working` is optional and usually redundant. The spinner itself communicates activity.
+
+Spinner frames:
+
+```text
+⠋
+⠙
+⠹
+⠸
+⠼
+⠴
+⠦
+⠧
+⠇
+⠏
+```
+
+Rules:
+
+* Render the working indicator inline, not boxed.
+* Align it with transcript flow.
+* Use the spinner as the activity signal.
+* Include elapsed time.
+* Include interrupt hint.
+* Include token/IO telemetry if available.
+* Keep it to one line.
+* Do not duplicate this information in a bottom status bar.
+
+## Composer / Editor
+
+The composer is a large bordered multiline editor at the bottom of the pane.
+
+It aligns with tool panels.
+
+Canonical structure:
+
+```text
+    ┌──────────────────────────────────────────────────────────────────────────────────┐
+    │                                                                                  │
+    │  Give iris a task...                                                             │
+    │                                                                                  │
+    │ ↵ to send  •  shift+↵ for new line  •  / for commands                            │
+    └──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Composer rules
+
+* Always bordered.
+* Always multiline.
+* Taller than one row.
+* Indented to align with tool panels.
+* No separate bottom status bar.
+* Placeholder text inside editor.
+* Hints inside editor.
+* Hints are subtle and dim.
+* Editor should not look like a chat bubble.
+* Editor should feel like an input instrument.
+
+### Placeholder text
+
+Use product-specific language:
+
+```text
+Give iris a task...
+```
+
+Avoid generic assistant language:
+
+```text
+Ask the agent anything...
+```
+
+### Hint row
+
+Use concise inline hints:
+
+```text
+↵ to send  •  shift+↵ for new line  •  / for commands
+```
+
+Do not move these hints into a separate bottom bar.
+
+### Composer height
+
+Default composer height should be at least 4 rows including borders.
+
+Suggested minimum:
+
+```text
+top border
+blank/input row
+blank row
+hint row
+bottom border
+```
+
+The composer may grow with input up to a maximum height, but should not dominate the pane.
+
+## Status Bars
+
+### Bottom status bar
+
+Do not render a bottom telemetry/status bar in the pane.
+
+Remove information such as:
+
+```text
+RUN auto
+QUEUE
+TOOLS
+CPU
+MEM
+NET
+? help
+q quit
+```
+
+This information was visually noisy and not relevant to the current pane direction.
+
+If global runtime metadata is needed, place it in a compact top status line outside the transcript pane or expose it through a command/help overlay.
+
+### Top status line
+
+A compact top status line may exist elsewhere in the product. It should not be duplicated inside the pane.
+
+If present, it should be minimal and global:
+
+```text
+● active  ┊  mode code  ┊  approval auto  ┊  branch main
+```
+
+But the pane design must not depend on it.
+
+## Spacing Rules
+
+### Between tool panels
+
+Use one blank line between adjacent panels.
+
+```text
+    ┌────
+    └────
+
+    ┌────
+    └────
+```
+
+### Between panels and messages
+
+Use one blank line before natural-language transcript text following a tool panel.
+
+```text
+    └───────────────────────────────────────────────────────────────────────────────────┘
+
+  ●   Done; I listed the available tools...
+```
+
+### Between message turns
+
+Use one blank line between distinct turns or paragraphs.
+
+```text
+  ●   Assistant message.
+
+      User response.
+
+  ●   Assistant response.
+```
+
+### Inside panels
+
+Use compact padding.
+
+Body lines start with four spaces inside the panel by default:
+
+```text
+│    body text
+```
+
+For shell command output, command/output indentation may use:
+
+```text
+│    $ command
+│      output
+```
+
+Do not add excessive blank lines inside tool panels unless they reflect meaningful command output.
+
+## Width and Wrapping
+
+### Width
+
+The pane should render within the available terminal width.
+
+Tool panels and composer should share the same width.
+
+Panel width should be calculated after applying the pane indentation.
+
+### Wrapping
+
+All text must wrap safely.
+
+Rules:
+
+* Never overflow panel borders.
+* Never break border invariants.
+* Wrapped natural-language lines align to the transcript text column.
+* Wrapped panel body lines align to the panel body text column.
+* Wrapped command lines follow shell-specific wrapping rules.
+* Long paths may be shortened only when safe and unambiguous.
+
+### Borders
+
+Every bordered component must obey strict row invariants.
+
+A bordered component row is exactly one of:
+
+```text
+top border
+header row
+separator row
+body row
+bottom border
+```
+
+Never combine rows.
+
+Never produce dangling border characters.
+
+Never render content outside the frame if the content belongs to the frame.
+
+## Color and Theme
+
+The design must work in both light and dark mode.
+
+### Light mode direction
+
+Use:
+
+* off-white / light grey background
+* charcoal text
+* muted grey borders
+* subtle orange accent for active/running
+* muted green for success
+* muted red/dusty rose for errors
+* pale green/red backgrounds for edit diff rows when available
+
+### Dark mode direction
+
+Use:
+
+* deep graphite / dark grey backgrounds
+* warm grey panels
+* soft grey borders
+* off-white text
+* vivid orange accent for active/running
+* muted sage green for success/additions
+* dusty red/rose for errors/removals
+
+### Color restraint
+
+Color should be sparse.
+
+Use color for:
+
+* active dot
+* running spinner
+* state labels/dots
+* diff additions/removals
+* warnings/errors
+
+Do not color entire panels aggressively.
+
+The UI must remain understandable without color.
+
+## Interaction Model
+
+### Expand/collapse panels
+
+Use the disclosure marker in panel headers.
+
+```text
+▾ expanded
+▸ collapsed
+```
+
+Collapsed panel:
+
+```text
+    ┌───────────────────────────────────────────────────────────────────────────────────┐
+    │ ▸  EXPLORE  tmp                                          ● DONE        00:00:00s  │
+    └───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Expanded panel:
+
+```text
+    ┌───────────────────────────────────────────────────────────────────────────────────┐
+    │ ▾  EXPLORE  tmp                                          ● DONE        00:00:00s  │
+    ├───────────────────────────────────────────────────────────────────────────────────┤
+    │    List /home/someotherguy/tmp                                                    │
+    └───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Hidden long content
+
+When content is hidden or folded, use a single subtle affordance row.
+
+```text
+│      … 11 earlier lines hidden                                      ctrl+o to expand  │
+```
+
+Rules:
+
+* Use `…`, not `...`.
+* Show hidden count.
+* Right-align the expansion hint if possible.
+* Keep it inside the relevant panel.
+* Do not leak raw hidden content after the panel.
+
+### Working indicator
+
+The working indicator is not expandable and not framed.
+
+It is a live line in the transcript flow.
+
+```text
+  ⠋  1m 27s  •  esc to interrupt  •  ↑177k  ↓5.7k
+```
+
+## Event-to-Render Mapping
+
+### Assistant text event
+
+Render as:
+
+```text
+  ●   assistant text
+      wrapped assistant text
+```
+
+### User text event
+
+Render as:
+
+```text
+      user text
+      wrapped user text
+```
+
+### Explore event
+
+Render as a bordered `EXPLORE` panel.
+
+Body contains read/search/list/find summaries.
+
+```text
+    ┌─
+    │ ▾  EXPLORE  scope                                     ● DONE        00:00:00s
+    ├─
+    │    Read file
+    │    Search query
+    │    List directory
+    └─
+```
+
+### Shell event
+
+Render as a bordered `SHELL` panel.
+
+Use shell-specific command/output formatting inside the panel.
+
+### Edit event
+
+Render as a bordered `EDIT` panel.
+
+Use a diff table inside the body.
+
+### Approval event
+
+Render as a bordered `APPROVAL` panel.
+
+Keep content concise.
+
+### Working event
+
+Render as an inline spinner readout.
+
+Do not use a panel.
+
+### Composer
+
+Render as fixed bottom multiline editor.
+
+## Do / Don’t
+
+### Do
+
+* Use a single transcript column.
+* Use assistant `●` marker.
+* Keep natural-language messages unboxed.
+* Indent tool panels.
+* Align composer with tool panels.
+* Use hard borders only for tool panels and composer.
+* Use `EXPLORE` as the container for read/search/list/find.
+* Use `SHELL` for command execution.
+* Use `EDIT` for mutation/diff previews.
+* Use inline spinner for working state.
+* Keep all panel rows width-safe.
+* Keep the bottom of the pane clean.
+
+### Don’t
+
+* Do not render `USER` / `AGENT` labels.
+* Do not box user or assistant messages.
+* Do not create standalone `READ` panels for normal exploration.
+* Do not render a framed `WORKING` panel.
+* Do not include a bottom telemetry/status row.
+* Do not make short outputs use a totally different visual system.
+* Do not leak raw bullet output outside panels.
+* Do not append separators to header rows.
+* Do not rely on color alone.
+* Do not over-decorate with icons.
+
+## Implementation Guidance
+
+A renderer should treat the transcript as a sequence of semantic events, not as a raw text stream.
+
+Suggested high-level event model:
 
 ```rust
-Layout::vertical([
-    Constraint::Length(menu_h),
-    Constraint::Length(working_h),
-    Constraint::Length(editor_h),
-    Constraint::Length(status_h),
-])
+enum PaneEvent {
+    AssistantMessage(MessageText),
+    UserMessage(MessageText),
+    Explore(ExploreEvent),
+    Shell(ShellEvent),
+    Edit(EditEvent),
+    Approval(ApprovalEvent),
+    Working(WorkingEvent),
+}
 ```
 
-Invariants:
-
-- The editor is never starved by a tall menu.
-- Slash and command menus appear above the working indicator/editor.
-- The working indicator appears immediately above the editor during active work.
-- The statusline appears below the editor.
-
-## Implementation Checklist
-
-For any new TUI surface:
+Suggested layout model:
 
 ```rust
-assert_eq!(box_left, 2);
-assert_eq!(readable_text_left, 4);
-assert!(unboxed_rows_have_no_background);
-assert!(selected_rows_use_foreground_color_only);
-assert!(separator_rows_are_empty_and_unpadded);
-assert!(boxed_rows_paint_from_x_2_and_text_starts_at_x_4);
+struct PaneLayout {
+    outer_width: usize,
+    pane_indent: usize,
+    transcript_marker_col: usize,
+    transcript_text_col: usize,
+    panel_width: usize,
+    composer_width: usize,
+}
 ```
 
-Do not add a new padding constant unless the visual language itself changes.
+Rendering should happen in two phases:
+
+1. Convert raw tool/runtime events into semantic display events.
+2. Render display events into width-safe rows using the pane layout.
+
+Do not render directly from raw logs when the log contains structured information such as tool name, timeout, duration, exit code, approval state, file path, or search target.
+
+### Implementation constraints
+
+Keep pane rendering changes inside the Iris CLI/TUI tier. Do not move pane-specific visual policy, terminal layout, or ratatui/text rendering concerns into Nexus or Wayland. Nexus should continue to expose provider-neutral runtime events and contracts; Wayland should continue to own harness/session concerns.
+
+Prefer small in-crate renderer modules over expanding a single large TUI file. Useful seams are:
+
+* semantic pane/display events
+* pane layout calculation
+* bordered panel rendering
+* natural-language message rendering
+* composer rendering
+* snapshot/invariant test helpers
+
+Do not split into new crates for this work unless a second front-end or published runtime API justifies it. Keep module boundaries explicit, cohesive, and behavior-preserving.
+
+Preserve raw structured data until the display-event conversion step. Tool name, path, timeout, duration, exit code, approval state, diff metadata, and search target should remain machine-readable until rendering needs text rows. Avoid parsing already-rendered transcript strings to recover structure.
+
+Implement this spec incrementally. Prefer the smallest coherent slice that can be tested, such as assistant/user message shape, one panel family, working indicator, or composer geometry. Avoid broad rewrites that combine visual changes with runtime, tool execution, session storage, or provider-contract changes.
+
+## Testing Requirements
+
+Add golden/snapshot tests for:
+
+* Assistant message wrapping.
+* User message wrapping.
+* Adjacent assistant/user messages without labels.
+* Tool panel indentation.
+* Composer indentation.
+* `EXPLORE` with one body line.
+* `EXPLORE` with multiple body lines.
+* `SHELL` panel alignment.
+* `EDIT` panel border integrity.
+* Inline working indicator.
+* Absence of bottom status bar.
+* No standalone `READ` panel for exploration.
+* Equal-width panel rows.
+* Narrow terminal wrapping.
+* Wide terminal layout.
+* Collapsed panel rendering.
+* Hidden-content affordance rendering.
+
+## Final Design Rule
+
+The pane should feel like a precise transcript instrument.
+
+Plain language flows lightly.
+
+Tools become mechanical panels.
+
+The current operation is a tiny live readout.
+
+The editor is a calm input module.
+
+Nothing else gets chrome.
