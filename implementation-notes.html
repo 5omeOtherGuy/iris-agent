@@ -1,453 +1,131 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html>
 <head>
-  <meta charset="utf-8">
-  <title>Iris implementation notes</title>
+  <meta charset="utf-8" />
+  <title>Built-in ToolRenderer registry — implementation notes</title>
 </head>
 <body>
-<h1>Implementation notes</h1>
-<h2>Align arbitrary harness restrictions to pi-mono</h2>
-<p>
-  Branch <code>feat/pimono-limits</code> off <code>origin/main</code> at
-  <code>6b48611</code> (fetch succeeded, primary 0 ahead / 0 behind). Reference
-  tree <code>~/vendor/pi-mono</code> (consulted, not vendored). Only
-  decisions/discoveries not already explicit in the spec are recorded below,
-  organized by unit.
-</p>
+<h1>Built-in ToolRenderer registry — implementation notes</h1>
+<p>Non-obvious decisions and discoveries only. Organized by unit. Not a step log.</p>
 
-<h2>Verification / drift</h2>
+<h2>Base / working state</h2>
 <ul>
-  <li>All <code>&lt;read_first&gt;</code> Iris constants matched the prompt
-    snapshot when re-read (line numbers had drifted a little but the values were
-    as cited).</li>
-  <li>pi-mono path drift: the prompt cited <code>RetrySettings</code> at
-    <code>packages/coding-agent/src/config.ts#L27-L32</code>. The actual type
-    lives in <code>packages/coding-agent/src/core/settings-manager.ts</code>
-    (<code>RetrySettings</code> L27-31: <code>maxRetries</code> default 3,
-    <code>baseDelayMs</code> default 2000; consumed via
-    <code>getRetrySettings()</code> L799-803). The 60s ceiling is
-    <code>maxRetryDelayMs</code> in <code>packages/ai/src/types.ts</code>
-    (L149/L192). All other cited pi-mono files exist as referenced;
-    <code>harness/utils/truncate.ts</code> confirms
-    <code>DEFAULT_MAX_BYTES = 50 * 1024</code>.</li>
+  <li>Primary checkout was in <b>detached HEAD at <code>d1d9bce</code></b> (origin/main
+      <code>6b48611</code> +1 unmerged commit "compact tool durations, expand hint, intra-line diff
+      highlights" touching <code>panel.rs</code>/<code>transcript.rs</code>/<code>tui.rs</code>).
+      <code>git fetch</code> succeeded; <code>origin/main</code> = <code>6b48611</code>.</li>
+  <li>Built the worktree from <b><code>origin/main</code></b> per AGENTS.md:
+      <code>git worktree add ../iris-tool-renderers -b feat/tool-renderer-registry origin/main</code>.
+      So <code>panel.rs</code> in this worktree is the clean origin/main variant (336 lines, the
+      <code>tool_panel_title</code>/<code>tool_panel_meta</code>/<code>explore_*</code> taxonomy the
+      prompt cites), NOT the unmerged compact-diff variant. Line numbers in the prompt were from the
+      detached variant and drifted; worked from observed code.</li>
+  <li>Both <code>~/vendor/pi-mono</code> reference paths exist and were read.</li>
+  <li><b>Mid-task base shift &mdash; rebased onto the now-merged #170.</b> After the work was first
+      written and reviewed, <code>origin/main</code> advanced <code>6b48611 -&gt; a77c97f</code>: the
+      formerly-unmerged compact-diff commit landed as <b>#170</b> ("compact durations, ctrl+o output
+      reveal, intra-line diff highlights") plus #171. #170 rewrote the exact functions this refactor
+      touches. The two feature commits were squashed and <b>rebased onto current
+      <code>origin/main</code></b>; <code>panel.rs</code>/<code>tui.rs</code> auto-merged,
+      <code>transcript.rs</code> was reset to #170 and the registry wiring re-applied on top.</li>
+  <li><b>FoldVis integration.</b> #170 added a <code>FoldVis</code> row-tag system (<code>Always</code>
+      /<code>WhenCollapsed</code>/<code>WhenExpanded</code>): capped tool output emits a collapsed
+      preview <i>and</i> the full output so <code>ctrl+o</code> toggles between them, and the panel
+      header is marked a collapsed preview via <code>mark_panel_preview</code>. <code>PanelBody</code>
+      was made fold-aware (ports #170's <code>push_tool_output</code>/<code>_tail</code> + fold hints +
+      <code>right_align_hint</code>); <code>append_tool_panel</code> detects a foldable body (any row
+      with <code>fold != Always</code>) and calls <code>mark_panel_preview</code>, reproducing #170's
+      behavior under the registry. Durations are now compact (<code>format_elapsed_compact</code>) and
+      the hint reads <code>ctrl+o to expand</code>/<code>to collapse</code> &mdash; all inherited from
+      #170, not changed here. Byte-identity target is now #170's output, verified by its snapshot
+      tests which pass unchanged.</li>
 </ul>
 
-<h2>Unit 1 — turn cap: unbounded default, optional graceful soft cap</h2>
+<h2>Unit 1 — ToolRenderer trait + module (src/ui/tui/tool_render.rs)</h2>
 <ul>
-  <li>Removed the hardcoded <code>MAX_TOOL_ROUNDTRIPS = 50</code>. The loop in
-    <code>Agent::complete_turn</code> is now an unbounded <code>loop</code> with a
-    manual <code>roundtrip</code> counter; it ends naturally when the model emits
-    no tool calls (or on cancellation).</li>
-  <li><strong>Tradeoff / runaway guard:</strong> with no fixed cap a malfunctioning
-    model could loop indefinitely. Cancellation (Ctrl-C, the turn
-    <code>CancellationToken</code>) is the always-on runaway guard and is checked
-    at the top of every iteration, before the provider stream, and during tool
-    execution — so a runaway turn is always interruptible. This matches pi-mono's
-    <code>runLoop</code>, which has no <code>maxTurns</code>/<code>maxSteps</code>.</li>
-  <li><strong>Config shape:</strong> new <code>Settings.max_tool_roundtrips:
-    Option&lt;usize&gt;</code> (camelCase <code>maxToolRoundtrips</code>). Absent =
-    unbounded. Precedence: <em>project-overridable</em> (merged like
-    <code>contextTokenBudget</code>) because a turn cap can only narrow a run, never
-    redirect tokens. Threaded into the agent via a builder
-    <code>Agent::with_max_tool_roundtrips(Option&lt;usize&gt;)</code>, called in
-    <code>run_agent</code>/<code>resume_agent</code> right where
-    <code>context_token_budget()</code> is read.</li>
-  <li>When set and reached, the loop reuses the existing graceful Notice path
-    ("stopped after N tool round-trips; send another message to continue.") +
-    <code>TurnComplete</code> — never a fatal error.</li>
+  <li><b>Returns panel primitives, not a Component.</b> Iris has no Component/Container abstraction
+      (separate deferred task), so the trait returns Iris's existing render units:
+      <code>title -&gt; &amp;'static str</code>, <code>header_meta/plain_meta -&gt; String</code>, and
+      <code>body -&gt; Vec&lt;TranscriptRow&gt;</code> (the rows between the separator and the bottom
+      border). This mirrors pi-mono's renderCall (title/meta) + renderResult (body) split without
+      adopting its Component return type.</li>
+  <li><b>renderShell default|self.</b> Modeled as <code>ToolPanelKind { Explore, Shell, Generic }</code>.
+      Shell is the "self-framing" case (emits its own <code>$ target</code> command row + cursor);
+      Explore/Generic/Edit use the standard panel body. <code>kind()</code> drives the stateful
+      dispatch path in transcript.rs (replacing <code>is_exploration_tool</code> and
+      <code>call.name == "bash"</code> branches).</li>
+  <li><b>No rendererState object.</b> pi-mono keeps a long-lived <code>rendererState</code> per tool
+      row; Iris keeps cross-frame state (expansion, live output buffer, exploration grouping) in
+      retained transcript rows. Renderers are pure functions over
+      <code>(ctx, call, outcome)</code>. Divergence noted and intentional.</li>
+  <li><b>tool_display reused, not duplicated.</b> Renderers call
+      <code>summarize</code>/<code>run_target</code>/<code>exploration_summary</code>/<code>display_path</code>
+      from <code>src/tool_display.rs</code>. The name&rarr;renderer map in <code>resolve()</code> is the
+      single source for the TUI surface.</li>
 </ul>
 
-<h2>Unit 2 — parallel cap removed</h2>
+<h2>Unit 2 — Built-in renderers</h2>
 <ul>
-  <li>Removed <code>MAX_PARALLEL_TOOL_CALLS = 8</code>. <code>run_parallel</code>
-    now uses <code>.buffered(calls.len().max(1))</code>.</li>
-  <li><strong>Ordering approach:</strong> kept <code>buffered</code> (not
-    <code>buffer_unordered</code>) deliberately: it preserves result order, which
-    the caller relies on when it zips outcomes back onto the calls. The whole
-    parallelizable run executes concurrently (pi-mono's <code>Promise.all</code>
-    over the batch). <code>max(1)</code> guards the empty-batch case
-    (<code>buffered(0)</code> stalls); in practice <code>run_tools</code> only
-    calls this with a non-empty parallelizable run. <code>is_parallelizable</code>
-    and the sequential/exclusive path are unchanged.</li>
+  <li><b>EXPLORE is a single-row adapter, not a normal body.</b> Per oracle review: the grouped
+      EXPLORE panel stores one body-row index and replaces it in place, so EXPLORE's
+      <code>body()</code> returns exactly one TranscriptRow. The grouping/aggregate-header machinery
+      stays in transcript.rs; only meta + the summary line come from the renderer.</li>
+  <li><b>Shell Running body depends on whether output exists.</b> <code>begin_exec</code> (empty
+      stream) emits <code>$ target</code> + cursor with NO <code>(no output)</code>; the relayout path
+      (non-empty stream) emits <code>$ target</code> + output-tail + cursor. Encoded as: skip the
+      output-tail when <code>streamed.is_empty()</code>. This is the one easy place to break
+      byte-identical output.</li>
+  <li><b>One intentional micro-divergence (reviewer-facing regression risk).</b> The old code had two
+      empty-output behaviors: <code>begin_exec</code> never emitted <code>(no output)</code>, but
+      <code>relayout_active_running</code> used <code>push_tool_output_tail</code> which emits
+      <code>(no output)</code> for an empty buffer. <code>relayout</code> only runs after a chunk is
+      appended, so its buffer is non-empty in every reachable state; the unified Shell Running body is
+      therefore byte-identical for all reachable states and matches <code>begin_exec</code> exactly.
+      The only divergence is a degenerate, untested path (provider sends an <i>empty</i> first
+      <code>ToolOutputDelta</code> chunk): old code would show <code>(no output)</code> above the live
+      cursor, new code shows none. Judged better; not worth a distinguishing flag. No snapshot covers
+      it.</li>
+  <li><b>Hidden-affordance literal.</b> Kept <code>"ctrl+o toggles panel"</code> to stay
+      byte-identical with the origin/main base; the sibling detached-<code>d1d9bce</code> worktree's
+      <code>"ctrl+o to expand"</code> belongs to that unmerged commit, not this base.</li>
+  <li>Generic/Edit share one body; they differ only in title (EDIT vs TOOL). Generic Cancelled has
+      no body rows; Shell Cancelled keeps only <code>$ target</code> (+ streamed tail if any).</li>
 </ul>
 
-<h2>Unit 3 — inline-output threshold to 50 KB</h2>
+<h2>Unit 3 — Registry + dispatch / PanelBody</h2>
 <ul>
-  <li><code>MAX_INLINE_TOOL_OUTPUT_BYTES</code> 16 KiB → <code>50 * 1024</code>.
-    Preview sizes (<code>PREVIEW_HEAD_BYTES = 4K</code>,
-    <code>PREVIEW_TAIL_BYTES = 2K</code>, sum 6K) are unchanged; the compile-time
-    invariant <code>assert!(MAX_INLINE_TOOL_OUTPUT_BYTES &gt; HEAD + TAIL)</code>
-    still holds, so no preview re-sizing was needed. Reuses the existing
-    handle-offload (issue #61) — no new spill subsystem.</li>
+  <li><b>PanelBody builder.</b> The body helpers (<code>push_panel_body</code>,
+      <code>push_tool_output</code>, <code>push_tool_output_tail</code>, hidden-affordance, output-line
+      gutter) were moved into a short-lived <code>PanelBody { width, rows }</code> builder so both
+      renderers and the thin transcript wrappers use one implementation (no duplicated flood-cap
+      logic). transcript.rs methods now delegate to PanelBody.</li>
 </ul>
 
-<h2>Unit 4 — single shared, configurable retry policy</h2>
+<h2>Unit 4 — Failure isolation</h2>
 <ul>
-  <li>New <code>src/mimir/retry.rs</code> with <code>RetryPolicy</code>
-    (<code>max_retries</code>, <code>base_backoff</code>, <code>max_backoff</code>),
-    <code>Copy</code> so cloned providers carry it. It owns the single
-    <code>backoff_delay()</code> (exponential + jitter + bounded
-    <code>Retry-After</code>). Deleted the duplicated constants
-    (<code>MAX_TRANSIENT_RETRIES</code>/<code>BASE_BACKOFF</code>/<code>MAX_BACKOFF</code>)
-    and the two copies of <code>backoff_delay</code> from
-    <code>transport.rs</code> and <code>openai_codex_responses.rs</code>.</li>
-  <li><strong>Defaults adopted (pi-mono-aligned):</strong> <code>max_retries =
-    3</code>, <code>base_backoff = 2000 ms</code>, <code>max_backoff = 60 s</code>.
-    This <em>changes</em> Iris's prior values (was 500 ms base / 8 s cap) — an
-    intentional alignment. <code>Retry-After</code> honoring and jitter
-    (≤250 ms) are preserved; the pathological-hint clamp is now
-    <code>4 × max_backoff</code>.</li>
-  <li><strong>Config shape:</strong> new <code>Settings.retry:
-    Option&lt;RetrySettings&gt;</code> with <code>maxRetries</code> /
-    <code>baseDelayMs</code> / <code>maxDelayMs</code> (all optional; absent
-    subfields fall back to the defaults). <em>Global-only</em> (merged like
-    <code>promptCacheRetention</code>): retry volume affects provider load/cost,
-    so an untrusted project file must not crank it up.</li>
-  <li><strong>Divergence from pi-mono:</strong> pi-mono's <code>RetrySettings</code>
-    also has <code>enabled</code> and a per-provider <code>provider</code> override,
-    and keeps the 60 s ceiling in a separate <code>ai/types</code> field
-    (<code>maxRetryDelayMs</code>). Iris keeps one flat policy and exposes the cap
-    as <code>maxDelayMs</code> in the same object (single seam, no inert knobs).
-    No <code>enabled</code>/per-provider knobs were added (they would trigger
-    nothing today).</li>
-  <li><strong>Threading:</strong> <code>RetryPolicy</code> is resolved in
-    <code>ModelSelection::resolve</code> from <code>settings.retry_settings()</code>
-    (alongside <code>cache_retention</code>/<code>context_management</code>) and
-    carried on <code>ModelSelection.retry_policy</code>. <code>build_provider</code>
-    passes it to the Codex and Anthropic constructors; a runtime
-    <code>/model</code> switch carries the same policy. Antigravity uses
-    <code>run_with_reauth</code> (reauth-only, no transient retries) and is
-    unchanged.</li>
+  <li><b>catch_unwind at the body boundary.</b> <code>render_body</code> wraps
+      <code>renderer.body()</code> in <code>std::panic::catch_unwind(AssertUnwindSafe(..))</code> and
+      falls back to <code>GenericRenderer</code> on panic. Renderers return a freshly-built Vec, so a
+      panic discards a partial body cleanly and never corrupts <code>Transcript::rows</code> (nothing
+      shared is mutated inside the caught closure). Used <code>Result</code>-free panic catching
+      rather than a fallible trait because built-in renderers do not return errors; the seam exists
+      for the deferred extension phase where third-party renderers may panic.</li>
+  <li><b>Stderr tradeoff.</b> The default panic hook still prints a backtrace to stderr on a caught
+      panic; tests silence it with <code>set_hook</code>/<code>take_hook</code>. Did not swap the hook
+      per-render in production (racy/global); accepted as a rare-path cosmetic concern.</li>
+  <li><b>EXPLORE fallback note.</b> EXPLORE also routes through <code>render_body</code>; if its
+      renderer ever panicked the generic fallback could yield a non-single-row body, but built-in
+      EXPLORE never panics, so this only matters for the deferred extension phase.</li>
 </ul>
 
-<h2>Unit 5 — bash default timeout removed</h2>
+<h2>Deferrals (named in report)</h2>
 <ul>
-  <li>Removed <code>DEFAULT_BASH_TIMEOUT_SECS = 120</code>. One-shot and session
-    <code>run</code> now derive timeout as
-    <code>input.timeout.filter(|s| *s &gt; 0).map(Duration::from_secs)</code> —
-    unset (or <code>0</code>) means no caller time limit (pi-mono parity);
-    a positive value is the per-call limit.</li>
-  <li><strong>Kept rail:</strong> the persistent-session
-    <code>SESSION_HARD_CAP</code> (600 s) is a wedge-safety rail (a wedged shell,
-    e.g. an unterminated here-doc, still gets killed), not the arbitrary 120 s
-    default. It is unchanged; <code>render_session</code> already reports it when
-    no per-command limit is set.</li>
-  <li>The background-job <code>finalize</code> wait default (previously 120 s when
-    unset) was also removed: unset/0 now blocks until the job completes
-    (cancellation-aware), a positive value bounds the wait.</li>
-  <li>Cancellation, drain, and the temp-file save of full output are untouched.
-    DESCRIPTION/parameter strings updated ("No timeout by default").</li>
-</ul>
-
-<h2>Unit 6 — default truncation byte cap to 50 KB</h2>
-<ul>
-  <li><code>text::DEFAULT_MAX_BYTES</code> 1 MB → <code>50 * 1024</code>. This
-    propagates to read/grep/ls/find/bash <em>display</em> truncation. DESCRIPTION
-    strings and the read paging notice updated "1MB" → "50KB".</li>
-  <li><strong>Decoupling (avoids an unintended shrink):</strong>
-    <code>bash/jobs.rs DEFAULT_JOB_CAPACITY</code> previously aliased
-    <code>DEFAULT_MAX_BYTES</code>. It is a peak-memory <em>capture</em> ring
-    bound, not a display cap, so it was pinned to <code>1_000_000</code> rather
-    than following the display cap down to 50 KB. The bash one-shot
-    <code>MAX_CAPTURE_BYTES</code> (4 MiB/stream) memory rail is unchanged (only
-    its comment updated to the new 50 KiB display window).</li>
-</ul>
-
-<h2>Unit 7 — grep clamps removed</h2>
-<ul>
-  <li>Deleted <code>MAX_CONTEXT</code>, <code>MAX_GREP_LIMIT</code>,
-    <code>MAX_HEAD_LIMIT</code>, <code>MAX_OFFSET</code> and all clamping.
-    <code>positive_cap</code> lost its <code>max</code> parameter (now default +
-    reject-zero only). <code>context</code> is no longer clamped; <code>offset</code>
-    has no ceiling; an unset <code>headLimit</code> now shows every output row
-    (was implicitly capped at 500), bounded only by <code>limit</code>.</li>
-  <li>Kept <code>DEFAULT_GREP_LIMIT = 100</code> and
-    <code>GREP_MAX_LINE_LENGTH = 500</code>. DESCRIPTION/parameter strings updated
-    (dropped "capped at 1000"/"capped at 500").</li>
-  <li><strong>Accepted tradeoff (reviewer-flagged):</strong> with
-    <code>context</code>/<code>limit</code> no longer clamped, a request such as
-    <code>context=1000000</code> makes the match sink collect more context lines
-    before the final <code>truncate_head</code> (2000 lines / 50 KB) trims the
-    output. This is intentional pi-mono parity: pi-mono's grep likewise has no
-    max-context/limit clamp. Memory stays bounded by the actual file content
-    (ripgrep emits no more context than the file has, and overlapping context is
-    merged) and by <code>GREP_MAX_LINE_LENGTH = 500</code> (the real guard against
-    minified-line blowups). Re-adding a context/limit bound would reintroduce the
-    very clamp this unit removes, so it was deliberately not done.</li>
-  <li><strong>Deferral (named):</strong> <code>DEFAULT_CONTEXT</code> stays at
-    <code>2</code> (pi-mono defaults to 0). Per the spec, changing the default is
-    a behavior choice beyond removing clamps — divergence noted, not changed.</li>
-</ul>
-
-<h2>Unit 8 — ls scan hard cap removed</h2>
-<ul>
-  <li>Deleted <code>LS_SCAN_HARD_LIMIT = 20_000</code> and both its enforcement
-    sites (the <code>limit.min(cap)</code> and the per-directory scan break). The
-    listing is bounded by the requested <code>limit</code> only. Kept
-    <code>DEFAULT_LS_LIMIT = 500</code> and <code>DEFAULT_FIND_LIMIT = 1000</code>.</li>
-</ul>
-
-<h2>Tests changed / added (and why)</h2>
-<ul>
-  <li><code>nexus_tests.rs</code>: <code>tool_loop_stops_gracefully_at_roundtrip_limit</code>
-    → split into <code>tool_loop_stops_gracefully_at_configured_soft_cap</code>
-    (sets a cap via the new builder, proves the graceful Notice + exact provider
-    call count) and new <code>tool_loop_is_unbounded_by_default</code> (scripts 60
-    rounds past the old ceiling, proves no soft-cap notice). Old test depended on
-    the removed <code>MAX_TOOL_ROUNDTRIPS</code>.</li>
-  <li><code>nexus_tests.rs</code>: <code>safe_tool_parallelism_is_bounded</code> →
-    <code>safe_tool_parallelism_is_uncapped</code> (batch of 12 &gt; old cap of 8;
-    asserts the whole batch overlaps). Old test asserted the removed cap.</li>
-  <li><code>transport.rs</code> + <code>openai_codex_responses_tests.rs</code>:
-    retry-loop tests now pass <code>&amp;RetryPolicy::default()</code> and read
-    <code>max_retries</code> from it; the three duplicated
-    <code>backoff_delay_*</code> tests were removed (computation moved to
-    <code>mimir::retry::tests</code>, which adds coverage for the new defaults).</li>
-  <li><code>grep.rs</code>: <code>context_is_capped</code> →
-    <code>context_is_not_clamped</code>; <code>default_output_is_bounded_and_pageable</code>
-    → <code>explicit_head_limit_is_bounded_and_pageable</code> + new
-    <code>unset_head_limit_is_not_clamped</code>.</li>
-  <li>New config tests (<code>max_tool_roundtrips_*</code>,
-    <code>retry_settings_parse_and_default_and_are_global_only</code>), a selection
-    test (<code>resolve_builds_retry_policy_from_settings_with_defaults</code>),
-    and a bash test (<code>bash_unset_timeout_imposes_no_default_limit</code>).</li>
-  <li><strong>Test-coverage limitation:</strong> ls's removed scan hard cap
-    (20,000) is not directly unit-tested — exercising it would require a
-    pathologically large directory. The grep clamp-removal tests cover the
-    "accepts values past the old clamps" requirement; existing ls tests prove no
-    regression.</li>
-</ul>
-
-<h2>Named deferrals (out of scope, per spec)</h2>
-<ul>
-  <li><strong>Compaction engine</strong> tied to <code>context_token_budget</code>
-    (pi-mono <code>compaction.ts</code>): a separate roadmap feature, not an
-    arbitrary restriction. <code>contextTokenBudget</code> left exactly as-is.</li>
-  <li><strong>Memory-safety rails kept:</strong>
-    <code>READ_TOOL_MAX_BYTES</code> / <code>WRITE_TOOL_MAX_BYTES</code> (100 MB
-    load/write bounds) and <code>MAX_CAPTURE_BYTES</code> (4 MiB/stream peak
-    capture) are OOM rails, not arbitrary harness ceilings — unchanged. So is the
-    bash session <code>SESSION_HARD_CAP</code> (wedge-safety) and the job ring
-    capacity (peak-memory bound).</li>
-  <li><strong>grep <code>DEFAULT_CONTEXT = 2</code></strong> kept (pi-mono 0) — see
-    Unit 7.</li>
-  <li><strong>Not adopted from pi-mono:</strong> its
-    <code>AgentLoopConfig</code>/host-callback architecture, SDK retry classes,
-    <code>shell-output.ts</code> spill machinery, per-provider/<code>enabled</code>
-    retry knobs, and module structure. Behavior was reimplemented idiomatically in
-    Rust; no new dependencies.</li>
-</ul>
-<hr>
-<h2>Tier-3 TUI component abstraction</h2>
-<p>Decisions and discoveries not already explicit in the task spec. Organized by
-scope unit. Not a step log.</p>
-
-<h2>Verification of starting state</h2>
-<ul>
-  <li><code>git fetch</code> succeeded; <code>origin/main</code> at
-  <code>6b48611</code> (matches the prompt snapshot). The primary checkout was in
-  detached HEAD at <code>d1d9bce</code> (one commit ahead, owned by another
-  worktree branch), but the <code>main</code> branch == <code>origin/main</code>
-  and <code>worktree-preflight.sh</code> reported PASS. Branched
-  <code>feat/tui-component-abstraction</code> off <code>origin/main</code>.</li>
-  <li><code>~/vendor/pi-mono/packages/tui/src/tui.ts</code> present (1495 lines);
-  used as conceptual reference only.</li>
-  <li>Cited symbols/lines had drifted (Iris file <code>tui.rs</code> is the
-  module root; the renderers live in <code>src/ui/tui/{rows,pane,panel,
-  transcript,screen}.rs</code>). Worked from observed code.</li>
-</ul>
-
-<h2>Unit 1 — Component trait + cursor marker (src/ui/tui/component.rs)</h2>
-<ul>
-  <li><b>Render unit.</b> Iris's currency is <code>Vec&lt;Line&lt;'static&gt;&gt;</code>,
-  so the trait is <code>render(&amp;self, width: usize) -&gt; Vec&lt;Line&lt;'static&gt;&gt;</code>
-  (pi-mono returns <code>string[]</code>).</li>
-  <li><b>Trait kept minimal (render only).</b> pi-mono's <code>handleInput</code>
-  and <code>invalidate</code> were intentionally NOT added. Iris routes typed
-  crossterm events through the focus/overlay layer, not a stringly-typed input
-  hook; and no Iris component caches render state, so <code>invalidate</code>
-  would be a no-caller stub — forbidden by the spec's anti-stub rule. Both are
-  deferred until a real caller exists (theming/markdown cache → invalidate).</li>
-  <li><b>Cursor marker.</b> Adopted pi-mono's APC sentinel
-  (<code>CURSOR_MARKER = "\x1b_pi:c\x07"</code>) and a
-  <code>take_cursor_position</code> that locates the marker, computes
-  <code>(row, col)</code> by display width, and strips it across spans. Iris uses
-  NO hardware cursor today (the editor draws its own reversed block cursor via
-  <code>ratatui-textarea</code>), so no shipped component emits the marker. The
-  function is still genuinely wired (called by the composition root, unit 6) and
-  fully unit-tested with a marker-emitting fixture — it is the real seam the
-  deferred hardware-cursor/IME work plugs into, today a no-op strip.</li>
-</ul>
-
-<h2>Unit 2 — Container (src/ui/tui/component.rs)</h2>
-<ul>
-  <li><code>Container</code> owns <code>Vec&lt;Box&lt;dyn Component&gt;&gt;</code>
-  and composites in order. A separate borrowed <code>composite()</code> helper
-  exists so hot paths can composite <code>&amp;dyn Component</code> without
-  boxing (the transcript renders up to <code>MAX_TRANSCRIPT_ROWS</code> rows per
-  frame).</li>
-</ul>
-
-<h2>Unit 3 — Transcript rows migration (rows.rs, pane.rs, transcript.rs)</h2>
-<ul>
-  <li><code>TranscriptRow::render(width, out)</code> renamed to the inherent
-  <code>render_rows</code> (append-based); the <code>Component</code> impl's
-  <code>render_into</code> override calls it (no per-row <code>Vec</code>) and
-  <code>render</code> wraps it.</li>
-  <li><code>Transcript::render</code> now selects the visible fold-tagged rows
-  (collapsed panels show the capped preview, expanded panels show the full body) into a
-  <code>Vec&lt;&amp;dyn Component&gt;</code> and calls <code>composite</code>.
-  The in-flight stream became <code>pane::streaming_assistant_rows</code>
-  (returns transient <code>TranscriptRow</code>s) so it joins the same borrowed
-  composite instead of rendering directly.</li>
-  <li><b>Byte-identical:</b> <code>composite</code>'s <code>extend</code> equals
-  the former <code>push</code> loop; each row's <code>render_into</code> is
-  unchanged. Proven by the existing <code>width_resize_reflows_transcript_from_state</code>
-  and <code>surface_draw_path_replays_history_from_state</code> tests.</li>
-</ul>
-
-<h2>Unit 5 — Overlay + focus (overlay.rs, screen.rs, modal.rs, tui_loop.rs)</h2>
-<ul>
-  <li><b>Docked, not floating (key divergence).</b> pi-mono overlays float and
-  composite over the base document at anchor/margin positions. Iris's modal and
-  slash palette occupy a RESERVED region above the composer (allocated by
-  <code>chrome_heights</code>); the editor shifts down. Modeling them as floating
-  would move where they render and break byte-identical output. So overlays stay
-  docked; the abstraction supplies the two pieces pi-mono couples to overlays:
-  explicit focus and a Component render path. A true floating anchor/margin
-  compositor + overlay handles (hide/show/focus/unfocus) are deferred (no Iris
-  floating UI to migrate; adding it now = abstraction with no caller). Recorded
-  in ADR-0024.</li>
-  <li><b>Explicit focus.</b> <code>FocusTarget { Editor, Palette, Modal }</code>
-  with precedence Editor &lt; Palette &lt; Modal. <code>Screen::focus()</code> is
-  the single source of truth, derived from existing modal/palette state (no new
-  duplicated flags to keep in sync). It replaced the implicit checks in
-  <code>tui_loop.rs</code>: <code>modal_open()</code> (deleted) → <code>focus()
-  == Modal</code> at the modal-phase gates; <code>palette.is_active()</code> →
-  <code>focus() == Palette</code> for the idle chord-suppression and palette-nav
-  branches. Byte-identical because in idle a modal is never open, so
-  <code>focus()==Palette ⟺ palette.is_active(input)</code>.</li>
-  <li><b>Modal + palette as Components.</b> <code>impl Component for Modal</code>
-  (clamps the <code>usize</code> width back to the <code>u16</code> the picker
-  renderers use). The palette's STATE stays in <code>slash.rs</code>;
-  <code>overlay::PaletteView</code> is its Component render face, reproducing the
-  former <code>screen::render_palette</code> rows exactly.
-  <code>render_editor_chrome</code> now picks the focused overlay
-  (<code>match screen.focus()</code>), renders it once via <code>Component</code>,
-  uses that length for menu height, and paints it through one
-  <code>overlay::render_menu_lines</code> helper.</li>
-  <li><b>Byte-identical traps handled.</b> The old code had two inset helpers
-  (<code>render_palette</code>, <code>render_plain_menu_lines</code>) with
-  IDENTICAL inner-rect math; collapsed into one. Modal render width was
-  <code>content_width(area.width)</code>, which equals the menu inner width, so
-  rendering at the inner width is unchanged. Menu height (<code>len + 2</code>,
-  <code>MAX_MENU_ROWS</code> cap) preserved by computing it from the single
-  rendered line list. <code>Paragraph</code> still does the clipping (no manual
-  truncation added).</li>
-</ul>
-
-<h2>Unit 6 — Composition root (screen.rs)</h2>
-<ul>
-  <li><code>render_document_with_chrome_tail</code> assembles transcript +
-  working block + chrome through a root <code>Container</code> of
-  <code>LinesSection</code> components (mirrors pi-mono <code>TUI extends
-  Container</code>), then calls <code>take_cursor_position</code> to strip any
-  marker before the document reaches <code>TerminalSurface</code>.</li>
-  <li><b>TerminalSurface seam:</b> untouched. The abstraction only produces the
-  final <code>Vec&lt;Line&gt;</code>; diff/append/replay/resize stay in
-  <code>terminal_surface.rs</code> (existing terminal-surface tests still pass).</li>
-  <li><b>Performance (post-review):</b> the first pass wrapped the whole document
-  (incl. transcript) in cloning <code>LinesSection</code>s, an avoidable O(n)
-  full-document copy per frame. Fixed after wave-1 review: the transcript is
-  MOVED into the document as the scrolling base; only the viewport-bounded tail
-  (working indicator + chrome) is composed through the root <code>Container</code>.
-  Separately, <code>Component::render_into</code> was added so the transcript's
-  borrowed <code>composite</code> over thousands of rows allocates no per-row
-  <code>Vec</code> (matches the pre-abstraction push loop).</li>
-  <li><b>Cursor-marker scan bounded.</b> <code>take_cursor_position</code> runs on
-  the volatile tail only (the cursor only ever lives in the composer chrome), not
-  the full document.</li>
-  <li><b>Focus allocation.</b> <code>Screen::focus_for(&amp;input)</code> lets the
-  hot callers (idle key handler, chrome render) reuse their existing editor-text
-  snapshot instead of re-joining the buffer; <code>focus()</code> remains for the
-  non-hot modal-phase gates.</li>
-</ul>
-
-<h2>Unit 4 — Tool panels: DEFERRED (named follow-up)</h2>
-<ul>
-  <li>After unit 3, tool panels already render through the row-level
-  <code>Component</code> path: every panel is a flat sequence of
-  <code>TranscriptRow</code>s carrying <code>ChromeRow</code> chrome, and
-  <code>TranscriptRow: Component</code>.</li>
-  <li>Grouping those flat rows into a standalone <code>Panel</code> component
-  would require reworking the in-place panel machinery
-  (<code>panel_end_from</code>, <code>replace_active_exec_panel</code> /
-  <code>replace_active_tool_panel</code>, the splice-based live-exec/tool
-  finalize, trim-safety, and the collapse filter in <code>Transcript::render</code>).
-  That is high regression risk and not safely byte-identical within this session,
-  so it is deferred. The spec explicitly permits deferring units 3/4/5; units 1–2
-  plus two real migrations (3 and 5) landed.</li>
-</ul>
-
-<h2>Other deferrals (out of scope here)</h2>
-<ul>
-  <li><b>Text fallback UI (<code>src/ui/text.rs</code>):</b> left on its current
-  path. It is a line-printer over stdout (no <code>Screen</code>, no
-  <code>TerminalSurface</code>, no <code>Line</code> composition), so it is not a
-  component-rendered surface; migrating it would add an abstraction with nothing
-  to composite.</li>
-  <li><b>pi-mono component catalog Iris lacks</b> (image/kitty-iterm graphics,
-  autocomplete, kill-ring, undo-stack, configurable keybindings, theming) and a
-  second terminal-diff engine: out of scope; separate roadmap items.</li>
-  <li><b>Floating overlay compositor + overlay handles + multiple overlays +
-  hardware cursor:</b> deferred (no current floating UI / no hardware cursor in
-  Iris). The <code>CURSOR_MARKER</code> seam is in place for the cursor part.</li>
-</ul>
-
-<h2>Trait shape decision (raised in review)</h2>
-<p>Reviewers asked whether <code>render_into</code> should be the required method
-and <code>render</code> the provided one (efficient-by-default). Kept
-<code>render</code> required + <code>render_into</code> provided/overridable: the
-only hot component is <code>TranscriptRow</code> (which overrides
-<code>render_into</code>); <code>Modal</code>, <code>PaletteView</code>,
-<code>LinesSection</code>, and <code>Container</code> naturally produce owned
-lines, so requiring <code>render_into</code> would add append-style boilerplate
-for owned data with no efficiency gain. The current shape achieves zero per-row
-allocation on the hot path without churning the cold components.</p>
-
-<h2>Cursor-marker / wrapping constraint (forward seam)</h2>
-<p><code>take_cursor_position</code> runs on already-rendered (post-wrap) lines and
-uses <code>display_width</code>. Note that <code>wrap.rs::char_width</code>
-clamps every char to width &ge; 1, so the multi-byte <code>CURSOR_MARKER</code>
-must NOT pass through wrapping as part of real text or it would be miscounted and
-force premature wraps. No component emits the marker today, so this is latent;
-the constraint for the deferred hardware-cursor work is: emitters place the
-marker in its own span and the composition root strips it before any width/wrap
-computation (which it already does, bounded to the volatile tail).
-<code>wrap.rs</code> is intentionally left unchanged to preserve byte-identical
-wrapping of existing content.</p>
-
-<h2>ADR-0006 tension and resolution</h2>
-<p>ADR-0006 says build Iris-native, sized to Iris, do not import app-scale
-architecture; Ratatui = primitives; Iris owns the terminal surface. This change
-stays inside that: the abstraction is small (two files), reuses
-<code>TerminalSurface</code> unchanged, adds no dependencies, vendors no
-pi-mono/Codex code, and lives entirely in Tier-3 <code>src/ui/tui/</code>. It
-amends ADR-0006 only by adding a render-abstraction layer above the surface, and
-explicitly declines the pi-mono floating-overlay/component-catalog scale.
-Recorded as ADR-0024.</p>
-
-<h2>Reviewer-facing risks</h2>
-<ul>
-  <li>Menu-region byte-identical (height math, inner-rect insets, Paragraph
-  clipping) — preserved exactly; covered by existing modal/palette tests +
-  new overlay tests.</li>
-  <li>Focus precedence drift (Editor &lt; Palette &lt; Modal; active palette must
-  still suppress global idle chords) — covered by <code>tui_loop</code> tests
-  including <code>idle_chords_yield_to_an_active_palette</code>.</li>
-  <li>Root container per-frame clone (see Unit 6 tradeoff).</li>
-  <li>Cursor: <code>TerminalSurface</code> untouched; no hardware cursor enabled
-  or moved.</li>
+  <li>Extension/custom third-party renderers + public registration API — explicit "later" phase.</li>
+  <li>General Component/Container abstraction — separate task; trait returns existing primitives.</li>
+  <li>Text fallback surface (<code>src/ui/text.rs</code>) — different surface; keeps its own
+      <code>is_exploration_tool</code>/<code>run_target</code> path. <code>is_exploration_tool</code>
+      remains in tool_display only for text.rs; the TUI no longer uses it.</li>
+  <li>Long-lived per-renderer mutable state object — not needed; state lives in transcript rows.</li>
 </ul>
 </body>
 </html>
