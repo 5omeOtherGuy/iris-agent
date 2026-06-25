@@ -97,20 +97,33 @@ Applied fixes:</p>
       model/context changes, so the working indicator can't briefly show a prior
       model's IO. Verified the model-switch test still passes (it keeps the same model).</li>
 </ul>
+<h2>Follow-up changes (post-merge of #164)</h2>
+<ul>
+  <li><strong>Fix #1 — case-insensitive model compare (done).</strong>
+      <code>set_footer_with_context</code> now compares the model id and context label
+      with <code>eq_ignore_ascii_case</code> (via <code>label_eq_ignore_case</code>) so a
+      differently-cased model id from a future caller does not needlessly reset the
+      persisted context meter. Tested by
+      <code>context_meter_persists_across_case_insensitive_model_refresh</code>.</li>
+  <li><strong>Fix #2 — input_tokens vs total_tokens: investigated, NOT changed (with
+      evidence).</strong> The meter intentionally uses <code>total_tokens</code>. The
+      harness auto-compaction trigger (<code>wayland::maybe_auto_compact</code>) compares
+      the budget against <code>context_tokens(messages)</code> = the sum of <em>all</em>
+      message token estimates (the full conversation, user + assistant). That equals
+      <code>input + output</code> ≈ <code>total_tokens</code>. Using
+      <code>input_tokens</code> alone would omit the latest assistant response and make
+      the meter <em>under</em>-report relative to when compaction actually fires.
+      <code>total_tokens</code> keeps the meter aligned with the real compaction
+      threshold, so switching to <code>input_tokens</code> would be a regression. Added a
+      code comment at the meter-update site documenting this rationale.</li>
+</ul>
+
 <p>Considered and deferred / not actioned (with rationale):</p>
 <ul>
   <li><strong>Extract a <code>chrome.rs</code> module</strong> (reviewer: medium).
       <code>screen.rs</code> is ~1.2k lines, but it was already that size from the
       concurrent #163 refactor; splitting is a separate cohesion refactor outside this
       task's scope. Deferred as a follow-up to keep this change focused.</li>
-  <li><strong>Meter uses <code>total_tokens</code> (input+output), not
-      <code>input_tokens</code>.</strong> Verified the provider contract: for the
-      stateless Codex/Anthropic lanes <code>input_tokens</code> is the full cumulative
-      prompt, so <code>total_tokens</code> is a sound, slightly-conservative proxy for
-      window fullness. Kept as-is (tested); switching to <code>input_tokens</code> is a
-      possible future refinement.</li>
-  <li><strong>Case-sensitive model comparison</strong> in the meter-reset check: all
-      live callers pass the bare lowercase model id, so this cannot misfire today.</li>
   <li><strong>Ultra-narrow degradation:</strong> below the minimum content width the top
       border returns <code>None</code> and the plain <code>Block</code> border is kept
       (status hidden, frame intact). This is intentional graceful degradation, covered

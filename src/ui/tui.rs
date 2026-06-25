@@ -1293,6 +1293,50 @@ mod tests {
     }
 
     #[test]
+    fn context_meter_persists_across_case_insensitive_model_refresh() {
+        let mut screen = Screen::new();
+        // Use set_footer_with_context directly so the (case-sensitive) catalog
+        // lookup does not change the context label between refreshes.
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            None,
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 150_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 150_000,
+                cache_creation: None,
+            }),
+        });
+        let before = composer_top_border(&screen, 110)
+            .map(|l| line_text(&l))
+            .expect("top");
+        assert!(before.contains("CTX 300K ●●●●●○○○○○"), "{before:?}");
+
+        // A refresh with a differently-cased same model id must NOT reset the meter.
+        screen.set_footer_with_context(
+            "GPT-5.5".to_string(),
+            None,
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+        let after = composer_top_border(&screen, 110)
+            .map(|l| line_text(&l))
+            .expect("top");
+        assert!(after.contains("CTX 300K ●●●●●○○○○○"), "{after:?}");
+    }
+
+    #[test]
     fn workspace_label_truncates_cwd_preserving_project_and_branch() {
         let mut screen = Screen::new();
         screen.set_footer(
