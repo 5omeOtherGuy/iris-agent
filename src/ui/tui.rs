@@ -43,6 +43,7 @@ mod panel;
 mod rows;
 mod screen;
 mod text;
+mod tool_render;
 mod transcript;
 mod wrap;
 

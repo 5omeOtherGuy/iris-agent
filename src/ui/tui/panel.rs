@@ -6,9 +6,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 
-use crate::nexus::ToolCall;
-use crate::tool_display::{display_path, exploration_summary, summarize};
-
 use super::rows::{ChromeRow, TranscriptRow, hrule_line};
 use super::text::strip_ansi_for_text;
 use super::wrap::{
@@ -170,37 +167,6 @@ pub(super) fn apply_width_bg(line: &mut Line<'static>, bg: Color, width: usize) 
             Style::default().bg(bg),
         ));
     }
-}
-
-pub(super) fn tool_panel_title(call: &ToolCall) -> &'static str {
-    match call.name.as_str() {
-        "read" | "grep" | "find" | "ls" => "EXPLORE",
-        "write" | "edit" => "EDIT",
-        _ => "TOOL",
-    }
-}
-
-fn tool_path_arg(call: &ToolCall) -> Option<&str> {
-    call.arguments
-        .get("file_path")
-        .or_else(|| call.arguments.get("path"))
-        .and_then(|value| value.as_str())
-}
-
-pub(super) fn tool_panel_meta(call: &ToolCall) -> String {
-    tool_path_arg(call)
-        .map(display_path)
-        .unwrap_or_else(|| summarize(call))
-}
-
-pub(super) fn explore_panel_meta(call: &ToolCall) -> String {
-    tool_path_arg(call)
-        .map(display_path)
-        .unwrap_or_else(|| "workspace".to_string())
-}
-
-pub(super) fn explore_body(call: &ToolCall) -> String {
-    exploration_summary(call)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

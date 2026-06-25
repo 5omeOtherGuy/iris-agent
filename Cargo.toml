@@ -49,6 +49,13 @@ ratatui-textarea = { version = "0.9", default-features = false }
 # unicode-width is the canonical implementation (already in the tree via
 # ratatui); used instead of counting chars, which is wrong for CJK/emoji.
 unicode-width = "0.2"
+# Grapheme-cluster segmentation for the unified text engine (src/ui/textengine.rs).
+# The Rust stdlib has no grapheme iterator, and unicode-width alone cannot keep
+# emoji ZWJ/VS16/flag clusters intact across wrap/truncate boundaries (it only
+# measures width once the whole cluster is known). unicode-segmentation is the
+# canonical UAX#29 implementation and is already in the build graph transitively
+# via ratatui-core, so this is a direct-dep promotion, not a new crate.
+unicode-segmentation = "1"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

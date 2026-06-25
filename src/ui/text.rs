@@ -46,46 +46,52 @@ fn sgr(ansi: bool, code: &str, text: &str) -> String {
     }
 }
 
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::new();
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
+// Width/strip are delegated to the unified text engine. The previous local
+// `visible_width` used `chars().count()`, which miscounts CJK/emoji (a wide
+// glyph is 2 columns but 1 char); the frame in `write_frame` is built from
+// `visible_width`, so that bug produced misaligned right borders and a frame
+// that overflowed for non-ASCII content. `crate::ui::textengine::visible_width`
+// measures display columns over grapheme clusters after stripping ANSI, fixing
+// the alignment. The local strippers were also removed in favor of the engine's
+// single ANSI/OSC/APC parser.
+use unicode_segmentation::UnicodeSegmentation;
 
-fn visible_width(input: &str) -> usize {
-    strip_ansi(input).chars().count()
-}
+use crate::ui::textengine::{cluster_width, strip_ansi, truncate_to_width, visible_width};
 
+/// Truncate to at most `max` display columns after stripping ANSI, on a
+/// grapheme-cluster boundary. The whole frame path measures by display column
+/// (fits-check, hard-wrap, and padding), so the title is column-bounded too;
+/// for ASCII this is identical to the previous char-count truncation.
 fn truncate_plain(input: &str, max: usize) -> String {
-    strip_ansi(input).chars().take(max).collect()
+    truncate_to_width(&strip_ansi(input), max)
 }
 
+/// Hard-wrap a frame body line to `width` display columns. If it already fits,
+/// the original (ANSI included) is returned so colored diff lines keep their
+/// color; otherwise ANSI is stripped and the line is hard-wrapped at grapheme
+/// boundaries by display width. Wrapping by columns (not cluster count) keeps
+/// the fixed-width frame aligned for CJK/emoji content while staying
+/// byte-identical for ASCII (one cluster == one column).
 fn wrap_plain(input: &str, width: usize) -> Vec<String> {
-    if visible_width(input) <= width.max(1) {
+    let width = width.max(1);
+    if visible_width(input) <= width {
         return vec![input.to_string()];
     }
-    let input = strip_ansi(input);
-    if input.is_empty() {
+    let stripped = strip_ansi(input);
+    if stripped.is_empty() {
         return vec![String::new()];
     }
     let mut rows = Vec::new();
     let mut current = String::new();
-    for ch in input.chars() {
-        if current.chars().count() >= width.max(1) {
+    let mut used = 0usize;
+    for cluster in stripped.graphemes(true) {
+        let w = cluster_width(cluster).max(1);
+        if used + w > width && used > 0 {
             rows.push(std::mem::take(&mut current));
+            used = 0;
         }
-        current.push(ch);
+        current.push_str(cluster);
+        used += w;
     }
     rows.push(current);
     rows
@@ -174,7 +180,9 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
         const WIDTH: usize = 96;
         let title = truncate_plain(title, WIDTH.saturating_sub(4));
         let title_cell = format!(" {title} ");
-        let top_fill = WIDTH.saturating_sub(2 + title_cell.chars().count());
+        // Display columns, not char count, so a CJK/emoji title does not
+        // overflow the fixed-width top border (ASCII is unchanged).
+        let top_fill = WIDTH.saturating_sub(2 + visible_width(&title_cell));
         writeln!(
             self.out,
             "{}{}{}",
@@ -765,6 +773,29 @@ mod tests {
         let mut ui = TextUi::new("first\\\nsecond\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(ui.next_prompt()?.as_deref(), Some("first\nsecond\n"));
         Ok(())
+    }
+
+    #[test]
+    fn frame_helpers_measure_cjk_by_display_column() {
+        // The frame width-bug fix: a 2-column CJK glyph counts as 2 columns, and
+        // the body hard-wrap keeps every row within the field width (so the
+        // fixed-width frame border stays aligned for non-ASCII content).
+        assert_eq!(visible_width("\u{4e2d}\u{6587}"), 4);
+        let rows = wrap_plain("\u{4e2d}\u{6587}\u{5b57}\u{6570}", 4);
+        assert!(rows.len() > 1, "CJK line should wrap: {rows:?}");
+        for row in &rows {
+            assert!(visible_width(row) <= 4, "row overran field width: {row:?}");
+        }
+        // ASCII parity: a line that fits is returned unchanged (color preserved).
+        assert_eq!(
+            wrap_plain("\x1b[32mhi\x1b[0m", 8),
+            vec!["\x1b[32mhi\x1b[0m"]
+        );
+        // Title truncation is column-bounded.
+        assert_eq!(
+            visible_width(&truncate_plain("\u{4e2d}\u{6587}\u{5b57}", 4)),
+            4
+        );
     }
 
     #[test]

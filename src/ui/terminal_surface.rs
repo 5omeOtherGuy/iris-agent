@@ -10,7 +10,8 @@ use std::io::{self, Write};
 use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::ui::textengine::clip_to_width;
 
 const BEGIN_SYNC: &str = "\x1b[?2026h";
 const END_SYNC: &str = "\x1b[?2026l";
@@ -498,24 +499,6 @@ fn render_line(line: &Line<'static>, max_width: usize) -> io::Result<String> {
     Ok(out)
 }
 
-fn clip_to_width(content: &str, remaining: usize) -> (String, usize) {
-    let full_width = UnicodeWidthStr::width(content);
-    if full_width <= remaining {
-        return (content.to_string(), full_width);
-    }
-    let mut out = String::new();
-    let mut width = 0usize;
-    for ch in content.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > remaining {
-            break;
-        }
-        out.push(ch);
-        width += ch_width;
-    }
-    (out, width)
-}
-
 fn style_sgr(style: Style) -> String {
     let mut codes: Vec<String> = Vec::new();
     if let Some(fg) = style.fg {
@@ -937,6 +920,22 @@ mod tests {
         assert!(!plain.contains("abcdef"), "{plain:?}");
         // Styles are always closed with a trailing reset even when clipped.
         assert!(output(&surface).contains("\x1b[0m"));
+        Ok(())
+    }
+
+    #[test]
+    fn wide_glyph_line_clips_on_cluster_boundary_without_overrun() -> io::Result<()> {
+        // Routed through the unified text engine's clip_to_width. A CJK glyph is
+        // two columns; clipping to width 5 keeps two full glyphs (4 cols) and
+        // never splits one across the terminal edge.
+        let mut surface = TerminalSurface::new(Vec::new());
+        surface.render(size(5, 3), &[Line::from("\u{4e2d}\u{6587}\u{5b57}")])?;
+        let plain = strip_ansi(&output(&surface));
+        assert!(plain.contains("\u{4e2d}\u{6587}"), "{plain:?}");
+        assert!(
+            !plain.contains("\u{5b57}"),
+            "third glyph should be clipped: {plain:?}"
+        );
         Ok(())
     }
 
