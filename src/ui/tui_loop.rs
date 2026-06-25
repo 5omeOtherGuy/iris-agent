@@ -42,7 +42,7 @@ use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLogin
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
 use crate::ui::slash::{self, SlashAction, SlashCommand};
-use crate::ui::tui::{Screen, TuiUi};
+use crate::ui::tui::{FocusTarget, Screen, TuiUi};
 use crate::wayland::Harness;
 
 /// Spinner cadence. Input redraws are immediate (channel-driven), so this paces
@@ -195,7 +195,7 @@ async fn session_loop<P: ChatProvider>(
         // A command/keybinding may have opened a picker/dialog. Run it to
         // completion here, where harness + switch are in scope; switches land at
         // this same inter-turn boundary.
-        if tui.screen.modal_open() {
+        if tui.screen.focus() == FocusTarget::Modal {
             run_modal_phase(
                 harness,
                 tui,
@@ -488,7 +488,7 @@ async fn run_modal_phase<P: ChatProvider>(
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
 ) -> Result<()> {
-    while tui.screen.modal_open() {
+    while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
             maybe = input_rx.recv() => {
                 let Some(event) = maybe else {
@@ -847,10 +847,15 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let input = screen.editor_text();
 
+    // Explicit focus routing (Editor < Palette < Modal). Modals run in their own
+    // phase, so idle focus is only ever Editor or Palette here. Reuse the input
+    // snapshot already computed above instead of re-joining the editor buffer.
+    let focus = screen.focus_for(&input);
+
     // Global picker chords work regardless of editor contents (but not while the
     // slash palette is steering Up/Down/Enter): Ctrl+L opens the model picker,
     // Ctrl+P / Shift+Ctrl+P cycle models, Shift+Tab cycles effort.
-    if !screen.palette.is_active(&input) {
+    if focus != FocusTarget::Palette {
         match key.code {
             KeyCode::Char('l') | KeyCode::Char('L') if ctrl => {
                 return IdleKey::OpenModelPicker;
@@ -868,7 +873,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     }
 
     // Palette navigation takes priority while it is open with matches.
-    if screen.palette.is_active(&input) {
+    if focus == FocusTarget::Palette {
         match key.code {
             KeyCode::Up => {
                 screen.palette.up();
@@ -1186,12 +1191,20 @@ mod tests {
     #[test]
     fn ctrl_o_toggles_latest_panel_when_idle() {
         let mut screen = Screen::new();
+        // Long output caps to a preview, so the panel is foldable and ctrl+o
+        // reveals it.
+        let content = (0..20)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         screen.apply(UiEvent::ToolResult {
             call: call(),
-            content: "hi".to_string(),
+            content,
             exit_code: None,
             duration: None,
         });
+        // Capped output starts collapsed (preview).
+        assert!(screen.latest_panel_collapsed());
 
         assert!(matches!(
             handle_idle_event(
@@ -1200,7 +1213,8 @@ mod tests {
             ),
             IdleKey::Continue
         ));
-        assert!(screen.latest_panel_collapsed());
+        // ctrl+o reveals the full output.
+        assert!(!screen.latest_panel_collapsed());
     }
 
     #[test]

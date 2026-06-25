@@ -161,6 +161,7 @@ mod tests {
             reasoning,
             cache_retention: PromptCacheRetention::Short,
             context_management: ContextManagement::default(),
+            retry_policy: crate::mimir::retry::RetryPolicy::default(),
         }
     }
 
@@ -215,6 +216,7 @@ mod tests {
                 reasoning: Some(ReasoningEffort::XHigh),
                 cache_retention: PromptCacheRetention::Short,
                 context_management: ContextManagement::default(),
+                retry_policy: crate::mimir::retry::RetryPolicy::default(),
             };
             assert!(validate(&sel).is_ok(), "{model} should accept xhigh");
             assert_eq!(

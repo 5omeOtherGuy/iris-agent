@@ -125,7 +125,8 @@ fn run_agent() -> Result<()> {
     mimir::model_capabilities::validate(&selection)?;
     let session_id = session::new_session_id();
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
-    let agent = Agent::new(provider, tools);
+    let agent =
+        Agent::new(provider, tools).with_max_tool_roundtrips(settings.max_tool_roundtrips());
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
     let session = match session::SessionLog::create_with_id(&cwd, &session_id) {
@@ -195,7 +196,8 @@ fn resume_agent(session_id: &str) -> Result<()> {
     mimir::model_capabilities::validate(&selection)?;
     let session_id = meta.id.clone();
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
-    let agent = Agent::resumed(provider, tools, stored.messages);
+    let agent = Agent::resumed(provider, tools, stored.messages)
+        .with_max_tool_roundtrips(settings.max_tool_roundtrips());
 
     // Reopen the same transcript for append so continued turns extend it rather
     // than starting a new file. Best-effort, like new-session persistence: if
@@ -295,6 +297,7 @@ fn build_provider(
                 system_prompt,
                 session_id,
                 selection.cache_retention,
+                selection.retry_policy,
             )?,
         ),
         ProviderId::Anthropic => Box::new(
@@ -305,6 +308,7 @@ fn build_provider(
                 system_prompt,
                 selection.cache_retention,
                 selection.context_management.clone(),
+                selection.retry_policy,
             )?,
         ),
         ProviderId::Antigravity => {

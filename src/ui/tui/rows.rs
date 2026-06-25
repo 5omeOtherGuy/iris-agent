@@ -3,6 +3,7 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use super::component::Component;
 use super::panel::{
     apply_width_bg, inset_rule_line, panel_body_line, panel_body_lines, panel_header_line,
     panel_rule_line,
@@ -14,6 +15,17 @@ use super::wrap::{
 };
 use super::{BOX_X_PADDING, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING, dim_style};
 
+/// Per-row visibility within a foldable tool-output panel. `Always` rows show
+/// in both states; `WhenCollapsed`/`WhenExpanded` rows show only in the
+/// preview (capped) or fully-revealed state respectively. The enclosing panel
+/// header's `expanded` flag selects which set renders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FoldVis {
+    Always,
+    WhenCollapsed,
+    WhenExpanded,
+}
+
 /// One styled logical transcript row. Most rows are plain text + style; ANSI
 /// tool output stores a parsed ratatui line so the escape styling survives.
 #[derive(Clone)]
@@ -22,6 +34,8 @@ pub(super) struct TranscriptRow {
     pub(super) style: Style,
     pub(super) continuation_prefix: Option<&'static str>,
     pub(super) line: Option<Line<'static>>,
+    /// Fold-state visibility for collapsible tool-output bodies.
+    pub(super) fold: FoldVis,
     /// Word-aware (space-breaking, URL-safe) wrap for this row's styled `line`
     /// instead of the default ANSI char-hard-wrap. Set for Markdown prose; the
     /// gutter/ANSI tool-output rows keep char-wrap so their leading-space
@@ -43,11 +57,18 @@ impl TranscriptRow {
             style,
             continuation_prefix: None,
             line: None,
+            fold: FoldVis::Always,
             word_wrap: false,
             background: None,
             hrule: false,
             chrome: None,
         }
+    }
+
+    /// Tag this row with a fold-state visibility (builder style).
+    pub(super) fn with_fold(mut self, fold: FoldVis) -> Self {
+        self.fold = fold;
+        self
     }
 
     pub(super) fn chrome(chrome: ChromeRow) -> Self {
@@ -60,6 +81,7 @@ impl TranscriptRow {
             style,
             continuation_prefix: None,
             line: None,
+            fold: FoldVis::Always,
             word_wrap: false,
             background: None,
             hrule: false,
@@ -67,7 +89,10 @@ impl TranscriptRow {
         }
     }
 
-    pub(super) fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
+    /// Push this row's physical (wrapped) lines into `out`. Shared by the
+    /// [`Component::render_into`] override; kept as an inherent method so other
+    /// `ui::tui` modules can append rows without a trait import.
+    pub(super) fn render_rows(&self, width: usize, out: &mut Vec<Line<'static>>) {
         if let Some(chrome) = &self.chrome {
             if let ChromeRow::Body { line, bg } = chrome {
                 panel_body_lines(width, line.clone(), *bg, out);
@@ -127,6 +152,20 @@ impl TranscriptRow {
                 pad_line_right(physical, BOX_X_PADDING);
             }
         }
+    }
+}
+
+impl Component for TranscriptRow {
+    fn render(&self, width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        self.render_rows(width, &mut out);
+        out
+    }
+
+    /// Append directly so the transcript's borrowed `composite` over thousands
+    /// of rows allocates no intermediate per-row `Vec`.
+    fn render_into(&self, width: usize, out: &mut Vec<Line<'static>>) {
+        self.render_rows(width, out);
     }
 }
 

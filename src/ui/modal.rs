@@ -145,6 +145,16 @@ impl Modal {
     }
 }
 
+/// The modal is a docked overlay [`Component`]: the composer chrome composites
+/// it through the same render contract as every other surface (see
+/// `ui::tui::overlay`). Width arrives as `usize` from the component path and is
+/// clamped back to the `u16` the picker renderers use.
+impl crate::ui::tui::Component for Modal {
+    fn render(&self, width: usize) -> Vec<Line<'static>> {
+        Modal::render(self, u16::try_from(width).unwrap_or(u16::MAX))
+    }
+}
+
 // --- shared rendering helpers ---
 
 fn dim() -> Style {
@@ -1406,6 +1416,22 @@ mod tests {
             }
             other => panic!("expected SetEffort, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn modal_renders_through_component_trait_with_width_clamp() {
+        use crate::ui::tui::Component;
+        let modal = Modal::Effort(EffortPicker::new(
+            vec![ReasoningEffort::Low, ReasoningEffort::High],
+            ReasoningEffort::Low,
+        ));
+        // The Component impl forwards to Modal::render after clamping usize->u16.
+        assert_eq!(Component::render(&modal, 40), Modal::render(&modal, 40));
+        // An out-of-u16-range width clamps to u16::MAX rather than overflowing.
+        assert_eq!(
+            Component::render(&modal, usize::from(u16::MAX) + 100),
+            Modal::render(&modal, u16::MAX)
+        );
     }
 
     #[test]

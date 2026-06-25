@@ -11,15 +11,12 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-// Safety valve against a runaway tool loop. Each round-trip is one model
-// response; the loop normally ends earlier when the model stops calling tools.
-// Set high so legitimate multi-step tasks complete, and enforced gracefully
-// rather than as a fatal error (see complete_turn).
-const MAX_TOOL_ROUNDTRIPS: usize = 50;
-
-// ponytail: small fixed cap. If tool batches need more throughput, make this a
-// runtime setting after measuring disk/blocking-pool pressure.
-const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+// The agent loop has no built-in fixed turn cap: it runs while the model keeps
+// emitting tool calls and ends naturally when the model stops (matching
+// pi-mono's `runLoop`, which has no maxTurns/maxSteps). Cancellation (Ctrl-C) is
+// the always-on runaway guard. An optional soft cap can be supplied via
+// `Settings` (`Agent::max_tool_roundtrips`); when set it ends the turn with a
+// graceful Notice rather than a fatal error (see complete_turn).
 
 // Oversized-tool-output policy (issue #61). A successful tool result whose text
 // exceeds this many bytes is stored out of context behind a handle and replaced
@@ -27,13 +24,13 @@ const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 // reinserted into provider context on every round-trip. Outputs at or below the
 // threshold stay inline exactly as before.
 //
-// ponytail: fixed default, ~4k tokens at 4 chars/token. Covers ordinary tool
-// output (file reads, small greps) inline and catches genuinely large logs.
-// Upgrade path = a `Settings` knob threaded through `ToolEnv` (kept a constant
-// here to avoid a config field that triggers nothing, like `contextTokenBudget`
-// already is). Bytes, not lines: context cost tracks bytes/tokens, not line
-// count.
-const MAX_INLINE_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
+// ponytail: fixed default. Matches pi-mono's 50 KB truncate threshold
+// (`harness/utils/truncate.ts` DEFAULT_MAX_BYTES). Covers ordinary tool output
+// (file reads, small greps) inline and catches genuinely large logs. Upgrade
+// path = a `Settings` knob threaded through `ToolEnv` (kept a constant here to
+// avoid a config field that triggers nothing, like `contextTokenBudget` already
+// is). Bytes, not lines: context cost tracks bytes/tokens, not line count.
+const MAX_INLINE_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
 
 // Head/tail kept in the compact preview of an offloaded output. Their sum is
 // well under MAX_INLINE_TOOL_OUTPUT_BYTES, so an offloaded result is always
@@ -513,6 +510,12 @@ pub(crate) struct Agent<P> {
     // Provider/model round-trip id sequence. Nexus owns these ids because it
     // owns the provider loop; Wayland may persist them, but never mints them.
     next_provider_turn_seq: u32,
+    // Optional graceful soft cap on tool round-trips per turn. `None` (default)
+    // = unbounded: the loop runs while the model emits tool calls, matching
+    // pi-mono. When `Some(n)`, the loop ends the turn with a Notice after `n`
+    // round-trips instead of a fatal error. Cancellation remains the always-on
+    // runaway guard regardless. Supplied by the host from `Settings`.
+    max_tool_roundtrips: Option<usize>,
 }
 
 /// Result of consuming one provider stream to its terminal event (or to a
@@ -561,7 +564,17 @@ impl<P: ChatProvider> Agent<P> {
             tools,
             session_allowed: HashSet::new(),
             next_provider_turn_seq: 0,
+            max_tool_roundtrips: None,
         }
+    }
+
+    /// Install an optional graceful soft cap on tool round-trips per turn.
+    /// `None` keeps the default unbounded loop; `Some(n)` ends the turn with a
+    /// Notice after `n` round-trips. The host threads the configured value from
+    /// `Settings` exactly like the context token budget.
+    pub(crate) fn with_max_tool_roundtrips(mut self, cap: Option<usize>) -> Self {
+        self.max_tool_roundtrips = cap;
+        self
     }
 
     /// A bare agent seeded with a prior conversation, for resuming a session.
@@ -579,6 +592,7 @@ impl<P: ChatProvider> Agent<P> {
             tools,
             session_allowed: HashSet::new(),
             next_provider_turn_seq,
+            max_tool_roundtrips: None,
         }
     }
 
@@ -629,7 +643,25 @@ impl<P: ChatProvider> Agent<P> {
         env: &ToolEnv<'_>,
         token: &CancellationToken,
     ) -> Result<()> {
-        for roundtrip in 0..MAX_TOOL_ROUNDTRIPS {
+        // Unbounded by default: the loop ends when the model stops emitting
+        // tool calls (or on cancellation). An optional configured soft cap
+        // ends the turn gracefully after that many round-trips.
+        let mut roundtrip = 0usize;
+        loop {
+            if let Some(cap) = self.max_tool_roundtrips
+                && roundtrip >= cap
+            {
+                tracing::warn!(cap, "tool round-trip soft cap reached; ending turn");
+                // Reached the configured soft cap while the model still wants
+                // to call tools. End the turn gracefully so completed tool work
+                // and conversation state are preserved and the REPL keeps
+                // running; this is a soft limit, not a provider failure.
+                obs.on_event(AgentEvent::Notice(format!(
+                    "stopped after {cap} tool round-trips; send another message to continue."
+                )))?;
+                obs.on_event(AgentEvent::TurnComplete)?;
+                return Ok(());
+            }
             if token.is_cancelled() {
                 tracing::info!(roundtrips = roundtrip, "turn interrupted by user");
                 if roundtrip == 0 {
@@ -770,21 +802,8 @@ impl<P: ChatProvider> Agent<P> {
                     }
                 }
             }
+            roundtrip += 1;
         }
-
-        tracing::warn!(
-            cap = MAX_TOOL_ROUNDTRIPS,
-            "tool round-trip cap reached; ending turn"
-        );
-        // Reached the round-trip guard while the model still wants to call
-        // tools. End the turn gracefully so completed tool work and
-        // conversation state are preserved and the REPL keeps running; this is
-        // a soft limit, not a provider failure.
-        obs.on_event(AgentEvent::Notice(format!(
-            "stopped after {MAX_TOOL_ROUNDTRIPS} tool round-trips; send another message to continue."
-        )))?;
-        obs.on_event(AgentEvent::TurnComplete)?;
-        Ok(())
     }
 
     /// Consume one provider stream to its terminal event, emitting text deltas
@@ -1084,7 +1103,13 @@ async fn run_parallel(
                 }
             }
         })
-        .buffered(MAX_PARALLEL_TOOL_CALLS)
+        // No fixed parallelism cap: every parallelizable call in the batch runs
+        // concurrently (matching pi-mono's `Promise.all` over the batch).
+        // `buffered` (not `buffer_unordered`) preserves result order, which the
+        // caller zips back onto the calls. `max(1)` guards the empty-batch case
+        // (`buffered(0)` would stall); run_tools only calls this with a
+        // non-empty parallelizable run.
+        .buffered(calls.len().max(1))
         .collect()
         .await
 }

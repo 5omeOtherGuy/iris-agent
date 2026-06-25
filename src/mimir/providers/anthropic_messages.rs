@@ -71,6 +71,7 @@ pub(crate) struct AnthropicProvider {
     context_management: ContextManagement,
     cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     tokens: AnthropicTokenStore,
+    retry_policy: crate::mimir::retry::RetryPolicy,
 }
 
 impl AnthropicProvider {
@@ -85,6 +86,7 @@ impl AnthropicProvider {
         system_prompt: &str,
         cache_retention: PromptCacheRetention,
         context_management: ContextManagement,
+        retry_policy: crate::mimir::retry::RetryPolicy,
     ) -> Result<Self> {
         context_management.validate_supported()?;
         Ok(Self {
@@ -99,6 +101,7 @@ impl AnthropicProvider {
             context_management,
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             tokens: AnthropicTokenStore::from_env()?,
+            retry_policy,
         })
     }
 }
@@ -145,6 +148,7 @@ impl ChatProvider for AnthropicProvider {
                 let mut last_token: Option<String> = None;
                 run_with_retry(
                     "anthropic",
+                    &provider.retry_policy,
                     cancel,
                     |force| {
                         let token = if force {

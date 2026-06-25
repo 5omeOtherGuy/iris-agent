@@ -206,8 +206,8 @@ Use a small, consistent symbol vocabulary. Each glyph should have one job.
 ▲   warning / approval review
 □   skipped / cancelled / neutral
 ›   assistant message
-▾   expanded
-▸   collapsed
+▾   expanded (full tool output shown)
+▸   collapsed (capped preview; hidden lines elided)
 +   added
 −   removed
 ±   modified
@@ -1022,30 +1022,44 @@ The UI must remain understandable without color.
 
 ### Expand/collapse panels
 
-Use the disclosure marker in panel headers.
+Use the disclosure marker in panel headers. `ctrl+o` toggles the latest
+foldable panel between its capped preview and its full output. Panels whose
+output already fits are not foldable: they always show in full and `ctrl+o`
+is a no-op for them.
 
 ```text
-▾ expanded
-▸ collapsed
+▸ collapsed: capped preview (head/tail slice + an elided-lines affordance)
+▾ expanded:  full output revealed
 ```
 
-Collapsed panel:
+Collapsed (capped preview) panel — header, body preview, and the expand
+affordance stay inside the panel:
 
 ```text
   ┌───────────────────────────────────────────────────────────────────────────────────────┐
-  │ ▸  EXPLORE  tmp                                              ◆ DONE        0.0s       │
-  └───────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-Expanded panel:
-
-```text
-  ┌───────────────────────────────────────────────────────────────────────────────────────┐
-  │ ▾  EXPLORE  tmp                                              ◆ DONE        0.0s       │
+  │ ▸  SHELL  seq                                               ◆ DONE        0.1s       │
   ├───────────────────────────────────────────────────────────────────────────────────────┤
-  │    List ~/project                                                        │
+  │ line 1                                                                                   │
+  │ … 12 lines hidden                                                     ctrl+o to expand   │
+  │ line 20                                                                                  │
   └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Expanded (full output) panel — every line is shown, with a collapse hint:
+
+```text
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  SHELL  seq                                               ◆ DONE        0.1s       │
+  ├───────────────────────────────────────────────────────────────────────────────────────┤
+  │ line 1                                                                                   │
+  │ …                                                                                       │
+  │ line 20                                                                                  │
+  │                                                                     ctrl+o to collapse   │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Note: collapsing no longer hides the entire body to a header-only row; the
+disclosure marker reflects capped-preview vs full-output.
 
 ### Hidden long content
 

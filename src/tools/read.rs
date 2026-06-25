@@ -11,7 +11,7 @@ use super::ObservedFiles;
 use super::path::resolve_existing;
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, READ_TOOL_MAX_BYTES};
 
-pub(super) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 1MB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
+pub(super) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -129,7 +129,7 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
         let next_offset = end + 1;
         if byte_capped {
             out.push_str(&format!(
-                "\n\n[Showing lines {}-{end} of {total_lines} (1MB limit). Use offset={next_offset} to continue.]",
+                "\n\n[Showing lines {}-{end} of {total_lines} (50KB limit). Use offset={next_offset} to continue.]",
                 start + 1
             ));
         } else {
