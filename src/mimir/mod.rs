@@ -9,4 +9,5 @@ pub(crate) mod auth;
 pub(crate) mod model_capabilities;
 pub(crate) mod model_catalog;
 pub(crate) mod providers;
+pub(crate) mod retry;
 pub(crate) mod selection;

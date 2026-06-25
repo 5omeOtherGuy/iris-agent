@@ -13,8 +13,11 @@ use rand::Rng;
 
 /// Default output cap: keep at most the first/last 2000 lines.
 pub(super) const DEFAULT_MAX_LINES: usize = 2000;
-/// Default output cap: keep at most the first/last 1MB of bytes.
-pub(super) const DEFAULT_MAX_BYTES: usize = 1_000_000; // 1MB
+/// Default output cap: keep at most the first/last 50KB of bytes. Matches
+/// pi-mono's truncate threshold (`harness/utils/truncate.ts` DEFAULT_MAX_BYTES =
+/// 50 * 1024). This bounds what read/grep/ls/find/bash render inline; genuinely
+/// large output is offloaded behind a handle by Nexus.
+pub(super) const DEFAULT_MAX_BYTES: usize = 50 * 1024; // 50KB
 /// Largest file that `read`/`edit` will load into memory.
 pub(super) const READ_TOOL_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// Largest content that `write`/`edit` will write to disk.

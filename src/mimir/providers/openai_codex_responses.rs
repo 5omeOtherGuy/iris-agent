@@ -55,10 +55,10 @@ impl TurnSink for ChannelSink {
 
 // Transport resilience for Codex requests. Transient failures (network, 429,
 // 5xx) are retried with exponential backoff plus jitter; a single auth
-// rejection (401/403) triggers one forced token refresh before retrying.
-const MAX_TRANSIENT_RETRIES: u32 = 3;
-const BASE_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_BACKOFF: Duration = Duration::from_secs(8);
+// rejection (401/403) triggers one forced token refresh before retrying. The
+// retry budget and backoff shape come from the shared
+// [`RetryPolicy`](crate::mimir::retry::RetryPolicy), the single definition for
+// every provider adapter.
 const PROVIDER_ID: &str = "openai-codex";
 const API_ID: &str = "openai-codex-responses";
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
@@ -74,6 +74,7 @@ pub(crate) struct OpenAiCodexResponsesProvider {
     cache_retention: PromptCacheRetention,
     cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     tokens: OpenAiCodexTokenStore,
+    retry_policy: crate::mimir::retry::RetryPolicy,
 }
 
 impl OpenAiCodexResponsesProvider {
@@ -90,6 +91,7 @@ impl OpenAiCodexResponsesProvider {
         system_prompt: &str,
         prompt_cache_key: &str,
         cache_retention: PromptCacheRetention,
+        retry_policy: crate::mimir::retry::RetryPolicy,
     ) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
@@ -103,6 +105,7 @@ impl OpenAiCodexResponsesProvider {
             cache_retention,
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             tokens: OpenAiCodexTokenStore::from_env()?,
+            retry_policy,
         })
     }
 }
@@ -182,6 +185,7 @@ impl OpenAiCodexResponsesProvider {
         let _guard = span.enter();
 
         run_retry_loop(
+            &self.retry_policy,
             |force_refresh| {
                 if force_refresh {
                     self.tokens.force_refresh(&self.client)
@@ -213,9 +217,10 @@ impl OpenAiCodexResponsesProvider {
 /// closures: `get_token(force_refresh)` obtains a token (cached, or forcibly
 /// refreshed after an auth rejection), `send` performs one attempt, and `sleep`
 /// applies a backoff delay. Termination is guaranteed: reauth fires at most
-/// once, transient retries are bounded by `MAX_TRANSIENT_RETRIES` and are not
+/// once, transient retries are bounded by `policy.max_retries` and are not
 /// reset by a reauth, and every other branch returns.
 fn run_retry_loop(
+    policy: &crate::mimir::retry::RetryPolicy,
     mut get_token: impl FnMut(bool) -> Result<AccessToken>,
     mut send: impl FnMut(&AccessToken) -> Attempt,
     mut sleep: impl FnMut(Duration),
@@ -254,12 +259,12 @@ fn run_retry_loop(
                 continue;
             }
             Attempt::Retry(error, retry_after) => {
-                if transient_retries >= MAX_TRANSIENT_RETRIES {
+                if transient_retries >= policy.max_retries {
                     tracing::error!(error = %format!("{error:#}"), retries = transient_retries, "codex transient error; retries exhausted");
                     return Err(error);
                 }
                 transient_retries += 1;
-                let delay = backoff_delay(transient_retries, retry_after, BASE_BACKOFF);
+                let delay = policy.backoff_delay(transient_retries, retry_after);
                 tracing::warn!(
                     error = %format!("{error:#}"),
                     attempt = transient_retries,
@@ -377,26 +382,6 @@ fn classify_http_status(status: u16) -> HttpClass {
         500..=599 => HttpClass::Retry,
         _ => HttpClass::Fatal,
     }
-}
-
-/// Compute the delay before the next transient retry.
-///
-/// Honors a server `Retry-After` hint when present (bounded against
-/// pathological values); otherwise exponential backoff from `base` doubling
-/// per retry, clamped to `MAX_BACKOFF`. Either way, up to 250ms of jitter is
-/// added so concurrent requests hitting the same rate-limit window do not
-/// retry in lockstep.
-fn backoff_delay(retry: u32, retry_after: Option<Duration>, base: Duration) -> Duration {
-    let jitter = Duration::from_millis(rand::random::<u64>() % 250);
-    if let Some(after) = retry_after {
-        return after.min(MAX_BACKOFF.saturating_mul(4)) + jitter;
-    }
-    let shift = retry.saturating_sub(1).min(10);
-    let exp = base
-        .checked_mul(1u32 << shift)
-        .unwrap_or(MAX_BACKOFF)
-        .min(MAX_BACKOFF);
-    exp + jitter
 }
 
 /// Parse an integer-seconds `Retry-After` header. The HTTP-date form is

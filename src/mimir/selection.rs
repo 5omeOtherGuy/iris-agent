@@ -315,6 +315,10 @@ pub(crate) struct ModelSelection {
     /// Anthropic-only context-management opt-in; empty/default for other
     /// providers and when unconfigured.
     pub(crate) context_management: ContextManagement,
+    /// Shared provider retry/backoff policy, resolved from settings with
+    /// pi-mono-aligned defaults. Every provider adapter uses this single
+    /// definition instead of its own retry constants.
+    pub(crate) retry_policy: crate::mimir::retry::RetryPolicy,
 }
 
 impl ModelSelection {
@@ -358,6 +362,8 @@ impl ModelSelection {
             None => ContextManagement::default(),
         };
         context_management.validate_supported()?;
+        let retry_policy =
+            crate::mimir::retry::RetryPolicy::from_settings(&settings.retry_settings());
         Ok(ModelSelection {
             provider,
             model,
@@ -365,6 +371,7 @@ impl ModelSelection {
             reasoning,
             cache_retention,
             context_management,
+            retry_policy,
         })
     }
 }
@@ -416,6 +423,8 @@ mod tests {
             prompt_cache_retention: None,
             anthropic_context_management: None,
             enabled_models: None,
+            max_tool_roundtrips: None,
+            retry: None,
         }
     }
 
@@ -469,6 +478,32 @@ mod tests {
             env::remove_var("IRIS_MODEL");
             env::remove_var("IRIS_CODEX_BASE_URL");
         }
+    }
+
+    #[test]
+    fn resolve_builds_retry_policy_from_settings_with_defaults() {
+        use crate::config::RetrySettings;
+        use crate::mimir::retry::{DEFAULT_BASE_BACKOFF, RetryPolicy};
+        use std::time::Duration;
+
+        // Unset -> the pi-mono-aligned default policy.
+        let s = settings(None, None, None, None);
+        assert_eq!(
+            ModelSelection::resolve(&s).unwrap().retry_policy,
+            RetryPolicy::default()
+        );
+
+        // Present -> resolved, with any absent subfield filled by the default.
+        let mut s = settings(None, None, None, None);
+        s.retry = Some(RetrySettings {
+            max_retries: Some(7),
+            base_delay_ms: None,
+            max_delay_ms: Some(45_000),
+        });
+        let policy = ModelSelection::resolve(&s).unwrap().retry_policy;
+        assert_eq!(policy.max_retries, 7);
+        assert_eq!(policy.base_backoff, DEFAULT_BASE_BACKOFF);
+        assert_eq!(policy.max_backoff, Duration::from_millis(45_000));
     }
 
     #[test]

@@ -15,9 +15,8 @@ use super::path::resolve_existing;
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_head};
 
 const DEFAULT_LS_LIMIT: usize = 500;
-const LS_SCAN_HARD_LIMIT: usize = 20_000;
 
-pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Set long=true to prefix each entry with a type marker (d/f/l) and human-readable size. Output is truncated to 500 entries or 1MB (whichever is hit first).";
+pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Set long=true to prefix each entry with a type marker (d/f/l) and human-readable size. Output is truncated to 500 entries or 50KB (whichever is hit first).";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -61,8 +60,9 @@ fn ls(root: &Path, input: &LsInput) -> Result<super::ToolOutput> {
     if !dir_path.is_dir() {
         bail!("not a directory: {dir}");
     }
+    // No arbitrary scan hard cap (matching pi-mono): the listing is bounded by
+    // the requested `limit` only.
     let limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT).max(1);
-    let cap = limit.min(LS_SCAN_HARD_LIMIT);
 
     // Explicit depth wins; bare `recursive` means a 2-level tree; default is flat.
     let max_depth = match (input.recursive, input.depth) {
@@ -78,7 +78,7 @@ fn ls(root: &Path, input: &LsInput) -> Result<super::ToolOutput> {
         dir,
         0,
         max_depth,
-        cap,
+        limit,
         input.long,
         &mut lines,
         &mut truncated,
@@ -143,12 +143,6 @@ fn append_dir(
     // (name, is_dir, is_symlink, size_bytes)
     let mut entries: Vec<(String, bool, bool, u64)> = Vec::new();
     for entry in read {
-        // Bound per-directory memory: stop scanning a pathologically large
-        // directory instead of reading every entry before truncating.
-        if entries.len() >= LS_SCAN_HARD_LIMIT {
-            *truncated = true;
-            break;
-        }
         let Ok(entry) = entry else { continue };
         let Ok(file_type) = entry.file_type() else {
             continue;

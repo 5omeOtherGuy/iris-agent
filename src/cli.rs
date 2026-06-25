@@ -176,6 +176,8 @@ pub(crate) fn candidate_for(
         reasoning,
         cache_retention: current.cache_retention,
         context_management: current.context_management.clone(),
+        // A runtime model switch keeps the configured retry policy.
+        retry_policy: current.retry_policy,
     }
 }
 
@@ -451,6 +453,7 @@ mod tests {
             reasoning: None,
             cache_retention: selection::PromptCacheRetention::Short,
             context_management: selection::ContextManagement::default(),
+            retry_policy: crate::mimir::retry::RetryPolicy::default(),
         }
     }
 
