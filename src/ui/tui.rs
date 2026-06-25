@@ -850,6 +850,16 @@ fn explore_body(call: &ToolCall) -> String {
     exploration_summary(call)
 }
 
+struct PanelHeaderSpec<'a> {
+    title: &'static str,
+    meta: &'a str,
+    plain_meta: &'a str,
+    running: bool,
+    failed: bool,
+    duration: Option<std::time::Duration>,
+    started: Option<Instant>,
+}
+
 /// Transcript state and width-aware rendering, separate from editor/spinner UI.
 #[derive(Default)]
 struct Transcript {
@@ -998,48 +1008,42 @@ impl Transcript {
         }
     }
 
-    fn push_panel_header(
-        &mut self,
-        title: &'static str,
-        meta: String,
-        plain_meta: &str,
-        running: bool,
-        failed: bool,
-        duration: Option<std::time::Duration>,
-        started: Option<Instant>,
-    ) {
-        let state = if running {
+    fn push_panel_header(&mut self, spec: PanelHeaderSpec<'_>) {
+        let state = if spec.running {
             " RUNNING"
-        } else if failed {
+        } else if spec.failed {
             " ERROR"
         } else {
             " DONE"
         };
-        let elapsed = if running {
-            started
+        let elapsed = if spec.running {
+            spec.started
                 .map(|started| format_panel_duration(started.elapsed()))
                 .unwrap_or_else(|| "00:00:00s".to_string())
         } else {
-            duration
+            spec.duration
                 .map(format_panel_duration)
-                .or_else(|| started.map(|started| format_panel_duration(started.elapsed())))
+                .or_else(|| {
+                    spec.started
+                        .map(|started| format_panel_duration(started.elapsed()))
+                })
                 .unwrap_or_else(|| "00:00:00s".to_string())
         };
-        let plain = if running {
-            format!("• Running {plain_meta}")
-        } else if failed {
-            format!("✗ Ran {plain_meta}")
+        let plain = if spec.running {
+            format!("• Running {}", spec.plain_meta)
+        } else if spec.failed {
+            format!("✗ Ran {}", spec.plain_meta)
         } else {
-            format!("• Ran {plain_meta}")
+            format!("• Ran {}", spec.plain_meta)
         };
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Header {
                 expanded: true,
-                title,
-                meta,
+                title: spec.title,
+                meta: spec.meta.to_string(),
                 right: vec![
-                    ("●".to_string(), status_dot_style(running, failed)),
+                    ("●".to_string(), status_dot_style(spec.running, spec.failed)),
                     (state.to_string(), panel_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
@@ -1058,15 +1062,15 @@ impl Transcript {
         started: Option<Instant>,
         target: &str,
     ) {
-        self.push_panel_header(
-            "SHELL",
-            "bash".to_string(),
-            target,
+        self.push_panel_header(PanelHeaderSpec {
+            title: "SHELL",
+            meta: "bash",
+            plain_meta: target,
             running,
             failed,
             duration,
             started,
-        );
+        });
     }
 
     fn push_shell_panel(
@@ -1104,15 +1108,15 @@ impl Transcript {
         started: Option<Instant>,
     ) {
         let meta = tool_panel_meta(call);
-        self.push_panel_header(
-            tool_panel_title(call),
-            meta.clone(),
-            &meta,
+        self.push_panel_header(PanelHeaderSpec {
+            title: tool_panel_title(call),
+            meta: &meta,
+            plain_meta: &meta,
             running,
             failed,
             duration,
             started,
-        );
+        });
     }
 
     fn push_generic_tool_panel(
