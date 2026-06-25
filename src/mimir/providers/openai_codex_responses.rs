@@ -788,6 +788,7 @@ impl ResponseStreamParser {
             tool_calls: self.tool_calls,
             response_id: self.response_id,
             usage,
+            completion_reason: None,
         })
     }
 }
@@ -842,6 +843,7 @@ fn extract_assistant_turn(value: &Value, model: &str) -> AssistantTurn {
         tool_calls,
         response_id: value.get("id").and_then(Value::as_str).map(str::to_string),
         usage: extract_openai_usage(value, model),
+        completion_reason: None,
     }
 }
 

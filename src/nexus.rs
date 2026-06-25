@@ -78,6 +78,10 @@ pub(crate) enum AgentEvent {
         turn_id: String,
         response_id: Option<String>,
         usage: Option<ProviderUsage>,
+        /// Provider-neutral reason the model turn ended, when the provider
+        /// reports one. Safe metadata: an enumerated completion classification,
+        /// never response text. `None` for providers that do not surface it.
+        completion_reason: Option<CompletionReason>,
     },
     /// One provider/model round trip was interrupted before completion.
     ProviderTurnCancelled {
@@ -676,7 +680,14 @@ impl<P: ChatProvider> Agent<P> {
                         tool_calls,
                         response_id,
                         usage,
+                        completion_reason,
                     } = turn;
+                    // Captured before `reasoning` is consumed below: drives
+                    // whether a content-less completion (e.g. a bare refusal)
+                    // needs an explanatory notice.
+                    let had_visible_content = text.as_deref().is_some_and(|t| !t.is_empty())
+                        || !tool_calls.is_empty()
+                        || !reasoning.is_empty();
                     for block in reasoning {
                         self.messages.push(
                             Message::assistant_reasoning_block(block)
@@ -700,7 +711,17 @@ impl<P: ChatProvider> Agent<P> {
                         turn_id: provider_turn_id.clone(),
                         response_id,
                         usage,
+                        completion_reason,
                     })?;
+                    // Surface notable completions (truncation, content-less
+                    // refusal) to the user. Provider-neutral: driven by the
+                    // typed completion metadata, not any provider-specific
+                    // stop-reason string.
+                    if let Some(notice) = completion_reason
+                        .and_then(|reason| completion_reason_notice(reason, had_visible_content))
+                    {
+                        obs.on_event(AgentEvent::Notice(notice.to_string()))?;
+                    }
                     if tool_calls.is_empty() {
                         tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
                         obs.on_event(AgentEvent::TurnComplete)?;
@@ -1295,13 +1316,67 @@ pub(crate) struct CacheCreation {
     pub(crate) ephemeral_1h_input_tokens: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Provider-neutral reason a model turn completed, mapped from the provider's
+/// terminal stop signal (e.g. Anthropic `message_delta.delta.stop_reason`).
+/// Carried as safe completion metadata on [`AssistantTurn`] and
+/// [`AgentEvent::ProviderTurnCompleted`]; every variant is an enumerated
+/// classification and never carries response text. Stop reasons Iris does not
+/// model yet map to `Other` (the raw wire token is logged at parse time rather
+/// than stored, keeping this a small `Copy` enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionReason {
+    /// Natural end of the assistant turn.
+    EndTurn,
+    /// The model stopped to call one or more tools.
+    ToolUse,
+    /// Output was truncated at the requested max output-token ceiling.
+    MaxOutputTokens,
+    /// The model's input context window was exceeded.
+    ContextWindowExceeded,
+    /// A configured stop sequence was emitted.
+    StopSequence,
+    /// The provider paused a long-running turn and expects continuation.
+    Paused,
+    /// The model declined to continue (safety refusal).
+    Refusal,
+    /// A stop reason Iris does not model yet. The raw enumerated wire token is
+    /// logged at parse time rather than stored.
+    Other,
+}
+
+/// Provider-neutral, user-facing notice for a completion reason the user should
+/// know about. Returns `None` for routine reasons that need no notice. Wording
+/// stays model-agnostic so it is correct for any provider; the runtime never
+/// hard-codes a provider/model name here.
+///
+/// `had_visible_content` is whether the turn produced any text, reasoning, or
+/// tool calls: a refusal that carried an explanation needs no extra notice (the
+/// user already sees why), but a content-less refusal would otherwise be silent.
+pub(crate) fn completion_reason_notice(
+    reason: CompletionReason,
+    had_visible_content: bool,
+) -> Option<&'static str> {
+    match reason {
+        CompletionReason::MaxOutputTokens => {
+            Some("The model hit its maximum output-token limit; this response may be truncated.")
+        }
+        CompletionReason::ContextWindowExceeded => {
+            Some("The model reached its context-window limit; this response may be truncated.")
+        }
+        CompletionReason::Refusal if !had_visible_content => Some("The model declined to respond."),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssistantTurn {
     pub(crate) text: Option<String>,
     pub(crate) reasoning: Vec<ReasoningBlock>,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) response_id: Option<String>,
     pub(crate) usage: Option<ProviderUsage>,
+    /// Provider-neutral completion reason, when the provider reports one.
+    pub(crate) completion_reason: Option<CompletionReason>,
 }
 
 impl AssistantTurn {
@@ -1309,10 +1384,7 @@ impl AssistantTurn {
     pub(crate) fn text(text: &str) -> Self {
         Self {
             text: Some(text.to_string()),
-            reasoning: Vec::new(),
-            tool_calls: Vec::new(),
-            response_id: None,
-            usage: None,
+            ..Self::default()
         }
     }
 }
