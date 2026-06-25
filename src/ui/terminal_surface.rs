@@ -165,7 +165,8 @@ impl<W: Write> TerminalSurface<W> {
         // viewport top downward (never the rows above it, i.e. the user's
         // scrollback) and repaint the slice that fits on screen.
         let start = if clear {
-            self.move_to_viewport_top(&mut buffer);
+            let clear_top = viewport_top(self.state.previous_lines.len(), height);
+            self.move_to_viewport_top(&mut buffer, clear_top);
             buffer.push_str(CLEAR_TO_SCREEN_END);
             viewport_top(lines.len(), height)
         } else {
@@ -186,16 +187,13 @@ impl<W: Write> TerminalSurface<W> {
         Ok(())
     }
 
-    fn move_to_viewport_top(&mut self, buffer: &mut String) {
-        let current_screen_row = self
-            .state
-            .hardware_cursor_row
-            .saturating_sub(self.state.previous_viewport_top);
+    fn move_to_viewport_top(&mut self, buffer: &mut String, viewport_top: usize) {
+        let current_screen_row = self.state.hardware_cursor_row.saturating_sub(viewport_top);
         if current_screen_row > 0 {
             buffer.push_str(&format!("\x1b[{current_screen_row}A"));
         }
         buffer.push('\r');
-        self.state.hardware_cursor_row = self.state.previous_viewport_top;
+        self.state.hardware_cursor_row = viewport_top;
     }
 
     fn write_diff_or_replay(
@@ -453,8 +451,8 @@ fn changed_range(previous: &[String], next: &[String]) -> Option<(usize, usize)>
     let mut first = None;
     let mut last = 0usize;
     for i in 0..max_len {
-        let old = previous.get(i).map(String::as_str).unwrap_or("");
-        let new = next.get(i).map(String::as_str).unwrap_or("");
+        let old = previous.get(i).map(String::as_str);
+        let new = next.get(i).map(String::as_str);
         if old != new {
             first.get_or_insert(i);
             last = i;
@@ -689,6 +687,32 @@ mod tests {
     }
 
     #[test]
+    fn trailing_blank_line_addition_is_detected_as_append() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        surface.render(size(20, 3), &[Line::from("a")])?;
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(20, 3), &[Line::from("a"), Line::from("")])?;
+
+        assert_eq!(stats.kind, RenderKind::Append);
+        assert_eq!(surface.state().previous_lines.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_blank_line_removal_is_detected_as_full_redraw() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        surface.render(size(20, 3), &[Line::from("a"), Line::from("")])?;
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(20, 3), &[Line::from("a")])?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        assert_eq!(surface.state().previous_lines.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn append_replaces_volatile_tail_before_writing_new_history() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         surface.render_with_volatile_tail(
@@ -845,6 +869,35 @@ mod tests {
         assert!(!plain.contains("line 1"), "{plain:?}");
         assert!(!plain.contains("line 3"), "{plain:?}");
         assert!(!output(&surface).contains("\x1b[2J"), "{plain:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn height_grow_full_redraw_moves_to_new_visible_top() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let doc: Vec<Line<'static>> = (1..=10).map(|n| Line::from(format!("line {n}"))).collect();
+        surface.render(size(20, 4), &doc)?;
+        assert_eq!(surface.state().previous_viewport_top, 6);
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(20, 8), &doc)?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        let raw = output(&surface);
+        assert!(
+            raw.contains("\x1b[7A"),
+            "must move to the new taller viewport top: {raw:?}"
+        );
+        assert!(
+            !raw.contains("\x1b[3A"),
+            "old stale viewport-top replay risk: {raw:?}"
+        );
+        let plain = strip_ansi(&raw);
+        let rows: Vec<&str> = plain.lines().map(|line| line.trim_matches('\r')).collect();
+        assert!(rows.contains(&"line 3"), "{plain:?}");
+        assert!(rows.contains(&"line 10"), "{plain:?}");
+        assert!(!rows.contains(&"line 1"), "{plain:?}");
+        assert_eq!(surface.state().previous_viewport_top, 2);
         Ok(())
     }
 

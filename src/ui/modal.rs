@@ -152,9 +152,7 @@ fn dim() -> Style {
 }
 
 fn accent() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(Color::Cyan)
 }
 
 fn muted() -> Style {
@@ -1151,6 +1149,32 @@ mod tests {
         assert!(!text.contains('\u{2714}'), "{text}");
         assert!(!text.contains("tab scope"), "{text}");
         assert!(!text.contains("Model Name:"), "{text}");
+    }
+
+    #[test]
+    fn selected_modal_rows_use_foreground_accent_without_bold() {
+        let picker = ModelPicker::new(
+            models(),
+            "openai-codex/gpt-5.5",
+            "openai-codex/gpt-5.5",
+            ReasoningEffort::High,
+        );
+        let selected = picker.render(80).remove(0);
+
+        assert!(
+            selected
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Cyan)),
+            "selected row should be accented: {selected:?}"
+        );
+        assert!(
+            selected
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
+            "selected row must not use bold: {selected:?}"
+        );
     }
 
     #[test]

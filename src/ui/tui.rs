@@ -39,11 +39,12 @@ use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{
     display_path, exploration_summary, is_exploration_tool, run_target, summarize,
 };
-use crate::ui::markdown::render_markdown;
 use crate::ui::modal::Modal;
 use crate::ui::slash::{self, Palette, SlashCommand};
 use crate::ui::terminal_surface::TerminalSurface;
 use crate::ui::{TurnErrorKind, UiEvent};
+
+mod pane;
 
 /// Editor box grows with content up to this many text rows, then scrolls
 /// internally (keeps the transcript from being squeezed by a huge paste).
@@ -52,7 +53,7 @@ const MAX_EDITOR_ROWS: u16 = 10;
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
 const MIN_EDITOR_H: u16 = 5;
-const RAIL_H: u16 = 1;
+const GLOBAL_STATUS_H: u16 = 1;
 
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
@@ -72,13 +73,10 @@ const MAX_STREAMING_MARKDOWN_BYTES: usize = 64 * 1024;
 /// The model still receives the full output; only the terminal preview is
 /// bounded, and the omitted logical-line count is reported.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
-const PANEL_BODY_SIDE_PADDING: usize = 2;
+const PANEL_BODY_SIDE_PADDING: usize = 1;
 const PANEL_BODY_BORDER_WIDTH: usize = 2;
 const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_BORDER_WIDTH + PANEL_BODY_SIDE_PADDING * 2;
-const ROLE_PREFIX_WIDTH: usize = 10;
 
-#[cfg(test)]
-const USER_BG: Color = Color::Rgb(16, 17, 18);
 const BORDER: Color = Color::Rgb(82, 84, 86);
 const TEXT: Color = Color::Rgb(205, 205, 199);
 const MUTED: Color = Color::Rgb(125, 126, 123);
@@ -87,8 +85,7 @@ const GREEN: Color = Color::Rgb(109, 196, 119);
 const RED: Color = Color::Rgb(221, 93, 69);
 const DIFF_ADD_BG: Color = Color::Rgb(25, 45, 31);
 const DIFF_DEL_BG: Color = Color::Rgb(55, 31, 30);
-#[cfg(test)]
-const IDLE_HINT: &str = "↵ to send  •  shift+↵ for new line  •  / for commands";
+const COMPOSER_HINT: &str = "↵ to send  •  shift+↵ for new line  •  / for commands";
 
 const X_PADDING: usize = 2;
 const BOX_X_PADDING: usize = X_PADDING;
@@ -236,7 +233,7 @@ struct TranscriptRow {
     /// prefixes are never collapsed.
     word_wrap: bool,
     /// Full-width background fill applied to every physical row this logical row
-    /// wraps to (Codex's shaded user-message cell). `None` for ordinary rows.
+    /// wraps to. `None` for ordinary rows.
     background: Option<Color>,
     /// A horizontal-rule row (Codex's turn separator). When set, `text` is the
     /// optional centered label and the row renders as `─ label ─────` to width.
@@ -251,19 +248,6 @@ impl TranscriptRow {
             style,
             continuation_prefix: None,
             line: None,
-            word_wrap: false,
-            background: None,
-            hrule: false,
-            chrome: None,
-        }
-    }
-
-    fn with_line(line: Line<'static>, continuation_prefix: Option<&'static str>) -> Self {
-        Self {
-            text: line_text(&line),
-            style: Style::default(),
-            continuation_prefix,
-            line: Some(line),
             word_wrap: false,
             background: None,
             hrule: false,
@@ -294,24 +278,6 @@ impl TranscriptRow {
                 panel_body_lines(width, line.clone(), *bg, out);
                 return;
             }
-            if let ChromeRow::Role {
-                label,
-                marker,
-                text,
-            } = chrome
-            {
-                out.extend(role_lines(width, label, marker, text));
-                return;
-            }
-            if let ChromeRow::RoleLine {
-                label,
-                marker,
-                line,
-            } = chrome
-            {
-                out.extend(role_styled_lines(width, label, marker, line));
-                return;
-            }
             out.push(chrome.render(width));
             return;
         }
@@ -331,7 +297,13 @@ impl TranscriptRow {
             .max(1);
         let start = out.len();
         match &self.line {
-            Some(line) if self.word_wrap => push_wrapped_line_wordwise(line, render_width, out),
+            Some(line) if self.word_wrap => {
+                if let Some(prefix) = self.continuation_prefix {
+                    push_wrapped_line_wordwise_with_prefix(line, render_width, prefix, out);
+                } else {
+                    push_wrapped_line_wordwise(line, render_width, out);
+                }
+            }
             Some(line) => push_wrapped_line(line, render_width, self.continuation_prefix, out),
             None => push_wrapped_row(
                 &self.text,
@@ -371,16 +343,6 @@ enum ChromeRow {
         line: Line<'static>,
         bg: Option<Color>,
     },
-    Role {
-        label: &'static str,
-        marker: Option<&'static str>,
-        text: String,
-    },
-    RoleLine {
-        label: &'static str,
-        marker: Option<&'static str>,
-        line: Line<'static>,
-    },
 }
 
 impl ChromeRow {
@@ -396,22 +358,6 @@ impl ChromeRow {
             ChromeRow::Separator => panel_rule_line(width, '├', '┤'),
             ChromeRow::Bottom => panel_rule_line(width, '└', '┘'),
             ChromeRow::Body { line, bg } => panel_body_line(width, line.clone(), *bg),
-            ChromeRow::Role {
-                label,
-                marker,
-                text,
-            } => role_lines(width, label, marker, text)
-                .into_iter()
-                .next()
-                .unwrap_or_default(),
-            ChromeRow::RoleLine {
-                label,
-                marker,
-                line,
-            } => role_styled_lines(width, label, marker, line)
-                .into_iter()
-                .next()
-                .unwrap_or_default(),
         }
     }
 }
@@ -477,13 +423,59 @@ fn panel_style() -> Style {
     Style::default().fg(TEXT)
 }
 
+fn panel_outer_padding(width: usize) -> usize {
+    if width <= BOX_X_PADDING.saturating_mul(2).saturating_add(1) {
+        0
+    } else {
+        BOX_X_PADDING
+    }
+}
+
+fn panel_width(width: usize) -> usize {
+    width
+        .saturating_sub(panel_outer_padding(width).saturating_mul(2))
+        .max(1)
+}
+
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+fn take_spans_to_width(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    for span in spans {
+        if used >= max {
+            break;
+        }
+        let content = truncate_to_width(span.content.as_ref(), max - used);
+        used += display_width(&content);
+        if !content.is_empty() {
+            out.push(Span::styled(content, span.style));
+        }
+    }
+    out
+}
+
 fn panel_rule_line(width: usize, left: char, right: char) -> Line<'static> {
-    let width = width.max(2);
-    Line::from(vec![
-        Span::styled(left.to_string(), border_style()),
-        Span::styled("─".repeat(width.saturating_sub(2)), border_style()),
-        Span::styled(right.to_string(), border_style()),
-    ])
+    let outer = panel_outer_padding(width);
+    let rule_width = panel_width(width);
+    let rule = match rule_width {
+        0 => String::new(),
+        1 => left.to_string(),
+        2 => format!("{left}{right}"),
+        n => format!("{left}{}{right}", "─".repeat(n - 2)),
+    };
+    let mut line = Line::from(vec![
+        Span::raw(" ".repeat(outer)),
+        Span::styled(rule, border_style()),
+        Span::raw(" ".repeat(outer)),
+    ]);
+    truncate_line(&mut line, width.max(1));
+    line
 }
 
 fn panel_header_line(
@@ -493,43 +485,46 @@ fn panel_header_line(
     meta: &str,
     right: &[(String, Style)],
 ) -> Line<'static> {
-    let width = width.max(2);
-    let inner_width = width.saturating_sub(2);
+    let panel_width = panel_width(width);
+    let inner_width = panel_width.saturating_sub(2);
     let arrow = if expanded { "▾" } else { "▸" };
+    let title_width = title.len().max(7);
     let mut left = vec![
         Span::styled(format!(" {arrow}  "), dim_style()),
-        Span::styled(format!("{title:<7}"), panel_style()),
+        Span::styled(format!("{title:<title_width$}"), panel_style()),
     ];
     if !meta.is_empty() {
-        left.push(Span::styled(
-            format!("  {}", truncate_to_width(meta, inner_width / 2)),
-            dim_style(),
-        ));
+        left.push(Span::styled(format!("  {meta}"), dim_style()));
     }
-    let right_width = right
+    let right_full: Vec<Span<'static>> = right
         .iter()
-        .map(|(text, _)| display_width(text))
-        .sum::<usize>();
-    let left_width = left
-        .iter()
-        .map(|span| display_width(span.content.as_ref()))
-        .sum::<usize>();
+        .map(|(text, style)| Span::styled(text.clone(), *style))
+        .collect();
+    let right = take_spans_to_width(right_full, inner_width / 2);
+    let right_width = spans_width(&right);
+    let left = take_spans_to_width(left, inner_width.saturating_sub(right_width));
+    let left_width = spans_width(&left);
     let spacer = inner_width
         .saturating_sub(left_width)
         .saturating_sub(right_width);
-    let mut spans = vec![Span::styled("│", border_style())];
+    let outer = panel_outer_padding(width);
+    let mut spans = vec![
+        Span::raw(" ".repeat(outer)),
+        Span::styled("│", border_style()),
+    ];
     spans.extend(left);
     spans.push(Span::styled(" ".repeat(spacer), panel_style()));
-    for (text, style) in right {
-        spans.push(Span::styled(text.clone(), *style));
-    }
+    spans.extend(right);
     spans.push(Span::styled("│", border_style()));
-    Line::from(spans)
+    spans.push(Span::raw(" ".repeat(outer)));
+    let mut line = Line::from(spans);
+    truncate_line(&mut line, width.max(1));
+    line
 }
 
 fn panel_body_line(width: usize, mut line: Line<'static>, bg: Option<Color>) -> Line<'static> {
-    let width = width.max(PANEL_BODY_BORDER_WIDTH);
-    let body_width = width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
+    let panel_width = panel_width(width).max(PANEL_BODY_BORDER_WIDTH);
+    let body_width = panel_width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
     truncate_line(&mut line, body_width);
     if let Some(bg) = bg {
         apply_width_bg(&mut line, bg, body_width);
@@ -542,15 +537,20 @@ fn panel_body_line(width: usize, mut line: Line<'static>, bg: Option<Color>) -> 
             ));
         }
     }
+    let outer = panel_outer_padding(width);
     let side_padding = " ".repeat(PANEL_BODY_SIDE_PADDING);
     let mut spans = vec![
+        Span::raw(" ".repeat(outer)),
         Span::styled("│", border_style()),
         Span::styled(side_padding.clone(), panel_style()),
     ];
     spans.extend(line.spans);
     spans.push(Span::styled(side_padding, panel_style()));
     spans.push(Span::styled("│", border_style()));
-    Line::from(spans)
+    spans.push(Span::raw(" ".repeat(outer)));
+    let mut line = Line::from(spans);
+    truncate_line(&mut line, width.max(1));
+    line
 }
 
 fn panel_body_lines(
@@ -559,59 +559,13 @@ fn panel_body_lines(
     bg: Option<Color>,
     out: &mut Vec<Line<'static>>,
 ) {
-    let width = width.max(PANEL_BODY_BORDER_WIDTH);
-    let body_width = width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
+    let panel_width = panel_width(width).max(PANEL_BODY_BORDER_WIDTH);
+    let body_width = panel_width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
     let mut wrapped = Vec::new();
     push_wrapped_line(&line, body_width, None, &mut wrapped);
     for physical in wrapped {
         out.push(panel_body_line(width, physical, bg));
     }
-}
-
-fn role_lines(
-    width: usize,
-    label: &'static str,
-    marker: &Option<&'static str>,
-    text: &str,
-) -> Vec<Line<'static>> {
-    role_styled_lines(
-        width,
-        label,
-        marker,
-        &Line::from(Span::styled(text.to_string(), panel_style())),
-    )
-}
-
-fn role_styled_lines(
-    width: usize,
-    label: &'static str,
-    marker: &Option<&'static str>,
-    line: &Line<'static>,
-) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let body_width = width.saturating_sub(ROLE_PREFIX_WIDTH).max(1);
-    let mut body_rows = Vec::new();
-    push_wrapped_line_wordwise(line, body_width, &mut body_rows);
-    body_rows
-        .into_iter()
-        .enumerate()
-        .map(|(i, body)| {
-            let mut spans = if i == 0 {
-                let mut spans = vec![Span::styled(format!("{label:<5}"), panel_style())];
-                if let Some(marker) = marker {
-                    spans.push(Span::styled(format!(" {marker}"), prompt_style()));
-                    spans.push(Span::styled("   ", panel_style()));
-                } else {
-                    spans.push(Span::styled("     ", panel_style()));
-                }
-                spans
-            } else {
-                vec![Span::styled(" ".repeat(ROLE_PREFIX_WIDTH), panel_style())]
-            };
-            spans.extend(body.spans);
-            Line::from(spans)
-        })
-        .collect()
 }
 
 fn inset_rule_line(width: usize, label: &str) -> Line<'static> {
@@ -689,8 +643,11 @@ fn push_wrapped_line(
                 out.push(Line::from(std::mem::take(&mut spans)));
                 cur_w = 0;
                 if let Some(prefix) = continuation_prefix {
-                    spans.push(Span::styled(prefix, dim_style()));
-                    cur_w = display_width(prefix);
+                    let prefix = truncate_to_width(prefix, width.saturating_sub(1));
+                    if !prefix.is_empty() {
+                        cur_w = display_width(&prefix);
+                        spans.push(Span::styled(prefix, dim_style()));
+                    }
                 }
             }
             push_span_char(&mut spans, ch, span.style);
@@ -699,6 +656,69 @@ fn push_wrapped_line(
     }
 
     out.push(Line::from(spans));
+}
+
+fn styled_physical_row(
+    cells: &[(char, Style)],
+    cursor: &mut usize,
+    physical: &str,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for rc in physical.chars() {
+        while *cursor < cells.len() && cells[*cursor].0 != rc {
+            *cursor += 1;
+        }
+        let style = cells.get(*cursor).map_or(Style::default(), |(_, st)| *st);
+        push_span_char(&mut spans, rc, style);
+        *cursor += 1;
+    }
+    Line::from(spans)
+}
+
+fn push_wrapped_line_wordwise_with_prefix(
+    line: &Line<'static>,
+    width: usize,
+    continuation_prefix: &'static str,
+    out: &mut Vec<Line<'static>>,
+) {
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+        .collect();
+    if cells.is_empty() {
+        out.push(Line::default());
+        return;
+    }
+    let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+    let width = width.max(1);
+    let first = wrap_to_width(&text, width)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let mut cursor = 0usize;
+    out.push(styled_physical_row(&cells, &mut cursor, &first));
+    if cursor < cells.len() && cells[cursor].0 == ' ' {
+        cursor += 1;
+    }
+    if cursor >= cells.len() {
+        return;
+    }
+    let continuation_width = width
+        .saturating_sub(display_width(continuation_prefix))
+        .max(1);
+    let remainder: String = cells[cursor..].iter().map(|(ch, _)| *ch).collect();
+    for physical in wrap_to_width(&remainder, continuation_width) {
+        if physical.is_empty() {
+            continue;
+        }
+        let mut line = styled_physical_row(&cells, &mut cursor, &physical);
+        pad_line_left(&mut line, display_width(continuation_prefix));
+        out.push(line);
+        if cursor < cells.len() && cells[cursor].0 == ' ' {
+            cursor += 1;
+        }
+    }
 }
 
 /// Word-aware, URL-safe wrap of a styled line, preserving each span's style.
@@ -718,21 +738,9 @@ fn push_wrapped_line_wordwise(line: &Line<'static>, width: usize, out: &mut Vec<
         return;
     }
     let text: String = cells.iter().map(|(ch, _)| *ch).collect();
-    // The only chars wrap_to_width removes are space separators, so matching
-    // each physical row's chars back to the cell stream in order recovers the
-    // style for every glyph (collapsed spaces are skipped over).
-    let mut ci = 0;
+    let mut cursor = 0;
     for physical in wrap_to_width(&text, width.max(1)) {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for rc in physical.chars() {
-            while ci < cells.len() && cells[ci].0 != rc {
-                ci += 1;
-            }
-            let style = cells.get(ci).map_or(Style::default(), |(_, st)| *st);
-            push_span_char(&mut spans, rc, style);
-            ci += 1;
-        }
-        out.push(Line::from(spans));
+        out.push(styled_physical_row(&cells, &mut cursor, &physical));
     }
 }
 
@@ -788,6 +796,8 @@ struct ActiveExec {
 struct ActiveExploration {
     call_id: String,
     row: usize,
+    failed: bool,
+    done: bool,
 }
 
 struct ActiveTool {
@@ -798,12 +808,8 @@ struct ActiveTool {
 
 fn tool_panel_title(call: &ToolCall) -> &'static str {
     match call.name.as_str() {
-        "read" => "READ",
-        "write" => "WRITE",
-        "edit" => "EDIT",
-        "grep" => "GREP",
-        "find" => "FIND",
-        "ls" => "LS",
+        "read" | "grep" | "find" | "ls" => "EXPLORE",
+        "write" | "edit" => "EDIT",
         _ => "TOOL",
     }
 }
@@ -823,13 +829,7 @@ fn tool_panel_meta(call: &ToolCall) -> String {
 
 fn explore_panel_meta(call: &ToolCall) -> String {
     tool_path_arg(call)
-        .map(|path| {
-            display_path(path)
-                .rsplit('/')
-                .next()
-                .unwrap_or(path)
-                .to_string()
-        })
+        .map(display_path)
         .unwrap_or_else(|| "workspace".to_string())
 }
 
@@ -882,28 +882,8 @@ impl Transcript {
         }
     }
 
-    fn push_agent_text(&mut self, text: &str) {
-        for (i, line) in render_markdown(text).into_iter().enumerate() {
-            let text = line_text(&line);
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::RoleLine {
-                    label: if i == 0 { "AGENT" } else { "" },
-                    marker: if i == 0 { Some("●") } else { None },
-                    line,
-                },
-                text,
-                panel_style(),
-            ));
-        }
-    }
-
-    fn push_continued(&mut self, text: &str, style: Style, continuation_prefix: &'static str) {
-        for line in text.split('\n') {
-            self.rows.push(TranscriptRow::with_line(
-                Line::from(Span::styled(line.to_string(), style)),
-                Some(continuation_prefix),
-            ));
-        }
+    fn push_assistant_text(&mut self, text: &str) {
+        pane::push_assistant_rows(&mut self.rows, text);
     }
 
     /// Commit any in-flight streamed assistant text into the transcript.
@@ -911,7 +891,7 @@ impl Transcript {
         if let Some(text) = self.streaming.take()
             && !text.is_empty()
         {
-            self.push_agent_text(&text);
+            self.push_assistant_text(&text);
             self.push_blank();
         }
     }
@@ -923,10 +903,39 @@ impl Transcript {
             ApprovalDecision::Deny => return,
         };
         self.begin_block();
-        self.rows.push(TranscriptRow::with_line(
-            approval_line(call, scope),
-            Some("  │ "),
+        self.push_approval_panel(approval_line(call, scope), false);
+    }
+
+    fn push_approval_panel(&mut self, line: Line<'static>, failed: bool) {
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
+            expanded: true,
+            title: "APPROVAL",
+            meta: "decision".to_string(),
+            right: vec![
+                (
+                    "●".to_string(),
+                    if failed { err_style() } else { ok_style() },
+                ),
+                (
+                    if failed {
+                        " DENIED      "
+                    } else {
+                        " RECORDED    "
+                    }
+                    .to_string(),
+                    panel_style(),
+                ),
+            ],
+        }));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        let text = line_text(&line);
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Body { line, bg: None },
+            text,
+            panel_style(),
         ));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
     }
 
     /// Fallback (non-streamed) result render, used when no live exec cell was
@@ -937,27 +946,28 @@ impl Transcript {
         &mut self,
         call: &ToolCall,
         content: &str,
-        _exit_code: Option<i32>,
+        exit_code: Option<i32>,
         duration: Option<std::time::Duration>,
     ) {
         if is_exploration_tool(call) {
             self.push_explored_result(call);
             return;
         }
+        let failed = exit_code.is_some_and(|code| code != 0);
         self.begin_block();
         if call.name == "bash" {
-            self.push_shell_panel(call, content, false, duration, None);
+            self.push_shell_panel(call, content, false, failed, duration, None);
         } else {
-            self.push_generic_tool_panel(call, content, false, duration, None);
+            self.push_generic_tool_panel(call, content, false, failed, duration, None);
         }
     }
 
     fn push_tool_error(&mut self, call: &ToolCall, message: &str) {
         self.begin_block();
         if call.name == "bash" {
-            self.push_shell_panel(call, message, false, None, Some(message));
+            self.push_shell_panel(call, "", false, true, None, Some(message));
         } else {
-            self.push_generic_tool_panel(call, message, false, None, Some(message));
+            self.push_generic_tool_panel(call, "", false, true, None, Some(message));
         }
     }
 
@@ -978,7 +988,7 @@ impl Transcript {
         for line in text.split('\n') {
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
-                    line: Line::from(Span::styled(format!("  {line}"), style)),
+                    line: Line::from(Span::styled(line.to_string(), style)),
                     bg: None,
                 },
                 line.to_string(),
@@ -990,11 +1000,18 @@ impl Transcript {
     fn push_shell_header(
         &mut self,
         running: bool,
+        failed: bool,
         duration: Option<std::time::Duration>,
         started: Option<Instant>,
         target: &str,
     ) {
-        let state = if running { " RUNNING" } else { " DONE" };
+        let state = if running {
+            " RUNNING"
+        } else if failed {
+            " ERROR"
+        } else {
+            " DONE"
+        };
         let elapsed = if running {
             started
                 .map(|started| format_panel_duration(started.elapsed()))
@@ -1002,10 +1019,13 @@ impl Transcript {
         } else {
             duration
                 .map(format_panel_duration)
+                .or_else(|| started.map(|started| format_panel_duration(started.elapsed())))
                 .unwrap_or_else(|| "00:00:00s".to_string())
         };
         let plain = if running {
             format!("• Running {target}")
+        } else if failed {
+            format!("✗ Ran {target}")
         } else {
             format!("• Ran {target}")
         };
@@ -1014,9 +1034,12 @@ impl Transcript {
             ChromeRow::Header {
                 expanded: true,
                 title: "SHELL",
-                meta: "zsh".to_string(),
+                meta: "bash".to_string(),
                 right: vec![
-                    ("●".to_string(), prompt_style()),
+                    (
+                        "●".to_string(),
+                        if failed { err_style() } else { prompt_style() },
+                    ),
                     (state.to_string(), panel_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
@@ -1032,11 +1055,12 @@ impl Transcript {
         call: &ToolCall,
         content: &str,
         running: bool,
+        failed: bool,
         duration: Option<std::time::Duration>,
         error: Option<&str>,
     ) {
         let target = run_target(call);
-        self.push_shell_header(running, duration, None, &target);
+        self.push_shell_header(running, failed, duration, None, &target);
         self.push_tool_panel_body(&format!("$ {target}"), panel_style());
         if !content.is_empty() {
             self.push_tool_output(content);
@@ -1056,10 +1080,17 @@ impl Transcript {
         &mut self,
         call: &ToolCall,
         running: bool,
+        failed: bool,
         duration: Option<std::time::Duration>,
         started: Option<Instant>,
     ) {
-        let state = if running { " RUNNING" } else { " DONE" };
+        let state = if running {
+            " RUNNING"
+        } else if failed {
+            " ERROR"
+        } else {
+            " DONE"
+        };
         let elapsed = if running {
             started
                 .map(|started| format_panel_duration(started.elapsed()))
@@ -1067,6 +1098,7 @@ impl Transcript {
         } else {
             duration
                 .map(format_panel_duration)
+                .or_else(|| started.map(|started| format_panel_duration(started.elapsed())))
                 .unwrap_or_else(|| "00:00:00s".to_string())
         };
         let title = tool_panel_title(call);
@@ -1078,13 +1110,18 @@ impl Transcript {
                 title,
                 meta: meta.clone(),
                 right: vec![
-                    ("●".to_string(), prompt_style()),
+                    (
+                        "●".to_string(),
+                        if failed { err_style() } else { prompt_style() },
+                    ),
                     (state.to_string(), panel_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
             },
             if running {
                 format!("• Running {meta}")
+            } else if failed {
+                format!("✗ Ran {meta}")
             } else {
                 format!("• Ran {meta}")
             },
@@ -1098,10 +1135,11 @@ impl Transcript {
         call: &ToolCall,
         content: &str,
         running: bool,
+        failed: bool,
         duration: Option<std::time::Duration>,
         error: Option<&str>,
     ) {
-        self.push_generic_tool_header(call, running, duration, None);
+        self.push_generic_tool_header(call, running, failed, duration, None);
         if !content.is_empty() {
             self.push_tool_output(content);
         } else if error.is_none() {
@@ -1121,7 +1159,7 @@ impl Transcript {
         let body_start = self.rows.len();
         let started = Instant::now();
         let target = run_target(&call);
-        self.push_shell_header(true, None, Some(started), &target);
+        self.push_shell_header(true, false, None, Some(started), &target);
         self.push_tool_panel_body(&format!("$ {target}"), panel_style());
         self.push_tool_panel_body("$ █", panel_style());
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
@@ -1137,7 +1175,7 @@ impl Transcript {
         self.begin_block();
         let body_start = self.rows.len();
         let started = Instant::now();
-        self.push_generic_tool_header(&call, true, None, Some(started));
+        self.push_generic_tool_header(&call, true, false, None, Some(started));
         self.push_tool_panel_body("running…", dim_style());
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.active_tool = Some(ActiveTool {
@@ -1147,15 +1185,28 @@ impl Transcript {
         });
     }
 
-    fn active_tool_panel_end(&self, active: &ActiveTool) -> usize {
-        self.rows[active.body_start..]
+    fn panel_end_from(&self, start: usize) -> usize {
+        self.rows[start..]
             .iter()
             .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)))
-            .map_or(active.body_start, |offset| active.body_start + offset + 1)
+            .map_or(start, |offset| start + offset + 1)
+    }
+
+    fn active_tool_panel_end(&self, active: &ActiveTool) -> usize {
+        self.panel_end_from(active.body_start)
     }
 
     fn replace_active_tool_panel(&mut self, active: &ActiveTool, replacement: Vec<TranscriptRow>) {
         let end = self.active_tool_panel_end(active);
+        self.rows.splice(active.body_start..end, replacement);
+    }
+
+    fn active_exec_panel_end(&self, active: &ActiveExec) -> usize {
+        self.panel_end_from(active.body_start)
+    }
+
+    fn replace_active_exec_panel(&mut self, active: &ActiveExec, replacement: Vec<TranscriptRow>) {
+        let end = self.active_exec_panel_end(active);
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -1173,7 +1224,7 @@ impl Transcript {
         started: Instant,
     ) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
-            this.push_generic_tool_header(call, false, duration, Some(started));
+            this.push_generic_tool_header(call, false, false, duration, Some(started));
             if !content.is_empty() {
                 this.push_tool_output(content);
             } else {
@@ -1190,7 +1241,7 @@ impl Transcript {
         started: Instant,
     ) -> Vec<TranscriptRow> {
         self.collect_rows(|this| {
-            this.push_generic_tool_header(call, false, None, Some(started));
+            this.push_generic_tool_header(call, false, true, None, Some(started));
             this.push_tool_panel_body(&format!("error: {message}"), err_style());
             this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         })
@@ -1238,19 +1289,62 @@ impl Transcript {
         }
     }
 
+    fn running_exec_rows(&mut self, active: &ActiveExec) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            let target = run_target(&active.call);
+            this.push_shell_header(true, false, None, Some(active.started), &target);
+            this.push_tool_panel_body(&format!("$ {target}"), panel_style());
+            this.push_tool_output_tail(&active.output);
+            this.push_tool_panel_body("$ █", panel_style());
+            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        })
+    }
+
+    fn finalized_exec_rows(
+        &mut self,
+        call: &ToolCall,
+        content: &str,
+        exit_code: Option<i32>,
+        duration: Option<std::time::Duration>,
+        started: Instant,
+    ) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            let target = run_target(call);
+            let failed = exit_code.is_some_and(|code| code != 0);
+            this.push_shell_header(false, failed, duration, Some(started), &target);
+            this.push_tool_panel_body(&format!("$ {target}"), panel_style());
+            this.push_tool_output(content);
+            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        })
+    }
+
+    fn errored_exec_rows(
+        &mut self,
+        call: &ToolCall,
+        message: &str,
+        streamed_output: &str,
+        started: Instant,
+    ) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            let target = run_target(call);
+            this.push_shell_header(false, true, None, Some(started), &target);
+            this.push_tool_panel_body(&format!("$ {target}"), panel_style());
+            if !streamed_output.is_empty() {
+                this.push_tool_output_tail(streamed_output);
+            }
+            this.push_tool_panel_body(&format!("error: {message}"), err_style());
+            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        })
+    }
+
     /// Re-render the open exec block in place from its bounded output buffer: the
     /// `Running` header followed by the flood-capped live tail.
     fn relayout_active_running(&mut self) {
         let Some(active) = self.active_exec.take() else {
             return;
         };
-        self.rows.truncate(active.body_start);
-        let target = run_target(&active.call);
-        self.push_shell_header(true, None, Some(active.started), &target);
-        self.push_tool_panel_body(&format!("$ {target}"), panel_style());
-        self.push_tool_output_tail(&active.output);
-        self.push_tool_panel_body("$ █", panel_style());
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let rows = self.running_exec_rows(&active);
+        self.replace_active_exec_panel(&active, rows);
         self.active_exec = Some(active);
     }
 
@@ -1261,18 +1355,18 @@ impl Transcript {
         &mut self,
         call: &ToolCall,
         content: &str,
-        _exit_code: Option<i32>,
+        exit_code: Option<i32>,
         duration: Option<std::time::Duration>,
     ) {
         let Some(active) = self.active_exec.take() else {
             return;
         };
-        self.rows.truncate(active.body_start);
-        let target = run_target(call);
-        self.push_shell_header(false, duration, Some(active.started), &target);
-        self.push_tool_panel_body(&format!("$ {target}"), panel_style());
-        self.push_tool_output(content);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        if active.call.id != call.id {
+            self.active_exec = Some(active);
+            return;
+        }
+        let rows = self.finalized_exec_rows(call, content, exit_code, duration, active.started);
+        self.replace_active_exec_panel(&active, rows);
     }
 
     /// Finalize the open exec block as an error/cancellation in place: a red
@@ -1282,15 +1376,12 @@ impl Transcript {
         let Some(active) = self.active_exec.take() else {
             return;
         };
-        self.rows.truncate(active.body_start);
-        let target = run_target(call);
-        self.push_shell_header(false, None, Some(active.started), &target);
-        self.push_tool_panel_body(&format!("$ {target}"), panel_style());
-        if !active.output.is_empty() {
-            self.push_tool_output_tail(&active.output);
+        if active.call.id != call.id {
+            self.active_exec = Some(active);
+            return;
         }
-        self.push_tool_panel_body(&format!("error: {message}"), err_style());
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let rows = self.errored_exec_rows(call, message, &active.output, active.started);
+        self.replace_active_exec_panel(&active, rows);
     }
 
     /// The width to assume when shaping rows during `apply` (before a frame has
@@ -1316,7 +1407,7 @@ impl Transcript {
         if line.contains("\x1b[") {
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
-                    line: tool_output_line("  ", &line),
+                    line: tool_output_line("", &line),
                     bg: None,
                 },
                 strip_ansi_for_text(&legacy),
@@ -1325,7 +1416,7 @@ impl Transcript {
         } else {
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
-                    line: Line::from(Span::styled(format!("  {line}"), dim_style())),
+                    line: Line::from(Span::styled(line.to_string(), dim_style())),
                     bg: None,
                 },
                 legacy,
@@ -1436,13 +1527,79 @@ impl Transcript {
         }
     }
 
+    fn explore_header_right(running: bool, failed: bool) -> Vec<(String, Style)> {
+        let state = if running {
+            " RUNNING     "
+        } else if failed {
+            " ERROR       "
+        } else {
+            " DONE        "
+        };
+        vec![
+            (
+                "●".to_string(),
+                if failed && !running {
+                    err_style()
+                } else {
+                    prompt_style()
+                },
+            ),
+            (state.to_string(), panel_style()),
+            ("00:00:00s  ".to_string(), dim_style()),
+        ]
+    }
+
+    fn current_explore_header_row(&self) -> Option<usize> {
+        self.rows.iter().rposition(|row| {
+            matches!(
+                row.chrome.as_ref(),
+                Some(ChromeRow::Header {
+                    title: "EXPLORE",
+                    ..
+                })
+            )
+        })
+    }
+
+    fn set_explore_header(&mut self, call: &ToolCall, running: bool, failed: bool) {
+        let Some(header) = self.current_explore_header_row() else {
+            return;
+        };
+        let meta = match self.rows[header].chrome.as_ref() {
+            Some(ChromeRow::Header { meta, .. }) => meta.clone(),
+            _ => explore_panel_meta(call),
+        };
+        self.rows[header] = TranscriptRow::chrome(ChromeRow::Header {
+            expanded: true,
+            title: "EXPLORE",
+            meta,
+            right: Self::explore_header_right(running, failed),
+        });
+    }
+
+    fn update_explore_header_from_active(&mut self, call: &ToolCall) {
+        let running = self.active_explorations.iter().any(|active| !active.done);
+        let failed = self.active_explorations.iter().any(|active| active.failed);
+        self.set_explore_header(call, running, failed && !running);
+        if !running {
+            self.active_explorations.clear();
+        }
+    }
+
+    fn pop_trailing_explore_bottom(&mut self) {
+        if matches!(
+            self.rows.last().and_then(|row| row.chrome.as_ref()),
+            Some(ChromeRow::Bottom)
+        ) {
+            self.rows.pop();
+        }
+    }
+
     fn push_explore_body(&mut self, call: &ToolCall, failed: bool) {
         if self.exploring_open {
-            if matches!(
-                self.rows.last().and_then(|row| row.chrome.as_ref()),
-                Some(ChromeRow::Bottom)
-            ) {
-                self.rows.pop();
+            self.pop_trailing_explore_bottom();
+            if failed {
+                self.set_explore_header(call, false, true);
             }
         } else {
             self.push_blank();
@@ -1451,22 +1608,7 @@ impl Transcript {
                 expanded: true,
                 title: "EXPLORE",
                 meta: explore_panel_meta(call),
-                right: vec![
-                    (
-                        "●".to_string(),
-                        if failed { err_style() } else { prompt_style() },
-                    ),
-                    (
-                        if failed {
-                            " ERROR       "
-                        } else {
-                            " DONE        "
-                        }
-                        .to_string(),
-                        panel_style(),
-                    ),
-                    ("00:00:00s  ".to_string(), dim_style()),
-                ],
+                right: Self::explore_header_right(false, failed),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
@@ -1474,7 +1616,7 @@ impl Transcript {
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Body {
                 line: Line::from(Span::styled(
-                    format!("  {text}"),
+                    text.clone(),
                     if failed { err_style() } else { dim_style() },
                 )),
                 bg: None,
@@ -1488,7 +1630,7 @@ impl Transcript {
 
     fn push_explored_result(&mut self, call: &ToolCall) {
         self.finish_stream();
-        if self.finish_exploration(call, false) {
+        if self.finish_exploration(call, explore_body(call), dim_style(), false) {
             return;
         }
         self.push_explore_body(call, false);
@@ -1496,39 +1638,65 @@ impl Transcript {
 
     fn push_explored_start(&mut self, call: &ToolCall) {
         self.finish_stream();
-        self.push_blank();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        if self.exploring_open {
+            self.pop_trailing_explore_bottom();
+            self.set_explore_header(call, true, false);
+        } else {
+            self.push_blank();
+            self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+            self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
+                expanded: true,
+                title: "EXPLORE",
+                meta: explore_panel_meta(call),
+                right: Self::explore_header_right(true, false),
+            }));
+            self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        }
         let row = self.rows.len();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
-            expanded: true,
-            title: "EXPLORE",
-            meta: explore_panel_meta(call),
-            right: vec![
-                ("●".to_string(), prompt_style()),
-                (" RUNNING     ".to_string(), panel_style()),
-                ("00:00:00s  ".to_string(), dim_style()),
-            ],
-        }));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        let text = explore_body(call);
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Body {
-                line: Line::from(Span::styled(
-                    format!("  {}", explore_body(call)),
-                    dim_style(),
-                )),
+                line: Line::from(Span::styled(text.clone(), dim_style())),
                 bg: None,
             },
-            explore_body(call),
+            text,
             dim_style(),
         ));
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.exploring_open = true;
         self.active_explorations.push(ActiveExploration {
             call_id: call.id.clone(),
             row,
+            failed: false,
+            done: false,
         });
     }
 
-    fn finish_exploration(&mut self, call: &ToolCall, failed: bool) -> bool {
+    fn replace_explore_body_at(&mut self, row: usize, text: String, style: Style) -> bool {
+        let Some(slot) = self.rows.get_mut(row) else {
+            return false;
+        };
+        if !matches!(slot.chrome.as_ref(), Some(ChromeRow::Body { .. })) {
+            return false;
+        }
+        *slot = TranscriptRow::chrome_with_text(
+            ChromeRow::Body {
+                line: Line::from(Span::styled(text.clone(), style)),
+                bg: None,
+            },
+            text,
+            style,
+        );
+        true
+    }
+
+    fn finish_exploration(
+        &mut self,
+        call: &ToolCall,
+        text: String,
+        style: Style,
+        failed: bool,
+    ) -> bool {
         let Some(pos) = self
             .active_explorations
             .iter()
@@ -1536,33 +1704,18 @@ impl Transcript {
         else {
             return false;
         };
-        let active = self.active_explorations.remove(pos);
-        if let Some(row) = self.rows.get_mut(active.row) {
-            let state = if failed { " ERROR" } else { " DONE" };
-            *row = TranscriptRow::chrome(ChromeRow::Header {
-                expanded: true,
-                title: "EXPLORE",
-                meta: explore_panel_meta(call),
-                right: vec![
-                    (
-                        "●".to_string(),
-                        if failed { err_style() } else { prompt_style() },
-                    ),
-                    (format!("{state}        "), panel_style()),
-                    ("00:00:00s  ".to_string(), dim_style()),
-                ],
-            });
-        }
+        let row = self.active_explorations[pos].row;
+        self.active_explorations[pos].failed = failed;
+        self.active_explorations[pos].done = true;
+        let replaced = self.replace_explore_body_at(row, text, style);
+        debug_assert!(replaced);
+        self.update_explore_header_from_active(call);
         true
     }
 
     fn push_explored_error(&mut self, call: &ToolCall, message: &str) -> bool {
         self.finish_stream();
-        if !self.finish_exploration(call, true) {
-            return false;
-        }
-        self.push_continued(&format!("    error: {message}"), err_style(), "    ");
-        true
+        self.finish_exploration(call, format!("error: {message}"), err_style(), true)
     }
 
     /// Apply one semantic event to the transcript rows.
@@ -1584,12 +1737,18 @@ impl Transcript {
                     .push_str(&delta);
             }
             UiEvent::AssistantTextEnd(text) => {
-                // The accumulated stream and `text` are the same content; drop
-                // the accumulator and commit the authoritative text exactly once.
-                self.streaming = None;
+                // A non-empty end event is authoritative. Some providers only
+                // send deltas and finish with an empty end marker; in that case
+                // commit the accumulated stream instead of dropping it.
+                let text = if text.is_empty() {
+                    self.streaming.take().unwrap_or_default()
+                } else {
+                    self.streaming = None;
+                    text
+                };
                 if !text.is_empty() {
                     self.push_blank();
-                    self.push_agent_text(&text);
+                    self.push_assistant_text(&text);
                     self.push_blank();
                 }
             }
@@ -1597,7 +1756,7 @@ impl Transcript {
                 self.finish_stream();
                 if !text.is_empty() {
                     self.push_blank();
-                    self.push_agent_text(&text);
+                    self.push_assistant_text(&text);
                     self.push_blank();
                 }
             }
@@ -1649,9 +1808,8 @@ impl Transcript {
                     title: tool_panel_title(&call),
                     meta: tool_panel_meta(&call),
                     right: vec![
-                        ("●".to_string(), prompt_style()),
-                        (" RUNNING     ".to_string(), panel_style()),
-                        ("00:00:00s  ".to_string(), dim_style()),
+                        ("●".to_string(), dim_style()),
+                        (" PREVIEW     ".to_string(), panel_style()),
                     ],
                 }));
                 self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
@@ -1660,11 +1818,9 @@ impl Transcript {
             }
             UiEvent::ToolDenied(call) => {
                 self.begin_block();
-                self.push_continued(
-                    &format!("✗ Denied {}", run_target(&call)),
-                    err_style(),
-                    "  │ ",
-                );
+                let mut spans = vec![Span::styled("✗", err_style()), Span::raw(" Denied ")];
+                spans.extend(ansi_spans(&run_target(&call), Style::default()));
+                self.push_approval_panel(Line::from(spans), true);
             }
             UiEvent::ToolResult {
                 call,
@@ -1730,27 +1886,54 @@ impl Transcript {
         {
             return;
         }
-        let remove = self.rows.len() - MAX_TRANSCRIPT_ROWS;
+        let remove = self.panel_safe_trim_index(self.rows.len() - MAX_TRANSCRIPT_ROWS);
         self.rows.drain(..remove);
-        self.exploring_open = self.rows.iter().any(|row| row.text == "• Explored");
+        self.exploring_open = self.trailing_explore_panel_open();
     }
 
-    /// Commit a submitted prompt into the transcript as a bordered role panel.
+    fn panel_safe_trim_index(&self, min_remove: usize) -> usize {
+        let mut remove = min_remove.min(self.rows.len());
+        while remove < self.rows.len() && self.row_is_inside_panel(remove) {
+            remove = self.panel_end_from(remove);
+        }
+        remove
+    }
+
+    fn row_is_inside_panel(&self, index: usize) -> bool {
+        matches!(
+            self.rows.get(index).and_then(|row| row.chrome.as_ref()),
+            Some(
+                ChromeRow::Header { .. }
+                    | ChromeRow::Separator
+                    | ChromeRow::Body { .. }
+                    | ChromeRow::Bottom
+            )
+        )
+    }
+
+    fn trailing_explore_panel_open(&self) -> bool {
+        let Some(last) = self.rows.iter().rposition(|row| !is_separator_row(row)) else {
+            return false;
+        };
+        if !matches!(self.rows[last].chrome.as_ref(), Some(ChromeRow::Bottom)) {
+            return false;
+        }
+        for row in self.rows[..=last].iter().rev() {
+            match row.chrome.as_ref() {
+                Some(ChromeRow::Header { title, .. }) => return *title == "EXPLORE",
+                Some(ChromeRow::Top) => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Commit a submitted prompt into the transcript as plain pane text.
     /// This is display-only; the raw prompt still goes to Nexus unchanged
     /// through the loop.
     fn commit_user(&mut self, text: &str) {
         self.push_blank();
-        for (i, line) in text.split('\n').enumerate() {
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Role {
-                    label: if i == 0 { "USER" } else { "" },
-                    marker: None,
-                    text: line.to_string(),
-                },
-                line.to_string(),
-                panel_style(),
-            ));
-        }
+        pane::push_user_rows(&mut self.rows, text);
         self.trim_history();
     }
 
@@ -1764,20 +1947,7 @@ impl Transcript {
             row.render(width, &mut rows);
         }
         if let Some(text) = &self.streaming {
-            let text = streaming_markdown_preview(text);
-            for (i, line) in render_markdown(&text).into_iter().enumerate() {
-                let text = line_text(&line);
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::RoleLine {
-                        label: if i == 0 { "AGENT" } else { "" },
-                        marker: if i == 0 { Some("●") } else { None },
-                        line,
-                    },
-                    text,
-                    panel_style(),
-                )
-                .render(width, &mut rows);
-            }
+            pane::render_streaming_assistant(width, text, &mut rows);
         }
         rows
     }
@@ -1828,11 +1998,11 @@ fn approval_status_lines(hint: &ApprovalHint, width: usize) -> Vec<Line<'static>
     let mut target = vec![Span::raw("approve ")];
     target.extend(ansi_spans(&hint.target, Style::default()));
     let mut lines = Vec::new();
-    push_wrapped_line(&Line::from(target), width, Some("  │ "), &mut lines);
+    push_wrapped_line(&Line::from(target), width, Some("  "), &mut lines);
     push_wrapped_line(
         &Line::from(Span::styled(hint.options, dim_style())),
         width,
-        Some("  │ "),
+        Some("  "),
         &mut lines,
     );
     lines
@@ -2012,56 +2182,38 @@ fn working_lines(
     width: usize,
 ) -> Vec<Line<'static>> {
     let secs = elapsed.unwrap_or_default().as_secs();
-    let elapsed = format_panel_duration(Duration::from_secs(secs));
-    let mut details = vec![format_elapsed_compact(secs)];
+    let mut details = vec![format_elapsed_compact(secs), "esc to interrupt".to_string()];
     if let Some(usage) = footer.and_then(|footer| footer.usage.as_ref()) {
-        details.push(format!(
-            "last turn ↓ {} tokens",
-            compact_count(usage.total_tokens)
-        ));
+        details.push(format!("↓ {} tokens", compact_count(usage.total_tokens)));
     }
     if let Some(effort) = footer.and_then(|footer| footer.effort.as_ref()) {
         details.push(format!("thinking with {effort} effort"));
     }
-    let status = format!("  {glyph} Working… ({})", details.join(" · "));
-    vec![
-        Line::default(),
-        panel_rule_line(width, '┌', '┐'),
-        panel_header_line(
-            width,
-            true,
-            "WORKING",
-            "",
-            &[
-                (glyph.to_string(), prompt_style()),
-                (" RUNNING     ".to_string(), panel_style()),
-                (format!("{elapsed:>10}  "), dim_style()),
-            ],
-        ),
-        panel_rule_line(width, '├', '┤'),
-        panel_body_line(width, Line::from(Span::styled(status, dim_style())), None),
-        panel_body_line(
-            width,
-            Line::from(Span::styled("  esc to interrupt", dim_style())),
-            None,
-        ),
-        panel_rule_line(width, '└', '┘'),
-        Line::default(),
-    ]
+    let mut line = Line::from(vec![
+        Span::styled(format!("{glyph} "), prompt_style()),
+        Span::styled("Working…", dim_style()),
+        Span::styled(format!(" ({})", details.join(" · ")), dim_style()),
+    ]);
+    truncate_line(&mut line, content_width(width));
+    pad_line_left(
+        &mut line,
+        TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1)),
+    );
+    truncate_line(&mut line, width.max(1));
+    vec![Line::default(), line, Line::default()]
 }
 
-/// Build a styled, empty editor: borderless shaded input row, dim placeholder,
-/// and a reversed block cursor the widget draws itself (no hardware cursor
-/// needed). The shaded backing and the pad rows above/below are painted by
-/// `render` so the whole editor box matches committed user-message blocks,
-/// including cells not occupied by text.
+/// Build a styled, empty editor for the bordered composer panel: dim
+/// placeholder and a reversed block cursor the widget draws itself (no hardware
+/// cursor needed). The surrounding border and hint row are painted by
+/// `render_editor_chrome`.
 fn fresh_editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
     editor.set_cursor_line_style(Style::default());
     editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     editor.set_placeholder_style(dim_style());
-    editor.set_placeholder_text("Ask the agent anything...");
+    editor.set_placeholder_text("Give iris a task...");
     editor
 }
 
@@ -2092,9 +2244,9 @@ pub(crate) struct Screen {
     spinner: Spinner,
     /// Short status-row hint while a gated tool awaits the user's decision.
     approval_hint: Option<ApprovalHint>,
-    /// Idle status-row footer (model / effort / cwd), Codex's bottom bar. The
-    /// loop refreshes it from the live model selection; `None` falls back to the
-    /// keybind hint (e.g. before a provider is selected).
+    /// Sourced global status chrome (model / effort / cwd). The loop refreshes
+    /// it from the live model selection; `None` falls back to the composer hint
+    /// (e.g. before a provider is selected).
     footer: Option<Footer>,
     /// The active picker/dialog, when one is open. While present it renders
     /// above the editor and the loop routes keys to it instead of the editor.
@@ -2275,7 +2427,7 @@ impl Screen {
             footer_lines(footer, usize::from(width))
         } else {
             vec![Line::from(Span::styled(
-                truncate_to_width(IDLE_HINT, content_width(usize::from(width))),
+                truncate_to_width(COMPOSER_HINT, content_width(usize::from(width))),
                 dim_style(),
             ))]
         };
@@ -2422,8 +2574,8 @@ pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// Render the slash popup into an offscreen Ratatui buffer: a bordered list with
-/// the selected row highlighted.
+/// Render the slash popup into an offscreen Ratatui buffer: plain above-composer
+/// rows with the selected row accented by foreground color only.
 fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selected: usize) {
     let inner = Rect {
         x: area.x + u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX),
@@ -2445,9 +2597,7 @@ fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selec
     for (i, cmd) in matches.iter().enumerate() {
         let selected_row = i == selected;
         let name_style = if selected_row {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
@@ -2518,65 +2668,47 @@ fn render_document_with_chrome_tail(
     (transcript, chrome_len)
 }
 
-fn status_rail_line(screen: &Screen, width: u16) -> Line<'static> {
-    let (model, effort, cwd, branch) = screen.footer.as_ref().map_or_else(
-        || {
-            (
-                "model".to_string(),
-                "-".to_string(),
-                "~".to_string(),
-                "-".to_string(),
-            )
-        },
-        |footer| {
-            let (cwd, branch) = split_cwd_branch(&footer.cwd);
-            (
-                footer.model.clone(),
-                footer.effort.clone().unwrap_or_else(|| "-".to_string()),
-                cwd,
-                branch,
-            )
-        },
-    );
+fn global_status_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
+    let footer = screen.footer.as_ref()?;
+    let (cwd, branch) = split_cwd_branch(&footer.cwd);
     let mut spans = vec![
-        Span::styled("  ● ", prompt_style()),
+        Span::raw(" ".repeat(BOX_X_PADDING)),
+        Span::styled("● ", prompt_style()),
         Span::styled("MODE ", panel_style()),
         Span::styled("code", dim_style()),
         rail_sep(),
         Span::styled("MODEL ", panel_style()),
-        Span::styled(model, dim_style()),
-        rail_sep(),
-        Span::styled("EFFORT ", panel_style()),
-        Span::styled(effort, dim_style()),
-        rail_sep(),
-        Span::styled("CONTEXT ", panel_style()),
-        Span::styled("128k", dim_style()),
-        rail_sep(),
-        Span::styled("APPROVAL ", panel_style()),
-        Span::styled("auto", dim_style()),
-        rail_sep(),
-        Span::styled("CWD ", panel_style()),
-        Span::styled(cwd, dim_style()),
-        rail_sep(),
-        Span::styled("BRANCH ", panel_style()),
-        Span::styled(branch, dim_style()),
+        Span::styled(footer.model.clone(), dim_style()),
     ];
+    if let Some(effort) = &footer.effort {
+        spans.push(rail_sep());
+        spans.push(Span::styled("EFFORT ", panel_style()));
+        spans.push(Span::styled(effort.clone(), dim_style()));
+    }
+    spans.push(rail_sep());
+    spans.push(Span::styled("CWD ", panel_style()));
+    spans.push(Span::styled(cwd, dim_style()));
+    if let Some(branch) = branch {
+        spans.push(rail_sep());
+        spans.push(Span::styled("BRANCH ", panel_style()));
+        spans.push(Span::styled(branch, dim_style()));
+    }
     let mut line = Line::from(std::mem::take(&mut spans));
     truncate_line(&mut line, usize::from(width).max(1));
-    line
+    Some(line)
 }
 
 fn rail_sep() -> Span<'static> {
     Span::styled("  ┊  ", dim_style())
 }
 
-fn split_cwd_branch(cwd: &str) -> (String, String) {
+fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
     if let Some((left, right)) = cwd.rsplit_once(" (")
         && let Some(branch) = right.strip_suffix(')')
     {
-        return (left.to_string(), branch.to_string());
+        return (left.to_string(), Some(branch.to_string()));
     }
-    (cwd.to_string(), "-".to_string())
+    (cwd.to_string(), None)
 }
 
 #[derive(Clone, Copy)]
@@ -2589,13 +2721,15 @@ struct ChromeHeights {
 fn chrome_heights(
     height: u16,
     menu_wanted: u16,
+    desired_global_status_h: u16,
     desired_working_h: u16,
     editor_rows: u16,
 ) -> ChromeHeights {
+    let global_status = desired_global_status_h.min(GLOBAL_STATUS_H);
     let working = if desired_working_h > 0
         && height
             >= MIN_EDITOR_H
-                .saturating_add(RAIL_H)
+                .saturating_add(global_status)
                 .saturating_add(desired_working_h)
     {
         desired_working_h
@@ -2605,12 +2739,12 @@ fn chrome_heights(
     let menu = menu_wanted.min(
         height
             .saturating_sub(MIN_EDITOR_H)
-            .saturating_sub(RAIL_H)
+            .saturating_sub(global_status)
             .saturating_sub(working),
     );
     let max_editor_h = height
         .saturating_sub(menu)
-        .saturating_sub(RAIL_H)
+        .saturating_sub(global_status)
         .saturating_sub(working)
         .max(1);
     let wanted_editor_h = editor_rows.saturating_add(4);
@@ -2665,23 +2799,28 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
 
     // Bottom-anchored, clamped to the fixed viewport. The editor owns its hint
     // row inside the border; there is no bottom status bar in the spec.
-    let rail_lines = vec![status_rail_line(screen, area.width)];
+    // Explicit global chrome, when sourced, is outside transcript pane rows,
+    // tool panels, and the composer body. There is no bottom telemetry bar.
+    let global_status_lines: Vec<Line<'static>> =
+        global_status_line(screen, area.width).into_iter().collect();
+    let global_status_h = u16::try_from(global_status_lines.len()).unwrap_or(GLOBAL_STATUS_H);
     let working_lines = screen.working_lines(area.width);
     let heights = chrome_heights(
         area.height,
         menu_wanted,
+        global_status_h,
         u16::try_from(working_lines.len()).unwrap_or(u16::MAX),
         editor_rows,
     );
     let chrome_h = heights
         .menu
-        .saturating_add(RAIL_H)
+        .saturating_add(global_status_h)
         .saturating_add(heights.working)
         .saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(heights.menu),
-        Constraint::Length(RAIL_H),
+        Constraint::Length(global_status_h),
         Constraint::Length(heights.working),
         Constraint::Length(heights.editor),
     ])
@@ -2705,7 +2844,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             );
         }
     }
-    Paragraph::new(Text::from(rail_lines)).render(rail_area, &mut buf);
+    if global_status_h > 0 {
+        Paragraph::new(Text::from(global_status_lines)).render(rail_area, &mut buf);
+    }
     if heights.working > 0 {
         Paragraph::new(Text::from(working_lines)).render(working_area, &mut buf);
     }
@@ -2735,10 +2876,11 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     } else {
         (&screen.editor).render(text_area, &mut buf);
     }
-    let hint = Line::from(Span::styled(
-        "↵ to send  •  shift+↵ for new line  •  / for commands",
-        dim_style(),
-    ));
+    let hint = if screen.approval_hint.is_some() {
+        Line::default()
+    } else {
+        Line::from(Span::styled(COMPOSER_HINT, dim_style()))
+    };
     let hint_area = Rect {
         x: box_area.x + 2.min(box_area.width.saturating_sub(1)),
         y: box_area.y.saturating_add(box_area.height.saturating_sub(2)),
@@ -2907,14 +3049,6 @@ mod tests {
             .collect()
     }
 
-    fn background_width(line: &Line<'static>, bg: Color) -> usize {
-        line.spans
-            .iter()
-            .filter(|span| span.style.bg == Some(bg))
-            .map(|span| display_width(span.content.as_ref()))
-            .sum()
-    }
-
     fn line_matching<'a>(
         lines: &'a [Line<'static>],
         predicate: impl Fn(&Line<'static>) -> bool,
@@ -2974,6 +3108,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_assistant_text_end_commits_accumulated_deltas() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextDelta("Hel".to_string()));
+        screen.apply(UiEvent::AssistantTextDelta("lo".to_string()));
+
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["Hello".to_string(), String::new()]);
+        assert!(screen.transcript.streaming.is_none());
+    }
+
+    #[test]
     fn wrap_breaks_long_line_at_spaces_and_hard_breaks_long_words() {
         assert_eq!(
             wrap_to_width("alpha beta gamma", 11),
@@ -2987,15 +3134,21 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_renders_with_agent_role_rail() {
+    fn assistant_text_renders_with_marker_without_role_label() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText(
             "# Title\n\nuse `cargo test` and:\n- one\n- two".to_string(),
         ));
         let lines = screen.wrapped_lines(80);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
+        let joined = rendered.join("\n");
 
-        assert!(rendered.iter().any(|line| line.starts_with("AGENT ●")));
+        assert!(!joined.contains("AGENT"), "{joined}");
+        assert!(!joined.contains("USER"), "{joined}");
+        assert!(
+            rendered.iter().any(|line| line.starts_with("    ● Title")),
+            "{rendered:?}"
+        );
         let title = line_matching(&lines, |line| line_text(line).contains("Title"));
         assert!(!line_text(title).contains('#'));
         assert!(
@@ -3028,11 +3181,13 @@ mod tests {
 
         let live = screen.wrapped_lines(80);
         assert!(screen.transcript.rows.is_empty());
-        assert!(
-            render_document(&mut screen, Size::new(80, 12))
-                .iter()
-                .any(|line| line_text(line).contains("AGENT ●"))
-        );
+        let live_document = render_document(&mut screen, Size::new(80, 12))
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live_document.contains("● Title"), "{live_document}");
+        assert!(!live_document.contains("AGENT"), "{live_document}");
         assert!(live.iter().any(|l| line_text(l).contains("Title")));
         assert!(!live.iter().any(|l| line_text(l).contains("# Title")));
         assert!(live.iter().any(|l| line_text(l).contains("cargo test")));
@@ -3119,7 +3274,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_reply_gets_text_padding_and_blank_rows() {
+    fn assistant_reply_gets_marker_text_padding_and_blank_rows() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("alpha beta".to_string()));
         let lines = screen.wrapped_lines(16);
@@ -3127,8 +3282,8 @@ mod tests {
         assert_eq!(
             lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "AGENT ●   alpha".to_string(),
-                "          beta".to_string(),
+                "    ● alpha".to_string(),
+                "      beta".to_string(),
                 String::new()
             ]
         );
@@ -3136,81 +3291,29 @@ mod tests {
     }
 
     #[test]
-    fn assistant_reply_after_user_box_gets_unshaded_top_padding() {
+    fn adjacent_user_and_assistant_turns_are_plain_with_one_separator() {
         let mut screen = Screen::new();
         screen.commit_user("HI");
         screen.apply(UiEvent::AssistantText(
             "Hi! What are you working on?".to_string(),
         ));
         let lines = screen.wrapped_lines(80);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
+        let joined = rendered.join("\n");
 
-        let reply_idx = lines
+        assert!(!joined.contains("USER"), "{joined}");
+        assert!(!joined.contains("AGENT"), "{joined}");
+        assert!(rendered.iter().any(|line| line == "    HI"), "{rendered:?}");
+        let reply_idx = rendered
             .iter()
-            .position(|line| line_text(line).contains("Hi! What"))
+            .position(|line| line.contains("Hi! What"))
             .expect("assistant reply");
-        let gap = &lines[reply_idx - 1];
-        assert_eq!(line_text(gap), "");
-        assert_eq!(gap.style.bg, None);
-        assert!(line_text(&lines[reply_idx]).starts_with("AGENT ●   Hi! What"));
+        assert_eq!(rendered[reply_idx - 1], "");
+        assert!(
+            rendered[reply_idx].starts_with("    ● Hi! What"),
+            "{rendered:?}"
+        );
         assert_eq!(lines[reply_idx].style.bg, None);
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn transcript_outputs_align_to_user_text_column() {
-        let mut screen = Screen::new();
-        screen.commit_user("Hi");
-        screen.apply(UiEvent::AssistantText(
-            "Hey! What are you working on?".to_string(),
-        ));
-        screen.apply(UiEvent::ToolResult {
-            call: call_args("read", json!({ "path": "src/ui/tui.rs" })),
-            content: "ignored file body".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-        screen.apply(UiEvent::ToolResult {
-            call: call_args("bash", json!({ "command": "true" })),
-            content: String::new(),
-            exit_code: None,
-            duration: None,
-        });
-        let lines = screen.wrapped_lines(80);
-        let text_column = line_text(
-            lines
-                .iter()
-                .find(|line| line_text(line).contains("Hi"))
-                .expect("user line"),
-        )
-        .find("Hi")
-        .expect("user text");
-
-        for needle in ["Hey!", "\u{2022} Explored", "\u{2022} Ran true"] {
-            let rendered = line_text(
-                lines
-                    .iter()
-                    .find(|line| line_text(line).contains(needle))
-                    .expect(needle),
-            );
-            assert_eq!(rendered.find(needle).expect(needle), text_column);
-        }
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn bash_tool_result_uses_codex_style_gutters() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::ToolResult {
-            call: call_args("bash", json!({ "command": "echo hi" })),
-            content: "a\nb".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
-        assert!(texts.iter().any(|t| t == "• Ran echo hi"));
-        assert!(texts.iter().any(|t| t == "  └ a"));
-        assert!(texts.iter().any(|t| t == "    b"));
-        assert!(!texts.iter().any(|t| t.starts_with("[ok]")));
     }
 
     #[test]
@@ -3229,31 +3332,6 @@ mod tests {
         assert_eq!(red.style, Style::default().fg(Color::Red));
         let plain = span_matching(output, |span| span.content.as_ref() == " plain");
         assert_eq!(plain.style.fg, Some(MUTED));
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn committed_user_block_carries_inset_background() {
-        // The shaded user block stays replayable, with the background inset
-        // from the terminal edges and text padded inside the box.
-        let mut screen = Screen::new();
-        screen.commit_user("hello");
-        let lines = screen.wrapped_lines(20);
-        let row = lines
-            .iter()
-            .find(|l| line_text(l).contains("hello"))
-            .expect("user row rendered from state");
-        assert_eq!(row.style.bg, None);
-        assert_eq!(display_width(&line_text(row)), 20);
-        assert_eq!(background_width(row, USER_BG), 16);
-        assert_eq!(row.spans.first().unwrap().style.bg, None);
-        assert_eq!(row.spans.last().unwrap().style.bg, None);
-        assert!(
-            row.spans
-                .iter()
-                .all(|s| s.style.bg.is_none() || s.style.bg == Some(USER_BG)),
-            "only the inset box carries the shaded background: {row:?}"
-        );
     }
 
     #[test]
@@ -3399,21 +3477,6 @@ mod tests {
         assert!(shown <= MAX_TOOL_OUTPUT_ROWS, "{texts:?}");
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn empty_tool_output_shows_no_output_line() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::ToolResult {
-            call: call_args("bash", json!({ "command": "true" })),
-            content: String::new(),
-            exit_code: None,
-            duration: None,
-        });
-        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
-        assert!(texts.iter().any(|t| t == "• Ran true"));
-        assert!(texts.iter().any(|t| t == "  └ (no output)"));
-    }
-
     #[test]
     fn approval_hint_names_tool_target() {
         let mut screen = Screen::new();
@@ -3422,6 +3485,29 @@ mod tests {
         assert!(line_text(&lines[0]).contains("approve echo hi"));
         assert!(line_text(&lines[0]).contains("[y] once"));
         assert!(line_text(&lines[0]).contains("[N] deny"));
+    }
+
+    #[test]
+    fn approval_and_working_lines_stay_bounded_at_tiny_widths() {
+        let hint = ApprovalHint {
+            target: "run an extremely long command".to_string(),
+            options: "[y] once  [N] deny",
+        };
+        for width in 1..=4 {
+            for line in approval_status_lines(&hint, width) {
+                assert!(
+                    display_width(&line_text(&line)) <= width,
+                    "width {width}: {line:?}"
+                );
+            }
+            for line in working_lines(SPINNER_FRAMES[0], Some(Duration::from_secs(1)), None, width)
+            {
+                assert!(
+                    display_width(&line_text(&line)) <= width,
+                    "width {width}: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3446,9 +3532,9 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 48, 12);
         assert!(rendered.contains("approve printf 'global:"));
-        assert!(rendered.contains("  │ "));
         assert!(rendered.contains("120s)"), "{rendered}");
         assert!(rendered.contains("[N] deny"), "{rendered}");
+        assert!(!rendered.contains(COMPOSER_HINT), "{rendered}");
         assert!(
             !rendered.contains("Ask the agent anything..."),
             "{rendered}"
@@ -3464,21 +3550,50 @@ mod tests {
     }
 
     #[test]
-    fn approval_record_styles_only_marker_green() {
+    fn approval_record_renders_as_approval_panel_with_green_marker() {
         let mut screen = Screen::new();
         screen.record_approval(
             &call_args("bash", json!({ "command": "echo hi" })),
             ApprovalDecision::Allow,
         );
+        assert!(screen.transcript.rows.iter().any(|row| matches!(
+            row.chrome.as_ref(),
+            Some(ChromeRow::Header {
+                title: "APPROVAL",
+                ..
+            })
+        )));
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("APPROVAL"), "{rendered}");
+        assert!(
+            rendered.contains("You approved iris to run echo hi this time"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("┌"), "{rendered}");
+        assert!(rendered.contains("└"), "{rendered}");
+
         let lines = screen.wrapped_lines(80);
         let line = line_matching(&lines, |line| line_text(line).contains("You approved"));
         let marker = span_matching(line, |span| span.content.as_ref() == "✔");
         assert_eq!(marker.style, ok_style());
-        assert_eq!(
-            line.spans[2].content.as_ref(),
-            " You approved iris to run echo hi this time"
-        );
-        assert_eq!(line.spans[2].style, Style::default());
+    }
+
+    #[test]
+    fn tool_denial_renders_as_approval_panel_with_red_marker() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolDenied(call_args(
+            "bash",
+            json!({ "command": "echo hi" }),
+        )));
+
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("APPROVAL"), "{rendered}");
+        assert!(rendered.contains("DENIED"), "{rendered}");
+        assert!(rendered.contains("✗ Denied echo hi"), "{rendered}");
+        let lines = screen.wrapped_lines(80);
+        let line = line_matching(&lines, |line| line_text(line).contains("Denied echo hi"));
+        let marker = span_matching(line, |span| span.content.as_ref() == "✗");
+        assert_eq!(marker.style, err_style());
     }
 
     #[test]
@@ -3496,152 +3611,6 @@ mod tests {
             .find(|span| span.content.as_ref() == "red")
             .expect("red span");
         assert_eq!(red.style, Style::default().fg(Color::Red));
-    }
-
-    #[ignore = "obsolete loose exploration visual assertion; exploration output is now framed"]
-    #[test]
-    fn read_only_tool_results_group_as_explored() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::ToolResult {
-            call: call("read"),
-            content: "ignored file body".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-        screen.apply(UiEvent::ToolResult {
-            call: call_args("grep", json!({ "pattern": "needle", "path": "src" })),
-            content: "ignored grep body".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
-        assert_eq!(
-            texts,
-            vec![
-                "• Explored".to_string(),
-                "  └ Read note.txt".to_string(),
-                "  └ Search needle in src".to_string(),
-            ]
-        );
-    }
-
-    #[ignore = "obsolete loose exploration visual assertion; exploration output is now framed"]
-    #[test]
-    fn exploration_tool_start_names_target_live_and_finalizes_in_place() {
-        let mut screen = Screen::new();
-        screen.start_turn();
-        let read = call_args("read", json!({ "path": "src/ui/tui.rs" }));
-
-        screen.apply(UiEvent::ToolStarted(read.clone()));
-        let live: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
-        assert_eq!(
-            live,
-            vec![
-                "• Explored".to_string(),
-                "  └ Reading src/ui/tui.rs".to_string(),
-            ]
-        );
-        assert!(
-            screen
-                .wrapped_lines(80)
-                .iter()
-                .any(|line| line_text(line).contains("Reading src/ui/tui.rs"))
-        );
-
-        screen.apply(UiEvent::ToolResult {
-            call: read,
-            content: "ignored file body".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-        let done: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
-        assert_eq!(
-            done,
-            vec![
-                "• Explored".to_string(),
-                "  └ Read src/ui/tui.rs".to_string(),
-            ]
-        );
-    }
-
-    #[ignore = "obsolete loose exploration visual assertion; exploration output is now framed"]
-    #[test]
-    fn long_exploration_rows_keep_gutter_when_wrapped() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::ToolResult {
-            call: call_args(
-                "grep",
-                json!({
-                    "pattern": "bordered editor|editor box|editor borders|borderless|shaded editor",
-                    "path": "src/ui",
-                    "glob": "tui.rs",
-                }),
-            ),
-            content: "ignored grep body".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-
-        let lines: Vec<String> = screen.wrapped_lines(36).iter().map(line_text).collect();
-        let first = lines
-            .iter()
-            .find(|line| line.contains("Search"))
-            .expect("search row");
-        assert!(first.starts_with("      └ "), "{lines:?}");
-        assert!(
-            lines
-                .iter()
-                .filter(|line| line.starts_with("        "))
-                .count()
-                > 0,
-            "wrapped search row lost continuation gutter: {lines:?}"
-        );
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn long_run_header_wraps_with_vertical_gutter() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::ToolResult {
-            call: call_args(
-                "bash",
-                json!({ "command": "node -e 'const fs=require(\"fs\"); const p=\"CHANGELOG.md\"; console.log(p)'" }),
-            ),
-            content: String::new(),
-            exit_code: None,
-            duration: None,
-        });
-        let lines: Vec<String> = screen.wrapped_lines(34).iter().map(line_text).collect();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.starts_with("    • Ran node -e"))
-        );
-        assert!(lines.iter().any(|line| line.starts_with("      │ ")));
-        assert!(lines.iter().any(|line| line == "      └ (no output)"));
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn long_run_header_gutter_does_not_inherit_bold() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::ToolResult {
-            call: call_args(
-                "bash",
-                json!({ "command": "rm -rf tmp && mkdir -p tmp && printf 'Created tmp directory\\n' && pwd && ls -ld tmp", "timeout": 120 }),
-            ),
-            content: "Created tmp directory\n/home/someotherguy/projects/iris-tool-output\ndrwxrwxr-x 2 someotherguy someotherguy 4096 Jun 17 23:59 tmp".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-        let lines = screen.wrapped_lines(80);
-        let continuation = line_matching(&lines, |line| line_text(line).starts_with("      │ "));
-        assert_eq!(continuation.spans.len(), 3);
-        assert_eq!(continuation.spans[0].content.as_ref(), "    ");
-        assert_eq!(continuation.spans[0].style, Style::default());
-        assert_eq!(continuation.spans[1].content.as_ref(), "  │ ");
-        assert_eq!(continuation.spans[1].style, dim_style());
-        assert_eq!(continuation.spans[2].style, tool_header_style());
     }
 
     #[test]
@@ -3727,7 +3696,6 @@ mod tests {
         assert_eq!(remove2.style, err_style());
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn transcript_history_stays_in_state_for_replay_after_turn_end() {
         let mut screen = Screen::new();
@@ -3739,7 +3707,11 @@ mod tests {
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("first answer"), "{rendered:?}");
         assert!(rendered.contains("a note"), "{rendered:?}");
-        assert!(rendered.contains("message"), "editor missing: {rendered:?}");
+        assert!(
+            rendered.contains("Give iris a task"),
+            "composer missing: {rendered:?}"
+        );
+        assert!(!rendered.contains("AGENT"), "{rendered:?}");
         assert!(
             screen
                 .transcript
@@ -3750,7 +3722,6 @@ mod tests {
         );
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn surface_draw_path_replays_history_from_state() -> std::io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
@@ -3770,11 +3741,14 @@ mod tests {
         screen.end_turn();
         surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
 
-        let replay = surface.state().previous_lines.join("\n");
+        let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert!(replay.contains("hello there"), "{replay:?}");
-        assert!(replay.contains("Done"), "{replay:?}");
-        assert!(replay.contains("Ran echo hi"), "{replay:?}");
-        assert!(replay.contains("message"), "{replay:?}");
+        assert!(replay.contains("● Done"), "{replay:?}");
+        assert!(replay.contains("SHELL"), "{replay:?}");
+        assert!(replay.contains("$ echo hi"), "{replay:?}");
+        assert!(replay.contains("Give iris a task"), "{replay:?}");
+        assert!(!replay.contains("USER"), "{replay:?}");
+        assert!(!replay.contains("AGENT"), "{replay:?}");
         assert!(
             screen
                 .transcript
@@ -3816,7 +3790,7 @@ mod tests {
     }
 
     #[test]
-    fn instrument_top_rail_and_editor_match_visual_spec() {
+    fn global_status_rail_and_composer_match_pane_spec() {
         let mut screen = Screen::new();
         screen.set_footer(
             "sonnet 3.5".to_string(),
@@ -3830,13 +3804,16 @@ mod tests {
         assert!(rendered.contains("EFFORT high"));
         assert!(rendered.contains("CWD ~/workspace/user-auth"));
         assert!(rendered.contains("BRANCH feat/rate-limit"));
+        assert!(!rendered.contains("CONTEXT 128k"));
+        assert!(!rendered.contains("APPROVAL auto"));
         assert!(rendered.contains("┌"));
-        assert!(rendered.contains("Ask the agent anything..."));
+        assert!(rendered.contains("Give iris a task..."));
+        assert!(!rendered.contains("Ask the agent anything..."));
         assert!(rendered.contains("↵ to send  •  shift+↵ for new line  •  / for commands"));
     }
 
     #[test]
-    fn status_rail_is_pinned_with_editor_chrome_not_scrollback() {
+    fn global_status_rail_is_pinned_with_composer_chrome_not_scrollback() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
@@ -3855,14 +3832,20 @@ mod tests {
             .expect("status rail remains visible");
         let editor_idx = texts
             .iter()
-            .position(|line| line.contains("Ask the agent anything"))
-            .expect("editor remains visible");
+            .position(|line| line.contains("Give iris a task"))
+            .expect("composer remains visible");
         assert!(rail_idx < editor_idx, "{texts:?}");
         assert!(texts[rail_idx].contains("BRANCH feat/pin-rail"));
+        assert!(
+            !texts
+                .last()
+                .is_some_and(|line| line.contains("MODEL") || line.contains("tokens")),
+            "{texts:?}"
+        );
     }
 
     #[test]
-    fn working_panel_keeps_spinner_usage_and_effort() {
+    fn inline_working_indicator_keeps_spinner_usage_interrupt_hint_and_effort() {
         let mut screen = Screen::new();
         screen.set_footer(
             "opus-4.8".to_string(),
@@ -3887,14 +3870,26 @@ mod tests {
         screen.start_turn();
 
         let before = rendered_text(&mut screen, 100, 16);
-        assert!(before.contains("WORKING"), "{before}");
+        assert!(!before.contains("WORKING"), "{before}");
         assert!(before.contains(SPINNER_FRAMES[0]), "{before}");
-        assert!(before.contains("last turn ↓ 404 tokens"), "{before}");
+        assert!(before.contains("Working…"), "{before}");
+        assert!(before.contains("esc to interrupt"), "{before}");
+        assert!(before.contains("↓ 404 tokens"), "{before}");
         assert!(before.contains("thinking with high effort"), "{before}");
 
         assert!(screen.tick());
         let after = rendered_text(&mut screen, 100, 16);
         assert!(after.contains(SPINNER_FRAMES[1]), "{after}");
+        let working = screen
+            .working_lines(100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !working.contains('┌'),
+            "working indicator must not be framed: {working}"
+        );
     }
 
     #[test]
@@ -3948,6 +3943,157 @@ mod tests {
     }
 
     #[test]
+    fn active_shell_delta_and_finalize_preserve_interleaved_rows() {
+        let mut screen = Screen::new();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::Notice("interleaved note".to_string()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "hi\n".to_string(),
+        });
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(3)),
+        });
+
+        let rendered = rendered_text(&mut screen, 100, 18);
+        assert!(rendered.contains("SHELL"), "{rendered}");
+        assert!(rendered.contains("● DONE"), "{rendered}");
+        assert!(rendered.contains("$ echo hi"), "{rendered}");
+        assert!(rendered.contains("hi"), "{rendered}");
+        assert!(rendered.contains("note: interleaved note"), "{rendered}");
+        assert!(!rendered.contains("RUNNING"), "{rendered}");
+    }
+
+    #[test]
+    fn exploration_tool_error_stays_inside_explore_panel() {
+        let mut screen = Screen::new();
+        let call = call_args("read", json!({ "path": "src/missing.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolError {
+            call,
+            message: "not found".to_string(),
+        });
+
+        let rows = &screen.transcript.rows;
+        let header = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Header {
+                        title: "EXPLORE",
+                        ..
+                    })
+                )
+            })
+            .expect("explore header");
+        let error = rows
+            .iter()
+            .position(|row| row.text.contains("error: not found"))
+            .expect("error body");
+        let bottom = rows
+            .iter()
+            .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)))
+            .expect("bottom border");
+        assert!(
+            header < error && error < bottom,
+            "error must stay inside panel"
+        );
+    }
+
+    #[test]
+    fn concurrent_explorations_share_one_header_with_aggregate_state() {
+        let mut screen = Screen::new();
+        let read = call_args("read", json!({ "path": "src/missing.rs" }));
+        let mut grep = call_args("grep", json!({ "pattern": "needle", "path": "src" }));
+        grep.id = "call_2".to_string();
+
+        screen.apply(UiEvent::ToolStarted(read.clone()));
+        screen.apply(UiEvent::ToolStarted(grep.clone()));
+        screen.apply(UiEvent::ToolError {
+            call: read,
+            message: "not found".to_string(),
+        });
+        let running = rendered_text(&mut screen, 100, 16);
+        assert!(running.contains("EXPLORE"), "{running}");
+        assert!(running.contains("RUNNING"), "{running}");
+        assert!(!running.contains("ERROR       00:00:00s\n├"), "{running}");
+
+        screen.apply(UiEvent::ToolResult {
+            call: grep,
+            content: "src/main.rs:needle".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        let rows = &screen.transcript.rows;
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Top)))
+                .count(),
+            1,
+            "started explorations should share one panel"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Header {
+                        title: "EXPLORE",
+                        ..
+                    })
+                ))
+                .count(),
+            1,
+            "started explorations should share one header"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Separator)))
+                .count(),
+            1,
+            "started explorations should share one separator"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)))
+                .count(),
+            1,
+            "started explorations should share one bottom border"
+        );
+        let state = rows
+            .iter()
+            .find_map(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::Header { title, right, .. }) if *title == "EXPLORE" => Some(
+                    right
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("explore header state");
+        assert!(state.contains("ERROR"), "{state:?}");
+        assert!(!state.contains("RUNNING"), "{state:?}");
+        let body_texts: Vec<&str> = rows
+            .iter()
+            .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Body { .. })))
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(body_texts.len(), 2, "{body_texts:?}");
+        assert!(body_texts.contains(&"error: not found"), "{body_texts:?}");
+        assert!(
+            body_texts.iter().any(|text| text.contains("Search needle")),
+            "{body_texts:?}"
+        );
+    }
+
+    #[test]
     fn explore_panel_keeps_bottom_border_when_grouping_results() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolResult {
@@ -3984,14 +4130,18 @@ mod tests {
     }
 
     #[test]
-    fn submitted_prompt_renders_as_unboxed_user_role_row() {
+    fn submitted_prompt_renders_as_plain_unboxed_user_text() {
         let mut screen = Screen::new();
         screen.commit_user("Add rate limiting to the login endpoint.");
         let rendered = rendered_text(&mut screen, 96, 14);
 
         assert!(!rendered.contains("TASK"));
-        assert!(rendered.contains("USER      Add rate limiting to the login endpoint."));
-        assert!(!rendered.contains("│  USER"));
+        assert!(!rendered.contains("USER"), "{rendered}");
+        assert!(
+            rendered.contains("    Add rate limiting to the login endpoint."),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("│  Add rate limiting"));
     }
 
     #[test]
@@ -4013,16 +4163,189 @@ mod tests {
         let rendered = rendered_text(&mut screen, 110, 24);
 
         assert!(rendered.contains("SHELL"));
-        assert!(rendered.contains("zsh"));
+        assert!(rendered.contains("bash"));
         assert!(rendered.contains("● DONE"));
         assert!(rendered.contains("$ pnpm test --filter user.auth"));
         assert!(rendered.contains("PASS    test/auth.service.test.ts"));
         assert!(rendered.contains("EDIT"));
+        assert!(rendered.contains("PREVIEW"), "{rendered}");
+        assert!(!rendered.contains("RUNNING"), "{rendered}");
         assert!(rendered.contains("packages/user.auth/src/auth.service.ts"));
         assert!(rendered.contains("-  |  old"));
         assert!(rendered.contains("+  |  new"));
         assert!(!rendered.contains("--- a/file"));
         assert!(!rendered.contains("@@ -1 +1 @@"));
+    }
+
+    #[test]
+    fn diff_preview_denial_leaves_no_stale_running_panel() {
+        let mut screen = Screen::new();
+        let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
+        screen.apply(UiEvent::DiffPreview {
+            call: call.clone(),
+            diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        });
+        screen.apply(UiEvent::ToolDenied(call));
+
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(rendered.contains("PREVIEW"), "{rendered}");
+        assert!(rendered.contains("DENIED"), "{rendered}");
+        assert!(!rendered.contains("RUNNING"), "{rendered}");
+    }
+
+    #[test]
+    fn unsourced_global_status_fields_are_not_rendered() {
+        let mut screen = Screen::new();
+        let rendered = rendered_text(&mut screen, 80, 10);
+
+        assert!(!rendered.contains("MODEL model"), "{rendered}");
+        assert!(!rendered.contains("EFFORT -"), "{rendered}");
+        assert!(!rendered.contains("CWD ~"), "{rendered}");
+        assert!(!rendered.contains("BRANCH -"), "{rendered}");
+    }
+
+    #[test]
+    fn sourced_global_status_omits_unknown_effort_and_branch() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        let rendered = rendered_text(&mut screen, 100, 10);
+
+        assert!(rendered.contains("MODEL gpt-5.5"), "{rendered}");
+        assert!(rendered.contains("CWD ~/repo"), "{rendered}");
+        assert!(!rendered.contains("EFFORT"), "{rendered}");
+        assert!(!rendered.contains("BRANCH"), "{rendered}");
+    }
+
+    #[test]
+    fn sourced_global_status_separates_model_and_effort() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            "~/repo".to_string(),
+        );
+        let rendered = rendered_text(&mut screen, 100, 10);
+
+        assert!(rendered.contains("MODEL gpt-5.5"), "{rendered}");
+        assert!(rendered.contains("EFFORT high"), "{rendered}");
+        assert!(!rendered.contains("MODEL gpt-5.5 high"), "{rendered}");
+    }
+
+    #[test]
+    fn tiny_panel_rows_are_width_safe_with_visible_border_glyphs() {
+        for width in 1..=5 {
+            let rows = vec![
+                panel_rule_line(width, '┌', '┐'),
+                panel_header_line(
+                    width,
+                    true,
+                    "SHELL",
+                    "bash",
+                    &[
+                        ("●".to_string(), prompt_style()),
+                        (" DONE".to_string(), panel_style()),
+                    ],
+                ),
+                panel_body_line(
+                    width,
+                    Line::from(Span::styled("body".to_string(), panel_style())),
+                    None,
+                ),
+            ];
+            for row in rows {
+                let text = line_text(&row);
+                assert!(display_width(&text) <= width, "width {width}: {row:?}");
+                assert!(
+                    text.contains('┌')
+                        || text.contains('┐')
+                        || text.contains('│')
+                        || text.contains('└')
+                        || text.contains('┘'),
+                    "width {width}: a tiny panel row should show the clearest possible border glyph: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trim_history_never_leaves_orphan_panel_rows() {
+        let mut transcript = Transcript::default();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        transcript.push_shell_panel(&call, "hi", false, false, None, None);
+        for i in 0..MAX_TRANSCRIPT_ROWS.saturating_sub(2) {
+            transcript
+                .rows
+                .push(TranscriptRow::new(format!("plain {i}"), panel_style()));
+        }
+        assert!(transcript.rows.len() > MAX_TRANSCRIPT_ROWS);
+
+        transcript.trim_history();
+
+        assert!(transcript.rows.len() <= MAX_TRANSCRIPT_ROWS);
+        assert!(
+            !matches!(
+                transcript.rows.first().and_then(|row| row.chrome.as_ref()),
+                Some(
+                    ChromeRow::Header { .. }
+                        | ChromeRow::Separator
+                        | ChromeRow::Body { .. }
+                        | ChromeRow::Bottom
+                )
+            ),
+            "trim left an orphan panel row at the start"
+        );
+        let mut in_panel = false;
+        for row in &transcript.rows {
+            match row.chrome.as_ref() {
+                Some(ChromeRow::Top) => {
+                    assert!(!in_panel, "nested panel start");
+                    in_panel = true;
+                }
+                Some(ChromeRow::Header { .. } | ChromeRow::Separator | ChromeRow::Body { .. }) => {
+                    assert!(in_panel, "orphan panel interior: {:?}", row.text);
+                }
+                Some(ChromeRow::Bottom) => {
+                    assert!(in_panel, "orphan panel bottom");
+                    in_panel = false;
+                }
+                None => assert!(!in_panel, "plain row inside panel: {:?}", row.text),
+            }
+        }
+        assert!(!in_panel, "trim left an unterminated panel");
+    }
+
+    #[test]
+    fn bordered_panel_rows_are_equal_width_and_narrow_width_safe() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args(
+                "bash",
+                json!({ "command": "printf very-long-command-name-that-wraps" }),
+            ),
+            content: "line one\nline two".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_secs(71)),
+        });
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("read", json!({ "path": "src/very/long/path/name.rs" })),
+            content: "ignored".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        for width in [34u16, 96] {
+            let lines = screen.wrapped_lines(width);
+            let texts: Vec<String> = lines.iter().map(line_text).collect();
+            for text in texts.iter().filter(|text| {
+                text.contains('┌') || text.contains('│') || text.contains('├') || text.contains('└')
+            }) {
+                assert_eq!(
+                    display_width(text),
+                    usize::from(width),
+                    "width {width}: {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4047,6 +4370,8 @@ mod tests {
 
         assert!(rendered.contains("┌"));
         assert!(rendered.contains("EXPLORE"));
+        assert!(!rendered.contains("READ"), "{rendered}");
+        assert!(!rendered.contains("GREP"), "{rendered}");
         assert!(rendered.contains("src/tool_display.rs"));
         assert!(rendered.contains("Read src/tool_display.rs"));
         assert!(rendered.contains("Search DiffPreview in src/ui (*.rs)"));
@@ -4055,53 +4380,55 @@ mod tests {
     }
 
     #[test]
-    fn mutating_non_bash_tools_render_as_tool_panels_not_shell() {
+    fn mutating_non_bash_tools_render_as_edit_panels_not_shell() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolResult {
-            call: call_args("edit", json!({ "file_path": "/tmp/demo.txt" })),
-            content: "Successfully replaced 1 occurrence in /tmp/demo.txt.".to_string(),
+            call: call_args("write", json!({ "path": "/tmp/demo.txt" })),
+            content: "Wrote /tmp/demo.txt.".to_string(),
             exit_code: None,
             duration: Some(Duration::from_millis(3)),
         });
         let rendered = rendered_text(&mut screen, 100, 12);
 
         assert!(rendered.contains("EDIT"), "{rendered}");
+        assert!(!rendered.contains("WRITE"), "{rendered}");
         assert!(rendered.contains("/tmp/demo.txt"), "{rendered}");
-        assert!(rendered.contains("Successfully replaced 1 occurrence"));
+        assert!(rendered.contains("Wrote /tmp/demo.txt"));
         assert!(!rendered.contains("SHELL"), "{rendered}");
-        assert!(!rendered.contains("$ edit"), "{rendered}");
+        assert!(!rendered.contains("$ write"), "{rendered}");
     }
 
     #[test]
-    fn pasted_terminal_frames_inside_user_prompt_wrap_under_role_rail() {
+    fn pasted_terminal_frames_inside_user_prompt_wrap_as_plain_text() {
         let mut screen = Screen::new();
         screen.commit_user(
             "┌────────────────────────────────────────────────────────────────────────────┐\n\
-             │ ▾  SHELL    zsh                                      ● DONE        0ms   ▣│\n\
+             │ ▾  SHELL    bash                                     ● DONE        0ms   ▣│\n\
              ├────────────────────────────────────────────────────────────────────────────┤\n\
              │  $ edit /tmp/demo.txt                                                     │\n\
              └────────────────────────────────────────────────────────────────────────────┘",
         );
         let lines: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
+        let joined = lines.join("\n");
 
-        assert!(lines.first().is_some_and(|line| line.starts_with("USER")));
+        assert!(!joined.contains("USER"), "{joined}");
+        assert!(
+            lines.first().is_some_and(|line| line.starts_with("    ┌")),
+            "{lines:?}"
+        );
         for line in &lines {
             assert!(
                 display_width(line) <= 80,
                 "user prompt row exceeds width: {line:?}"
             );
             if !line.is_empty() {
-                assert!(
-                    line.starts_with("USER") || line.starts_with("          "),
-                    "{line:?}"
-                );
+                assert!(line.starts_with("    "), "{line:?}");
             }
         }
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn repeated_resize_does_not_duplicate_editor_shadow() -> std::io::Result<()> {
+    fn repeated_resize_does_not_duplicate_composer_placeholder() -> std::io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         let mut screen = Screen::new();
         screen.apply(UiEvent::SessionStarted);
@@ -4114,13 +4441,11 @@ mod tests {
         }
 
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
-        // The borderless editor draws its placeholder exactly once: no duplicated
-        // editor shadow lingering from a previous, larger frame.
-        assert_eq!(replay.matches("Type a message").count(), 1, "{replay:?}");
+        assert_eq!(replay.matches("Give iris a task").count(), 1, "{replay:?}");
+        assert!(!replay.contains("Ask the agent anything"), "{replay:?}");
         Ok(())
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn shrinking_palette_and_modal_content_clears_old_rows() -> std::io::Result<()> {
         use crate::mimir::model_catalog::CatalogModel;
@@ -4158,7 +4483,7 @@ mod tests {
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert_ne!(stats.kind, RenderKind::Unchanged);
         assert!(!replay.contains("GPT 5.5"), "{replay:?}");
-        assert!(replay.contains("message"), "{replay:?}");
+        assert!(replay.contains("Give iris a task"), "{replay:?}");
         Ok(())
     }
 
@@ -4197,14 +4522,12 @@ mod tests {
         assert_eq!(screen.editor_text(), "alpha\n");
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn modal_render_survives_a_tiny_terminal() {
         use crate::mimir::model_catalog::CatalogModel;
         use crate::mimir::selection::ProviderId;
         use crate::ui::modal::{Modal, ModelPicker};
 
-        // A 3-row (and 2-row) terminal must not panic on the modal height clamp.
         for height in [2u16, 3, 4] {
             let mut screen = Screen::new();
             screen.open_modal(Modal::Model(ModelPicker::new(
@@ -4220,9 +4543,8 @@ mod tests {
         }
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn open_modal_renders_plain_picker_above_editor() {
+    fn open_modal_renders_plain_picker_above_composer() {
         use crate::mimir::model_catalog::CatalogModel;
         use crate::mimir::selection::ProviderId;
         use crate::ui::modal::{Modal, ModelPicker};
@@ -4247,18 +4569,16 @@ mod tests {
         )));
 
         let rendered = rendered_text(&mut screen, 60, 14);
-        // Transcript still on top; the menu renders above the editor.
         assert!(rendered.contains("prior reply"), "{rendered}");
         assert!(rendered.contains("GPT 5.5"), "{rendered}");
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
-        assert!(rendered.contains("Type a message"), "{rendered}");
+        assert!(rendered.contains("Give iris a task"), "{rendered}");
         let model_idx = rendered.find("GPT 5.5").expect("model row");
-        let editor_idx = rendered.find("Type a message").expect("editor row");
+        let editor_idx = rendered.find("Give iris a task").expect("composer row");
         assert!(model_idx < editor_idx, "{rendered}");
         assert!(!rendered.contains("Select model"), "{rendered}");
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn open_modal_has_room_for_model_picker_footer() {
         use crate::mimir::model_catalog;
@@ -4275,144 +4595,21 @@ mod tests {
         let rendered = rendered_text(&mut screen, 80, 16);
         assert!(rendered.contains("Haiku 4.5"), "{rendered}");
         assert!(rendered.contains("xhigh effort"), "{rendered}");
-        assert!(rendered.contains("Enter to set as default"), "{rendered}");
-        assert!(rendered.contains("Type a message"), "{rendered}");
+        assert!(rendered.contains("Reasoning"), "{rendered}");
+        assert!(rendered.contains("Give iris a task"), "{rendered}");
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn frame_pins_editor_box_below_transcript() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::AssistantText("hello world".to_string()));
-        screen.editor.insert_str("hi");
-
-        let lines = rendered_lines(&mut screen, 40, 8);
-        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("hello world"));
-        // The editor text sits in the shaded input box near the bottom; the old
-        // bordered frame is gone.
-        assert!(rendered.contains("hi"));
-        assert!(
-            !rendered.contains("┌ message"),
-            "bordered editor frame should be gone: {rendered}"
-        );
-        // The editor box sits above the bottom status row; its bottom pad row
-        // is shaded, followed immediately by an inset divider and then status.
-        let bottom_idx = lines
-            .iter()
-            .rposition(|line| line.spans.iter().any(|s| s.style.bg == Some(USER_BG)))
-            .expect("editor box row");
-        let bottom = &lines[bottom_idx];
-        assert!(
-            bottom.spans.iter().any(|s| s.style.bg == Some(USER_BG)),
-            "editor pad row should be shaded: {bottom:?}"
-        );
-        let divider = &lines[bottom_idx + 1];
-        assert_eq!(line_text(divider), format!("  {}  ", "\u{2500}".repeat(36)));
-        assert_eq!(divider.spans[1].style.fg, Some(Color::DarkGray));
-        assert_ne!(divider.spans[1].style.bg, Some(USER_BG));
-        // Idle status hint is shown when no turn runs (the long hint is
-        // truncated at this narrow test width, so assert its leading words).
-        assert!(line_text(&lines[bottom_idx + 2]).contains("enter send"));
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn long_editor_line_wraps_instead_of_scrolling_right() {
+    fn long_composer_line_wraps_instead_of_scrolling_right() {
         let mut screen = Screen::new();
         screen.editor.insert_str("abcdefghijklmnopqrst");
 
         let rendered = rendered_text(&mut screen, 18, 8);
-        // The editor reserves two text columns on each side, so a 20-cell word
-        // wraps inside a 14-cell text area instead of scrolling right.
-        assert!(rendered.contains("    abcdefghij"));
-        assert!(rendered.contains("    klmnopqrst"));
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn frame_shows_spinner_while_turn_active() {
-        let mut screen = Screen::new();
-        screen.set_footer(
-            "opus-4.8 high".to_string(),
-            Some("high".to_string()),
-            "~/repo (branch)".to_string(),
-        );
-        screen.apply(UiEvent::ProviderTurnCompleted {
-            turn_id: "turn_1".to_string(),
-            response_id: Some("resp_1".to_string()),
-            usage: Some(ProviderUsage {
-                provider: "anthropic".to_string(),
-                model: "opus-4.8".to_string(),
-                input_tokens: 300,
-                output_tokens: 104,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-                reasoning_output_tokens: 30,
-                total_tokens: 404,
-                cache_creation: None,
-            }),
-        });
-        screen.start_turn();
-        let before = rendered_lines(&mut screen, 80, 10);
-        let working_idx = before
-            .iter()
-            .position(|line| line_text(line).contains("Working"))
-            .expect("working indicator");
-        assert!(line_text(&before[working_idx - 1]).trim().is_empty());
-        assert!(line_text(&before[working_idx + 1]).trim().is_empty());
-        let working = line_text(&before[working_idx]);
-        assert!(
-            working.starts_with("    \u{280b} Working\u{2026}"),
-            "{working}"
-        );
-        let working_status = line_text(&screen.working_lines(80)[1]);
-        assert!(display_width(&working_status) <= 76, "{working_status}");
-        assert!(working.contains("0s"), "{working}");
-        assert!(working.contains("\u{2193} 404 tokens"), "{working}");
-        assert!(working.contains("thinking with high effort"), "{working}");
-
-        // A tick advances the spinner glyph (animation), idle does not.
-        let glyph0 = SPINNER_FRAMES[0];
-        assert!(working.contains(glyph0));
-        assert!(screen.tick());
-        let after = rendered_text(&mut screen, 64, 10);
-        assert!(after.contains(SPINNER_FRAMES[1]));
-
-        screen.end_turn();
-        assert!(!screen.tick());
-        let idle = rendered_text(&mut screen, 40, 8);
-        assert!(
-            idle.contains("opus-4.8 high"),
-            "footer replaces the spinner"
-        );
-        assert!(!idle.contains("Working"), "spinner cleared on turn end");
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn footer_replaces_idle_hint_when_set() {
-        let mut screen = Screen::new();
-        // No footer wired: the keybind hint shows.
-        let idle_hint = line_text(&screen.status_lines(80)[0]);
-        assert!(idle_hint.contains("enter send"));
-        assert!(display_width(&idle_hint) <= 76, "{idle_hint}");
-        screen.set_footer(
-            "gpt-5.5 xhigh".to_string(),
-            Some("xhigh".to_string()),
-            "~".to_string(),
-        );
-        let lines = screen.status_lines(80);
-        assert_eq!(lines.len(), 2);
-        let cwd = line_text(&lines[0]);
-        let model = line_text(&lines[1]);
-        assert!(cwd.starts_with("    "), "{cwd}");
-        assert!(cwd.contains('~'), "{cwd}");
-        assert!(model.contains("gpt-5.5 xhigh"), "{model}");
-        assert_eq!(display_width(&model), 76, "{model}");
-        assert!(model.ends_with("gpt-5.5 xhigh"), "{model}");
-        assert!(!cwd.contains("enter send"), "{cwd}");
-        assert!(!model.contains("enter send"), "{model}");
+        assert!(rendered.contains("abcdefghij"), "{rendered}");
+        assert!(rendered.contains("klmnopqrst"), "{rendered}");
+        for line in rendered.lines() {
+            assert!(display_width(line) <= 18, "{line:?}");
+        }
     }
 
     #[test]
@@ -4461,91 +4658,24 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(early.contains("WORKING"), "{early}");
-        assert!(early.contains("00:00:05s"), "{early}");
+        assert!(!early.contains("WORKING"), "{early}");
+        assert!(!early.contains("00:00:05s"), "{early}");
         assert!(early.contains("5s"), "{early}");
+        assert!(early.contains("esc to interrupt"), "{early}");
 
         let zero = working_lines("\u{280b}", None, None, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(zero.contains("00:00:00s"), "{zero}");
+        assert!(zero.contains("0s"), "{zero}");
 
         let over = working_lines("\u{280b}", Some(Duration::from_secs(71)), None, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(over.contains("00:01:11s"), "{over}");
         assert!(over.contains("1m 11s"), "{over}");
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn user_message_renders_shaded_box_without_prompt_glyph() {
-        let mut screen = Screen::new();
-        screen.commit_user("hello\nworld");
-        let lines = screen.wrapped_lines(20);
-        let first = line_matching(&lines, |l| line_text(l).contains("hello"));
-        // No prompt glyph: the text is inset inside an inset shaded box.
-        assert_eq!(first.spans[0].content.as_ref(), "  ");
-        assert_eq!(first.spans[0].style.bg, None);
-        assert_eq!(first.spans[1].content.as_ref(), "  ");
-        assert_eq!(first.spans[1].style.bg, Some(USER_BG));
-        assert_eq!(first.spans[2].content.as_ref(), "hello");
-        assert_eq!(first.spans[2].style.bg, Some(USER_BG));
-        assert_eq!(first.style.bg, None);
-        assert_eq!(display_width(&line_text(first)), 20);
-        assert_eq!(background_width(first, USER_BG), 16);
-        // Continuation input line gets the same text inset and stays shaded.
-        let second = line_matching(&lines, |l| line_text(l).contains("world"));
-        assert_eq!(second.spans[0].content.as_ref(), "  ");
-        assert_eq!(second.spans[0].style.bg, None);
-        assert_eq!(second.spans[1].content.as_ref(), "  ");
-        assert_eq!(second.spans[1].style.bg, Some(USER_BG));
-        assert_eq!(second.spans[2].content.as_ref(), "world");
-        assert_eq!(second.spans[2].style.bg, Some(USER_BG));
-        assert_eq!(second.style.bg, None);
-        // The block is a box: a shaded pad row brackets the text above and below.
-        let hello_idx = lines
-            .iter()
-            .position(|l| line_text(l).contains("hello"))
-            .expect("hello row");
-        let above = &lines[hello_idx - 1];
-        let below = &lines[hello_idx + 2]; // hello, world, then the pad row
-        assert_eq!(above.style.bg, None);
-        assert_eq!(background_width(above, USER_BG), 16);
-        assert!(line_text(above).trim().is_empty());
-        assert_eq!(below.style.bg, None);
-        assert_eq!(background_width(below, USER_BG), 16);
-        assert!(line_text(below).trim().is_empty());
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn end_turn_appends_dim_turn_rule_after_tool_work() {
-        let mut screen = Screen::new();
-        screen.start_turn();
-        // A tool ran, so this is "concrete work" and earns the turn rule.
-        screen.apply(UiEvent::ToolResult {
-            call: call_args("bash", json!({ "command": "echo hi" })),
-            content: "hi".to_string(),
-            exit_code: Some(0),
-            duration: None,
-        });
-        screen.end_turn();
-        // A short turn (<60s) closes with an inset rule that matches the
-        // editor/user-message box width.
-        let lines = screen.wrapped_lines(20);
-        let rule = line_matching(&lines, |l| line_text(l).contains('\u{2500}'));
-        assert_eq!(line_text(rule), format!("  {}  ", "\u{2500}".repeat(16)));
-        assert_eq!(display_width(&line_text(rule)), 20);
-        assert_eq!(rule.spans[0].content.as_ref(), "  ");
-        assert_eq!(rule.spans[0].style, Style::default());
-        assert_eq!(rule.spans[1].style, dim_style());
-        assert_eq!(rule.spans[2].content.as_ref(), "  ");
-        assert_eq!(rule.spans[2].style, Style::default());
     }
 
     #[test]
@@ -4593,7 +4723,14 @@ mod tests {
         assert!(
             exit.spans
                 .iter()
-                .all(|span| !matches!(span.style.bg, Some(Color::Cyan) | Some(USER_BG)))
+                .all(|span| !matches!(span.style.bg, Some(Color::Cyan))),
+            "selected slash row must not use a background highlight: {exit:?}"
+        );
+        assert!(
+            exit.spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
+            "selected slash row uses foreground color only: {exit:?}"
         );
         assert!(exit.spans.iter().any(|span| {
             span.content.as_ref().contains("End the session") && span.style.fg == Some(Color::Cyan)
@@ -4609,38 +4746,36 @@ mod tests {
         }));
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn tool_started_opens_running_cell_in_replay_state() {
+    fn tool_started_opens_running_shell_panel_in_replay_state() {
         let mut screen = Screen::new();
         screen.start_turn();
         let call = call_args("bash", json!({ "command": "echo hi" }));
         screen.apply(UiEvent::ToolStarted(call));
-        // The live viewport shows the Running header.
         let live: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
+        assert!(live.iter().any(|line| line.contains("SHELL")), "{live:?}");
+        assert!(live.iter().any(|line| line.contains("RUNNING")), "{live:?}");
         assert!(
-            live.iter().any(|l| l.contains("\u{2022} Running echo hi")),
-            "running header not live: {live:?}"
+            live.iter().any(|line| line.contains("$ echo hi")),
+            "{live:?}"
         );
         assert!(
             screen
                 .transcript
                 .rows
                 .iter()
-                .any(|row| row.text.contains("Running echo hi")),
-            "running cell must remain in Iris replay state"
+                .any(|row| row.text.contains("Running echo hi") || row.text.contains("$ echo hi")),
+            "running panel must remain in Iris replay state"
         );
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn tool_output_deltas_append_under_gutter_and_are_flood_capped() {
+    fn tool_output_deltas_stream_inside_shell_panel_and_are_flood_capped() {
         let mut screen = Screen::new();
         screen.start_turn();
         let _ = screen.wrapped_lines(80); // prime last_width
         let call = call_args("bash", json!({ "command": "flood" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
-        // Stream a flood of long lines; the growing tail must respect the cap.
         let long = "x".repeat(400);
         for _ in 0..50 {
             screen.apply(UiEvent::ToolOutputDelta {
@@ -4654,8 +4789,9 @@ mod tests {
             output_rows <= MAX_TOOL_OUTPUT_ROWS,
             "streamed output not flood-capped: {output_rows} rows"
         );
-        // Still streaming: the Running header is present, not yet finalized.
-        assert!(lines.iter().any(|l| line_text(l).contains("Running flood")));
+        assert!(lines.iter().any(|l| line_text(l).contains("SHELL")));
+        assert!(lines.iter().any(|l| line_text(l).contains("RUNNING")));
+        assert!(lines.iter().any(|l| line_text(l).contains("$ flood")));
     }
 
     #[test]
@@ -4690,77 +4826,75 @@ mod tests {
         );
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn exec_cell_finalizes_in_place_with_green_bullet_and_duration() {
+    fn shell_nonzero_exit_renders_error_status() {
         let mut screen = Screen::new();
-        screen.start_turn();
-        let call = call_args("bash", json!({ "command": "echo hi" }));
-        screen.apply(UiEvent::ToolStarted(call.clone()));
-        screen.apply(UiEvent::ToolOutputDelta {
-            call_id: call.id.clone(),
-            chunk: "hi\n".to_string(),
-        });
-        let sep_before = screen
-            .transcript
-            .rows
-            .iter()
-            .filter(|r| is_separator_row(r))
-            .count();
         screen.apply(UiEvent::ToolResult {
-            call: call.clone(),
-            content: "hi".to_string(),
-            exit_code: Some(0),
-            duration: Some(std::time::Duration::from_millis(1200)),
-        });
-        // Finalize must not open a new block (same separator count).
-        let sep_after = screen
-            .transcript
-            .rows
-            .iter()
-            .filter(|r| is_separator_row(r))
-            .count();
-        assert_eq!(sep_before, sep_after, "finalize opened a new block");
-        let lines = screen.wrapped_lines(80);
-        assert!(
-            !lines.iter().any(|l| line_text(l).contains("Running")),
-            "Running header not replaced in place"
-        );
-        let header = line_matching(&lines, |l| line_text(l).contains("Ran echo hi"));
-        let bullet = span_matching(header, |span| span.content.as_ref() == "\u{2022}");
-        assert_eq!(bullet.style, ok_style().add_modifier(Modifier::BOLD));
-        assert!(
-            line_text(header).contains("(1.2s)"),
-            "duration suffix missing: {}",
-            line_text(header)
-        );
-    }
-
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
-    #[test]
-    fn exec_cell_nonzero_exit_shows_red_bold_bullet() {
-        let mut screen = Screen::new();
-        screen.start_turn();
-        let call = call_args("bash", json!({ "command": "false" }));
-        screen.apply(UiEvent::ToolStarted(call.clone()));
-        screen.apply(UiEvent::ToolResult {
-            call: call.clone(),
+            call: call_args("bash", json!({ "command": "false" })),
             content: "boom".to_string(),
             exit_code: Some(1),
-            duration: Some(std::time::Duration::from_millis(50)),
+            duration: Some(Duration::from_millis(50)),
         });
-        let lines = screen.wrapped_lines(80);
-        let header = line_matching(&lines, |l| line_text(l).contains("Ran false"));
-        // Codex parity: a failed command (non-zero exit) keeps the bullet glyph,
-        // colored red and bold; `✗` is reserved for true tool errors.
-        let bullet = span_matching(header, |span| span.content.as_ref() == "\u{2022}");
-        assert_eq!(bullet.style, err_style().add_modifier(Modifier::BOLD));
-        assert!(line_text(header).contains("(50ms)"));
+
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("SHELL"), "{rendered}");
+        assert!(rendered.contains("ERROR"), "{rendered}");
+        assert!(!rendered.contains("DONE"), "{rendered}");
+        assert!(rendered.contains("boom"), "{rendered}");
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn exec_cell_error_keeps_streamed_output() {
+    fn finalized_headers_use_started_elapsed_when_duration_is_missing() {
+        let mut transcript = Transcript::default();
+        let started = Instant::now() - Duration::from_secs(2);
+        transcript.push_shell_header(false, false, None, Some(started), "echo hi");
+        let rendered = transcript
+            .render(100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("SHELL"), "{rendered}");
+        assert!(!rendered.contains("00:00:00s"), "{rendered}");
+        assert!(rendered.contains("00:00:0"), "{rendered}");
+    }
+
+    #[test]
+    fn non_bash_tool_error_renders_error_status() {
+        let mut screen = Screen::new();
+        let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolError {
+            call,
+            message: "patch failed".to_string(),
+        });
+
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("EDIT"), "{rendered}");
+        assert!(rendered.contains("ERROR"), "{rendered}");
+        assert!(!rendered.contains("DONE"), "{rendered}");
+        assert!(rendered.contains("error: patch failed"), "{rendered}");
+    }
+
+    #[test]
+    fn fallback_tool_error_renders_message_once() {
+        let mut screen = Screen::new();
+        let call = call_args("bash", json!({ "command": "exit 2" }));
+
+        screen.apply(UiEvent::ToolError {
+            call,
+            message: "cancelled".to_string(),
+        });
+
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("SHELL"), "{rendered}");
+        assert_eq!(rendered.matches("cancelled").count(), 1, "{rendered}");
+        assert!(rendered.contains("error: cancelled"), "{rendered}");
+    }
+
+    #[test]
+    fn shell_panel_error_keeps_streamed_output() {
         let mut screen = Screen::new();
         screen.start_turn();
         let call = call_args("bash", json!({ "command": "sleep 9" }));
@@ -4769,23 +4903,21 @@ mod tests {
             call_id: call.id.clone(),
             chunk: "partial line\n".to_string(),
         });
-        // Cancellation finalizes as a ToolError but keeps whatever streamed.
         screen.apply(UiEvent::ToolError {
             call: call.clone(),
             message: "cancelled".to_string(),
         });
-        let lines: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
-        assert!(lines.iter().any(|l| l.contains("\u{2717} Ran sleep 9")));
-        assert!(
-            lines.iter().any(|l| l.contains("partial line")),
-            "streamed output lost on error finalize: {lines:?}"
-        );
-        assert!(lines.iter().any(|l| l.contains("error: cancelled")));
+        let rendered = rendered_text(&mut screen, 80, 14);
+        assert!(rendered.contains("SHELL"), "{rendered}");
+        assert!(rendered.contains("ERROR"), "{rendered}");
+        assert!(!rendered.contains("DONE"), "{rendered}");
+        assert!(rendered.contains("$ sleep 9"), "{rendered}");
+        assert!(rendered.contains("partial line"), "{rendered}");
+        assert!(rendered.contains("error: cancelled"), "{rendered}");
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn streamed_exec_cell_replays_from_state_after_finalize() -> std::io::Result<()> {
+    fn streamed_shell_panel_replays_from_state_after_finalize() -> std::io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         let mut screen = Screen::new();
         screen.commit_user("run it");
@@ -4808,17 +4940,17 @@ mod tests {
         screen.end_turn();
         surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
 
-        let everything = surface.state().previous_lines.join("\n");
-        assert!(
-            everything.contains("Ran echo hi"),
-            "finalized exec cell missing from terminal replay: {everything:?}"
-        );
+        let everything = strip_ansi(&surface.state().previous_lines.join("\n"));
+        assert!(everything.contains("SHELL"), "{everything:?}");
+        assert!(everything.contains("DONE"), "{everything:?}");
+        assert!(everything.contains("$ echo hi"), "{everything:?}");
+        assert!(everything.contains("hi"), "{everything:?}");
         assert!(
             screen
                 .transcript
                 .rows
                 .iter()
-                .any(|row| row.text.contains("Ran echo hi")),
+                .any(|row| row.text.contains("$ echo hi")),
             "exec rows must remain replayable from Iris state"
         );
         Ok(())
