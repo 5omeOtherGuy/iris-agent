@@ -14,16 +14,15 @@ use super::panel::{
     PanelHeaderSpec, PanelState, diff_table_rows, explore_body, explore_panel_meta, panel_state,
     tool_panel_meta, tool_panel_title,
 };
-use super::rows::{ChromeRow, TranscriptRow, is_separator_row};
+use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::wrap::{
     clamp_output_line, display_width, line_text, truncate_chars, wrapped_row_estimate,
 };
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TOOL_OUTPUT_LINE_CHARS,
-    MAX_TOOL_OUTPUT_ROWS, MAX_TRANSCRIPT_ROWS, PANEL_BODY_CHROME_WIDTH, TEXT_COLUMN_X_PADDING,
-    dim_style, err_style, format_elapsed_compact, ok_style, panel_style, tool_header_style,
-    turn_divider_label,
+    MAX_TOOL_OUTPUT_ROWS, MAX_TRANSCRIPT_ROWS, TEXT_COLUMN_X_PADDING, dim_style, err_style,
+    format_elapsed_compact, ok_style, panel_style, tool_header_style, turn_divider_label,
 };
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
@@ -118,6 +117,7 @@ impl Transcript {
             style: dim_style(),
             continuation_prefix: None,
             line: None,
+            fold: FoldVis::Always,
             word_wrap: false,
             background: None,
             hrule: true,
@@ -224,32 +224,58 @@ impl Transcript {
     }
 
     fn push_panel_body(&mut self, text: &str, style: Style) {
+        self.push_panel_body_folded(text, style, FoldVis::Always);
+    }
+
+    fn push_panel_body_folded(&mut self, text: &str, style: Style, fold: FoldVis) {
         for line in text.split('\n') {
             let line = strip_ansi_for_text(line);
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::from(Span::styled(line.clone(), style)),
-                    bg: None,
-                },
-                line,
-                style,
-            ));
+            self.rows.push(
+                TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: Line::from(Span::styled(line.clone(), style)),
+                        bg: None,
+                    },
+                    line,
+                    style,
+                )
+                .with_fold(fold),
+            );
         }
     }
 
-    fn push_hidden_affordance(&mut self, hidden: usize, earlier: bool) {
+    /// Inner panel-body text width available for right-aligning fold hints.
+    /// `wrap_width()` already equals the panel body width (terminal width minus
+    /// outer padding and panel chrome), so the hint can hug the right border.
+    fn fold_hint_width(&self) -> usize {
+        self.wrap_width().max(1)
+    }
+
+    /// Preview-state fold affordance: `… N lines hidden        ctrl+o to expand`.
+    /// Only rendered while the panel is collapsed (capped).
+    fn push_fold_expand_hint(&mut self, hidden: usize, earlier: bool) {
         let noun = if earlier { "earlier lines" } else { "lines" };
         let left = format!("… {hidden} {noun} hidden");
-        let hint = "ctrl+o to expand";
-        let width = self
-            .wrap_width()
-            .saturating_sub(PANEL_BODY_CHROME_WIDTH)
-            .max(1);
-        let gap = width
-            .saturating_sub(display_width(&left))
-            .saturating_sub(display_width(hint))
-            .max(1);
-        self.push_panel_body(&format!("{left}{}{hint}", " ".repeat(gap)), dim_style());
+        let text = right_align_hint(&left, "ctrl+o to expand", self.fold_hint_width());
+        self.push_panel_body_folded(&text, dim_style(), FoldVis::WhenCollapsed);
+    }
+
+    /// Expanded-state fold affordance: right-aligned `ctrl+o to collapse`.
+    /// Only rendered while the panel is fully revealed.
+    fn push_fold_collapse_hint(&mut self) {
+        let text = right_align_hint("", "ctrl+o to collapse", self.fold_hint_width());
+        self.push_panel_body_folded(&text, dim_style(), FoldVis::WhenExpanded);
+    }
+
+    /// Mark the most recent panel header as collapsed (preview) so foldable
+    /// output starts capped; toggling reveals the hidden lines.
+    fn mark_panel_preview(&mut self) {
+        for row in self.rows.iter_mut().rev() {
+            if let Some(ChromeRow::Header { expanded, .. }) = row.chrome.as_mut() {
+                *expanded = false;
+                return;
+            }
+        }
     }
 
     fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
@@ -416,14 +442,23 @@ impl Transcript {
         self.panel_end_from(active.body_start)
     }
 
-    fn panel_expanded_in(&self, start: usize, end: usize) -> bool {
+    /// The reveal state to carry across an in-place panel rebuild, but only when
+    /// the old panel was foldable (had capped output). Returning `None` lets a
+    /// freshly capped panel keep its built-in preview default instead of
+    /// inheriting an unrelated `expanded` flag.
+    fn panel_reveal_state_in(&self, start: usize, end: usize) -> Option<bool> {
+        if !self.rows[start..end]
+            .iter()
+            .any(|row| row.fold != FoldVis::Always)
+        {
+            return None;
+        }
         self.rows[start..end]
             .iter()
             .find_map(|row| match row.chrome.as_ref() {
                 Some(ChromeRow::Header { expanded, .. }) => Some(*expanded),
                 _ => None,
             })
-            .unwrap_or(true)
     }
 
     fn preserve_panel_expanded(replacement: &mut [TranscriptRow], expanded: bool) {
@@ -445,8 +480,9 @@ impl Transcript {
         mut replacement: Vec<TranscriptRow>,
     ) {
         let end = self.active_tool_panel_end(active);
-        let expanded = self.panel_expanded_in(active.body_start, end);
-        Self::preserve_panel_expanded(&mut replacement, expanded);
+        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+            Self::preserve_panel_expanded(&mut replacement, expanded);
+        }
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -460,8 +496,9 @@ impl Transcript {
         mut replacement: Vec<TranscriptRow>,
     ) {
         let end = self.active_exec_panel_end(active);
-        let expanded = self.panel_expanded_in(active.body_start, end);
-        Self::preserve_panel_expanded(&mut replacement, expanded);
+        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+            Self::preserve_panel_expanded(&mut replacement, expanded);
+        }
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -702,7 +739,7 @@ impl Transcript {
     /// Push one gutter-prefixed tool-output line, preserving ANSI styling and
     /// hard-wrapping so leading indentation/aligned columns survive. `first`
     /// selects the `  └ ` head gutter vs the `    ` continuation gutter.
-    fn push_output_line(&mut self, raw: &str, first: bool) {
+    fn push_output_line(&mut self, raw: &str, first: bool, fold: FoldVis) {
         let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
         let legacy = if first {
             format!("  └ {line}")
@@ -710,23 +747,29 @@ impl Transcript {
             format!("    {line}")
         };
         if line.contains("\x1b[") {
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: tool_output_line("", &line),
-                    bg: None,
-                },
-                strip_ansi_for_text(&legacy),
-                dim_style(),
-            ));
+            self.rows.push(
+                TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: tool_output_line("", &line),
+                        bg: None,
+                    },
+                    strip_ansi_for_text(&legacy),
+                    dim_style(),
+                )
+                .with_fold(fold),
+            );
         } else {
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::from(Span::styled(line.to_string(), dim_style())),
-                    bg: None,
-                },
-                legacy,
-                dim_style(),
-            ));
+            self.rows.push(
+                TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: Line::from(Span::styled(line.to_string(), dim_style())),
+                        bg: None,
+                    },
+                    legacy,
+                    dim_style(),
+                )
+                .with_fold(fold),
+            );
         }
     }
 
@@ -749,7 +792,7 @@ impl Transcript {
         let total_rows: usize = lines.iter().map(|raw| cost(raw)).sum();
         if total_rows <= MAX_TOOL_OUTPUT_ROWS {
             for (i, raw) in lines.iter().enumerate() {
-                self.push_output_line(raw, i == 0);
+                self.push_output_line(raw, i == 0, FoldVis::Always);
             }
             return;
         }
@@ -780,20 +823,38 @@ impl Transcript {
             tail_rows += rows;
             tail_start -= 1;
         }
-        // Clamp each shown line to its slice budget so a single over-budget line
-        // (kept for visibility) cannot blow past the physical-row cap.
+        let hidden = tail_start.saturating_sub(head_end);
+        if hidden == 0 {
+            // Nothing elided (e.g. one over-budget line): keep the original
+            // clamped head/tail slices so a single huge line cannot blow the
+            // row cap, and stay non-foldable.
+            for (i, raw) in lines[..head_end].iter().enumerate() {
+                let clamped = clamp_output_line(raw, width, head_budget);
+                self.push_output_line(&clamped, i == 0, FoldVis::Always);
+            }
+            for raw in &lines[tail_start..] {
+                let clamped = clamp_output_line(raw, width, tail_budget);
+                self.push_output_line(&clamped, false, FoldVis::Always);
+            }
+            return;
+        }
+        // Preview set (shown while collapsed): clamped head slice, the hidden
+        // affordance, then the clamped tail slice.
         for (i, raw) in lines[..head_end].iter().enumerate() {
             let clamped = clamp_output_line(raw, width, head_budget);
-            self.push_output_line(&clamped, i == 0);
+            self.push_output_line(&clamped, i == 0, FoldVis::WhenCollapsed);
         }
-        let hidden = tail_start - head_end;
-        if hidden > 0 {
-            self.push_hidden_affordance(hidden, false);
-        }
+        self.push_fold_expand_hint(hidden, false);
         for raw in &lines[tail_start..] {
             let clamped = clamp_output_line(raw, width, tail_budget);
-            self.push_output_line(&clamped, false);
+            self.push_output_line(&clamped, false, FoldVis::WhenCollapsed);
         }
+        // Full set (shown while expanded): every line, then the collapse hint.
+        for (i, raw) in lines.iter().enumerate() {
+            self.push_output_line(raw, i == 0, FoldVis::WhenExpanded);
+        }
+        self.push_fold_collapse_hint();
+        self.mark_panel_preview();
     }
 
     /// TAIL-capped tool output for the LIVE streaming cell: show the most recent
@@ -820,16 +881,27 @@ impl Transcript {
             take += 1;
         }
         let start = lines.len() - take;
-        if start > 0 {
-            self.push_hidden_affordance(start, true);
+        if start == 0 {
+            for (offset, raw) in lines.iter().enumerate() {
+                let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
+                self.push_output_line(&clamped, offset == 0, FoldVis::Always);
+            }
+            return;
         }
-        for (offset, raw) in lines[start..].iter().enumerate() {
-            // Use the head gutter for the very first visible row only when no
-            // earlier-lines note took it. Clamp each shown line so one very long
-            // line cannot blow past the physical-row cap.
+        // Preview set: the earlier-lines affordance, then the most recent tail.
+        self.push_fold_expand_hint(start, true);
+        for raw in &lines[start..] {
             let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
-            self.push_output_line(&clamped, start == 0 && offset == 0);
+            self.push_output_line(&clamped, false, FoldVis::WhenCollapsed);
         }
+        // Full set: every line in order (unclamped, matching the finalized
+        // path so revealing a streamed run shows the same rows), then the
+        // collapse hint.
+        for (offset, raw) in lines.iter().enumerate() {
+            self.push_output_line(raw, offset == 0, FoldVis::WhenExpanded);
+        }
+        self.push_fold_collapse_hint();
+        self.mark_panel_preview();
     }
 
     fn explore_header_right(state: PanelState, duration: Option<Duration>) -> Vec<(String, Style)> {
@@ -839,7 +911,9 @@ impl Transcript {
         vec![
             ("●".to_string(), state.dot_style()),
             (format!("{:<13}", state.label()), panel_style()),
-            (format!("{elapsed}  "), dim_style()),
+            // Fixed-width elapsed so the live timer does not shift the header
+            // right edge as the compact label changes length (e.g. 9.9s -> 10s).
+            (format!("{elapsed:>8}  "), dim_style()),
         ]
     }
 
@@ -1308,6 +1382,15 @@ impl Transcript {
         else {
             return false;
         };
+        // Only foldable panels (those with capped output) respond to ctrl+o;
+        // a panel with nothing hidden has no reveal state to toggle.
+        let end = self.panel_end_from(header);
+        if !self.rows[header..end]
+            .iter()
+            .any(|row| row.fold != FoldVis::Always)
+        {
+            return false;
+        }
         if let Some(ChromeRow::Header { expanded, .. }) = self.rows[header].chrome.as_mut() {
             *expanded = !*expanded;
             true
@@ -1343,21 +1426,29 @@ impl Transcript {
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
             .max(1);
         let mut rows = Vec::new();
-        let mut collapsed = false;
+        // Track the enclosing panel's reveal state so fold-tagged body rows show
+        // in the matching state: collapsed shows the capped preview + expand
+        // hint, expanded shows the full output + collapse hint.
+        let mut expanded = true;
         for row in &self.rows {
             match row.chrome.as_ref() {
-                Some(ChromeRow::Header {
-                    expanded: false, ..
-                }) => {
-                    collapsed = true;
-                    row.render(width, &mut rows);
-                }
-                Some(ChromeRow::Separator | ChromeRow::Body { .. }) if collapsed => {}
-                Some(ChromeRow::Bottom) => {
-                    row.render(width, &mut rows);
-                    collapsed = false;
-                }
-                _ => row.render(width, &mut rows),
+                // A panel opens fully shown until its header sets the state;
+                // resetting at Top guards against a missing Bottom leaking a
+                // prior panel's collapsed state into the next one.
+                Some(ChromeRow::Top) => expanded = true,
+                Some(ChromeRow::Header { expanded: e, .. }) => expanded = *e,
+                _ => {}
+            }
+            let skip = match row.fold {
+                FoldVis::Always => false,
+                FoldVis::WhenCollapsed => expanded,
+                FoldVis::WhenExpanded => !expanded,
+            };
+            if !skip {
+                row.render(width, &mut rows);
+            }
+            if matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)) {
+                expanded = true;
             }
         }
         if let Some(text) = &self.streaming {
@@ -1376,6 +1467,20 @@ pub(super) fn streaming_markdown_preview(text: &str) -> String {
         "… streaming preview truncated; showing latest content …\n{}",
         &text[start..]
     )
+}
+
+/// Right-align `hint` within `width`, after optional `left` text. Used for the
+/// fold affordances so the keybinding hint hugs the panel's right edge.
+fn right_align_hint(left: &str, hint: &str, width: usize) -> String {
+    let hint_w = display_width(hint);
+    let left_w = display_width(left);
+    // Too narrow for both: keep the actionable hint, right-aligned, dropping the
+    // descriptive left text rather than overflowing and wrapping the row.
+    if left.is_empty() || left_w + 1 + hint_w > width {
+        return format!("{}{hint}", " ".repeat(width.saturating_sub(hint_w)));
+    }
+    let gap = width.saturating_sub(left_w).saturating_sub(hint_w).max(1);
+    format!("{left}{}{hint}", " ".repeat(gap))
 }
 
 fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {

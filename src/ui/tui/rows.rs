@@ -14,6 +14,17 @@ use super::wrap::{
 };
 use super::{BOX_X_PADDING, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING, dim_style};
 
+/// Per-row visibility within a foldable tool-output panel. `Always` rows show
+/// in both states; `WhenCollapsed`/`WhenExpanded` rows show only in the
+/// preview (capped) or fully-revealed state respectively. The enclosing panel
+/// header's `expanded` flag selects which set renders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FoldVis {
+    Always,
+    WhenCollapsed,
+    WhenExpanded,
+}
+
 /// One styled logical transcript row. Most rows are plain text + style; ANSI
 /// tool output stores a parsed ratatui line so the escape styling survives.
 #[derive(Clone)]
@@ -22,6 +33,8 @@ pub(super) struct TranscriptRow {
     pub(super) style: Style,
     pub(super) continuation_prefix: Option<&'static str>,
     pub(super) line: Option<Line<'static>>,
+    /// Fold-state visibility for collapsible tool-output bodies.
+    pub(super) fold: FoldVis,
     /// Word-aware (space-breaking, URL-safe) wrap for this row's styled `line`
     /// instead of the default ANSI char-hard-wrap. Set for Markdown prose; the
     /// gutter/ANSI tool-output rows keep char-wrap so their leading-space
@@ -43,11 +56,18 @@ impl TranscriptRow {
             style,
             continuation_prefix: None,
             line: None,
+            fold: FoldVis::Always,
             word_wrap: false,
             background: None,
             hrule: false,
             chrome: None,
         }
+    }
+
+    /// Tag this row with a fold-state visibility (builder style).
+    pub(super) fn with_fold(mut self, fold: FoldVis) -> Self {
+        self.fold = fold;
+        self
     }
 
     pub(super) fn chrome(chrome: ChromeRow) -> Self {
@@ -60,6 +80,7 @@ impl TranscriptRow {
             style,
             continuation_prefix: None,
             line: None,
+            fold: FoldVis::Always,
             word_wrap: false,
             background: None,
             hrule: false,

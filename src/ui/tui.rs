@@ -1039,6 +1039,31 @@ mod tests {
     }
 
     #[test]
+    fn indentation_only_change_is_not_token_highlighted() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call("edit"),
+            diff: "--- a/n.txt\n+++ b/n.txt\n@@ -1 +1 @@\n-foo\n+  foo\n".to_string(),
+        });
+        let reversed = ratatui::style::Modifier::REVERSED;
+        let any_reversed = screen
+            .transcript
+            .rows
+            .iter()
+            .any(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::Body { line, .. }) => line
+                    .spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(reversed)),
+                _ => false,
+            });
+        assert!(
+            !any_reversed,
+            "pure indentation changes must stay quiet (no reversed tokens)"
+        );
+    }
+
+    #[test]
     fn two_file_diff_drops_every_header_pair_not_just_the_first() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::DiffPreview {
@@ -1821,7 +1846,9 @@ mod tests {
         let running = rendered_text(&mut screen, 100, 16);
         assert!(running.contains("EXPLORE"), "{running}");
         assert!(running.contains("RUNNING"), "{running}");
-        assert!(!running.contains("ERROR       00:00:00s\n├"), "{running}");
+        // Aggregate EXPLORE state must stay RUNNING (uppercase ERROR is the
+        // state label; the errored read still streams a lowercase `error:` body).
+        assert!(!running.contains("ERROR"), "{running}");
 
         screen.apply(UiEvent::ToolResult {
             call: grep,
@@ -2052,70 +2079,114 @@ mod tests {
         assert!(rendered.contains("~/repo ┊ git branch"), "{rendered}");
     }
 
-    #[test]
-    fn collapsed_live_shell_panel_stays_collapsed_across_updates_and_finalize() {
-        let mut screen = Screen::new();
-        let call = call_args("bash", json!({ "command": "seq" }));
-        screen.apply(UiEvent::ToolStarted(call.clone()));
-        assert!(screen.toggle_latest_panel());
-
-        screen.apply(UiEvent::ToolOutputDelta {
-            call_id: call.id.clone(),
-            chunk: "line 1\n".to_string(),
-        });
-        let collapsed_after_delta = rendered_text(&mut screen, 80, 12);
-        assert!(
-            collapsed_after_delta.contains("▸"),
-            "{collapsed_after_delta}"
-        );
-        assert!(
-            !collapsed_after_delta.contains("line 1"),
-            "{collapsed_after_delta}"
-        );
-
-        screen.apply(UiEvent::ToolResult {
-            call,
-            content: "line 1\nline 2".to_string(),
-            exit_code: None,
-            duration: None,
-        });
-        let collapsed_after_result = rendered_text(&mut screen, 80, 12);
-        assert!(
-            collapsed_after_result.contains("▸"),
-            "{collapsed_after_result}"
-        );
-        assert!(
-            !collapsed_after_result.contains("line 2"),
-            "{collapsed_after_result}"
-        );
+    fn transcript_text(screen: &mut Screen, width: u16) -> String {
+        screen
+            .wrapped_lines(width)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn latest_panel_collapses_and_expands_with_body_restored() {
+    fn revealed_shell_panel_stays_revealed_across_updates_and_finalize() {
         let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80); // prime last_width so hints fit the body
+        let call = call_args("bash", json!({ "command": "seq" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+
+        // Stream enough lines that the live tail caps and becomes foldable.
+        let chunk = std::iter::once("FIRSTLINE".to_string())
+            .chain((2..=20).map(|n| format!("line {n}")))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk,
+        });
+
+        // Default preview: collapsed marker, expand hint, earliest line hidden.
+        let preview = transcript_text(&mut screen, 80);
+        assert!(preview.contains("▸"), "{preview}");
+        assert!(preview.contains("ctrl+o to expand"), "{preview}");
+        assert!(!preview.contains("FIRSTLINE"), "{preview}");
+
+        // Reveal; expansion must survive a later delta and the final result.
+        assert!(screen.toggle_latest_panel());
+        let revealed = transcript_text(&mut screen, 80);
+        assert!(revealed.contains("▾"), "{revealed}");
+        assert!(revealed.contains("ctrl+o to collapse"), "{revealed}");
+        assert!(revealed.contains("FIRSTLINE"), "{revealed}");
+
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "line 21\n".to_string(),
+        });
+        let after_delta = transcript_text(&mut screen, 80);
+        assert!(after_delta.contains("▾"), "{after_delta}");
+        assert!(after_delta.contains("FIRSTLINE"), "{after_delta}");
+
         screen.apply(UiEvent::ToolResult {
-            call: call_args("bash", json!({ "command": "echo hi" })),
-            content: "hi".to_string(),
+            call,
+            content: std::iter::once("FIRSTLINE".to_string())
+                .chain((2..=21).map(|n| format!("line {n}")))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            exit_code: None,
+            duration: None,
+        });
+        let after_result = transcript_text(&mut screen, 80);
+        assert!(after_result.contains("▾"), "{after_result}");
+        assert!(
+            after_result.contains("ctrl+o to collapse"),
+            "{after_result}"
+        );
+        assert!(after_result.contains("FIRSTLINE"), "{after_result}");
+    }
+
+    #[test]
+    fn ctrl_o_reveals_and_recollapses_capped_tool_output() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80); // prime last_width so hints fit the body
+        // HEAD/TAIL capping hides the middle, so the unique marker sits there.
+        let content = (1..=20)
+            .map(|n| {
+                if n == 10 {
+                    "MIDDLELINE".to_string()
+                } else {
+                    format!("line {n}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "seq" })),
+            content,
             exit_code: None,
             duration: None,
         });
 
-        let expanded = rendered_text(&mut screen, 80, 12);
-        assert!(expanded.contains("▾"), "{expanded}");
-        assert!(expanded.contains("$ echo hi"), "{expanded}");
-        assert!(expanded.contains("hi"), "{expanded}");
+        // Default preview: collapsed marker, expand hint, middle line hidden.
+        let preview = transcript_text(&mut screen, 80);
+        assert!(preview.contains("▸"), "{preview}");
+        assert!(preview.contains("ctrl+o to expand"), "{preview}");
+        assert!(!preview.contains("MIDDLELINE"), "{preview}");
 
+        // Expand reveals the hidden line and switches the hint.
         assert!(screen.toggle_latest_panel());
-        let collapsed = rendered_text(&mut screen, 80, 12);
-        assert!(collapsed.contains("▸"), "{collapsed}");
-        assert!(!collapsed.contains("$ echo hi"), "{collapsed}");
-        assert!(!collapsed.contains("├"), "{collapsed}");
+        let revealed = transcript_text(&mut screen, 80);
+        assert!(revealed.contains("▾"), "{revealed}");
+        assert!(revealed.contains("MIDDLELINE"), "{revealed}");
+        assert!(revealed.contains("ctrl+o to collapse"), "{revealed}");
+        assert!(!revealed.contains("ctrl+o to expand"), "{revealed}");
 
+        // Collapse again restores the capped preview.
         assert!(screen.toggle_latest_panel());
-        let restored = rendered_text(&mut screen, 80, 12);
-        assert!(restored.contains("▾"), "{restored}");
-        assert!(restored.contains("$ echo hi"), "{restored}");
-        assert!(restored.contains("hi"), "{restored}");
+        let recollapsed = transcript_text(&mut screen, 80);
+        assert!(recollapsed.contains("▸"), "{recollapsed}");
+        assert!(!recollapsed.contains("MIDDLELINE"), "{recollapsed}");
+        assert!(recollapsed.contains("ctrl+o to expand"), "{recollapsed}");
     }
 
     #[test]
@@ -2712,9 +2783,17 @@ mod tests {
     #[test]
     fn elapsed_format_and_labelled_rule() {
         assert_eq!(format_elapsed_compact(Duration::from_millis(500)), "0.5s");
+        assert_eq!(format_elapsed_compact(Duration::from_millis(9900)), "9.9s");
+        // Threshold boundaries: tenths < 10s, bare seconds < 60s, M:SS < 60min,
+        // then H:MM:SS.
+        assert_eq!(format_elapsed_compact(Duration::from_secs(10)), "10s");
         assert_eq!(format_elapsed_compact(Duration::from_secs(45)), "45s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(60)), "1:00");
         assert_eq!(format_elapsed_compact(Duration::from_secs(71)), "1:11");
         assert_eq!(format_elapsed_compact(Duration::from_secs(132)), "2:12");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(3599)), "59:59");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(3600)), "1:00:00");
         assert_eq!(format_elapsed_compact(Duration::from_secs(3669)), "1:01:09");
     }
 

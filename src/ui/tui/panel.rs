@@ -438,13 +438,13 @@ fn intra_line_diff(old: &str, new: &str) -> (Vec<Span<'static>>, Vec<Span<'stati
     let mut old_spans = Vec::new();
     let mut new_spans = Vec::new();
     for change in diff.iter_all_changes() {
-        let value = change.value().to_string();
+        let value = change.value();
         match change.tag() {
-            ChangeTag::Delete => push_token(&mut old_spans, value, err_style()),
-            ChangeTag::Insert => push_token(&mut new_spans, value, ok_style()),
+            ChangeTag::Delete => push_token(&mut old_spans, value.to_string(), err_style()),
+            ChangeTag::Insert => push_token(&mut new_spans, value.to_string(), ok_style()),
             ChangeTag::Equal => {
-                old_spans.push(Span::styled(value.clone(), err_style()));
-                new_spans.push(Span::styled(value, ok_style()));
+                old_spans.push(Span::styled(value.to_string(), err_style()));
+                new_spans.push(Span::styled(value.to_string(), ok_style()));
             }
         }
     }
