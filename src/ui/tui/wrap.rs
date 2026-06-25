@@ -1,48 +1,18 @@
-//! Width, truncation, and wrapping helpers for the TUI pane.
+//! Ratatui span-layout helpers for the TUI pane: padding, span clipping, and
+//! line wrapping. All width / truncation / plain-text wrap math is delegated to
+//! the unified [`crate::ui::textengine`] so there is a single grapheme-aware
+//! source of truth (this module no longer measures width itself).
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{MAX_TOOL_OUTPUT_LINE_CHARS, PANEL_BODY_CHROME_WIDTH, dim_style};
-
-/// Display width of a string as the terminal renders it, reused for word-wrap.
-/// Control chars count as zero (they are not emitted).
-pub(super) fn display_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
-}
-
-/// Display width of a single char, clamped to at least 1 so a zero-width or
-/// control char still advances the wrap and never loops forever.
-fn char_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(0).max(1)
-}
-
-/// Truncate `text` to at most `max` characters (on a char boundary).
-pub(super) fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        text.chars().take(max).collect()
-    }
-}
-
-/// Truncate `text` to at most `max` terminal columns (display width), stopping on
-/// a char boundary. Unlike [`truncate_chars`], this accounts for wide/CJK glyphs
-/// so the result never exceeds `max` columns.
-pub(super) fn truncate_to_width(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0usize;
-    for c in text.chars() {
-        let w = char_width(c);
-        if used + w > max {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out
-}
+use crate::ui::textengine::cluster_advance;
+// Re-exported so existing `super::wrap::{display_width, ...}` imports keep
+// resolving while the implementations live in the engine.
+pub(crate) use crate::ui::textengine::wrap_to_width;
+pub(super) use crate::ui::textengine::{display_width, truncate_chars, truncate_to_width};
 
 /// Clamp one logical tool-output line so it wraps to at most `max_rows` physical
 /// rows at `width` (accounting for panel body chrome), appending an ellipsis
@@ -142,6 +112,16 @@ fn push_span_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
     spans.push(Span::styled(ch.to_string(), style));
 }
 
+fn push_span_str(spans: &mut Vec<Span<'static>>, cluster: &str, style: Style) {
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push_str(cluster);
+        return;
+    }
+    spans.push(Span::styled(cluster.to_string(), style));
+}
+
 pub(super) fn push_wrapped_line(
     line: &Line<'static>,
     width: usize,
@@ -155,8 +135,8 @@ pub(super) fn push_wrapped_line(
     let mut cur_w = 0;
 
     for span in &line.spans {
-        for ch in span.content.chars() {
-            let cw = char_width(ch);
+        for cluster in span.content.graphemes(true) {
+            let cw = cluster_advance(cluster);
             if cur_w > 0 && cur_w + cw > width {
                 out.push(Line::from(std::mem::take(&mut spans)));
                 cur_w = 0;
@@ -168,7 +148,7 @@ pub(super) fn push_wrapped_line(
                     }
                 }
             }
-            push_span_char(&mut spans, ch, span.style);
+            push_span_str(&mut spans, cluster, span.style);
             cur_w += cw;
         }
     }
@@ -344,54 +324,6 @@ pub(super) fn push_wrapped_row(
             ]));
         }
     }
-}
-
-/// Greedy word-wrap `text` to `width` display columns, breaking at spaces. A
-/// word that fits is moved whole onto its own row rather than split mid-token,
-/// so a URL/path that fits within the width stays selectable as one unit; a
-/// single word longer than the width still hard-breaks, because the row-exact
-/// rendering model (one logical row = one physical row, see [`TuiUi::draw`])
-/// cannot emit an over-wide row without the terminal clipping its tail.
-/// Returns at least one row (possibly empty) so a blank logical line still
-/// occupies a row.
-pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
-    if width == 0 || display_width(text) <= width {
-        return vec![text.to_string()];
-    }
-    let mut rows: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut cur_w = 0;
-    for (i, word) in text.split(' ').enumerate() {
-        let word_w = display_width(word);
-        if i > 0 && !cur.is_empty() && cur_w + 1 + word_w <= width {
-            cur.push(' ');
-            cur.push_str(word);
-            cur_w += 1 + word_w;
-            continue;
-        }
-        if !cur.is_empty() {
-            rows.push(std::mem::take(&mut cur));
-            cur_w = 0;
-        }
-        if word_w <= width {
-            cur.push_str(word);
-            cur_w = word_w;
-        } else {
-            for ch in word.chars() {
-                let cw = char_width(ch);
-                // Guard `!cur.is_empty()` so a single glyph wider than the
-                // whole width never emits a phantom blank row before itself.
-                if cur_w + cw > width && !cur.is_empty() {
-                    rows.push(std::mem::take(&mut cur));
-                    cur_w = 0;
-                }
-                cur.push(ch);
-                cur_w += cw;
-            }
-        }
-    }
-    rows.push(cur);
-    rows
 }
 
 #[cfg(test)]

@@ -1,453 +1,215 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Iris implementation notes</title>
+<meta charset="utf-8">
+<title>Text engine consolidation - implementation notes</title>
 </head>
 <body>
-<h1>Implementation notes</h1>
-<h2>Align arbitrary harness restrictions to pi-mono</h2>
-<p>
-  Branch <code>feat/pimono-limits</code> off <code>origin/main</code> at
-  <code>6b48611</code> (fetch succeeded, primary 0 ahead / 0 behind). Reference
-  tree <code>~/vendor/pi-mono</code> (consulted, not vendored). Only
-  decisions/discoveries not already explicit in the spec are recorded below,
-  organized by unit.
-</p>
+<h1>Unified text engine (src/ui/textengine.rs) &mdash; implementation notes</h1>
+<p>Branch <code>feat/text-engine</code>. Records non-obvious decisions, parity risks, and
+reviewer context. Not a step log. This file previously held the merged Anthropic-stream
+notes; it is the per-task notes file and was overwritten for this task.</p>
 
-<h2>Verification / drift</h2>
+<h2>Base commit / detached-HEAD drift</h2>
+<p>The primary checkout was in <b>detached HEAD at <code>d1d9bce</code></b> = <code>origin/main</code>
+(<code>6b48611</code>) + 1 unmerged commit (<code>feat(tui): compact tool durations ...</code>).
+<code>git diff 6b48611 d1d9bce</code> touches only <code>tui.rs</code>, <code>tui/panel.rs</code>,
+<code>tui/transcript.rs</code> &mdash; none of the files this task consolidates. Per
+<code>AGENTS.md</code> I branched the worktree from a clean base:
+<code>git worktree add ../iris-text-engine -b feat/text-engine origin/main</code>
+(<b>built on <code>6b48611</code></b>). The unmerged commit is unaffected by this change and merges
+independently. The untracked <code>mydiff.txt</code> in the primary was left alone.</p>
+
+<h2>Unit 1 &mdash; the engine module</h2>
 <ul>
-  <li>All <code>&lt;read_first&gt;</code> Iris constants matched the prompt
-    snapshot when re-read (line numbers had drifted a little but the values were
-    as cited).</li>
-  <li>pi-mono path drift: the prompt cited <code>RetrySettings</code> at
-    <code>packages/coding-agent/src/config.ts#L27-L32</code>. The actual type
-    lives in <code>packages/coding-agent/src/core/settings-manager.ts</code>
-    (<code>RetrySettings</code> L27-31: <code>maxRetries</code> default 3,
-    <code>baseDelayMs</code> default 2000; consumed via
-    <code>getRetrySettings()</code> L799-803). The 60s ceiling is
-    <code>maxRetryDelayMs</code> in <code>packages/ai/src/types.ts</code>
-    (L149/L192). All other cited pi-mono files exist as referenced;
-    <code>harness/utils/truncate.ts</code> confirms
-    <code>DEFAULT_MAX_BYTES = 50 * 1024</code>.</li>
+<li><b>Grapheme crate choice: <code>unicode-segmentation</code> (justified).</b> The Rust stdlib has
+no grapheme-cluster iterator. I empirically confirmed (throwaway test, since removed) that
+<code>unicode-width</code> 0.2.2's <code>UnicodeWidthStr::width</code> on a <em>whole grapheme
+cluster</em> already returns the correct terminal width for ZWJ families, flags, VS16, keycaps, and
+combining marks (e.g. <code>"\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"</code> &rarr; 2). So no
+custom emoji/east-asian table is needed; the only missing primitive is cluster segmentation. A thin
+wrapper over <code>unicode-width</code> alone is insufficient because the bug is that the old
+per-<em>char</em> wrap/truncate loops split clusters (losing the cluster-aware width and emitting
+broken half-emoji). <code>unicode-segmentation</code> is the canonical UAX#29 implementation and is
+<b>already in the build graph transitively via <code>ratatui-core</code></b> (also pulls
+<code>unicode-truncate</code>), so adding it as a direct dep downloads/builds <b>no new crate</b> &mdash;
+it is a direct-dep promotion. Rejected alternatives: <code>textwrap</code>/<code>ansi-width</code>
+(heavier, own width tables, would duplicate <code>unicode-width</code>); hand-rolling UAX#29
+segmentation (forbidden by the reuse ladder).</li>
+<li><b>Two strip variants, one parser.</b> The old code had two divergent <em>handcoded</em>
+strippers. The engine has one scanner (CSI <code>ESC [ &hellip; final</code>; OSC/DCS/PM/APC/SOS
+string controls terminated by BEL or ST; plus the 8-bit C1 forms) exposed through two output
+policies: <code>strip_ansi</code> (removes escape sequences, keeps other chars incl. TAB/CR) and
+<code>clean_text</code> (also drops remaining control chars). <code>clean_text</code> is
+byte-identical to the old <code>tui/text.rs::strip_ansi_for_text</code> (the <code>\r</code>-splitting /
+footer-cleaning path) and is re-exported under that name. <code>strip_ansi</code> matches the intent
+of the old <code>ui/text.rs::strip_ansi</code> for common content; it differs only on malformed /
+non-SGR sequences (e.g. bracketed-paste <code>ESC[200~</code>), where the proper CSI parser is more
+correct than the old "consume until first ASCII letter" loop (which ate the following letter).</li>
+<li><b>display_width is raw (does NOT strip ANSI); visible_width does.</b> The historic
+<code>wrap.rs::display_width</code> was raw <code>UnicodeWidthStr::width</code> and several call sites
+rely on that as a conservative over-estimate (e.g. the tool-output flood guard
+<code>wrapped_row_estimate</code>, which intentionally counts escapes as width). Keeping
+<code>display_width</code> raw preserves that behavior exactly. The new <code>visible_width</code>
+(strip then measure) is the correct measure for escape-bearing strings and is what fixed the
+<code>ui/text.rs</code> bug.</li>
+<li><b>SGR + OSC 8 carry across wrapped lines (Rust model).</b> <code>AnsiState</code> mirrors
+pi-mono's <code>AnsiCodeTracker</code>: each boolean SGR attribute plus fg/bg stored as raw code
+strings (e.g. <code>"38;5;240"</code>), and an <code>Option&lt;Hyperlink&gt;</code>. On each physical
+row break, <code>active_codes()</code> re-emits the open SGR + reopens the OSC 8 link, and
+<code>close_codes()</code> closes the link + resets SGR at row end. The OSC 8 terminator (BEL vs ST)
+is preserved per-link because some terminals only make BEL-terminated links clickable (OAuth URLs use
+BEL) &mdash; reopening with the wrong terminator would break clickability on wrapped rows.</li>
 </ul>
 
-<h2>Unit 1 — turn cap: unbounded default, optional graceful soft cap</h2>
+<h2>Reserved <code>ansi_aware</code> subsystem (deferred feature, scoped allow)</h2>
+<p>The string-based ANSI-aware <code>wrap_ansi</code> / <code>truncate_ansi</code> /
+<code>slice_by_column</code> (and the tracker/parser they need) are <b>built and unit-tested but not
+wired into any render path</b>. The ratatui span pipeline already carries SGR via
+<code>Span.style</code>, and emitting clickable hyperlinks is explicitly deferred. They live in a
+<code>pub(crate) mod ansi_aware</code> with a single scoped <code>#![allow(dead_code)]</code> (rather
+than a whole-file allow, so genuinely dead production code is still caught). This is the foundation a
+future markdown/hyperlink renderer builds on; today it only <em>preserves</em> OSC 8 (cross-wrap and
+cross-truncate tests prove the link is reopened on every physical row).</p>
+
+<h2>Per-unit migration parity</h2>
 <ul>
-  <li>Removed the hardcoded <code>MAX_TOOL_ROUNDTRIPS = 50</code>. The loop in
-    <code>Agent::complete_turn</code> is now an unbounded <code>loop</code> with a
-    manual <code>roundtrip</code> counter; it ends naturally when the model emits
-    no tool calls (or on cancellation).</li>
-  <li><strong>Tradeoff / runaway guard:</strong> with no fixed cap a malfunctioning
-    model could loop indefinitely. Cancellation (Ctrl-C, the turn
-    <code>CancellationToken</code>) is the always-on runaway guard and is checked
-    at the top of every iteration, before the provider stream, and during tool
-    execution — so a runaway turn is always interruptible. This matches pi-mono's
-    <code>runLoop</code>, which has no <code>maxTurns</code>/<code>maxSteps</code>.</li>
-  <li><strong>Config shape:</strong> new <code>Settings.max_tool_roundtrips:
-    Option&lt;usize&gt;</code> (camelCase <code>maxToolRoundtrips</code>). Absent =
-    unbounded. Precedence: <em>project-overridable</em> (merged like
-    <code>contextTokenBudget</code>) because a turn cap can only narrow a run, never
-    redirect tokens. Threaded into the agent via a builder
-    <code>Agent::with_max_tool_roundtrips(Option&lt;usize&gt;)</code>, called in
-    <code>run_agent</code>/<code>resume_agent</code> right where
-    <code>context_token_budget()</code> is read.</li>
-  <li>When set and reached, the loop reuses the existing graceful Notice path
-    ("stopped after N tool round-trips; send another message to continue.") +
-    <code>TurnComplete</code> — never a fatal error.</li>
+<li><b>wrap.rs (unit 2/4):</b> width/truncate/plain-wrap now re-export from the engine; the local
+<code>display_width</code>/<code>char_width</code>/<code>truncate_*</code>/<code>wrap_to_width</code>
+bodies are gone. The char-by-char loops (<code>push_wrapped_line</code>) now iterate grapheme
+clusters via a new <code>push_span_str</code> helper, so for ASCII/CJK output is byte-identical and
+emoji clusters are no longer split. <code>styled_physical_row</code> stays char-based (it matches a
+plain wrapped string back to per-char styled cells; cluster-safe wrap output still yields the same
+chars in order).</li>
+<li><b>tui/text.rs (unit 3):</b> <code>strip_ansi_for_text</code> is now
+<code>textengine::clean_text</code> (byte-identical); the handcoded CSI/string-control consumers were
+removed. <code>ansi_spans</code> still uses <code>ansi-to-tui</code> for ratatui span parsing (kept,
+see below) but routes its strip through the engine.</li>
+<li><b>ui/text.rs (unit 3) &mdash; the documented width-bug fix:</b> <code>visible_width</code> used
+<code>strip_ansi(input).chars().count()</code>, counting a 2-column CJK/emoji glyph as 1. The frame
+in <code>write_frame</code> computes right-border padding from <code>visible_width</code>, so non-ASCII
+diff/title content produced a misaligned (overflowing) right border. Now
+<code>textengine::visible_width</code> (strip + grapheme display width). To avoid a half-fix (review
+finding), the <em>entire</em> <code>write_frame</code> path is now display-column-consistent: the
+fits-check (<code>visible_width</code>), the body hard-wrap (<code>wrap_plain</code> breaks by column
+width, not cluster count), the title truncation (<code>truncate_plain</code> &rarr;
+<code>truncate_to_width</code>), and the top-border fill (<code>visible_width</code> instead of
+<code>chars().count()</code>). <b>Behavioral effect:</b> ASCII output is byte-identical (one cluster ==
+one column); CJK/emoji content that previously overran or misaligned the fixed-width frame now wraps
+and pads to fit. <code>wrap_plain</code> still returns the original ANSI-colored line unchanged when it
+fits, so colored diff lines keep their color.</li>
+<li><b>terminal_surface.rs (unit 5) &mdash; the width-math seam:</b> its <code>clip_to_width</code> now
+calls <code>textengine::clip_to_width</code> and the direct <code>unicode_width</code> import is gone.
+The old clip was per-<em>char</em> with width <code>unwrap_or(0)</code> (no <code>max(1)</code>); the
+engine clip is per-<em>grapheme</em>. These are byte-identical for ASCII/CJK/combining (all existing
+tests are ASCII and stay green). The <b>only</b> behavioral difference is at the exact right edge: an
+emoji ZWJ/flag cluster that no longer fits is dropped as a unit instead of being split into a broken
+half-cluster (which the terminal would have rendered as garbage anyway). A new
+<code>wide_glyph_line_clips_on_cluster_boundary_without_overrun</code> test pins the CJK behavior. The
+diff/replay/cursor logic was not touched.</li>
 </ul>
 
-<h2>Unit 2 — parallel cap removed</h2>
+<h2>ansi-to-tui kept, not replaced</h2>
+<p><code>ansi_spans</code> still uses <code>ansi-to-tui</code> to turn raw ANSI into ratatui
+<code>Span</code>s with proper <code>Style</code>. Replacing it would mean hand-mapping every SGR code
+to a ratatui <code>Style</code> &mdash; out of scope and a regression risk. The task only requires that
+<em>stripping and width</em> go through the engine, which they now do; <code>ansi-to-tui</code> remains
+the span-construction path.</p>
+
+<h2>wayland/mod.rs NOT migrated (deliberate, architecture-driven)</h2>
+<p><code>wayland::truncate_chars</code> (summary <code>MAX_SUMMARY_CHARS</code>/<code>MAX_EXCERPT_CHARS</code>
+bounds) was left in place and is <b>not</b> routed through the engine. Two reasons: (1)
+<code>src/wayland</code> is Tier 2 and <code>docs/ARCHITECTURE.md</code> requires Tier 2 to depend on
+Tier 1 only; routing it to the Tier-3 <code>src/ui</code> engine would create a forbidden upward
+Tier&nbsp;2&rarr;Tier&nbsp;3 dependency. (2) Its semantics differ &mdash; it is a char-count bound on
+stored summary text with a <code>"..."</code> ellipsis, not terminal display-width truncation, so it is
+not the same operation as the engine's width helpers. The prompt's "wayland may consume it" is
+superseded by the tier rule (AGENTS.md: trust the architecture boundary). This is a justified
+deferral, not a skipped migration.</p>
+
+<h2>Test-only strip helpers left in place</h2>
+<p>Three <code>strip_ansi</code> copies remain under <code>#[cfg(test)]</code> (in
+<code>tui.rs</code>, <code>terminal_surface.rs</code>, and a <code>chars().count()</code> assertion in
+<code>modal.rs</code>). They are assertion utilities for rendered-output tests, not production
+parsers. Routing them through the engine risks the carefully-tuned terminal-surface tests for no
+production benefit, so they were left; the production duplicate parsers are gone.</p>
+
+<h2>Review-round fixes (wave 1)</h2>
 <ul>
-  <li>Removed <code>MAX_PARALLEL_TOOL_CALLS = 8</code>. <code>run_parallel</code>
-    now uses <code>.buffered(calls.len().max(1))</code>.</li>
-  <li><strong>Ordering approach:</strong> kept <code>buffered</code> (not
-    <code>buffer_unordered</code>) deliberately: it preserves result order, which
-    the caller relies on when it zips outcomes back onto the calls. The whole
-    parallelizable run executes concurrently (pi-mono's <code>Promise.all</code>
-    over the batch). <code>max(1)</code> guards the empty-batch case
-    (<code>buffered(0)</code> stalls); in practice <code>run_tools</code> only
-    calls this with a non-empty parallelizable run. <code>is_parallelizable</code>
-    and the sequential/exclusive path are unchanged.</li>
+<li><b>O(n^2) tokenizer on malformed escapes (high):</b> <code>csi_len</code>/<code>string_control_len</code>
+now return <code>Some(rest.len())</code> for an unterminated sequence instead of <code>None</code>, so a
+dangling introducer is consumed as one zero-width token and the <code>ansi_aware</code> tokenizer stays
+linear on adversarial input. The production strip path (<code>transform</code>) was already single-pass
+linear; this hardens the deferred subsystem before it is wired. Test:
+<code>tokenize_is_linear_on_unterminated_escapes</code>.</li>
+<li><b>slice_by_column style leak (medium):</b> it now tracks an <code>AnsiState</code> and appends
+<code>close_codes()</code> before returning, so a slice ending mid-style does not leak SGR/OSC 8 into the
+next rendered content. Test: <code>slice_by_column_closes_style_and_does_not_leak</code>.</li>
+<li><b>C1 (8-bit) consistency (medium):</b> the tokenizer recognized 8-bit C1 CSI/OSC, but the tracker
+did not. <code>AnsiState::process</code> now also accepts the C1 CSI introducer and <code>parse_osc8</code>
+the C1 OSC introducer, so C1-encoded styles/links carry across wrapped rows.</li>
+<li><b>truncate_ansi ellipsis wider than field (low):</b> guarded so the result never exceeds
+<code>max_width</code> (clips the ellipsis itself).</li>
+<li><b>Dedup/cleanup:</b> <code>cluster_advance</code> is exported from the engine and reused by
+<code>wrap.rs</code> (was duplicated); removed a dead binding in <code>ansi_escape_len</code>.</li>
+<li><b>Added coverage:</b> RGB/256-color SGR carry across wrap, OSC 8 preservation through
+<code>truncate_ansi</code>, and a CJK frame-helper test in <code>ui/text.rs</code>.</li>
 </ul>
 
-<h2>Unit 3 — inline-output threshold to 50 KB</h2>
+<h2>Review-round fixes (wave 2)</h2>
 <ul>
-  <li><code>MAX_INLINE_TOOL_OUTPUT_BYTES</code> 16 KiB → <code>50 * 1024</code>.
-    Preview sizes (<code>PREVIEW_HEAD_BYTES = 4K</code>,
-    <code>PREVIEW_TAIL_BYTES = 2K</code>, sum 6K) are unchanged; the compile-time
-    invariant <code>assert!(MAX_INLINE_TOOL_OUTPUT_BYTES &gt; HEAD + TAIL)</code>
-    still holds, so no preview re-sizing was needed. Reuses the existing
-    handle-offload (issue #61) — no new spill subsystem.</li>
+<li><b>C1 ST terminator (U+009C):</b> <code>consume_string_control</code> (production strip path) and
+<code>string_control_len</code>/<code>parse_osc8</code> (engine) now treat the 8-bit C1 String
+Terminator as a valid terminator, not just BEL / 7-bit ST. Previously a C1-ST-terminated OSC/DCS would
+swallow the following visible text. Test added in <code>strip_ansi_handles_osc_with_st_and_bel</code>.</li>
+<li><b>visible_width non-allocating fast path:</b> when the input has no ESC and no 0xC2 lead byte (so no
+escape/C1 sequence is possible) it now sums widths directly instead of allocating a stripped copy.
+Control chars contribute 0 to <code>UnicodeWidthStr</code> either way, so this is identical output with
+no allocation on the common plain-text path.</li>
+<li><b>slice_by_column overflow guard:</b> <code>start + len</code> is now <code>saturating_add</code>.</li>
+<li><b>SGR 21:</b> kept as bold-off to match the pi-mono reference tracker, though ECMA-48 defines 21 as
+double-underline; this is the deferred subsystem and matches prior art. Colon (T.416) SGR sub-parameter
+separators are likewise not parsed (semicolon only) &mdash; noted, out of scope.</li>
 </ul>
 
-<h2>Unit 4 — single shared, configurable retry policy</h2>
+<h2>Deliberately NOT migrated (reviewer findings judged out of scope / not bugs)</h2>
+<p><code>tool_display.rs::fold</code> (<code>MAX_DISPLAY_CHARS</code>) and <code>truncate_inline</code> use
+<code>chars().count()</code>/<code>take()</code>: these are char-count <em>content budgets</em> (how much
+text to show), not display-column layout, so char/grapheme count is the correct semantic &mdash; the same
+reasoning as <code>wayland::truncate_chars</code>. Converting them to display-width would wrongly halve a
+CJK-heavy preview. <code>markdown.rs</code>'s continuation-prefix padding uses <code>chars().count()</code>
+on markers that are ASCII in practice. <code>screen.rs::take_last_display</code> already measures via the
+engine's <code>display_width</code> (it is a reverse-truncate algorithm, not a duplicate width impl).
+<code>wrap.rs::styled_physical_row</code> keeps per-char cells (documented above). None of these are
+production width/ANSI duplicates; leaving them is the smallest-correct scope.</p>
+
+<h2>Performance notes (no production regression)</h2>
+<p>Reviewers flagged allocations in the <code>ansi_aware</code> subsystem (<code>tokenize</code> returning a
+<code>Vec</code>, <code>split(';').collect()</code> in <code>AnsiState::process</code>, per-row
+<code>active_codes</code>/<code>format!</code>, the double tokenize in <code>wrap_ansi</code>). All are in
+the deferred, not-yet-wired subsystem and fine for real SGR input; left for when that path is wired to a
+real feature. The production transcript paths (<code>display_width</code> raw, <code>wrap_to_width</code>
+fast-path, <code>push_wrapped_line</code> per-cluster append) match the prior cost profile &mdash; no
+regression.</p>
+
+<h2>Known minor divergence: TAB width</h2>
+<p>The old <code>ui/text.rs::visible_width</code> counted a literal TAB as 1 (char count); the engine's
+<code>visible_width</code> reports 0 for control chars (TAB included), matching <code>UnicodeWidthStr</code>.
+For tab-indented frame/diff content the right-border padding shifts slightly. Both behaviors are wrong
+without true tab-stop expansion (the terminal renders TAB as a variable-width stop); tab expansion was
+left out of scope. Noted so it reads as a deliberate, bounded delta, not an oversight.</p>
+
+<h2>Reviewer-facing regression risks</h2>
 <ul>
-  <li>New <code>src/mimir/retry.rs</code> with <code>RetryPolicy</code>
-    (<code>max_retries</code>, <code>base_backoff</code>, <code>max_backoff</code>),
-    <code>Copy</code> so cloned providers carry it. It owns the single
-    <code>backoff_delay()</code> (exponential + jitter + bounded
-    <code>Retry-After</code>). Deleted the duplicated constants
-    (<code>MAX_TRANSIENT_RETRIES</code>/<code>BASE_BACKOFF</code>/<code>MAX_BACKOFF</code>)
-    and the two copies of <code>backoff_delay</code> from
-    <code>transport.rs</code> and <code>openai_codex_responses.rs</code>.</li>
-  <li><strong>Defaults adopted (pi-mono-aligned):</strong> <code>max_retries =
-    3</code>, <code>base_backoff = 2000 ms</code>, <code>max_backoff = 60 s</code>.
-    This <em>changes</em> Iris's prior values (was 500 ms base / 8 s cap) — an
-    intentional alignment. <code>Retry-After</code> honoring and jitter
-    (≤250 ms) are preserved; the pathological-hint clamp is now
-    <code>4 × max_backoff</code>.</li>
-  <li><strong>Config shape:</strong> new <code>Settings.retry:
-    Option&lt;RetrySettings&gt;</code> with <code>maxRetries</code> /
-    <code>baseDelayMs</code> / <code>maxDelayMs</code> (all optional; absent
-    subfields fall back to the defaults). <em>Global-only</em> (merged like
-    <code>promptCacheRetention</code>): retry volume affects provider load/cost,
-    so an untrusted project file must not crank it up.</li>
-  <li><strong>Divergence from pi-mono:</strong> pi-mono's <code>RetrySettings</code>
-    also has <code>enabled</code> and a per-provider <code>provider</code> override,
-    and keeps the 60 s ceiling in a separate <code>ai/types</code> field
-    (<code>maxRetryDelayMs</code>). Iris keeps one flat policy and exposes the cap
-    as <code>maxDelayMs</code> in the same object (single seam, no inert knobs).
-    No <code>enabled</code>/per-provider knobs were added (they would trigger
-    nothing today).</li>
-  <li><strong>Threading:</strong> <code>RetryPolicy</code> is resolved in
-    <code>ModelSelection::resolve</code> from <code>settings.retry_settings()</code>
-    (alongside <code>cache_retention</code>/<code>context_management</code>) and
-    carried on <code>ModelSelection.retry_policy</code>. <code>build_provider</code>
-    passes it to the Codex and Anthropic constructors; a runtime
-    <code>/model</code> switch carries the same policy. Antigravity uses
-    <code>run_with_reauth</code> (reauth-only, no transient retries) and is
-    unchanged.</li>
-</ul>
-
-<h2>Unit 5 — bash default timeout removed</h2>
-<ul>
-  <li>Removed <code>DEFAULT_BASH_TIMEOUT_SECS = 120</code>. One-shot and session
-    <code>run</code> now derive timeout as
-    <code>input.timeout.filter(|s| *s &gt; 0).map(Duration::from_secs)</code> —
-    unset (or <code>0</code>) means no caller time limit (pi-mono parity);
-    a positive value is the per-call limit.</li>
-  <li><strong>Kept rail:</strong> the persistent-session
-    <code>SESSION_HARD_CAP</code> (600 s) is a wedge-safety rail (a wedged shell,
-    e.g. an unterminated here-doc, still gets killed), not the arbitrary 120 s
-    default. It is unchanged; <code>render_session</code> already reports it when
-    no per-command limit is set.</li>
-  <li>The background-job <code>finalize</code> wait default (previously 120 s when
-    unset) was also removed: unset/0 now blocks until the job completes
-    (cancellation-aware), a positive value bounds the wait.</li>
-  <li>Cancellation, drain, and the temp-file save of full output are untouched.
-    DESCRIPTION/parameter strings updated ("No timeout by default").</li>
-</ul>
-
-<h2>Unit 6 — default truncation byte cap to 50 KB</h2>
-<ul>
-  <li><code>text::DEFAULT_MAX_BYTES</code> 1 MB → <code>50 * 1024</code>. This
-    propagates to read/grep/ls/find/bash <em>display</em> truncation. DESCRIPTION
-    strings and the read paging notice updated "1MB" → "50KB".</li>
-  <li><strong>Decoupling (avoids an unintended shrink):</strong>
-    <code>bash/jobs.rs DEFAULT_JOB_CAPACITY</code> previously aliased
-    <code>DEFAULT_MAX_BYTES</code>. It is a peak-memory <em>capture</em> ring
-    bound, not a display cap, so it was pinned to <code>1_000_000</code> rather
-    than following the display cap down to 50 KB. The bash one-shot
-    <code>MAX_CAPTURE_BYTES</code> (4 MiB/stream) memory rail is unchanged (only
-    its comment updated to the new 50 KiB display window).</li>
-</ul>
-
-<h2>Unit 7 — grep clamps removed</h2>
-<ul>
-  <li>Deleted <code>MAX_CONTEXT</code>, <code>MAX_GREP_LIMIT</code>,
-    <code>MAX_HEAD_LIMIT</code>, <code>MAX_OFFSET</code> and all clamping.
-    <code>positive_cap</code> lost its <code>max</code> parameter (now default +
-    reject-zero only). <code>context</code> is no longer clamped; <code>offset</code>
-    has no ceiling; an unset <code>headLimit</code> now shows every output row
-    (was implicitly capped at 500), bounded only by <code>limit</code>.</li>
-  <li>Kept <code>DEFAULT_GREP_LIMIT = 100</code> and
-    <code>GREP_MAX_LINE_LENGTH = 500</code>. DESCRIPTION/parameter strings updated
-    (dropped "capped at 1000"/"capped at 500").</li>
-  <li><strong>Accepted tradeoff (reviewer-flagged):</strong> with
-    <code>context</code>/<code>limit</code> no longer clamped, a request such as
-    <code>context=1000000</code> makes the match sink collect more context lines
-    before the final <code>truncate_head</code> (2000 lines / 50 KB) trims the
-    output. This is intentional pi-mono parity: pi-mono's grep likewise has no
-    max-context/limit clamp. Memory stays bounded by the actual file content
-    (ripgrep emits no more context than the file has, and overlapping context is
-    merged) and by <code>GREP_MAX_LINE_LENGTH = 500</code> (the real guard against
-    minified-line blowups). Re-adding a context/limit bound would reintroduce the
-    very clamp this unit removes, so it was deliberately not done.</li>
-  <li><strong>Deferral (named):</strong> <code>DEFAULT_CONTEXT</code> stays at
-    <code>2</code> (pi-mono defaults to 0). Per the spec, changing the default is
-    a behavior choice beyond removing clamps — divergence noted, not changed.</li>
-</ul>
-
-<h2>Unit 8 — ls scan hard cap removed</h2>
-<ul>
-  <li>Deleted <code>LS_SCAN_HARD_LIMIT = 20_000</code> and both its enforcement
-    sites (the <code>limit.min(cap)</code> and the per-directory scan break). The
-    listing is bounded by the requested <code>limit</code> only. Kept
-    <code>DEFAULT_LS_LIMIT = 500</code> and <code>DEFAULT_FIND_LIMIT = 1000</code>.</li>
-</ul>
-
-<h2>Tests changed / added (and why)</h2>
-<ul>
-  <li><code>nexus_tests.rs</code>: <code>tool_loop_stops_gracefully_at_roundtrip_limit</code>
-    → split into <code>tool_loop_stops_gracefully_at_configured_soft_cap</code>
-    (sets a cap via the new builder, proves the graceful Notice + exact provider
-    call count) and new <code>tool_loop_is_unbounded_by_default</code> (scripts 60
-    rounds past the old ceiling, proves no soft-cap notice). Old test depended on
-    the removed <code>MAX_TOOL_ROUNDTRIPS</code>.</li>
-  <li><code>nexus_tests.rs</code>: <code>safe_tool_parallelism_is_bounded</code> →
-    <code>safe_tool_parallelism_is_uncapped</code> (batch of 12 &gt; old cap of 8;
-    asserts the whole batch overlaps). Old test asserted the removed cap.</li>
-  <li><code>transport.rs</code> + <code>openai_codex_responses_tests.rs</code>:
-    retry-loop tests now pass <code>&amp;RetryPolicy::default()</code> and read
-    <code>max_retries</code> from it; the three duplicated
-    <code>backoff_delay_*</code> tests were removed (computation moved to
-    <code>mimir::retry::tests</code>, which adds coverage for the new defaults).</li>
-  <li><code>grep.rs</code>: <code>context_is_capped</code> →
-    <code>context_is_not_clamped</code>; <code>default_output_is_bounded_and_pageable</code>
-    → <code>explicit_head_limit_is_bounded_and_pageable</code> + new
-    <code>unset_head_limit_is_not_clamped</code>.</li>
-  <li>New config tests (<code>max_tool_roundtrips_*</code>,
-    <code>retry_settings_parse_and_default_and_are_global_only</code>), a selection
-    test (<code>resolve_builds_retry_policy_from_settings_with_defaults</code>),
-    and a bash test (<code>bash_unset_timeout_imposes_no_default_limit</code>).</li>
-  <li><strong>Test-coverage limitation:</strong> ls's removed scan hard cap
-    (20,000) is not directly unit-tested — exercising it would require a
-    pathologically large directory. The grep clamp-removal tests cover the
-    "accepts values past the old clamps" requirement; existing ls tests prove no
-    regression.</li>
-</ul>
-
-<h2>Named deferrals (out of scope, per spec)</h2>
-<ul>
-  <li><strong>Compaction engine</strong> tied to <code>context_token_budget</code>
-    (pi-mono <code>compaction.ts</code>): a separate roadmap feature, not an
-    arbitrary restriction. <code>contextTokenBudget</code> left exactly as-is.</li>
-  <li><strong>Memory-safety rails kept:</strong>
-    <code>READ_TOOL_MAX_BYTES</code> / <code>WRITE_TOOL_MAX_BYTES</code> (100 MB
-    load/write bounds) and <code>MAX_CAPTURE_BYTES</code> (4 MiB/stream peak
-    capture) are OOM rails, not arbitrary harness ceilings — unchanged. So is the
-    bash session <code>SESSION_HARD_CAP</code> (wedge-safety) and the job ring
-    capacity (peak-memory bound).</li>
-  <li><strong>grep <code>DEFAULT_CONTEXT = 2</code></strong> kept (pi-mono 0) — see
-    Unit 7.</li>
-  <li><strong>Not adopted from pi-mono:</strong> its
-    <code>AgentLoopConfig</code>/host-callback architecture, SDK retry classes,
-    <code>shell-output.ts</code> spill machinery, per-provider/<code>enabled</code>
-    retry knobs, and module structure. Behavior was reimplemented idiomatically in
-    Rust; no new dependencies.</li>
-</ul>
-<hr>
-<h2>Tier-3 TUI component abstraction</h2>
-<p>Decisions and discoveries not already explicit in the task spec. Organized by
-scope unit. Not a step log.</p>
-
-<h2>Verification of starting state</h2>
-<ul>
-  <li><code>git fetch</code> succeeded; <code>origin/main</code> at
-  <code>6b48611</code> (matches the prompt snapshot). The primary checkout was in
-  detached HEAD at <code>d1d9bce</code> (one commit ahead, owned by another
-  worktree branch), but the <code>main</code> branch == <code>origin/main</code>
-  and <code>worktree-preflight.sh</code> reported PASS. Branched
-  <code>feat/tui-component-abstraction</code> off <code>origin/main</code>.</li>
-  <li><code>~/vendor/pi-mono/packages/tui/src/tui.ts</code> present (1495 lines);
-  used as conceptual reference only.</li>
-  <li>Cited symbols/lines had drifted (Iris file <code>tui.rs</code> is the
-  module root; the renderers live in <code>src/ui/tui/{rows,pane,panel,
-  transcript,screen}.rs</code>). Worked from observed code.</li>
-</ul>
-
-<h2>Unit 1 — Component trait + cursor marker (src/ui/tui/component.rs)</h2>
-<ul>
-  <li><b>Render unit.</b> Iris's currency is <code>Vec&lt;Line&lt;'static&gt;&gt;</code>,
-  so the trait is <code>render(&amp;self, width: usize) -&gt; Vec&lt;Line&lt;'static&gt;&gt;</code>
-  (pi-mono returns <code>string[]</code>).</li>
-  <li><b>Trait kept minimal (render only).</b> pi-mono's <code>handleInput</code>
-  and <code>invalidate</code> were intentionally NOT added. Iris routes typed
-  crossterm events through the focus/overlay layer, not a stringly-typed input
-  hook; and no Iris component caches render state, so <code>invalidate</code>
-  would be a no-caller stub — forbidden by the spec's anti-stub rule. Both are
-  deferred until a real caller exists (theming/markdown cache → invalidate).</li>
-  <li><b>Cursor marker.</b> Adopted pi-mono's APC sentinel
-  (<code>CURSOR_MARKER = "\x1b_pi:c\x07"</code>) and a
-  <code>take_cursor_position</code> that locates the marker, computes
-  <code>(row, col)</code> by display width, and strips it across spans. Iris uses
-  NO hardware cursor today (the editor draws its own reversed block cursor via
-  <code>ratatui-textarea</code>), so no shipped component emits the marker. The
-  function is still genuinely wired (called by the composition root, unit 6) and
-  fully unit-tested with a marker-emitting fixture — it is the real seam the
-  deferred hardware-cursor/IME work plugs into, today a no-op strip.</li>
-</ul>
-
-<h2>Unit 2 — Container (src/ui/tui/component.rs)</h2>
-<ul>
-  <li><code>Container</code> owns <code>Vec&lt;Box&lt;dyn Component&gt;&gt;</code>
-  and composites in order. A separate borrowed <code>composite()</code> helper
-  exists so hot paths can composite <code>&amp;dyn Component</code> without
-  boxing (the transcript renders up to <code>MAX_TRANSCRIPT_ROWS</code> rows per
-  frame).</li>
-</ul>
-
-<h2>Unit 3 — Transcript rows migration (rows.rs, pane.rs, transcript.rs)</h2>
-<ul>
-  <li><code>TranscriptRow::render(width, out)</code> renamed to the inherent
-  <code>render_rows</code> (append-based); the <code>Component</code> impl's
-  <code>render_into</code> override calls it (no per-row <code>Vec</code>) and
-  <code>render</code> wraps it.</li>
-  <li><code>Transcript::render</code> now selects the visible fold-tagged rows
-  (collapsed panels show the capped preview, expanded panels show the full body) into a
-  <code>Vec&lt;&amp;dyn Component&gt;</code> and calls <code>composite</code>.
-  The in-flight stream became <code>pane::streaming_assistant_rows</code>
-  (returns transient <code>TranscriptRow</code>s) so it joins the same borrowed
-  composite instead of rendering directly.</li>
-  <li><b>Byte-identical:</b> <code>composite</code>'s <code>extend</code> equals
-  the former <code>push</code> loop; each row's <code>render_into</code> is
-  unchanged. Proven by the existing <code>width_resize_reflows_transcript_from_state</code>
-  and <code>surface_draw_path_replays_history_from_state</code> tests.</li>
-</ul>
-
-<h2>Unit 5 — Overlay + focus (overlay.rs, screen.rs, modal.rs, tui_loop.rs)</h2>
-<ul>
-  <li><b>Docked, not floating (key divergence).</b> pi-mono overlays float and
-  composite over the base document at anchor/margin positions. Iris's modal and
-  slash palette occupy a RESERVED region above the composer (allocated by
-  <code>chrome_heights</code>); the editor shifts down. Modeling them as floating
-  would move where they render and break byte-identical output. So overlays stay
-  docked; the abstraction supplies the two pieces pi-mono couples to overlays:
-  explicit focus and a Component render path. A true floating anchor/margin
-  compositor + overlay handles (hide/show/focus/unfocus) are deferred (no Iris
-  floating UI to migrate; adding it now = abstraction with no caller). Recorded
-  in ADR-0024.</li>
-  <li><b>Explicit focus.</b> <code>FocusTarget { Editor, Palette, Modal }</code>
-  with precedence Editor &lt; Palette &lt; Modal. <code>Screen::focus()</code> is
-  the single source of truth, derived from existing modal/palette state (no new
-  duplicated flags to keep in sync). It replaced the implicit checks in
-  <code>tui_loop.rs</code>: <code>modal_open()</code> (deleted) → <code>focus()
-  == Modal</code> at the modal-phase gates; <code>palette.is_active()</code> →
-  <code>focus() == Palette</code> for the idle chord-suppression and palette-nav
-  branches. Byte-identical because in idle a modal is never open, so
-  <code>focus()==Palette ⟺ palette.is_active(input)</code>.</li>
-  <li><b>Modal + palette as Components.</b> <code>impl Component for Modal</code>
-  (clamps the <code>usize</code> width back to the <code>u16</code> the picker
-  renderers use). The palette's STATE stays in <code>slash.rs</code>;
-  <code>overlay::PaletteView</code> is its Component render face, reproducing the
-  former <code>screen::render_palette</code> rows exactly.
-  <code>render_editor_chrome</code> now picks the focused overlay
-  (<code>match screen.focus()</code>), renders it once via <code>Component</code>,
-  uses that length for menu height, and paints it through one
-  <code>overlay::render_menu_lines</code> helper.</li>
-  <li><b>Byte-identical traps handled.</b> The old code had two inset helpers
-  (<code>render_palette</code>, <code>render_plain_menu_lines</code>) with
-  IDENTICAL inner-rect math; collapsed into one. Modal render width was
-  <code>content_width(area.width)</code>, which equals the menu inner width, so
-  rendering at the inner width is unchanged. Menu height (<code>len + 2</code>,
-  <code>MAX_MENU_ROWS</code> cap) preserved by computing it from the single
-  rendered line list. <code>Paragraph</code> still does the clipping (no manual
-  truncation added).</li>
-</ul>
-
-<h2>Unit 6 — Composition root (screen.rs)</h2>
-<ul>
-  <li><code>render_document_with_chrome_tail</code> assembles transcript +
-  working block + chrome through a root <code>Container</code> of
-  <code>LinesSection</code> components (mirrors pi-mono <code>TUI extends
-  Container</code>), then calls <code>take_cursor_position</code> to strip any
-  marker before the document reaches <code>TerminalSurface</code>.</li>
-  <li><b>TerminalSurface seam:</b> untouched. The abstraction only produces the
-  final <code>Vec&lt;Line&gt;</code>; diff/append/replay/resize stay in
-  <code>terminal_surface.rs</code> (existing terminal-surface tests still pass).</li>
-  <li><b>Performance (post-review):</b> the first pass wrapped the whole document
-  (incl. transcript) in cloning <code>LinesSection</code>s, an avoidable O(n)
-  full-document copy per frame. Fixed after wave-1 review: the transcript is
-  MOVED into the document as the scrolling base; only the viewport-bounded tail
-  (working indicator + chrome) is composed through the root <code>Container</code>.
-  Separately, <code>Component::render_into</code> was added so the transcript's
-  borrowed <code>composite</code> over thousands of rows allocates no per-row
-  <code>Vec</code> (matches the pre-abstraction push loop).</li>
-  <li><b>Cursor-marker scan bounded.</b> <code>take_cursor_position</code> runs on
-  the volatile tail only (the cursor only ever lives in the composer chrome), not
-  the full document.</li>
-  <li><b>Focus allocation.</b> <code>Screen::focus_for(&amp;input)</code> lets the
-  hot callers (idle key handler, chrome render) reuse their existing editor-text
-  snapshot instead of re-joining the buffer; <code>focus()</code> remains for the
-  non-hot modal-phase gates.</li>
-</ul>
-
-<h2>Unit 4 — Tool panels: DEFERRED (named follow-up)</h2>
-<ul>
-  <li>After unit 3, tool panels already render through the row-level
-  <code>Component</code> path: every panel is a flat sequence of
-  <code>TranscriptRow</code>s carrying <code>ChromeRow</code> chrome, and
-  <code>TranscriptRow: Component</code>.</li>
-  <li>Grouping those flat rows into a standalone <code>Panel</code> component
-  would require reworking the in-place panel machinery
-  (<code>panel_end_from</code>, <code>replace_active_exec_panel</code> /
-  <code>replace_active_tool_panel</code>, the splice-based live-exec/tool
-  finalize, trim-safety, and the collapse filter in <code>Transcript::render</code>).
-  That is high regression risk and not safely byte-identical within this session,
-  so it is deferred. The spec explicitly permits deferring units 3/4/5; units 1–2
-  plus two real migrations (3 and 5) landed.</li>
-</ul>
-
-<h2>Other deferrals (out of scope here)</h2>
-<ul>
-  <li><b>Text fallback UI (<code>src/ui/text.rs</code>):</b> left on its current
-  path. It is a line-printer over stdout (no <code>Screen</code>, no
-  <code>TerminalSurface</code>, no <code>Line</code> composition), so it is not a
-  component-rendered surface; migrating it would add an abstraction with nothing
-  to composite.</li>
-  <li><b>pi-mono component catalog Iris lacks</b> (image/kitty-iterm graphics,
-  autocomplete, kill-ring, undo-stack, configurable keybindings, theming) and a
-  second terminal-diff engine: out of scope; separate roadmap items.</li>
-  <li><b>Floating overlay compositor + overlay handles + multiple overlays +
-  hardware cursor:</b> deferred (no current floating UI / no hardware cursor in
-  Iris). The <code>CURSOR_MARKER</code> seam is in place for the cursor part.</li>
-</ul>
-
-<h2>Trait shape decision (raised in review)</h2>
-<p>Reviewers asked whether <code>render_into</code> should be the required method
-and <code>render</code> the provided one (efficient-by-default). Kept
-<code>render</code> required + <code>render_into</code> provided/overridable: the
-only hot component is <code>TranscriptRow</code> (which overrides
-<code>render_into</code>); <code>Modal</code>, <code>PaletteView</code>,
-<code>LinesSection</code>, and <code>Container</code> naturally produce owned
-lines, so requiring <code>render_into</code> would add append-style boilerplate
-for owned data with no efficiency gain. The current shape achieves zero per-row
-allocation on the hot path without churning the cold components.</p>
-
-<h2>Cursor-marker / wrapping constraint (forward seam)</h2>
-<p><code>take_cursor_position</code> runs on already-rendered (post-wrap) lines and
-uses <code>display_width</code>. Note that <code>wrap.rs::char_width</code>
-clamps every char to width &ge; 1, so the multi-byte <code>CURSOR_MARKER</code>
-must NOT pass through wrapping as part of real text or it would be miscounted and
-force premature wraps. No component emits the marker today, so this is latent;
-the constraint for the deferred hardware-cursor work is: emitters place the
-marker in its own span and the composition root strips it before any width/wrap
-computation (which it already does, bounded to the volatile tail).
-<code>wrap.rs</code> is intentionally left unchanged to preserve byte-identical
-wrapping of existing content.</p>
-
-<h2>ADR-0006 tension and resolution</h2>
-<p>ADR-0006 says build Iris-native, sized to Iris, do not import app-scale
-architecture; Ratatui = primitives; Iris owns the terminal surface. This change
-stays inside that: the abstraction is small (two files), reuses
-<code>TerminalSurface</code> unchanged, adds no dependencies, vendors no
-pi-mono/Codex code, and lives entirely in Tier-3 <code>src/ui/tui/</code>. It
-amends ADR-0006 only by adding a render-abstraction layer above the surface, and
-explicitly declines the pi-mono floating-overlay/component-catalog scale.
-Recorded as ADR-0024.</p>
-
-<h2>Reviewer-facing risks</h2>
-<ul>
-  <li>Menu-region byte-identical (height math, inner-rect insets, Paragraph
-  clipping) — preserved exactly; covered by existing modal/palette tests +
-  new overlay tests.</li>
-  <li>Focus precedence drift (Editor &lt; Palette &lt; Modal; active palette must
-  still suppress global idle chords) — covered by <code>tui_loop</code> tests
-  including <code>idle_chords_yield_to_an_active_palette</code>.</li>
-  <li>Root container per-frame clone (see Unit 6 tradeoff).</li>
-  <li>Cursor: <code>TerminalSurface</code> untouched; no hardware cursor enabled
-  or moved.</li>
+<li><b>Terminal wrap drift:</b> the main risk is any divergence in wrap/truncate output for existing
+content. Mitigated by keeping <code>display_width</code> raw, preserving each migrated function's
+algorithm, and grapheme==char width equality for ASCII/CJK/single-emoji/combining (verified). Only
+ZWJ/flag/multi-RI sequences and the documented <code>ui/text.rs</code> CJK frame-overflow fix change
+output, all toward correctness.</li>
+<li><b>let-chains:</b> three <code>collapsible_if</code> sites in the engine use
+<code>if A &amp;&amp; let &hellip;</code> let-chains (already used elsewhere in the tree); the tokenizer
+escape-introducer OR-group is bound to a local first to keep <code>&amp;&amp;</code>/<code>||</code>
+precedence correct.</li>
 </ul>
 </body>
 </html>
