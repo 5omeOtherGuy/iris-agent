@@ -1,48 +1,141 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>TUI Implementation Notes</title>
+<meta charset="utf-8">
+<title>Composer / Editor Statusline Upgrade — Implementation Notes</title>
 </head>
 <body>
-  <h1>TUI Implementation Notes</h1>
-  <section>
-    <h2>Reviewer Context</h2>
-    <ul>
-      <li>This file contains reviewer-facing decisions from the composer/statusline work already on <code>origin/main</code> plus the working-indicator changes in this branch.</li>
-      <li><strong>Worktree constraint:</strong> project preflight could not be completed because the primary checkout was behind <code>origin/main</code> and contained a pre-existing untracked <code>package-lock.json</code>. I did not modify that file.</li>
-    </ul>
-  </section>
-  <section>
-    <h2>Composer and Statusline Decisions</h2>
-    <ul>
-      <li>The existing TUI footer source has model, reasoning effort, and cwd, but no explicit mode. The implementation keeps the current hard-coded mode as <code>code</code>.</li>
-      <li><code>CTX</code> is derived from <code>mimir::model_catalog::ctx_label</code>. Live TUI refresh builds a provider-qualified lookup key for the catalog, while the rendered <code>MODEL</code> value remains the existing bare model id to avoid making the statusline noisier.</li>
-      <li>Reasoning effort is rendered as the optional model flag token after <code>MODEL</code> instead of as a separate <code>EFFORT</code> field. This matches the spec's allowance for compact model option flags and avoids adding a fifth statusline field.</li>
-      <li>Branch remains parsed from the existing cwd string for compatibility, but it is lower priority than <code>MODE</code>, <code>MODEL</code>, <code>CTX</code>, and <code>CWD</code>; on narrow widths it is the first field omitted.</li>
-      <li>When no footer/model selection has been sourced yet, Iris continues to omit the statusline rather than inventing unknown model/context/cwd values.</li>
-      <li>On terminals too short to fit the canonical composer shape, the hint row is hidden rather than overlapping the editor text. This preserves width/row integrity under severe height constraints.</li>
-      <li>The bare/qualified model adapter on <code>Screen::set_footer</code> is test-only; production uses <code>set_footer_with_context</code> so release builds do not carry an unused compatibility shim.</li>
-      <li>The statusline dot aligns with the editor input text by using the existing composer border indent plus the two-column editor text padding. A broader shared-gutter change was avoided because it reflows transcript and pasted-terminal rendering outside this feature's scope.</li>
-      <li>The canonical editor vertical chrome count is named in code to keep the height calculation and text-area subtraction in sync.</li>
-    </ul>
-  </section>
-  <section>
-    <h2>Working Indicator Decisions</h2>
-    <ul>
-      <li><strong>Telemetry source:</strong> the TUI only receives provider token usage on <code>ProviderTurnCompleted</code>. The indicator therefore shows usage once the active turn has reported it, and clears stale prior usage when a new turn starts so the readout represents the current turn rather than the previous one.</li>
-      <li><strong>Field scope:</strong> the prior active-turn line included model reasoning effort text. The new indicator intentionally omits that extra field because the spec fixes the working indicator field order to activity, elapsed, interrupt, then token telemetry.</li>
-      <li><strong>Merge with composer statusline:</strong> after merging <code>origin/main</code>, the working indicator remains outside editor chrome and is appended to the transcript tail before composer/statusline chrome. This preserves the composer statusline PR's height model while matching the working indicator's transcript-flow placement.</li>
-    </ul>
-  </section>
-  <section>
-    <h2>Turn Divider Decisions</h2>
-    <ul>
-      <li><strong>Work detection scope:</strong> the divider is tracked in the Iris TUI tier from rendered UI events. Provider start/completion events alone are not treated as concrete work, because those events also occur for pure conversational turns and the spec forbids dividers there. Provider errors are treated as runtime work because they represent a failed turn attempt rather than pure conversation.</li>
-      <li><strong>Elapsed source:</strong> the TUI uses the existing active-turn spinner start timestamp as the divider elapsed source. This keeps the divider aligned with the working indicator and avoids changing Nexus event contracts.</li>
-      <li><strong>Emission point:</strong> the divider is appended from <code>Screen::end_turn</code> after the working indicator state is no longer needed. This keeps the completed divider and live working indicator mutually exclusive in rendered state.</li>
-      <li><strong>Telemetry source:</strong> token telemetry comes from the latest provider usage observed during the active turn. No synthetic token estimates are added when provider usage is absent; the divider falls back to elapsed-only text.</li>
-    </ul>
-  </section>
+<h1>Composer / Editor Statusline Upgrade — Implementation Notes</h1>
+<p>Reviewer-facing notes for the TUI composer statusline upgrade. Records only
+decisions/changes not explicit in the spec. Routine steps omitted.</p>
+
+<h2>Scope &amp; key files</h2>
+<ul>
+  <li><code>src/ui/tui/screen.rs</code> — composer chrome rendering (the file changed by this work).</li>
+  <li><code>src/ui/tui.rs</code> — constants, style helpers, and the test module for chrome.</li>
+</ul>
+
+<h2>Pre-existing state vs. spec</h2>
+<p>Before this change the runtime status was rendered as a <em>separate line above</em>
+the editor box (a "rail": <code>● MODE code ┊ MODEL … ┊ CTX … ┊ CWD … ┊ BRANCH …</code>).
+The spec explicitly forbids a floating statusline above the composer, so the rail was
+removed and its data relocated: mode/model/context into the editor's top border, and
+cwd/git into a quiet unboxed label below the box.</p>
+
+<h2>Decisions not specified by the spec</h2>
+<ul>
+  <li><strong>Active dot is statically orange.</strong> The top-frame <code>●</code> uses
+      the accent color always (it signals "session active"); it is not tied to turn
+      state. The inline working indicator already signals turn activity.</li>
+  <li><strong>Effort is always shown when set</strong> (e.g. <code>LOW</code>), including
+      during an active turn. The removed rail hid effort while the spinner ran; the
+      new frame shows it because the spec layout includes it. It is dropped only by
+      width fallback.</li>
+  <li><strong>Model display = uppercased bare model id</strong> (<code>gpt-5.4</code> →
+      <code>GPT-5.4</code>), not the catalog display name (<code>GPT 5.4</code>),
+      because the spec shows <code>GPT-5.4</code>. Effort is appended uppercased.</li>
+  <li><strong>CTX label</strong> = catalog context-window label uppercased
+      (<code>300k</code> → <code>CTX 300K</code>). The meter is computed from
+      <code>total_tokens / parse(window)</code> where <code>parse</code> handles
+      <code>k</code>/<code>m</code> suffixes and plain integers.</li>
+  <li><strong>Meter value persisted separately from per-turn usage.</strong> Added
+      <code>Footer.context_used_tokens</code>, updated on every
+      <code>ProviderTurnCompleted</code> and <em>not</em> cleared at turn start, so the
+      meter does not blank at the start of every turn. It is cleared in
+      <code>set_footer_with_context</code> when the model or context window changes, so
+      a prior model's usage is never shown against a new window (oracle-recommended).
+      The working indicator keeps using <code>Footer.usage</code> (still per-turn).</li>
+  <li><strong>Meter math:</strong> 10 dots, <code>div_ceil</code> so any nonzero usage
+      lights ≥ 1 dot; over-budget clamps to a full strip. The last lit dot is the
+      orange edge; earlier lit dots are muted (<code>DarkGray</code>); empty dots are
+      dim (<code>○</code>).</li>
+  <li><strong>Width step 3 ("shorten model alias") is a no-op.</strong> No alias table
+      exists in the catalog, so narrowing is handled by the remaining steps: drop
+      effort → drop meter → drop CTX → minimum <code>● CODE ─ MODEL</code>. Candidates
+      are monotonic (effort never reappears after being dropped).</li>
+  <li><strong>Pulsing not implemented.</strong> The spec's edge-pulse / 100%-pulse are
+      "may" behaviors; omitted (static styling only).</li>
+  <li><strong>Workspace label placement:</strong> indented to the transcript text
+      column (<code>TEXT_COLUMN_X_PADDING</code> = 4), dim, formatted
+      <code>&lt;cwd&gt; ┊ git &lt;branch&gt;</code> with no trailing separator. CWD uses a
+      middle-ellipsis that preserves the final path segment (project name); if even
+      <code>…/&lt;project&gt;</code> does not fit it left-ellipsizes the project name.</li>
+</ul>
+
+<h2>Layout / frame-integrity mechanics</h2>
+<ul>
+  <li>The statusline is printed into the editor's top border via
+      <code>buf.set_line()</code> <em>after</em> the block, body, and hint are rendered
+      (so the textarea cannot overwrite it at tiny heights). The line is built at
+      exactly the box width: <code>┌─ </code> + segments joined by <code> ─ </code> +
+      <code> </code> + <code>─</code> fill + <code>┐</code>.</li>
+  <li><strong>Never breaks the frame:</strong> if even the minimum content cannot fit
+      (extremely narrow terminals), <code>composer_top_border</code> returns
+      <code>None</code> and the plain <code>Block</code> border is kept. A test sweeps
+      box widths 6..=200 asserting the line is exactly the box width and is corner-bounded.</li>
+  <li><strong>Height budget reordered.</strong> Chrome is now
+      <code>[menu, editor, workspace-label]</code> (label below the editor). The editor
+      frame is protected first: the menu yields to <code>MIN_EDITOR_H</code>, then the
+      workspace label yields to both, so constrained heights drop the label before
+      squeezing the editor frame. Constant <code>GLOBAL_STATUS_H</code> renamed
+      <code>WORKSPACE_LABEL_H</code>.</li>
+</ul>
+
+<h2>Code-review outcomes (4 parallel reviewers)</h2>
+<p>Reviewed from four angles: correctness/frame-integrity, spec conformance,
+architecture/tier boundaries, and test quality. No correctness or spec-conformance
+bugs were found; the frame-integrity width sweep and meter math were validated.
+Applied fixes:</p>
+<ul>
+  <li><strong>Removed duplicated helpers</strong> (AGENTS.md reuse rule): the local
+      <code>spans_display_width</code> and <code>take_first_display</code> now reuse
+      <code>wrap::spans_width</code> and <code>wrap::truncate_to_width</code>.
+      <code>take_last_display</code> is kept (wrap only exposes a prefix variant) but
+      no longer allocates a <code>String</code> per character.</li>
+  <li><strong>Stale usage reset:</strong> <code>set_footer_with_context</code> now also
+      drops the carried-over <code>usage</code> (not just the meter value) when the
+      model/context changes, so the working indicator can't briefly show a prior
+      model's IO. Verified the model-switch test still passes (it keeps the same model).</li>
+</ul>
+<p>Considered and deferred / not actioned (with rationale):</p>
+<ul>
+  <li><strong>Extract a <code>chrome.rs</code> module</strong> (reviewer: medium).
+      <code>screen.rs</code> is ~1.2k lines, but it was already that size from the
+      concurrent #163 refactor; splitting is a separate cohesion refactor outside this
+      task's scope. Deferred as a follow-up to keep this change focused.</li>
+  <li><strong>Meter uses <code>total_tokens</code> (input+output), not
+      <code>input_tokens</code>.</strong> Verified the provider contract: for the
+      stateless Codex/Anthropic lanes <code>input_tokens</code> is the full cumulative
+      prompt, so <code>total_tokens</code> is a sound, slightly-conservative proxy for
+      window fullness. Kept as-is (tested); switching to <code>input_tokens</code> is a
+      possible future refinement.</li>
+  <li><strong>Case-sensitive model comparison</strong> in the meter-reset check: all
+      live callers pass the bare lowercase model id, so this cannot misfire today.</li>
+  <li><strong>Ultra-narrow degradation:</strong> below the minimum content width the top
+      border returns <code>None</code> and the plain <code>Block</code> border is kept
+      (status hidden, frame intact). This is intentional graceful degradation, covered
+      by the width sweep (no panic / correct corners).</li>
+</ul>
+
+<h2>Caveats / follow-up risks</h2>
+<ul>
+  <li><strong>Concurrent refactor mid-task:</strong> commit #163 ("split TUI rendering
+      modules") landed while this work was in progress, moving chrome rendering from
+      <code>src/ui/tui.rs</code> into <code>src/ui/tui/screen.rs</code>. This change
+      targets the post-refactor layout; tests remain in the <code>tui.rs</code> test
+      module.</li>
+  <li><strong>No explicit light/dark theming added.</strong> The spec lists per-mode
+      color tables; the implementation reuses the existing semantic style helpers
+      (border = <code>Color::Gray</code>, accent <code>ORANGE</code> which this codebase
+      maps to <code>Color::Yellow</code>, dim via <code>Modifier::DIM</code>) and relies
+      on the terminal palette, consistent with the rest of the TUI. The exact
+      light/dark hex directions are not encoded.</li>
+  <li><strong>Meter granularity is coarse (10 buckets, ceil).</strong> One token of
+      usage shows one lit dot; this is intentional per the spec ("each dot ~10%").</li>
+  <li>The <code>set_footer_with_context</code> model-equality check compares the bare
+      model display string. Both the live loop and the test helper pass the bare model
+      id, so the comparison is consistent; a future caller passing a qualified id would
+      reset the meter more eagerly (safe direction).</li>
+</ul>
 </body>
 </html>
