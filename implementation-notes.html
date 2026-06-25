@@ -2,181 +2,149 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Anthropic OAuth stream robustness - implementation notes</title>
+<title>Text engine consolidation - implementation notes</title>
 </head>
 <body>
-<h1>Anthropic Messages OAuth stream robustness &mdash; implementation notes</h1>
-<p>Branch <code>anthropic-stream-robustness</code>. Records decisions not explicit in the
-spec, tradeoffs, and reviewer context. Not a step log.</p>
+<h1>Unified text engine (src/ui/textengine.rs) &mdash; implementation notes</h1>
+<p>Branch <code>feat/text-engine</code>. Records non-obvious decisions, parity risks, and
+reviewer context. Not a step log. This file previously held the merged Anthropic-stream
+notes; it is the per-task notes file and was overwritten for this task.</p>
 
-<h2>Verified failure being fixed</h2>
-<p><code>Anthropic stream ended before content_block_stop [status=200 ...]</code>. The parser
-only emits this when <code>message_stop</code> arrives while <code>open_tools</code> or
-<code>open_reasoning</code> is non-empty; plain text blocks cannot trigger it.</p>
+<h2>Base commit / detached-HEAD drift</h2>
+<p>The primary checkout was in <b>detached HEAD at <code>d1d9bce</code></b> = <code>origin/main</code>
+(<code>6b48611</code>) + 1 unmerged commit (<code>feat(tui): compact tool durations ...</code>).
+<code>git diff 6b48611 d1d9bce</code> touches only <code>tui.rs</code>, <code>tui/panel.rs</code>,
+<code>tui/transcript.rs</code> &mdash; none of the files this task consolidates. Per
+<code>AGENTS.md</code> I branched the worktree from a clean base:
+<code>git worktree add ../iris-text-engine -b feat/text-engine origin/main</code>
+(<b>built on <code>6b48611</code></b>). The unmerged commit is unaffected by this change and merges
+independently. The untracked <code>mydiff.txt</code> in the primary was left alone.</p>
 
-<h2>Key decisions</h2>
+<h2>Unit 1 &mdash; the engine module</h2>
 <ul>
-<li><b>Duplicate-delta prevention (scope item 5) &mdash; chosen strategy: gate retry on
-"no visible text emitted this attempt", NOT per-attempt buffering.</b>
-Rationale: buffering every attempt would kill live token streaming on the happy path
-(every turn, not just retried ones). Instead the parser carries an explicit
-<code>emitted_visible_text</code> flag (set only when a non-empty <code>text_delta</code>
-is successfully forwarded to the sink). A malformed status-200 stream is retried only
-when no visible text was emitted on that attempt. Because tool input
-(<code>input_json_delta</code>) and reasoning (<code>thinking_delta</code>/<code>signature_delta</code>)
-are buffered internally and never streamed live, the verified tool-only / thinking-only
-malformed turns always qualify for retry. If visible text was already streamed and then
-the stream malformed, we do NOT retry; we surface the typed protocol error (DoD permits
-"retried/recovered OR fails with a typed sanitized protocol error"). A retried attempt by
-definition emitted no text, so the next attempt starts with no prior visible text and
-duplicate user-visible deltas are impossible.
-<br><b>Caveat for reviewers:</b> this predicate is safe only because <code>text_delta</code>
-is the ONLY live event today. If reasoning/tool deltas ever stream live, the predicate must
-be revisited.</li>
-
-<li><b>Transport retry placement (scope item 3):</b> added a new shared
-<code>run_with_retry</code> alongside the existing <code>run_with_reauth</code> rather than
-generalizing the latter. Antigravity stays on <code>run_with_reauth</code> with identical
-behavior; only Anthropic uses the retry loop. <code>classify_http_status</code> (Reauth/Fatal)
-is left untouched for Antigravity; a separate <code>classify_http_status_retryable</code>
-(Reauth/Retry/Fatal) is added for Anthropic. <code>Attempt::Retry</code> is added to the shared
-enum; <code>run_with_reauth</code> treats it as fatal for exhaustiveness (Antigravity never
-produces it).</li>
-
-<li><b>Backoff constants:</b> mirrored from Codex (<code>MAX_TRANSIENT_RETRIES=3</code>,
-<code>BASE_BACKOFF=500ms</code>, <code>MAX_BACKOFF=8s</code>, up to 250ms jitter, integer
-<code>Retry-After</code> seconds honored). Intentional small duplication with Codex: Codex
-predates the shared transport module and keeps its own copy (see transport.rs module note);
-unifying both is out of scope.</li>
-
-<li><b>Typed protocol error:</b> <code>StreamProtocolAnomaly</code> carries only block-shape
-metadata (message_stop seen, open tool/reasoning counts, open block indexes, last event
-type) &mdash; never streamed content. It is attached via <code>anyhow::Error::new(..)</code>
-and the safe request diagnostics are added with <code>.context(..)</code> so the typed error
-stays downcastable for classification (per oracle review). Network send errors and 429/5xx
-also become <code>Attempt::Retry</code>; the transient budget is shared across all three and
-is not reset by the one-shot reauth.</li>
-
-<li><b>max_tokens (scope item 8):</b> base <code>max_tokens</code> changed from a fixed 8192
-to the selected model's <code>output_cap</code> (<code>DEFAULT_OUTPUT_CAP=64000</code> for
-unknown models). For manual-budget thinking, <code>resolve_manual_thinking(output_cap, budget,
-output_cap)</code> keeps <code>budget_tokens &lt; max_tokens</code>, so the invariant holds and
-<code>max_tokens=output_cap</code>. This directly removes the 8192 truncation that produced
-silently-dropped <code>stop_reason=max_tokens</code>.</li>
-
-<li><b>stop_reason (scope items 6/7):</b> parsed from <code>message_delta.delta.stop_reason</code>,
-mapped to a provider-neutral <code>CompletionReason</code> enum (EndTurn, ToolUse,
-MaxOutputTokens, ContextWindowExceeded, StopSequence, Paused, Refusal, Other).
-<b>Decision change:</b> <code>Other</code> is a unit variant (not <code>Other(String)</code>).
-Keeping the enum small and <code>Copy</code> avoids tripping clippy's
-<code>large_enum_variant</code> lint once <code>completion_reason</code> is embedded in
-<code>AssistantTurn</code> (which flows through <code>ProviderEvent::Completed</code> /
-<code>StreamResult::Completed</code>); the alternative was boxing <code>AssistantTurn</code>
-in three enums across six files, a larger blast radius. The raw unknown stop-reason token
-is still surfaced for diagnostics via a <code>tracing::debug</code> line at parse time
-(the token is an enumerated wire value, never response content), so observability is
-preserved without storing it. Truncation reasons
-(MaxOutputTokens / ContextWindowExceeded) additionally emit a <code>tracing::warn</code> so they
-are not silently dropped. Stored on <code>AssistantTurn</code> and propagated to
-<code>AgentEvent::ProviderTurnCompleted</code>.</li>
-
-<li><b>UiEvent left unchanged:</b> <code>completion_reason</code> is added to the Nexus
-<code>AgentEvent::ProviderTurnCompleted</code> (the provider-neutral metadata event) but NOT to
-<code>UiEvent::ProviderTurnCompleted</code>, since no UI surface renders it yet. The
-<code>ui/mod.rs</code> mapping drops it. This keeps the change minimal and leaves typed
-completion metadata available for later continuation/fallback work, per the goal.</li>
+<li><b>Grapheme crate choice: <code>unicode-segmentation</code> (justified).</b> The Rust stdlib has
+no grapheme-cluster iterator. I empirically confirmed (throwaway test, since removed) that
+<code>unicode-width</code> 0.2.2's <code>UnicodeWidthStr::width</code> on a <em>whole grapheme
+cluster</em> already returns the correct terminal width for ZWJ families, flags, VS16, keycaps, and
+combining marks (e.g. <code>"\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"</code> &rarr; 2). So no
+custom emoji/east-asian table is needed; the only missing primitive is cluster segmentation. A thin
+wrapper over <code>unicode-width</code> alone is insufficient because the bug is that the old
+per-<em>char</em> wrap/truncate loops split clusters (losing the cluster-aware width and emitting
+broken half-emoji). <code>unicode-segmentation</code> is the canonical UAX#29 implementation and is
+<b>already in the build graph transitively via <code>ratatui-core</code></b> (also pulls
+<code>unicode-truncate</code>), so adding it as a direct dep downloads/builds <b>no new crate</b> &mdash;
+it is a direct-dep promotion. Rejected alternatives: <code>textwrap</code>/<code>ansi-width</code>
+(heavier, own width tables, would duplicate <code>unicode-width</code>); hand-rolling UAX#29
+segmentation (forbidden by the reuse ladder).</li>
+<li><b>Two strip variants, one parser.</b> The old code had two divergent <em>handcoded</em>
+strippers. The engine has one scanner (CSI <code>ESC [ &hellip; final</code>; OSC/DCS/PM/APC/SOS
+string controls terminated by BEL or ST; plus the 8-bit C1 forms) exposed through two output
+policies: <code>strip_ansi</code> (removes escape sequences, keeps other chars incl. TAB/CR) and
+<code>clean_text</code> (also drops remaining control chars). <code>clean_text</code> is
+byte-identical to the old <code>tui/text.rs::strip_ansi_for_text</code> (the <code>\r</code>-splitting /
+footer-cleaning path) and is re-exported under that name. <code>strip_ansi</code> matches the intent
+of the old <code>ui/text.rs::strip_ansi</code> for common content; it differs only on malformed /
+non-SGR sequences (e.g. bracketed-paste <code>ESC[200~</code>), where the proper CSI parser is more
+correct than the old "consume until first ASCII letter" loop (which ate the following letter).</li>
+<li><b>display_width is raw (does NOT strip ANSI); visible_width does.</b> The historic
+<code>wrap.rs::display_width</code> was raw <code>UnicodeWidthStr::width</code> and several call sites
+rely on that as a conservative over-estimate (e.g. the tool-output flood guard
+<code>wrapped_row_estimate</code>, which intentionally counts escapes as width). Keeping
+<code>display_width</code> raw preserves that behavior exactly. The new <code>visible_width</code>
+(strip then measure) is the correct measure for escape-bearing strings and is what fixed the
+<code>ui/text.rs</code> bug.</li>
+<li><b>SGR + OSC 8 carry across wrapped lines (Rust model).</b> <code>AnsiState</code> mirrors
+pi-mono's <code>AnsiCodeTracker</code>: each boolean SGR attribute plus fg/bg stored as raw code
+strings (e.g. <code>"38;5;240"</code>), and an <code>Option&lt;Hyperlink&gt;</code>. On each physical
+row break, <code>active_codes()</code> re-emits the open SGR + reopens the OSC 8 link, and
+<code>close_codes()</code> closes the link + resets SGR at row end. The OSC 8 terminator (BEL vs ST)
+is preserved per-link because some terminals only make BEL-terminated links clickable (OAuth URLs use
+BEL) &mdash; reopening with the wrong terminator would break clickability on wrapped rows.</li>
 </ul>
 
-<h2>Review follow-up fixes (second pass)</h2>
+<h2>Reserved <code>ansi_aware</code> subsystem (deferred feature, scoped allow)</h2>
+<p>The string-based ANSI-aware <code>wrap_ansi</code> / <code>truncate_ansi</code> /
+<code>slice_by_column</code> (and the tracker/parser they need) are <b>built and unit-tested but not
+wired into any render path</b>. The ratatui span pipeline already carries SGR via
+<code>Span.style</code>, and emitting clickable hyperlinks is explicitly deferred. They live in a
+<code>pub(crate) mod ansi_aware</code> with a single scoped <code>#![allow(dead_code)]</code> (rather
+than a whole-file allow, so genuinely dead production code is still caught). This is the foundation a
+future markdown/hyperlink renderer builds on; today it only <em>preserves</em> OSC 8 (cross-wrap and
+cross-truncate tests prove the link is reopened on every physical row).</p>
+
+<h2>Per-unit migration parity</h2>
 <ul>
-<li><b>Retry-gate invariant hardened (review item 1):</b> the duplicate-delta predicate is
-unchanged in behavior, but the doc comment on <code>protocol_anomaly_retryable</code> now
-states an explicit INVARIANT: any future live UI event (live reasoning or tool deltas) MUST
-set the same <code>emitted_visible_text</code> gate, or the retry policy must change. Added
-<code>malformed_stream_after_visible_text_is_not_retryable</code> covering the
-<code>content_block_stop</code> variant after a real <code>text_delta</code> (the prior
-tests only covered the missing-<code>message_stop</code> variant).</li>
-
-<li><b>Truncation is now user-visible (review item 2):</b> a provider-neutral
-<code>completion_reason_notice(CompletionReason)</code> lives in <code>nexus.rs</code> and the
-provider loop emits <code>AgentEvent::Notice</code> right after
-<code>ProviderTurnCompleted</code> when the reason is <code>MaxOutputTokens</code> or
-<code>ContextWindowExceeded</code>. <b>Decision:</b> wording is model-neutral ("The model hit
-its maximum output-token limit..." / "...context-window limit...") rather than the
-Anthropic-specific "Claude ..." phrasing the request suggested, because the notice is emitted
-from provider-neutral Nexus completion metadata and the runtime must not hard-code a
-provider/model name (ADR-0003 / tier boundaries). The existing <code>tracing::warn</code> in
-the Anthropic adapter is retained. Notices ride the existing
-<code>AgentEvent::Notice -&gt; UiEvent::Notice</code> path; no new event type.</li>
-
-<li><b>Empty completed turns with a valid stop reason (review item 3):</b>
-<code>AnthropicStreamParser::finish</code> now treats a terminal stream with no
-text/reasoning/tool calls as a valid empty completion when a <code>stop_reason</code> was
-present (<code>completion_reason.is_some()</code>); a contentless stream with NO stop reason
-still errors as before. The presence of the stop reason (any mapped value, including
-<code>Other</code> for unknown-but-present tokens) is the gate, since a stop reason is the
-provider's terminal completion signal.</li>
-
-<li><b>Stale-doc fixes (review item 4):</b> the module headers in <code>transport.rs</code>
-and <code>anthropic_messages.rs</code> no longer claim "no transient backoff"; they now
-describe <code>run_with_retry</code> (Anthropic) vs <code>run_with_reauth</code>
-(Antigravity, reauth-only).</li>
+<li><b>wrap.rs (unit 2/4):</b> width/truncate/plain-wrap now re-export from the engine; the local
+<code>display_width</code>/<code>char_width</code>/<code>truncate_*</code>/<code>wrap_to_width</code>
+bodies are gone. The char-by-char loops (<code>push_wrapped_line</code>) now iterate grapheme
+clusters via a new <code>push_span_str</code> helper, so for ASCII/CJK output is byte-identical and
+emoji clusters are no longer split. <code>styled_physical_row</code> stays char-based (it matches a
+plain wrapped string back to per-char styled cells; cluster-safe wrap output still yields the same
+chars in order).</li>
+<li><b>tui/text.rs (unit 3):</b> <code>strip_ansi_for_text</code> is now
+<code>textengine::clean_text</code> (byte-identical); the handcoded CSI/string-control consumers were
+removed. <code>ansi_spans</code> still uses <code>ansi-to-tui</code> for ratatui span parsing (kept,
+see below) but routes its strip through the engine.</li>
+<li><b>ui/text.rs (unit 3) &mdash; the documented width-bug fix:</b> <code>visible_width</code> used
+<code>strip_ansi(input).chars().count()</code>, counting a 2-column CJK/emoji glyph as 1. The frame
+in <code>write_frame</code> computes right-border padding from <code>visible_width</code>, so non-ASCII
+diff/title content produced a misaligned (overflowing) right border. Now
+<code>textengine::visible_width</code> (strip + grapheme display width). To avoid a half-fix (review
+finding), the <em>entire</em> <code>write_frame</code> path is now display-column-consistent: the
+fits-check (<code>visible_width</code>), the body hard-wrap (<code>wrap_plain</code> breaks by column
+width, not cluster count), the title truncation (<code>truncate_plain</code> &rarr;
+<code>truncate_to_width</code>), and the top-border fill (<code>visible_width</code> instead of
+<code>chars().count()</code>). <b>Behavioral effect:</b> ASCII output is byte-identical (one cluster ==
+one column); CJK/emoji content that previously overran or misaligned the fixed-width frame now wraps
+and pads to fit. <code>wrap_plain</code> still returns the original ANSI-colored line unchanged when it
+fits, so colored diff lines keep their color.</li>
+<li><b>terminal_surface.rs (unit 5) &mdash; the width-math seam:</b> its <code>clip_to_width</code> now
+calls <code>textengine::clip_to_width</code> and the direct <code>unicode_width</code> import is gone.
+The old clip was per-<em>char</em> with width <code>unwrap_or(0)</code> (no <code>max(1)</code>); the
+engine clip is per-<em>grapheme</em>. These are byte-identical for ASCII/CJK/combining (all existing
+tests are ASCII and stay green). The <b>only</b> behavioral difference is at the exact right edge: an
+emoji ZWJ/flag cluster that no longer fits is dropped as a unit instead of being split into a broken
+half-cluster (which the terminal would have rendered as garbage anyway). A new
+<code>wide_glyph_line_clips_on_cluster_boundary_without_overrun</code> test pins the CJK behavior. The
+diff/replay/cursor logic was not touched.</li>
 </ul>
 
-<h2>Review follow-up fixes (third pass &mdash; 6 reviewer findings)</h2>
+<h2>ansi-to-tui kept, not replaced</h2>
+<p><code>ansi_spans</code> still uses <code>ansi-to-tui</code> to turn raw ANSI into ratatui
+<code>Span</code>s with proper <code>Style</code>. Replacing it would mean hand-mapping every SGR code
+to a ratatui <code>Style</code> &mdash; out of scope and a regression risk. The task only requires that
+<em>stripping and width</em> go through the engine, which they now do; <code>ansi-to-tui</code> remains
+the span-construction path.</p>
+
+<h2>wayland/mod.rs NOT migrated (deliberate, architecture-driven)</h2>
+<p><code>wayland::truncate_chars</code> (summary <code>MAX_SUMMARY_CHARS</code>/<code>MAX_EXCERPT_CHARS</code>
+bounds) was left in place and is <b>not</b> routed through the engine. Two reasons: (1)
+<code>src/wayland</code> is Tier 2 and <code>docs/ARCHITECTURE.md</code> requires Tier 2 to depend on
+Tier 1 only; routing it to the Tier-3 <code>src/ui</code> engine would create a forbidden upward
+Tier&nbsp;2&rarr;Tier&nbsp;3 dependency. (2) Its semantics differ &mdash; it is a char-count bound on
+stored summary text with a <code>"..."</code> ellipsis, not terminal display-width truncation, so it is
+not the same operation as the engine's width helpers. The prompt's "wayland may consume it" is
+superseded by the tier rule (AGENTS.md: trust the architecture boundary). This is a justified
+deferral, not a skipped migration.</p>
+
+<h2>Test-only strip helpers left in place</h2>
+<p>Three <code>strip_ansi</code> copies remain under <code>#[cfg(test)]</code> (in
+<code>tui.rs</code>, <code>terminal_surface.rs</code>, and a <code>chars().count()</code> assertion in
+<code>modal.rs</code>). They are assertion utilities for rendered-output tests, not production
+parsers. Routing them through the engine risks the carefully-tuned terminal-surface tests for no
+production benefit, so they were left; the production duplicate parsers are gone.</p>
+
+<h2>Reviewer-facing regression risks</h2>
 <ul>
-<li><b>Mid-stream read failure is now retryable when safe (finding 1):</b> a
-<code>for_each_sse_event</code> failure in <code>send_once</code> previously always returned
-<code>Attempt::Fatal</code>, even though a pre-stream <code>send()</code> failure was already
-retried. A mid-stream connection drop/timeout is transient and is now retried on the SAME
-gate as a protocol anomaly: only when <code>!cancel.is_cancelled() && !emitted_visible_text</code>,
-so a retry can never duplicate user-visible output and cancellation is never swallowed.
-<b>No new unit test:</b> there is no HTTP-mock harness for <code>send_once</code> (provider
-tests operate at the parser level), and the decisive predicate is the already-tested
-<code>emitted_visible_text</code> gate plus the shared cancellation token; building a mock
-server purely for this path would dwarf the fix.</li>
-
-<li><b>Defensive redaction of serde errors (finding 2):</b> both
-<code>serde_json::from_str</code> sites (<code>ingest_event</code> SSE frame,
-<code>finalize_tool</code> tool JSON) now drop the serde error via <code>map_err(|_| ...)</code>
-and return a fixed message. Both deserialize to an untyped <code>Value</code>, so serde only
-produces positional syntax errors (never the input bytes) &mdash; this is belt-and-suspenders,
-not a live leak. Removing the last <code>Result::context</code> call made the <code>anyhow::Context</code>
-import unused; it was dropped.</li>
-
-<li><b>force_refresh in run_with_reauth (finding 3):</b> investigated the suggested
-"reset for consistency with <code>retry_loop</code>" and found a reset is actually DEAD CODE
-here (clippy <code>unused_assignments</code>): this loop's only loop-back is the <code>Reauth</code>
-arm, which immediately sets <code>force_refresh = true</code>, so a reset to <code>false</code>
-is never read on any path. Kept the original (no reset) and documented WHY it correctly differs
-from <code>retry_loop</code> (whose <code>Retry</code> arm loops without touching the flag and
-thus genuinely needs the reset). No behavior change.</li>
-
-<li><b>Empty-turn test coverage (finding 4):</b>
-<code>empty_turn_with_valid_stop_reason_completes</code> now also iterates <code>pause_turn</code>
-and <code>refusal</code>, the other contentless stop reasons <code>finish()</code> accepts.</li>
-
-<li><b>Content-less refusal notice (finding 5):</b> <code>completion_reason_notice</code> now
-takes <code>had_visible_content</code> and returns "The model declined to respond." for a
-<code>Refusal</code> that produced no text/reasoning/tool calls. A refusal that DID carry an
-explanation emits no extra notice (the user already sees it). <code>had_visible_content</code>
-is captured in the agent loop before <code>reasoning</code> is consumed. Wording stays
-provider/model-neutral. Tested both ways in <code>nexus_tests.rs</code>.</li>
-
-<li><b>Diagnostics key consistency (finding 6):</b> <code>StreamProtocolAnomaly</code>'s Display
-now uses the <code>last_event=</code> key (was <code>last_event_type=</code>) to match
-<code>AnthropicDiagnostics</code> and the original failure log, so logs are searchable on one
-field.</li>
-</ul>
-
-<h2>Deferred (explicitly out of the smallest-correct scope)</h2>
-<ul>
-<li><b>Automatic in-stream continuation / non-streaming fallback</b> (scope item 12): not
-implemented. Recovering a malformed stream <em>after</em> visible text without a UI rewind
-event would require buffering all live deltas (regressing streaming UX for every turn) or a
-new Nexus "discard partial" event. Both exceed the smallest correct fix. Typed error
-classification, bounded retry/recovery, safe diagnostics, stop-reason propagation, and the
-max-token cap correction are all implemented (not deferred).</li>
+<li><b>Terminal wrap drift:</b> the main risk is any divergence in wrap/truncate output for existing
+content. Mitigated by keeping <code>display_width</code> raw, preserving each migrated function's
+algorithm, and grapheme==char width equality for ASCII/CJK/single-emoji/combining (verified). Only
+ZWJ/flag/multi-RI sequences and the documented <code>ui/text.rs</code> CJK frame-overflow fix change
+output, all toward correctness.</li>
+<li><b>let-chains:</b> three <code>collapsible_if</code> sites in the engine use
+<code>if A &amp;&amp; let &hellip;</code> let-chains (already used elsewhere in the tree); the tokenizer
+escape-introducer OR-group is bound to a local first to keep <code>&amp;&amp;</code>/<code>||</code>
+precedence correct.</li>
 </ul>
 </body>
 </html>

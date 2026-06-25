@@ -1,8 +1,14 @@
 //! Shared ANSI-aware text helpers for TUI rendering.
+//!
+//! ANSI/OSC/APC stripping is owned by [`crate::ui::textengine`]; this module
+//! only adapts the ratatui span path. `strip_ansi_for_text` is the engine's
+//! `clean_text` (strips escape sequences AND remaining control characters).
 
 use ansi_to_tui::IntoText;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
+
+pub(super) use crate::ui::textengine::clean_text as strip_ansi_for_text;
 
 pub(super) fn ansi_spans(text: &str, default_style: Style) -> Vec<Span<'static>> {
     if let Ok(parsed_text) = text.into_text() {
@@ -29,45 +35,4 @@ pub(super) fn ansi_spans(text: &str, default_style: Style) -> Vec<Span<'static>>
         }
     }
     vec![Span::styled(strip_ansi_for_text(text), default_style)]
-}
-
-pub(super) fn strip_ansi_for_text(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\x1b' => match chars.next() {
-                Some('[') => consume_csi(&mut chars),
-                Some(']' | 'P' | '^' | '_' | 'X') => consume_string_control(&mut chars),
-                Some(_) | None => {}
-            },
-            '\u{009b}' => consume_csi(&mut chars),
-            '\u{009d}' | '\u{0090}' | '\u{009e}' | '\u{009f}' | '\u{0098}' => {
-                consume_string_control(&mut chars);
-            }
-            _ if ch.is_control() => {}
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn consume_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    for ch in chars.by_ref() {
-        if ('\u{40}'..='\u{7e}').contains(&ch) {
-            break;
-        }
-    }
-}
-
-fn consume_string_control(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while let Some(ch) = chars.next() {
-        if ch == '\u{7}' {
-            break;
-        }
-        if ch == '\x1b' && matches!(chars.peek(), Some('\\')) {
-            chars.next();
-            break;
-        }
-    }
 }
