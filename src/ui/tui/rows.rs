@@ -9,7 +9,8 @@ use super::panel::{
 };
 use super::wrap::{
     display_width, pad_line_left, pad_line_right, push_wrapped_line, push_wrapped_line_wordwise,
-    push_wrapped_line_wordwise_with_prefix, push_wrapped_row, truncate_to_width,
+    push_wrapped_line_wordwise_with_prefix, push_wrapped_row, push_wrapped_row_with_prefix,
+    truncate_to_width,
 };
 use super::{BOX_X_PADDING, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING, dim_style};
 
@@ -99,6 +100,13 @@ impl TranscriptRow {
                 }
             }
             Some(line) => push_wrapped_line(line, render_width, self.continuation_prefix, out),
+            None if self.word_wrap => {
+                if let Some(prefix) = self.continuation_prefix {
+                    push_wrapped_row_with_prefix(&self.text, self.style, render_width, prefix, out);
+                } else {
+                    push_wrapped_row(&self.text, self.style, render_width, None, out);
+                }
+            }
             None => push_wrapped_row(
                 &self.text,
                 self.style,

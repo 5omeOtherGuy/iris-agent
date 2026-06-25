@@ -540,12 +540,29 @@ mod tests {
 
         assert!(!joined.contains("USER"), "{joined}");
         assert!(!joined.contains("AGENT"), "{joined}");
-        assert!(rendered.iter().any(|line| line == "    HI"), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|line| line == "      HI"),
+            "{rendered:?}"
+        );
+        let user_idx = rendered
+            .iter()
+            .position(|line| line.trim_start() == "HI")
+            .expect("user prompt");
         let reply_idx = rendered
             .iter()
             .position(|line| line.contains("Hi! What"))
             .expect("assistant reply");
         assert_eq!(rendered[reply_idx - 1], "");
+        let user_col = rendered[user_idx]
+            .find("HI")
+            .map(|idx| display_width(&rendered[user_idx][..idx]));
+        let reply_col = rendered[reply_idx]
+            .find("Hi!")
+            .map(|idx| display_width(&rendered[reply_idx][..idx]));
+        assert_eq!(
+            user_col, reply_col,
+            "user text and assistant text should share a column: {rendered:?}"
+        );
         assert!(
             rendered[reply_idx].starts_with("    ● Hi! What"),
             "{rendered:?}"
@@ -1867,7 +1884,7 @@ mod tests {
         assert!(!rendered.contains("TASK"));
         assert!(!rendered.contains("USER"), "{rendered}");
         assert!(
-            rendered.contains("    Add rate limiting to the login endpoint."),
+            rendered.contains("      Add rate limiting to the login endpoint."),
             "{rendered}"
         );
         assert!(!rendered.contains("│  Add rate limiting"));
@@ -2237,7 +2254,9 @@ mod tests {
 
         assert!(!joined.contains("USER"), "{joined}");
         assert!(
-            lines.first().is_some_and(|line| line.starts_with("    ┌")),
+            lines
+                .first()
+                .is_some_and(|line| line.starts_with("      ┌")),
             "{lines:?}"
         );
         for line in &lines {
@@ -2246,7 +2265,7 @@ mod tests {
                 "user prompt row exceeds width: {line:?}"
             );
             if !line.is_empty() {
-                assert!(line.starts_with("    "), "{line:?}");
+                assert!(line.starts_with("      "), "{line:?}");
             }
         }
     }
