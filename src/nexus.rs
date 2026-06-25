@@ -158,6 +158,7 @@ pub(crate) enum AgentEvent {
         call: ToolCall,
         message: String,
     },
+    ToolCancelled(ToolCall),
     Notice(String),
     TurnComplete,
 }
@@ -1242,10 +1243,7 @@ fn record_call(
                 .with_provider_turn_id(provider_turn_id),
             );
             emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Cancelled)?;
-            AgentEvent::ToolError {
-                call: call.clone(),
-                message: "cancelled".to_string(),
-            }
+            AgentEvent::ToolCancelled(call.clone())
         }
         ToolOutcome::Denied => {
             tracing::warn!(tool = %call.name, "tool call denied");

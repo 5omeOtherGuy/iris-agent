@@ -2598,6 +2598,63 @@ fn cancellation_before_tools_proposes_remaining_calls_before_cancelling() -> Res
 }
 
 #[test]
+fn cancelled_tool_outcome_emits_typed_cancelled_event_not_tool_error() -> Result<()> {
+    struct AlreadyCancelledTool;
+    impl Tool for AlreadyCancelledTool {
+        fn name(&self) -> &str {
+            "cancelme"
+        }
+        fn description(&self) -> &str {
+            "cancelled test tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                cancel.cancel();
+                Ok(ToolOutput::text("should not display"))
+            })
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("cancelme", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(AlreadyCancelledTool)]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::ToolCancelled(call) if call.name == "cancelme")
+        ),
+        "cancelled outcome should emit a typed display event: {events:#?}"
+    );
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::ToolError { message, .. } if message == "cancelled"
+        )),
+        "cancelled outcome must not be displayed as ToolError: {events:#?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn async_tool_result_feeds_follow_up_turn() -> Result<()> {
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![
