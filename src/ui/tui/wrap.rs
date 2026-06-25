@@ -210,6 +210,27 @@ pub(super) fn push_wrapped_line_wordwise_with_prefix(
     }
     let text: String = cells.iter().map(|(ch, _)| *ch).collect();
     let width = width.max(1);
+
+    if text.starts_with(continuation_prefix) {
+        let prefix_chars = continuation_prefix.chars().count();
+        let prefix_width = display_width(continuation_prefix);
+        let content_width = width.saturating_sub(prefix_width).max(1);
+        let content_cells = &cells[prefix_chars..];
+        if content_cells.is_empty() {
+            out.push(Line::from(Span::styled(continuation_prefix, dim_style())));
+            return;
+        }
+
+        let content_text: String = content_cells.iter().map(|(ch, _)| *ch).collect();
+        let mut cursor = 0usize;
+        for physical in wrap_to_width(&content_text, content_width) {
+            let mut line = styled_physical_row(content_cells, &mut cursor, &physical);
+            pad_line_left(&mut line, prefix_width);
+            out.push(line);
+        }
+        return;
+    }
+
     let first = wrap_to_width(&text, width)
         .into_iter()
         .next()
