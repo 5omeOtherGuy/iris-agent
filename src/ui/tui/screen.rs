@@ -345,6 +345,12 @@ impl Screen {
         } = &event
             && let Some(footer) = &mut self.footer
         {
+            // `total_tokens` (prompt + completion) is the full conversation size
+            // after this turn, which matches what the harness measures for
+            // auto-compaction (`context_tokens` = sum of all message estimates).
+            // `input_tokens` alone would omit the latest response and under-report
+            // fullness relative to the compaction trigger, so the meter uses the
+            // total.
             footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
         }
@@ -435,8 +441,13 @@ impl Screen {
         cwd: String,
     ) {
         let prev = self.footer.as_ref();
-        let same_context =
-            prev.is_some_and(|footer| footer.model == model && footer.context == context);
+        // Model ids and catalog context labels are ASCII; compare case-
+        // insensitively so a differently-cased model id (e.g. from a future
+        // caller) does not needlessly reset the persisted context meter.
+        let same_context = prev.is_some_and(|footer| {
+            footer.model.eq_ignore_ascii_case(&model)
+                && label_eq_ignore_case(footer.context.as_deref(), context.as_deref())
+        });
         // Carry usage and the meter value across an unchanged model/context;
         // reset both when the model or context window changes so a prior model's
         // usage cannot be shown against a new context window.
@@ -859,6 +870,15 @@ fn take_last_display(text: &str, max: usize) -> String {
         used += width;
     }
     tail
+}
+
+/// Case-insensitive equality for optional ASCII labels (catalog context labels).
+fn label_eq_ignore_case(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
