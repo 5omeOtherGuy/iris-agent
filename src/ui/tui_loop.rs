@@ -858,6 +858,10 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             KeyCode::Char('p') | KeyCode::Char('P') if ctrl => {
                 return IdleKey::CycleModel(!shift);
             }
+            KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
+                screen.toggle_latest_panel();
+                return IdleKey::Continue;
+            }
             KeyCode::BackTab => return IdleKey::CycleEffort,
             _ => {}
         }
@@ -1032,6 +1036,10 @@ fn handle_running_event(
         Event::Resize(..) => true,
         Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
+                screen.toggle_latest_panel();
+                return true;
+            }
             if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
                 // The input thread already cancelled the token; unblock a pending
                 // approval as Deny so Nexus observes the cancellation and aborts.
@@ -1173,6 +1181,26 @@ mod tests {
             IdleKey::Submit(text) => assert_eq!(text, "hello"),
             _ => panic!("expected submit"),
         }
+    }
+
+    #[test]
+    fn ctrl_o_toggles_latest_panel_when_idle() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call(),
+            content: "hi".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('o'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+        assert!(screen.latest_panel_collapsed());
     }
 
     #[test]
