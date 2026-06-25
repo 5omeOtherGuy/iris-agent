@@ -1,182 +1,186 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Anthropic OAuth stream robustness - implementation notes</title>
+<title>TUI Component/Container/overlay/focus abstraction — implementation notes</title>
 </head>
 <body>
-<h1>Anthropic Messages OAuth stream robustness &mdash; implementation notes</h1>
-<p>Branch <code>anthropic-stream-robustness</code>. Records decisions not explicit in the
-spec, tradeoffs, and reviewer context. Not a step log.</p>
+<h1>Tier-3 TUI component abstraction — implementation notes</h1>
+<p>Decisions and discoveries not already explicit in the task spec. Organized by
+scope unit. Not a step log.</p>
 
-<h2>Verified failure being fixed</h2>
-<p><code>Anthropic stream ended before content_block_stop [status=200 ...]</code>. The parser
-only emits this when <code>message_stop</code> arrives while <code>open_tools</code> or
-<code>open_reasoning</code> is non-empty; plain text blocks cannot trigger it.</p>
-
-<h2>Key decisions</h2>
+<h2>Verification of starting state</h2>
 <ul>
-<li><b>Duplicate-delta prevention (scope item 5) &mdash; chosen strategy: gate retry on
-"no visible text emitted this attempt", NOT per-attempt buffering.</b>
-Rationale: buffering every attempt would kill live token streaming on the happy path
-(every turn, not just retried ones). Instead the parser carries an explicit
-<code>emitted_visible_text</code> flag (set only when a non-empty <code>text_delta</code>
-is successfully forwarded to the sink). A malformed status-200 stream is retried only
-when no visible text was emitted on that attempt. Because tool input
-(<code>input_json_delta</code>) and reasoning (<code>thinking_delta</code>/<code>signature_delta</code>)
-are buffered internally and never streamed live, the verified tool-only / thinking-only
-malformed turns always qualify for retry. If visible text was already streamed and then
-the stream malformed, we do NOT retry; we surface the typed protocol error (DoD permits
-"retried/recovered OR fails with a typed sanitized protocol error"). A retried attempt by
-definition emitted no text, so the next attempt starts with no prior visible text and
-duplicate user-visible deltas are impossible.
-<br><b>Caveat for reviewers:</b> this predicate is safe only because <code>text_delta</code>
-is the ONLY live event today. If reasoning/tool deltas ever stream live, the predicate must
-be revisited.</li>
-
-<li><b>Transport retry placement (scope item 3):</b> added a new shared
-<code>run_with_retry</code> alongside the existing <code>run_with_reauth</code> rather than
-generalizing the latter. Antigravity stays on <code>run_with_reauth</code> with identical
-behavior; only Anthropic uses the retry loop. <code>classify_http_status</code> (Reauth/Fatal)
-is left untouched for Antigravity; a separate <code>classify_http_status_retryable</code>
-(Reauth/Retry/Fatal) is added for Anthropic. <code>Attempt::Retry</code> is added to the shared
-enum; <code>run_with_reauth</code> treats it as fatal for exhaustiveness (Antigravity never
-produces it).</li>
-
-<li><b>Backoff constants:</b> mirrored from Codex (<code>MAX_TRANSIENT_RETRIES=3</code>,
-<code>BASE_BACKOFF=500ms</code>, <code>MAX_BACKOFF=8s</code>, up to 250ms jitter, integer
-<code>Retry-After</code> seconds honored). Intentional small duplication with Codex: Codex
-predates the shared transport module and keeps its own copy (see transport.rs module note);
-unifying both is out of scope.</li>
-
-<li><b>Typed protocol error:</b> <code>StreamProtocolAnomaly</code> carries only block-shape
-metadata (message_stop seen, open tool/reasoning counts, open block indexes, last event
-type) &mdash; never streamed content. It is attached via <code>anyhow::Error::new(..)</code>
-and the safe request diagnostics are added with <code>.context(..)</code> so the typed error
-stays downcastable for classification (per oracle review). Network send errors and 429/5xx
-also become <code>Attempt::Retry</code>; the transient budget is shared across all three and
-is not reset by the one-shot reauth.</li>
-
-<li><b>max_tokens (scope item 8):</b> base <code>max_tokens</code> changed from a fixed 8192
-to the selected model's <code>output_cap</code> (<code>DEFAULT_OUTPUT_CAP=64000</code> for
-unknown models). For manual-budget thinking, <code>resolve_manual_thinking(output_cap, budget,
-output_cap)</code> keeps <code>budget_tokens &lt; max_tokens</code>, so the invariant holds and
-<code>max_tokens=output_cap</code>. This directly removes the 8192 truncation that produced
-silently-dropped <code>stop_reason=max_tokens</code>.</li>
-
-<li><b>stop_reason (scope items 6/7):</b> parsed from <code>message_delta.delta.stop_reason</code>,
-mapped to a provider-neutral <code>CompletionReason</code> enum (EndTurn, ToolUse,
-MaxOutputTokens, ContextWindowExceeded, StopSequence, Paused, Refusal, Other).
-<b>Decision change:</b> <code>Other</code> is a unit variant (not <code>Other(String)</code>).
-Keeping the enum small and <code>Copy</code> avoids tripping clippy's
-<code>large_enum_variant</code> lint once <code>completion_reason</code> is embedded in
-<code>AssistantTurn</code> (which flows through <code>ProviderEvent::Completed</code> /
-<code>StreamResult::Completed</code>); the alternative was boxing <code>AssistantTurn</code>
-in three enums across six files, a larger blast radius. The raw unknown stop-reason token
-is still surfaced for diagnostics via a <code>tracing::debug</code> line at parse time
-(the token is an enumerated wire value, never response content), so observability is
-preserved without storing it. Truncation reasons
-(MaxOutputTokens / ContextWindowExceeded) additionally emit a <code>tracing::warn</code> so they
-are not silently dropped. Stored on <code>AssistantTurn</code> and propagated to
-<code>AgentEvent::ProviderTurnCompleted</code>.</li>
-
-<li><b>UiEvent left unchanged:</b> <code>completion_reason</code> is added to the Nexus
-<code>AgentEvent::ProviderTurnCompleted</code> (the provider-neutral metadata event) but NOT to
-<code>UiEvent::ProviderTurnCompleted</code>, since no UI surface renders it yet. The
-<code>ui/mod.rs</code> mapping drops it. This keeps the change minimal and leaves typed
-completion metadata available for later continuation/fallback work, per the goal.</li>
+  <li><code>git fetch</code> succeeded; <code>origin/main</code> at
+  <code>6b48611</code> (matches the prompt snapshot). The primary checkout was in
+  detached HEAD at <code>d1d9bce</code> (one commit ahead, owned by another
+  worktree branch), but the <code>main</code> branch == <code>origin/main</code>
+  and <code>worktree-preflight.sh</code> reported PASS. Branched
+  <code>feat/tui-component-abstraction</code> off <code>origin/main</code>.</li>
+  <li><code>~/vendor/pi-mono/packages/tui/src/tui.ts</code> present (1495 lines);
+  used as conceptual reference only.</li>
+  <li>Cited symbols/lines had drifted (Iris file <code>tui.rs</code> is the
+  module root; the renderers live in <code>src/ui/tui/{rows,pane,panel,
+  transcript,screen}.rs</code>). Worked from observed code.</li>
 </ul>
 
-<h2>Review follow-up fixes (second pass)</h2>
+<h2>Unit 1 — Component trait + cursor marker (src/ui/tui/component.rs)</h2>
 <ul>
-<li><b>Retry-gate invariant hardened (review item 1):</b> the duplicate-delta predicate is
-unchanged in behavior, but the doc comment on <code>protocol_anomaly_retryable</code> now
-states an explicit INVARIANT: any future live UI event (live reasoning or tool deltas) MUST
-set the same <code>emitted_visible_text</code> gate, or the retry policy must change. Added
-<code>malformed_stream_after_visible_text_is_not_retryable</code> covering the
-<code>content_block_stop</code> variant after a real <code>text_delta</code> (the prior
-tests only covered the missing-<code>message_stop</code> variant).</li>
-
-<li><b>Truncation is now user-visible (review item 2):</b> a provider-neutral
-<code>completion_reason_notice(CompletionReason)</code> lives in <code>nexus.rs</code> and the
-provider loop emits <code>AgentEvent::Notice</code> right after
-<code>ProviderTurnCompleted</code> when the reason is <code>MaxOutputTokens</code> or
-<code>ContextWindowExceeded</code>. <b>Decision:</b> wording is model-neutral ("The model hit
-its maximum output-token limit..." / "...context-window limit...") rather than the
-Anthropic-specific "Claude ..." phrasing the request suggested, because the notice is emitted
-from provider-neutral Nexus completion metadata and the runtime must not hard-code a
-provider/model name (ADR-0003 / tier boundaries). The existing <code>tracing::warn</code> in
-the Anthropic adapter is retained. Notices ride the existing
-<code>AgentEvent::Notice -&gt; UiEvent::Notice</code> path; no new event type.</li>
-
-<li><b>Empty completed turns with a valid stop reason (review item 3):</b>
-<code>AnthropicStreamParser::finish</code> now treats a terminal stream with no
-text/reasoning/tool calls as a valid empty completion when a <code>stop_reason</code> was
-present (<code>completion_reason.is_some()</code>); a contentless stream with NO stop reason
-still errors as before. The presence of the stop reason (any mapped value, including
-<code>Other</code> for unknown-but-present tokens) is the gate, since a stop reason is the
-provider's terminal completion signal.</li>
-
-<li><b>Stale-doc fixes (review item 4):</b> the module headers in <code>transport.rs</code>
-and <code>anthropic_messages.rs</code> no longer claim "no transient backoff"; they now
-describe <code>run_with_retry</code> (Anthropic) vs <code>run_with_reauth</code>
-(Antigravity, reauth-only).</li>
+  <li><b>Render unit.</b> Iris's currency is <code>Vec&lt;Line&lt;'static&gt;&gt;</code>,
+  so the trait is <code>render(&amp;self, width: usize) -&gt; Vec&lt;Line&lt;'static&gt;&gt;</code>
+  (pi-mono returns <code>string[]</code>).</li>
+  <li><b>Trait kept minimal (render only).</b> pi-mono's <code>handleInput</code>
+  and <code>invalidate</code> were intentionally NOT added. Iris routes typed
+  crossterm events through the focus/overlay layer, not a stringly-typed input
+  hook; and no Iris component caches render state, so <code>invalidate</code>
+  would be a no-caller stub — forbidden by the spec's anti-stub rule. Both are
+  deferred until a real caller exists (theming/markdown cache → invalidate).</li>
+  <li><b>Cursor marker.</b> Adopted pi-mono's APC sentinel
+  (<code>CURSOR_MARKER = "\x1b_pi:c\x07"</code>) and a
+  <code>take_cursor_position</code> that locates the marker, computes
+  <code>(row, col)</code> by display width, and strips it across spans. Iris uses
+  NO hardware cursor today (the editor draws its own reversed block cursor via
+  <code>ratatui-textarea</code>), so no shipped component emits the marker. The
+  function is still genuinely wired (called by the composition root, unit 6) and
+  fully unit-tested with a marker-emitting fixture — it is the real seam the
+  deferred hardware-cursor/IME work plugs into, today a no-op strip.</li>
 </ul>
 
-<h2>Review follow-up fixes (third pass &mdash; 6 reviewer findings)</h2>
+<h2>Unit 2 — Container (src/ui/tui/component.rs)</h2>
 <ul>
-<li><b>Mid-stream read failure is now retryable when safe (finding 1):</b> a
-<code>for_each_sse_event</code> failure in <code>send_once</code> previously always returned
-<code>Attempt::Fatal</code>, even though a pre-stream <code>send()</code> failure was already
-retried. A mid-stream connection drop/timeout is transient and is now retried on the SAME
-gate as a protocol anomaly: only when <code>!cancel.is_cancelled() && !emitted_visible_text</code>,
-so a retry can never duplicate user-visible output and cancellation is never swallowed.
-<b>No new unit test:</b> there is no HTTP-mock harness for <code>send_once</code> (provider
-tests operate at the parser level), and the decisive predicate is the already-tested
-<code>emitted_visible_text</code> gate plus the shared cancellation token; building a mock
-server purely for this path would dwarf the fix.</li>
-
-<li><b>Defensive redaction of serde errors (finding 2):</b> both
-<code>serde_json::from_str</code> sites (<code>ingest_event</code> SSE frame,
-<code>finalize_tool</code> tool JSON) now drop the serde error via <code>map_err(|_| ...)</code>
-and return a fixed message. Both deserialize to an untyped <code>Value</code>, so serde only
-produces positional syntax errors (never the input bytes) &mdash; this is belt-and-suspenders,
-not a live leak. Removing the last <code>Result::context</code> call made the <code>anyhow::Context</code>
-import unused; it was dropped.</li>
-
-<li><b>force_refresh in run_with_reauth (finding 3):</b> investigated the suggested
-"reset for consistency with <code>retry_loop</code>" and found a reset is actually DEAD CODE
-here (clippy <code>unused_assignments</code>): this loop's only loop-back is the <code>Reauth</code>
-arm, which immediately sets <code>force_refresh = true</code>, so a reset to <code>false</code>
-is never read on any path. Kept the original (no reset) and documented WHY it correctly differs
-from <code>retry_loop</code> (whose <code>Retry</code> arm loops without touching the flag and
-thus genuinely needs the reset). No behavior change.</li>
-
-<li><b>Empty-turn test coverage (finding 4):</b>
-<code>empty_turn_with_valid_stop_reason_completes</code> now also iterates <code>pause_turn</code>
-and <code>refusal</code>, the other contentless stop reasons <code>finish()</code> accepts.</li>
-
-<li><b>Content-less refusal notice (finding 5):</b> <code>completion_reason_notice</code> now
-takes <code>had_visible_content</code> and returns "The model declined to respond." for a
-<code>Refusal</code> that produced no text/reasoning/tool calls. A refusal that DID carry an
-explanation emits no extra notice (the user already sees it). <code>had_visible_content</code>
-is captured in the agent loop before <code>reasoning</code> is consumed. Wording stays
-provider/model-neutral. Tested both ways in <code>nexus_tests.rs</code>.</li>
-
-<li><b>Diagnostics key consistency (finding 6):</b> <code>StreamProtocolAnomaly</code>'s Display
-now uses the <code>last_event=</code> key (was <code>last_event_type=</code>) to match
-<code>AnthropicDiagnostics</code> and the original failure log, so logs are searchable on one
-field.</li>
+  <li><code>Container</code> owns <code>Vec&lt;Box&lt;dyn Component&gt;&gt;</code>
+  and composites in order. A separate borrowed <code>composite()</code> helper
+  exists so hot paths can composite <code>&amp;dyn Component</code> without
+  boxing (the transcript renders up to <code>MAX_TRANSCRIPT_ROWS</code> rows per
+  frame).</li>
 </ul>
 
-<h2>Deferred (explicitly out of the smallest-correct scope)</h2>
+<h2>Unit 3 — Transcript rows migration (rows.rs, pane.rs, transcript.rs)</h2>
 <ul>
-<li><b>Automatic in-stream continuation / non-streaming fallback</b> (scope item 12): not
-implemented. Recovering a malformed stream <em>after</em> visible text without a UI rewind
-event would require buffering all live deltas (regressing streaming UX for every turn) or a
-new Nexus "discard partial" event. Both exceed the smallest correct fix. Typed error
-classification, bounded retry/recovery, safe diagnostics, stop-reason propagation, and the
-max-token cap correction are all implemented (not deferred).</li>
+  <li><code>TranscriptRow::render(width, out)</code> renamed to
+  <code>render_into</code> (append-based, kept for the hot loop);
+  <code>impl Component for TranscriptRow</code> wraps it.</li>
+  <li><code>Transcript::render</code> now selects the visible rows (collapsed
+  panels still hide their separator/body rows — unchanged logic) into a
+  <code>Vec&lt;&amp;dyn Component&gt;</code> and calls <code>composite</code>.
+  The in-flight stream became <code>pane::streaming_assistant_rows</code>
+  (returns transient <code>TranscriptRow</code>s) so it joins the same borrowed
+  composite instead of rendering directly.</li>
+  <li><b>Byte-identical:</b> <code>composite</code>'s <code>extend</code> equals
+  the former <code>push</code> loop; each row's <code>render_into</code> is
+  unchanged. Proven by the existing <code>width_resize_reflows_transcript_from_state</code>
+  and <code>surface_draw_path_replays_history_from_state</code> tests.</li>
+</ul>
+
+<h2>Unit 5 — Overlay + focus (overlay.rs, screen.rs, modal.rs, tui_loop.rs)</h2>
+<ul>
+  <li><b>Docked, not floating (key divergence).</b> pi-mono overlays float and
+  composite over the base document at anchor/margin positions. Iris's modal and
+  slash palette occupy a RESERVED region above the composer (allocated by
+  <code>chrome_heights</code>); the editor shifts down. Modeling them as floating
+  would move where they render and break byte-identical output. So overlays stay
+  docked; the abstraction supplies the two pieces pi-mono couples to overlays:
+  explicit focus and a Component render path. A true floating anchor/margin
+  compositor + overlay handles (hide/show/focus/unfocus) are deferred (no Iris
+  floating UI to migrate; adding it now = abstraction with no caller). Recorded
+  in ADR-0024.</li>
+  <li><b>Explicit focus.</b> <code>FocusTarget { Editor, Palette, Modal }</code>
+  with precedence Editor &lt; Palette &lt; Modal. <code>Screen::focus()</code> is
+  the single source of truth, derived from existing modal/palette state (no new
+  duplicated flags to keep in sync). It replaced the implicit checks in
+  <code>tui_loop.rs</code>: <code>modal_open()</code> (deleted) → <code>focus()
+  == Modal</code> at the modal-phase gates; <code>palette.is_active()</code> →
+  <code>focus() == Palette</code> for the idle chord-suppression and palette-nav
+  branches. Byte-identical because in idle a modal is never open, so
+  <code>focus()==Palette ⟺ palette.is_active(input)</code>.</li>
+  <li><b>Modal + palette as Components.</b> <code>impl Component for Modal</code>
+  (clamps the <code>usize</code> width back to the <code>u16</code> the picker
+  renderers use). The palette's STATE stays in <code>slash.rs</code>;
+  <code>overlay::PaletteView</code> is its Component render face, reproducing the
+  former <code>screen::render_palette</code> rows exactly.
+  <code>render_editor_chrome</code> now picks the focused overlay
+  (<code>match screen.focus()</code>), renders it once via <code>Component</code>,
+  uses that length for menu height, and paints it through one
+  <code>overlay::render_menu_lines</code> helper.</li>
+  <li><b>Byte-identical traps handled.</b> The old code had two inset helpers
+  (<code>render_palette</code>, <code>render_plain_menu_lines</code>) with
+  IDENTICAL inner-rect math; collapsed into one. Modal render width was
+  <code>content_width(area.width)</code>, which equals the menu inner width, so
+  rendering at the inner width is unchanged. Menu height (<code>len + 2</code>,
+  <code>MAX_MENU_ROWS</code> cap) preserved by computing it from the single
+  rendered line list. <code>Paragraph</code> still does the clipping (no manual
+  truncation added).</li>
+</ul>
+
+<h2>Unit 6 — Composition root (screen.rs)</h2>
+<ul>
+  <li><code>render_document_with_chrome_tail</code> assembles transcript +
+  working block + chrome through a root <code>Container</code> of
+  <code>LinesSection</code> components (mirrors pi-mono <code>TUI extends
+  Container</code>), then calls <code>take_cursor_position</code> to strip any
+  marker before the document reaches <code>TerminalSurface</code>.</li>
+  <li><b>TerminalSurface seam:</b> untouched. The abstraction only produces the
+  final <code>Vec&lt;Line&gt;</code>; diff/append/replay/resize stay in
+  <code>terminal_surface.rs</code> (existing terminal-surface tests still pass).</li>
+  <li><b>Tradeoff (reviewer-facing):</b> <code>LinesSection::render</code> clones
+  its already-materialized lines, so the root container does one extra O(n)
+  full-document copy per frame. This is the same order as the per-frame diff and
+  is bounded by <code>MAX_TRANSCRIPT_ROWS</code>; a borrowed/streaming composite
+  can replace it if profiling ever shows it matters. Documented in ADR-0024.</li>
+</ul>
+
+<h2>Unit 4 — Tool panels: DEFERRED (named follow-up)</h2>
+<ul>
+  <li>After unit 3, tool panels already render through the row-level
+  <code>Component</code> path: every panel is a flat sequence of
+  <code>TranscriptRow</code>s carrying <code>ChromeRow</code> chrome, and
+  <code>TranscriptRow: Component</code>.</li>
+  <li>Grouping those flat rows into a standalone <code>Panel</code> component
+  would require reworking the in-place panel machinery
+  (<code>panel_end_from</code>, <code>replace_active_exec_panel</code> /
+  <code>replace_active_tool_panel</code>, the splice-based live-exec/tool
+  finalize, trim-safety, and the collapse filter in <code>Transcript::render</code>).
+  That is high regression risk and not safely byte-identical within this session,
+  so it is deferred. The spec explicitly permits deferring units 3/4/5; units 1–2
+  plus two real migrations (3 and 5) landed.</li>
+</ul>
+
+<h2>Other deferrals (out of scope here)</h2>
+<ul>
+  <li><b>Text fallback UI (<code>src/ui/text.rs</code>):</b> left on its current
+  path. It is a line-printer over stdout (no <code>Screen</code>, no
+  <code>TerminalSurface</code>, no <code>Line</code> composition), so it is not a
+  component-rendered surface; migrating it would add an abstraction with nothing
+  to composite.</li>
+  <li><b>pi-mono component catalog Iris lacks</b> (image/kitty-iterm graphics,
+  autocomplete, kill-ring, undo-stack, configurable keybindings, theming) and a
+  second terminal-diff engine: out of scope; separate roadmap items.</li>
+  <li><b>Floating overlay compositor + overlay handles + multiple overlays +
+  hardware cursor:</b> deferred (no current floating UI / no hardware cursor in
+  Iris). The <code>CURSOR_MARKER</code> seam is in place for the cursor part.</li>
+</ul>
+
+<h2>ADR-0006 tension and resolution</h2>
+<p>ADR-0006 says build Iris-native, sized to Iris, do not import app-scale
+architecture; Ratatui = primitives; Iris owns the terminal surface. This change
+stays inside that: the abstraction is small (two files), reuses
+<code>TerminalSurface</code> unchanged, adds no dependencies, vendors no
+pi-mono/Codex code, and lives entirely in Tier-3 <code>src/ui/tui/</code>. It
+amends ADR-0006 only by adding a render-abstraction layer above the surface, and
+explicitly declines the pi-mono floating-overlay/component-catalog scale.
+Recorded as ADR-0024.</p>
+
+<h2>Reviewer-facing risks</h2>
+<ul>
+  <li>Menu-region byte-identical (height math, inner-rect insets, Paragraph
+  clipping) — preserved exactly; covered by existing modal/palette tests +
+  new overlay tests.</li>
+  <li>Focus precedence drift (Editor &lt; Palette &lt; Modal; active palette must
+  still suppress global idle chords) — covered by <code>tui_loop</code> tests
+  including <code>idle_chords_yield_to_an_active_palette</code>.</li>
+  <li>Root container per-frame clone (see Unit 6 tradeoff).</li>
+  <li>Cursor: <code>TerminalSurface</code> untouched; no hardware cursor enabled
+  or moved.</li>
 </ul>
 </body>
 </html>

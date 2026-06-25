@@ -3,6 +3,7 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use super::component::Component;
 use super::panel::{
     apply_width_bg, inset_rule_line, panel_body_line, panel_body_lines, panel_header_line,
     panel_rule_line,
@@ -67,7 +68,10 @@ impl TranscriptRow {
         }
     }
 
-    pub(super) fn render(&self, width: usize, out: &mut Vec<Line<'static>>) {
+    /// Push this row's physical (wrapped) lines into `out`. The append-based
+    /// counterpart to the [`Component`] impl, kept for the transcript's hot
+    /// loop, which composites borrowed rows without per-row allocation.
+    pub(super) fn render_into(&self, width: usize, out: &mut Vec<Line<'static>>) {
         if let Some(chrome) = &self.chrome {
             if let ChromeRow::Body { line, bg } = chrome {
                 panel_body_lines(width, line.clone(), *bg, out);
@@ -127,6 +131,14 @@ impl TranscriptRow {
                 pad_line_right(physical, BOX_X_PADDING);
             }
         }
+    }
+}
+
+impl Component for TranscriptRow {
+    fn render(&self, width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        self.render_into(width, &mut out);
+        out
     }
 }
 

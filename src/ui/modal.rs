@@ -145,6 +145,16 @@ impl Modal {
     }
 }
 
+/// The modal is a docked overlay [`Component`]: the composer chrome composites
+/// it through the same render contract as every other surface (see
+/// `ui::tui::overlay`). Width arrives as `usize` from the component path and is
+/// clamped back to the `u16` the picker renderers use.
+impl crate::ui::tui::Component for Modal {
+    fn render(&self, width: usize) -> Vec<Line<'static>> {
+        Modal::render(self, u16::try_from(width).unwrap_or(u16::MAX))
+    }
+}
+
 // --- shared rendering helpers ---
 
 fn dim() -> Style {

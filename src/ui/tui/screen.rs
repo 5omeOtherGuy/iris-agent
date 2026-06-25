@@ -15,8 +15,10 @@ use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::run_target;
 use crate::ui::UiEvent;
 use crate::ui::modal::Modal;
-use crate::ui::slash::{self, Palette, SlashCommand};
+use crate::ui::slash::Palette;
 
+use super::component::{Component, Container, take_cursor_position};
+use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::transcript::Transcript;
 use super::wrap::{
@@ -328,9 +330,18 @@ impl Screen {
         self.modal = None;
     }
 
-    /// Whether a picker/dialog is currently open.
-    pub(crate) fn modal_open(&self) -> bool {
-        self.modal.is_some()
+    /// Which layer currently owns keyboard input. Single source of truth for
+    /// input routing (`tui_loop.rs`) and docked-overlay selection
+    /// (`render_editor_chrome`); precedence is Editor < Palette < Modal,
+    /// mirroring pi-mono's overlay focus stack.
+    pub(crate) fn focus(&self) -> FocusTarget {
+        if self.modal.is_some() {
+            FocusTarget::Modal
+        } else if self.palette.is_active(&self.editor_text()) {
+            FocusTarget::Palette
+        } else {
+            FocusTarget::Editor
+        }
     }
 
     // --- transcript ---
@@ -545,63 +556,17 @@ impl Screen {
     }
 }
 
-/// Render the slash popup into an offscreen Ratatui buffer: plain above-composer
-/// rows with the selected row accented by foreground color only.
-fn render_palette(buf: &mut Buffer, area: Rect, matches: &[&SlashCommand], selected: usize) {
-    let inner = Rect {
-        x: area.x + u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX),
-        y: area.y + u16::from(area.height > 1),
-        width: area
-            .width
-            .saturating_sub(
-                u16::try_from(TEXT_COLUMN_X_PADDING.saturating_mul(2)).unwrap_or(u16::MAX),
-            )
-            .max(1),
-        height: area.height.saturating_sub(2).max(1),
-    };
-    let mut rows = Vec::new();
-    let command_width = matches
-        .iter()
-        .map(|cmd| display_width(cmd.name))
-        .max()
-        .unwrap_or(0);
-    for (i, cmd) in matches.iter().enumerate() {
-        let selected_row = i == selected;
-        let name_style = if selected_row {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        };
-        let description_style = if selected_row {
-            Style::default().fg(Color::Cyan)
-        } else {
-            dim_style()
-        };
-        let gap = command_width
-            .saturating_sub(display_width(cmd.name))
-            .saturating_add(2);
-        rows.push(Line::from(vec![
-            Span::styled(cmd.name.to_string(), name_style),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(cmd.description, description_style),
-        ]));
-    }
-    Paragraph::new(Text::from(rows)).render(inner, buf);
-}
+/// A composition-root section wrapping already-materialized lines as a
+/// [`Component`], so the root assembles the document through [`Container`] like
+/// pi-mono's `TUI extends Container`. `render` clones the section's lines (the
+/// same O(n) order the terminal-surface diff already pays each frame); the
+/// section sizes are bounded by `MAX_TRANSCRIPT_ROWS` and the viewport.
+struct LinesSection(Vec<Line<'static>>);
 
-fn render_plain_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static>>) {
-    let inner = Rect {
-        x: area.x + u16::try_from(TEXT_COLUMN_X_PADDING).unwrap_or(u16::MAX),
-        y: area.y + u16::from(area.height > 1),
-        width: area
-            .width
-            .saturating_sub(
-                u16::try_from(TEXT_COLUMN_X_PADDING.saturating_mul(2)).unwrap_or(u16::MAX),
-            )
-            .max(1),
-        height: area.height.saturating_sub(2).max(1),
-    };
-    Paragraph::new(Text::from(lines)).render(inner, buf);
+impl Component for LinesSection {
+    fn render(&self, _width: usize) -> Vec<Line<'static>> {
+        self.0.clone()
+    }
 }
 
 /// Render the full logical document for the current terminal size: all
@@ -647,9 +612,22 @@ pub(super) fn render_document_with_chrome_tail(
         padded.extend(transcript);
         transcript = padded;
     }
-    transcript.extend(working_block);
-    transcript.extend(chrome);
-    (transcript, volatile_tail)
+    // Assemble the final document through the root container: transcript,
+    // working-indicator block, then composer chrome -- the composition root no
+    // longer hand-concatenates sections, mirroring pi-mono's `TUI extends
+    // Container` (`tui.ts#L265`). Each section is already materialized, so the
+    // container's ordered compositing produces the same line list.
+    let mut root = Container::new();
+    root.add_child(Box::new(LinesSection(transcript)));
+    root.add_child(Box::new(LinesSection(working_block)));
+    root.add_child(Box::new(LinesSection(chrome)));
+    let mut document = root.render(usize::from(width));
+    // Locate-and-strip any focus cursor marker before the document reaches the
+    // terminal surface. No shipped component emits one yet (the editor draws its
+    // own block cursor), so this is the real seam the deferred hardware-cursor
+    // work plugs into; today it is a defensive no-op strip.
+    let _cursor = take_cursor_position(&mut document);
+    (document, volatile_tail)
 }
 
 /// Number of dots in the top-frame context meter; each dot is ~10% usage.
@@ -940,25 +918,29 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         },
     );
     let input_text = screen.editor_text();
-    let modal_lines = screen.modal.as_ref().map(|modal| {
-        modal.render(u16::try_from(content_width(usize::from(area.width))).unwrap_or(u16::MAX))
-    });
-    let palette_active = modal_lines.is_none() && screen.palette.is_active(&input_text);
-    let palette_matches: Vec<&SlashCommand> = if palette_active {
-        slash::matches(&input_text)
-    } else {
-        Vec::new()
+    // The docked menu region shows whichever overlay currently has focus, each
+    // rendered through the `Component` contract. The inner render width equals
+    // the inset width `render_menu_lines` paints into, so output is unchanged.
+    let menu_inner_width = content_width(usize::from(area.width));
+    let menu_lines: Option<Vec<Line<'static>>> = match screen.focus() {
+        FocusTarget::Modal => screen
+            .modal
+            .as_ref()
+            .map(|modal| Component::render(modal, menu_inner_width)),
+        FocusTarget::Palette => {
+            Some(PaletteView::for_palette(&screen.palette, &input_text).render(menu_inner_width))
+        }
+        FocusTarget::Editor => None,
     };
-    let menu_wanted = if let Some(lines) = &modal_lines {
-        u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(MAX_MENU_ROWS)
-    } else if palette_active {
-        (palette_matches.len() as u16 + 2).min(MAX_MENU_ROWS)
-    } else {
-        0
-    };
+    let menu_wanted = menu_lines
+        .as_ref()
+        .map(|lines| {
+            u16::try_from(lines.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(2)
+                .min(MAX_MENU_ROWS)
+        })
+        .unwrap_or(0);
 
     // Bottom-anchored, clamped to the fixed viewport. The runtime statusline is
     // printed into the editor's top border; the workspace label sits below the
@@ -984,17 +966,10 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
 
     let mut buf = Buffer::empty(chrome_area);
 
-    if heights.menu > 0 {
-        if let Some(lines) = modal_lines {
-            render_plain_menu_lines(&mut buf, menu_area, lines);
-        } else {
-            render_palette(
-                &mut buf,
-                menu_area,
-                &palette_matches,
-                screen.palette.selected(),
-            );
-        }
+    if heights.menu > 0
+        && let Some(lines) = menu_lines
+    {
+        render_menu_lines(&mut buf, menu_area, lines);
     }
     let box_area = Rect {
         x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),

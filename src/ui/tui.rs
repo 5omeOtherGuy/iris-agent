@@ -36,6 +36,8 @@ use ratatui::text::{Line, Span};
 use crate::nexus::ProviderUsage;
 use crate::ui::terminal_surface::TerminalSurface;
 
+mod component;
+mod overlay;
 mod pane;
 mod panel;
 mod rows;
@@ -44,6 +46,8 @@ mod text;
 mod transcript;
 mod wrap;
 
+pub(crate) use component::Component;
+pub(crate) use overlay::FocusTarget;
 #[cfg(test)]
 use panel::PanelState;
 #[cfg(test)]

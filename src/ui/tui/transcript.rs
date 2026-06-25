@@ -9,6 +9,7 @@ use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{is_exploration_tool, run_target};
 use crate::ui::{TurnErrorKind, UiEvent};
 
+use super::component::{self, Component};
 use super::pane;
 use super::panel::{
     PanelHeaderSpec, PanelState, diff_table_rows, explore_body, explore_panel_meta, panel_state,
@@ -1342,7 +1343,11 @@ impl Transcript {
         self.last_width = width
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
             .max(1);
-        let mut rows = Vec::new();
+        // Select the visible rows (collapsed panels hide their separator/body
+        // rows) then composite them through the `Component` contract. Borrowing
+        // `&dyn Component` avoids boxing the (up to `MAX_TRANSCRIPT_ROWS`) rows
+        // every frame while still routing every row through the shared path.
+        let mut visible: Vec<&dyn Component> = Vec::with_capacity(self.rows.len());
         let mut collapsed = false;
         for row in &self.rows {
             match row.chrome.as_ref() {
@@ -1350,20 +1355,25 @@ impl Transcript {
                     expanded: false, ..
                 }) => {
                     collapsed = true;
-                    row.render(width, &mut rows);
+                    visible.push(row);
                 }
                 Some(ChromeRow::Separator | ChromeRow::Body { .. }) if collapsed => {}
                 Some(ChromeRow::Bottom) => {
-                    row.render(width, &mut rows);
+                    visible.push(row);
                     collapsed = false;
                 }
-                _ => row.render(width, &mut rows),
+                _ => visible.push(row),
             }
         }
-        if let Some(text) = &self.streaming {
-            pane::render_streaming_assistant(width, text, &mut rows);
-        }
-        rows
+        // The in-flight stream renders as transient rows appended after history;
+        // hold them locally so they can join the same borrowed composite.
+        let streaming_rows = self
+            .streaming
+            .as_ref()
+            .map(|text| pane::streaming_assistant_rows(text))
+            .unwrap_or_default();
+        visible.extend(streaming_rows.iter().map(|row| row as &dyn Component));
+        component::composite(visible, width)
     }
 }
 
