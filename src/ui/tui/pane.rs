@@ -8,7 +8,10 @@ use ratatui::text::{Line, Span};
 
 use crate::ui::markdown::render_markdown;
 
-use super::{TranscriptRow, line_text, panel_style, prompt_style, streaming_markdown_preview};
+use super::rows::TranscriptRow;
+use super::transcript::streaming_markdown_preview;
+use super::wrap::line_text;
+use super::{panel_style, prompt_style};
 
 const ASSISTANT_TEXT_PREFIX: &str = "  ";
 
