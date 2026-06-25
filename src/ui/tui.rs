@@ -16,7 +16,9 @@
 //! output are unit-testable without a TTY.
 
 use std::io::{self, Stdout};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use anyhow::Result;
 use ratatui::crossterm::cursor::{Hide, Show};
@@ -28,6 +30,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier, Style};
+#[cfg(test)]
 use ratatui::text::{Line, Span};
 
 use crate::nexus::ProviderUsage;
