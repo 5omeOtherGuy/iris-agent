@@ -771,6 +771,29 @@ mod tests {
     }
 
     #[test]
+    fn frame_helpers_measure_cjk_by_display_column() {
+        // The frame width-bug fix: a 2-column CJK glyph counts as 2 columns, and
+        // the body hard-wrap keeps every row within the field width (so the
+        // fixed-width frame border stays aligned for non-ASCII content).
+        assert_eq!(visible_width("\u{4e2d}\u{6587}"), 4);
+        let rows = wrap_plain("\u{4e2d}\u{6587}\u{5b57}\u{6570}", 4);
+        assert!(rows.len() > 1, "CJK line should wrap: {rows:?}");
+        for row in &rows {
+            assert!(visible_width(row) <= 4, "row overran field width: {row:?}");
+        }
+        // ASCII parity: a line that fits is returned unchanged (color preserved).
+        assert_eq!(
+            wrap_plain("\x1b[32mhi\x1b[0m", 8),
+            vec!["\x1b[32mhi\x1b[0m"]
+        );
+        // Title truncation is column-bounded.
+        assert_eq!(
+            visible_width(&truncate_plain("\u{4e2d}\u{6587}\u{5b57}", 4)),
+            4
+        );
+    }
+
+    #[test]
     fn diff_preview_colorizes_and_drops_file_headers_with_ansi() -> Result<()> {
         let diff = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
         let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new()).with_ansi(true);

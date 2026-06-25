@@ -134,6 +134,35 @@ deferral, not a skipped migration.</p>
 parsers. Routing them through the engine risks the carefully-tuned terminal-surface tests for no
 production benefit, so they were left; the production duplicate parsers are gone.</p>
 
+<h2>Review-round fixes (wave 1)</h2>
+<ul>
+<li><b>O(n^2) tokenizer on malformed escapes (high):</b> <code>csi_len</code>/<code>string_control_len</code>
+now return <code>Some(rest.len())</code> for an unterminated sequence instead of <code>None</code>, so a
+dangling introducer is consumed as one zero-width token and the <code>ansi_aware</code> tokenizer stays
+linear on adversarial input. The production strip path (<code>transform</code>) was already single-pass
+linear; this hardens the deferred subsystem before it is wired. Test:
+<code>tokenize_is_linear_on_unterminated_escapes</code>.</li>
+<li><b>slice_by_column style leak (medium):</b> it now tracks an <code>AnsiState</code> and appends
+<code>close_codes()</code> before returning, so a slice ending mid-style does not leak SGR/OSC 8 into the
+next rendered content. Test: <code>slice_by_column_closes_style_and_does_not_leak</code>.</li>
+<li><b>C1 (8-bit) consistency (medium):</b> the tokenizer recognized 8-bit C1 CSI/OSC, but the tracker
+did not. <code>AnsiState::process</code> now also accepts the C1 CSI introducer and <code>parse_osc8</code>
+the C1 OSC introducer, so C1-encoded styles/links carry across wrapped rows.</li>
+<li><b>truncate_ansi ellipsis wider than field (low):</b> guarded so the result never exceeds
+<code>max_width</code> (clips the ellipsis itself).</li>
+<li><b>Dedup/cleanup:</b> <code>cluster_advance</code> is exported from the engine and reused by
+<code>wrap.rs</code> (was duplicated); removed a dead binding in <code>ansi_escape_len</code>.</li>
+<li><b>Added coverage:</b> RGB/256-color SGR carry across wrap, OSC 8 preservation through
+<code>truncate_ansi</code>, and a CJK frame-helper test in <code>ui/text.rs</code>.</li>
+</ul>
+
+<h2>Known minor divergence: TAB width</h2>
+<p>The old <code>ui/text.rs::visible_width</code> counted a literal TAB as 1 (char count); the engine's
+<code>visible_width</code> reports 0 for control chars (TAB included), matching <code>UnicodeWidthStr</code>.
+For tab-indented frame/diff content the right-border padding shifts slightly. Both behaviors are wrong
+without true tab-stop expansion (the terminal renders TAB as a variable-width stop); tab expansion was
+left out of scope. Noted so it reads as a deliberate, bounded delta, not an oversight.</p>
+
 <h2>Reviewer-facing regression risks</h2>
 <ul>
 <li><b>Terminal wrap drift:</b> the main risk is any divergence in wrap/truncate output for existing

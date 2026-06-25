@@ -46,7 +46,7 @@ pub(crate) fn cluster_width(cluster: &str) -> usize {
 
 /// Cluster width clamped to at least 1, so a zero-width / control cluster still
 /// advances a wrap loop and never spins forever. Mirrors the old `char_width`.
-fn cluster_advance(cluster: &str) -> usize {
+pub(crate) fn cluster_advance(cluster: &str) -> usize {
     cluster_width(cluster).max(1)
 }
 
@@ -229,43 +229,45 @@ pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
 // `textengine::ansi_aware::{wrap_ansi, truncate_ansi, slice_by_column}`.
 pub(crate) mod ansi_aware {
     #![allow(dead_code)]
-    use super::{cluster_advance, cluster_width, display_width, visible_width};
+    use super::{cluster_advance, cluster_width, display_width, truncate_to_width, visible_width};
     use unicode_segmentation::UnicodeSegmentation;
 
     /// If an ANSI/OSC/APC escape sequence starts at byte `pos` in `s`, return its
     /// length in bytes; otherwise `None`. Mirrors pi-mono `extractAnsiCode`.
     fn ansi_escape_len(s: &str, pos: usize) -> Option<usize> {
-        let bytes = s.as_bytes();
-        let first = *bytes.get(pos)?;
+        if pos >= s.len() {
+            return None;
+        }
         // ESC-introduced and 8-bit C1 introduced sequences. C1 bytes are encoded
         // as two UTF-8 bytes (0xC2 0x9b ..), so we match on the decoded char.
         let rest = &s[pos..];
         let mut iter = rest.char_indices();
         let (_, intro) = iter.next()?;
-        let after_intro = match intro {
+        match intro {
             '\x1b' => {
                 let (_, second) = iter.next()?;
                 match second {
-                    '[' => return csi_len(rest),
-                    ']' | 'P' | '^' | '_' | 'X' => return string_control_len(rest),
+                    '[' => csi_len(rest),
+                    ']' | 'P' | '^' | '_' | 'X' => string_control_len(rest),
                     // ESC + single byte: 1 (ESC) + len(second).
-                    _ => return Some(rest.char_indices().nth(2).map_or(rest.len(), |(i, _)| i)),
+                    _ => Some(rest.char_indices().nth(2).map_or(rest.len(), |(i, _)| i)),
                 }
             }
-            '\u{009b}' => return csi_len(rest),
+            '\u{009b}' => csi_len(rest),
             '\u{009d}' | '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
-                return string_control_len(rest);
+                string_control_len(rest)
             }
             _ => None,
-        };
-        let _ = first;
-        after_intro
+        }
     }
 
     fn csi_len(rest: &str) -> Option<usize> {
         // rest starts at the introducer: `ESC [` (two chars) or the 8-bit C1 CSI
         // (one char). Scan past the introducer, then return at the final byte
         // (0x40..=0x7e). `[` is itself in that range, so it must be skipped.
+        // An unterminated sequence consumes to end-of-string: this keeps the
+        // tokenizer linear (a dangling introducer is one token, not an O(n)
+        // rescan from every following byte) and a dangling control has no width.
         let mut chars = rest.char_indices();
         let (_, first) = chars.next()?;
         if first == '\x1b' {
@@ -276,10 +278,12 @@ pub(crate) mod ansi_aware {
                 return Some(i + ch.len_utf8());
             }
         }
-        None
+        Some(rest.len())
     }
 
     fn string_control_len(rest: &str) -> Option<usize> {
+        // As with `csi_len`, an unterminated string control consumes to EOF so
+        // the tokenizer stays linear on malformed input.
         let mut chars = rest.char_indices();
         // Skip introducer.
         chars.next();
@@ -293,7 +297,7 @@ pub(crate) mod ansi_aware {
                 return Some(j + '\\'.len_utf8());
             }
         }
-        None
+        Some(rest.len())
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -324,13 +328,19 @@ pub(crate) mod ansi_aware {
         //   None        -> not an OSC 8 sequence
         //   Some(None)  -> OSC 8 close (empty url)
         //   Some(Some)  -> OSC 8 open
-        if !code.starts_with("\x1b]8;") {
+        // Accept both the 7-bit `ESC ] 8 ;` and the 8-bit C1 OSC `\u{009d}8;`
+        // introducer, matching what the tokenizer recognizes.
+        let intro_len = if code.starts_with("\x1b]8;") {
+            "\x1b]8;".len()
+        } else if code.starts_with("\u{009d}8;") {
+            "\u{009d}8;".len()
+        } else {
             return None;
-        }
+        };
         let (term, body) = if let Some(b) = code.strip_suffix('\x07') {
-            (Osc8Term::Bel, &b["\x1b]8;".len()..])
+            (Osc8Term::Bel, &b[intro_len..])
         } else if let Some(b) = code.strip_suffix("\x1b\\") {
-            (Osc8Term::St, &b["\x1b]8;".len()..])
+            (Osc8Term::St, &b[intro_len..])
         } else {
             return None;
         };
@@ -367,12 +377,13 @@ pub(crate) mod ansi_aware {
                 self.link = link;
                 return;
             }
-            // Only SGR (`ESC [ ... m`) mutates style state.
-            let Some(params) = code
+            // Only SGR (`ESC [ ... m`, or the 8-bit C1 CSI `\u{009b} ... m`)
+            // mutates style state.
+            let body = code
                 .strip_prefix('\x1b')
                 .and_then(|c| c.strip_prefix('['))
-                .and_then(|c| c.strip_suffix('m'))
-            else {
+                .or_else(|| code.strip_prefix('\u{009b}'));
+            let Some(params) = body.and_then(|c| c.strip_suffix('m')) else {
                 return;
             };
             if params.is_empty() || params == "0" {
@@ -659,6 +670,16 @@ pub(crate) mod ansi_aware {
             return text.to_string();
         }
         let ellipsis_w = display_width(ellipsis);
+        if ellipsis_w >= max_width {
+            // The ellipsis alone does not fit: clip it to the field so the
+            // result never exceeds max_width (matches pi-mono's behavior).
+            let clipped = truncate_to_width(ellipsis, max_width);
+            if pad {
+                let w = display_width(&clipped);
+                return format!("{clipped}{}", " ".repeat(max_width - w));
+            }
+            return clipped;
+        }
         let target = max_width.saturating_sub(ellipsis_w);
         let mut state = AnsiState::default();
         let mut out = String::new();
@@ -700,10 +721,22 @@ pub(crate) mod ansi_aware {
         let end = start + len;
         let mut out = String::new();
         let mut pending = String::new();
+        // Track active style across the slice so it is closed at the end and
+        // never leaks into whatever the caller renders next.
+        let mut state = AnsiState::default();
         let mut col = 0usize;
+        let finish = |out: &mut String, state: &AnsiState| {
+            if !out.is_empty() {
+                out.push_str(&state.close_codes());
+            }
+        };
         for tok in tokenize(line) {
             match tok {
                 Token::Ansi(code) => {
+                    // Codes before the range set the style at the range start;
+                    // either way they advance the tracker so the closing reset
+                    // is correct.
+                    state.process(code);
                     if col >= start && col < end {
                         out.push_str(code);
                     } else if col < start {
@@ -722,12 +755,14 @@ pub(crate) mod ansi_aware {
                         }
                         col += w;
                         if col >= end {
+                            finish(&mut out, &state);
                             return out;
                         }
                     }
                 }
             }
         }
+        finish(&mut out, &state);
         out
     }
 }
@@ -888,6 +923,65 @@ mod tests {
         let out = slice_by_column("\x1b[31mabcdef\x1b[0m", 2, 3);
         assert!(out.starts_with("\x1b[31m"));
         assert_eq!(strip_ansi(&out), "cde");
+    }
+
+    #[test]
+    fn wrap_ansi_carries_rgb_and_256_color_across_rows() {
+        let rgb = wrap_ansi("\x1b[38;2;10;20;30mrgb wrap line\x1b[0m", 4);
+        assert!(rgb.len() > 1);
+        for row in &rgb[1..] {
+            assert!(
+                row.starts_with("\x1b[38;2;10;20;30m"),
+                "RGB fg not carried: {row:?}"
+            );
+        }
+        let c256 = wrap_ansi("\x1b[38;5;240mxterm wrap\x1b[0m", 4);
+        for row in &c256[1..] {
+            assert!(
+                row.starts_with("\x1b[38;5;240m"),
+                "256 fg not carried: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_ansi_preserves_osc8_hyperlink() {
+        let link = "\x1b]8;;https://example.com\x1b\\link text here\x1b]8;;\x1b\\";
+        let out = truncate_ansi(link, 6, "\u{2026}", false);
+        assert!(
+            out.contains("\x1b]8;;https://example.com"),
+            "link open lost: {out:?}"
+        );
+        assert!(out.contains("\x1b]8;;\x1b\\"), "link not closed: {out:?}");
+        assert!(out.contains('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_ansi_never_exceeds_width_when_ellipsis_too_wide() {
+        // ellipsis "..." (3 cols) wider than max_width 1 must still fit.
+        assert!(visible_width(&truncate_ansi("hello", 1, "...", false)) <= 1);
+        assert_eq!(truncate_ansi("hello", 2, "...", false), "..");
+    }
+
+    #[test]
+    fn slice_by_column_closes_style_and_does_not_leak() {
+        // A slice that ends while red is active must emit a closing reset.
+        let out = slice_by_column("\x1b[31mredtext\x1b[0m", 0, 3);
+        assert_eq!(strip_ansi(&out), "red");
+        assert!(out.starts_with("\x1b[31m"));
+        assert!(out.trim_end().ends_with("\x1b[0m"), "style leaked: {out:?}");
+    }
+
+    #[test]
+    fn tokenize_is_linear_on_unterminated_escapes() {
+        // Many unterminated OSC introducers must not blow up (was O(n^2));
+        // this completes quickly and treats the dangling run as zero width.
+        let pathological = "\x1b]".repeat(20_000);
+        // Dangling OSC introducers have no visible width.
+        assert_eq!(visible_width(&pathological), 0);
+        // The ANSI-aware wrap of the same input also terminates quickly.
+        let rows = wrap_ansi(&pathological, 10);
+        assert!(!rows.is_empty());
     }
 
     #[test]

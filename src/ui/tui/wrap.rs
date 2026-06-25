@@ -8,17 +8,11 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{MAX_TOOL_OUTPUT_LINE_CHARS, PANEL_BODY_CHROME_WIDTH, dim_style};
-use crate::ui::textengine::cluster_width;
+use crate::ui::textengine::cluster_advance;
 // Re-exported so existing `super::wrap::{display_width, ...}` imports keep
 // resolving while the implementations live in the engine.
 pub(crate) use crate::ui::textengine::wrap_to_width;
 pub(super) use crate::ui::textengine::{display_width, truncate_chars, truncate_to_width};
-
-/// Grapheme-cluster advance width, clamped to at least 1 so a zero-width cluster
-/// still moves the wrap forward and never loops forever.
-fn cluster_advance(cluster: &str) -> usize {
-    cluster_width(cluster).max(1)
-}
 
 /// Clamp one logical tool-output line so it wraps to at most `max_rows` physical
 /// rows at `width` (accounting for panel body chrome), appending an ellipsis
