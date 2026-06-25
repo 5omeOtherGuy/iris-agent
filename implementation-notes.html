@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Working Indicator and Composer Implementation Notes</title>
+  <title>TUI Implementation Notes</title>
 </head>
 <body>
-  <h1>Working Indicator and Composer Implementation Notes</h1>
+  <h1>TUI Implementation Notes</h1>
   <section>
     <h2>Reviewer Context</h2>
     <ul>
@@ -33,6 +33,15 @@
       <li><strong>Telemetry source:</strong> the TUI only receives provider token usage on <code>ProviderTurnCompleted</code>. The indicator therefore shows usage once the active turn has reported it, and clears stale prior usage when a new turn starts so the readout represents the current turn rather than the previous one.</li>
       <li><strong>Field scope:</strong> the prior active-turn line included model reasoning effort text. The new indicator intentionally omits that extra field because the spec fixes the working indicator field order to activity, elapsed, interrupt, then token telemetry.</li>
       <li><strong>Merge with composer statusline:</strong> after merging <code>origin/main</code>, the working indicator remains outside editor chrome and is appended to the transcript tail before composer/statusline chrome. This preserves the composer statusline PR's height model while matching the working indicator's transcript-flow placement.</li>
+    </ul>
+  </section>
+  <section>
+    <h2>Turn Divider Decisions</h2>
+    <ul>
+      <li><strong>Work detection scope:</strong> the divider is tracked in the Iris TUI tier from rendered UI events. Provider start/completion events alone are not treated as concrete work, because those events also occur for pure conversational turns and the spec forbids dividers there. Provider errors are treated as runtime work because they represent a failed turn attempt rather than pure conversation.</li>
+      <li><strong>Elapsed source:</strong> the TUI uses the existing active-turn spinner start timestamp as the divider elapsed source. This keeps the divider aligned with the working indicator and avoids changing Nexus event contracts.</li>
+      <li><strong>Emission point:</strong> the divider is appended from <code>Screen::end_turn</code> after the working indicator state is no longer needed. This keeps the completed divider and live working indicator mutually exclusive in rendered state.</li>
+      <li><strong>Telemetry source:</strong> token telemetry comes from the latest provider usage observed during the active turn. No synthetic token estimates are added when provider usage is absent; the divider falls back to elapsed-only text.</li>
     </ul>
   </section>
 </body>
