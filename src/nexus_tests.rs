@@ -512,6 +512,7 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("The file says hello from file.")),
     ]);
@@ -557,6 +558,7 @@ fn tool_result_is_displayed_to_user() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -597,6 +599,7 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("recovered")),
     ]);
@@ -636,6 +639,7 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         })
     };
     let provider = FakeProvider::new((0..MAX_TOOL_ROUNDTRIPS).map(|_| repeated_call()).collect());
@@ -680,6 +684,7 @@ fn unknown_tool_call_returns_tool_error_to_model() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("I could not use that tool.")),
     ]);
@@ -833,6 +838,7 @@ fn malformed_read_arguments_return_tool_error_to_model() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("The read call was malformed.")),
     ]);
@@ -917,6 +923,7 @@ fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
         }],
         response_id: None,
         usage: None,
+        completion_reason: None,
     }
 }
 
@@ -1008,6 +1015,7 @@ fn provider_completion_event_carries_response_id_and_usage() -> Result<()> {
         tool_calls: Vec::new(),
         response_id: Some("msg_1".to_string()),
         usage: Some(usage.clone()),
+        completion_reason: Some(CompletionReason::MaxOutputTokens),
     })]);
     let mut harness = test_harness(provider, &workspace.path, Tools::new(Vec::new()));
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
@@ -1023,13 +1031,134 @@ fn provider_completion_event_carries_response_id_and_usage() -> Result<()> {
                 turn_id,
                 response_id,
                 usage,
-            } => Some((turn_id.clone(), response_id.clone(), usage.clone())),
+                completion_reason,
+            } => Some((
+                turn_id.clone(),
+                response_id.clone(),
+                usage.clone(),
+                *completion_reason,
+            )),
             _ => None,
         })
         .expect("completion event");
     assert_eq!(completed.0, "turn_00000000");
+    assert_eq!(completed.3, Some(CompletionReason::MaxOutputTokens));
     assert_eq!(completed.1.as_deref(), Some("msg_1"));
     assert_eq!(completed.2, Some(usage));
+    // A truncation completion reason surfaces a provider-neutral user notice.
+    assert!(
+        frontend.events.borrow().iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice(m) if m.contains("maximum output-token limit")
+        )),
+        "max-output-token truncation should emit a user notice"
+    );
+    Ok(())
+}
+
+#[test]
+fn context_window_exceeded_completion_emits_user_notice() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: Some("partial".to_string()),
+        reasoning: Vec::new(),
+        tool_calls: Vec::new(),
+        response_id: None,
+        usage: None,
+        completion_reason: Some(CompletionReason::ContextWindowExceeded),
+    })]);
+    let mut harness = test_harness(provider, &workspace.path, Tools::new(Vec::new()));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events.borrow().iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice(m) if m.contains("context-window limit")
+        )),
+        "context-window truncation should emit a user notice"
+    );
+    Ok(())
+}
+
+#[test]
+fn routine_completion_reason_emits_no_notice() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: Some("done".to_string()),
+        reasoning: Vec::new(),
+        tool_calls: Vec::new(),
+        response_id: None,
+        usage: None,
+        completion_reason: Some(CompletionReason::EndTurn),
+    })]);
+    let mut harness = test_harness(provider, &workspace.path, Tools::new(Vec::new()));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        !frontend
+            .events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(_))),
+        "a routine end_turn completion must not emit a notice"
+    );
+    Ok(())
+}
+
+#[test]
+fn content_less_refusal_emits_user_notice() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: None,
+        reasoning: Vec::new(),
+        tool_calls: Vec::new(),
+        response_id: None,
+        usage: None,
+        completion_reason: Some(CompletionReason::Refusal),
+    })]);
+    let mut harness = test_harness(provider, &workspace.path, Tools::new(Vec::new()));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events.borrow().iter().any(|e| matches!(
+            e,
+            AgentEvent::Notice(m) if m.contains("declined to respond")
+        )),
+        "a content-less refusal should emit a user notice"
+    );
+    Ok(())
+}
+
+#[test]
+fn refusal_with_text_emits_no_notice() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: Some("I can't help with that.".to_string()),
+        reasoning: Vec::new(),
+        tool_calls: Vec::new(),
+        response_id: None,
+        usage: None,
+        completion_reason: Some(CompletionReason::Refusal),
+    })]);
+    let mut harness = test_harness(provider, &workspace.path, Tools::new(Vec::new()));
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        !frontend
+            .events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(_))),
+        "a refusal that carried explanatory text must not add a notice"
+    );
     Ok(())
 }
 
@@ -1060,6 +1189,7 @@ fn completed_turn_records_reasoning_and_all_tool_calls_before_results() -> Resul
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -1552,6 +1682,7 @@ fn multiple_gated_calls_consume_one_decision_each() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -1627,6 +1758,7 @@ fn always_allow_auto_approves_later_same_tool_calls_in_session() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -1779,6 +1911,7 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2466,6 +2599,7 @@ fn streamed_events_reach_observer_in_order() -> Result<()> {
             turn_id: "turn_00000000".to_string(),
             response_id: None,
             usage: None,
+            completion_reason: None,
         }
     );
     assert_eq!(events[5], AgentEvent::TurnComplete);
@@ -2562,6 +2696,7 @@ fn cancellation_before_tools_proposes_remaining_calls_before_cancelling() -> Res
         ],
         response_id: None,
         usage: None,
+        completion_reason: None,
     })]);
     let token = CancellationToken::new();
     let mut harness = test_harness(
@@ -2782,6 +2917,7 @@ fn unsafe_tools_run_sequentially() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2823,6 +2959,7 @@ fn safe_tools_run_in_parallel_with_ordered_results() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2881,6 +3018,7 @@ fn auto_compaction_does_not_split_reasoning_from_retained_tool_calls() -> Result
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("after tool")),
         Ok(AssistantTurn::text("second done")),
@@ -2947,6 +3085,7 @@ fn safe_tool_parallelism_is_bounded() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);
@@ -2993,6 +3132,7 @@ fn safe_tools_do_not_cross_an_unsafe_tool() -> Result<()> {
 
             response_id: None,
             usage: None,
+            completion_reason: None,
         }),
         Ok(AssistantTurn::text("done")),
     ]);

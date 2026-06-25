@@ -4,14 +4,16 @@
 //! one-shot reauth glue, with each SSE event assembled into an `AssistantTurn`.
 //!
 //! ponytail: only the Claude Code subscription OAuth lane (Bearer token, no
-//! x-api-key, no thinking replay, no transient backoff). Add the API-key lane
-//! or extended-thinking replay only if a real need shows up.
+//! x-api-key, no thinking replay). Malformed status-200 streams, 429s, 5xx, and
+//! network errors get bounded transient backoff via the shared transport's
+//! `run_with_retry`. Add the API-key lane or extended-thinking replay only if a
+//! real need shows up.
 
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
@@ -19,23 +21,17 @@ use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
 use super::transport::{
-    Attempt, HttpClass, TurnSink, classify_http_status, for_each_sse_event, run_with_reauth,
-    spawn_stream,
+    Attempt, HttpClass, TurnSink, classify_http_status_retryable, for_each_sse_event,
+    retry_after_hint, run_with_retry, spawn_stream,
 };
 use crate::mimir::anthropic_models::{self, ThinkingMode};
 use crate::mimir::auth::anthropic::AnthropicTokenStore;
 use crate::mimir::selection::{ContextManagement, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
-    AssistantTurn, CacheCreation, ChatProvider, Message, ModelOrigin, ProviderStream,
-    ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
+    AssistantTurn, CacheCreation, ChatProvider, CompletionReason, Message, ModelOrigin,
+    ProviderStream, ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
 };
 
-/// Base output-token allowance, treated as the visible-output ask
-/// (`requested_output_tokens` in the manual-budget invariant). For manual-budget
-/// thinking the budget is added on top and the sum is capped at the model's
-/// output cap; for adaptive thinking the API allocates reasoning dynamically and
-/// this stays the base `max_tokens`.
-const MAX_TOKENS: u32 = 8192;
 /// Default output cap for an unknown/non-subscription Anthropic id (conservative
 /// 64k). Subscription models carry their real cap in `anthropic_models`.
 const DEFAULT_OUTPUT_CAP: u32 = 64000;
@@ -147,7 +143,7 @@ impl ChatProvider for AnthropicProvider {
                 // concurrent refresh already rotated in -- otherwise a coalesced
                 // refresh could hand the rejected token straight back.
                 let mut last_token: Option<String> = None;
-                run_with_reauth(
+                run_with_retry(
                     "anthropic",
                     cancel,
                     |force| {
@@ -188,8 +184,11 @@ impl AnthropicProvider {
         let response = match self.client.post(&url).headers(headers).json(request).send() {
             Ok(response) => response,
             Err(error) => {
-                return Attempt::Fatal(
+                // A pre-stream send failure (DNS/TLS/connect/timeout) is
+                // transient and emitted no output yet: retry with backoff.
+                return Attempt::Retry(
                     anyhow::Error::new(error).context("failed to send Anthropic request"),
+                    None,
                 );
             }
         };
@@ -214,23 +213,49 @@ impl AnthropicProvider {
                 parser.ingest_event(data, sink)
             }) {
                 let last = parser.last_event_type.clone();
-                return Attempt::Fatal(anyhow!("{error} [{}]", diag(last)));
+                let error = error.context(diag(last).to_string());
+                // A mid-stream read failure (connection drop, timeout) is
+                // transient. It is safe to retry on the same terms as a
+                // protocol anomaly: only when this attempt streamed no visible
+                // text, so a retry cannot duplicate user-visible output. If text
+                // was already shown, or the turn was cancelled, surface it.
+                if !cancel.is_cancelled() && !parser.emitted_visible_text {
+                    return Attempt::Retry(error, None);
+                }
+                return Attempt::Fatal(error);
             }
             let last = parser.last_event_type.clone();
+            // Whether this attempt streamed any visible text to the consumer.
+            // Only `text_delta` is forwarded live (tool input and reasoning are
+            // buffered), so this gates whether a malformed stream can be safely
+            // retried without duplicating user-visible output.
+            let emitted_visible_text = parser.emitted_visible_text;
             return match parser.finish() {
                 Ok(turn) => {
                     if let Some(usage) = &turn.usage {
                         self.record_usage(usage);
                     }
+                    warn_on_truncation(&self.model, turn.completion_reason.as_ref());
                     Attempt::Done(Box::new(turn))
                 }
-                Err(error) => Attempt::Fatal(anyhow!("{error} [{}]", diag(last))),
+                Err(error) => {
+                    let retryable = protocol_anomaly_retryable(&error, emitted_visible_text);
+                    // Attach safe diagnostics; downcast already happened above so
+                    // wrapping does not lose the classification.
+                    let error = error.context(diag(last).to_string());
+                    if retryable {
+                        Attempt::Retry(error, None)
+                    } else {
+                        Attempt::Fatal(error)
+                    }
+                }
             };
         }
 
         // Non-success: surface only safe metadata. The raw body is read and
         // dropped; only the enumerated `error.type` is pulled out of it (never
         // the body text, which can carry prompts/paths/args).
+        let retry_after = retry_after_hint(response.headers());
         let body = response.text().unwrap_or_default();
         let diag = AnthropicDiagnostics {
             status: status.as_u16(),
@@ -242,8 +267,9 @@ impl AnthropicProvider {
             last_event_type: None,
         };
         let error = anyhow!("Anthropic request failed [{diag}]");
-        match classify_http_status(status.as_u16()) {
+        match classify_http_status_retryable(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
+            HttpClass::Retry => Attempt::Retry(error, retry_after),
             HttpClass::Fatal => Attempt::Fatal(error),
         }
     }
@@ -311,6 +337,124 @@ impl std::fmt::Display for AnthropicDiagnostics {
             write!(f, " last_event={event}")?;
         }
         Ok(())
+    }
+}
+
+/// A status-200 Anthropic stream that ended in a structurally invalid state
+/// (malformed SSE): either the terminal `message_stop` never arrived, or it
+/// arrived while one or more content blocks were still open (no
+/// `content_block_stop`). Recoverable: the transport may retry the whole turn.
+///
+/// Carries only block-shape metadata -- counts, open block indexes, and the
+/// last event type. It never carries streamed content (text, tool input,
+/// reasoning), prompts, paths, tool arguments, or auth material.
+#[derive(Debug, Clone)]
+struct StreamProtocolAnomaly {
+    /// Whether the terminal `message_stop` event was observed before the stream
+    /// ended. `false` means a truncated/incomplete stream.
+    message_stop_seen: bool,
+    /// Tool-use content blocks still open (no `content_block_stop`) at stream
+    /// end.
+    open_tool_blocks: usize,
+    /// Thinking / redacted-thinking content blocks still open at stream end.
+    open_reasoning_blocks: usize,
+    /// Stream indexes of the still-open content blocks (safe correlation ids).
+    open_block_indexes: Vec<u64>,
+    /// Type of the most recent SSE event the parser saw.
+    last_event_type: Option<String>,
+}
+
+impl std::fmt::Display for StreamProtocolAnomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Name the anomaly so the keyword (`message_stop` / `content_block_stop`)
+        // is stable for callers and logs, then append safe block metadata.
+        if !self.message_stop_seen {
+            write!(f, "Anthropic stream ended before message_stop")?;
+        } else {
+            write!(f, "Anthropic stream ended before content_block_stop")?;
+        }
+        write!(
+            f,
+            " (message_stop_seen={} open_tool_blocks={} open_reasoning_blocks={}",
+            self.message_stop_seen, self.open_tool_blocks, self.open_reasoning_blocks
+        )?;
+        if !self.open_block_indexes.is_empty() {
+            let indexes = self
+                .open_block_indexes
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(f, " open_block_indexes={indexes}")?;
+        }
+        if let Some(event) = &self.last_event_type {
+            // Use the same `last_event` key as `AnthropicDiagnostics` so logs are
+            // searchable on one field across both error shapes.
+            write!(f, " last_event={event}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl std::error::Error for StreamProtocolAnomaly {}
+
+/// Whether a status-200 `finish()` error may be retried. Recoverable only when
+/// the error is a [`StreamProtocolAnomaly`] AND this attempt streamed no visible
+/// output to the consumer, so a retry cannot duplicate already-shown output.
+/// Other finish failures (incomplete tool JSON, empty turn) and any anomaly that
+/// arrived after visible output are non-retryable.
+///
+/// INVARIANT: `emitted_visible_text` must be `true` whenever this attempt has
+/// pushed ANYTHING to the user-visible stream. Today only `text_delta` is
+/// forwarded live (`AnthropicStreamParser` sets `emitted_visible_text` there);
+/// tool input (`input_json_delta`) and reasoning (`thinking_delta` /
+/// `signature_delta`) are buffered and only surface in the terminal
+/// `AssistantTurn`, so they cannot duplicate on a retry. If reasoning or tool
+/// deltas ever become live UI events, they MUST set the same
+/// `emitted_visible_text` gate, or this retry policy must change -- otherwise a
+/// retry could replay already-shown reasoning/tool output.
+fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_text: bool) -> bool {
+    !emitted_visible_text && error.downcast_ref::<StreamProtocolAnomaly>().is_some()
+}
+
+/// Map an Anthropic `stop_reason` wire token onto the provider-neutral
+/// [`CompletionReason`]. Unknown/future values map to `Other`; the raw
+/// enumerated token is logged by the caller rather than stored.
+fn map_stop_reason(reason: &str) -> CompletionReason {
+    match reason {
+        "end_turn" => CompletionReason::EndTurn,
+        "tool_use" => CompletionReason::ToolUse,
+        "max_tokens" => CompletionReason::MaxOutputTokens,
+        "model_context_window_exceeded" => CompletionReason::ContextWindowExceeded,
+        "stop_sequence" => CompletionReason::StopSequence,
+        "pause_turn" => CompletionReason::Paused,
+        "refusal" => CompletionReason::Refusal,
+        _ => CompletionReason::Other,
+    }
+}
+
+/// Surface truncation completion reasons so they are not silently dropped. The
+/// reason itself rides on the turn's safe completion metadata; this adds an
+/// operator-visible log line for the two truncation outcomes.
+fn warn_on_truncation(model: &str, reason: Option<&CompletionReason>) {
+    match reason {
+        Some(CompletionReason::MaxOutputTokens) => {
+            tracing::warn!(
+                provider = PROVIDER_ID,
+                model = %model,
+                completion_reason = "max_output_tokens",
+                "Anthropic turn truncated at the max output-token ceiling"
+            );
+        }
+        Some(CompletionReason::ContextWindowExceeded) => {
+            tracing::warn!(
+                provider = PROVIDER_ID,
+                model = %model,
+                completion_reason = "context_window_exceeded",
+                "Anthropic turn ended because the model context window was exceeded"
+            );
+        }
+        _ => {}
     }
 }
 
@@ -453,9 +597,13 @@ fn build_anthropic_request(
         .unwrap_or(ThinkingMode::ManualBudget);
     let output_cap = meta.map(|m| m.output_cap).unwrap_or(DEFAULT_OUTPUT_CAP);
 
+    // The `max_tokens` ceiling is the model's full output cap. A fixed 8192
+    // base used to truncate large outputs, surfacing as a silently-dropped
+    // `stop_reason=max_tokens`; unknown models fall back to the conservative
+    // DEFAULT_OUTPUT_CAP.
     let mut body = json!({
         "model": model,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": output_cap,
         "stream": true,
         "system": [
             { "type": "text", "text": CLAUDE_CODE_IDENTITY },
@@ -479,7 +627,7 @@ fn build_anthropic_request(
             }
             ThinkingMode::ManualBudget => {
                 let (max_tokens, budget_tokens) =
-                    resolve_manual_thinking(MAX_TOKENS, manual_budget(level), output_cap);
+                    resolve_manual_thinking(output_cap, manual_budget(level), output_cap);
                 body["max_tokens"] = json!(max_tokens);
                 if let Some(budget_tokens) = budget_tokens {
                     body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
@@ -749,6 +897,13 @@ struct AnthropicStreamParser {
     raw_input_tokens: u64,
     usage_seen: bool,
     message_stopped: bool,
+    /// Whether a non-empty `text_delta` was forwarded to the sink this attempt.
+    /// Only visible text is streamed live (tool input and reasoning are
+    /// buffered), so this gates whether a malformed stream can be retried
+    /// without duplicating user-visible output.
+    emitted_visible_text: bool,
+    /// Provider-neutral completion reason from `message_delta.delta.stop_reason`.
+    completion_reason: Option<CompletionReason>,
     /// Type of the most recent SSE event seen, for safe failure diagnostics.
     last_event_type: Option<String>,
 }
@@ -785,6 +940,8 @@ impl AnthropicStreamParser {
             raw_input_tokens: 0,
             usage_seen: false,
             message_stopped: false,
+            emitted_visible_text: false,
+            completion_reason: None,
             last_event_type: None,
         }
     }
@@ -793,8 +950,12 @@ impl AnthropicStreamParser {
         if data == "[DONE]" {
             return Ok(());
         }
+        // Drop the serde error: although deserializing to an untyped `Value`
+        // yields only positional syntax errors today (never the input bytes),
+        // returning a fixed message guarantees no streamed content can ever
+        // reach logs through this path.
         let value: Value = serde_json::from_str(data)
-            .map_err(|e| anyhow!("failed to parse Anthropic SSE: {e}"))?;
+            .map_err(|_| anyhow!("failed to parse Anthropic SSE frame"))?;
         let event_type = value.get("type").and_then(Value::as_str);
         if let Some(event_type) = event_type {
             self.last_event_type = Some(event_type.to_string());
@@ -864,6 +1025,9 @@ impl AnthropicStreamParser {
                             if let Some(text) = delta.get("text").and_then(Value::as_str) {
                                 self.text.push_str(text);
                                 sink.on_text_delta(text)?;
+                                if !text.is_empty() {
+                                    self.emitted_visible_text = true;
+                                }
                             }
                         }
                         Some("input_json_delta") => {
@@ -906,6 +1070,24 @@ impl AnthropicStreamParser {
                 }
             }
             Some("message_delta") => {
+                if let Some(reason) = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    let mapped = map_stop_reason(reason);
+                    if mapped == CompletionReason::Other {
+                        // Forward-compat: a stop reason Iris does not model yet.
+                        // The token is an enumerated wire value (never response
+                        // content), safe to log for observability.
+                        tracing::debug!(
+                            provider = PROVIDER_ID,
+                            stop_reason = reason,
+                            "unmapped Anthropic stop_reason"
+                        );
+                    }
+                    self.completion_reason = Some(mapped);
+                }
                 if let Some(usage) = value.get("usage") {
                     self.merge_usage(usage);
                 }
@@ -981,16 +1163,35 @@ impl AnthropicStreamParser {
     }
 
     fn finish(self) -> Result<AssistantTurn> {
-        if !self.message_stopped {
-            return Err(anyhow!("Anthropic stream ended before message_stop"));
-        }
-        if !self.open_tools.is_empty() || !self.open_reasoning.is_empty() {
-            return Err(anyhow!("Anthropic stream ended before content_block_stop"));
+        // Malformed status-200 streams (no terminal `message_stop`, or
+        // `message_stop` with content blocks still open) are recoverable
+        // protocol anomalies: return the typed error so the transport can retry.
+        if !self.message_stopped || !self.open_tools.is_empty() || !self.open_reasoning.is_empty() {
+            let mut open_block_indexes: Vec<u64> = self
+                .open_tools
+                .keys()
+                .chain(self.open_reasoning.keys())
+                .copied()
+                .collect();
+            open_block_indexes.sort_unstable();
+            return Err(anyhow::Error::new(StreamProtocolAnomaly {
+                message_stop_seen: self.message_stopped,
+                open_tool_blocks: self.open_tools.len(),
+                open_reasoning_blocks: self.open_reasoning.len(),
+                open_block_indexes,
+                last_event_type: self.last_event_type.clone(),
+            }));
         }
         if self.text.is_empty() && self.tool_calls.is_empty() && self.reasoning.is_empty() {
-            return Err(anyhow!(
-                "Anthropic response did not include assistant text, reasoning, or tool calls"
-            ));
+            // A terminal stream carrying a valid `stop_reason` but no content is
+            // a legitimate empty completion (e.g. `end_turn` / `tool_use` with
+            // nothing to add). Only a contentless stream with NO stop reason is
+            // treated as a malformed/empty response.
+            if self.completion_reason.is_none() {
+                return Err(anyhow!(
+                    "Anthropic response did not include assistant text, reasoning, or tool calls"
+                ));
+            }
         }
         Ok(AssistantTurn {
             text: (!self.text.is_empty()).then_some(self.text),
@@ -998,6 +1199,7 @@ impl AnthropicStreamParser {
             tool_calls: self.tool_calls,
             response_id: self.response_id,
             usage: self.usage_seen.then_some(self.usage),
+            completion_reason: self.completion_reason,
         })
     }
 }
@@ -1009,8 +1211,10 @@ fn finalize_tool(block: ToolBlock) -> Result<ToolCall> {
     let arguments = match block.inline_input {
         Some(input) => input,
         None if block.partial_json.is_empty() => json!({}),
+        // Drop the serde error so a malformed buffer cannot surface any of the
+        // tool arguments; the fixed message is sufficient for diagnostics.
         None => serde_json::from_str(&block.partial_json)
-            .context("Anthropic tool_use input JSON was incomplete or invalid")?,
+            .map_err(|_| anyhow!("Anthropic tool_use input JSON was incomplete or invalid"))?,
     };
     Ok(ToolCall {
         id: block.id,
@@ -1506,9 +1710,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             PromptCacheRetention::Short,
             &ContextManagement::default(),
         );
+        // Sonnet's output cap is the new base/ceiling for max_tokens.
+        const SONNET_CAP: u32 = 64000;
         assert!(none.get("thinking").is_none(), "None omits thinking");
         assert!(none.get("output_config").is_none());
-        assert_eq!(none["max_tokens"], json!(MAX_TOKENS));
+        assert_eq!(none["max_tokens"], json!(SONNET_CAP));
 
         // Explicit Off also omits thinking (no `disabled` block, matching
         // minimalcc-pi).
@@ -1522,9 +1728,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             &ContextManagement::default(),
         );
         assert!(off.get("thinking").is_none(), "Off omits thinking");
-        assert_eq!(off["max_tokens"], json!(MAX_TOKENS));
+        assert_eq!(off["max_tokens"], json!(SONNET_CAP));
 
-        // High -> 20480 budget; max_tokens = min(8192 + 20480, 64000) = 28672.
+        // High -> 20480 budget; max_tokens = min(64000 + 20480, 64000) = 64000.
         let high = build_anthropic_request(
             "claude-sonnet-4-6",
             "P",
@@ -1538,7 +1744,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             high["thinking"],
             json!({ "type": "enabled", "budget_tokens": 20480 })
         );
-        assert_eq!(high["max_tokens"], json!(MAX_TOKENS + 20480));
+        assert_eq!(high["max_tokens"], json!(SONNET_CAP));
         assert!(
             high["thinking"]["budget_tokens"].as_u64().unwrap()
                 < high["max_tokens"].as_u64().unwrap(),
@@ -1549,7 +1755,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "manual model has no effort"
         );
 
-        // xhigh -> 32768 budget; max_tokens = 8192 + 32768 = 40960 (< 64k cap).
+        // xhigh -> 32768 budget; max_tokens = min(64000 + 32768, 64000) = 64000.
         let xhigh = build_anthropic_request(
             "claude-sonnet-4-6",
             "P",
@@ -1563,7 +1769,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             xhigh["thinking"],
             json!({ "type": "enabled", "budget_tokens": 32768 })
         );
-        assert_eq!(xhigh["max_tokens"], json!(MAX_TOKENS + 32768));
+        assert_eq!(xhigh["max_tokens"], json!(SONNET_CAP));
 
         // The full minimalcc-pi budget map on a manual model.
         for (level, budget) in [
@@ -1612,10 +1818,12 @@ data: {\"type\":\"message_stop\"}\n\n";
             json!({ "type": "adaptive", "display": "summarized" })
         );
         assert_eq!(body["output_config"], json!({ "effort": "xhigh" }));
+        // Opus 4.8 output cap is the base/ceiling max_tokens for adaptive too.
+        const OPUS_CAP: u32 = 128000;
         assert_eq!(
             body["max_tokens"],
-            json!(MAX_TOKENS),
-            "adaptive keeps base max_tokens"
+            json!(OPUS_CAP),
+            "adaptive max_tokens is the model output cap"
         );
         assert!(body["thinking"].get("budget_tokens").is_none());
 
@@ -1657,7 +1865,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(none.get("thinking").is_none());
         assert!(none.get("output_config").is_none());
-        assert_eq!(none["max_tokens"], json!(MAX_TOKENS));
+        assert_eq!(none["max_tokens"], json!(OPUS_CAP));
         let off = build_anthropic_request(
             "claude-opus-4-8",
             "P",
@@ -1767,7 +1975,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(resolve_manual_thinking(500, 4096, 1200), (500, None));
         // A production manual model never trips the reduce/omit path: even xhigh
         // (32768) on the 64k cap leaves budget < max_tokens.
-        let (max_tokens, budget) = resolve_manual_thinking(MAX_TOKENS, 32768, 64000);
+        let (max_tokens, budget) = resolve_manual_thinking(8192, 32768, 64000);
         assert!(budget.unwrap() < max_tokens);
     }
 
@@ -2062,5 +2270,328 @@ data: {\"type\":\"message_stop\"}
             &ContextManagement::default(),
         );
         assert!(!anthropic_beta(&opus).contains(SERVER_SIDE_FALLBACK_BETA));
+    }
+
+    /// Drive `body` through the parser and return it for inspection (open block
+    /// state, emitted-text flag) before `finish()` consumes it.
+    fn parser_after(body: &str, model: &str) -> AnthropicStreamParser {
+        struct NoopSink;
+        impl TurnSink for NoopSink {
+            fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut parser = AnthropicStreamParser::new(anthropic_origin(model));
+        let mut sink = NoopSink;
+        for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
+            parser.ingest_event(data, &mut sink)
+        })
+        .expect("events ingest without error");
+        parser
+    }
+
+    #[test]
+    fn missing_content_block_stop_on_open_tool_use_is_recoverable_anomaly() {
+        // message_stop arrives while a tool_use block is still open: malformed.
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let parser = parser_after(body, "claude-opus-4-8");
+        // Tool input is buffered, never streamed live -> safe to retry.
+        assert!(!parser.emitted_visible_text);
+        let err = parser.finish().unwrap_err();
+        let anomaly = err
+            .downcast_ref::<StreamProtocolAnomaly>()
+            .expect("typed protocol anomaly");
+        assert!(anomaly.message_stop_seen);
+        assert_eq!(anomaly.open_tool_blocks, 1);
+        assert_eq!(anomaly.open_reasoning_blocks, 0);
+        assert_eq!(anomaly.open_block_indexes, vec![0]);
+        assert_eq!(anomaly.last_event_type.as_deref(), Some("message_stop"));
+        let rendered = err.to_string();
+        assert!(rendered.contains("content_block_stop"), "{rendered}");
+        // The malformed anomaly with no visible text is retryable.
+        assert!(protocol_anomaly_retryable(&err, false));
+        assert!(
+            !protocol_anomaly_retryable(&err, true),
+            "already-streamed text disables retry"
+        );
+    }
+
+    #[test]
+    fn missing_content_block_stop_on_open_thinking_and_redacted_is_recoverable_anomaly() {
+        // Two open reasoning blocks (thinking + redacted_thinking) at message_stop.
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"hmm\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-a\"}}
+
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque\"}}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let parser = parser_after(body, "claude-opus-4-8");
+        assert!(
+            !parser.emitted_visible_text,
+            "reasoning is not streamed live"
+        );
+        let err = parser.finish().unwrap_err();
+        let anomaly = err
+            .downcast_ref::<StreamProtocolAnomaly>()
+            .expect("typed protocol anomaly");
+        assert!(anomaly.message_stop_seen);
+        assert_eq!(anomaly.open_tool_blocks, 0);
+        assert_eq!(anomaly.open_reasoning_blocks, 2);
+        assert_eq!(anomaly.open_block_indexes, vec![0, 1]);
+        assert!(protocol_anomaly_retryable(&err, false));
+    }
+
+    #[test]
+    fn missing_message_stop_is_recoverable_anomaly_with_safe_metadata() {
+        // Stream truncated before the terminal message_stop.
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}
+
+";
+        let parser = parser_after(body, "claude-opus-4-8");
+        // Visible text WAS streamed: the anomaly must NOT be retried.
+        assert!(parser.emitted_visible_text);
+        let err = parser.finish().unwrap_err();
+        let anomaly = err
+            .downcast_ref::<StreamProtocolAnomaly>()
+            .expect("typed protocol anomaly");
+        assert!(!anomaly.message_stop_seen);
+        assert!(err.to_string().contains("message_stop"));
+        assert!(
+            !protocol_anomaly_retryable(&err, true),
+            "text already streamed -> no retry"
+        );
+    }
+
+    #[test]
+    fn malformed_stream_after_visible_text_is_not_retryable() {
+        // Visible text streams, then a tool_use block is left open at
+        // message_stop. A retry would replay the already-shown text, so this
+        // malformed stream must be classified non-retryable even though it is a
+        // typed protocol anomaly.
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial answer\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\"}}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let parser = parser_after(body, "claude-opus-4-8");
+        let emitted_visible_text = parser.emitted_visible_text;
+        assert!(
+            emitted_visible_text,
+            "a text_delta was streamed to the consumer"
+        );
+        let err = parser.finish().unwrap_err();
+        // It IS a typed protocol anomaly...
+        assert!(
+            err.downcast_ref::<StreamProtocolAnomaly>().is_some(),
+            "open tool block at message_stop is a protocol anomaly"
+        );
+        // ...but having already shown text, it must NOT be retried.
+        assert!(
+            !protocol_anomaly_retryable(&err, emitted_visible_text),
+            "anomaly after visible text must not be retryable"
+        );
+    }
+
+    #[test]
+    fn empty_turn_with_valid_stop_reason_completes() {
+        // A terminal stream with a valid stop_reason but no content blocks is a
+        // legitimate empty completion, not an error.
+        for reason in [
+            "end_turn",
+            "tool_use",
+            "stop_sequence",
+            "pause_turn",
+            "refusal",
+        ] {
+            let body = format!(
+                "\
+data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\"}}}}
+
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}},\"usage\":{{\"output_tokens\":0}}}}
+
+data: {{\"type\":\"message_stop\"}}
+
+"
+            );
+            let turn = parse_anthropic_sse(&body)
+                .unwrap_or_else(|e| panic!("empty {reason} should complete: {e}"));
+            assert!(turn.text.is_none(), "{reason}: no text");
+            assert!(turn.tool_calls.is_empty(), "{reason}: no tool calls");
+            assert!(turn.reasoning.is_empty(), "{reason}: no reasoning");
+            assert_eq!(turn.completion_reason, Some(map_stop_reason(reason)));
+        }
+    }
+
+    #[test]
+    fn empty_turn_without_stop_reason_is_error() {
+        // No content AND no stop reason: still treated as a malformed/empty
+        // response.
+        let body = "\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let error = parse_anthropic_sse(body).unwrap_err().to_string();
+        assert!(error.contains("did not include assistant"), "got: {error}");
+    }
+
+    #[test]
+    fn incomplete_tool_json_is_not_a_recoverable_anomaly() {
+        // A CLOSED tool block with invalid JSON is a hard parse failure, not a
+        // recoverable stream anomaly, and must never be retried/executed.
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let err = parse_anthropic_sse(body).unwrap_err();
+        assert!(err.downcast_ref::<StreamProtocolAnomaly>().is_none());
+        assert!(!protocol_anomaly_retryable(&err, false));
+    }
+
+    #[test]
+    fn stop_reason_is_captured_and_mapped_provider_neutrally() {
+        let turn_with_reason = |reason: &str| {
+            let body = format!(
+                "\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}
+
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"hi\"}}}}
+
+data: {{\"type\":\"content_block_stop\",\"index\":0}}
+
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}},\"usage\":{{\"output_tokens\":3}}}}
+
+data: {{\"type\":\"message_stop\"}}
+
+"
+            );
+            parse_anthropic_sse(&body).unwrap().completion_reason
+        };
+        // max_tokens / model_context_window_exceeded are no longer dropped.
+        assert_eq!(
+            turn_with_reason("max_tokens"),
+            Some(CompletionReason::MaxOutputTokens)
+        );
+        assert_eq!(
+            turn_with_reason("model_context_window_exceeded"),
+            Some(CompletionReason::ContextWindowExceeded)
+        );
+        assert_eq!(
+            turn_with_reason("end_turn"),
+            Some(CompletionReason::EndTurn)
+        );
+        assert_eq!(
+            turn_with_reason("tool_use"),
+            Some(CompletionReason::ToolUse)
+        );
+        assert_eq!(
+            turn_with_reason("stop_sequence"),
+            Some(CompletionReason::StopSequence)
+        );
+        assert_eq!(
+            turn_with_reason("pause_turn"),
+            Some(CompletionReason::Paused)
+        );
+        assert_eq!(turn_with_reason("refusal"), Some(CompletionReason::Refusal));
+        assert_eq!(
+            turn_with_reason("some_future_reason"),
+            Some(CompletionReason::Other)
+        );
+    }
+
+    #[test]
+    fn map_stop_reason_covers_every_known_value() {
+        assert_eq!(map_stop_reason("end_turn"), CompletionReason::EndTurn);
+        assert_eq!(map_stop_reason("tool_use"), CompletionReason::ToolUse);
+        assert_eq!(
+            map_stop_reason("max_tokens"),
+            CompletionReason::MaxOutputTokens
+        );
+        assert_eq!(
+            map_stop_reason("model_context_window_exceeded"),
+            CompletionReason::ContextWindowExceeded
+        );
+        assert_eq!(
+            map_stop_reason("stop_sequence"),
+            CompletionReason::StopSequence
+        );
+        assert_eq!(map_stop_reason("pause_turn"), CompletionReason::Paused);
+        assert_eq!(map_stop_reason("refusal"), CompletionReason::Refusal);
+        assert_eq!(map_stop_reason("weird"), CompletionReason::Other);
+    }
+
+    #[test]
+    fn output_cap_drives_max_tokens_with_conservative_unknown_fallback() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+        // Known subscription model -> its output cap (Opus 4.8 = 128k).
+        let opus = build_anthropic_request(
+            "claude-opus-4-8",
+            "P",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Short,
+            &ContextManagement::default(),
+        );
+        assert_eq!(opus["max_tokens"], json!(128000));
+        // Unknown model -> conservative DEFAULT_OUTPUT_CAP fallback (64k), never
+        // the old fixed 8192.
+        let unknown = build_anthropic_request(
+            "claude-some-unreleased-model",
+            "P",
+            &messages,
+            &tools,
+            None,
+            PromptCacheRetention::Short,
+            &ContextManagement::default(),
+        );
+        assert_eq!(unknown["max_tokens"], json!(DEFAULT_OUTPUT_CAP));
+    }
+
+    #[test]
+    fn protocol_anomaly_diagnostics_carry_no_streamed_content() {
+        // The anomaly Display must include block-shape metadata only.
+        let anomaly = StreamProtocolAnomaly {
+            message_stop_seen: true,
+            open_tool_blocks: 1,
+            open_reasoning_blocks: 0,
+            open_block_indexes: vec![2],
+            last_event_type: Some("message_stop".to_string()),
+        };
+        let rendered = anomaly.to_string();
+        assert!(rendered.contains("content_block_stop"));
+        assert!(rendered.contains("open_tool_blocks=1"));
+        assert!(rendered.contains("open_reasoning_blocks=0"));
+        assert!(rendered.contains("open_block_indexes=2"));
+        assert!(rendered.contains("last_event=message_stop"));
     }
 }

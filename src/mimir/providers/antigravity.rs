@@ -149,7 +149,10 @@ impl AntigravityProvider {
         };
         match classify_http_status(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
-            HttpClass::Fatal => Attempt::Fatal(error),
+            // Antigravity uses the reauth-only loop and does not retry transient
+            // failures; `classify_http_status` never returns `Retry`, so this is
+            // only here for exhaustiveness over the shared `HttpClass`.
+            HttpClass::Retry | HttpClass::Fatal => Attempt::Fatal(error),
         }
     }
 }
@@ -456,6 +459,7 @@ impl GeminiStreamParser {
             tool_calls: self.tool_calls,
             response_id: None,
             usage: None,
+            completion_reason: None,
         })
     }
 }

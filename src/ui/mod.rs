@@ -151,6 +151,9 @@ impl UiEvent {
                 turn_id,
                 response_id,
                 usage,
+                // Provider-neutral completion reason is metadata-only today; no
+                // UI surface renders it yet, so it is intentionally dropped here.
+                completion_reason: _,
             } => UiEvent::ProviderTurnCompleted {
                 turn_id,
                 response_id,
@@ -324,6 +327,7 @@ mod tests {
             turn_id: "turn_1".to_string(),
             response_id: Some("resp_1".to_string()),
             usage: Some(usage.clone()),
+            completion_reason: None,
         });
         assert_eq!(
             mapped,

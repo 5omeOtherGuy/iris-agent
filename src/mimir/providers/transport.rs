@@ -4,20 +4,33 @@
 //! adapter only owns its wire format (request build, message mapping, SSE event
 //! parsing) and not the executor/cancellation plumbing.
 //!
-//! The OpenAI Codex adapter predates this module and keeps its own (richer,
-//! backoff-capable) copy; the newer providers share this leaner version.
+//! The OpenAI Codex adapter predates this module and keeps its own copy of the
+//! same patterns; the newer providers share this version.
 //!
-//! ponytail: one reauth, no transient backoff. The Codex adapter has the full
-//! exponential-backoff loop; promote this to the shared version too if 429/5xx
-//! flakiness on Anthropic/Antigravity proves it pays for itself.
+//! Two control flows are offered: `run_with_reauth` (one-shot reauth only, used
+//! by Antigravity) and `run_with_retry` (bounded exponential backoff for
+//! transient network/429/5xx/stream anomalies plus the one-shot reauth, used by
+//! Anthropic). The transient budget is bounded by `MAX_TRANSIENT_RETRIES` and is
+//! not reset by the reauth.
 
 use std::io::BufRead;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use futures::channel::mpsc;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
 use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream};
+
+/// Bounded transient-retry budget for [`run_with_retry`]. Reauth fires at most
+/// once and never resets this budget. Mirrors the Codex adapter's constants
+/// (`openai_codex_responses.rs`), which predates this shared module and keeps its
+/// own copy; unifying the two is out of scope here.
+const MAX_TRANSIENT_RETRIES: u32 = 3;
+const BASE_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
 /// Provider-internal seam for incremental assistant text. The streamed SSE
 /// parser pushes deltas here; the live provider forwards them onto the
@@ -63,11 +76,16 @@ pub(super) fn spawn_stream(
     Box::pin(rx)
 }
 
-/// Outcome of a single HTTP attempt, classified for [`run_with_reauth`].
+/// Outcome of a single HTTP attempt, classified for [`run_with_reauth`] /
+/// [`run_with_retry`].
 pub(super) enum Attempt {
     Done(Box<AssistantTurn>),
     /// Auth rejected (401/403): force one token refresh, then retry once.
     Reauth(anyhow::Error),
+    /// Transient failure (network / 429 / 5xx / recoverable stream anomaly):
+    /// retry with bounded backoff. Carries any server `Retry-After` hint. Only
+    /// honored by [`run_with_retry`]; [`run_with_reauth`] treats it as fatal.
+    Retry(anyhow::Error, Option<Duration>),
     /// Anything else non-retryable here: surface immediately.
     Fatal(anyhow::Error),
 }
@@ -76,15 +94,31 @@ pub(super) enum Attempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HttpClass {
     Reauth,
+    /// Transient (network/429/5xx): retry with backoff.
+    Retry,
     Fatal,
 }
 
 /// Classify an HTTP status into a (reauth-or-fatal) policy class. Transient
-/// (429/5xx) is treated as fatal here -- the leaner transport does not retry
-/// them (see the module-level ponytail note).
+/// (429/5xx) is treated as fatal here -- the reauth-only callers (Antigravity)
+/// do not retry them. Callers that want bounded transient retry use
+/// [`classify_http_status_retryable`] with [`run_with_retry`].
 pub(super) fn classify_http_status(status: u16) -> HttpClass {
     match status {
         401 | 403 => HttpClass::Reauth,
+        _ => HttpClass::Fatal,
+    }
+}
+
+/// Classify an HTTP status into a reauth/retry/fatal policy class for callers
+/// driving [`run_with_retry`]. 408/425/429 and 5xx are transient (retryable);
+/// 401/403 trigger one-shot reauth; everything else is fatal. Mirrors the Codex
+/// adapter's classification.
+pub(super) fn classify_http_status_retryable(status: u16) -> HttpClass {
+    match status {
+        401 | 403 => HttpClass::Reauth,
+        408 | 425 | 429 => HttpClass::Retry,
+        500..=599 => HttpClass::Retry,
         _ => HttpClass::Fatal,
     }
 }
@@ -110,6 +144,11 @@ pub(super) fn run_with_reauth<T>(
             tracing::error!(error = %format!("{error:#}"), "failed to obtain access token");
             auth_error(provider, &error)
         })?;
+        // Unlike `retry_loop`, this loop deliberately does NOT reset
+        // `force_refresh` after acquisition: its only loop-back (the `Reauth`
+        // arm) sets `force_refresh = true` and `reauth_used = true`, so a refresh
+        // happens at most once and the flag is never stale on a later read. A
+        // reset here would be dead code (clippy `unused_assignments`).
         if cancel.is_cancelled() {
             bail!("turn cancelled");
         }
@@ -127,8 +166,152 @@ pub(super) fn run_with_reauth<T>(
                 force_refresh = true;
                 tracing::warn!(error = %format!("{error:#}"), "auth rejected; refreshing token and retrying");
             }
+            // The reauth-only loop does not retry transient failures; surface
+            // them. Antigravity never constructs `Retry`, so this is unreachable
+            // for it and only exists for exhaustiveness.
+            Attempt::Retry(error, _) => return Err(error),
             Attempt::Fatal(error) => return Err(error),
         }
+    }
+}
+
+/// Drive a bounded transient-retry control flow with a one-shot reauth, for
+/// callers that classify transient HTTP / network / recoverable stream anomalies
+/// as [`Attempt::Retry`]. `get_token(force_refresh)` obtains a token (cached, or
+/// forcibly refreshed after an auth rejection); `send` performs one attempt.
+///
+/// Termination is guaranteed: reauth fires at most once, transient retries are
+/// bounded by `MAX_TRANSIENT_RETRIES`, the reauth does NOT reset the transient
+/// budget, and every other branch returns. Backoff sleeps are sliced so a
+/// cancelled turn stops promptly instead of waiting out the full delay.
+pub(super) fn run_with_retry<T>(
+    provider: &str,
+    cancel: &CancellationToken,
+    get_token: impl FnMut(bool) -> Result<T>,
+    send: impl FnMut(&T) -> Attempt,
+) -> Result<AssistantTurn> {
+    retry_loop(
+        provider,
+        get_token,
+        send,
+        // Sleep in slices so a turn-level cancel interrupts retry backoff.
+        |delay| sleep_cancellable(delay, cancel),
+        || cancel.is_cancelled(),
+    )
+}
+
+/// Pure retry/reauth state machine, free of timing and the cancellation token so
+/// it can be unit-tested with scripted closures. `sleep` applies a backoff delay;
+/// `is_cancelled` reports turn cancellation (checked before each attempt and
+/// after each backoff sleep).
+fn retry_loop<T>(
+    provider: &str,
+    mut get_token: impl FnMut(bool) -> Result<T>,
+    mut send: impl FnMut(&T) -> Attempt,
+    mut sleep: impl FnMut(Duration),
+    is_cancelled: impl Fn() -> bool,
+) -> Result<AssistantTurn> {
+    let mut transient_retries: u32 = 0;
+    let mut reauth_used = false;
+    let mut force_refresh = false;
+    loop {
+        if is_cancelled() {
+            bail!("turn cancelled");
+        }
+        let token = get_token(force_refresh).map_err(|error| {
+            tracing::error!(error = %format!("{error:#}"), "failed to obtain access token");
+            auth_error(provider, &error)
+        })?;
+        // Reset immediately after acquisition: a later transient retry must not
+        // keep force-refreshing the token.
+        force_refresh = false;
+        if is_cancelled() {
+            bail!("turn cancelled");
+        }
+        match send(&token) {
+            Attempt::Done(turn) => return Ok(*turn),
+            Attempt::Reauth(error) => {
+                if reauth_used {
+                    tracing::error!(error = %format!("{error:#}"), "auth rejected after refresh");
+                    return Err(auth_error(provider, &error).into());
+                }
+                if is_cancelled() {
+                    bail!("turn cancelled");
+                }
+                reauth_used = true;
+                force_refresh = true;
+                tracing::warn!(error = %format!("{error:#}"), "auth rejected; refreshing token and retrying");
+            }
+            Attempt::Retry(error, retry_after) => {
+                // The transient budget is shared across network/429/5xx/stream
+                // anomalies and is NOT reset by the one-shot reauth.
+                if transient_retries >= MAX_TRANSIENT_RETRIES {
+                    tracing::error!(error = %format!("{error:#}"), retries = transient_retries, "transient error; retries exhausted");
+                    return Err(error);
+                }
+                transient_retries += 1;
+                let delay = backoff_delay(transient_retries, retry_after, BASE_BACKOFF);
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    attempt = transient_retries,
+                    delay_ms = delay.as_millis() as u64,
+                    "transient error; retrying"
+                );
+                sleep(delay);
+            }
+            Attempt::Fatal(error) => return Err(error),
+        }
+    }
+}
+
+/// Compute the delay before the next transient retry. Honors a server
+/// `Retry-After` hint when present (bounded against pathological values);
+/// otherwise exponential backoff from `base` doubling per retry, clamped to
+/// `MAX_BACKOFF`. Either way up to 250ms of jitter is added so concurrent
+/// requests in the same rate-limit window do not retry in lockstep.
+fn backoff_delay(retry: u32, retry_after: Option<Duration>, base: Duration) -> Duration {
+    let jitter = Duration::from_millis(rand::random::<u64>() % 250);
+    if let Some(after) = retry_after {
+        return after.min(MAX_BACKOFF.saturating_mul(4)) + jitter;
+    }
+    let shift = retry.saturating_sub(1).min(10);
+    let exp = base
+        .checked_mul(1u32 << shift)
+        .unwrap_or(MAX_BACKOFF)
+        .min(MAX_BACKOFF);
+    exp + jitter
+}
+
+/// Parse an integer-seconds `Retry-After` header. The HTTP-date form is
+/// uncommon for 429s and is intentionally ignored.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+/// Surface a server `Retry-After` hint from response headers (integer seconds).
+/// Public seam so provider adapters can attach the hint to [`Attempt::Retry`].
+pub(super) fn retry_after_hint(headers: &HeaderMap) -> Option<Duration> {
+    parse_retry_after(headers)
+}
+
+/// Sleep up to `delay`, but in slices so `cancel` is observed promptly; returns
+/// early once cancelled.
+fn sleep_cancellable(delay: Duration, cancel: &CancellationToken) {
+    const SLICE: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        sleep(remaining.min(SLICE));
     }
 }
 
@@ -220,6 +403,7 @@ mod tests {
                         tool_calls: Vec::new(),
                         response_id: None,
                         usage: None,
+                        completion_reason: None,
                     }))
                 }
             },
@@ -303,6 +487,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     response_id: None,
                     usage: None,
+                    completion_reason: None,
                 }))
             },
         );
@@ -342,5 +527,155 @@ mod tests {
         assert_eq!(classify_http_status(401), HttpClass::Reauth);
         assert_eq!(classify_http_status(403), HttpClass::Reauth);
         assert_eq!(classify_http_status(500), HttpClass::Fatal);
+    }
+
+    #[test]
+    fn retryable_classifier_marks_transient_statuses() {
+        assert_eq!(classify_http_status_retryable(401), HttpClass::Reauth);
+        assert_eq!(classify_http_status_retryable(403), HttpClass::Reauth);
+        assert_eq!(classify_http_status_retryable(408), HttpClass::Retry);
+        assert_eq!(classify_http_status_retryable(425), HttpClass::Retry);
+        assert_eq!(classify_http_status_retryable(429), HttpClass::Retry);
+        assert_eq!(classify_http_status_retryable(500), HttpClass::Retry);
+        assert_eq!(classify_http_status_retryable(503), HttpClass::Retry);
+        assert_eq!(classify_http_status_retryable(404), HttpClass::Fatal);
+        assert_eq!(classify_http_status_retryable(400), HttpClass::Fatal);
+    }
+
+    fn done_turn(text: &str) -> Attempt {
+        Attempt::Done(Box::new(AssistantTurn::text(text)))
+    }
+
+    #[test]
+    fn retry_loop_retries_transient_then_succeeds() {
+        let mut sends = 0u32;
+        let mut slept = Vec::new();
+        let turn = retry_loop(
+            "test",
+            |_force| Ok(()),
+            |&()| {
+                sends += 1;
+                if sends <= 2 {
+                    Attempt::Retry(anyhow!("503"), None)
+                } else {
+                    done_turn("ok")
+                }
+            },
+            |delay| slept.push(delay),
+            || false,
+        )
+        .expect("retry then success");
+        assert_eq!(turn.text.as_deref(), Some("ok"));
+        assert_eq!(sends, 3);
+        assert_eq!(slept.len(), 2, "slept once per transient retry");
+    }
+
+    #[test]
+    fn retry_loop_exhausts_budget_and_returns_last_error() {
+        let mut sends = 0u32;
+        let mut slept = 0u32;
+        let result = retry_loop(
+            "test",
+            |_force| Ok(()),
+            |&()| {
+                sends += 1;
+                Attempt::Retry(anyhow!("persistent 500 protocol anomaly"), None)
+            },
+            |_delay| slept += 1,
+            || false,
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("protocol anomaly"), "{error}");
+        // 3 retries (with sleeps) then the 4th attempt exhausts the budget.
+        assert_eq!(sends, MAX_TRANSIENT_RETRIES + 1);
+        assert_eq!(slept, MAX_TRANSIENT_RETRIES);
+    }
+
+    #[test]
+    fn reauth_does_not_reset_the_transient_budget() {
+        // One reauth interleaved with transient retries must not grant extra
+        // transient attempts: total sends stay bounded.
+        let mut sends = 0u32;
+        let mut tokens = Vec::new();
+        let result = retry_loop(
+            "test",
+            |force| {
+                tokens.push(force);
+                Ok(())
+            },
+            |&()| {
+                sends += 1;
+                match sends {
+                    1 => Attempt::Reauth(anyhow!("401")),
+                    _ => Attempt::Retry(anyhow!("503"), None),
+                }
+            },
+            |_delay| {},
+            || false,
+        );
+        assert!(result.is_err());
+        // 1 reauth attempt + (MAX_TRANSIENT_RETRIES retries) + 1 exhausting attempt.
+        assert_eq!(sends, MAX_TRANSIENT_RETRIES + 2);
+        assert!(!tokens[0], "first token is cached");
+        assert!(tokens[1], "reauth forces one refresh");
+    }
+
+    #[test]
+    fn retry_loop_stops_when_cancelled_during_backoff() {
+        // The first attempt is transient; cancellation flips before the next
+        // loop iteration, so the loop bails instead of retrying forever.
+        let cancelled = std::cell::Cell::new(false);
+        let mut sends = 0u32;
+        let result = retry_loop(
+            "test",
+            |_force| Ok(()),
+            |&()| {
+                sends += 1;
+                Attempt::Retry(anyhow!("503"), None)
+            },
+            |_delay| cancelled.set(true),
+            || cancelled.get(),
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(sends, 1, "no further attempts after cancellation");
+    }
+
+    #[test]
+    fn sleep_cancellable_returns_promptly_when_already_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let start = Instant::now();
+        sleep_cancellable(Duration::from_secs(30), &cancel);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_delay_honors_retry_after_and_grows_exponentially() {
+        // Exponential growth from the base, clamped to MAX_BACKOFF.
+        let d1 = backoff_delay(1, None, BASE_BACKOFF);
+        let d2 = backoff_delay(2, None, BASE_BACKOFF);
+        assert!(d1 >= BASE_BACKOFF && d1 < BASE_BACKOFF + Duration::from_millis(250));
+        assert!(d2 >= BASE_BACKOFF * 2);
+        let big = backoff_delay(20, None, BASE_BACKOFF);
+        assert!(big <= MAX_BACKOFF + Duration::from_millis(250));
+        // A server Retry-After hint wins (plus jitter), bounded against
+        // pathological values.
+        let hint = backoff_delay(1, Some(Duration::from_secs(2)), BASE_BACKOFF);
+        assert!(hint >= Duration::from_secs(2) && hint < Duration::from_secs(3));
+        let pathological = backoff_delay(1, Some(Duration::from_secs(86400)), BASE_BACKOFF);
+        assert!(pathological <= MAX_BACKOFF * 4 + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn parse_retry_after_reads_integer_seconds_only() {
+        let mut headers = HeaderMap::new();
+        assert!(parse_retry_after(&headers).is_none());
+        headers.insert(RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
+        headers.insert(
+            RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert!(parse_retry_after(&headers).is_none(), "http-date ignored");
     }
 }

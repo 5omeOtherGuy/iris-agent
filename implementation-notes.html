@@ -2,153 +2,181 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Composer / Editor Statusline Upgrade — Implementation Notes</title>
+<title>Anthropic OAuth stream robustness - implementation notes</title>
 </head>
 <body>
-<h1>Composer / Editor Statusline Upgrade — Implementation Notes</h1>
-<p>Reviewer-facing notes for the TUI composer statusline upgrade. Records only
-decisions/changes not explicit in the spec. Routine steps omitted.</p>
+<h1>Anthropic Messages OAuth stream robustness &mdash; implementation notes</h1>
+<p>Branch <code>anthropic-stream-robustness</code>. Records decisions not explicit in the
+spec, tradeoffs, and reviewer context. Not a step log.</p>
 
-<h2>Scope &amp; key files</h2>
+<h2>Verified failure being fixed</h2>
+<p><code>Anthropic stream ended before content_block_stop [status=200 ...]</code>. The parser
+only emits this when <code>message_stop</code> arrives while <code>open_tools</code> or
+<code>open_reasoning</code> is non-empty; plain text blocks cannot trigger it.</p>
+
+<h2>Key decisions</h2>
 <ul>
-  <li><code>src/ui/tui/screen.rs</code> — composer chrome rendering (the file changed by this work).</li>
-  <li><code>src/ui/tui.rs</code> — constants, style helpers, and the test module for chrome.</li>
+<li><b>Duplicate-delta prevention (scope item 5) &mdash; chosen strategy: gate retry on
+"no visible text emitted this attempt", NOT per-attempt buffering.</b>
+Rationale: buffering every attempt would kill live token streaming on the happy path
+(every turn, not just retried ones). Instead the parser carries an explicit
+<code>emitted_visible_text</code> flag (set only when a non-empty <code>text_delta</code>
+is successfully forwarded to the sink). A malformed status-200 stream is retried only
+when no visible text was emitted on that attempt. Because tool input
+(<code>input_json_delta</code>) and reasoning (<code>thinking_delta</code>/<code>signature_delta</code>)
+are buffered internally and never streamed live, the verified tool-only / thinking-only
+malformed turns always qualify for retry. If visible text was already streamed and then
+the stream malformed, we do NOT retry; we surface the typed protocol error (DoD permits
+"retried/recovered OR fails with a typed sanitized protocol error"). A retried attempt by
+definition emitted no text, so the next attempt starts with no prior visible text and
+duplicate user-visible deltas are impossible.
+<br><b>Caveat for reviewers:</b> this predicate is safe only because <code>text_delta</code>
+is the ONLY live event today. If reasoning/tool deltas ever stream live, the predicate must
+be revisited.</li>
+
+<li><b>Transport retry placement (scope item 3):</b> added a new shared
+<code>run_with_retry</code> alongside the existing <code>run_with_reauth</code> rather than
+generalizing the latter. Antigravity stays on <code>run_with_reauth</code> with identical
+behavior; only Anthropic uses the retry loop. <code>classify_http_status</code> (Reauth/Fatal)
+is left untouched for Antigravity; a separate <code>classify_http_status_retryable</code>
+(Reauth/Retry/Fatal) is added for Anthropic. <code>Attempt::Retry</code> is added to the shared
+enum; <code>run_with_reauth</code> treats it as fatal for exhaustiveness (Antigravity never
+produces it).</li>
+
+<li><b>Backoff constants:</b> mirrored from Codex (<code>MAX_TRANSIENT_RETRIES=3</code>,
+<code>BASE_BACKOFF=500ms</code>, <code>MAX_BACKOFF=8s</code>, up to 250ms jitter, integer
+<code>Retry-After</code> seconds honored). Intentional small duplication with Codex: Codex
+predates the shared transport module and keeps its own copy (see transport.rs module note);
+unifying both is out of scope.</li>
+
+<li><b>Typed protocol error:</b> <code>StreamProtocolAnomaly</code> carries only block-shape
+metadata (message_stop seen, open tool/reasoning counts, open block indexes, last event
+type) &mdash; never streamed content. It is attached via <code>anyhow::Error::new(..)</code>
+and the safe request diagnostics are added with <code>.context(..)</code> so the typed error
+stays downcastable for classification (per oracle review). Network send errors and 429/5xx
+also become <code>Attempt::Retry</code>; the transient budget is shared across all three and
+is not reset by the one-shot reauth.</li>
+
+<li><b>max_tokens (scope item 8):</b> base <code>max_tokens</code> changed from a fixed 8192
+to the selected model's <code>output_cap</code> (<code>DEFAULT_OUTPUT_CAP=64000</code> for
+unknown models). For manual-budget thinking, <code>resolve_manual_thinking(output_cap, budget,
+output_cap)</code> keeps <code>budget_tokens &lt; max_tokens</code>, so the invariant holds and
+<code>max_tokens=output_cap</code>. This directly removes the 8192 truncation that produced
+silently-dropped <code>stop_reason=max_tokens</code>.</li>
+
+<li><b>stop_reason (scope items 6/7):</b> parsed from <code>message_delta.delta.stop_reason</code>,
+mapped to a provider-neutral <code>CompletionReason</code> enum (EndTurn, ToolUse,
+MaxOutputTokens, ContextWindowExceeded, StopSequence, Paused, Refusal, Other).
+<b>Decision change:</b> <code>Other</code> is a unit variant (not <code>Other(String)</code>).
+Keeping the enum small and <code>Copy</code> avoids tripping clippy's
+<code>large_enum_variant</code> lint once <code>completion_reason</code> is embedded in
+<code>AssistantTurn</code> (which flows through <code>ProviderEvent::Completed</code> /
+<code>StreamResult::Completed</code>); the alternative was boxing <code>AssistantTurn</code>
+in three enums across six files, a larger blast radius. The raw unknown stop-reason token
+is still surfaced for diagnostics via a <code>tracing::debug</code> line at parse time
+(the token is an enumerated wire value, never response content), so observability is
+preserved without storing it. Truncation reasons
+(MaxOutputTokens / ContextWindowExceeded) additionally emit a <code>tracing::warn</code> so they
+are not silently dropped. Stored on <code>AssistantTurn</code> and propagated to
+<code>AgentEvent::ProviderTurnCompleted</code>.</li>
+
+<li><b>UiEvent left unchanged:</b> <code>completion_reason</code> is added to the Nexus
+<code>AgentEvent::ProviderTurnCompleted</code> (the provider-neutral metadata event) but NOT to
+<code>UiEvent::ProviderTurnCompleted</code>, since no UI surface renders it yet. The
+<code>ui/mod.rs</code> mapping drops it. This keeps the change minimal and leaves typed
+completion metadata available for later continuation/fallback work, per the goal.</li>
 </ul>
 
-<h2>Pre-existing state vs. spec</h2>
-<p>Before this change the runtime status was rendered as a <em>separate line above</em>
-the editor box (a "rail": <code>● MODE code ┊ MODEL … ┊ CTX … ┊ CWD … ┊ BRANCH …</code>).
-The spec explicitly forbids a floating statusline above the composer, so the rail was
-removed and its data relocated: mode/model/context into the editor's top border, and
-cwd/git into a quiet unboxed label below the box.</p>
-
-<h2>Decisions not specified by the spec</h2>
+<h2>Review follow-up fixes (second pass)</h2>
 <ul>
-  <li><strong>Active dot is statically orange.</strong> The top-frame <code>●</code> uses
-      the accent color always (it signals "session active"); it is not tied to turn
-      state. The inline working indicator already signals turn activity.</li>
-  <li><strong>Effort is always shown when set</strong> (e.g. <code>LOW</code>), including
-      during an active turn. The removed rail hid effort while the spinner ran; the
-      new frame shows it because the spec layout includes it. It is dropped only by
-      width fallback.</li>
-  <li><strong>Model display = uppercased bare model id</strong> (<code>gpt-5.4</code> →
-      <code>GPT-5.4</code>), not the catalog display name (<code>GPT 5.4</code>),
-      because the spec shows <code>GPT-5.4</code>. Effort is appended uppercased.</li>
-  <li><strong>CTX label</strong> = catalog context-window label uppercased
-      (<code>300k</code> → <code>CTX 300K</code>). The meter is computed from
-      <code>total_tokens / parse(window)</code> where <code>parse</code> handles
-      <code>k</code>/<code>m</code> suffixes and plain integers.</li>
-  <li><strong>Meter value persisted separately from per-turn usage.</strong> Added
-      <code>Footer.context_used_tokens</code>, updated on every
-      <code>ProviderTurnCompleted</code> and <em>not</em> cleared at turn start, so the
-      meter does not blank at the start of every turn. It is cleared in
-      <code>set_footer_with_context</code> when the model or context window changes, so
-      a prior model's usage is never shown against a new window (oracle-recommended).
-      The working indicator keeps using <code>Footer.usage</code> (still per-turn).</li>
-  <li><strong>Meter math:</strong> 10 dots, <code>div_ceil</code> so any nonzero usage
-      lights ≥ 1 dot; over-budget clamps to a full strip. The last lit dot is the
-      orange edge; earlier lit dots are muted (<code>DarkGray</code>); empty dots are
-      dim (<code>○</code>).</li>
-  <li><strong>Width step 3 ("shorten model alias") is a no-op.</strong> No alias table
-      exists in the catalog, so narrowing is handled by the remaining steps: drop
-      effort → drop meter → drop CTX → minimum <code>● CODE ─ MODEL</code>. Candidates
-      are monotonic (effort never reappears after being dropped).</li>
-  <li><strong>Pulsing not implemented.</strong> The spec's edge-pulse / 100%-pulse are
-      "may" behaviors; omitted (static styling only).</li>
-  <li><strong>Workspace label placement:</strong> indented to the transcript text
-      column (<code>TEXT_COLUMN_X_PADDING</code> = 4), dim, formatted
-      <code>&lt;cwd&gt; ┊ git &lt;branch&gt;</code> with no trailing separator. CWD uses a
-      middle-ellipsis that preserves the final path segment (project name); if even
-      <code>…/&lt;project&gt;</code> does not fit it left-ellipsizes the project name.</li>
+<li><b>Retry-gate invariant hardened (review item 1):</b> the duplicate-delta predicate is
+unchanged in behavior, but the doc comment on <code>protocol_anomaly_retryable</code> now
+states an explicit INVARIANT: any future live UI event (live reasoning or tool deltas) MUST
+set the same <code>emitted_visible_text</code> gate, or the retry policy must change. Added
+<code>malformed_stream_after_visible_text_is_not_retryable</code> covering the
+<code>content_block_stop</code> variant after a real <code>text_delta</code> (the prior
+tests only covered the missing-<code>message_stop</code> variant).</li>
+
+<li><b>Truncation is now user-visible (review item 2):</b> a provider-neutral
+<code>completion_reason_notice(CompletionReason)</code> lives in <code>nexus.rs</code> and the
+provider loop emits <code>AgentEvent::Notice</code> right after
+<code>ProviderTurnCompleted</code> when the reason is <code>MaxOutputTokens</code> or
+<code>ContextWindowExceeded</code>. <b>Decision:</b> wording is model-neutral ("The model hit
+its maximum output-token limit..." / "...context-window limit...") rather than the
+Anthropic-specific "Claude ..." phrasing the request suggested, because the notice is emitted
+from provider-neutral Nexus completion metadata and the runtime must not hard-code a
+provider/model name (ADR-0003 / tier boundaries). The existing <code>tracing::warn</code> in
+the Anthropic adapter is retained. Notices ride the existing
+<code>AgentEvent::Notice -&gt; UiEvent::Notice</code> path; no new event type.</li>
+
+<li><b>Empty completed turns with a valid stop reason (review item 3):</b>
+<code>AnthropicStreamParser::finish</code> now treats a terminal stream with no
+text/reasoning/tool calls as a valid empty completion when a <code>stop_reason</code> was
+present (<code>completion_reason.is_some()</code>); a contentless stream with NO stop reason
+still errors as before. The presence of the stop reason (any mapped value, including
+<code>Other</code> for unknown-but-present tokens) is the gate, since a stop reason is the
+provider's terminal completion signal.</li>
+
+<li><b>Stale-doc fixes (review item 4):</b> the module headers in <code>transport.rs</code>
+and <code>anthropic_messages.rs</code> no longer claim "no transient backoff"; they now
+describe <code>run_with_retry</code> (Anthropic) vs <code>run_with_reauth</code>
+(Antigravity, reauth-only).</li>
 </ul>
 
-<h2>Layout / frame-integrity mechanics</h2>
+<h2>Review follow-up fixes (third pass &mdash; 6 reviewer findings)</h2>
 <ul>
-  <li>The statusline is printed into the editor's top border via
-      <code>buf.set_line()</code> <em>after</em> the block, body, and hint are rendered
-      (so the textarea cannot overwrite it at tiny heights). The line is built at
-      exactly the box width: <code>┌─ </code> + segments joined by <code> ─ </code> +
-      <code> </code> + <code>─</code> fill + <code>┐</code>.</li>
-  <li><strong>Never breaks the frame:</strong> if even the minimum content cannot fit
-      (extremely narrow terminals), <code>composer_top_border</code> returns
-      <code>None</code> and the plain <code>Block</code> border is kept. A test sweeps
-      box widths 6..=200 asserting the line is exactly the box width and is corner-bounded.</li>
-  <li><strong>Height budget reordered.</strong> Chrome is now
-      <code>[menu, editor, workspace-label]</code> (label below the editor). The editor
-      frame is protected first: the menu yields to <code>MIN_EDITOR_H</code>, then the
-      workspace label yields to both, so constrained heights drop the label before
-      squeezing the editor frame. Constant <code>GLOBAL_STATUS_H</code> renamed
-      <code>WORKSPACE_LABEL_H</code>.</li>
+<li><b>Mid-stream read failure is now retryable when safe (finding 1):</b> a
+<code>for_each_sse_event</code> failure in <code>send_once</code> previously always returned
+<code>Attempt::Fatal</code>, even though a pre-stream <code>send()</code> failure was already
+retried. A mid-stream connection drop/timeout is transient and is now retried on the SAME
+gate as a protocol anomaly: only when <code>!cancel.is_cancelled() && !emitted_visible_text</code>,
+so a retry can never duplicate user-visible output and cancellation is never swallowed.
+<b>No new unit test:</b> there is no HTTP-mock harness for <code>send_once</code> (provider
+tests operate at the parser level), and the decisive predicate is the already-tested
+<code>emitted_visible_text</code> gate plus the shared cancellation token; building a mock
+server purely for this path would dwarf the fix.</li>
+
+<li><b>Defensive redaction of serde errors (finding 2):</b> both
+<code>serde_json::from_str</code> sites (<code>ingest_event</code> SSE frame,
+<code>finalize_tool</code> tool JSON) now drop the serde error via <code>map_err(|_| ...)</code>
+and return a fixed message. Both deserialize to an untyped <code>Value</code>, so serde only
+produces positional syntax errors (never the input bytes) &mdash; this is belt-and-suspenders,
+not a live leak. Removing the last <code>Result::context</code> call made the <code>anyhow::Context</code>
+import unused; it was dropped.</li>
+
+<li><b>force_refresh in run_with_reauth (finding 3):</b> investigated the suggested
+"reset for consistency with <code>retry_loop</code>" and found a reset is actually DEAD CODE
+here (clippy <code>unused_assignments</code>): this loop's only loop-back is the <code>Reauth</code>
+arm, which immediately sets <code>force_refresh = true</code>, so a reset to <code>false</code>
+is never read on any path. Kept the original (no reset) and documented WHY it correctly differs
+from <code>retry_loop</code> (whose <code>Retry</code> arm loops without touching the flag and
+thus genuinely needs the reset). No behavior change.</li>
+
+<li><b>Empty-turn test coverage (finding 4):</b>
+<code>empty_turn_with_valid_stop_reason_completes</code> now also iterates <code>pause_turn</code>
+and <code>refusal</code>, the other contentless stop reasons <code>finish()</code> accepts.</li>
+
+<li><b>Content-less refusal notice (finding 5):</b> <code>completion_reason_notice</code> now
+takes <code>had_visible_content</code> and returns "The model declined to respond." for a
+<code>Refusal</code> that produced no text/reasoning/tool calls. A refusal that DID carry an
+explanation emits no extra notice (the user already sees it). <code>had_visible_content</code>
+is captured in the agent loop before <code>reasoning</code> is consumed. Wording stays
+provider/model-neutral. Tested both ways in <code>nexus_tests.rs</code>.</li>
+
+<li><b>Diagnostics key consistency (finding 6):</b> <code>StreamProtocolAnomaly</code>'s Display
+now uses the <code>last_event=</code> key (was <code>last_event_type=</code>) to match
+<code>AnthropicDiagnostics</code> and the original failure log, so logs are searchable on one
+field.</li>
 </ul>
 
-<h2>Code-review outcomes (4 parallel reviewers)</h2>
-<p>Reviewed from four angles: correctness/frame-integrity, spec conformance,
-architecture/tier boundaries, and test quality. No correctness or spec-conformance
-bugs were found; the frame-integrity width sweep and meter math were validated.
-Applied fixes:</p>
+<h2>Deferred (explicitly out of the smallest-correct scope)</h2>
 <ul>
-  <li><strong>Removed duplicated helpers</strong> (AGENTS.md reuse rule): the local
-      <code>spans_display_width</code> and <code>take_first_display</code> now reuse
-      <code>wrap::spans_width</code> and <code>wrap::truncate_to_width</code>.
-      <code>take_last_display</code> is kept (wrap only exposes a prefix variant) but
-      no longer allocates a <code>String</code> per character.</li>
-  <li><strong>Stale usage reset:</strong> <code>set_footer_with_context</code> now also
-      drops the carried-over <code>usage</code> (not just the meter value) when the
-      model/context changes, so the working indicator can't briefly show a prior
-      model's IO. Verified the model-switch test still passes (it keeps the same model).</li>
-</ul>
-<h2>Follow-up changes (post-merge of #164)</h2>
-<ul>
-  <li><strong>Fix #1 — case-insensitive model compare (done).</strong>
-      <code>set_footer_with_context</code> now compares the model id and context label
-      with <code>eq_ignore_ascii_case</code> (via <code>label_eq_ignore_case</code>) so a
-      differently-cased model id from a future caller does not needlessly reset the
-      persisted context meter. Tested by
-      <code>context_meter_persists_across_case_insensitive_model_refresh</code>.</li>
-  <li><strong>Fix #2 — input_tokens vs total_tokens: investigated, NOT changed (with
-      evidence).</strong> The meter intentionally uses <code>total_tokens</code>. The
-      harness auto-compaction trigger (<code>wayland::maybe_auto_compact</code>) compares
-      the budget against <code>context_tokens(messages)</code> = the sum of <em>all</em>
-      message token estimates (the full conversation, user + assistant). That equals
-      <code>input + output</code> ≈ <code>total_tokens</code>. Using
-      <code>input_tokens</code> alone would omit the latest assistant response and make
-      the meter <em>under</em>-report relative to when compaction actually fires.
-      <code>total_tokens</code> keeps the meter aligned with the real compaction
-      threshold, so switching to <code>input_tokens</code> would be a regression. Added a
-      code comment at the meter-update site documenting this rationale.</li>
-</ul>
-
-<p>Considered and deferred / not actioned (with rationale):</p>
-<ul>
-  <li><strong>Extract a <code>chrome.rs</code> module</strong> (reviewer: medium).
-      <code>screen.rs</code> is ~1.2k lines, but it was already that size from the
-      concurrent #163 refactor; splitting is a separate cohesion refactor outside this
-      task's scope. Deferred as a follow-up to keep this change focused.</li>
-  <li><strong>Ultra-narrow degradation:</strong> below the minimum content width the top
-      border returns <code>None</code> and the plain <code>Block</code> border is kept
-      (status hidden, frame intact). This is intentional graceful degradation, covered
-      by the width sweep (no panic / correct corners).</li>
-</ul>
-
-<h2>Caveats / follow-up risks</h2>
-<ul>
-  <li><strong>Concurrent refactor mid-task:</strong> commit #163 ("split TUI rendering
-      modules") landed while this work was in progress, moving chrome rendering from
-      <code>src/ui/tui.rs</code> into <code>src/ui/tui/screen.rs</code>. This change
-      targets the post-refactor layout; tests remain in the <code>tui.rs</code> test
-      module.</li>
-  <li><strong>No explicit light/dark theming added.</strong> The spec lists per-mode
-      color tables; the implementation reuses the existing semantic style helpers
-      (border = <code>Color::Gray</code>, accent <code>ORANGE</code> which this codebase
-      maps to <code>Color::Yellow</code>, dim via <code>Modifier::DIM</code>) and relies
-      on the terminal palette, consistent with the rest of the TUI. The exact
-      light/dark hex directions are not encoded.</li>
-  <li><strong>Meter granularity is coarse (10 buckets, ceil).</strong> One token of
-      usage shows one lit dot; this is intentional per the spec ("each dot ~10%").</li>
-  <li>The <code>set_footer_with_context</code> model-equality check compares the bare
-      model display string. Both the live loop and the test helper pass the bare model
-      id, so the comparison is consistent; a future caller passing a qualified id would
-      reset the meter more eagerly (safe direction).</li>
+<li><b>Automatic in-stream continuation / non-streaming fallback</b> (scope item 12): not
+implemented. Recovering a malformed stream <em>after</em> visible text without a UI rewind
+event would require buffering all live deltas (regressing streaming UX for every turn) or a
+new Nexus "discard partial" event. Both exceed the smallest correct fix. Typed error
+classification, bounded retry/recovery, safe diagnostics, stop-reason propagation, and the
+max-token cap correction are all implemented (not deferred).</li>
 </ul>
 </body>
 </html>
