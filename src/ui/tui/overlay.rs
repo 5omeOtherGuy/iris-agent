@@ -111,6 +111,11 @@ impl Component for PaletteView<'_> {
 /// rect math is preserved byte-for-byte from the former `render_palette` /
 /// `render_plain_menu_lines`; `Paragraph` clips overflow exactly as before.
 pub(super) fn render_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static>>) {
+    // Defense in depth: the caller only paints when `heights.menu > 0`, but a
+    // zero-sized area must never reach `Paragraph::render`.
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let inner = Rect {
         x: area.x + TEXT_COLUMN_X_PADDING_U16,
         y: area.y + u16::from(area.height > 1),

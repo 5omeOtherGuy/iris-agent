@@ -115,10 +115,12 @@ pub(crate) const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 /// (e.g. hardware-cursor) component lands.
 pub(crate) fn take_cursor_position(lines: &mut [Line<'static>]) -> Option<(usize, usize)> {
     for (row, line) in lines.iter_mut().enumerate() {
-        let Some(span_idx) = line
+        // Locate the marker (span index + byte offset) in one pass.
+        let Some((span_idx, marker_at)) = line
             .spans
             .iter()
-            .position(|span| span.content.contains(CURSOR_MARKER))
+            .enumerate()
+            .find_map(|(i, span)| span.content.find(CURSOR_MARKER).map(|at| (i, at)))
         else {
             continue;
         };
@@ -128,7 +130,6 @@ pub(crate) fn take_cursor_position(lines: &mut [Line<'static>]) -> Option<(usize
             .sum();
         let span = &line.spans[span_idx];
         let content = span.content.as_ref();
-        let marker_at = content.find(CURSOR_MARKER).expect("marker present");
         let before = &content[..marker_at];
         let after = &content[marker_at + CURSOR_MARKER.len()..];
         let column = prefix_width + display_width(before);

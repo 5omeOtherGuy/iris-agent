@@ -57,9 +57,10 @@ scope unit. Not a step log.</p>
 
 <h2>Unit 3 — Transcript rows migration (rows.rs, pane.rs, transcript.rs)</h2>
 <ul>
-  <li><code>TranscriptRow::render(width, out)</code> renamed to
-  <code>render_into</code> (append-based, kept for the hot loop);
-  <code>impl Component for TranscriptRow</code> wraps it.</li>
+  <li><code>TranscriptRow::render(width, out)</code> renamed to the inherent
+  <code>render_rows</code> (append-based); the <code>Component</code> impl's
+  <code>render_into</code> override calls it (no per-row <code>Vec</code>) and
+  <code>render</code> wraps it.</li>
   <li><code>Transcript::render</code> now selects the visible rows (collapsed
   panels still hide their separator/body rows — unchanged logic) into a
   <code>Vec&lt;&amp;dyn Component&gt;</code> and calls <code>composite</code>.
@@ -169,6 +170,29 @@ scope unit. Not a step log.</p>
   hardware cursor:</b> deferred (no current floating UI / no hardware cursor in
   Iris). The <code>CURSOR_MARKER</code> seam is in place for the cursor part.</li>
 </ul>
+
+<h2>Trait shape decision (raised in review)</h2>
+<p>Reviewers asked whether <code>render_into</code> should be the required method
+and <code>render</code> the provided one (efficient-by-default). Kept
+<code>render</code> required + <code>render_into</code> provided/overridable: the
+only hot component is <code>TranscriptRow</code> (which overrides
+<code>render_into</code>); <code>Modal</code>, <code>PaletteView</code>,
+<code>LinesSection</code>, and <code>Container</code> naturally produce owned
+lines, so requiring <code>render_into</code> would add append-style boilerplate
+for owned data with no efficiency gain. The current shape achieves zero per-row
+allocation on the hot path without churning the cold components.</p>
+
+<h2>Cursor-marker / wrapping constraint (forward seam)</h2>
+<p><code>take_cursor_position</code> runs on already-rendered (post-wrap) lines and
+uses <code>display_width</code>. Note that <code>wrap.rs::char_width</code>
+clamps every char to width &ge; 1, so the multi-byte <code>CURSOR_MARKER</code>
+must NOT pass through wrapping as part of real text or it would be miscounted and
+force premature wraps. No component emits the marker today, so this is latent;
+the constraint for the deferred hardware-cursor work is: emitters place the
+marker in its own span and the composition root strips it before any width/wrap
+computation (which it already does, bounded to the volatile tail).
+<code>wrap.rs</code> is intentionally left unchanged to preserve byte-identical
+wrapping of existing content.</p>
 
 <h2>ADR-0006 tension and resolution</h2>
 <p>ADR-0006 says build Iris-native, sized to Iris, do not import app-scale

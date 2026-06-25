@@ -574,6 +574,10 @@ impl Component for LinesSection {
     fn render(&self, _width: usize) -> Vec<Line<'static>> {
         self.0.clone()
     }
+
+    fn render_into(&self, _width: usize, out: &mut Vec<Line<'static>>) {
+        out.extend(self.0.iter().cloned());
+    }
 }
 
 /// Render the full logical document for the current terminal size: all
@@ -629,7 +633,7 @@ pub(super) fn render_document_with_chrome_tail(
     tail.add_child(Box::new(LinesSection(working_block)));
     tail.add_child(Box::new(LinesSection(chrome)));
     let mut document = transcript;
-    document.extend(tail.render(usize::from(width)));
+    tail.render_into(usize::from(width), &mut document);
     // Locate-and-strip any focus cursor marker before the document reaches the
     // terminal surface. The cursor only ever lives in the composer chrome, so
     // the scan is bounded to the volatile tail instead of the whole (possibly
