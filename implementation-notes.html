@@ -1,11 +1,12 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Iris: align arbitrary harness restrictions to pi-mono</title>
+  <title>Iris implementation notes</title>
 </head>
 <body>
-<h1>Implementation notes: align arbitrary harness restrictions to pi-mono</h1>
+<h1>Implementation notes</h1>
+<h2>Align arbitrary harness restrictions to pi-mono</h2>
 <p>
   Branch <code>feat/pimono-limits</code> off <code>origin/main</code> at
   <code>6b48611</code> (fetch succeeded, primary 0 ahead / 0 behind). Reference
@@ -235,6 +236,218 @@
     <code>shell-output.ts</code> spill machinery, per-provider/<code>enabled</code>
     retry knobs, and module structure. Behavior was reimplemented idiomatically in
     Rust; no new dependencies.</li>
+</ul>
+<hr>
+<h2>Tier-3 TUI component abstraction</h2>
+<p>Decisions and discoveries not already explicit in the task spec. Organized by
+scope unit. Not a step log.</p>
+
+<h2>Verification of starting state</h2>
+<ul>
+  <li><code>git fetch</code> succeeded; <code>origin/main</code> at
+  <code>6b48611</code> (matches the prompt snapshot). The primary checkout was in
+  detached HEAD at <code>d1d9bce</code> (one commit ahead, owned by another
+  worktree branch), but the <code>main</code> branch == <code>origin/main</code>
+  and <code>worktree-preflight.sh</code> reported PASS. Branched
+  <code>feat/tui-component-abstraction</code> off <code>origin/main</code>.</li>
+  <li><code>~/vendor/pi-mono/packages/tui/src/tui.ts</code> present (1495 lines);
+  used as conceptual reference only.</li>
+  <li>Cited symbols/lines had drifted (Iris file <code>tui.rs</code> is the
+  module root; the renderers live in <code>src/ui/tui/{rows,pane,panel,
+  transcript,screen}.rs</code>). Worked from observed code.</li>
+</ul>
+
+<h2>Unit 1 — Component trait + cursor marker (src/ui/tui/component.rs)</h2>
+<ul>
+  <li><b>Render unit.</b> Iris's currency is <code>Vec&lt;Line&lt;'static&gt;&gt;</code>,
+  so the trait is <code>render(&amp;self, width: usize) -&gt; Vec&lt;Line&lt;'static&gt;&gt;</code>
+  (pi-mono returns <code>string[]</code>).</li>
+  <li><b>Trait kept minimal (render only).</b> pi-mono's <code>handleInput</code>
+  and <code>invalidate</code> were intentionally NOT added. Iris routes typed
+  crossterm events through the focus/overlay layer, not a stringly-typed input
+  hook; and no Iris component caches render state, so <code>invalidate</code>
+  would be a no-caller stub — forbidden by the spec's anti-stub rule. Both are
+  deferred until a real caller exists (theming/markdown cache → invalidate).</li>
+  <li><b>Cursor marker.</b> Adopted pi-mono's APC sentinel
+  (<code>CURSOR_MARKER = "\x1b_pi:c\x07"</code>) and a
+  <code>take_cursor_position</code> that locates the marker, computes
+  <code>(row, col)</code> by display width, and strips it across spans. Iris uses
+  NO hardware cursor today (the editor draws its own reversed block cursor via
+  <code>ratatui-textarea</code>), so no shipped component emits the marker. The
+  function is still genuinely wired (called by the composition root, unit 6) and
+  fully unit-tested with a marker-emitting fixture — it is the real seam the
+  deferred hardware-cursor/IME work plugs into, today a no-op strip.</li>
+</ul>
+
+<h2>Unit 2 — Container (src/ui/tui/component.rs)</h2>
+<ul>
+  <li><code>Container</code> owns <code>Vec&lt;Box&lt;dyn Component&gt;&gt;</code>
+  and composites in order. A separate borrowed <code>composite()</code> helper
+  exists so hot paths can composite <code>&amp;dyn Component</code> without
+  boxing (the transcript renders up to <code>MAX_TRANSCRIPT_ROWS</code> rows per
+  frame).</li>
+</ul>
+
+<h2>Unit 3 — Transcript rows migration (rows.rs, pane.rs, transcript.rs)</h2>
+<ul>
+  <li><code>TranscriptRow::render(width, out)</code> renamed to the inherent
+  <code>render_rows</code> (append-based); the <code>Component</code> impl's
+  <code>render_into</code> override calls it (no per-row <code>Vec</code>) and
+  <code>render</code> wraps it.</li>
+  <li><code>Transcript::render</code> now selects the visible fold-tagged rows
+  (collapsed panels show the capped preview, expanded panels show the full body) into a
+  <code>Vec&lt;&amp;dyn Component&gt;</code> and calls <code>composite</code>.
+  The in-flight stream became <code>pane::streaming_assistant_rows</code>
+  (returns transient <code>TranscriptRow</code>s) so it joins the same borrowed
+  composite instead of rendering directly.</li>
+  <li><b>Byte-identical:</b> <code>composite</code>'s <code>extend</code> equals
+  the former <code>push</code> loop; each row's <code>render_into</code> is
+  unchanged. Proven by the existing <code>width_resize_reflows_transcript_from_state</code>
+  and <code>surface_draw_path_replays_history_from_state</code> tests.</li>
+</ul>
+
+<h2>Unit 5 — Overlay + focus (overlay.rs, screen.rs, modal.rs, tui_loop.rs)</h2>
+<ul>
+  <li><b>Docked, not floating (key divergence).</b> pi-mono overlays float and
+  composite over the base document at anchor/margin positions. Iris's modal and
+  slash palette occupy a RESERVED region above the composer (allocated by
+  <code>chrome_heights</code>); the editor shifts down. Modeling them as floating
+  would move where they render and break byte-identical output. So overlays stay
+  docked; the abstraction supplies the two pieces pi-mono couples to overlays:
+  explicit focus and a Component render path. A true floating anchor/margin
+  compositor + overlay handles (hide/show/focus/unfocus) are deferred (no Iris
+  floating UI to migrate; adding it now = abstraction with no caller). Recorded
+  in ADR-0024.</li>
+  <li><b>Explicit focus.</b> <code>FocusTarget { Editor, Palette, Modal }</code>
+  with precedence Editor &lt; Palette &lt; Modal. <code>Screen::focus()</code> is
+  the single source of truth, derived from existing modal/palette state (no new
+  duplicated flags to keep in sync). It replaced the implicit checks in
+  <code>tui_loop.rs</code>: <code>modal_open()</code> (deleted) → <code>focus()
+  == Modal</code> at the modal-phase gates; <code>palette.is_active()</code> →
+  <code>focus() == Palette</code> for the idle chord-suppression and palette-nav
+  branches. Byte-identical because in idle a modal is never open, so
+  <code>focus()==Palette ⟺ palette.is_active(input)</code>.</li>
+  <li><b>Modal + palette as Components.</b> <code>impl Component for Modal</code>
+  (clamps the <code>usize</code> width back to the <code>u16</code> the picker
+  renderers use). The palette's STATE stays in <code>slash.rs</code>;
+  <code>overlay::PaletteView</code> is its Component render face, reproducing the
+  former <code>screen::render_palette</code> rows exactly.
+  <code>render_editor_chrome</code> now picks the focused overlay
+  (<code>match screen.focus()</code>), renders it once via <code>Component</code>,
+  uses that length for menu height, and paints it through one
+  <code>overlay::render_menu_lines</code> helper.</li>
+  <li><b>Byte-identical traps handled.</b> The old code had two inset helpers
+  (<code>render_palette</code>, <code>render_plain_menu_lines</code>) with
+  IDENTICAL inner-rect math; collapsed into one. Modal render width was
+  <code>content_width(area.width)</code>, which equals the menu inner width, so
+  rendering at the inner width is unchanged. Menu height (<code>len + 2</code>,
+  <code>MAX_MENU_ROWS</code> cap) preserved by computing it from the single
+  rendered line list. <code>Paragraph</code> still does the clipping (no manual
+  truncation added).</li>
+</ul>
+
+<h2>Unit 6 — Composition root (screen.rs)</h2>
+<ul>
+  <li><code>render_document_with_chrome_tail</code> assembles transcript +
+  working block + chrome through a root <code>Container</code> of
+  <code>LinesSection</code> components (mirrors pi-mono <code>TUI extends
+  Container</code>), then calls <code>take_cursor_position</code> to strip any
+  marker before the document reaches <code>TerminalSurface</code>.</li>
+  <li><b>TerminalSurface seam:</b> untouched. The abstraction only produces the
+  final <code>Vec&lt;Line&gt;</code>; diff/append/replay/resize stay in
+  <code>terminal_surface.rs</code> (existing terminal-surface tests still pass).</li>
+  <li><b>Performance (post-review):</b> the first pass wrapped the whole document
+  (incl. transcript) in cloning <code>LinesSection</code>s, an avoidable O(n)
+  full-document copy per frame. Fixed after wave-1 review: the transcript is
+  MOVED into the document as the scrolling base; only the viewport-bounded tail
+  (working indicator + chrome) is composed through the root <code>Container</code>.
+  Separately, <code>Component::render_into</code> was added so the transcript's
+  borrowed <code>composite</code> over thousands of rows allocates no per-row
+  <code>Vec</code> (matches the pre-abstraction push loop).</li>
+  <li><b>Cursor-marker scan bounded.</b> <code>take_cursor_position</code> runs on
+  the volatile tail only (the cursor only ever lives in the composer chrome), not
+  the full document.</li>
+  <li><b>Focus allocation.</b> <code>Screen::focus_for(&amp;input)</code> lets the
+  hot callers (idle key handler, chrome render) reuse their existing editor-text
+  snapshot instead of re-joining the buffer; <code>focus()</code> remains for the
+  non-hot modal-phase gates.</li>
+</ul>
+
+<h2>Unit 4 — Tool panels: DEFERRED (named follow-up)</h2>
+<ul>
+  <li>After unit 3, tool panels already render through the row-level
+  <code>Component</code> path: every panel is a flat sequence of
+  <code>TranscriptRow</code>s carrying <code>ChromeRow</code> chrome, and
+  <code>TranscriptRow: Component</code>.</li>
+  <li>Grouping those flat rows into a standalone <code>Panel</code> component
+  would require reworking the in-place panel machinery
+  (<code>panel_end_from</code>, <code>replace_active_exec_panel</code> /
+  <code>replace_active_tool_panel</code>, the splice-based live-exec/tool
+  finalize, trim-safety, and the collapse filter in <code>Transcript::render</code>).
+  That is high regression risk and not safely byte-identical within this session,
+  so it is deferred. The spec explicitly permits deferring units 3/4/5; units 1–2
+  plus two real migrations (3 and 5) landed.</li>
+</ul>
+
+<h2>Other deferrals (out of scope here)</h2>
+<ul>
+  <li><b>Text fallback UI (<code>src/ui/text.rs</code>):</b> left on its current
+  path. It is a line-printer over stdout (no <code>Screen</code>, no
+  <code>TerminalSurface</code>, no <code>Line</code> composition), so it is not a
+  component-rendered surface; migrating it would add an abstraction with nothing
+  to composite.</li>
+  <li><b>pi-mono component catalog Iris lacks</b> (image/kitty-iterm graphics,
+  autocomplete, kill-ring, undo-stack, configurable keybindings, theming) and a
+  second terminal-diff engine: out of scope; separate roadmap items.</li>
+  <li><b>Floating overlay compositor + overlay handles + multiple overlays +
+  hardware cursor:</b> deferred (no current floating UI / no hardware cursor in
+  Iris). The <code>CURSOR_MARKER</code> seam is in place for the cursor part.</li>
+</ul>
+
+<h2>Trait shape decision (raised in review)</h2>
+<p>Reviewers asked whether <code>render_into</code> should be the required method
+and <code>render</code> the provided one (efficient-by-default). Kept
+<code>render</code> required + <code>render_into</code> provided/overridable: the
+only hot component is <code>TranscriptRow</code> (which overrides
+<code>render_into</code>); <code>Modal</code>, <code>PaletteView</code>,
+<code>LinesSection</code>, and <code>Container</code> naturally produce owned
+lines, so requiring <code>render_into</code> would add append-style boilerplate
+for owned data with no efficiency gain. The current shape achieves zero per-row
+allocation on the hot path without churning the cold components.</p>
+
+<h2>Cursor-marker / wrapping constraint (forward seam)</h2>
+<p><code>take_cursor_position</code> runs on already-rendered (post-wrap) lines and
+uses <code>display_width</code>. Note that <code>wrap.rs::char_width</code>
+clamps every char to width &ge; 1, so the multi-byte <code>CURSOR_MARKER</code>
+must NOT pass through wrapping as part of real text or it would be miscounted and
+force premature wraps. No component emits the marker today, so this is latent;
+the constraint for the deferred hardware-cursor work is: emitters place the
+marker in its own span and the composition root strips it before any width/wrap
+computation (which it already does, bounded to the volatile tail).
+<code>wrap.rs</code> is intentionally left unchanged to preserve byte-identical
+wrapping of existing content.</p>
+
+<h2>ADR-0006 tension and resolution</h2>
+<p>ADR-0006 says build Iris-native, sized to Iris, do not import app-scale
+architecture; Ratatui = primitives; Iris owns the terminal surface. This change
+stays inside that: the abstraction is small (two files), reuses
+<code>TerminalSurface</code> unchanged, adds no dependencies, vendors no
+pi-mono/Codex code, and lives entirely in Tier-3 <code>src/ui/tui/</code>. It
+amends ADR-0006 only by adding a render-abstraction layer above the surface, and
+explicitly declines the pi-mono floating-overlay/component-catalog scale.
+Recorded as ADR-0024.</p>
+
+<h2>Reviewer-facing risks</h2>
+<ul>
+  <li>Menu-region byte-identical (height math, inner-rect insets, Paragraph
+  clipping) — preserved exactly; covered by existing modal/palette tests +
+  new overlay tests.</li>
+  <li>Focus precedence drift (Editor &lt; Palette &lt; Modal; active palette must
+  still suppress global idle chords) — covered by <code>tui_loop</code> tests
+  including <code>idle_chords_yield_to_an_active_palette</code>.</li>
+  <li>Root container per-frame clone (see Unit 6 tradeoff).</li>
+  <li>Cursor: <code>TerminalSurface</code> untouched; no hardware cursor enabled
+  or moved.</li>
 </ul>
 </body>
 </html>

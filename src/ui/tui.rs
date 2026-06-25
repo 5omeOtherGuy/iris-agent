@@ -36,6 +36,8 @@ use ratatui::text::{Line, Span};
 use crate::nexus::ProviderUsage;
 use crate::ui::terminal_surface::TerminalSurface;
 
+mod component;
+mod overlay;
 mod pane;
 mod panel;
 mod rows;
@@ -44,6 +46,8 @@ mod text;
 mod transcript;
 mod wrap;
 
+pub(crate) use component::Component;
+pub(crate) use overlay::FocusTarget;
 #[cfg(test)]
 use panel::PanelState;
 #[cfg(test)]
@@ -107,6 +111,7 @@ const TEXT_X_PADDING: usize = X_PADDING;
 const TEXT_COLUMN_X_PADDING: usize = BOX_X_PADDING + TEXT_X_PADDING;
 const BOX_X_PADDING_U16: u16 = X_PADDING as u16;
 const TEXT_X_PADDING_U16: u16 = X_PADDING as u16;
+const TEXT_COLUMN_X_PADDING_U16: u16 = TEXT_COLUMN_X_PADDING as u16;
 
 /// Secondary guard: truncate any single output line to this many characters
 /// before wrapping, so one pathological line cannot dominate the row budget.

@@ -21,11 +21,16 @@ pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
     }
 }
 
-pub(super) fn render_streaming_assistant(width: usize, text: &str, out: &mut Vec<Line<'static>>) {
+/// Build the transient transcript rows for the in-flight streamed assistant
+/// text. The transcript composites these through the shared `Component` path
+/// after committed history, then commits them once on `AssistantTextEnd`.
+pub(super) fn streaming_assistant_rows(text: &str) -> Vec<TranscriptRow> {
     let text = streaming_markdown_preview(text);
-    for (index, line) in render_markdown(&text).into_iter().enumerate() {
-        assistant_row(line, index == 0).render(width, out);
-    }
+    render_markdown(&text)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| assistant_row(line, index == 0))
+        .collect()
 }
 
 pub(super) fn push_user_rows(rows: &mut Vec<TranscriptRow>, text: &str) {

@@ -9,6 +9,7 @@ use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{is_exploration_tool, run_target};
 use crate::ui::{TurnErrorKind, UiEvent};
 
+use super::component::{self, Component};
 use super::pane;
 use super::panel::{
     PanelHeaderSpec, PanelState, diff_table_rows, explore_body, explore_panel_meta, panel_state,
@@ -1425,10 +1426,10 @@ impl Transcript {
         self.last_width = width
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
             .max(1);
-        let mut rows = Vec::new();
-        // Track the enclosing panel's reveal state so fold-tagged body rows show
-        // in the matching state: collapsed shows the capped preview + expand
-        // hint, expanded shows the full output + collapse hint.
+        // Select the visible fold-tagged rows, then composite them through the
+        // `Component` contract. Borrowing `&dyn Component` avoids boxing the
+        // rows every frame while still routing every row through the shared path.
+        let mut visible: Vec<&dyn Component> = Vec::with_capacity(self.rows.len());
         let mut expanded = true;
         for row in &self.rows {
             match row.chrome.as_ref() {
@@ -1445,16 +1446,21 @@ impl Transcript {
                 FoldVis::WhenExpanded => !expanded,
             };
             if !skip {
-                row.render(width, &mut rows);
+                visible.push(row);
             }
             if matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)) {
                 expanded = true;
             }
         }
-        if let Some(text) = &self.streaming {
-            pane::render_streaming_assistant(width, text, &mut rows);
-        }
-        rows
+        // The in-flight stream renders as transient rows appended after history;
+        // hold them locally so they can join the same borrowed composite.
+        let streaming_rows = self
+            .streaming
+            .as_ref()
+            .map(|text| pane::streaming_assistant_rows(text))
+            .unwrap_or_default();
+        visible.extend(streaming_rows.iter().map(|row| row as &dyn Component));
+        component::composite(visible, width)
     }
 }
 
