@@ -2923,11 +2923,21 @@ fn render_document_with_chrome_tail(
     let height = size.height.max(1);
     let mut transcript = screen.wrapped_lines(width);
     let working = screen.working_lines(width);
+    let working_block = if working.is_empty() {
+        Vec::new()
+    } else {
+        let mut block = Vec::with_capacity(working.len() + 2);
+        block.push(Line::default());
+        block.extend(working);
+        block.push(Line::default());
+        block
+    };
     let chrome = render_editor_chrome(screen, width, height);
     let chrome_len = chrome.len();
-    let volatile_tail = chrome_len + working.len();
+    let volatile_tail = chrome_len + working_block.len();
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
-    let min_transcript_rows = usize::from(target_rows).saturating_sub(chrome.len() + working.len());
+    let min_transcript_rows =
+        usize::from(target_rows).saturating_sub(chrome.len() + working_block.len());
     if transcript.len() < min_transcript_rows {
         let mut padded = Vec::with_capacity(min_transcript_rows + chrome.len());
         padded.extend(
@@ -2936,7 +2946,7 @@ fn render_document_with_chrome_tail(
         padded.extend(transcript);
         transcript = padded;
     }
-    transcript.extend(working);
+    transcript.extend(working_block);
     transcript.extend(chrome);
     (transcript, volatile_tail)
 }
@@ -4334,6 +4344,57 @@ mod tests {
                 .is_some_and(|line| line.contains("MODEL") || line.contains("tokens")),
             "{texts:?}"
         );
+    }
+
+    #[test]
+    fn assistant_message_working_indicator_and_statusline_have_vertical_separation() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.4".to_string(),
+            None,
+            "~/projects/iris-agent".to_string(),
+        );
+        screen.apply(UiEvent::AssistantText(
+            "assistant message...\nwrapped assistant message".to_string(),
+        ));
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: Some("resp_1".to_string()),
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.4".to_string(),
+                input_tokens: 5_400,
+                output_tokens: 137,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 5_537,
+                cache_creation: None,
+            }),
+        });
+
+        let lines = rendered_lines(&mut screen, 100, 16);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let working_idx = texts
+            .iter()
+            .position(|line| line.contains("●···") && line.contains("┊ ESC ┊"))
+            .expect("working indicator");
+        let status_idx = texts
+            .iter()
+            .position(|line| line.contains("● MODE code"))
+            .expect("composer statusline");
+
+        assert!(
+            texts[..working_idx]
+                .iter()
+                .any(|line| line.contains("assistant message")),
+            "{texts:?}"
+        );
+        assert_eq!(texts[working_idx - 1].trim(), "", "{texts:?}");
+        assert_eq!(texts[working_idx + 1].trim(), "", "{texts:?}");
+        assert_eq!(status_idx, working_idx + 2, "{texts:?}");
+        assert!(texts[working_idx].contains("↑5.4k ↓137"), "{texts:?}");
     }
 
     #[test]
