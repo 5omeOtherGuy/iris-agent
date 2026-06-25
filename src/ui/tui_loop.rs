@@ -216,9 +216,9 @@ fn apply_notices(tui: &mut TuiUi, lines: Vec<String>) {
     }
 }
 
-/// Refresh the idle status footer (Codex's `model effort · cwd` bar) from the
-/// live model selection. A no-op when no model switch is wired (the footer then
-/// stays unset and the keybind hint shows instead).
+/// Refresh the idle status footer from the live model selection. A no-op when
+/// no model switch is wired (the footer then stays unset and the keybind hint
+/// shows instead).
 fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<'_, P>>) {
     let Some(sw) = switch.as_ref() else {
         return;
@@ -227,11 +227,8 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
     let effort = selection
         .reasoning
         .map(|effort| effort.as_str().to_string());
-    let model = match selection.reasoning {
-        Some(effort) => format!("{} {}", selection.model, effort.as_str()),
-        None => selection.model.clone(),
-    };
-    tui.screen.set_footer(model, effort, footer_cwd());
+    tui.screen
+        .set_footer(selection.model.clone(), effort, footer_cwd());
 }
 
 /// The working directory for the footer, home-relativized to `~`/`~/sub`.
