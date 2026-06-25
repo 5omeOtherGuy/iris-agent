@@ -494,6 +494,12 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 self.in_tool_block = false;
                 self.exploring_open = false;
             }
+            UiEvent::ToolCancelled(call) => {
+                self.finish_assistant_stream()?;
+                self.write_header("2", "•", &format!("Cancelled {}", run_target(&call)))?;
+                self.in_tool_block = false;
+                self.exploring_open = false;
+            }
             UiEvent::Notice(message) => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;
