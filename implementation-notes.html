@@ -2,18 +2,19 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Composer Editor & Statusline Implementation Notes</title>
+  <title>Working Indicator and Composer Implementation Notes</title>
 </head>
 <body>
-  <h1>Composer Editor &amp; Statusline Implementation Notes</h1>
+  <h1>Working Indicator and Composer Implementation Notes</h1>
   <section>
     <h2>Reviewer Context</h2>
     <ul>
-      <li>This work is scoped to the Iris TUI composer/statusline rendering. The notes below record only decisions, tradeoffs, constraints, and follow-up risks that affect review.</li>
+      <li>This file contains reviewer-facing decisions from the composer/statusline work already on <code>origin/main</code> plus the working-indicator changes in this branch.</li>
+      <li><strong>Worktree constraint:</strong> project preflight could not be completed because the primary checkout was behind <code>origin/main</code> and contained a pre-existing untracked <code>package-lock.json</code>. I did not modify that file.</li>
     </ul>
   </section>
   <section>
-    <h2>Decisions and Tradeoffs</h2>
+    <h2>Composer and Statusline Decisions</h2>
     <ul>
       <li>The existing TUI footer source has model, reasoning effort, and cwd, but no explicit mode. The implementation keeps the current hard-coded mode as <code>code</code>.</li>
       <li><code>CTX</code> is derived from <code>mimir::model_catalog::ctx_label</code>. Live TUI refresh builds a provider-qualified lookup key for the catalog, while the rendered <code>MODEL</code> value remains the existing bare model id to avoid making the statusline noisier.</li>
@@ -24,6 +25,14 @@
       <li>The bare/qualified model adapter on <code>Screen::set_footer</code> is test-only; production uses <code>set_footer_with_context</code> so release builds do not carry an unused compatibility shim.</li>
       <li>The statusline dot aligns with the editor input text by using the existing composer border indent plus the two-column editor text padding. A broader shared-gutter change was avoided because it reflows transcript and pasted-terminal rendering outside this feature's scope.</li>
       <li>The canonical editor vertical chrome count is named in code to keep the height calculation and text-area subtraction in sync.</li>
+    </ul>
+  </section>
+  <section>
+    <h2>Working Indicator Decisions</h2>
+    <ul>
+      <li><strong>Telemetry source:</strong> the TUI only receives provider token usage on <code>ProviderTurnCompleted</code>. The indicator therefore shows usage once the active turn has reported it, and clears stale prior usage when a new turn starts so the readout represents the current turn rather than the previous one.</li>
+      <li><strong>Field scope:</strong> the prior active-turn line included model reasoning effort text. The new indicator intentionally omits that extra field because the spec fixes the working indicator field order to activity, elapsed, interrupt, then token telemetry.</li>
+      <li><strong>Merge with composer statusline:</strong> after merging <code>origin/main</code>, the working indicator remains outside editor chrome and is appended to the transcript tail before composer/statusline chrome. This preserves the composer statusline PR's height model while matching the working indicator's transcript-flow placement.</li>
     </ul>
   </section>
 </body>
