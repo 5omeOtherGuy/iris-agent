@@ -128,6 +128,16 @@ fn tool_header_style() -> Style {
     Style::default().fg(TEXT)
 }
 
+fn status_dot_style(running: bool, failed: bool) -> Style {
+    if failed && !running {
+        err_style()
+    } else if running {
+        prompt_style()
+    } else {
+        ok_style()
+    }
+}
+
 /// Render instrument-panel runtime as a fixed clock field (`00:01:48s`).
 fn format_panel_duration(duration: std::time::Duration) -> String {
     let secs = duration.as_secs();
@@ -233,7 +243,7 @@ struct TranscriptRow {
     /// prefixes are never collapsed.
     word_wrap: bool,
     /// Full-width background fill applied to every physical row this logical row
-    /// wraps to. `None` for ordinary rows.
+    /// wraps to. `None` for ordinary rows; panel bodies use this for diff rows.
     background: Option<Color>,
     /// A horizontal-rule row (Codex's turn separator). When set, `text` is the
     /// optional centered label and the row renders as `─ label ─────` to width.
@@ -493,12 +503,13 @@ fn panel_header_line(
         Span::styled(format!(" {arrow}  "), dim_style()),
         Span::styled(format!("{title:<title_width$}"), panel_style()),
     ];
+    let meta = strip_ansi_for_text(meta);
     if !meta.is_empty() {
         left.push(Span::styled(format!("  {meta}"), dim_style()));
     }
     let right_full: Vec<Span<'static>> = right
         .iter()
-        .map(|(text, style)| Span::styled(text.clone(), *style))
+        .map(|(text, style)| Span::styled(strip_ansi_for_text(text), *style))
         .collect();
     let right = take_spans_to_width(right_full, inner_width / 2);
     let right_width = spans_width(&right);
@@ -796,6 +807,8 @@ struct ActiveExec {
 struct ActiveExploration {
     call_id: String,
     row: usize,
+    started: Instant,
+    duration: Option<Duration>,
     failed: bool,
     done: bool,
 }
@@ -950,7 +963,7 @@ impl Transcript {
         duration: Option<std::time::Duration>,
     ) {
         if is_exploration_tool(call) {
-            self.push_explored_result(call);
+            self.push_explored_result(call, duration);
             return;
         }
         let failed = exit_code.is_some_and(|code| code != 0);
@@ -973,12 +986,13 @@ impl Transcript {
 
     fn push_panel_body(&mut self, text: &str, style: Style) {
         for line in text.split('\n') {
+            let line = strip_ansi_for_text(line);
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
-                    line: Line::from(Span::styled(line.to_string(), style)),
+                    line: Line::from(Span::styled(line.clone(), style)),
                     bg: None,
                 },
-                line.to_string(),
+                line,
                 style,
             ));
         }
@@ -986,12 +1000,13 @@ impl Transcript {
 
     fn push_tool_panel_body(&mut self, text: &str, style: Style) {
         for line in text.split('\n') {
+            let line = strip_ansi_for_text(line);
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
-                    line: Line::from(Span::styled(line.to_string(), style)),
+                    line: Line::from(Span::styled(line.clone(), style)),
                     bg: None,
                 },
-                line.to_string(),
+                line,
                 style,
             ));
         }
@@ -1036,10 +1051,7 @@ impl Transcript {
                 title: "SHELL",
                 meta: "bash".to_string(),
                 right: vec![
-                    (
-                        "●".to_string(),
-                        if failed { err_style() } else { prompt_style() },
-                    ),
+                    ("●".to_string(), status_dot_style(running, failed)),
                     (state.to_string(), panel_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
@@ -1110,10 +1122,7 @@ impl Transcript {
                 title,
                 meta: meta.clone(),
                 right: vec![
-                    (
-                        "●".to_string(),
-                        if failed { err_style() } else { prompt_style() },
-                    ),
+                    ("●".to_string(), status_dot_style(running, failed)),
                     (state.to_string(), panel_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
@@ -1527,7 +1536,11 @@ impl Transcript {
         }
     }
 
-    fn explore_header_right(running: bool, failed: bool) -> Vec<(String, Style)> {
+    fn explore_header_right(
+        running: bool,
+        failed: bool,
+        duration: Option<Duration>,
+    ) -> Vec<(String, Style)> {
         let state = if running {
             " RUNNING     "
         } else if failed {
@@ -1535,17 +1548,13 @@ impl Transcript {
         } else {
             " DONE        "
         };
+        let elapsed = duration
+            .map(format_panel_duration)
+            .unwrap_or_else(|| "00:00:00s".to_string());
         vec![
-            (
-                "●".to_string(),
-                if failed && !running {
-                    err_style()
-                } else {
-                    prompt_style()
-                },
-            ),
+            ("●".to_string(), status_dot_style(running, failed)),
             (state.to_string(), panel_style()),
-            ("00:00:00s  ".to_string(), dim_style()),
+            (format!("{elapsed}  "), dim_style()),
         ]
     }
 
@@ -1561,7 +1570,35 @@ impl Transcript {
         })
     }
 
-    fn set_explore_header(&mut self, call: &ToolCall, running: bool, failed: bool) {
+    fn active_exploration_duration(&self, running: bool) -> Option<Duration> {
+        if running {
+            let started = self
+                .active_explorations
+                .iter()
+                .map(|active| active.started)
+                .min()?;
+            return Some(started.elapsed());
+        }
+        self.active_explorations
+            .iter()
+            .filter_map(|active| active.duration)
+            .max()
+            .or_else(|| {
+                self.active_explorations
+                    .iter()
+                    .map(|active| active.started)
+                    .min()
+                    .map(|started| started.elapsed())
+            })
+    }
+
+    fn set_explore_header(
+        &mut self,
+        call: &ToolCall,
+        running: bool,
+        failed: bool,
+        duration: Option<Duration>,
+    ) {
         let Some(header) = self.current_explore_header_row() else {
             return;
         };
@@ -1573,14 +1610,15 @@ impl Transcript {
             expanded: true,
             title: "EXPLORE",
             meta,
-            right: Self::explore_header_right(running, failed),
+            right: Self::explore_header_right(running, failed, duration),
         });
     }
 
     fn update_explore_header_from_active(&mut self, call: &ToolCall) {
         let running = self.active_explorations.iter().any(|active| !active.done);
         let failed = self.active_explorations.iter().any(|active| active.failed);
-        self.set_explore_header(call, running, failed && !running);
+        let duration = self.active_exploration_duration(running);
+        self.set_explore_header(call, running, failed && !running, duration);
         if !running {
             self.active_explorations.clear();
         }
@@ -1595,12 +1633,10 @@ impl Transcript {
         }
     }
 
-    fn push_explore_body(&mut self, call: &ToolCall, failed: bool) {
+    fn push_explore_body(&mut self, call: &ToolCall, failed: bool, duration: Option<Duration>) {
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
-            if failed {
-                self.set_explore_header(call, false, true);
-            }
+            self.set_explore_header(call, false, failed, duration);
         } else {
             self.push_blank();
             self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
@@ -1608,7 +1644,7 @@ impl Transcript {
                 expanded: true,
                 title: "EXPLORE",
                 meta: explore_panel_meta(call),
-                right: Self::explore_header_right(false, failed),
+                right: Self::explore_header_right(false, failed, duration),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
@@ -1628,19 +1664,19 @@ impl Transcript {
         self.exploring_open = true;
     }
 
-    fn push_explored_result(&mut self, call: &ToolCall) {
+    fn push_explored_result(&mut self, call: &ToolCall, duration: Option<Duration>) {
         self.finish_stream();
-        if self.finish_exploration(call, explore_body(call), dim_style(), false) {
+        if self.finish_exploration(call, explore_body(call), dim_style(), duration, false) {
             return;
         }
-        self.push_explore_body(call, false);
+        self.push_explore_body(call, false, duration);
     }
 
     fn push_explored_start(&mut self, call: &ToolCall) {
         self.finish_stream();
+        let started = Instant::now();
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
-            self.set_explore_header(call, true, false);
         } else {
             self.push_blank();
             self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
@@ -1648,7 +1684,7 @@ impl Transcript {
                 expanded: true,
                 title: "EXPLORE",
                 meta: explore_panel_meta(call),
-                right: Self::explore_header_right(true, false),
+                right: Self::explore_header_right(true, false, Some(Duration::ZERO)),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
@@ -1667,9 +1703,12 @@ impl Transcript {
         self.active_explorations.push(ActiveExploration {
             call_id: call.id.clone(),
             row,
+            started,
+            duration: None,
             failed: false,
             done: false,
         });
+        self.update_explore_header_from_active(call);
     }
 
     fn replace_explore_body_at(&mut self, row: usize, text: String, style: Style) -> bool {
@@ -1695,6 +1734,7 @@ impl Transcript {
         call: &ToolCall,
         text: String,
         style: Style,
+        duration: Option<Duration>,
         failed: bool,
     ) -> bool {
         let Some(pos) = self
@@ -1705,6 +1745,7 @@ impl Transcript {
             return false;
         };
         let row = self.active_explorations[pos].row;
+        self.active_explorations[pos].duration = duration;
         self.active_explorations[pos].failed = failed;
         self.active_explorations[pos].done = true;
         let replaced = self.replace_explore_body_at(row, text, style);
@@ -1715,7 +1756,7 @@ impl Transcript {
 
     fn push_explored_error(&mut self, call: &ToolCall, message: &str) -> bool {
         self.finish_stream();
-        self.finish_exploration(call, format!("error: {message}"), err_style(), true)
+        self.finish_exploration(call, format!("error: {message}"), err_style(), None, true)
     }
 
     /// Apply one semantic event to the transcript rows.
@@ -2013,38 +2054,67 @@ fn ansi_spans(text: &str, default_style: Style) -> Vec<Span<'static>> {
         // Flatten any parsed sub-lines (a stray \r can split one input line)
         // so no styled content is dropped.
         let mut spans = Vec::new();
-        for mut parsed in parsed_text.lines {
-            for span in &mut parsed.spans {
+        for parsed in parsed_text.lines {
+            for mut span in parsed.spans {
+                let content = strip_ansi_for_text(span.content.as_ref());
+                if content.is_empty() {
+                    continue;
+                }
+                span.content = content.into();
                 if matches!(span.style.fg, None | Some(Color::Reset))
                     && let Some(fg) = default_style.fg
                 {
                     span.style = span.style.fg(fg);
                 }
+                spans.push(span);
             }
-            spans.append(&mut parsed.spans);
         }
         if !spans.is_empty() {
             return spans;
         }
     }
-    vec![Span::styled(text.to_string(), default_style)]
+    vec![Span::styled(strip_ansi_for_text(text), default_style)]
 }
 
 fn strip_ansi_for_text(input: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
+        match ch {
+            '\x1b' => match chars.next() {
+                Some('[') => consume_csi(&mut chars),
+                Some(']' | 'P' | '^' | '_' | 'X') => consume_string_control(&mut chars),
+                Some(_) | None => {}
+            },
+            '\u{009b}' => consume_csi(&mut chars),
+            '\u{009d}' | '\u{0090}' | '\u{009e}' | '\u{009f}' | '\u{0098}' => {
+                consume_string_control(&mut chars);
             }
-        } else {
-            out.push(ch);
+            _ if ch.is_control() => {}
+            _ => out.push(ch),
         }
     }
     out
+}
+
+fn consume_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for ch in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&ch) {
+            break;
+        }
+    }
+}
+
+fn consume_string_control(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = chars.next() {
+        if ch == '\u{7}' {
+            break;
+        }
+        if ch == '\x1b' && matches!(chars.peek(), Some('\\')) {
+            chars.next();
+            break;
+        }
+    }
 }
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -2678,20 +2748,22 @@ fn global_status_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
         Span::styled("code", dim_style()),
         rail_sep(),
         Span::styled("MODEL ", panel_style()),
-        Span::styled(footer.model.clone(), dim_style()),
+        Span::styled(strip_ansi_for_text(&footer.model), dim_style()),
     ];
-    if let Some(effort) = &footer.effort {
+    if !screen.spinner.active
+        && let Some(effort) = &footer.effort
+    {
         spans.push(rail_sep());
         spans.push(Span::styled("EFFORT ", panel_style()));
-        spans.push(Span::styled(effort.clone(), dim_style()));
+        spans.push(Span::styled(strip_ansi_for_text(effort), dim_style()));
     }
     spans.push(rail_sep());
     spans.push(Span::styled("CWD ", panel_style()));
-    spans.push(Span::styled(cwd, dim_style()));
+    spans.push(Span::styled(strip_ansi_for_text(&cwd), dim_style()));
     if let Some(branch) = branch {
         spans.push(rail_sep());
         spans.push(Span::styled("BRANCH ", panel_style()));
-        spans.push(Span::styled(branch, dim_style()));
+        spans.push(Span::styled(strip_ansi_for_text(&branch), dim_style()));
     }
     let mut line = Line::from(std::mem::take(&mut spans));
     truncate_line(&mut line, usize::from(width).max(1));
@@ -3335,6 +3407,73 @@ mod tests {
     }
 
     #[test]
+    fn panel_headers_and_plain_body_rows_strip_terminal_controls() {
+        let mut screen = Screen::new();
+        let command = "echo \u{1b}]0;owned\u{7}safe\u{1b}[31m red\u{1b}[0m\rboom";
+        let file = "src/\u{1b}]0;owned\u{7}safe.rs";
+
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": command })),
+            content: "ok".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("edit", json!({ "file_path": file })),
+            content: "patched".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        let rendered = screen
+            .wrapped_lines(120)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{7}'), "{rendered:?}");
+        assert!(!rendered.contains('\r'), "{rendered:?}");
+        assert!(!rendered.contains("owned"), "{rendered:?}");
+        assert!(rendered.contains("echo safe redboom"), "{rendered:?}");
+        assert!(rendered.contains("src/safe.rs"), "{rendered:?}");
+    }
+
+    #[test]
+    fn ansi_tool_output_metadata_is_per_visible_line() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "printf lines" })),
+            content: "\u{1b}[31mfirst\u{1b}[0m\n\u{1b}[32msecond\u{1b}[0m".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        let body_texts: Vec<&str> = screen
+            .transcript
+            .rows
+            .iter()
+            .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Body { .. })))
+            .map(|row| row.text.as_str())
+            .collect();
+
+        assert!(
+            body_texts.iter().any(|text| text.contains("first")),
+            "{body_texts:?}"
+        );
+        assert!(
+            body_texts.iter().any(|text| text.contains("second")),
+            "{body_texts:?}"
+        );
+        assert!(
+            body_texts
+                .iter()
+                .all(|text| !(text.contains("first") && text.contains("second"))),
+            "each output row should carry only its own visible text: {body_texts:?}"
+        );
+    }
+
+    #[test]
     fn single_over_budget_line_stays_within_row_cap() {
         // A single very long line must not blow past the physical-row cap: it is
         // clamped (with an ellipsis) to its slice budget instead of wrapping to
@@ -3893,6 +4032,30 @@ mod tests {
     }
 
     #[test]
+    fn active_turn_effort_is_only_in_working_indicator() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            "~/repo".to_string(),
+        );
+        screen.start_turn();
+
+        let rail = global_status_line(&screen, 100)
+            .map(|line| line_text(&line))
+            .unwrap_or_default();
+        let working = screen
+            .working_lines(100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rail.contains("EFFORT"), "{rail}");
+        assert!(working.contains("thinking with high effort"), "{working}");
+    }
+
+    #[test]
     fn non_bash_tools_show_live_running_panel_and_finalize_in_place() {
         let mut screen = Screen::new();
         let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
@@ -3916,6 +4079,26 @@ mod tests {
             "{done}"
         );
         assert!(!done.contains("running…"), "{done}");
+    }
+
+    #[test]
+    fn completed_panel_headers_use_success_dot_not_running_accent() {
+        let mut transcript = Transcript::default();
+        transcript.push_shell_header(false, false, Some(Duration::from_secs(1)), None, "echo hi");
+        let dot_style = transcript
+            .rows
+            .iter()
+            .find_map(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::Header {
+                    title: "SHELL",
+                    right,
+                    ..
+                }) => Some(right[0].1),
+                _ => None,
+            })
+            .expect("shell header dot style");
+
+        assert_eq!(dot_style.fg, ok_style().fg);
     }
 
     #[test]
@@ -4091,6 +4274,22 @@ mod tests {
             body_texts.iter().any(|text| text.contains("Search needle")),
             "{body_texts:?}"
         );
+    }
+
+    #[test]
+    fn explore_header_uses_reported_result_duration() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("read", json!({ "path": "src/a.rs" })),
+            content: "ignored".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_secs(4)),
+        });
+
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(rendered.contains("EXPLORE"), "{rendered}");
+        assert!(rendered.contains("00:00:04s"), "{rendered}");
+        assert!(!rendered.contains("00:00:00s"), "{rendered}");
     }
 
     #[test]
@@ -4857,7 +5056,7 @@ mod tests {
 
         assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(!rendered.contains("00:00:00s"), "{rendered}");
-        assert!(rendered.contains("00:00:0"), "{rendered}");
+        assert!(rendered.contains("00:00:02s"), "{rendered}");
     }
 
     #[test]
