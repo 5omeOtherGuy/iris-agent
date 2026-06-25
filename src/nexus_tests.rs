@@ -622,27 +622,81 @@ fn tool_error_is_displayed_and_loop_continues() -> Result<()> {
     Ok(())
 }
 
+fn repeated_read_call() -> Result<AssistantTurn, &'static str> {
+    Ok(AssistantTurn {
+        text: None,
+        reasoning: Vec::new(),
+        tool_calls: vec![ToolCall {
+            id: "call_1".to_string(),
+            thought_signature: None,
+            name: "read".to_string(),
+            arguments: json!({ "path": "note.txt" }),
+        }],
+
+        response_id: None,
+        usage: None,
+        completion_reason: None,
+    })
+}
+
 #[test]
-fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
+fn tool_loop_stops_gracefully_at_configured_soft_cap() -> Result<()> {
+    // With a configured soft cap, the loop ends the turn gracefully after that
+    // many round-trips: a user-visible notice, no provider error, and the REPL
+    // keeps running. There is no built-in default cap (see
+    // `tool_loop_is_unbounded_by_default`).
+    const CAP: usize = 5;
     let workspace = test_workspace()?;
     fs::write(workspace.path.join("note.txt"), "hello from file")?;
-    let repeated_call = || {
-        Ok(AssistantTurn {
-            text: None,
-            reasoning: Vec::new(),
-            tool_calls: vec![ToolCall {
-                id: "call_1".to_string(),
-                thought_signature: None,
-                name: "read".to_string(),
-                arguments: json!({ "path": "note.txt" }),
-            }],
+    // Script more tool calls than the cap to prove the loop stops at the cap,
+    // not because the provider ran out of scripted turns.
+    let provider = FakeProvider::new((0..CAP + 3).map(|_| repeated_read_call()).collect());
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()).with_max_tool_roundtrips(Some(CAP)),
+        workspace.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
 
-            response_id: None,
-            usage: None,
-            completion_reason: None,
-        })
-    };
-    let provider = FakeProvider::new((0..MAX_TOOL_ROUNDTRIPS).map(|_| repeated_call()).collect());
+    run_text_session(
+        &mut harness,
+        "read forever\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    let rendered = String::from_utf8(output)?;
+    assert!(rendered.contains("stopped after"));
+    assert!(errors.is_empty());
+    // The provider is consulted exactly the capped number of times, then the
+    // loop stops without one extra round-trip.
+    assert_eq!(harness.agent.provider.seen.borrow().len(), CAP);
+    Ok(())
+}
+
+#[test]
+fn tool_loop_is_unbounded_by_default() -> Result<()> {
+    // No configured cap: the loop runs while the model emits tool calls and
+    // ends only when the model stops, with no built-in fixed turn cap. Script
+    // well past the old hardcoded 50-roundtrip ceiling to prove it is gone.
+    const ROUNDS: usize = 60;
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "hello from file")?;
+    let mut turns: Vec<Result<AssistantTurn, &'static str>> =
+        (0..ROUNDS).map(|_| repeated_read_call()).collect();
+    // A final turn with no tool calls ends the turn naturally.
+    turns.push(Ok(AssistantTurn {
+        text: Some("done reading".to_string()),
+        reasoning: Vec::new(),
+        tool_calls: Vec::new(),
+        response_id: None,
+        usage: None,
+        completion_reason: None,
+    }));
+    let provider = FakeProvider::new(turns);
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
     let mut output = Vec::new();
     let mut errors = Vec::new();
@@ -654,17 +708,13 @@ fn tool_loop_stops_gracefully_at_roundtrip_limit() -> Result<()> {
         &mut errors,
     )?;
 
-    // Hitting the guard ends the turn gracefully: a user-visible notice,
-    // no provider error, and the REPL keeps running (it consumes /exit).
     let rendered = String::from_utf8(output)?;
-    assert!(rendered.contains("stopped after"));
+    // The model's natural completion is reached; no soft-cap notice fires.
+    assert!(rendered.contains("done reading"), "out: {rendered}");
+    assert!(!rendered.contains("stopped after"), "out: {rendered}");
     assert!(errors.is_empty());
-    // The provider is consulted exactly the capped number of times, then
-    // the loop stops without one extra round-trip.
-    assert_eq!(
-        harness.agent.provider.seen.borrow().len(),
-        MAX_TOOL_ROUNDTRIPS
-    );
+    // Every scripted turn (ROUNDS tool calls + the final text turn) is consumed.
+    assert_eq!(harness.agent.provider.seen.borrow().len(), ROUNDS + 1);
     Ok(())
 }
 
@@ -3064,11 +3114,15 @@ fn auto_compaction_does_not_split_reasoning_from_retained_tool_calls() -> Result
 }
 
 #[test]
-fn safe_tool_parallelism_is_bounded() -> Result<()> {
+fn safe_tool_parallelism_is_uncapped() -> Result<()> {
+    // There is no fixed parallelism cap: every parallelizable call in the batch
+    // runs concurrently (pi-mono parity). Use a batch well past the old
+    // hardcoded cap of 8 and prove the whole batch overlaps.
+    const BATCH: usize = 12;
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let workspace = test_workspace()?;
-    let tool_calls = (0..MAX_PARALLEL_TOOL_CALLS + 2)
+    let tool_calls = (0..BATCH)
         .map(|idx| {
             call(
                 &format!("c{idx}"),
@@ -3104,11 +3158,8 @@ fn safe_tool_parallelism_is_bounded() -> Result<()> {
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
 
     let peak = peak.load(AtomicOrdering::SeqCst);
-    assert!(peak > 1, "safe calls should still overlap");
-    assert!(
-        peak <= MAX_PARALLEL_TOOL_CALLS,
-        "parallel batch exceeded cap: {peak}"
-    );
+    assert!(peak > 8, "batch should exceed the old cap of 8: {peak}");
+    assert_eq!(peak, BATCH, "the whole parallelizable batch should overlap");
     Ok(())
 }
 

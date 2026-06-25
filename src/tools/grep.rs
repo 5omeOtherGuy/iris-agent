@@ -29,13 +29,11 @@ use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_head};
 
 /// Per-line content cap so a single minified line cannot blow the budget.
 const GREP_MAX_LINE_LENGTH: usize = 500;
-/// Default and safety caps tuned for agent use.
+/// Default match limit tuned for agent use. There are no arbitrary maximum
+/// clamps on limit/context/headLimit/offset (matching pi-mono); the caller may
+/// request larger values, bounded only by what the search actually produces.
 const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_CONTEXT: usize = 2;
-const MAX_CONTEXT: usize = 20;
-const MAX_GREP_LIMIT: usize = 1_000;
-const MAX_HEAD_LIMIT: usize = 500;
-const MAX_OFFSET: usize = 10_000;
 
 pub(super) const DESCRIPTION: &str = "Search file contents for a pattern. Native ripgrep-style exact search: list matching files, show matching content with context, or count matches. Respects .gitignore. Workspace confinement is opt-in via IRIS_SECURITY_OPT_IN=1. Output is bounded by limit/headLimit and long lines are truncated to 500 chars.";
 
@@ -49,9 +47,9 @@ pub(super) fn parameters() -> Value {
             "ignoreCase": { "type": "boolean", "description": "Case-insensitive search (default: false)" },
             "literal": { "type": "boolean", "description": "Treat pattern as literal string instead of regex (default: false)" },
             "context": { "type": "integer", "description": "Lines of context before and after each match (default: 2)" },
-            "limit": { "type": "integer", "description": "Maximum number of matches or matching files to scan (default: 100, capped at 1000)" },
+            "limit": { "type": "integer", "description": "Maximum number of matches or matching files to scan (default: 100)" },
             "outputMode": { "type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Result shape: matching content, files containing matches, or per-file match counts (default: content)" },
-            "headLimit": { "type": "integer", "description": "Maximum number of output rows to show from the selected mode (capped at 500)" },
+            "headLimit": { "type": "integer", "description": "Maximum number of output rows to show from the selected mode (default: all)" },
             "offset": { "type": "integer", "description": "Output row offset for pagination (default: 0)" }
         },
         "required": ["pattern"]
@@ -168,8 +166,8 @@ struct FileHits {
 fn grep(root: &Path, input: &GrepInput) -> Result<(String, GrepMeta)> {
     let search = input.path.as_deref().unwrap_or(".");
     let search_path = resolve_existing(root, search)?;
-    let limit = positive_cap("limit", input.limit, DEFAULT_GREP_LIMIT, MAX_GREP_LIMIT)?;
-    let context = input.context.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
+    let limit = positive_cap("limit", input.limit, DEFAULT_GREP_LIMIT)?;
+    let context = input.context.unwrap_or(DEFAULT_CONTEXT);
     let page = Page::from(input)?;
 
     let matcher = RegexMatcherBuilder::new()
@@ -442,11 +440,11 @@ fn grep_count(
     ))
 }
 
-fn positive_cap(name: &str, value: Option<usize>, default: usize, max: usize) -> Result<usize> {
+fn positive_cap(name: &str, value: Option<usize>, default: usize) -> Result<usize> {
     if matches!(value, Some(0)) {
         bail!("`{name}` must be greater than 0");
     }
-    Ok(value.unwrap_or(default).min(max))
+    Ok(value.unwrap_or(default))
 }
 
 fn build_overrides(search_path: &Path, glob: Option<&str>) -> Result<Option<Override>> {
@@ -511,17 +509,12 @@ impl Page {
             bail!("`headLimit` must be greater than 0");
         }
         let offset = input.offset.unwrap_or(0);
-        if offset > MAX_OFFSET {
-            bail!("`offset` must be at most {MAX_OFFSET}");
-        }
+        // No arbitrary offset cap and no default headLimit clamp (matching
+        // pi-mono): an unset headLimit shows every output row from the selected
+        // mode, bounded only by `limit`.
         Ok(Self {
             offset,
-            head_limit: Some(
-                input
-                    .head_limit
-                    .unwrap_or(MAX_HEAD_LIMIT)
-                    .min(MAX_HEAD_LIMIT),
-            ),
+            head_limit: input.head_limit,
             explicit_head_limit: input.head_limit.is_some(),
         })
     }
@@ -1081,7 +1074,10 @@ mod tests {
     }
 
     #[test]
-    fn context_is_capped() {
+    fn context_is_not_clamped() {
+        // A large `context` is no longer clamped (pi-mono parity): every line of
+        // the 100-line file renders around the single match instead of being
+        // capped to a fixed window.
         let dir = temp_dir();
         let root = root_of(&dir);
         let body = (0..100)
@@ -1095,12 +1091,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(dir.path.join("g.txt"), body).unwrap();
-        let mut capped = input("needle");
-        capped.context = Some(10_000);
+        let mut wide = input("needle");
+        wide.context = Some(10_000);
 
-        let out = run(&root, capped);
+        let out = run(&root, wide);
         let rendered_lines = out.lines().filter(|line| line.contains('│')).count();
-        assert_eq!(rendered_lines, MAX_CONTEXT * 2 + 1, "out: {out}");
+        assert_eq!(rendered_lines, 100, "out: {out}");
     }
 
     #[test]
@@ -1183,7 +1179,33 @@ mod tests {
     }
 
     #[test]
-    fn default_output_is_bounded_and_pageable() {
+    fn explicit_head_limit_is_bounded_and_pageable() {
+        // An explicit headLimit still pages output; there is just no implicit
+        // default cap anymore (pi-mono parity).
+        let h = GrepHarness::new();
+        let body = (0..650)
+            .map(|i| format!("needle {i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.write("huge.txt", body);
+
+        let mut broad = input("needle");
+        broad.context = Some(0);
+        broad.limit = Some(650);
+        broad.head_limit = Some(500);
+        let out = h.native(broad);
+
+        assert!(out.lines().count() <= 510, "out was too large: {out}");
+        assert!(out.contains("showing 1-500"), "out: {out}");
+        assert!(out.contains("use offset=500 for next page"), "out: {out}");
+        assert!(out.contains("needle 499"), "out: {out}");
+        assert!(!out.contains("needle 500"), "out: {out}");
+    }
+
+    #[test]
+    fn unset_head_limit_is_not_clamped() {
+        // Without an explicit headLimit, every match within `limit` is shown:
+        // the old 500-row default cap is gone.
         let h = GrepHarness::new();
         let body = (0..650)
             .map(|i| format!("needle {i:03}"))
@@ -1196,11 +1218,8 @@ mod tests {
         broad.limit = Some(650);
         let out = h.native(broad);
 
-        assert!(out.lines().count() <= 510, "out was too large: {out}");
-        assert!(out.contains("showing 1-500"), "out: {out}");
-        assert!(out.contains("use offset=500 for next page"), "out: {out}");
-        assert!(out.contains("needle 499"), "out: {out}");
-        assert!(!out.contains("needle 500"), "out: {out}");
+        assert!(out.contains("needle 600"), "out: {out}");
+        assert!(out.contains("needle 649"), "out: {out}");
     }
 
     #[test]

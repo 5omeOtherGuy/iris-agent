@@ -26,7 +26,7 @@ use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_head};
 
 const DEFAULT_FIND_LIMIT: usize = 1000;
 
-pub(super) const DESCRIPTION: &str = "Search for files by glob pattern. Returns matching file paths relative to the search directory. Sorted by modification time (newest first). Respects .gitignore. Output is truncated to 1000 results or 1MB (whichever is hit first).";
+pub(super) const DESCRIPTION: &str = "Search for files by glob pattern. Returns matching file paths relative to the search directory. Sorted by modification time (newest first). Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).";
 
 pub(super) fn parameters() -> Value {
     json!({
