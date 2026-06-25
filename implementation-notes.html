@@ -156,6 +156,42 @@ the C1 OSC introducer, so C1-encoded styles/links carry across wrapped rows.</li
 <code>truncate_ansi</code>, and a CJK frame-helper test in <code>ui/text.rs</code>.</li>
 </ul>
 
+<h2>Review-round fixes (wave 2)</h2>
+<ul>
+<li><b>C1 ST terminator (U+009C):</b> <code>consume_string_control</code> (production strip path) and
+<code>string_control_len</code>/<code>parse_osc8</code> (engine) now treat the 8-bit C1 String
+Terminator as a valid terminator, not just BEL / 7-bit ST. Previously a C1-ST-terminated OSC/DCS would
+swallow the following visible text. Test added in <code>strip_ansi_handles_osc_with_st_and_bel</code>.</li>
+<li><b>visible_width non-allocating fast path:</b> when the input has no ESC and no 0xC2 lead byte (so no
+escape/C1 sequence is possible) it now sums widths directly instead of allocating a stripped copy.
+Control chars contribute 0 to <code>UnicodeWidthStr</code> either way, so this is identical output with
+no allocation on the common plain-text path.</li>
+<li><b>slice_by_column overflow guard:</b> <code>start + len</code> is now <code>saturating_add</code>.</li>
+<li><b>SGR 21:</b> kept as bold-off to match the pi-mono reference tracker, though ECMA-48 defines 21 as
+double-underline; this is the deferred subsystem and matches prior art. Colon (T.416) SGR sub-parameter
+separators are likewise not parsed (semicolon only) &mdash; noted, out of scope.</li>
+</ul>
+
+<h2>Deliberately NOT migrated (reviewer findings judged out of scope / not bugs)</h2>
+<p><code>tool_display.rs::fold</code> (<code>MAX_DISPLAY_CHARS</code>) and <code>truncate_inline</code> use
+<code>chars().count()</code>/<code>take()</code>: these are char-count <em>content budgets</em> (how much
+text to show), not display-column layout, so char/grapheme count is the correct semantic &mdash; the same
+reasoning as <code>wayland::truncate_chars</code>. Converting them to display-width would wrongly halve a
+CJK-heavy preview. <code>markdown.rs</code>'s continuation-prefix padding uses <code>chars().count()</code>
+on markers that are ASCII in practice. <code>screen.rs::take_last_display</code> already measures via the
+engine's <code>display_width</code> (it is a reverse-truncate algorithm, not a duplicate width impl).
+<code>wrap.rs::styled_physical_row</code> keeps per-char cells (documented above). None of these are
+production width/ANSI duplicates; leaving them is the smallest-correct scope.</p>
+
+<h2>Performance notes (no production regression)</h2>
+<p>Reviewers flagged allocations in the <code>ansi_aware</code> subsystem (<code>tokenize</code> returning a
+<code>Vec</code>, <code>split(';').collect()</code> in <code>AnsiState::process</code>, per-row
+<code>active_codes</code>/<code>format!</code>, the double tokenize in <code>wrap_ansi</code>). All are in
+the deferred, not-yet-wired subsystem and fine for real SGR input; left for when that path is wired to a
+real feature. The production transcript paths (<code>display_width</code> raw, <code>wrap_to_width</code>
+fast-path, <code>push_wrapped_line</code> per-cluster append) match the prior cost profile &mdash; no
+regression.</p>
+
 <h2>Known minor divergence: TAB width</h2>
 <p>The old <code>ui/text.rs::visible_width</code> counted a literal TAB as 1 (char count); the engine's
 <code>visible_width</code> reports 0 for control chars (TAB included), matching <code>UnicodeWidthStr</code>.

@@ -54,6 +54,13 @@ pub(crate) fn cluster_advance(cluster: &str) -> usize {
 /// correct measure for strings that may contain escapes; it replaces the buggy
 /// `ui/text.rs::visible_width` which used `chars().count()`.
 pub(crate) fn visible_width(text: &str) -> usize {
+    // Fast path: with no ESC (0x1b) and no possible C1 lead byte (0xc2 prefixes
+    // U+0080..U+00BF, which covers every C1 introducer), there are no escape
+    // sequences to strip. Control chars contribute 0 to UnicodeWidthStr either
+    // way, so this is identical to stripping first -- without the allocation.
+    if text.bytes().all(|b| b != 0x1b && b != 0xc2) {
+        return display_width(text);
+    }
     display_width(&clean_text(text))
 }
 
@@ -124,7 +131,8 @@ fn consume_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 
 fn consume_string_control(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     while let Some(ch) = chars.next() {
-        if ch == '\u{7}' {
+        // Terminators: BEL, 8-bit C1 ST (U+009C), or 7-bit ST (ESC \).
+        if ch == '\u{7}' || ch == '\u{009c}' {
             break;
         }
         if ch == '\x1b' && matches!(chars.peek(), Some('\\')) {
@@ -288,7 +296,7 @@ pub(crate) mod ansi_aware {
         // Skip introducer.
         chars.next();
         while let Some((i, ch)) = chars.next() {
-            if ch == '\u{7}' {
+            if ch == '\u{7}' || ch == '\u{009c}' {
                 return Some(i + ch.len_utf8());
             }
             if ch == '\x1b'
@@ -340,6 +348,9 @@ pub(crate) mod ansi_aware {
         let (term, body) = if let Some(b) = code.strip_suffix('\x07') {
             (Osc8Term::Bel, &b[intro_len..])
         } else if let Some(b) = code.strip_suffix("\x1b\\") {
+            (Osc8Term::St, &b[intro_len..])
+        } else if let Some(b) = code.strip_suffix('\u{009c}') {
+            // 8-bit C1 ST: reopen with the portable 7-bit ST form.
             (Osc8Term::St, &b[intro_len..])
         } else {
             return None;
@@ -718,7 +729,7 @@ pub(crate) mod ansi_aware {
         if len == 0 {
             return String::new();
         }
-        let end = start + len;
+        let end = start.saturating_add(len);
         let mut out = String::new();
         let mut pending = String::new();
         // Track active style across the slice so it is closed at the end and
@@ -829,6 +840,9 @@ mod tests {
     fn strip_ansi_handles_osc_with_st_and_bel() {
         assert_eq!(strip_ansi("\x1b]8;;https://a\x07txt\x1b]8;;\x07"), "txt");
         assert_eq!(strip_ansi("\x1b]0;title\x1b\\body"), "body");
+        // 8-bit C1 ST (U+009C) also terminates a string control instead of
+        // swallowing the following visible text.
+        assert_eq!(strip_ansi("\x1b]0;title\u{009c}body"), "body");
     }
 
     #[test]
