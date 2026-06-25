@@ -401,19 +401,42 @@ fn truncate_line(line: &mut Line<'static>, max: usize) {
     line.spans = spans;
 }
 
-/// Build a dim full-width horizontal rule, optionally wrapping a centered label
-/// (`─ Worked for 2m 12s ───────`). Codex's `FinalMessageSeparator`.
+/// Build a dim full-width horizontal rule, optionally wrapping a quiet turn
+/// summary label (`── 7.6s ┊ ↑18.2k ↓846 ───────`).
 fn hrule_line(label: &str, width: usize) -> Line<'static> {
     let width = width.max(1);
     if label.is_empty() {
         return Line::from(Span::styled("\u{2500}".repeat(width), dim_style()));
     }
-    let text = truncate_to_width(&format!("\u{2500} {label} \u{2500}"), width);
+    let text = truncate_to_width(&format!("\u{2500}\u{2500} {label} \u{2500}"), width);
     let fill = width.saturating_sub(display_width(&text));
     Line::from(Span::styled(
         format!("{text}{}", "\u{2500}".repeat(fill)),
         dim_style(),
     ))
+}
+
+fn turn_divider_label(elapsed: Option<Duration>, usage: Option<&ProviderUsage>) -> String {
+    let Some(elapsed) = elapsed else {
+        return String::new();
+    };
+    let elapsed = format_elapsed_compact(elapsed);
+    match usage {
+        Some(usage) => format!(
+            "{elapsed} ┊ ↑{} ↓{}",
+            compact_count(usage.input_tokens),
+            compact_count(usage.output_tokens)
+        ),
+        None => elapsed,
+    }
+}
+
+fn turn_divider_line(
+    elapsed: Option<Duration>,
+    usage: Option<&ProviderUsage>,
+    width: usize,
+) -> Line<'static> {
+    hrule_line(&turn_divider_label(elapsed, usage), width)
 }
 
 fn border_style() -> Style {
@@ -945,6 +968,25 @@ impl Transcript {
 
     fn push_assistant_text(&mut self, text: &str) {
         pane::push_assistant_rows(&mut self.rows, text);
+    }
+
+    fn push_turn_divider(&mut self, divider: TurnDivider) {
+        if !divider.had_work {
+            return;
+        }
+        self.finish_stream();
+        self.push_blank();
+        self.rows.push(TranscriptRow {
+            text: turn_divider_label(divider.elapsed, divider.usage.as_ref()),
+            style: dim_style(),
+            continuation_prefix: None,
+            line: None,
+            word_wrap: false,
+            background: None,
+            hrule: true,
+            chrome: None,
+        });
+        self.push_blank();
     }
 
     /// Commit any in-flight streamed assistant text into the transcript.
@@ -2327,6 +2369,40 @@ struct ApprovalHint {
     options: &'static str,
 }
 
+#[derive(Clone, Default)]
+struct TurnDivider {
+    had_work: bool,
+    elapsed: Option<Duration>,
+    usage: Option<ProviderUsage>,
+}
+
+impl TurnDivider {
+    fn observe(&mut self, event: &UiEvent) {
+        if matches!(
+            event,
+            UiEvent::ToolStarted(_)
+                | UiEvent::ToolAutoApproved(_)
+                | UiEvent::DiffPreview { .. }
+                | UiEvent::ToolDenied(_)
+                | UiEvent::ToolResult { .. }
+                | UiEvent::ToolOutputDelta { .. }
+                | UiEvent::ToolError { .. }
+                | UiEvent::ToolCancelled(_)
+                | UiEvent::ProviderTurnError { .. }
+                | UiEvent::Notice(_)
+                | UiEvent::TurnError { .. }
+        ) {
+            self.had_work = true;
+        }
+        if let UiEvent::ProviderTurnCompleted {
+            usage: Some(usage), ..
+        } = event
+        {
+            self.usage = Some(usage.clone());
+        }
+    }
+}
+
 impl Spinner {
     fn start(&mut self) {
         self.active = true;
@@ -2503,6 +2579,7 @@ pub(crate) struct Screen {
     /// Slash-command palette selection state, synced after every edit.
     pub(crate) palette: Palette,
     spinner: Spinner,
+    turn_divider: TurnDivider,
     /// Short status-row hint while a gated tool awaits the user's decision.
     approval_hint: Option<ApprovalHint>,
     /// Sourced global status chrome (model / effort / cwd). The loop refreshes
@@ -2521,6 +2598,7 @@ impl Screen {
             editor: fresh_editor(),
             palette: Palette::default(),
             spinner: Spinner::default(),
+            turn_divider: TurnDivider::default(),
             approval_hint: None,
             footer: None,
             modal: None,
@@ -2548,6 +2626,9 @@ impl Screen {
 
     /// Apply one semantic event to the transcript.
     pub(crate) fn apply(&mut self, event: UiEvent) {
+        if self.spinner.active {
+            self.turn_divider.observe(&event);
+        }
         if let UiEvent::ProviderTurnCompleted {
             usage: Some(usage), ..
         } = &event
@@ -2653,6 +2734,7 @@ impl Screen {
 
     pub(crate) fn start_turn(&mut self) {
         self.spinner.start();
+        self.turn_divider = TurnDivider::default();
         self.approval_hint = None;
         if let Some(footer) = &mut self.footer {
             footer.usage = None;
@@ -2660,6 +2742,8 @@ impl Screen {
     }
 
     pub(crate) fn end_turn(&mut self) {
+        self.turn_divider.elapsed = self.spinner.elapsed();
+        self.transcript.push_turn_divider(self.turn_divider.clone());
         self.spinner.stop();
         self.approval_hint = None;
     }
@@ -5490,8 +5574,6 @@ mod tests {
 
     #[test]
     fn conversational_turn_emits_no_turn_rule() {
-        // Codex parity: a turn that ran no tool (text-only answer) shows no
-        // empty divider.
         let mut screen = Screen::new();
         screen.start_turn();
         screen.apply(UiEvent::AssistantText("done".to_string()));
@@ -5504,20 +5586,96 @@ mod tests {
     }
 
     #[test]
+    fn tool_backed_turn_appends_quiet_divider_with_elapsed_and_telemetry() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "opus-4.8".to_string(),
+            Some("high".to_string()),
+            "~/repo (branch)".to_string(),
+        );
+        screen.start_turn();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(12)),
+        });
+        screen.apply(UiEvent::AssistantText("done".to_string()));
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "anthropic".to_string(),
+                model: "opus-4.8".to_string(),
+                input_tokens: 18_200,
+                output_tokens: 846,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 19_046,
+                cache_creation: None,
+            }),
+        });
+        screen.end_turn();
+
+        let lines: Vec<String> = screen.wrapped_lines(90).iter().map(line_text).collect();
+        let divider = lines
+            .iter()
+            .find(|line| line.contains("↑18.2k ↓846"))
+            .expect("turn divider with telemetry");
+        assert!(divider.trim_start().starts_with("── "), "{divider}");
+        assert!(divider.contains(" ┊ ↑18.2k ↓846 "), "{divider}");
+        assert!(!divider.contains("Worked for"), "{divider}");
+        assert!(!divider.contains("T+"), "{divider}");
+        assert_eq!(display_width(divider), 90);
+        let idx = lines.iter().position(|line| line == divider).unwrap();
+        assert_eq!(lines[idx - 1].trim(), "", "{lines:?}");
+        assert_eq!(lines[idx + 1].trim(), "", "{lines:?}");
+    }
+
+    #[test]
+    fn provider_turn_error_counts_as_runtime_work_for_divider() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnError {
+            turn_id: "turn_1".to_string(),
+            message: "rate limited".to_string(),
+        });
+        screen.end_turn();
+
+        let lines: Vec<String> = screen.wrapped_lines(60).iter().map(line_text).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim_start().starts_with("── ")),
+            "runtime-error divider missing: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn turn_divider_label_omits_telemetry_when_usage_is_unavailable() {
+        let line = line_text(&turn_divider_line(Some(Duration::from_secs(16)), None, 60));
+
+        assert!(line.contains("── 16s ─"), "{line}");
+        assert!(!line.contains('┊'), "{line}");
+        assert_eq!(display_width(&line), 60);
+    }
+
+    #[test]
+    fn turn_divider_unlabelled_when_elapsed_is_unavailable() {
+        let line = line_text(&turn_divider_line(None, None, 60));
+
+        assert_eq!(line, "─".repeat(60));
+    }
+
+    #[test]
     fn elapsed_format_and_labelled_rule() {
         assert_eq!(format_elapsed_compact(Duration::from_secs(45)), "45s");
         assert_eq!(format_elapsed_compact(Duration::from_secs(71)), "1:11");
         assert_eq!(format_elapsed_compact(Duration::from_secs(132)), "2:12");
         assert_eq!(format_elapsed_compact(Duration::from_secs(3669)), "1:01:09");
-        // A labelled rule embeds the text and fills to width with dashes.
-        let line = hrule_line("Worked for 2m 12s", 40);
-        let text = line_text(&line);
-        assert!(
-            text.starts_with("\u{2500} Worked for 2m 12s \u{2500}"),
-            "{text}"
-        );
-        assert_eq!(display_width(&text), 40);
-        assert_eq!(line.spans[0].style, dim_style());
     }
 
     #[test]
