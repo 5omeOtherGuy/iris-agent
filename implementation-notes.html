@@ -22,7 +22,7 @@
       <li>When no footer/model selection has been sourced yet, Iris continues to omit the statusline rather than inventing unknown model/context/cwd values.</li>
       <li>On terminals too short to fit the canonical composer shape, the hint row is hidden rather than overlapping the editor text. This preserves width/row integrity under severe height constraints.</li>
       <li>The bare/qualified model adapter on <code>Screen::set_footer</code> is test-only; production uses <code>set_footer_with_context</code> so release builds do not carry an unused compatibility shim.</li>
-      <li>The composer/tool panel border indent is separated from the editor text padding (<code>4</code> columns vs. <code>2</code>) so the border starts in the panel column and the status dot aligns with the editor input text column.</li>
+      <li>The statusline dot aligns with the editor input text by using the existing composer border indent plus the two-column editor text padding. A broader shared-gutter change was avoided because it reflows transcript and pasted-terminal rendering outside this feature's scope.</li>
       <li>The canonical editor vertical chrome count is named in code to keep the height calculation and text-area subtraction in sync.</li>
     </ul>
   </section>

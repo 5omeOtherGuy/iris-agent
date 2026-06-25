@@ -87,11 +87,12 @@ const DIFF_ADD_BG: Color = Color::Indexed(22);
 const DIFF_DEL_BG: Color = Color::Indexed(52);
 const COMPOSER_HINT: &str = "↵ to send  •  shift+↵ for new line  •  / for commands";
 
-const BOX_X_PADDING: usize = 4;
-const TEXT_X_PADDING: usize = 2;
+const X_PADDING: usize = 2;
+const BOX_X_PADDING: usize = X_PADDING;
+const TEXT_X_PADDING: usize = X_PADDING;
 const TEXT_COLUMN_X_PADDING: usize = BOX_X_PADDING + TEXT_X_PADDING;
-const BOX_X_PADDING_U16: u16 = BOX_X_PADDING as u16;
-const TEXT_X_PADDING_U16: u16 = TEXT_X_PADDING as u16;
+const BOX_X_PADDING_U16: u16 = X_PADDING as u16;
+const TEXT_X_PADDING_U16: u16 = X_PADDING as u16;
 
 /// Secondary guard: truncate any single output line to this many characters
 /// before wrapping, so one pathological line cannot dominate the row budget.
@@ -4166,7 +4167,7 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 180, 12);
 
-        assert!(rendered.contains("      ● MODE code  ┊  MODEL sonnet 3.5 high"));
+        assert!(rendered.contains("    ● MODE code  ┊  MODEL sonnet 3.5 high"));
         assert!(rendered.contains("MODEL sonnet 3.5"));
         assert!(!rendered.contains("EFFORT high"));
         assert!(rendered.contains("CWD ~/workspace/user-auth"));
@@ -4222,7 +4223,7 @@ mod tests {
 
         assert!(
             status.starts_with(
-                "      ● MODE code  ┊  MODEL gpt-5.4-mini off  ┊  CTX 300k  ┊  CWD ~/project"
+                "    ● MODE code  ┊  MODEL gpt-5.4-mini off  ┊  CTX 300k  ┊  CWD ~/project"
             ),
             "{status:?}"
         );
@@ -4246,7 +4247,7 @@ mod tests {
 
         assert_eq!(
             status.trim_end(),
-            "      ● MODE code  ┊  MODEL gpt-5.4-mini"
+            "    ● MODE code  ┊  MODEL gpt-5.4-mini"
         );
         assert!(!status.contains(" off"));
         assert!(!status.contains("CTX"));
@@ -4351,7 +4352,7 @@ mod tests {
 
         let rendered = rendered_text(&mut screen, 100, 12);
         assert!(!rendered.contains("EFFORT"), "{rendered}");
-        assert!(!rendered.contains("MODEL"), "{rendered}");
+        assert!(rendered.contains("MODEL gpt-5.5"), "{rendered}");
         assert!(rendered.contains("thinking with high effort"), "{rendered}");
     }
 
@@ -5245,7 +5246,7 @@ mod tests {
 
         screen.start_turn();
         let rendered = rendered_text(&mut screen, 120, 12);
-        assert!(!rendered.contains("opus-4.8 xhigh"), "{rendered}");
+        assert!(rendered.contains("MODEL opus-4.8 xhigh"), "{rendered}");
         assert!(rendered.contains("↓ 120 tokens"), "{rendered}");
         assert!(
             rendered.contains("thinking with xhigh effort"),
@@ -5258,7 +5259,7 @@ mod tests {
             "~/repo (branch)".to_string(),
         );
         let refreshed = rendered_text(&mut screen, 120, 12);
-        assert!(!refreshed.contains("opus-4.8 high"), "{refreshed}");
+        assert!(refreshed.contains("MODEL opus-4.8 high"), "{refreshed}");
         assert!(refreshed.contains("↓ 120 tokens"), "{refreshed}");
         assert!(
             refreshed.contains("thinking with high effort"),
