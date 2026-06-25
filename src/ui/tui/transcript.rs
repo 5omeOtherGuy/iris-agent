@@ -6,24 +6,20 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
-use crate::tool_display::{is_exploration_tool, run_target};
+use crate::tool_display::run_target;
 use crate::ui::{TurnErrorKind, UiEvent};
 
 use super::component::{self, Component};
 use super::pane;
-use super::panel::{
-    PanelHeaderSpec, PanelState, diff_table_rows, explore_body, explore_panel_meta, panel_state,
-    tool_panel_meta, tool_panel_title,
-};
+use super::panel::{PanelHeaderSpec, PanelState, diff_table_rows, panel_state};
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
-use super::text::{ansi_spans, strip_ansi_for_text};
-use super::wrap::{
-    clamp_output_line, display_width, line_text, truncate_chars, wrapped_row_estimate,
-};
+use super::text::ansi_spans;
+use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
+use super::wrap::line_text;
 use super::{
-    MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TOOL_OUTPUT_LINE_CHARS,
-    MAX_TOOL_OUTPUT_ROWS, MAX_TRANSCRIPT_ROWS, TEXT_COLUMN_X_PADDING, dim_style, err_style,
-    format_elapsed_compact, ok_style, panel_style, tool_header_style, turn_divider_label,
+    MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TRANSCRIPT_ROWS,
+    TEXT_COLUMN_X_PADDING, dim_style, err_style, format_elapsed_compact, ok_style, panel_style,
+    tool_header_style, turn_divider_label,
 };
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
@@ -190,82 +186,121 @@ impl Transcript {
         exit_code: Option<i32>,
         duration: Option<std::time::Duration>,
     ) {
-        if is_exploration_tool(call) {
+        let renderer = tool_render::resolve(call);
+        if renderer.kind() == ToolPanelKind::Explore {
             self.push_explored_result(call, duration);
             return;
         }
         let failed = exit_code.is_some_and(|code| code != 0);
         self.begin_block();
-        if call.name == "bash" {
-            self.push_shell_panel(call, content, false, failed, duration, None);
-        } else {
-            self.push_generic_tool_panel(call, content, false, failed, duration, None);
-        }
+        self.append_tool_panel(
+            renderer,
+            call,
+            panel_state(false, failed),
+            duration,
+            None,
+            ToolOutcome::Done { content },
+        );
     }
 
     fn push_tool_error(&mut self, call: &ToolCall, message: &str) {
         self.begin_block();
-        if call.name == "bash" {
-            self.push_shell_panel(call, "", false, true, None, Some(message));
-        } else {
-            self.push_generic_tool_panel(call, "", false, true, None, Some(message));
-        }
+        let renderer = tool_render::resolve(call);
+        self.append_tool_panel(
+            renderer,
+            call,
+            PanelState::Error,
+            None,
+            None,
+            ToolOutcome::Error {
+                message,
+                streamed: "",
+            },
+        );
     }
 
     fn push_tool_cancelled(&mut self, call: &ToolCall) {
         self.begin_block();
-        if call.name == "bash" {
-            let target = run_target(call);
-            self.push_shell_header(PanelState::Cancelled, None, None, &target);
-            self.push_panel_body(&format!("$ {target}"), panel_style());
-        } else {
-            self.push_generic_tool_header(call, PanelState::Cancelled, None, None);
+        let renderer = tool_render::resolve(call);
+        self.append_tool_panel(
+            renderer,
+            call,
+            PanelState::Cancelled,
+            None,
+            None,
+            ToolOutcome::Cancelled { streamed: "" },
+        );
+    }
+
+    /// Wrap-width-aware [`RenderCtx`] for renderer body production.
+    fn render_ctx(&self) -> RenderCtx {
+        RenderCtx {
+            width: self.wrap_width(),
+        }
+    }
+
+    /// Push a complete standard tool panel (Top/Header/Separator/body/Bottom)
+    /// to `self.rows`, with the body produced by the renderer registry under
+    /// failure isolation. When the body is fold-capped, the header is marked as
+    /// a collapsed preview so ctrl+o reveals the hidden lines. This is the
+    /// single dispatch path for SHELL/EDIT/generic panels; EXPLORE keeps its
+    /// grouped path.
+    fn append_tool_panel(
+        &mut self,
+        renderer: &dyn tool_render::ToolRenderer,
+        call: &ToolCall,
+        state: PanelState,
+        duration: Option<std::time::Duration>,
+        started: Option<Instant>,
+        outcome: ToolOutcome<'_>,
+    ) {
+        self.push_tool_header(renderer, call, state, duration, started);
+        let ctx = self.render_ctx();
+        let body = tool_render::render_body(renderer, &ctx, call, &outcome);
+        let foldable = body.iter().any(|row| row.fold != FoldVis::Always);
+        self.rows.extend(body);
+        if foldable {
+            self.mark_panel_preview();
         }
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
     }
 
-    fn push_panel_body(&mut self, text: &str, style: Style) {
-        self.push_panel_body_folded(text, style, FoldVis::Always);
+    /// Collect the rows of a standard tool panel without committing them, for
+    /// in-place replacement of a live/active panel.
+    fn collect_tool_panel(
+        &mut self,
+        renderer: &dyn tool_render::ToolRenderer,
+        call: &ToolCall,
+        state: PanelState,
+        duration: Option<std::time::Duration>,
+        started: Option<Instant>,
+        outcome: ToolOutcome<'_>,
+    ) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            this.append_tool_panel(renderer, call, state, duration, started, outcome);
+        })
     }
 
-    fn push_panel_body_folded(&mut self, text: &str, style: Style, fold: FoldVis) {
-        for line in text.split('\n') {
-            let line = strip_ansi_for_text(line);
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: Line::from(Span::styled(line.clone(), style)),
-                        bg: None,
-                    },
-                    line,
-                    style,
-                )
-                .with_fold(fold),
-            );
-        }
-    }
-
-    /// Inner panel-body text width available for right-aligning fold hints.
-    /// `wrap_width()` already equals the panel body width (terminal width minus
-    /// outer padding and panel chrome), so the hint can hug the right border.
-    fn fold_hint_width(&self) -> usize {
-        self.wrap_width().max(1)
-    }
-
-    /// Preview-state fold affordance: `… N lines hidden        ctrl+o to expand`.
-    /// Only rendered while the panel is collapsed (capped).
-    fn push_fold_expand_hint(&mut self, hidden: usize, earlier: bool) {
-        let noun = if earlier { "earlier lines" } else { "lines" };
-        let left = format!("… {hidden} {noun} hidden");
-        let text = right_align_hint(&left, "ctrl+o to expand", self.fold_hint_width());
-        self.push_panel_body_folded(&text, dim_style(), FoldVis::WhenCollapsed);
-    }
-
-    /// Expanded-state fold affordance: right-aligned `ctrl+o to collapse`.
-    /// Only rendered while the panel is fully revealed.
-    fn push_fold_collapse_hint(&mut self) {
-        let text = right_align_hint("", "ctrl+o to collapse", self.fold_hint_width());
-        self.push_panel_body_folded(&text, dim_style(), FoldVis::WhenExpanded);
+    /// Build the standard panel header from the renderer's title/meta plus the
+    /// transcript-owned lifecycle state/duration.
+    fn push_tool_header(
+        &mut self,
+        renderer: &dyn tool_render::ToolRenderer,
+        call: &ToolCall,
+        state: PanelState,
+        duration: Option<std::time::Duration>,
+        started: Option<Instant>,
+    ) {
+        let meta = renderer.header_meta(call);
+        let plain = renderer.plain_meta(call);
+        self.push_panel_header(PanelHeaderSpec {
+            title: renderer.title(),
+            meta: &meta,
+            plain_meta: &plain,
+            state,
+            duration,
+            started,
+        });
     }
 
     /// Mark the most recent panel header as collapsed (preview) so foldable
@@ -316,6 +351,7 @@ impl Transcript {
         self.push_panel_header_with_expanded(spec, true);
     }
 
+    #[cfg(test)]
     pub(super) fn push_shell_header(
         &mut self,
         state: PanelState,
@@ -333,6 +369,10 @@ impl Transcript {
         });
     }
 
+    /// Test-only convenience that renders a finalized shell panel through the
+    /// registry dispatch path. Production result/error paths go through
+    /// [`Self::append_tool_panel`].
+    #[cfg(test)]
     pub(super) fn push_shell_panel(
         &mut self,
         call: &ToolCall,
@@ -342,60 +382,25 @@ impl Transcript {
         duration: Option<std::time::Duration>,
         error: Option<&str>,
     ) {
-        let target = run_target(call);
-        self.push_shell_header(panel_state(running, failed), duration, None, &target);
-        self.push_panel_body(&format!("$ {target}"), panel_style());
-        if !content.is_empty() {
-            self.push_tool_output(content);
-        } else if error.is_none() {
-            self.push_panel_body("(no output)", dim_style());
-        }
-        if let Some(error) = error {
-            self.push_panel_body(&format!("error: {error}"), err_style());
-        }
-        if running {
-            self.push_panel_body("$ █", panel_style());
-        }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-    }
-
-    fn push_generic_tool_header(
-        &mut self,
-        call: &ToolCall,
-        state: PanelState,
-        duration: Option<std::time::Duration>,
-        started: Option<Instant>,
-    ) {
-        let meta = tool_panel_meta(call);
-        self.push_panel_header(PanelHeaderSpec {
-            title: tool_panel_title(call),
-            meta: &meta,
-            plain_meta: &meta,
-            state,
+        let renderer = tool_render::resolve(call);
+        let outcome = if let Some(message) = error {
+            ToolOutcome::Error {
+                message,
+                streamed: content,
+            }
+        } else if running {
+            ToolOutcome::Running { streamed: content }
+        } else {
+            ToolOutcome::Done { content }
+        };
+        self.append_tool_panel(
+            renderer,
+            call,
+            panel_state(running, failed),
             duration,
-            started,
-        });
-    }
-
-    fn push_generic_tool_panel(
-        &mut self,
-        call: &ToolCall,
-        content: &str,
-        running: bool,
-        failed: bool,
-        duration: Option<std::time::Duration>,
-        error: Option<&str>,
-    ) {
-        self.push_generic_tool_header(call, panel_state(running, failed), duration, None);
-        if !content.is_empty() {
-            self.push_tool_output(content);
-        } else if error.is_none() {
-            self.push_panel_body("(no output)", dim_style());
-        }
-        if let Some(error) = error {
-            self.push_panel_body(&format!("error: {error}"), err_style());
-        }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+            None,
+            outcome,
+        );
     }
 
     /// Open a live exec block: a `• Running {target}` header under a fresh
@@ -405,11 +410,15 @@ impl Transcript {
         self.begin_block();
         let body_start = self.rows.len();
         let started = Instant::now();
-        let target = run_target(&call);
-        self.push_shell_header(PanelState::Running, None, Some(started), &target);
-        self.push_panel_body(&format!("$ {target}"), panel_style());
-        self.push_panel_body("$ █", panel_style());
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let renderer = tool_render::resolve(&call);
+        self.append_tool_panel(
+            renderer,
+            &call,
+            PanelState::Running,
+            None,
+            Some(started),
+            ToolOutcome::Running { streamed: "" },
+        );
         self.active_exec = Some(ActiveExec {
             call,
             output: String::new(),
@@ -422,9 +431,15 @@ impl Transcript {
         self.begin_block();
         let body_start = self.rows.len();
         let started = Instant::now();
-        self.push_generic_tool_header(&call, PanelState::Running, None, Some(started));
-        self.push_panel_body("running…", dim_style());
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let renderer = tool_render::resolve(&call);
+        self.append_tool_panel(
+            renderer,
+            &call,
+            PanelState::Running,
+            None,
+            Some(started),
+            ToolOutcome::Running { streamed: "" },
+        );
         self.active_tool = Some(ActiveTool {
             call,
             body_start,
@@ -509,44 +524,6 @@ impl Transcript {
         self.rows.split_off(start)
     }
 
-    fn finalized_tool_rows(
-        &mut self,
-        call: &ToolCall,
-        content: &str,
-        duration: Option<std::time::Duration>,
-        started: Instant,
-    ) -> Vec<TranscriptRow> {
-        self.collect_rows(|this| {
-            this.push_generic_tool_header(call, PanelState::Done, duration, Some(started));
-            if !content.is_empty() {
-                this.push_tool_output(content);
-            } else {
-                this.push_panel_body("(no output)", dim_style());
-            }
-            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-        })
-    }
-
-    fn errored_tool_rows(
-        &mut self,
-        call: &ToolCall,
-        message: &str,
-        started: Instant,
-    ) -> Vec<TranscriptRow> {
-        self.collect_rows(|this| {
-            this.push_generic_tool_header(call, PanelState::Error, None, Some(started));
-            this.push_panel_body(&format!("error: {}", message), err_style());
-            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-        })
-    }
-
-    fn cancelled_tool_rows(&mut self, call: &ToolCall, started: Instant) -> Vec<TranscriptRow> {
-        self.collect_rows(|this| {
-            this.push_generic_tool_header(call, PanelState::Cancelled, None, Some(started));
-            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-        })
-    }
-
     fn finalize_active_tool(
         &mut self,
         call: &ToolCall,
@@ -560,7 +537,15 @@ impl Transcript {
             self.active_tool = Some(active);
             return false;
         }
-        let rows = self.finalized_tool_rows(call, content, duration, active.started);
+        let renderer = tool_render::resolve(call);
+        let rows = self.collect_tool_panel(
+            renderer,
+            call,
+            PanelState::Done,
+            duration,
+            Some(active.started),
+            ToolOutcome::Done { content },
+        );
         self.replace_active_tool_panel(&active, rows);
         true
     }
@@ -573,7 +558,18 @@ impl Transcript {
             self.active_tool = Some(active);
             return false;
         }
-        let rows = self.errored_tool_rows(call, message, active.started);
+        let renderer = tool_render::resolve(call);
+        let rows = self.collect_tool_panel(
+            renderer,
+            call,
+            PanelState::Error,
+            None,
+            Some(active.started),
+            ToolOutcome::Error {
+                message,
+                streamed: "",
+            },
+        );
         self.replace_active_tool_panel(&active, rows);
         true
     }
@@ -586,7 +582,15 @@ impl Transcript {
             self.active_tool = Some(active);
             return false;
         }
-        let rows = self.cancelled_tool_rows(call, active.started);
+        let renderer = tool_render::resolve(call);
+        let rows = self.collect_tool_panel(
+            renderer,
+            call,
+            PanelState::Cancelled,
+            None,
+            Some(active.started),
+            ToolOutcome::Cancelled { streamed: "" },
+        );
         self.replace_active_tool_panel(&active, rows);
         true
     }
@@ -602,78 +606,23 @@ impl Transcript {
         }
     }
 
-    fn running_exec_rows(&mut self, active: &ActiveExec) -> Vec<TranscriptRow> {
-        self.collect_rows(|this| {
-            let target = run_target(&active.call);
-            this.push_shell_header(PanelState::Running, None, Some(active.started), &target);
-            this.push_panel_body(&format!("$ {target}"), panel_style());
-            this.push_tool_output_tail(&active.output);
-            this.push_panel_body("$ █", panel_style());
-            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-        })
-    }
-
-    fn finalized_exec_rows(
-        &mut self,
-        call: &ToolCall,
-        content: &str,
-        exit_code: Option<i32>,
-        duration: Option<std::time::Duration>,
-        started: Instant,
-    ) -> Vec<TranscriptRow> {
-        self.collect_rows(|this| {
-            let target = run_target(call);
-            let failed = exit_code.is_some_and(|code| code != 0);
-            this.push_shell_header(panel_state(false, failed), duration, Some(started), &target);
-            this.push_panel_body(&format!("$ {target}"), panel_style());
-            this.push_tool_output(content);
-            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-        })
-    }
-
-    fn errored_exec_rows(
-        &mut self,
-        call: &ToolCall,
-        message: &str,
-        streamed_output: &str,
-        started: Instant,
-    ) -> Vec<TranscriptRow> {
-        self.collect_rows(|this| {
-            let target = run_target(call);
-            this.push_shell_header(PanelState::Error, None, Some(started), &target);
-            this.push_panel_body(&format!("$ {target}"), panel_style());
-            if !streamed_output.is_empty() {
-                this.push_tool_output_tail(streamed_output);
-            }
-            this.push_panel_body(&format!("error: {}", message), err_style());
-            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-        })
-    }
-
-    fn cancelled_exec_rows(
-        &mut self,
-        call: &ToolCall,
-        streamed_output: &str,
-        started: Instant,
-    ) -> Vec<TranscriptRow> {
-        self.collect_rows(|this| {
-            let target = run_target(call);
-            this.push_shell_header(PanelState::Cancelled, None, Some(started), &target);
-            this.push_panel_body(&format!("$ {target}"), panel_style());
-            if !streamed_output.is_empty() {
-                this.push_tool_output_tail(streamed_output);
-            }
-            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
-        })
-    }
-
     /// Re-render the open exec block in place from its bounded output buffer: the
     /// `Running` header followed by the flood-capped live tail.
     fn relayout_active_running(&mut self) {
         let Some(active) = self.active_exec.take() else {
             return;
         };
-        let rows = self.running_exec_rows(&active);
+        let renderer = tool_render::resolve(&active.call);
+        let rows = self.collect_tool_panel(
+            renderer,
+            &active.call,
+            PanelState::Running,
+            None,
+            Some(active.started),
+            ToolOutcome::Running {
+                streamed: &active.output,
+            },
+        );
         self.replace_active_exec_panel(&active, rows);
         self.active_exec = Some(active);
     }
@@ -695,7 +644,16 @@ impl Transcript {
             self.active_exec = Some(active);
             return;
         }
-        let rows = self.finalized_exec_rows(call, content, exit_code, duration, active.started);
+        let failed = exit_code.is_some_and(|code| code != 0);
+        let renderer = tool_render::resolve(call);
+        let rows = self.collect_tool_panel(
+            renderer,
+            call,
+            panel_state(false, failed),
+            duration,
+            Some(active.started),
+            ToolOutcome::Done { content },
+        );
         self.replace_active_exec_panel(&active, rows);
     }
 
@@ -710,7 +668,18 @@ impl Transcript {
             self.active_exec = Some(active);
             return;
         }
-        let rows = self.errored_exec_rows(call, message, &active.output, active.started);
+        let renderer = tool_render::resolve(call);
+        let rows = self.collect_tool_panel(
+            renderer,
+            call,
+            PanelState::Error,
+            None,
+            Some(active.started),
+            ToolOutcome::Error {
+                message,
+                streamed: &active.output,
+            },
+        );
         self.replace_active_exec_panel(&active, rows);
     }
 
@@ -722,7 +691,17 @@ impl Transcript {
             self.active_exec = Some(active);
             return false;
         }
-        let rows = self.cancelled_exec_rows(call, &active.output, active.started);
+        let renderer = tool_render::resolve(call);
+        let rows = self.collect_tool_panel(
+            renderer,
+            call,
+            PanelState::Cancelled,
+            None,
+            Some(active.started),
+            ToolOutcome::Cancelled {
+                streamed: &active.output,
+            },
+        );
         self.replace_active_exec_panel(&active, rows);
         true
     }
@@ -735,174 +714,6 @@ impl Transcript {
         } else {
             self.last_width
         }
-    }
-
-    /// Push one gutter-prefixed tool-output line, preserving ANSI styling and
-    /// hard-wrapping so leading indentation/aligned columns survive. `first`
-    /// selects the `  └ ` head gutter vs the `    ` continuation gutter.
-    fn push_output_line(&mut self, raw: &str, first: bool, fold: FoldVis) {
-        let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
-        let legacy = if first {
-            format!("  └ {line}")
-        } else {
-            format!("    {line}")
-        };
-        if line.contains("\x1b[") {
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: tool_output_line("", &line),
-                        bg: None,
-                    },
-                    strip_ansi_for_text(&legacy),
-                    dim_style(),
-                )
-                .with_fold(fold),
-            );
-        } else {
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: Line::from(Span::styled(line.to_string(), dim_style())),
-                        bg: None,
-                    },
-                    legacy,
-                    dim_style(),
-                )
-                .with_fold(fold),
-            );
-        }
-    }
-
-    fn push_tool_output(&mut self, content: &str) {
-        if content.is_empty() {
-            self.push_panel_body("(no output)", dim_style());
-            return;
-        }
-        // Flood-safe AND compact (Codex parity): wrap each line to the transcript
-        // width FIRST, then keep a head slice and a tail slice that together fit
-        // the physical-row budget, with a `… +N lines` marker between. Showing
-        // the tail keeps a command's final/summary line visible instead of only
-        // its head. The omitted count is logical lines. The live cell still uses
-        // the tail-only variant while output is still growing.
-        let width = self.wrap_width();
-        let lines: Vec<&str> = content.lines().collect();
-        let cost = |raw: &str| {
-            wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width)
-        };
-        let total_rows: usize = lines.iter().map(|raw| cost(raw)).sum();
-        if total_rows <= MAX_TOOL_OUTPUT_ROWS {
-            for (i, raw) in lines.iter().enumerate() {
-                self.push_output_line(raw, i == 0, FoldVis::Always);
-            }
-            return;
-        }
-        // One row is reserved for the ellipsis marker; the rest splits in half.
-        let budget = MAX_TOOL_OUTPUT_ROWS.saturating_sub(1).max(1);
-        let head_budget = budget / 2;
-        let tail_budget = budget - head_budget;
-        let mut head_rows = 0usize;
-        let mut head_end = 0usize;
-        // Always keep at least the first line so a single over-budget line never
-        // collapses the cell to just a marker (and so the head gutter is always
-        // emitted); only later lines are gated on the head budget.
-        while head_end < lines.len() {
-            let rows = cost(lines[head_end]);
-            if head_end > 0 && head_rows + rows > head_budget {
-                break;
-            }
-            head_rows += rows;
-            head_end += 1;
-        }
-        let mut tail_rows = 0usize;
-        let mut tail_start = lines.len();
-        while tail_start > head_end {
-            let rows = cost(lines[tail_start - 1]);
-            if tail_rows + rows > tail_budget {
-                break;
-            }
-            tail_rows += rows;
-            tail_start -= 1;
-        }
-        let hidden = tail_start.saturating_sub(head_end);
-        if hidden == 0 {
-            // Nothing elided (e.g. one over-budget line): keep the original
-            // clamped head/tail slices so a single huge line cannot blow the
-            // row cap, and stay non-foldable.
-            for (i, raw) in lines[..head_end].iter().enumerate() {
-                let clamped = clamp_output_line(raw, width, head_budget);
-                self.push_output_line(&clamped, i == 0, FoldVis::Always);
-            }
-            for raw in &lines[tail_start..] {
-                let clamped = clamp_output_line(raw, width, tail_budget);
-                self.push_output_line(&clamped, false, FoldVis::Always);
-            }
-            return;
-        }
-        // Preview set (shown while collapsed): clamped head slice, the hidden
-        // affordance, then the clamped tail slice.
-        for (i, raw) in lines[..head_end].iter().enumerate() {
-            let clamped = clamp_output_line(raw, width, head_budget);
-            self.push_output_line(&clamped, i == 0, FoldVis::WhenCollapsed);
-        }
-        self.push_fold_expand_hint(hidden, false);
-        for raw in &lines[tail_start..] {
-            let clamped = clamp_output_line(raw, width, tail_budget);
-            self.push_output_line(&clamped, false, FoldVis::WhenCollapsed);
-        }
-        // Full set (shown while expanded): every line, then the collapse hint.
-        for (i, raw) in lines.iter().enumerate() {
-            self.push_output_line(raw, i == 0, FoldVis::WhenExpanded);
-        }
-        self.push_fold_collapse_hint();
-        self.mark_panel_preview();
-    }
-
-    /// TAIL-capped tool output for the LIVE streaming cell: show the most recent
-    /// physical rows so a growing stream scrolls instead of freezing on its
-    /// head, with a leading `… +N earlier lines` note when output was dropped.
-    fn push_tool_output_tail(&mut self, content: &str) {
-        if content.is_empty() {
-            self.push_panel_body("(no output)", dim_style());
-            return;
-        }
-        let width = self.wrap_width();
-        let lines: Vec<&str> = content.lines().collect();
-        // Walk from the end, accumulating physical rows until the budget, so the
-        // newest output is what stays visible.
-        let mut physical = 0usize;
-        let mut take = 0usize;
-        for raw in lines.iter().rev() {
-            let rows =
-                wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width);
-            if take > 0 && physical + rows > MAX_TOOL_OUTPUT_ROWS {
-                break;
-            }
-            physical += rows;
-            take += 1;
-        }
-        let start = lines.len() - take;
-        if start == 0 {
-            for (offset, raw) in lines.iter().enumerate() {
-                let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
-                self.push_output_line(&clamped, offset == 0, FoldVis::Always);
-            }
-            return;
-        }
-        // Preview set: the earlier-lines affordance, then the most recent tail.
-        self.push_fold_expand_hint(start, true);
-        for raw in &lines[start..] {
-            let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
-            self.push_output_line(&clamped, false, FoldVis::WhenCollapsed);
-        }
-        // Full set: every line in order (unclamped, matching the finalized
-        // path so revealing a streamed run shows the same rows), then the
-        // collapse hint.
-        for (offset, raw) in lines.iter().enumerate() {
-            self.push_output_line(raw, offset == 0, FoldVis::WhenExpanded);
-        }
-        self.push_fold_collapse_hint();
-        self.mark_panel_preview();
     }
 
     fn explore_header_right(state: PanelState, duration: Option<Duration>) -> Vec<(String, Style)> {
@@ -952,6 +763,24 @@ impl Transcript {
             })
     }
 
+    /// EXPLORE header meta, single-sourced from the renderer registry.
+    fn explore_meta(&self, call: &ToolCall) -> String {
+        tool_render::resolve(call).header_meta(call)
+    }
+
+    /// EXPLORE body summary `(text, style)`, single-sourced from the renderer's
+    /// one-row body for the given outcome (falls back to an empty dim row only
+    /// if a misbehaving renderer produced nothing).
+    fn explore_text_style(&self, call: &ToolCall, outcome: ToolOutcome<'_>) -> (String, Style) {
+        let renderer = tool_render::resolve(call);
+        let ctx = self.render_ctx();
+        tool_render::render_body(renderer, &ctx, call, &outcome)
+            .into_iter()
+            .next()
+            .map(|row| (row.text, row.style))
+            .unwrap_or_else(|| (String::new(), dim_style()))
+    }
+
     fn set_explore_header(
         &mut self,
         call: &ToolCall,
@@ -963,7 +792,7 @@ impl Transcript {
         };
         let (meta, expanded) = match self.rows[header].chrome.as_ref() {
             Some(ChromeRow::Header { meta, expanded, .. }) => (meta.clone(), *expanded),
-            _ => (explore_panel_meta(call), true),
+            _ => (self.explore_meta(call), true),
         };
         self.rows[header] = TranscriptRow::chrome(ChromeRow::Header {
             expanded,
@@ -1006,6 +835,9 @@ impl Transcript {
     }
 
     fn push_explore_body(&mut self, call: &ToolCall, failed: bool, duration: Option<Duration>) {
+        let meta = self.explore_meta(call);
+        let (text, _) = self.explore_text_style(call, ToolOutcome::Done { content: "" });
+        let style = if failed { err_style() } else { dim_style() };
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
             self.set_explore_header(call, panel_state(false, failed), duration);
@@ -1015,22 +847,18 @@ impl Transcript {
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
                 title: "EXPLORE",
-                meta: explore_panel_meta(call),
+                meta,
                 right: Self::explore_header_right(panel_state(false, failed), duration),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
-        let text = explore_body(call);
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Body {
-                line: Line::from(Span::styled(
-                    text.clone(),
-                    if failed { err_style() } else { dim_style() },
-                )),
+                line: Line::from(Span::styled(text.clone(), style)),
                 bg: None,
             },
             text,
-            if failed { err_style() } else { dim_style() },
+            style,
         ));
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.exploring_open = true;
@@ -1038,14 +866,8 @@ impl Transcript {
 
     fn push_explored_result(&mut self, call: &ToolCall, duration: Option<Duration>) {
         self.finish_stream();
-        if self.finish_exploration(
-            call,
-            explore_body(call),
-            dim_style(),
-            duration,
-            false,
-            false,
-        ) {
+        let (text, style) = self.explore_text_style(call, ToolOutcome::Done { content: "" });
+        if self.finish_exploration(call, text, style, duration, false, false) {
             return;
         }
         self.push_explore_body(call, false, duration);
@@ -1054,6 +876,8 @@ impl Transcript {
     fn push_explored_start(&mut self, call: &ToolCall) {
         self.finish_stream();
         let started = Instant::now();
+        let meta = self.explore_meta(call);
+        let (text, style) = self.explore_text_style(call, ToolOutcome::Done { content: "" });
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
         } else {
@@ -1062,20 +886,19 @@ impl Transcript {
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
                 title: "EXPLORE",
-                meta: explore_panel_meta(call),
+                meta,
                 right: Self::explore_header_right(PanelState::Running, Some(Duration::ZERO)),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
         let row = self.rows.len();
-        let text = explore_body(call);
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Body {
-                line: Line::from(Span::styled(text.clone(), dim_style())),
+                line: Line::from(Span::styled(text.clone(), style)),
                 bg: None,
             },
             text,
-            dim_style(),
+            style,
         ));
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.exploring_open = true;
@@ -1138,19 +961,20 @@ impl Transcript {
 
     fn push_explored_error(&mut self, call: &ToolCall, message: &str) -> bool {
         self.finish_stream();
-        self.finish_exploration(
+        let (text, style) = self.explore_text_style(
             call,
-            format!("error: {}", message),
-            err_style(),
-            None,
-            true,
-            false,
-        )
+            ToolOutcome::Error {
+                message,
+                streamed: "",
+            },
+        );
+        self.finish_exploration(call, text, style, None, true, false)
     }
 
     fn push_explored_cancelled(&mut self, call: &ToolCall) -> bool {
         self.finish_stream();
-        self.finish_exploration(call, explore_body(call), dim_style(), None, false, true)
+        let (text, style) = self.explore_text_style(call, ToolOutcome::Cancelled { streamed: "" });
+        self.finish_exploration(call, text, style, None, false, true)
     }
 
     /// Apply one semantic event to the transcript rows.
@@ -1202,15 +1026,11 @@ impl Transcript {
                 // Non-gated tools show only their result row; nothing to render.
                 self.finish_stream();
             }
-            UiEvent::ToolStarted(call) => {
-                if is_exploration_tool(&call) {
-                    self.push_explored_start(&call);
-                } else if call.name == "bash" {
-                    self.begin_exec(call);
-                } else {
-                    self.begin_tool(call);
-                }
-            }
+            UiEvent::ToolStarted(call) => match tool_render::resolve(&call).kind() {
+                ToolPanelKind::Explore => self.push_explored_start(&call),
+                ToolPanelKind::Shell => self.begin_exec(call),
+                ToolPanelKind::Generic => self.begin_tool(call),
+            },
             UiEvent::ToolOutputDelta { call_id, chunk } => {
                 if self
                     .active_exec
@@ -1238,10 +1058,11 @@ impl Transcript {
                 self.clear_active_tool_for_preview(&call);
                 self.begin_block();
                 self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+                let renderer = tool_render::resolve(&call);
                 self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                     expanded: true,
-                    title: tool_panel_title(&call),
-                    meta: tool_panel_meta(&call),
+                    title: renderer.title(),
+                    meta: renderer.header_meta(&call),
                     right: vec![
                         ("●".to_string(), dim_style()),
                         (" PREVIEW     ".to_string(), panel_style()),
@@ -1281,7 +1102,8 @@ impl Transcript {
                 {
                     self.finalize_active_error(&call, &message);
                 } else if self.finalize_active_tool_error(&call, &message) {
-                } else if !is_exploration_tool(&call) || !self.push_explored_error(&call, &message)
+                } else if tool_render::resolve(&call).kind() != ToolPanelKind::Explore
+                    || !self.push_explored_error(&call, &message)
                 {
                     self.push_tool_error(&call, &message);
                 }
@@ -1294,7 +1116,9 @@ impl Transcript {
                 {
                     self.finalize_active_cancelled(&call);
                 } else if self.finalize_active_tool_cancelled(&call) {
-                } else if !is_exploration_tool(&call) || !self.push_explored_cancelled(&call) {
+                } else if tool_render::resolve(&call).kind() != ToolPanelKind::Explore
+                    || !self.push_explored_cancelled(&call)
+                {
                     self.push_tool_cancelled(&call);
                 }
             }
@@ -1473,26 +1297,6 @@ pub(super) fn streaming_markdown_preview(text: &str) -> String {
         "… streaming preview truncated; showing latest content …\n{}",
         &text[start..]
     )
-}
-
-/// Right-align `hint` within `width`, after optional `left` text. Used for the
-/// fold affordances so the keybinding hint hugs the panel's right edge.
-fn right_align_hint(left: &str, hint: &str, width: usize) -> String {
-    let hint_w = display_width(hint);
-    let left_w = display_width(left);
-    // Too narrow for both: keep the actionable hint, right-aligned, dropping the
-    // descriptive left text rather than overflowing and wrapping the row.
-    if left.is_empty() || left_w + 1 + hint_w > width {
-        return format!("{}{hint}", " ".repeat(width.saturating_sub(hint_w)));
-    }
-    let gap = width.saturating_sub(left_w).saturating_sub(hint_w).max(1);
-    format!("{left}{}{hint}", " ".repeat(gap))
-}
-
-fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
-    let mut spans = vec![Span::styled(prefix, dim_style())];
-    spans.extend(ansi_spans(line, dim_style()));
-    Line::from(spans)
 }
 
 fn approval_line(call: &ToolCall, scope: &str) -> Line<'static> {

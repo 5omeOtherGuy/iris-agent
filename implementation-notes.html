@@ -211,5 +211,128 @@ output, all toward correctness.</li>
 escape-introducer OR-group is bound to a local first to keep <code>&amp;&amp;</code>/<code>||</code>
 precedence correct.</li>
 </ul>
+<hr>
+<h2>Built-in ToolRenderer registry — implementation notes</h2>
+<p>Non-obvious decisions and discoveries only. Organized by unit. Not a step log.</p>
+
+<h2>Base / working state</h2>
+<ul>
+  <li>Primary checkout was in <b>detached HEAD at <code>d1d9bce</code></b> (origin/main
+      <code>6b48611</code> +1 unmerged commit "compact tool durations, expand hint, intra-line diff
+      highlights" touching <code>panel.rs</code>/<code>transcript.rs</code>/<code>tui.rs</code>).
+      <code>git fetch</code> succeeded; <code>origin/main</code> = <code>6b48611</code>.</li>
+  <li>Built the worktree from <b><code>origin/main</code></b> per AGENTS.md:
+      <code>git worktree add ../iris-tool-renderers -b feat/tool-renderer-registry origin/main</code>.
+      So <code>panel.rs</code> in this worktree is the clean origin/main variant (336 lines, the
+      <code>tool_panel_title</code>/<code>tool_panel_meta</code>/<code>explore_*</code> taxonomy the
+      prompt cites), NOT the unmerged compact-diff variant. Line numbers in the prompt were from the
+      detached variant and drifted; worked from observed code.</li>
+  <li>Both <code>~/vendor/pi-mono</code> reference paths exist and were read.</li>
+  <li><b>Mid-task base shift &mdash; rebased onto the now-merged #170.</b> After the work was first
+      written and reviewed, <code>origin/main</code> advanced <code>6b48611 -&gt; a77c97f</code>: the
+      formerly-unmerged compact-diff commit landed as <b>#170</b> ("compact durations, ctrl+o output
+      reveal, intra-line diff highlights") plus #171. #170 rewrote the exact functions this refactor
+      touches. The two feature commits were squashed and <b>rebased onto current
+      <code>origin/main</code></b>; <code>panel.rs</code>/<code>tui.rs</code> auto-merged,
+      <code>transcript.rs</code> was reset to #170 and the registry wiring re-applied on top.</li>
+  <li><b>FoldVis integration.</b> #170 added a <code>FoldVis</code> row-tag system (<code>Always</code>
+      /<code>WhenCollapsed</code>/<code>WhenExpanded</code>): capped tool output emits a collapsed
+      preview <i>and</i> the full output so <code>ctrl+o</code> toggles between them, and the panel
+      header is marked a collapsed preview via <code>mark_panel_preview</code>. <code>PanelBody</code>
+      was made fold-aware (ports #170's <code>push_tool_output</code>/<code>_tail</code> + fold hints +
+      <code>right_align_hint</code>); <code>append_tool_panel</code> detects a foldable body (any row
+      with <code>fold != Always</code>) and calls <code>mark_panel_preview</code>, reproducing #170's
+      behavior under the registry. Durations are now compact (<code>format_elapsed_compact</code>) and
+      the hint reads <code>ctrl+o to expand</code>/<code>to collapse</code> &mdash; all inherited from
+      #170, not changed here. Byte-identity target is now #170's output, verified by its snapshot
+      tests which pass unchanged.</li>
+</ul>
+
+<h2>Unit 1 — ToolRenderer trait + module (src/ui/tui/tool_render.rs)</h2>
+<ul>
+  <li><b>Returns panel primitives, not a Component.</b> Iris has no Component/Container abstraction
+      (separate deferred task), so the trait returns Iris's existing render units:
+      <code>title -&gt; &amp;'static str</code>, <code>header_meta/plain_meta -&gt; String</code>, and
+      <code>body -&gt; Vec&lt;TranscriptRow&gt;</code> (the rows between the separator and the bottom
+      border). This mirrors pi-mono's renderCall (title/meta) + renderResult (body) split without
+      adopting its Component return type.</li>
+  <li><b>renderShell default|self.</b> Modeled as <code>ToolPanelKind { Explore, Shell, Generic }</code>.
+      Shell is the "self-framing" case (emits its own <code>$ target</code> command row + cursor);
+      Explore/Generic/Edit use the standard panel body. <code>kind()</code> drives the stateful
+      dispatch path in transcript.rs (replacing <code>is_exploration_tool</code> and
+      <code>call.name == "bash"</code> branches).</li>
+  <li><b>No rendererState object.</b> pi-mono keeps a long-lived <code>rendererState</code> per tool
+      row; Iris keeps cross-frame state (expansion, live output buffer, exploration grouping) in
+      retained transcript rows. Renderers are pure functions over
+      <code>(ctx, call, outcome)</code>. Divergence noted and intentional.</li>
+  <li><b>tool_display reused, not duplicated.</b> Renderers call
+      <code>summarize</code>/<code>run_target</code>/<code>exploration_summary</code>/<code>display_path</code>
+      from <code>src/tool_display.rs</code>. The name&rarr;renderer map in <code>resolve()</code> is the
+      single source for the TUI surface.</li>
+</ul>
+
+<h2>Unit 2 — Built-in renderers</h2>
+<ul>
+  <li><b>EXPLORE is a single-row adapter, not a normal body.</b> Per oracle review: the grouped
+      EXPLORE panel stores one body-row index and replaces it in place, so EXPLORE's
+      <code>body()</code> returns exactly one TranscriptRow. The grouping/aggregate-header machinery
+      stays in transcript.rs; only meta + the summary line come from the renderer.</li>
+  <li><b>Shell Running body depends on whether output exists.</b> <code>begin_exec</code> (empty
+      stream) emits <code>$ target</code> + cursor with NO <code>(no output)</code>; the relayout path
+      (non-empty stream) emits <code>$ target</code> + output-tail + cursor. Encoded as: skip the
+      output-tail when <code>streamed.is_empty()</code>. This is the one easy place to break
+      byte-identical output.</li>
+  <li><b>One intentional micro-divergence (reviewer-facing regression risk).</b> The old code had two
+      empty-output behaviors: <code>begin_exec</code> never emitted <code>(no output)</code>, but
+      <code>relayout_active_running</code> used <code>push_tool_output_tail</code> which emits
+      <code>(no output)</code> for an empty buffer. <code>relayout</code> only runs after a chunk is
+      appended, so its buffer is non-empty in every reachable state; the unified Shell Running body is
+      therefore byte-identical for all reachable states and matches <code>begin_exec</code> exactly.
+      The only divergence is a degenerate, untested path (provider sends an <i>empty</i> first
+      <code>ToolOutputDelta</code> chunk): old code would show <code>(no output)</code> above the live
+      cursor, new code shows none. Judged better; not worth a distinguishing flag. No snapshot covers
+      it.</li>
+  <li><b>Hidden-affordance literal.</b> Kept <code>"ctrl+o toggles panel"</code> to stay
+      byte-identical with the origin/main base; the sibling detached-<code>d1d9bce</code> worktree's
+      <code>"ctrl+o to expand"</code> belongs to that unmerged commit, not this base.</li>
+  <li>Generic/Edit share one body; they differ only in title (EDIT vs TOOL). Generic Cancelled has
+      no body rows; Shell Cancelled keeps only <code>$ target</code> (+ streamed tail if any).</li>
+</ul>
+
+<h2>Unit 3 — Registry + dispatch / PanelBody</h2>
+<ul>
+  <li><b>PanelBody builder.</b> The body helpers (<code>push_panel_body</code>,
+      <code>push_tool_output</code>, <code>push_tool_output_tail</code>, hidden-affordance, output-line
+      gutter) were moved into a short-lived <code>PanelBody { width, rows }</code> builder so both
+      renderers and the thin transcript wrappers use one implementation (no duplicated flood-cap
+      logic). transcript.rs methods now delegate to PanelBody.</li>
+</ul>
+
+<h2>Unit 4 — Failure isolation</h2>
+<ul>
+  <li><b>catch_unwind at the body boundary.</b> <code>render_body</code> wraps
+      <code>renderer.body()</code> in <code>std::panic::catch_unwind(AssertUnwindSafe(..))</code> and
+      falls back to <code>GenericRenderer</code> on panic. Renderers return a freshly-built Vec, so a
+      panic discards a partial body cleanly and never corrupts <code>Transcript::rows</code> (nothing
+      shared is mutated inside the caught closure). Used <code>Result</code>-free panic catching
+      rather than a fallible trait because built-in renderers do not return errors; the seam exists
+      for the deferred extension phase where third-party renderers may panic.</li>
+  <li><b>Stderr tradeoff.</b> The default panic hook still prints a backtrace to stderr on a caught
+      panic; tests silence it with <code>set_hook</code>/<code>take_hook</code>. Did not swap the hook
+      per-render in production (racy/global); accepted as a rare-path cosmetic concern.</li>
+  <li><b>EXPLORE fallback note.</b> EXPLORE also routes through <code>render_body</code>; if its
+      renderer ever panicked the generic fallback could yield a non-single-row body, but built-in
+      EXPLORE never panics, so this only matters for the deferred extension phase.</li>
+</ul>
+
+<h2>Deferrals (named in report)</h2>
+<ul>
+  <li>Extension/custom third-party renderers + public registration API — explicit "later" phase.</li>
+  <li>General Component/Container abstraction — separate task; trait returns existing primitives.</li>
+  <li>Text fallback surface (<code>src/ui/text.rs</code>) — different surface; keeps its own
+      <code>is_exploration_tool</code>/<code>run_target</code> path. <code>is_exploration_tool</code>
+      remains in tool_display only for text.rs; the TUI no longer uses it.</li>
+  <li>Long-lived per-renderer mutable state object — not needed; state lives in transcript rows.</li>
+</ul>
 </body>
 </html>
