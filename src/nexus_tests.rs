@@ -1267,6 +1267,115 @@ fn completed_turn_records_reasoning_and_all_tool_calls_before_results() -> Resul
 }
 
 #[test]
+fn completed_turn_emits_reasoning_event_before_text_without_changing_storage() -> Result<()> {
+    let workspace = test_workspace()?;
+    let origin = ModelOrigin::new("anthropic", "anthropic-messages", "claude-sonnet-4-6");
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: Some("the answer".to_string()),
+        reasoning: vec![ReasoningBlock::new(
+            "let me think",
+            Some("sig"),
+            false,
+            origin,
+        )],
+        tool_calls: Vec::new(),
+        response_id: None,
+        usage: None,
+        completion_reason: None,
+    })]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    let reasoning_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AssistantReasoning { .. }))
+        .expect("reasoning event emitted");
+    let text_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AssistantText(_)))
+        .expect("assistant text event emitted");
+    assert!(
+        reasoning_at < text_at,
+        "reasoning event must precede assistant text"
+    );
+    match &events[reasoning_at] {
+        AgentEvent::AssistantReasoning { text, redacted } => {
+            assert_eq!(text, "let me think");
+            assert!(!redacted);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    drop(events);
+
+    // Storage is unchanged: the reasoning row is still persisted (ADR-0016).
+    let reasoning_rows: Vec<&Message> = harness
+        .agent
+        .messages()
+        .iter()
+        .filter(|m| m.role == Role::AssistantReasoning)
+        .collect();
+    assert_eq!(reasoning_rows.len(), 1);
+    assert_eq!(reasoning_rows[0].content, "let me think");
+    assert_eq!(reasoning_rows[0].continuity.as_deref(), Some("sig"));
+    Ok(())
+}
+
+#[test]
+fn redacted_reasoning_emits_event_without_leaking_text() -> Result<()> {
+    let workspace = test_workspace()?;
+    let origin = ModelOrigin::new("anthropic", "anthropic-messages", "claude-sonnet-4-6");
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        text: Some("done".to_string()),
+        // A redacted block still stores its opaque content, but the emitted
+        // display event must never carry that text downstream.
+        reasoning: vec![ReasoningBlock::new(
+            "opaque-secret",
+            Some("data"),
+            true,
+            origin,
+        )],
+        tool_calls: Vec::new(),
+        response_id: None,
+        usage: None,
+        completion_reason: None,
+    })]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    let reasoning = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::AssistantReasoning { text, redacted } => Some((text.clone(), *redacted)),
+            _ => None,
+        })
+        .expect("redacted reasoning event emitted");
+    assert!(reasoning.1, "event must be marked redacted");
+    assert!(
+        reasoning.0.is_empty(),
+        "redacted reasoning text must never leak into the event: {:?}",
+        reasoning.0
+    );
+    drop(events);
+
+    // Storage is unchanged: the redacted row keeps its opaque content + flag.
+    let row = harness
+        .agent
+        .messages()
+        .iter()
+        .find(|m| m.role == Role::AssistantReasoning)
+        .expect("reasoning row stored");
+    assert!(row.redacted);
+    assert_eq!(row.content, "opaque-secret");
+    Ok(())
+}
+
+#[test]
 fn observer_error_on_tool_result_still_records_paired_transcript() -> Result<()> {
     // A front-end that fails while rendering a ToolResult must not leave a
     // dangling assistant-tool-call in the transcript. `record_call` appends both

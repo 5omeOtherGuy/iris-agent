@@ -100,6 +100,13 @@ pub(crate) enum UiEvent {
     AssistantText(String),
     AssistantTextDelta(String),
     AssistantTextEnd(String),
+    /// One block of model reasoning ("thinking") for display. Block-level (not a
+    /// stream); a `redacted` block carries no text and the original reasoning is
+    /// never reconstructed. See [`AgentEvent::AssistantReasoning`].
+    AssistantReasoning {
+        text: String,
+        redacted: bool,
+    },
     ToolProposed(ToolCall),
     /// A tool is about to execute; lets the front-end open a live progress cell.
     ToolStarted(ToolCall),
@@ -210,6 +217,9 @@ impl UiEvent {
             AgentEvent::AssistantText(text) => UiEvent::AssistantText(text),
             AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
             AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),
+            AgentEvent::AssistantReasoning { text, redacted } => {
+                UiEvent::AssistantReasoning { text, redacted }
+            }
             AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
             AgentEvent::ToolStarted(call) => UiEvent::ToolStarted(call),
             AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),
@@ -336,6 +346,36 @@ mod tests {
                 turn_id: "turn_1".to_string(),
                 response_id: Some("resp_1".to_string()),
                 usage: Some(usage),
+            }
+        );
+    }
+
+    #[test]
+    fn maps_reasoning_to_ui_event() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::AssistantReasoning {
+            text: "thinking".to_string(),
+            redacted: false,
+        });
+        assert_eq!(
+            mapped,
+            UiEvent::AssistantReasoning {
+                text: "thinking".to_string(),
+                redacted: false,
+            }
+        );
+    }
+
+    #[test]
+    fn maps_redacted_reasoning_to_ui_event() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::AssistantReasoning {
+            text: String::new(),
+            redacted: true,
+        });
+        assert_eq!(
+            mapped,
+            UiEvent::AssistantReasoning {
+                text: String::new(),
+                redacted: true,
             }
         );
     }

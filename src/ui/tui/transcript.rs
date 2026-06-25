@@ -7,7 +7,15 @@ use ratatui::text::{Line, Span};
 
 use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::run_target;
+use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use crate::ui::{TurnErrorKind, UiEvent};
+
+/// Collapsed-state label for a reasoning panel (mirrors pi-mono's
+/// `hiddenThinkingLabel`).
+const THINKING_LABEL: &str = "Thinking...";
+/// Placeholder for reasoning the provider withheld; the original text is never
+/// available and is never rendered.
+const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
 
 use super::component::{self, Component};
 use super::pane;
@@ -95,7 +103,76 @@ impl Transcript {
     }
 
     fn push_assistant_text(&mut self, text: &str) {
-        pane::push_assistant_rows(&mut self.rows, text);
+        let width = self.markdown_content_width();
+        pane::push_assistant_rows(&mut self.rows, width, text);
+    }
+
+    /// Content width used for width-aware markdown (tables) at append time.
+    /// Falls back to a default before the first frame has set `last_width`.
+    fn markdown_content_width(&self) -> usize {
+        if self.last_width == 0 {
+            crate::ui::markdown::DEFAULT_RENDER_WIDTH
+        } else {
+            self.last_width
+        }
+    }
+
+    /// Render a model reasoning ("thinking") trace as a collapsible panel.
+    ///
+    /// The panel is collapsed by default, showing only a `Thinking...` label;
+    /// the existing `ctrl+o` panel toggle (`toggle_latest_panel`) expands it to
+    /// the markdown-rendered trace, styled dim + italic. A `redacted` block has
+    /// no recoverable text, so a placeholder is shown and the original reasoning
+    /// is never rendered. Mirrors pi-mono's hide/show thinking block.
+    fn push_thinking_block(&mut self, text: &str, redacted: bool) {
+        // Intentionally do NOT finish the live stream here. Reasoning is emitted
+        // at completion, after the answer's text deltas have already streamed
+        // into `self.streaming` but before `AssistantTextEnd` commits them.
+        // Committing the stream now (via `begin_block`) would render the answer
+        // *above* the thinking block and double-commit it when `AssistantTextEnd`
+        // arrives. Adding the panel rows while the stream stays pending keeps the
+        // thinking block above the answer, which is committed afterwards.
+        self.push_blank();
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Header {
+                expanded: false,
+                title: "THINKING",
+                meta: String::new(),
+                right: vec![(THINKING_LABEL.to_string(), dim_style())],
+            },
+            THINKING_LABEL.to_string(),
+            dim_style(),
+        ));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
+        if redacted {
+            self.rows.push(
+                TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: Line::from(Span::styled(REDACTED_THINKING_BODY, dim_style())),
+                        bg: None,
+                    },
+                    REDACTED_THINKING_BODY.to_string(),
+                    dim_style(),
+                )
+                .with_fold(FoldVis::WhenExpanded),
+            );
+        } else {
+            let theme = MarkdownTheme::thinking();
+            let width = self.markdown_content_width();
+            for line in render_markdown_themed(text, &theme, width) {
+                let plain = line_text(&line);
+                self.rows.push(
+                    TranscriptRow::chrome_with_text(
+                        ChromeRow::Body { line, bg: None },
+                        plain,
+                        dim_style(),
+                    )
+                    .with_fold(FoldVis::WhenExpanded),
+                );
+            }
+        }
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
     }
 
     pub(super) fn push_turn_divider(
@@ -1019,6 +1096,16 @@ impl Transcript {
                     self.push_blank();
                 }
             }
+            UiEvent::AssistantReasoning { text, redacted } => {
+                // Reasoning arrives at completion, before the turn's
+                // `AssistantText`/`AssistantTextEnd`. The thinking panel is
+                // pushed above any still-pending streamed answer (which commits
+                // afterwards), so the thinking block renders above the answer
+                // without finishing/duplicating the stream here.
+                if redacted || !text.is_empty() {
+                    self.push_thinking_block(&text, redacted);
+                }
+            }
             UiEvent::SessionStarted => {
                 self.finish_stream();
             }
@@ -1281,7 +1368,7 @@ impl Transcript {
         let streaming_rows = self
             .streaming
             .as_ref()
-            .map(|text| pane::streaming_assistant_rows(text))
+            .map(|text| pane::streaming_assistant_rows(text, width))
             .unwrap_or_default();
         visible.extend(streaming_rows.iter().map(|row| row as &dyn Component));
         component::composite(visible, width)
