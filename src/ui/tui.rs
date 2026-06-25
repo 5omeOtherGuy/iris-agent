@@ -105,9 +105,12 @@ const MAX_TOOL_OUTPUT_LINE_CHARS: usize = 2000;
 /// reaches the model.
 const MAX_EXEC_STREAM_BYTES: usize = 64 * 1024;
 
-/// Braille spinner frames; cycled by the render tick while a turn computes.
-/// Not emojis: single-cell Unicode glyphs that render on any UTF-8 terminal.
-const SPINNER_FRAMES: &[&str] = &[
+/// LED-chase frames for the active turn indicator. The ping-pong sequence avoids
+/// a hard visual wrap from the rightmost LED back to the leftmost LED.
+const WORKING_FRAMES: &[&str] = &["●···", "·●··", "··●·", "···●", "··●·", "·●··"];
+
+#[cfg(test)]
+const BRAILLE_SPINNER_FRAMES: &[&str] = &[
     "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280f}",
 ];
@@ -147,21 +150,19 @@ fn format_panel_duration(duration: std::time::Duration) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}s")
 }
 
-/// Format an elapsed turn duration compactly (Codex's `fmt_elapsed_compact`):
-/// `45s`, `1m 11s`, `1h 03m 09s`. Used by the active-turn status and the
-/// turn-end "Worked for" rule.
-fn format_elapsed_compact(secs: u64) -> String {
-    if secs < 60 {
+/// Format an elapsed turn duration compactly for the working indicator:
+/// `<10s` gets tenths, seconds stay terse until one minute, then clock-like only
+/// at minute/hour granularity.
+fn format_elapsed_compact(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if duration < Duration::from_secs(10) {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
+        format!("{}:{:02}", secs / 60, secs % 60)
     } else {
-        format!(
-            "{}h {:02}m {:02}s",
-            secs / 3600,
-            (secs % 3600) / 60,
-            secs % 60
-        )
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
 }
 /// Display width of a string as the terminal renders it, reused for word-wrap.
@@ -2132,13 +2133,13 @@ impl Spinner {
     /// Advance one frame; a no-op when idle so ticks cause no redraw at rest.
     fn tick(&mut self) -> bool {
         if self.active {
-            self.frame = (self.frame + 1) % SPINNER_FRAMES.len();
+            self.frame = (self.frame + 1) % WORKING_FRAMES.len();
         }
         self.active
     }
 
-    fn glyph(&self) -> &'static str {
-        SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()]
+    fn frame(&self) -> &'static str {
+        WORKING_FRAMES[self.frame % WORKING_FRAMES.len()]
     }
 }
 
@@ -2161,41 +2162,88 @@ fn content_width(width: usize) -> usize {
 }
 
 fn compact_count(value: u64) -> String {
+    fn trim_decimal(text: String) -> String {
+        text.strip_suffix(".0")
+            .map_or_else(|| text.clone(), std::borrow::ToOwned::to_owned)
+    }
+
     if value >= 1_000_000 {
-        format!("{:.1}m", value as f64 / 1_000_000.0)
+        trim_decimal(format!("{:.1}", value as f64 / 1_000_000.0)) + "m"
+    } else if value >= 100_000 {
+        format!("{}k", value / 1_000)
     } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
+        trim_decimal(format!("{:.1}", value as f64 / 1_000.0)) + "k"
     } else {
         value.to_string()
     }
 }
 
-fn working_lines(
-    glyph: &str,
-    elapsed: Option<Duration>,
-    footer: Option<&Footer>,
+fn led_frame_spans(frame: &str) -> Vec<Span<'static>> {
+    frame
+        .chars()
+        .map(|ch| {
+            let style = if ch == '●' {
+                prompt_style()
+            } else {
+                dim_style()
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
+}
+
+fn working_sep() -> Span<'static> {
+    Span::styled(" ┊ ", dim_style())
+}
+
+fn working_indicator_line(
+    frame: &str,
+    elapsed: Duration,
+    can_interrupt: bool,
+    usage: Option<&ProviderUsage>,
     width: usize,
-) -> Vec<Line<'static>> {
-    let secs = elapsed.unwrap_or_default().as_secs();
-    let mut details = vec![format_elapsed_compact(secs), "esc to interrupt".to_string()];
-    if let Some(usage) = footer.and_then(|footer| footer.usage.as_ref()) {
-        details.push(format!("↓ {} tokens", compact_count(usage.total_tokens)));
+) -> Line<'static> {
+    let mut spans = led_frame_spans(frame);
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(format_elapsed_compact(elapsed), panel_style()));
+    if can_interrupt {
+        spans.push(working_sep());
+        spans.push(Span::styled("ESC", panel_style()));
     }
-    if let Some(effort) = footer.and_then(|footer| footer.effort.as_ref()) {
-        details.push(format!("thinking with {effort} effort"));
+    if let Some(usage) = usage {
+        spans.push(working_sep());
+        spans.push(Span::styled(
+            format!(
+                "↑{} ↓{}",
+                compact_count(usage.input_tokens),
+                compact_count(usage.output_tokens)
+            ),
+            dim_style(),
+        ));
     }
-    let mut line = Line::from(vec![
-        Span::styled(format!("{glyph} "), prompt_style()),
-        Span::styled("Working…", dim_style()),
-        Span::styled(format!(" ({})", details.join(" · ")), dim_style()),
-    ]);
+    let mut line = Line::from(spans);
     truncate_line(&mut line, content_width(width));
     pad_line_left(
         &mut line,
         TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1)),
     );
     truncate_line(&mut line, width.max(1));
-    vec![Line::default(), line, Line::default()]
+    line
+}
+
+fn working_lines(
+    frame: &str,
+    elapsed: Option<Duration>,
+    footer: Option<&Footer>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    vec![working_indicator_line(
+        frame,
+        elapsed.unwrap_or_default(),
+        true,
+        footer.and_then(|footer| footer.usage.as_ref()),
+        width,
+    )]
 }
 
 /// Build a styled, empty editor for the bordered composer panel: dim
@@ -2362,6 +2410,9 @@ impl Screen {
     pub(crate) fn start_turn(&mut self) {
         self.spinner.start();
         self.approval_hint = None;
+        if let Some(footer) = &mut self.footer {
+            footer.usage = None;
+        }
     }
 
     pub(crate) fn end_turn(&mut self) {
@@ -2407,7 +2458,7 @@ impl Screen {
     fn working_lines(&self, width: u16) -> Vec<Line<'static>> {
         if self.spinner.active && self.approval_hint.is_none() {
             working_lines(
-                self.spinner.glyph(),
+                self.spinner.frame(),
                 self.spinner.elapsed(),
                 self.footer.as_ref(),
                 usize::from(width),
@@ -2791,14 +2842,14 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(heights.menu),
-        Constraint::Length(global_status_h),
         Constraint::Length(heights.working),
+        Constraint::Length(global_status_h),
         Constraint::Length(heights.editor),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
-    let rail_area = chunks[1];
-    let working_area = chunks[2];
+    let working_area = chunks[1];
+    let rail_area = chunks[2];
     let editor_area = chunks[3];
 
     let mut buf = Buffer::empty(chrome_area);
@@ -3538,7 +3589,7 @@ mod tests {
                     "width {width}: {line:?}"
                 );
             }
-            for line in working_lines(SPINNER_FRAMES[0], Some(Duration::from_secs(1)), None, width)
+            for line in working_lines(WORKING_FRAMES[0], Some(Duration::from_secs(1)), None, width)
             {
                 assert!(
                     display_width(&line_text(&line)) <= width,
@@ -3883,41 +3934,48 @@ mod tests {
     }
 
     #[test]
-    fn inline_working_indicator_keeps_spinner_usage_interrupt_hint_and_effort() {
+    fn inline_working_indicator_uses_led_chase_interrupt_and_token_telemetry() {
         let mut screen = Screen::new();
         screen.set_footer(
             "opus-4.8".to_string(),
             Some("high".to_string()),
-            "~/repo (branch)".to_string(),
+            "~/repo".to_string(),
         );
+        screen.start_turn();
         screen.apply(UiEvent::ProviderTurnCompleted {
             turn_id: "turn_1".to_string(),
             response_id: Some("resp_1".to_string()),
             usage: Some(ProviderUsage {
                 provider: "anthropic".to_string(),
                 model: "opus-4.8".to_string(),
-                input_tokens: 300,
-                output_tokens: 104,
+                input_tokens: 177_000,
+                output_tokens: 5_700,
                 cache_read_input_tokens: 0,
                 cache_write_input_tokens: 0,
                 reasoning_output_tokens: 30,
-                total_tokens: 404,
+                total_tokens: 182_700,
                 cache_creation: None,
             }),
         });
-        screen.start_turn();
 
         let before = rendered_text(&mut screen, 100, 16);
         assert!(!before.contains("WORKING"), "{before}");
-        assert!(before.contains(SPINNER_FRAMES[0]), "{before}");
-        assert!(before.contains("Working…"), "{before}");
-        assert!(before.contains("esc to interrupt"), "{before}");
-        assert!(before.contains("↓ 404 tokens"), "{before}");
-        assert!(before.contains("thinking with high effort"), "{before}");
+        assert!(!before.contains("Working…"), "{before}");
+        assert!(before.contains("●···"), "{before}");
+        assert!(before.contains("┊ ESC ┊"), "{before}");
+        assert!(before.contains("↑177k ↓5.7k"), "{before}");
+        assert!(!before.contains('|'), "{before}");
+        assert!(!before.contains("T+"), "{before}");
+        for frame in BRAILLE_SPINNER_FRAMES {
+            assert!(
+                !before.contains(frame),
+                "braille spinner frame {frame} leaked: {before}"
+            );
+        }
 
         assert!(screen.tick());
         let after = rendered_text(&mut screen, 100, 16);
-        assert!(after.contains(SPINNER_FRAMES[1]), "{after}");
+        assert!(after.contains("·●··"), "{after}");
         let working = screen
             .working_lines(100)
             .iter()
@@ -3931,27 +3989,80 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_effort_is_only_in_working_indicator() {
-        let mut screen = Screen::new();
-        screen.set_footer(
-            "gpt-5.5".to_string(),
-            Some("high".to_string()),
-            "~/repo".to_string(),
+    fn working_indicator_renders_all_ping_pong_led_frames() {
+        let frames: Vec<String> = (0..WORKING_FRAMES.len())
+            .map(|frame| {
+                line_text(&working_indicator_line(
+                    WORKING_FRAMES[frame],
+                    Duration::from_secs(87),
+                    true,
+                    None,
+                    80,
+                ))
+                .trim()
+                .to_string()
+            })
+            .collect();
+        assert_eq!(
+            frames,
+            vec![
+                "●··· 1:27 ┊ ESC",
+                "·●·· 1:27 ┊ ESC",
+                "··●· 1:27 ┊ ESC",
+                "···● 1:27 ┊ ESC",
+                "··●· 1:27 ┊ ESC",
+                "·●·· 1:27 ┊ ESC",
+            ]
         );
-        screen.start_turn();
+    }
 
-        let rail = global_status_line(&screen, 100)
-            .map(|line| line_text(&line))
-            .unwrap_or_default();
-        let working = screen
-            .working_lines(100)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
+    #[test]
+    fn working_indicator_omits_unavailable_optional_fields_without_empty_separators() {
+        let usage = ProviderUsage {
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 12_000,
+            output_tokens: 5_700,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 12_400,
+            cache_creation: None,
+        };
+        let without_telemetry = line_text(&working_indicator_line(
+            WORKING_FRAMES[0],
+            Duration::from_secs(87),
+            true,
+            None,
+            80,
+        ))
+        .trim()
+        .to_string();
+        let without_interrupt = line_text(&working_indicator_line(
+            WORKING_FRAMES[0],
+            Duration::from_secs(87),
+            false,
+            Some(&usage),
+            80,
+        ))
+        .trim()
+        .to_string();
+        let elapsed_only = line_text(&working_indicator_line(
+            WORKING_FRAMES[0],
+            Duration::from_secs(87),
+            false,
+            None,
+            80,
+        ))
+        .trim()
+        .to_string();
 
-        assert!(!rail.contains("EFFORT"), "{rail}");
-        assert!(working.contains("thinking with high effort"), "{working}");
+        assert_eq!(without_telemetry, "●··· 1:27 ┊ ESC");
+        assert_eq!(without_interrupt, "●··· 1:27 ┊ ↑12k ↓5.7k");
+        assert_eq!(elapsed_only, "●··· 1:27");
+        assert!(!without_telemetry.contains("┊ ┊"));
+        assert!(!without_interrupt.contains("┊ ┊"));
+        assert!(!elapsed_only.contains('┊'));
     }
 
     #[test]
@@ -4718,6 +4829,7 @@ mod tests {
             Some("xhigh".to_string()),
             "~/repo (branch)".to_string(),
         );
+        screen.start_turn();
         screen.apply(UiEvent::ProviderTurnCompleted {
             turn_id: "turn_1".to_string(),
             response_id: Some("resp_1".to_string()),
@@ -4733,13 +4845,11 @@ mod tests {
                 cache_creation: None,
             }),
         });
-
-        screen.start_turn();
         let rendered = rendered_text(&mut screen, 120, 12);
         assert!(rendered.contains("opus-4.8 xhigh"), "{rendered}");
-        assert!(rendered.contains("↓ 120 tokens"), "{rendered}");
+        assert!(rendered.contains("↑100 ↓20"), "{rendered}");
         assert!(
-            rendered.contains("thinking with xhigh effort"),
+            !rendered.contains("thinking with xhigh effort"),
             "{rendered}"
         );
 
@@ -4750,38 +4860,52 @@ mod tests {
         );
         let refreshed = rendered_text(&mut screen, 120, 12);
         assert!(refreshed.contains("opus-4.8 high"), "{refreshed}");
-        assert!(refreshed.contains("↓ 120 tokens"), "{refreshed}");
+        assert!(refreshed.contains("↑100 ↓20"), "{refreshed}");
         assert!(
-            refreshed.contains("thinking with high effort"),
+            !refreshed.contains("thinking with high effort"),
             "{refreshed}"
         );
     }
 
     #[test]
-    fn working_indicator_shows_elapsed_from_the_first_second() {
-        let early = working_lines("\u{280b}", Some(Duration::from_secs(5)), None, 80)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!early.contains("WORKING"), "{early}");
-        assert!(!early.contains("00:00:05s"), "{early}");
-        assert!(early.contains("5s"), "{early}");
-        assert!(early.contains("esc to interrupt"), "{early}");
+    fn working_indicator_formats_elapsed_duration_compactly() {
+        let under_ten = line_text(&working_indicator_line(
+            WORKING_FRAMES[0],
+            Duration::from_millis(500),
+            true,
+            None,
+            80,
+        ));
+        assert!(under_ten.contains("0.5s"), "{under_ten}");
+        assert!(!under_ten.contains("T+"), "{under_ten}");
+        assert!(!under_ten.contains("00:00:00s"), "{under_ten}");
 
-        let zero = working_lines("\u{280b}", None, None, 80)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(zero.contains("0s"), "{zero}");
+        let over_ten = line_text(&working_indicator_line(
+            WORKING_FRAMES[0],
+            Duration::from_secs(13),
+            true,
+            None,
+            80,
+        ));
+        assert!(over_ten.contains("13s"), "{over_ten}");
 
-        let over = working_lines("\u{280b}", Some(Duration::from_secs(71)), None, 80)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(over.contains("1m 11s"), "{over}");
+        let over_minute = line_text(&working_indicator_line(
+            WORKING_FRAMES[0],
+            Duration::from_secs(87),
+            true,
+            None,
+            80,
+        ));
+        assert!(over_minute.contains("1:27"), "{over_minute}");
+
+        let over_hour = line_text(&working_indicator_line(
+            WORKING_FRAMES[0],
+            Duration::from_secs(3734),
+            true,
+            None,
+            80,
+        ));
+        assert!(over_hour.contains("1:02:14"), "{over_hour}");
     }
 
     #[test]
@@ -4801,10 +4925,10 @@ mod tests {
 
     #[test]
     fn elapsed_format_and_labelled_rule() {
-        assert_eq!(format_elapsed_compact(45), "45s");
-        assert_eq!(format_elapsed_compact(71), "1m 11s");
-        assert_eq!(format_elapsed_compact(132), "2m 12s");
-        assert_eq!(format_elapsed_compact(3669), "1h 01m 09s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(45)), "45s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(71)), "1:11");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(132)), "2:12");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(3669)), "1:01:09");
         // A labelled rule embeds the text and fills to width with dashes.
         let line = hrule_line("Worked for 2m 12s", 40);
         let text = line_text(&line);

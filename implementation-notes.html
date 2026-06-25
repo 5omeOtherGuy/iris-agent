@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Working Indicator Implementation Notes</title></head>
+<body>
+<h1>Working Indicator Implementation Notes</h1>
+<ul>
+  <li><strong>Worktree constraint:</strong> project preflight could not be completed because the primary checkout is behind origin/main and contains a pre-existing untracked <code>package-lock.json</code>. I did not modify that file and continued in the current checkout to avoid touching unrelated user/agent work.</li>
+  <li><strong>Telemetry source:</strong> the TUI only receives provider token usage on <code>ProviderTurnCompleted</code>. The indicator therefore shows usage once the active turn has reported it, and clears stale prior usage when a new turn starts so the readout represents the current turn rather than the previous one.</li>
+  <li><strong>Field scope:</strong> the prior active-turn line included model reasoning effort text. The new indicator intentionally omits that extra field because the spec fixes the working indicator field order to activity, elapsed, interrupt, then token telemetry.</li>
+</ul>
+</body>
+</html>
