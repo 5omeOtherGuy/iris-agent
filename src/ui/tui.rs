@@ -2132,6 +2132,7 @@ impl Transcript {
         }
     }
 
+    #[cfg(test)]
     fn latest_panel_collapsed(&self) -> bool {
         self.rows
             .iter()
@@ -2615,6 +2616,7 @@ impl Screen {
         self.transcript.toggle_latest_panel()
     }
 
+    #[cfg(test)]
     pub(crate) fn latest_panel_collapsed(&self) -> bool {
         self.transcript.latest_panel_collapsed()
     }
