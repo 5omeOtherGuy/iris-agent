@@ -4245,10 +4245,7 @@ mod tests {
             .map(|line| line_text(&line))
             .expect("statusline");
 
-        assert_eq!(
-            status.trim_end(),
-            "    ● MODE code  ┊  MODEL gpt-5.4-mini"
-        );
+        assert_eq!(status.trim_end(), "    ● MODE code  ┊  MODEL gpt-5.4-mini");
         assert!(!status.contains(" off"));
         assert!(!status.contains("CTX"));
         assert!(!status.contains("CWD"));
