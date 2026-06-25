@@ -1186,12 +1186,20 @@ mod tests {
     #[test]
     fn ctrl_o_toggles_latest_panel_when_idle() {
         let mut screen = Screen::new();
+        // Long output caps to a preview, so the panel is foldable and ctrl+o
+        // reveals it.
+        let content = (0..20)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         screen.apply(UiEvent::ToolResult {
             call: call(),
-            content: "hi".to_string(),
+            content,
             exit_code: None,
             duration: None,
         });
+        // Capped output starts collapsed (preview).
+        assert!(screen.latest_panel_collapsed());
 
         assert!(matches!(
             handle_idle_event(
@@ -1200,7 +1208,8 @@ mod tests {
             ),
             IdleKey::Continue
         ));
-        assert!(screen.latest_panel_collapsed());
+        // ctrl+o reveals the full output.
+        assert!(!screen.latest_panel_collapsed());
     }
 
     #[test]

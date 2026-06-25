@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use crate::ui::markdown::render_markdown;
 
-use super::rows::TranscriptRow;
+use super::rows::{FoldVis, TranscriptRow};
 use super::transcript::streaming_markdown_preview;
 use super::wrap::line_text;
 use super::{panel_style, prompt_style};
@@ -44,6 +44,7 @@ fn user_row(text: &str) -> TranscriptRow {
         style: panel_style(),
         continuation_prefix: Some(ASSISTANT_TEXT_PREFIX),
         line: None,
+        fold: FoldVis::Always,
         word_wrap: true,
         background: None,
         hrule: false,
@@ -65,6 +66,7 @@ fn assistant_row(mut line: Line<'static>, first: bool) -> TranscriptRow {
         style: panel_style(),
         continuation_prefix: Some(ASSISTANT_TEXT_PREFIX),
         line: Some(line),
+        fold: FoldVis::Always,
         word_wrap: true,
         background: None,
         hrule: false,
