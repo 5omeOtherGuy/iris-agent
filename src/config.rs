@@ -76,9 +76,11 @@ pub(crate) struct Settings {
     /// default) leaves the agent loop unbounded: it runs while the model emits
     /// tool calls and stops naturally, with cancellation as the runaway guard.
     /// When set, the loop ends the turn with a Notice after this many
-    /// round-trips. Not a security redirect, so a project may tune it (like
-    /// [`Settings::context_token_budget`]); a project value can only narrow a
-    /// run, never redirect tokens.
+    /// round-trips. Not a security-sensitive redirect (unlike provider/base-url),
+    /// and the built-in default is already unbounded, so a project override
+    /// cannot make a run more permissive than the default -- it can only impose
+    /// (or raise/lower) a local loop bound. Project-tunable like
+    /// [`Settings::context_token_budget`].
     pub(crate) max_tool_roundtrips: Option<usize>,
     /// Provider retry/backoff tuning (max retries, base/max backoff). Absent
     /// subfields fall back to the built-in defaults via
@@ -153,8 +155,9 @@ impl Settings {
             // (like provider/base-url) they are global-only and never taken from
             // untrusted project config.
             enabled_models: self.enabled_models,
-            // A turn cap can only narrow a run (never redirect tokens), so a
-            // project may tune it; fall back to global.
+            // A turn cap is not a security-sensitive redirect and the default is
+            // already unbounded, so a project override cannot make a run more
+            // permissive than the default; project value wins, else global.
             max_tool_roundtrips: project.max_tool_roundtrips.or(self.max_tool_roundtrips),
             // Retry tuning affects provider load/cost, so keep it global-only
             // like prompt cache retention; never taken from project config.

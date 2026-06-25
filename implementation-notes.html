@@ -163,6 +163,16 @@
   <li>Kept <code>DEFAULT_GREP_LIMIT = 100</code> and
     <code>GREP_MAX_LINE_LENGTH = 500</code>. DESCRIPTION/parameter strings updated
     (dropped "capped at 1000"/"capped at 500").</li>
+  <li><strong>Accepted tradeoff (reviewer-flagged):</strong> with
+    <code>context</code>/<code>limit</code> no longer clamped, a request such as
+    <code>context=1000000</code> makes the match sink collect more context lines
+    before the final <code>truncate_head</code> (2000 lines / 50 KB) trims the
+    output. This is intentional pi-mono parity: pi-mono's grep likewise has no
+    max-context/limit clamp. Memory stays bounded by the actual file content
+    (ripgrep emits no more context than the file has, and overlapping context is
+    merged) and by <code>GREP_MAX_LINE_LENGTH = 500</code> (the real guard against
+    minified-line blowups). Re-adding a context/limit bound would reintroduce the
+    very clamp this unit removes, so it was deliberately not done.</li>
   <li><strong>Deferral (named):</strong> <code>DEFAULT_CONTEXT</code> stays at
     <code>2</code> (pi-mono defaults to 0). Per the spec, changing the default is
     a behavior choice beyond removing clamps — divergence noted, not changed.</li>
