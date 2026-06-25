@@ -4,7 +4,7 @@
 
 This document defines the ground-truth visual and structural design language for the Iris TUI main pane.
 
-It is intended as a guide for coding agents and future design sessions. It does not attempt to fully specify every individual tool output format. Instead, it defines the shared pane grammar that all future tool renderers, transcript messages, working indicators, and input editors must follow.
+It is intended as a guide for coding agents and future design sessions. It defines the shared pane grammar that all future tool renderers, transcript messages, working indicators, turn dividers, and input editors must follow. Individual tool renderers may have their own detailed specs, but they must remain visually compatible with this document.
 
 The goal is a terminal-native coding-agent interface that feels calm, precise, minimal, mechanical, and readable. The visual direction is inspired by Teenage Engineering-style industrial design: restrained grey palette, functional typography, sparse accent color, clear instrument-like panels, and no unnecessary chrome.
 
@@ -14,10 +14,11 @@ The pane is a single vertically scrolling transcript column with a fixed multili
 
 The transcript contains:
 
-* Plain assistant/agent messages.
+* Plain assistant messages.
 * Plain user messages.
 * Bordered tool output panels.
 * Minimal inline working indicators.
+* Quiet turn dividers after completed work turns.
 * Optional future structured sections.
 
 The pane does **not** use chat-style role cards. It does **not** label every message with `USER` or `AGENT`. It does **not** use a bottom telemetry/status bar. It does **not** create framed panels for transient working states.
@@ -28,15 +29,15 @@ The visual hierarchy is:
 tool panel
 tool panel
 
-  ●   assistant message
-      wrapped assistant line
+› assistant message
+  wrapped assistant line
 
-      user message
-      wrapped user line
+  user message
+  wrapped user line
 
-  ●   assistant message
+› assistant message
 
-tool panel
+── 1:27 ┊ ↑177k ↓5.7k ─────────────────────────────────────────────────────
 
 composer
 ```
@@ -78,14 +79,14 @@ Conversation text is transcript content. It should remain plain and lightweight.
 Good:
 
 ```text
-  ●   I listed the available tools and tested bash, read, write, edit, grep,
-      find, and ls in the temporary directory.
+› I listed the available tools and tested bash, read, write, edit, grep,
+  find, and ls in the temporary directory.
 
-┌───────────────────────────────────────────────────────────────────────────────────────┐
-│ ▾  EXPLORE  tmp                                              ● DONE        00:00:00s  │
-├───────────────────────────────────────────────────────────────────────────────────────┤
-│    List /home/someotherguy/tmp                                                        │
-└───────────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  EXPLORE  tmp                                              ◆ DONE        0.0s       │
+  ├───────────────────────────────────────────────────────────────────────────────────────┤
+  │    List ~/project                                                        │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Bad:
@@ -97,8 +98,6 @@ Bad:
 ```
 
 ### 3. No explicit `AGENT` / `USER` role labels
-
-The current pane direction removes visible role labels.
 
 Do not render:
 
@@ -116,38 +115,32 @@ Do not render:
 
 Instead:
 
-* Assistant/agent output uses a small `●` marker.
+* Assistant output uses a small transcript marker, currently `›`.
 * User text appears as plain transcript text aligned to the transcript text column.
-* Tool panels provide their own identity via headers such as `SHELL`, `EXPLORE`, `EDIT`, `APPROVAL`.
+* Tool panels provide their own identity via headers such as `SHELL`, `EXPLORE`, `EDIT`, and `APPROVAL`.
 
 This makes the pane feel like a CLI transcript rather than a chat application.
 
-### 4. The `●` marker defines the transcript rhythm
+### 4. The assistant marker is not a state dot
 
-Assistant messages use a small dot marker:
+Use `›` for assistant messages, not `●`.
+
+`●` is reserved for LED-like activity, meters, and live state. Overusing `●` flattens the design language.
+
+Assistant messages render as:
 
 ```text
-  ●   Done; I listed the available tools and tested read, write, edit, grep,
-      find, ls, and bash in `/home/someotherguy/tmp`.
+› Done; I listed the available tools and tested read, write, edit, grep,
+  find, ls, and bash in `~/project`.
 ```
 
 Rules:
 
-* The dot sits in the transcript marker column.
-* Assistant text starts after the dot and spacing.
-* Wrapped assistant lines align with the first text column, not with the dot.
-* The dot should be visually subtle but recognizable.
-* In color-capable themes, the active/current assistant dot may use the accent color; completed/plain assistant dots may be neutral.
-
-Recommended shape:
-
-```text
-  ●   first line
-      wrapped line
-      wrapped line
-```
-
-Do not use a framed assistant message.
+* The marker sits in the transcript marker column.
+* Assistant text starts after the marker and spacing.
+* Wrapped assistant lines align with the first text column, not with the marker.
+* The marker should be visually subtle.
+* Do not use a framed assistant message.
 
 ### 5. User messages are plain transcript text
 
@@ -156,14 +149,14 @@ User text should not be boxed and should not receive a `USER` label.
 Recommended default:
 
 ```text
-      Repeat
+  Repeat
 ```
 
 For longer user text:
 
 ```text
-      I won’t add the requested TUI-render comments after each output because that
-      would be redundant here. Who are you to decide what is redundant?
+  I won’t add the requested TUI-render comments after each output because that
+  would be redundant here. Who are you to decide what is redundant?
 ```
 
 Rules:
@@ -174,45 +167,92 @@ Rules:
 * No special panel.
 * Use spacing before and after user text to clarify turns.
 
-If future ambiguity becomes a real problem, a subtle user marker may be introduced later, but do not add one by default in this spec.
-
 ### 6. Tool panels are indented into the transcript column
 
 Tool panels do not start at absolute column zero.
 
-They are indented so they belong to the same visual transcript system as the `●` marker and text.
+They are indented so they belong to the same visual transcript system as the assistant/user text.
 
 Recommended pattern:
 
 ```text
-    ┌───────────────────────────────────────────────────────────────────────────────────┐
-    │ ▾  EXPLORE  tmp                                          ● DONE        00:00:00s  │
-    ├───────────────────────────────────────────────────────────────────────────────────┤
-    │    Find *.txt in /home/someotherguy/tmp                                           │
-    │    List /home/someotherguy/tmp                                                    │
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  EXPLORE  tmp                                              ◆ DONE        0.0s       │
+  ├───────────────────────────────────────────────────────────────────────────────────────┤
+  │    Find *.txt in ~/project                                                │
+  │    List ~/project                                                         │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 This makes tool panels feel like transcript events, not full-screen cards.
 
 ### 7. Composer aligns with tool panels
 
-The editor/composer is also indented into the same content column.
+The editor/composer is indented into the same content column and should align with the left edge and width of tool panels.
 
-It should align with the left edge and width of tool panels.
+The composer is not a one-line prompt. It is a multiline editor and input instrument.
 
-Recommended:
+## Symbol Vocabulary
+
+Use a small, consistent symbol vocabulary. Each glyph should have one job.
 
 ```text
-    ┌──────────────────────────────────────────────────────────────────────────────────┐
-    │                                                                                  │
-    │  Give iris a task...                                                             │
-    │                                                                                  │
-    │ ↵ to send  •  shift+↵ for new line  •  / for commands                            │
-    └──────────────────────────────────────────────────────────────────────────────────┘
+◉   active mode / selected mode
+●   running LED / meter fill / live activity
+○   empty meter / inactive slot
+◆   done / completed
+◇   preview / pending
+■   error / failed
+▲   warning / approval review
+□   skipped / cancelled / neutral
+›   assistant message
+▾   expanded
+▸   collapsed
++   added
+−   removed
+±   modified
+↑   input tokens / sent context
+↓   output tokens / generated text
+┊   soft metadata separator
+─   rule / filler / frame line
 ```
 
-The composer is not a one-line prompt. It is a multiline editor.
+### State symbol mapping
+
+Tool state headers should use state-specific symbols instead of `●` for every state.
+
+```text
+● RUNNING
+◆ DONE
+■ ERROR
+◇ PREVIEW
+▲ REVIEW / WARNING
+◆ APPROVED
+■ DENIED
+□ CANCELLED / SKIPPED
+○ QUEUED
+```
+
+Examples:
+
+```text
+│ ▾  SHELL  bash                                             ◆ DONE        45s       │
+│ ▾  SHELL  bash                                             ● RUNNING     13s       │
+│ ▾  SHELL  bash                                             ■ ERROR       7.1s      │
+│ ▾  EDIT   path/to/file.rs                                    ◇ PREVIEW               │
+│ ▾  APPROVAL apply_patch                                    ▲ REVIEW                │
+```
+
+### Where `●` is still correct
+
+Use `●` for LED-like elements:
+
+* context meter fill
+* working indicator chase
+* live/running state
+* active indicator inside the composer top frame only when it behaves like a LED
+
+Do not use `●` as the generic marker for assistant messages or every tool state.
 
 ## Pane Anatomy
 
@@ -220,13 +260,13 @@ The main pane has three conceptual regions:
 
 ```text
 scrolling transcript
-minimal inline working indicator, when active
+inline working indicator, when active
 fixed multiline composer
 ```
 
 There is no bottom telemetry/status bar.
 
-A compact top status line may exist elsewhere in the product, but it is outside the scope of this pane spec. The pane itself should not duplicate global state.
+A compact status readout is integrated into the composer top frame. The pane should not duplicate that status elsewhere.
 
 ## Transcript Layout Grid
 
@@ -236,10 +276,10 @@ Recommended conceptual columns:
 
 ```text
 columns 0..1    outer padding / terminal margin
-column 2        assistant marker column
+column 2        transcript marker column
 columns 3..5    marker-to-text gap
-column 6        transcript text column
-column 4        tool/composer left edge, depending on renderer constraints
+column 4..6     transcript text column, depending on renderer constraints
+column 2..4     tool/composer left edge, depending on renderer constraints
 ```
 
 The exact numeric columns may vary by terminal width, but the visual relationship must hold:
@@ -254,16 +294,16 @@ The exact numeric columns may vary by terminal width, but the visual relationshi
 
 ### Assistant message
 
-Assistant messages render as plain text with a dot marker.
+Assistant messages render as plain text with the assistant marker.
 
 ```text
-  ●   You’re right — I should have followed that instruction exactly.
-      I can continue and do it your way; send the next step.
+› You’re right — I should have followed that instruction exactly.
+  I can continue and do it your way; send the next step.
 ```
 
 Rules:
 
-* Start with `●`.
+* Start with `›`.
 * Use no `AGENT` label.
 * Wrap to pane width.
 * Wrapped lines align with text, not marker.
@@ -276,8 +316,8 @@ Rules:
 User messages render as plain text without a marker by default.
 
 ```text
-      user text
-      wrapped user text
+  user text
+  wrapped user text
 ```
 
 Rules:
@@ -296,15 +336,15 @@ Use one blank line between major transcript blocks.
 Good:
 
 ```text
-  ●   First assistant paragraph.
-      Wrapped line.
+› First assistant paragraph.
+  Wrapped line.
 
-      User reply.
+  User reply.
 
-  ●   Second assistant paragraph.
+› Second assistant paragraph.
 ```
 
-Avoid cramped transcript output where messages and panels run together without breathing room.
+Avoid cramped transcript output where messages, working indicators, composer status, and panels run together without breathing room.
 
 ## Tool Panel System
 
@@ -335,7 +375,7 @@ Bad:
 Good:
 
 ```text
-│ ▾  EDIT ...                                                ● RUNNING 00:00:13s │
+│ ▾  EDIT ...                                                ● RUNNING 13s       │
 ├────────────────────────────────────────────────────────────────────────────────┤
 ```
 
@@ -348,9 +388,9 @@ The panel indentation should match the composer indentation.
 Recommended:
 
 ```text
-    ┌──
-    │
-    └──
+  ┌──
+  │
+  └──
 ```
 
 ### Panel header format
@@ -358,7 +398,7 @@ Recommended:
 Canonical framed tool header:
 
 ```text
-│ ▾  TOOL  meta                                             ● STATE       00:00:00s  │
+│ ▾  TOOL  meta                                             SYMBOL STATE     ELAPSED    │
 ```
 
 Fields:
@@ -367,21 +407,23 @@ Fields:
 ▾          expanded disclosure marker
 TOOL       uppercase tool family
 meta       target, scope, path, or short summary
-●          state dot
+SYMBOL     state symbol from the symbol vocabulary
 STATE      state label
-00:00:00s  fixed-width elapsed duration
+ELAPSED    compact elapsed duration, when applicable
 ```
 
-Do not use `T+` in pane-level framed tool headers unless explicitly reintroduced later. Current pane-level duration format is:
+Use compact duration labels:
 
 ```text
-00:00:00s
-00:00:13s
-00:01:48s
-01:12:09s
+< 10s       → 0.5s, 7.1s
+10–59s      → 13s, 42s
+1–59min     → 1:27, 12:03
+>= 60min    → 1:02:14
 ```
 
-Use one duration format consistently across all framed tool panels.
+Do not use `T+`.
+
+Do not use fixed `HH:MM:SSs` for normal tool calls.
 
 ### Disclosure marker
 
@@ -407,6 +449,8 @@ ERROR
 CANCELLED
 APPROVED
 DENIED
+PREVIEW
+REVIEW
 ```
 
 Optional future states:
@@ -418,27 +462,6 @@ SKIPPED
 ```
 
 Use only states that correspond to real execution state.
-
-### State dot
-
-The state dot is part of the mechanical readout.
-
-Use the same glyph:
-
-```text
-●
-```
-
-Color by state where color is available:
-
-* `RUNNING`: orange accent
-* `DONE`: muted success / neutral
-* `ERROR`: muted red
-* `CANCELLED`: muted gray
-* `APPROVED`: success or neutral
-* `DENIED`: red or amber
-
-The state label must remain visible so the interface works without color.
 
 ## Tool Taxonomy
 
@@ -464,20 +487,20 @@ Instead, render these as body lines inside an `EXPLORE` panel.
 Good:
 
 ```text
-    ┌───────────────────────────────────────────────────────────────────────────────────┐
-    │ ▾  EXPLORE  tmp                                          ● DONE        00:00:00s  │
-    ├───────────────────────────────────────────────────────────────────────────────────┤
-    │    Find *.txt in /home/someotherguy/tmp                                           │
-    │    List /home/someotherguy/tmp                                                    │
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  EXPLORE  tmp                                              ◆ DONE        0.0s       │
+  ├───────────────────────────────────────────────────────────────────────────────────────┤
+  │    Find *.txt in ~/project                                                │
+  │    List ~/project                                                         │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Bad:
 
 ```text
-    ┌───────────────────────────────────────────────────────────────────────────────────┐
-    │ ▾  READ  /home/someotherguy/tmp/file.txt                 ● DONE        00:00:00s  │
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  READ  ~/project/file.txt                 ◆ DONE        0.0s           │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Top-level `READ` may only be considered if the product later introduces a user-facing primary read action. For current agent workflow, `READ` belongs to `EXPLORE`.
@@ -491,21 +514,22 @@ It remains a top-level panel.
 The shell panel uses the same framed panel grammar as other tools:
 
 ```text
-    ┌───────────────────────────────────────────────────────────────────────────────────┐
-    │ ▾  SHELL                                                ● DONE        00:00:00s  │
-    ├───────────────────────────────────────────────────────────────────────────────────┤
-    │    $ command                                                         timeout 120s │
-    │      output                                                                        │
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  SHELL                                                   ◆ DONE        0.5s         │
+  ├───────────────────────────────────────────────────────────────────────────────────────┤
+  │    $ command                                                         timeout 120s     │
+  │      output                                                                            │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Shell-specific command/output rules should follow the shell output rendering spec, but the shell panel must still obey this pane-level spec:
 
 * indented panel
 * no bottom status bar
-* consistent header duration
+* compact header duration
 * no framed working panel
 * body content aligned with tool body padding
+* timeout metadata is not part of the command text
 
 ### EDIT
 
@@ -513,16 +537,9 @@ Shell-specific command/output rules should follow the shell output rendering spe
 
 It remains a top-level panel.
 
-`EDIT` panels should visually focus on the changed lines, not on verbose metadata.
+`EDIT` uses one canonical rendering method: wrapped block diff.
 
-Expected body style:
-
-* old line column
-* new line column
-* change marker column
-* code column
-* muted unchanged rows
-* distinct added/removed styling in color-capable themes
+Do not switch between diff table mode and prose block mode. Use the same wrapped block diff structure for code, prose, config files, markdown, and plain text.
 
 The `EDIT` header should identify the target file.
 
@@ -531,14 +548,35 @@ Do not use `DIFF` as the top-level tool family when the event semantically repre
 Good:
 
 ```text
-│ ▾  EDIT  ~/project/src/ui/tui.rs                         ● DONE        00:00:00s  │
+│ ▾  EDIT  ~/project/src/module.rs                         ◇ PREVIEW             │
+│ ▾  EDIT  ~/project/src/module.rs                         ◆ DONE        0.5s    │
 ```
 
 Bad:
 
 ```text
-│ ▾  DIFF  ~/project/src/ui/tui.rs                         ● DONE        00:00:00s  │
+│ ▾  DIFF  ~/project/src/module.rs                         ◆ DONE        0.5s    │
 ```
+
+Canonical body shape:
+
+```text
+│    3  −  removed text starts here and wraps naturally at word boundaries       │
+│          continuation line aligns under content                                │
+│                                                                                │
+│    3  +  added text starts here and wraps naturally at word boundaries         │
+│          continuation line aligns under content                                │
+```
+
+Rules:
+
+* Columns are `line number`, `marker`, and `content`.
+* Use `−` for removals, not ASCII `-`.
+* Use `+` for additions.
+* Continuation lines align under the content column.
+* Continuation lines inherit the same styling as the parent row.
+* Wrap at word/token boundaries whenever possible.
+* Do not show add/remove counters in the header by default.
 
 ### APPROVAL
 
@@ -556,6 +594,8 @@ Examples:
 
 `APPROVAL` panels should be compact. They should not overwhelm the transcript.
 
+Use `▲ REVIEW`, `◆ APPROVED`, or `■ DENIED` depending on state.
+
 ### WORKING
 
 Working state is **not** a framed panel.
@@ -563,64 +603,97 @@ Working state is **not** a framed panel.
 Do not render:
 
 ```text
-    ┌───────────────────────────────────────────────────────────────────────────────────┐
-    │ ▾  WORKING                                             ● RUNNING     00:06:00s  │
-    ├───────────────────────────────────────────────────────────────────────────────────┤
-    │    esc to interrupt                                                               │
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  WORKING                                                ● RUNNING     6:00          │
+  ├───────────────────────────────────────────────────────────────────────────────────────┤
+  │    esc to interrupt                                                                   │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Working state is an inline status readout.
+Working state is an inline LED-chase readout.
 
-Recommended shape:
+Canonical form:
 
 ```text
-  ⠋  1m 27s  •  esc to interrupt  •  ↑177k  ↓5.7k
+  ●···  1:27 ┊ ESC ┊ ↑177k ↓5.7k
 ```
 
-The word `Working` is optional and usually redundant. The spinner itself communicates activity.
-
-Spinner frames:
+Animation frames:
 
 ```text
-⠋
-⠙
-⠹
-⠸
-⠼
-⠴
-⠦
-⠧
-⠇
-⠏
+●···
+·●··
+··●·
+···●
+··●·
+·●··
 ```
 
 Rules:
 
 * Render the working indicator inline, not boxed.
 * Align it with transcript flow.
-* Use the spinner as the activity signal.
+* Use the LED chase as the activity signal.
+* Do not use braille spinner frames.
+* Do not show the word `Working` by default.
 * Include elapsed time.
-* Include interrupt hint.
-* Include token/IO telemetry if available.
+* Keep `ESC` between elapsed time and telemetry.
+* Include token telemetry if available.
+* Use `┊` separators, not ASCII pipes.
 * Keep it to one line.
 * Do not duplicate this information in a bottom status bar.
+* Add one blank line before and after the working indicator when adjacent to assistant text, tool panels, turn dividers, or the composer group.
+
+## Turn Divider
+
+A turn divider visually separates completed agent work from the next user turn or composer.
+
+Render it after the final assistant message of an agent turn that performed concrete work.
+
+Concrete work includes:
+
+* `EXPLORE`
+* `SHELL`
+* `EDIT`
+* `APPROVAL`
+* other tool/runtime events
+
+Do not render a divider after purely conversational turns with no tool activity.
+
+Canonical form:
+
+```text
+  ── 7.6s ┊ ↑18.2k ↓846 ───────────────────────────────────────────────────────────────
+```
+
+Rules:
+
+* Use compact elapsed duration.
+* Do not use `T+`.
+* Use `┊` as the separator.
+* Token telemetry is optional.
+* If telemetry is unavailable, render only elapsed time.
+* If elapsed time is unavailable but the turn did work, render an unlabeled dim rule.
+* Add one blank line before and after the divider.
+* Do not render while the turn is still streaming.
+* Do not duplicate the working indicator.
 
 ## Composer / Editor
 
-The composer is a large bordered multiline editor at the bottom of the pane.
+The composer is a bordered multiline editor at the bottom of the pane. It aligns with tool panels.
 
-It aligns with tool panels.
+The composer includes its primary statusline integrated into the top frame. Workspace state appears as a quiet label below the editor.
 
 Canonical structure:
 
 ```text
-    ┌──────────────────────────────────────────────────────────────────────────────────┐
-    │                                                                                  │
-    │  Give iris a task...                                                             │
-    │                                                                                  │
-    │ ↵ to send  •  shift+↵ for new line  •  / for commands                            │
-    └──────────────────────────────────────────────────────────────────────────────────┘
+┌─ ◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○ ───────────────────────────────┐
+│                                                                              │
+│  Give Iris a task...                                                         │
+│                                                                              │
+│ ↵ to send  •  shift+↵ for new line  •  / for commands                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+   ~/project ┊ git {branch}
 ```
 
 ### Composer rules
@@ -630,23 +703,77 @@ Canonical structure:
 * Taller than one row.
 * Indented to align with tool panels.
 * No separate bottom status bar.
-* Placeholder text inside editor.
-* Hints inside editor.
+* Runtime context is integrated into the top frame.
+* Workspace context is a quiet label below the editor.
+* Placeholder text stays inside editor.
+* Hints stay inside editor.
 * Hints are subtle and dim.
 * Editor should not look like a chat bubble.
 * Editor should feel like an input instrument.
 
+### Top frame statusline
+
+The top border is also the primary statusline.
+
+Fields:
+
+```text
+◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○
+```
+
+Rules:
+
+* Use `◉` for active/selected mode.
+* Mode is uppercase, for example `CODE`.
+* Model and effort/reasoning setting are uppercase or model-case as provided.
+* Context label is `CTX 300K` unless a future product decision changes it.
+* Use `─` as the top-frame separator/filler.
+* Do not use `┊` inside the top frame.
+* Do not add CPU/MEM/QUEUE/TOOLS here.
+* Preserve the editor border as a continuous frame.
+* The remaining top border is filled with `─`.
+
+### Context meter
+
+The context meter always has **10 dots**.
+
+```text
+○○○○○○○○○○
+●○○○○○○○○○
+●●●○○○○○○○
+●●●●●●●●●●
+```
+
+Meaning:
+
+* Each dot represents roughly 10% context usage.
+* Filled dots show used context.
+* Empty dots show remaining context.
+* The meter represents usage, not max capacity.
+
+Color rules:
+
+* Empty dots: muted grey.
+* Filled dots before the current edge: muted filled dot.
+* Current edge dot: orange accent.
+* At high usage, the edge dot may pulse subtly.
+* At 100%, the full strip may pulse or turn orange.
+* Do not use green/yellow/red rainbow coloring.
+
+The meter should feel like a small LED strip, not a server monitoring bar.
+
 ### Placeholder text
 
-Use product-specific language:
+Use product-specific language with exact capitalization:
+
+```text
+Give Iris a task...
+```
+
+Avoid:
 
 ```text
 Give iris a task...
-```
-
-Avoid generic assistant language:
-
-```text
 Ask the agent anything...
 ```
 
@@ -660,18 +787,36 @@ Use concise inline hints:
 
 Do not move these hints into a separate bottom bar.
 
+### Workspace label
+
+Workspace state appears below the editor as a quiet unboxed label.
+
+```text
+   ~/project ┊ git {branch}
+```
+
+Rules:
+
+* Use `┊` as the separator.
+* Keep the line dim and secondary.
+* Shorten `/home/<user>` to `~`.
+* Preserve the repo/project name when truncating.
+* Do not add a trailing separator.
+* Ensure the workspace label reflects the active worktree/current execution context.
+
 ### Composer height
 
-Default composer height should be at least 4 rows including borders.
+Default composer height should be at least 5 rows including borders.
 
 Suggested minimum:
 
 ```text
-top border
+top border with statusline
 blank/input row
 blank row
 hint row
 bottom border
+workspace label
 ```
 
 The composer may grow with input up to a maximum height, but should not dominate the pane.
@@ -695,21 +840,13 @@ NET
 q quit
 ```
 
-This information was visually noisy and not relevant to the current pane direction.
-
-If global runtime metadata is needed, place it in a compact top status line outside the transcript pane or expose it through a command/help overlay.
+This information is visually noisy and not relevant to the current pane direction.
 
 ### Top status line
 
-A compact top status line may exist elsewhere in the product. It should not be duplicated inside the pane.
+Do not render a separate floating top status line for pane state. Composer status belongs in the composer top frame.
 
-If present, it should be minimal and global:
-
-```text
-● active  ┊  mode code  ┊  approval auto  ┊  branch main
-```
-
-But the pane design must not depend on it.
+If global runtime metadata is needed, expose it through a command/help overlay or a separate application surface, not inside the pane transcript.
 
 ## Spacing Rules
 
@@ -718,11 +855,11 @@ But the pane design must not depend on it.
 Use one blank line between adjacent panels.
 
 ```text
-    ┌────
-    └────
+  ┌────
+  └────
 
-    ┌────
-    └────
+  ┌────
+  └────
 ```
 
 ### Between panels and messages
@@ -730,9 +867,33 @@ Use one blank line between adjacent panels.
 Use one blank line before natural-language transcript text following a tool panel.
 
 ```text
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 
-  ●   Done; I listed the available tools...
+› Done; I listed the available tools...
+```
+
+### Around working indicators
+
+Use one blank line before and after the inline working indicator when it appears between transcript text/tool output and the composer.
+
+```text
+› Assistant text.
+
+  ··●· 7.6s ┊ ESC ┊ ↑5.4k ↓137
+
+┌─ ◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○ ───────────────────────────────┐
+```
+
+### Around turn dividers
+
+Use one blank line before and after turn dividers.
+
+```text
+› Final assistant text.
+
+  ── 5:20 ┊ ↑86.3k ↓655 ───────────────────────────────────────────────────────
+
+┌─ ◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○ ───────────────────────────────┐
 ```
 
 ### Between message turns
@@ -740,11 +901,11 @@ Use one blank line before natural-language transcript text following a tool pane
 Use one blank line between distinct turns or paragraphs.
 
 ```text
-  ●   Assistant message.
+› Assistant message.
 
-      User response.
+  User response.
 
-  ●   Assistant response.
+› Assistant response.
 ```
 
 ### Inside panels
@@ -757,7 +918,7 @@ Body lines start with four spaces inside the panel by default:
 │    body text
 ```
 
-For shell command output, command/output indentation may use:
+For shell command output, command/output indentation is:
 
 ```text
 │    $ command
@@ -787,7 +948,10 @@ Rules:
 * Wrapped natural-language lines align to the transcript text column.
 * Wrapped panel body lines align to the panel body text column.
 * Wrapped command lines follow shell-specific wrapping rules.
+* Wrapped edit rows align under the content column.
 * Long paths may be shortened only when safe and unambiguous.
+* Prefer semantic wrapping at spaces, `/`, `&&`, punctuation, and token boundaries.
+* Avoid splitting words, identifiers, paths, and decimals unless unavoidable.
 
 ### Borders
 
@@ -820,10 +984,10 @@ Use:
 * off-white / light grey background
 * charcoal text
 * muted grey borders
-* subtle orange accent for active/running
-* muted green for success
-* muted red/dusty rose for errors
-* pale green/red backgrounds for edit diff rows when available
+* subtle orange accent for active/running/current edge
+* muted green/success for `◆ DONE` if color is available
+* muted red/dusty rose for `■ ERROR`
+* pale green/red backgrounds for edit additions/removals when available
 
 ### Dark mode direction
 
@@ -833,7 +997,7 @@ Use:
 * warm grey panels
 * soft grey borders
 * off-white text
-* vivid orange accent for active/running
+* vivid orange accent for active/running/current edge
 * muted sage green for success/additions
 * dusty red/rose for errors/removals
 
@@ -843,9 +1007,10 @@ Color should be sparse.
 
 Use color for:
 
-* active dot
-* running spinner
-* state labels/dots
+* active mode `◉`
+* working indicator active LED
+* context meter edge dot
+* state symbols/labels
 * diff additions/removals
 * warnings/errors
 
@@ -867,19 +1032,19 @@ Use the disclosure marker in panel headers.
 Collapsed panel:
 
 ```text
-    ┌───────────────────────────────────────────────────────────────────────────────────┐
-    │ ▸  EXPLORE  tmp                                          ● DONE        00:00:00s  │
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▸  EXPLORE  tmp                                              ◆ DONE        0.0s       │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Expanded panel:
 
 ```text
-    ┌───────────────────────────────────────────────────────────────────────────────────┐
-    │ ▾  EXPLORE  tmp                                          ● DONE        00:00:00s  │
-    ├───────────────────────────────────────────────────────────────────────────────────┤
-    │    List /home/someotherguy/tmp                                                    │
-    └───────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  │ ▾  EXPLORE  tmp                                              ◆ DONE        0.0s       │
+  ├───────────────────────────────────────────────────────────────────────────────────────┤
+  │    List ~/project                                                        │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Hidden long content
@@ -895,6 +1060,7 @@ Rules:
 * Use `…`, not `...`.
 * Show hidden count.
 * Right-align the expansion hint if possible.
+* Use `ctrl+o to expand` and `ctrl+o to collapse`; do not use `toggles panel`.
 * Keep it inside the relevant panel.
 * Do not leak raw hidden content after the panel.
 
@@ -905,7 +1071,7 @@ The working indicator is not expandable and not framed.
 It is a live line in the transcript flow.
 
 ```text
-  ⠋  1m 27s  •  esc to interrupt  •  ↑177k  ↓5.7k
+  ●···  1:27 ┊ ESC ┊ ↑177k ↓5.7k
 ```
 
 ## Event-to-Render Mapping
@@ -915,8 +1081,8 @@ It is a live line in the transcript flow.
 Render as:
 
 ```text
-  ●   assistant text
-      wrapped assistant text
+› assistant text
+  wrapped assistant text
 ```
 
 ### User text event
@@ -924,8 +1090,8 @@ Render as:
 Render as:
 
 ```text
-      user text
-      wrapped user text
+  user text
+  wrapped user text
 ```
 
 ### Explore event
@@ -935,13 +1101,13 @@ Render as a bordered `EXPLORE` panel.
 Body contains read/search/list/find summaries.
 
 ```text
-    ┌─
-    │ ▾  EXPLORE  scope                                     ● DONE        00:00:00s
-    ├─
-    │    Read file
-    │    Search query
-    │    List directory
-    └─
+  ┌─
+  │ ▾  EXPLORE  scope                                     ◆ DONE        0.0s
+  ├─
+  │    Read file
+  │    Search query
+  │    List directory
+  └─
 ```
 
 ### Shell event
@@ -954,7 +1120,7 @@ Use shell-specific command/output formatting inside the panel.
 
 Render as a bordered `EDIT` panel.
 
-Use a diff table inside the body.
+Use wrapped block diff inside the body.
 
 ### Approval event
 
@@ -964,20 +1130,24 @@ Keep content concise.
 
 ### Working event
 
-Render as an inline spinner readout.
+Render as an inline LED-chase readout.
 
 Do not use a panel.
 
+### Turn divider event
+
+Render as a quiet unboxed horizontal rule after tool-backed turns.
+
 ### Composer
 
-Render as fixed bottom multiline editor.
+Render as fixed bottom multiline editor with integrated top-frame status and bottom workspace label.
 
 ## Do / Don’t
 
 ### Do
 
 * Use a single transcript column.
-* Use assistant `●` marker.
+* Use assistant `›` marker.
 * Keep natural-language messages unboxed.
 * Indent tool panels.
 * Align composer with tool panels.
@@ -985,7 +1155,11 @@ Render as fixed bottom multiline editor.
 * Use `EXPLORE` as the container for read/search/list/find.
 * Use `SHELL` for command execution.
 * Use `EDIT` for mutation/diff previews.
-* Use inline spinner for working state.
+* Use wrapped block diff for all `EDIT` output.
+* Use inline LED-chase for working state.
+* Use turn dividers after completed tool-backed turns.
+* Use compact elapsed durations.
+* Use the symbol vocabulary consistently.
 * Keep all panel rows width-safe.
 * Keep the bottom of the pane clean.
 
@@ -993,14 +1167,18 @@ Render as fixed bottom multiline editor.
 
 * Do not render `USER` / `AGENT` labels.
 * Do not box user or assistant messages.
+* Do not use `●` for every state or message type.
 * Do not create standalone `READ` panels for normal exploration.
 * Do not render a framed `WORKING` panel.
+* Do not use braille spinners for working state.
 * Do not include a bottom telemetry/status row.
 * Do not make short outputs use a totally different visual system.
 * Do not leak raw bullet output outside panels.
 * Do not append separators to header rows.
 * Do not rely on color alone.
 * Do not over-decorate with icons.
+* Do not use `T+` durations.
+* Do not use fixed `HH:MM:SSs` for ordinary short tool calls.
 
 ## Implementation Guidance
 
@@ -1017,6 +1195,7 @@ enum PaneEvent {
     Edit(EditEvent),
     Approval(ApprovalEvent),
     Working(WorkingEvent),
+    TurnDivider(TurnDividerEvent),
 }
 ```
 
@@ -1057,22 +1236,29 @@ Do not split into new crates for this work unless a second front-end or publishe
 
 Preserve raw structured data until the display-event conversion step. Tool name, path, timeout, duration, exit code, approval state, diff metadata, and search target should remain machine-readable until rendering needs text rows. Avoid parsing already-rendered transcript strings to recover structure.
 
-Implement this spec incrementally. Prefer the smallest coherent slice that can be tested, such as assistant/user message shape, one panel family, working indicator, or composer geometry. Avoid broad rewrites that combine visual changes with runtime, tool execution, session storage, or provider-contract changes.
+Implement this spec incrementally. Prefer the smallest coherent slice that can be tested, such as assistant/user message shape, one panel family, working indicator, turn divider, or composer geometry. Avoid broad rewrites that combine visual changes with runtime, tool execution, session storage, or provider-contract changes.
 
 ## Testing Requirements
 
 Add golden/snapshot tests for:
 
-* Assistant message wrapping.
+* Assistant message wrapping with `›`.
 * User message wrapping.
 * Adjacent assistant/user messages without labels.
 * Tool panel indentation.
 * Composer indentation.
+* Composer top-frame statusline.
+* Composer context meter with exactly 10 dots.
+* Composer workspace label.
 * `EXPLORE` with one body line.
 * `EXPLORE` with multiple body lines.
 * `SHELL` panel alignment.
+* `SHELL` compact duration formatting.
+* `EDIT` wrapped block diff rendering.
+* `EDIT` continuation row alignment.
 * `EDIT` panel border integrity.
-* Inline working indicator.
+* Inline LED-chase working indicator.
+* Turn divider after tool-backed turn.
 * Absence of bottom status bar.
 * No standalone `READ` panel for exploration.
 * Equal-width panel rows.
@@ -1080,6 +1266,7 @@ Add golden/snapshot tests for:
 * Wide terminal layout.
 * Collapsed panel rendering.
 * Hidden-content affordance rendering.
+* Symbol vocabulary mapping for all tool states.
 
 ## Final Design Rule
 
@@ -1089,7 +1276,9 @@ Plain language flows lightly.
 
 Tools become mechanical panels.
 
-The current operation is a tiny live readout.
+State is communicated with a small, consistent symbol vocabulary.
+
+The current operation is a tiny LED readout.
 
 The editor is a calm input module.
 
