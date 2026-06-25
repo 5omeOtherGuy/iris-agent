@@ -129,7 +129,14 @@ impl Transcript {
     /// no recoverable text, so a placeholder is shown and the original reasoning
     /// is never rendered. Mirrors pi-mono's hide/show thinking block.
     fn push_thinking_block(&mut self, text: &str, redacted: bool) {
-        self.begin_block();
+        // Intentionally do NOT finish the live stream here. Reasoning is emitted
+        // at completion, after the answer's text deltas have already streamed
+        // into `self.streaming` but before `AssistantTextEnd` commits them.
+        // Committing the stream now (via `begin_block`) would render the answer
+        // *above* the thinking block and double-commit it when `AssistantTextEnd`
+        // arrives. Adding the panel rows while the stream stays pending keeps the
+        // thinking block above the answer, which is committed afterwards.
+        self.push_blank();
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Header {
@@ -1178,9 +1185,11 @@ impl Transcript {
                 }
             }
             UiEvent::AssistantReasoning { text, redacted } => {
-                // Reasoning arrives before the assistant text of the same turn,
-                // so the thinking panel renders above the answer.
-                self.finish_stream();
+                // Reasoning arrives at completion, before the turn's
+                // `AssistantText`/`AssistantTextEnd`. The thinking panel is
+                // pushed above any still-pending streamed answer (which commits
+                // afterwards), so the thinking block renders above the answer
+                // without finishing/duplicating the stream here.
                 if redacted || !text.is_empty() {
                     self.push_thinking_block(&text, redacted);
                 }

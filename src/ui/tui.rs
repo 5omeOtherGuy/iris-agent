@@ -2074,6 +2074,37 @@ mod tests {
     }
 
     #[test]
+    fn assistant_table_never_exceeds_frame_width() {
+        let md = "| Column one heading here | Column two heading here | Three |\n| - | - | - |\n| a fairly long cell value goes here | another long value also here | x |";
+        for width in [40u16, 60, 80] {
+            // Committed path.
+            let mut screen = Screen::new();
+            let _ = screen.wrapped_lines(width);
+            screen.apply(UiEvent::AssistantText(md.to_string()));
+            for line in rendered_lines(&mut screen, width, 24) {
+                let w = super::wrap::display_width(&line_text(&line));
+                assert!(
+                    w <= width as usize,
+                    "committed table line exceeds frame {width}: {:?}",
+                    line_text(&line)
+                );
+            }
+            // Streaming path.
+            let mut screen = Screen::new();
+            let _ = screen.wrapped_lines(width);
+            screen.apply(UiEvent::AssistantTextDelta(md.to_string()));
+            for line in rendered_lines(&mut screen, width, 24) {
+                let w = super::wrap::display_width(&line_text(&line));
+                assert!(
+                    w <= width as usize,
+                    "streaming table line exceeds frame {width}: {:?}",
+                    line_text(&line)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reasoning_renders_collapsed_thinking_block_by_default() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
@@ -2125,6 +2156,34 @@ mod tests {
         assert!(
             expanded.contains("withheld"),
             "redacted placeholder missing: {expanded}"
+        );
+    }
+
+    #[test]
+    fn reasoning_renders_above_streamed_answer_without_duplication() {
+        // Real provider path: answer text streams as deltas, then reasoning and
+        // the terminal text event arrive at completion. The thinking block must
+        // land above the committed answer, and the answer must appear once.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta("The ".to_string()));
+        screen.apply(UiEvent::AssistantTextDelta("answer.".to_string()));
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "deliberating".to_string(),
+            redacted: false,
+        });
+        screen.apply(UiEvent::AssistantTextEnd("The answer.".to_string()));
+        let out = rendered_text(&mut screen, 80, 16);
+        let thinking_at = out.find("Thinking...").expect("thinking label");
+        let answer_at = out.find("The answer.").expect("answer");
+        assert!(
+            thinking_at < answer_at,
+            "thinking block should precede the streamed answer: {out}"
+        );
+        assert_eq!(
+            out.matches("The answer.").count(),
+            1,
+            "streamed answer must be committed exactly once: {out}"
         );
     }
 

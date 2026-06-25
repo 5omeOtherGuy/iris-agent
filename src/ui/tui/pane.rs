@@ -11,7 +11,7 @@ use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use super::rows::TranscriptRow;
 use super::transcript::streaming_markdown_preview;
 use super::wrap::line_text;
-use super::{panel_style, prompt_style};
+use super::{TEXT_COLUMN_X_PADDING, panel_style, prompt_style};
 
 pub(super) const ASSISTANT_TEXT_PREFIX: &str = "  ";
 
@@ -21,6 +21,15 @@ pub(super) const ASSISTANT_TEXT_PREFIX: &str = "  ";
 fn markdown_width(content_width: usize) -> usize {
     content_width
         .saturating_sub(ASSISTANT_TEXT_PREFIX.len())
+        .max(1)
+}
+
+/// The assistant content column for a given full frame width, matching the
+/// inset `TranscriptRow::render` applies (`width - 2 * TEXT_COLUMN_X_PADDING`).
+/// Used by the streaming path, which is handed the full frame width.
+fn content_width(frame_width: usize) -> usize {
+    frame_width
+        .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
         .max(1)
 }
 
@@ -35,7 +44,10 @@ pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, t
 pub(super) fn render_streaming_assistant(width: usize, text: &str, out: &mut Vec<Line<'static>>) {
     let text = streaming_markdown_preview(text);
     let theme = MarkdownTheme::default();
-    let lines = render_markdown_themed(&text, &theme, markdown_width(width));
+    // `width` is the full frame here; reduce to the assistant content column
+    // (the committed path is already handed that column) so table layout matches
+    // the width these rows are actually rendered into.
+    let lines = render_markdown_themed(&text, &theme, markdown_width(content_width(width)));
     for (index, line) in lines.into_iter().enumerate() {
         assistant_row(line, index == 0).render(width, out);
     }

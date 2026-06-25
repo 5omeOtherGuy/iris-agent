@@ -204,7 +204,11 @@ impl<'a> Renderer<'a> {
             }
             Event::SoftBreak => self.push_span(" ".to_string(), self.text_style()),
             Event::HardBreak => {
-                if self.table.is_none() {
+                if let Some(table) = &mut self.table {
+                    // A hard break inside a cell becomes a space; cells are
+                    // single logical strings that the layout wraps per column.
+                    table.cur_cell.push(' ');
+                } else {
                     self.flush();
                 }
             }
@@ -510,7 +514,7 @@ impl<'a> Renderer<'a> {
         }
 
         // Border overhead: "│ " + (cols-1) * " │ " + " │" = 3*cols + 1.
-        let overhead = 3 * cols + 1;
+        let overhead = cols.saturating_mul(3).saturating_add(1);
         let available = self.width.saturating_sub(overhead);
         if available < cols {
             // Too narrow for a stable box: fall back to pipe-joined plain rows.
@@ -580,13 +584,17 @@ impl<'a> Renderer<'a> {
                     spans.push(Span::raw(" "));
                 }
                 let empty = String::new();
-                let text = wrapped[i].get(line_idx).unwrap_or(&empty);
+                let cell = wrapped[i].get(line_idx).unwrap_or(&empty);
+                // Defensive clamp: a glyph wider than a 1-column slot cannot be
+                // split, so guarantee the rendered cell never exceeds its column
+                // and pushes the border out of alignment.
+                let text = truncate_to_width(cell, *w);
                 let align = alignments.get(i).copied().unwrap_or(Alignment::None);
                 let (left, right) = pad_for(UnicodeWidthStr::width(text.as_str()), *w, align);
                 if left > 0 {
                     spans.push(Span::raw(" ".repeat(left)));
                 }
-                spans.push(Span::styled(text.clone(), cell_style));
+                spans.push(Span::styled(text, cell_style));
                 if right > 0 {
                     spans.push(Span::raw(" ".repeat(right)));
                 }
@@ -625,7 +633,7 @@ impl<'a> Renderer<'a> {
 /// Distribute `available` columns across `natural` widths: keep natural widths
 /// when they fit, otherwise shrink proportionally with a floor of 1 per column.
 fn fit_columns(natural: &[usize], available: usize) -> Vec<usize> {
-    let total: usize = natural.iter().sum();
+    let total: usize = natural.iter().fold(0usize, |acc, w| acc.saturating_add(*w));
     if total <= available {
         return natural.iter().map(|w| (*w).max(1)).collect();
     }
@@ -657,6 +665,26 @@ fn fit_columns(natural: &[usize], available: usize) -> Vec<usize> {
         i += 1;
     }
     widths
+}
+
+/// Truncate `text` to at most `max` display columns on a char boundary, so a
+/// rendered table cell never overflows its column (e.g. a wide glyph that cannot
+/// be split into a 1-column slot).
+fn truncate_to_width(text: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        if used + w > max {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
 }
 
 /// Left/right padding to fit `text_width` into `col` for the given alignment.

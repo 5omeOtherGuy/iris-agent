@@ -124,6 +124,31 @@
       resize or storing table source for re-layout.</li>
 </ul>
 
+<h2>Wave-1 review fixes (commit 2)</h2>
+<ul>
+  <li><strong>Streaming + reasoning ordering/duplication (real bug, fixed).</strong> The reasoning
+      apply-arm called <code>finish_stream()</code> (and <code>push_thinking_block</code> used
+      <code>begin_block</code>), which committed the live-streamed answer <em>before</em> the thinking
+      block and then double-committed it when <code>AssistantTextEnd</code> re-committed the same text.
+      Fix: the reasoning arm no longer finishes the stream; <code>push_thinking_block</code> uses
+      <code>push_blank</code> so the panel is inserted above the still-pending stream, which commits
+      once afterwards. Test: <code>reasoning_renders_above_streamed_answer_without_duplication</code>.</li>
+  <li><strong>Streaming table width (real bug, fixed).</strong> <code>render_streaming_assistant</code>
+      is handed the full frame width but passed it straight to table layout; committed rows get the
+      already-inset content width. Fix: streaming reduces by <code>2*TEXT_COLUMN_X_PADDING</code> first
+      so both paths lay out tables at <code>full-10</code>. Test:
+      <code>assistant_table_never_exceeds_frame_width</code> (widths 40/60/80, both paths).</li>
+  <li><strong>Verified false positives (no change):</strong> several reviewers flagged the committed
+      assistant table width and the thinking-block panel width as too wide. Checked the constants:
+      <code>last_width = full - 2*TEXT_COLUMN_X_PADDING = full-8</code> and panel body width =
+      <code>panel_width(full) - PANEL_BODY_CHROME_WIDTH = (full-4) - 4 = full-8</code> are equal, so
+      both already match. No change made (avoided an incorrect double-subtraction).</li>
+  <li><strong>Hardening:</strong> table cell lines are clamped with a width-aware
+      <code>truncate_to_width</code> so an unsplittable wide glyph in a 1-column slot can't push the
+      border out; <code>HardBreak</code> inside a cell becomes a space; table overhead/column-sum use
+      saturating arithmetic.</li>
+</ul>
+
 <h2>Reviewer-facing regression risks</h2>
 <ul>
   <li>Default markdown output parity rests on <code>MarkdownTheme::default()</code> matching the old
