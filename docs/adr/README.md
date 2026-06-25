@@ -23,6 +23,7 @@
 | [0020](0020-expand-typed-runtime-events.md) | Expand typed runtime events | accepted | 2026-06-21 |
 | [0021](0021-structured-tool-result-contracts.md) | Define structured tool-result contracts without a schema platform | accepted | 2026-06-21 |
 | [0022](0022-use-default-off-provider-native-cache-and-context-management.md) | Use default-off provider-native cache and context-management controls | accepted | 2026-06-22 |
+| [0023](0023-project-tool-declarations-per-provider-and-prefer-native-tools.md) | Project tool declarations per provider and prefer native tools | accepted | 2026-06-21 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.
