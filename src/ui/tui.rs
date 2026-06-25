@@ -2894,7 +2894,7 @@ fn global_status_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
     let (cwd, branch) = split_cwd_branch(&clean_cwd);
     let model = strip_ansi_for_text(&footer.model);
     let model_flag = (!screen.spinner.active)
-        .then(|| footer.effort.as_ref())
+        .then_some(footer.effort.as_ref())
         .flatten()
         .map(|effort| strip_ansi_for_text(effort));
     let fields = status_fields_for_width(
