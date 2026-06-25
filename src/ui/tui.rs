@@ -39,6 +39,7 @@ use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::tool_display::{
     display_path, exploration_summary, is_exploration_tool, run_target, summarize,
 };
+use crate::ui::markdown::render_markdown;
 use crate::ui::modal::Modal;
 use crate::ui::slash::{self, Palette, SlashCommand};
 use crate::ui::terminal_surface::TerminalSurface;
@@ -50,6 +51,8 @@ const MAX_EDITOR_ROWS: u16 = 10;
 
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
+const MIN_EDITOR_H: u16 = 5;
+const RAIL_H: u16 = 1;
 
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
@@ -69,6 +72,10 @@ const MAX_STREAMING_MARKDOWN_BYTES: usize = 64 * 1024;
 /// The model still receives the full output; only the terminal preview is
 /// bounded, and the omitted logical-line count is reported.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
+const PANEL_BODY_SIDE_PADDING: usize = 2;
+const PANEL_BODY_BORDER_WIDTH: usize = 2;
+const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_BORDER_WIDTH + PANEL_BODY_SIDE_PADDING * 2;
+const ROLE_PREFIX_WIDTH: usize = 10;
 
 #[cfg(test)]
 const USER_BG: Color = Color::Rgb(16, 17, 18);
@@ -189,13 +196,13 @@ fn truncate_to_width(text: &str, max: usize) -> String {
 }
 
 /// Clamp one logical tool-output line so it wraps to at most `max_rows` physical
-/// rows at `width` (accounting for the 4-column gutter), appending an ellipsis
+/// rows at `width` (accounting for panel body chrome), appending an ellipsis
 /// when content is dropped. This keeps the head/tail fold a HARD physical-row cap
 /// even when a single line (e.g. a minified blob) would otherwise wrap to far
 /// more rows than its slice budget.
 fn clamp_output_line(raw: &str, width: usize, max_rows: usize) -> String {
     let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
-    let usable = width.saturating_sub(4).max(1);
+    let usable = width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
     let max_cols = usable.saturating_mul(max_rows.max(1));
     if display_width(&line) <= max_cols {
         return line;
@@ -207,11 +214,11 @@ fn clamp_output_line(raw: &str, width: usize, max_rows: usize) -> String {
 }
 
 /// Estimate the physical rows a tool-output line occupies after wrapping to
-/// `width`, accounting for the 4-column gutter prefix. At least one row. ANSI
+/// `width`, accounting for the panel borders and body padding. At least one row. ANSI
 /// escapes are counted as visible width (a conservative over-estimate that only
 /// makes the flood cap trip slightly earlier), which is fine for a guard.
 fn wrapped_row_estimate(line: &str, width: usize) -> usize {
-    let usable = width.saturating_sub(4).max(1);
+    let usable = width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
     display_width(line).div_ceil(usable).max(1)
 }
 
@@ -296,6 +303,15 @@ impl TranscriptRow {
                 out.extend(role_lines(width, label, marker, text));
                 return;
             }
+            if let ChromeRow::RoleLine {
+                label,
+                marker,
+                line,
+            } = chrome
+            {
+                out.extend(role_styled_lines(width, label, marker, line));
+                return;
+            }
             out.push(chrome.render(width));
             return;
         }
@@ -360,6 +376,11 @@ enum ChromeRow {
         marker: Option<&'static str>,
         text: String,
     },
+    RoleLine {
+        label: &'static str,
+        marker: Option<&'static str>,
+        line: Line<'static>,
+    },
 }
 
 impl ChromeRow {
@@ -380,6 +401,14 @@ impl ChromeRow {
                 marker,
                 text,
             } => role_lines(width, label, marker, text)
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+            ChromeRow::RoleLine {
+                label,
+                marker,
+                line,
+            } => role_styled_lines(width, label, marker, line)
                 .into_iter()
                 .next()
                 .unwrap_or_default(),
@@ -499,9 +528,8 @@ fn panel_header_line(
 }
 
 fn panel_body_line(width: usize, mut line: Line<'static>, bg: Option<Color>) -> Line<'static> {
-    let width = width.max(2);
-    let inner_width = width.saturating_sub(2);
-    let body_width = inner_width.saturating_sub(4).max(1);
+    let width = width.max(PANEL_BODY_BORDER_WIDTH);
+    let body_width = width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
     truncate_line(&mut line, body_width);
     if let Some(bg) = bg {
         apply_width_bg(&mut line, bg, body_width);
@@ -514,12 +542,13 @@ fn panel_body_line(width: usize, mut line: Line<'static>, bg: Option<Color>) -> 
             ));
         }
     }
+    let side_padding = " ".repeat(PANEL_BODY_SIDE_PADDING);
     let mut spans = vec![
         Span::styled("│", border_style()),
-        Span::styled("  ", panel_style()),
+        Span::styled(side_padding.clone(), panel_style()),
     ];
     spans.extend(line.spans);
-    spans.push(Span::styled("  ", panel_style()));
+    spans.push(Span::styled(side_padding, panel_style()));
     spans.push(Span::styled("│", border_style()));
     Line::from(spans)
 }
@@ -530,8 +559,8 @@ fn panel_body_lines(
     bg: Option<Color>,
     out: &mut Vec<Line<'static>>,
 ) {
-    let width = width.max(2);
-    let body_width = width.saturating_sub(6).max(1);
+    let width = width.max(PANEL_BODY_BORDER_WIDTH);
+    let body_width = width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
     let mut wrapped = Vec::new();
     push_wrapped_line(&line, body_width, None, &mut wrapped);
     for physical in wrapped {
@@ -545,15 +574,29 @@ fn role_lines(
     marker: &Option<&'static str>,
     text: &str,
 ) -> Vec<Line<'static>> {
+    role_styled_lines(
+        width,
+        label,
+        marker,
+        &Line::from(Span::styled(text.to_string(), panel_style())),
+    )
+}
+
+fn role_styled_lines(
+    width: usize,
+    label: &'static str,
+    marker: &Option<&'static str>,
+    line: &Line<'static>,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let prefix_width = 10usize;
-    let body_width = width.saturating_sub(prefix_width).max(1);
-    let wrapped = wrap_to_width(text, body_width);
-    wrapped
+    let body_width = width.saturating_sub(ROLE_PREFIX_WIDTH).max(1);
+    let mut body_rows = Vec::new();
+    push_wrapped_line_wordwise(line, body_width, &mut body_rows);
+    body_rows
         .into_iter()
         .enumerate()
-        .map(|(i, physical)| {
-            if i == 0 {
+        .map(|(i, body)| {
+            let mut spans = if i == 0 {
                 let mut spans = vec![Span::styled(format!("{label:<5}"), panel_style())];
                 if let Some(marker) = marker {
                     spans.push(Span::styled(format!(" {marker}"), prompt_style()));
@@ -561,14 +604,12 @@ fn role_lines(
                 } else {
                     spans.push(Span::styled("     ", panel_style()));
                 }
-                spans.push(Span::styled(physical, panel_style()));
-                Line::from(spans)
+                spans
             } else {
-                Line::from(vec![
-                    Span::styled(" ".repeat(prefix_width), panel_style()),
-                    Span::styled(physical, panel_style()),
-                ])
-            }
+                vec![Span::styled(" ".repeat(ROLE_PREFIX_WIDTH), panel_style())]
+            };
+            spans.extend(body.spans);
+            Line::from(spans)
         })
         .collect()
 }
@@ -749,6 +790,12 @@ struct ActiveExploration {
     row: usize,
 }
 
+struct ActiveTool {
+    call: ToolCall,
+    body_start: usize,
+    started: Instant,
+}
+
 fn tool_panel_title(call: &ToolCall) -> &'static str {
     match call.name.as_str() {
         "read" => "READ",
@@ -800,6 +847,7 @@ struct Transcript {
     /// The open live exec cell, if a streaming tool is running.
     active_exec: Option<ActiveExec>,
     active_explorations: Vec<ActiveExploration>,
+    active_tool: Option<ActiveTool>,
     exploring_open: bool,
     /// Last width the transcript was rendered/flushed at, so width-aware
     /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
@@ -835,14 +883,15 @@ impl Transcript {
     }
 
     fn push_agent_text(&mut self, text: &str) {
-        for (i, line) in text.split('\n').enumerate() {
+        for (i, line) in render_markdown(text).into_iter().enumerate() {
+            let text = line_text(&line);
             self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Role {
+                ChromeRow::RoleLine {
                     label: if i == 0 { "AGENT" } else { "" },
                     marker: if i == 0 { Some("●") } else { None },
-                    text: line.to_string(),
+                    line,
                 },
-                line.to_string(),
+                text,
                 panel_style(),
             ));
         }
@@ -1008,11 +1057,18 @@ impl Transcript {
         call: &ToolCall,
         running: bool,
         duration: Option<std::time::Duration>,
+        started: Option<Instant>,
     ) {
         let state = if running { " RUNNING" } else { " DONE" };
-        let elapsed = duration
-            .map(format_panel_duration)
-            .unwrap_or_else(|| "00:00:00s".to_string());
+        let elapsed = if running {
+            started
+                .map(|started| format_panel_duration(started.elapsed()))
+                .unwrap_or_else(|| "00:00:00s".to_string())
+        } else {
+            duration
+                .map(format_panel_duration)
+                .unwrap_or_else(|| "00:00:00s".to_string())
+        };
         let title = tool_panel_title(call);
         let meta = tool_panel_meta(call);
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
@@ -1027,7 +1083,11 @@ impl Transcript {
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
             },
-            format!("• Ran {meta}"),
+            if running {
+                format!("• Running {meta}")
+            } else {
+                format!("• Ran {meta}")
+            },
             tool_header_style(),
         ));
         self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
@@ -1041,7 +1101,7 @@ impl Transcript {
         duration: Option<std::time::Duration>,
         error: Option<&str>,
     ) {
-        self.push_generic_tool_header(call, running, duration);
+        self.push_generic_tool_header(call, running, duration, None);
         if !content.is_empty() {
             self.push_tool_output(content);
         } else if error.is_none() {
@@ -1071,6 +1131,111 @@ impl Transcript {
             body_start,
             started,
         });
+    }
+
+    fn begin_tool(&mut self, call: ToolCall) {
+        self.begin_block();
+        let body_start = self.rows.len();
+        let started = Instant::now();
+        self.push_generic_tool_header(&call, true, None, Some(started));
+        self.push_tool_panel_body("running…", dim_style());
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.active_tool = Some(ActiveTool {
+            call,
+            body_start,
+            started,
+        });
+    }
+
+    fn active_tool_panel_end(&self, active: &ActiveTool) -> usize {
+        self.rows[active.body_start..]
+            .iter()
+            .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)))
+            .map_or(active.body_start, |offset| active.body_start + offset + 1)
+    }
+
+    fn replace_active_tool_panel(&mut self, active: &ActiveTool, replacement: Vec<TranscriptRow>) {
+        let end = self.active_tool_panel_end(active);
+        self.rows.splice(active.body_start..end, replacement);
+    }
+
+    fn collect_rows(&mut self, write: impl FnOnce(&mut Self)) -> Vec<TranscriptRow> {
+        let start = self.rows.len();
+        write(self);
+        self.rows.split_off(start)
+    }
+
+    fn finalized_tool_rows(
+        &mut self,
+        call: &ToolCall,
+        content: &str,
+        duration: Option<std::time::Duration>,
+        started: Instant,
+    ) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            this.push_generic_tool_header(call, false, duration, Some(started));
+            if !content.is_empty() {
+                this.push_tool_output(content);
+            } else {
+                this.push_tool_panel_body("(no output)", dim_style());
+            }
+            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        })
+    }
+
+    fn errored_tool_rows(
+        &mut self,
+        call: &ToolCall,
+        message: &str,
+        started: Instant,
+    ) -> Vec<TranscriptRow> {
+        self.collect_rows(|this| {
+            this.push_generic_tool_header(call, false, None, Some(started));
+            this.push_tool_panel_body(&format!("error: {message}"), err_style());
+            this.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        })
+    }
+
+    fn finalize_active_tool(
+        &mut self,
+        call: &ToolCall,
+        content: &str,
+        duration: Option<std::time::Duration>,
+    ) -> bool {
+        let Some(active) = self.active_tool.take() else {
+            return false;
+        };
+        if active.call.id != call.id {
+            self.active_tool = Some(active);
+            return false;
+        }
+        let rows = self.finalized_tool_rows(call, content, duration, active.started);
+        self.replace_active_tool_panel(&active, rows);
+        true
+    }
+
+    fn finalize_active_tool_error(&mut self, call: &ToolCall, message: &str) -> bool {
+        let Some(active) = self.active_tool.take() else {
+            return false;
+        };
+        if active.call.id != call.id {
+            self.active_tool = Some(active);
+            return false;
+        }
+        let rows = self.errored_tool_rows(call, message, active.started);
+        self.replace_active_tool_panel(&active, rows);
+        true
+    }
+
+    fn clear_active_tool_for_preview(&mut self, call: &ToolCall) {
+        if self
+            .active_tool
+            .as_ref()
+            .is_some_and(|active| active.call.id == call.id)
+            && let Some(active) = self.active_tool.take()
+        {
+            self.replace_active_tool_panel(&active, Vec::new());
+        }
     }
 
     /// Re-render the open exec block in place from its bounded output buffer: the
@@ -1449,8 +1614,7 @@ impl Transcript {
                 } else if call.name == "bash" {
                     self.begin_exec(call);
                 } else {
-                    // Non-streaming tools such as write/edit render on
-                    // ToolResult so their panel can include the final status.
+                    self.begin_tool(call);
                 }
             }
             UiEvent::ToolOutputDelta { call_id, chunk } => {
@@ -1477,6 +1641,7 @@ impl Transcript {
                 self.record_approval(&call, ApprovalDecision::AllowAlways);
             }
             UiEvent::DiffPreview { call, diff } => {
+                self.clear_active_tool_for_preview(&call);
                 self.begin_block();
                 self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
                 self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
@@ -1513,7 +1678,7 @@ impl Transcript {
                     .is_some_and(|a| a.call.id == call.id)
                 {
                     self.finalize_active(&call, &content, exit_code, duration);
-                } else {
+                } else if !self.finalize_active_tool(&call, &content, duration) {
                     self.push_tool_result(&call, &content, exit_code, duration);
                 }
             }
@@ -1524,6 +1689,7 @@ impl Transcript {
                     .is_some_and(|a| a.call.id == call.id)
                 {
                     self.finalize_active_error(&call, &message);
+                } else if self.finalize_active_tool_error(&call, &message) {
                 } else if !is_exploration_tool(&call) || !self.push_explored_error(&call, &message)
                 {
                     self.push_tool_error(&call, &message);
@@ -1559,6 +1725,7 @@ impl Transcript {
         if self.rows.len() <= MAX_TRANSCRIPT_ROWS
             || self.streaming.is_some()
             || self.active_exec.is_some()
+            || self.active_tool.is_some()
             || !self.active_explorations.is_empty()
         {
             return;
@@ -1598,14 +1765,15 @@ impl Transcript {
         }
         if let Some(text) = &self.streaming {
             let text = streaming_markdown_preview(text);
-            for (i, line) in text.split('\n').enumerate() {
+            for (i, line) in render_markdown(&text).into_iter().enumerate() {
+                let text = line_text(&line);
                 TranscriptRow::chrome_with_text(
-                    ChromeRow::Role {
+                    ChromeRow::RoleLine {
                         label: if i == 0 { "AGENT" } else { "" },
                         marker: if i == 0 { Some("●") } else { None },
-                        text: line.to_string(),
+                        line,
                     },
-                    line.to_string(),
+                    text,
                     panel_style(),
                 )
                 .render(width, &mut rows);
@@ -1642,7 +1810,6 @@ fn approval_line(call: &ToolCall, scope: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-#[cfg(test)]
 fn approval_status_line(hint: &ApprovalHint) -> Line<'static> {
     let mut spans = vec![Span::raw("approve ")];
     spans.extend(ansi_spans(&hint.target, Style::default()));
@@ -1651,7 +1818,6 @@ fn approval_status_line(hint: &ApprovalHint) -> Line<'static> {
     Line::from(spans)
 }
 
-#[cfg(test)]
 fn approval_status_lines(hint: &ApprovalHint, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let full = approval_status_line(hint);
@@ -1722,14 +1888,10 @@ struct Spinner {
     started: Option<Instant>,
 }
 
-#[cfg(test)]
 struct ApprovalHint {
     target: String,
     options: &'static str,
 }
-
-#[cfg(not(test))]
-struct ApprovalHint;
 
 impl Spinner {
     fn start(&mut self) {
@@ -1764,6 +1926,8 @@ impl Spinner {
 struct Footer {
     /// Model display token.
     model: String,
+    /// Reasoning effort display token, when configured.
+    effort: Option<String>,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
     /// Latest provider-reported usage, if the provider surfaced it.
@@ -1831,7 +1995,6 @@ fn footer_usage_text(usage: &ProviderUsage) -> String {
     text
 }
 
-#[cfg(test)]
 fn compact_count(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}m", value as f64 / 1_000_000.0)
@@ -1850,7 +2013,18 @@ fn working_lines(
 ) -> Vec<Line<'static>> {
     let secs = elapsed.unwrap_or_default().as_secs();
     let elapsed = format_panel_duration(Duration::from_secs(secs));
-    let mut rows = vec![
+    let mut details = vec![format_elapsed_compact(secs)];
+    if let Some(usage) = footer.and_then(|footer| footer.usage.as_ref()) {
+        details.push(format!(
+            "last turn ↓ {} tokens",
+            compact_count(usage.total_tokens)
+        ));
+    }
+    if let Some(effort) = footer.and_then(|footer| footer.effort.as_ref()) {
+        details.push(format!("thinking with {effort} effort"));
+    }
+    let status = format!("  {glyph} Working… ({})", details.join(" · "));
+    vec![
         Line::default(),
         panel_rule_line(width, '┌', '┐'),
         panel_header_line(
@@ -1859,33 +2033,21 @@ fn working_lines(
             "WORKING",
             "",
             &[
-                ("●".to_string(), prompt_style()),
+                (glyph.to_string(), prompt_style()),
                 (" RUNNING     ".to_string(), panel_style()),
                 (format!("{elapsed:>10}  "), dim_style()),
             ],
         ),
         panel_rule_line(width, '├', '┤'),
-        panel_body_line(
-            width,
-            Line::from(Span::styled(
-                format!("  {}", format_elapsed_compact(secs)),
-                dim_style(),
-            )),
-            None,
-        ),
+        panel_body_line(width, Line::from(Span::styled(status, dim_style())), None),
         panel_body_line(
             width,
             Line::from(Span::styled("  esc to interrupt", dim_style())),
             None,
         ),
         panel_rule_line(width, '└', '┘'),
-    ];
-    if let Some(usage) = footer.and_then(|footer| footer.usage.as_ref()) {
-        let _ = usage;
-    }
-    let _ = glyph;
-    rows.push(Line::default());
-    rows
+        Line::default(),
+    ]
 }
 
 /// Build a styled, empty editor: borderless shaded input row, dim placeholder,
@@ -1904,7 +2066,12 @@ fn fresh_editor() -> TextArea<'static> {
 }
 
 fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
-    let inner_width = usize::from(width.max(1)); // borderless: full frame width
+    let inner_width = usize::from(
+        width
+            .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
+            .saturating_sub(TEXT_X_PADDING_U16.saturating_mul(2))
+            .max(1),
+    );
     editor
         .lines()
         .iter()
@@ -2043,9 +2210,13 @@ impl Screen {
     /// Set (or refresh) the idle footer from the live model selection. The loop
     /// calls this whenever the model/effort changes; `cwd` is home-relativized.
     pub(crate) fn set_footer(&mut self, model: String, effort: Option<String>, cwd: String) {
-        let _ = effort;
         let usage = self.footer.as_ref().and_then(|footer| footer.usage.clone());
-        self.footer = Some(Footer { model, cwd, usage });
+        self.footer = Some(Footer {
+            model,
+            effort,
+            cwd,
+            usage,
+        });
     }
 
     pub(crate) fn start_turn(&mut self) {
@@ -2081,18 +2252,10 @@ impl Screen {
         } else {
             "[y] once  [N] deny"
         };
-        #[cfg(test)]
-        {
-            self.approval_hint = Some(ApprovalHint {
-                target: run_target(call),
-                options,
-            });
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (call, options);
-            self.approval_hint = Some(ApprovalHint);
-        }
+        self.approval_hint = Some(ApprovalHint {
+            target: run_target(call),
+            options,
+        });
     }
 
     pub(crate) fn record_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
@@ -2338,8 +2501,7 @@ fn render_document_with_chrome_tail(
     }
     let width = size.width.max(1);
     let height = size.height.max(1);
-    let mut transcript = vec![status_rail_line(screen, width)];
-    transcript.extend(screen.wrapped_lines(width));
+    let mut transcript = screen.wrapped_lines(width);
     let chrome = render_editor_chrome(screen, width, height);
     let chrome_len = chrome.len();
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
@@ -2357,11 +2519,23 @@ fn render_document_with_chrome_tail(
 }
 
 fn status_rail_line(screen: &Screen, width: u16) -> Line<'static> {
-    let (model, cwd, branch) = screen.footer.as_ref().map_or_else(
-        || ("model".to_string(), "~".to_string(), "-".to_string()),
+    let (model, effort, cwd, branch) = screen.footer.as_ref().map_or_else(
+        || {
+            (
+                "model".to_string(),
+                "-".to_string(),
+                "~".to_string(),
+                "-".to_string(),
+            )
+        },
         |footer| {
             let (cwd, branch) = split_cwd_branch(&footer.cwd);
-            (footer.model.clone(), cwd, branch)
+            (
+                footer.model.clone(),
+                footer.effort.clone().unwrap_or_else(|| "-".to_string()),
+                cwd,
+                branch,
+            )
         },
     );
     let mut spans = vec![
@@ -2371,6 +2545,9 @@ fn status_rail_line(screen: &Screen, width: u16) -> Line<'static> {
         rail_sep(),
         Span::styled("MODEL ", panel_style()),
         Span::styled(model, dim_style()),
+        rail_sep(),
+        Span::styled("EFFORT ", panel_style()),
+        Span::styled(effort, dim_style()),
         rail_sep(),
         Span::styled("CONTEXT ", panel_style()),
         Span::styled("128k", dim_style()),
@@ -2402,10 +2579,69 @@ fn split_cwd_branch(cwd: &str) -> (String, String) {
     (cwd.to_string(), "-".to_string())
 }
 
+#[derive(Clone, Copy)]
+struct ChromeHeights {
+    menu: u16,
+    working: u16,
+    editor: u16,
+}
+
+fn chrome_heights(
+    height: u16,
+    menu_wanted: u16,
+    desired_working_h: u16,
+    editor_rows: u16,
+) -> ChromeHeights {
+    let working = if desired_working_h > 0
+        && height
+            >= MIN_EDITOR_H
+                .saturating_add(RAIL_H)
+                .saturating_add(desired_working_h)
+    {
+        desired_working_h
+    } else {
+        0
+    };
+    let menu = menu_wanted.min(
+        height
+            .saturating_sub(MIN_EDITOR_H)
+            .saturating_sub(RAIL_H)
+            .saturating_sub(working),
+    );
+    let max_editor_h = height
+        .saturating_sub(menu)
+        .saturating_sub(RAIL_H)
+        .saturating_sub(working)
+        .max(1);
+    let wanted_editor_h = editor_rows.saturating_add(4);
+    let editor = if max_editor_h >= MIN_EDITOR_H {
+        wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
+    } else {
+        max_editor_h.max(1)
+    };
+    ChromeHeights {
+        menu,
+        working,
+        editor,
+    }
+}
+
 fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
     let area = Rect::new(0, 0, width, height);
 
-    let editor_rows = editor_visual_rows(&screen.editor, area.width);
+    let editor_rows = screen.approval_hint.as_ref().map_or_else(
+        || editor_visual_rows(&screen.editor, area.width),
+        |hint| {
+            let inner_width = area
+                .width
+                .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
+                .saturating_sub(TEXT_X_PADDING_U16.saturating_mul(2))
+                .max(1);
+            u16::try_from(approval_status_lines(hint, usize::from(inner_width)).len())
+                .unwrap_or(u16::MAX)
+                .clamp(1, MAX_EDITOR_ROWS)
+        },
+    );
     let input_text = screen.editor_text();
     let modal_lines = screen.modal.as_ref().map(|modal| {
         modal.render(u16::try_from(content_width(usize::from(area.width))).unwrap_or(u16::MAX))
@@ -2429,41 +2665,35 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
 
     // Bottom-anchored, clamped to the fixed viewport. The editor owns its hint
     // row inside the border; there is no bottom status bar in the spec.
-    const MIN_EDITOR_H: u16 = 5;
+    let rail_lines = vec![status_rail_line(screen, area.width)];
     let working_lines = screen.working_lines(area.width);
-    let desired_working_h = u16::try_from(working_lines.len()).unwrap_or(u16::MAX);
-    let working_h =
-        if desired_working_h > 0 && area.height >= MIN_EDITOR_H.saturating_add(desired_working_h) {
-            desired_working_h
-        } else {
-            0
-        };
-    let menu_h = menu_wanted.min(
-        area.height
-            .saturating_sub(MIN_EDITOR_H)
-            .saturating_sub(working_h),
+    let heights = chrome_heights(
+        area.height,
+        menu_wanted,
+        u16::try_from(working_lines.len()).unwrap_or(u16::MAX),
+        editor_rows,
     );
-    let max_editor_h = area
-        .height
-        .saturating_sub(menu_h)
-        .saturating_sub(working_h)
-        .max(1);
-    let editor_h = (editor_rows + 4).clamp(MIN_EDITOR_H, max_editor_h);
-    let chrome_h = menu_h.saturating_add(working_h).saturating_add(editor_h);
+    let chrome_h = heights
+        .menu
+        .saturating_add(RAIL_H)
+        .saturating_add(heights.working)
+        .saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
-        Constraint::Length(menu_h),
-        Constraint::Length(working_h),
-        Constraint::Length(editor_h),
+        Constraint::Length(heights.menu),
+        Constraint::Length(RAIL_H),
+        Constraint::Length(heights.working),
+        Constraint::Length(heights.editor),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
-    let working_area = chunks[1];
-    let editor_area = chunks[2];
+    let rail_area = chunks[1];
+    let working_area = chunks[2];
+    let editor_area = chunks[3];
 
     let mut buf = Buffer::empty(chrome_area);
 
-    if menu_h > 0 {
+    if heights.menu > 0 {
         if let Some(lines) = modal_lines {
             render_plain_menu_lines(&mut buf, menu_area, lines);
         } else {
@@ -2475,7 +2705,8 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             );
         }
     }
-    if working_h > 0 {
+    Paragraph::new(Text::from(rail_lines)).render(rail_area, &mut buf);
+    if heights.working > 0 {
         Paragraph::new(Text::from(working_lines)).render(working_area, &mut buf);
     }
 
@@ -2498,7 +2729,12 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         width: box_area.width.saturating_sub(TEXT_X_PADDING_U16 * 2).max(1),
         height: editor_area.height.saturating_sub(3).max(1),
     };
-    (&screen.editor).render(text_area, &mut buf);
+    if let Some(hint) = &screen.approval_hint {
+        let approval_lines = approval_status_lines(hint, usize::from(text_area.width));
+        Paragraph::new(Text::from(approval_lines)).render(text_area, &mut buf);
+    } else {
+        (&screen.editor).render(text_area, &mut buf);
+    }
     let hint = Line::from(Span::styled(
         "↵ to send  •  shift+↵ for new line  •  / for commands",
         dim_style(),
@@ -2760,12 +2996,26 @@ mod tests {
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(rendered.iter().any(|line| line.starts_with("AGENT ●")));
-        assert!(rendered.iter().any(|line| line.contains("# Title")));
+        let title = line_matching(&lines, |line| line_text(line).contains("Title"));
+        assert!(!line_text(title).contains('#'));
+        assert!(
+            title
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+            "heading lost bold style: {title:?}"
+        );
         assert!(
             rendered
                 .iter()
                 .any(|line| line.contains("use `cargo test`"))
         );
+        let code = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref().contains("cargo test"))
+            .expect("inline code span");
+        assert_eq!(code.style.fg, Some(Color::Cyan));
         assert!(rendered.iter().any(|line| line.trim_start() == "- one"));
         assert!(rendered.iter().any(|line| line.trim_start() == "- two"));
     }
@@ -2783,7 +3033,8 @@ mod tests {
                 .iter()
                 .any(|line| line_text(line).contains("AGENT ●"))
         );
-        assert!(live.iter().any(|l| line_text(l).contains("# Title")));
+        assert!(live.iter().any(|l| line_text(l).contains("Title")));
+        assert!(!live.iter().any(|l| line_text(l).contains("# Title")));
         assert!(live.iter().any(|l| line_text(l).contains("cargo test")));
         assert!(live.iter().any(|l| line_text(l).trim_start() == "- one"));
 
@@ -2962,7 +3213,6 @@ mod tests {
         assert!(!texts.iter().any(|t| t.starts_with("[ok]")));
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn tool_output_preserves_ansi_color_spans() {
         let mut screen = Screen::new();
@@ -2974,15 +3224,11 @@ mod tests {
         });
         let lines = screen.wrapped_lines(80);
         let output = line_matching(&lines, |line| line_text(line).contains("red plain"));
-        assert_eq!(line_text(output), "      └ red plain");
-        assert_eq!(output.spans[0].content.as_ref(), "    ");
-        assert_eq!(output.spans[0].style, Style::default());
-        assert_eq!(output.spans[1].content.as_ref(), "  └ ");
-        assert_eq!(output.spans[1].style, dim_style());
-        assert_eq!(output.spans[2].content.as_ref(), "red");
-        assert_eq!(output.spans[2].style, Style::default().fg(Color::Red));
-        assert_eq!(output.spans[3].content.as_ref(), " plain");
-        assert_eq!(output.spans[3].style.fg, Some(Color::DarkGray));
+        assert!(line_text(output).contains("red plain"), "{output:?}");
+        let red = span_matching(output, |span| span.content.as_ref() == "red");
+        assert_eq!(red.style, Style::default().fg(Color::Red));
+        let plain = span_matching(output, |span| span.content.as_ref() == " plain");
+        assert_eq!(plain.style.fg, Some(MUTED));
     }
 
     #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
@@ -3057,7 +3303,6 @@ mod tests {
         );
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn ansi_tool_output_hard_wraps_without_dropping_chars() {
         let mut screen = Screen::new();
@@ -3086,7 +3331,6 @@ mod tests {
         );
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn tool_output_caps_by_physical_rows_even_under_logical_line_limit() {
         let mut screen = Screen::new();
@@ -3121,7 +3365,6 @@ mod tests {
         );
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn tool_output_keeps_head_and_tail_with_middle_elided() {
         let mut screen = Screen::new();
@@ -3141,7 +3384,7 @@ mod tests {
         });
         let texts: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
         // First output line shown under the head gutter; last line shown in tail.
-        assert!(texts.iter().any(|t| t == "      └ line 0"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("line 0")), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("line 19")), "{texts:?}");
         // The middle is elided with an accurate count, and the block stays
         // within the physical-row budget (+ marker).
@@ -3177,11 +3420,12 @@ mod tests {
         screen.show_approval(&call_args("bash", json!({ "command": "echo hi" })), false);
         let lines = screen.status_lines(80);
         assert!(line_text(&lines[0]).contains("approve echo hi"));
+        assert!(line_text(&lines[0]).contains("[y] once"));
+        assert!(line_text(&lines[0]).contains("[N] deny"));
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
-    fn approval_hint_wraps_in_narrow_frame() {
+    fn approval_prompt_renders_inside_editor_panel_and_wraps() {
         let mut screen = Screen::new();
         screen.show_approval(
             &call_args(
@@ -3205,6 +3449,18 @@ mod tests {
         assert!(rendered.contains("  │ "));
         assert!(rendered.contains("120s)"), "{rendered}");
         assert!(rendered.contains("[N] deny"), "{rendered}");
+        assert!(
+            !rendered.contains("Ask the agent anything..."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn editor_visual_rows_use_actual_inner_text_width() {
+        let mut editor = fresh_editor();
+        editor.insert_str("abcdefghijklmnopqrst");
+
+        assert_eq!(editor_visual_rows(&editor, 18), 2);
     }
 
     #[test]
@@ -3400,7 +3656,6 @@ mod tests {
         );
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn diff_preview_drops_file_headers_and_colors_changes() {
         let mut screen = Screen::new();
@@ -3410,25 +3665,39 @@ mod tests {
         });
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(!texts.iter().any(|t| t.contains("--- a/note.txt")));
-        assert!(texts.iter().any(|t| t == "+new"));
-        assert!(texts.iter().any(|t| t == "-old"));
+        assert!(!texts.iter().any(|t| t.contains("@@ -1 +1 @@")));
+        assert!(texts.iter().any(|t| t.contains("-  |  old")));
+        assert!(texts.iter().any(|t| t.contains("+  |  new")));
         let add = screen
             .transcript
             .rows
             .iter()
-            .find(|row| row.text == "+new")
+            .find(|row| row.text.contains("+  |  new"))
             .expect("addition row");
         let remove = screen
             .transcript
             .rows
             .iter()
-            .find(|row| row.text == "-old")
+            .find(|row| row.text.contains("-  |  old"))
             .expect("removal row");
-        assert_eq!(add.style, Style::default().fg(Color::Green));
-        assert_eq!(remove.style, Style::default().fg(Color::Red));
+        assert_eq!(add.style, ok_style());
+        assert_eq!(remove.style, err_style());
+        assert!(matches!(
+            add.chrome.as_ref(),
+            Some(ChromeRow::Body {
+                bg: Some(DIFF_ADD_BG),
+                ..
+            })
+        ));
+        assert!(matches!(
+            remove.chrome.as_ref(),
+            Some(ChromeRow::Body {
+                bg: Some(DIFF_DEL_BG),
+                ..
+            })
+        ));
     }
 
-    #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
     #[test]
     fn two_file_diff_drops_every_header_pair_not_just_the_first() {
         let mut screen = Screen::new();
@@ -3445,17 +3714,17 @@ mod tests {
         assert!(!texts.iter().any(|t| t.starts_with("--- ")));
         assert!(!texts.iter().any(|t| t.starts_with("+++ ")));
         // Both files' real changes remain.
-        assert!(texts.iter().any(|t| t == "+new1"));
-        assert!(texts.iter().any(|t| t == "+new2"));
-        assert!(texts.iter().any(|t| t == "-old2"));
+        assert!(texts.iter().any(|t| t.contains("+  |  new1")));
+        assert!(texts.iter().any(|t| t.contains("+  |  new2")));
+        assert!(texts.iter().any(|t| t.contains("-  |  old2")));
         // The second file's removal is red, not styled as plain context.
         let remove2 = screen
             .transcript
             .rows
             .iter()
-            .find(|row| row.text == "-old2")
+            .find(|row| row.text.contains("-  |  old2"))
             .expect("second removal row");
-        assert_eq!(remove2.style, Style::default().fg(Color::Red));
+        assert_eq!(remove2.style, err_style());
     }
 
     #[ignore = "obsolete Codex-style visual assertion; replaced by instrument-panel visual tests"]
@@ -3558,11 +3827,160 @@ mod tests {
 
         assert!(rendered.contains("● MODE code  ┊  MODEL sonnet 3.5"));
         assert!(rendered.contains("MODEL sonnet 3.5"));
+        assert!(rendered.contains("EFFORT high"));
         assert!(rendered.contains("CWD ~/workspace/user-auth"));
         assert!(rendered.contains("BRANCH feat/rate-limit"));
         assert!(rendered.contains("┌"));
         assert!(rendered.contains("Ask the agent anything..."));
         assert!(rendered.contains("↵ to send  •  shift+↵ for new line  •  / for commands"));
+    }
+
+    #[test]
+    fn status_rail_is_pinned_with_editor_chrome_not_scrollback() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            "~/repo (feat/pin-rail)".to_string(),
+        );
+        for i in 0..40 {
+            screen.apply(UiEvent::AssistantText(format!("line {i}")));
+        }
+
+        let lines = rendered_lines(&mut screen, 180, 12);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let rail_idx = texts
+            .iter()
+            .position(|line| line.contains("● MODE code"))
+            .expect("status rail remains visible");
+        let editor_idx = texts
+            .iter()
+            .position(|line| line.contains("Ask the agent anything"))
+            .expect("editor remains visible");
+        assert!(rail_idx < editor_idx, "{texts:?}");
+        assert!(texts[rail_idx].contains("BRANCH feat/pin-rail"));
+    }
+
+    #[test]
+    fn working_panel_keeps_spinner_usage_and_effort() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "opus-4.8".to_string(),
+            Some("high".to_string()),
+            "~/repo (branch)".to_string(),
+        );
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: Some("resp_1".to_string()),
+            usage: Some(ProviderUsage {
+                provider: "anthropic".to_string(),
+                model: "opus-4.8".to_string(),
+                input_tokens: 300,
+                output_tokens: 104,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 30,
+                total_tokens: 404,
+                cache_creation: None,
+            }),
+        });
+        screen.start_turn();
+
+        let before = rendered_text(&mut screen, 100, 16);
+        assert!(before.contains("WORKING"), "{before}");
+        assert!(before.contains(SPINNER_FRAMES[0]), "{before}");
+        assert!(before.contains("last turn ↓ 404 tokens"), "{before}");
+        assert!(before.contains("thinking with high effort"), "{before}");
+
+        assert!(screen.tick());
+        let after = rendered_text(&mut screen, 100, 16);
+        assert!(after.contains(SPINNER_FRAMES[1]), "{after}");
+    }
+
+    #[test]
+    fn non_bash_tools_show_live_running_panel_and_finalize_in_place() {
+        let mut screen = Screen::new();
+        let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
+
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        let running = rendered_text(&mut screen, 100, 12);
+        assert!(running.contains("EDIT"), "{running}");
+        assert!(running.contains("● RUNNING"), "{running}");
+        assert!(running.contains("running…"), "{running}");
+
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "Successfully replaced 1 occurrence.".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(3)),
+        });
+        let done = rendered_text(&mut screen, 100, 12);
+        assert!(done.contains("● DONE"), "{done}");
+        assert!(
+            done.contains("Successfully replaced 1 occurrence."),
+            "{done}"
+        );
+        assert!(!done.contains("running…"), "{done}");
+    }
+
+    #[test]
+    fn non_bash_tool_finalization_preserves_interleaved_rows() {
+        let mut screen = Screen::new();
+        let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
+
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::Notice("interleaved note".to_string()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "Successfully replaced 1 occurrence.".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(3)),
+        });
+
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(rendered.contains("● DONE"), "{rendered}");
+        assert!(
+            rendered.contains("Successfully replaced 1 occurrence."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("note: interleaved note"), "{rendered}");
+        assert!(!rendered.contains("running…"), "{rendered}");
+    }
+
+    #[test]
+    fn explore_panel_keeps_bottom_border_when_grouping_results() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("read", json!({ "path": "src/a.rs" })),
+            content: "ignored".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("grep", json!({ "pattern": "needle", "path": "src" })),
+            content: "ignored".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+
+        let rows = &screen.transcript.rows;
+        let explore_headers = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Header {
+                        title: "EXPLORE",
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(explore_headers, 1);
+        assert!(matches!(
+            rows.last().and_then(|row| row.chrome.as_ref()),
+            Some(ChromeRow::Bottom)
+        ));
     }
 
     #[test]

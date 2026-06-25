@@ -251,6 +251,63 @@ fn gated_write_emits_diff_preview_before_approval() -> Result<()> {
 }
 
 #[test]
+fn ungated_tool_can_emit_diff_preview_before_execution() -> Result<()> {
+    struct PreviewTool;
+    impl Tool for PreviewTool {
+        fn name(&self) -> &str {
+            "preview"
+        }
+        fn description(&self) -> &str {
+            "ungated previewing tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("ran")) })
+        }
+        fn diff_preview(&self, _workspace: &Path, _args: &Value) -> Option<String> {
+            Some("--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n".to_string())
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("preview", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(
+        provider,
+        &workspace.path,
+        Tools::new(vec![Box::new(PreviewTool)]),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("preview", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    let diff_at = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::DiffPreview { .. }))
+        .expect("ungated preview event");
+    let started_at = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolStarted(_)))
+        .expect("tool started event");
+    assert!(diff_at < started_at, "{events:#?}");
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "ungated preview must not consult the approval gate"
+    );
+    Ok(())
+}
+
+#[test]
 fn malformed_denial_skips_diff_preview() -> Result<()> {
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![
