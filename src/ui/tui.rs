@@ -431,6 +431,7 @@ fn turn_divider_label(elapsed: Option<Duration>, usage: Option<&ProviderUsage>) 
     }
 }
 
+#[cfg(test)]
 fn turn_divider_line(
     elapsed: Option<Duration>,
     usage: Option<&ProviderUsage>,
