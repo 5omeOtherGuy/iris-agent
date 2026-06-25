@@ -1,4 +1,4 @@
-# ADR-0022: Project tool declarations per provider and prefer native tools
+# ADR-0023: Project tool declarations per provider and prefer native tools
 
 **Date**: 2026-06-21
 **Status**: accepted

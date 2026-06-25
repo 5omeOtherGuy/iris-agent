@@ -39,7 +39,7 @@ fn width_for_box(term_width: u16) -> u16 {
 
 fn width_for_text(term_width: u16) -> u16 {
     term_width
-        .saturating_sub(TEXT_COLUMN_X_PADDING as u16)
+        .saturating_sub((TEXT_COLUMN_X_PADDING * 2) as u16)
         .max(1)
 }
 ```
@@ -63,9 +63,10 @@ fn row_text_padding(row: &TranscriptRow) -> usize {
 Meaning:
 
 - Boxed rows paint from `x=2` to `term_width - 2`; their non-empty text starts at
-  `x=4`.
+  `x=4` and ends no later than `term_width - 4`.
 - Unboxed assistant text, tool output, tool summaries, slash menu rows, working
-  indicator text, and footer text start at `x=4`.
+  indicator text, and footer text start at `x=4` and end no later than
+  `term_width - 4`.
 - Separator rows are truly empty and unpadded.
 
 Do not add per-message padding. Route new transcript output through the row
@@ -247,7 +248,7 @@ const MAX_MENU_ROWS: u16 = 16; // includes the blank row above and below
 let inner = Rect {
     x: area.x + TEXT_COLUMN_X_PADDING as u16,
     y: area.y + u16::from(area.height > 1),
-    width: area.width.saturating_sub(TEXT_COLUMN_X_PADDING as u16).max(1),
+    width: area.width.saturating_sub((TEXT_COLUMN_X_PADDING * 2) as u16).max(1),
     height: area.height.saturating_sub(2).max(1),
 };
 ```
@@ -259,7 +260,7 @@ fn render_plain_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static
     let inner = Rect {
         x: area.x + TEXT_COLUMN_X_PADDING as u16,
         y: area.y + u16::from(area.height > 1),
-        width: area.width.saturating_sub(TEXT_COLUMN_X_PADDING as u16).max(1),
+        width: area.width.saturating_sub((TEXT_COLUMN_X_PADDING * 2) as u16).max(1),
         height: area.height.saturating_sub(2).max(1),
     };
     Paragraph::new(Text::from(lines)).render(inner, buf);
@@ -326,7 +327,7 @@ secondary details are dim. The editor remains visible below every menu.
 
 ## Footer Statusline
 
-The footer is unboxed and text-column aligned below the editor.
+The footer is unboxed and text-column aligned below the editor, inset from both terminal edges.
 
 ```rust
 fn footer_lines(footer: &Footer, width: usize) -> Vec<Line<'static>> {

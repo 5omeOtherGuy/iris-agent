@@ -43,6 +43,7 @@ pub(crate) struct RenderState {
     /// Logical row where the terminal cursor is expected to be after Iris's last
     /// write. It may be outside the visible viewport when content has scrolled.
     pub(crate) hardware_cursor_row: usize,
+    pub(crate) previous_volatile_tail: usize,
     pub(crate) first_render: bool,
 }
 
@@ -85,30 +86,40 @@ impl<W: Write> TerminalSurface<W> {
         size: Size,
         lines: &[Line<'static>],
     ) -> io::Result<RenderStats> {
+        self.render_with_volatile_tail(size, lines, 0)
+    }
+
+    pub(crate) fn render_with_volatile_tail(
+        &mut self,
+        size: Size,
+        lines: &[Line<'static>],
+        volatile_tail: usize,
+    ) -> io::Result<RenderStats> {
         let width = size.width.max(1);
         let height = size.height.max(1);
         let rendered = render_lines(lines, width)?;
         let new_lines: Vec<String> = rendered.into_iter().map(|line| line.ansi).collect();
+        let volatile_tail = volatile_tail.min(new_lines.len());
 
         let width_changed = self.state.previous_width != 0 && self.state.previous_width != width;
         let height_changed =
             self.state.previous_height != 0 && self.state.previous_height != height;
 
         if self.state.first_render && !width_changed && !height_changed {
-            self.write_full(new_lines, width, height, false)?;
+            self.write_full(new_lines, width, height, false, volatile_tail)?;
             return Ok(RenderStats {
                 kind: RenderKind::First,
             });
         }
 
         if width_changed || height_changed {
-            self.write_full(new_lines, width, height, true)?;
+            self.write_full(new_lines, width, height, true, volatile_tail)?;
             return Ok(RenderStats {
                 kind: RenderKind::FullRedraw,
             });
         }
 
-        match self.write_diff_or_replay(&new_lines, width, height)? {
+        match self.write_diff_or_replay(&new_lines, width, height, volatile_tail)? {
             RenderKind::FullRedraw => Ok(RenderStats {
                 kind: RenderKind::FullRedraw,
             }),
@@ -143,6 +154,7 @@ impl<W: Write> TerminalSurface<W> {
         width: u16,
         height: u16,
         clear: bool,
+        volatile_tail: usize,
     ) -> io::Result<()> {
         let mut buffer = String::from(BEGIN_SYNC);
         buffer.push_str(DISABLE_AUTOWRAP);
@@ -170,7 +182,7 @@ impl<W: Write> TerminalSurface<W> {
         write!(self.writer, "{buffer}")?;
         self.writer.flush()?;
         let hardware_cursor_row = lines.len().saturating_sub(1);
-        self.remember(lines, width, height, hardware_cursor_row);
+        self.remember(lines, width, height, hardware_cursor_row, volatile_tail);
         Ok(())
     }
 
@@ -191,22 +203,46 @@ impl<W: Write> TerminalSurface<W> {
         lines: &[String],
         width: u16,
         height: u16,
+        volatile_tail: usize,
     ) -> io::Result<RenderKind> {
         let previous_len = self.state.previous_lines.len();
         let new_len = lines.len();
+        let previous_volatile_tail = self.state.previous_volatile_tail.min(previous_len);
+        let previous_stable_len = previous_len.saturating_sub(previous_volatile_tail);
+        let new_stable_len = new_len.saturating_sub(volatile_tail.min(new_len));
 
         let Some((first_changed, last_changed)) = changed_range(&self.state.previous_lines, lines)
         else {
             self.state.previous_width = width;
             self.state.previous_height = height;
             self.state.previous_viewport_top = viewport_top(new_len, height);
+            self.state.previous_volatile_tail = volatile_tail;
             return Ok(RenderKind::Unchanged);
         };
+
+        let stable_append = new_stable_len > previous_stable_len
+            && self.state.previous_lines[..previous_stable_len] == lines[..previous_stable_len];
+        if stable_append && previous_volatile_tail > 0 {
+            self.write_append_replacing_volatile(
+                lines,
+                previous_stable_len,
+                width,
+                height,
+                volatile_tail,
+            )?;
+            return Ok(RenderKind::Append);
+        }
 
         let append_only =
             new_len > previous_len && first_changed == previous_len && previous_len > 0;
         if append_only {
-            self.write_append(&lines[previous_len..], width, height, new_len)?;
+            self.write_append(
+                &lines[previous_len..],
+                width,
+                height,
+                new_len,
+                volatile_tail,
+            )?;
             return Ok(RenderKind::Append);
         }
 
@@ -218,12 +254,103 @@ impl<W: Write> TerminalSurface<W> {
         // Changes above the previous viewport need the same coherent replay to
         // avoid stale rows after resize/history reflow.
         if new_len != previous_len || first_changed < self.state.previous_viewport_top {
-            self.write_full(lines.to_vec(), width, height, true)?;
+            let new_viewport_top = viewport_top(new_len, height);
+            if new_viewport_top > self.state.previous_viewport_top {
+                self.write_scrolling_replay(lines, width, height, new_viewport_top, volatile_tail)?;
+            } else {
+                self.write_full(lines.to_vec(), width, height, true, volatile_tail)?;
+            }
             return Ok(RenderKind::FullRedraw);
         }
 
-        self.write_visible_diff(lines, width, height, first_changed, last_changed)?;
+        self.write_visible_diff(
+            lines,
+            width,
+            height,
+            first_changed,
+            last_changed,
+            volatile_tail,
+        )?;
         Ok(RenderKind::Diff)
+    }
+
+    fn write_scrolling_replay(
+        &mut self,
+        lines: &[String],
+        width: u16,
+        height: u16,
+        new_viewport_top: usize,
+        volatile_tail: usize,
+    ) -> io::Result<()> {
+        let mut buffer = String::from(BEGIN_SYNC);
+        buffer.push_str(DISABLE_AUTOWRAP);
+        move_to_row(
+            &mut buffer,
+            &mut self.state.hardware_cursor_row,
+            self.state.previous_viewport_top,
+            self.state.previous_viewport_top,
+        );
+        buffer.push('\r');
+        for (offset, line) in lines[self.state.previous_viewport_top..].iter().enumerate() {
+            if offset > 0 {
+                buffer.push_str("\r\n");
+                self.state.hardware_cursor_row += 1;
+            }
+            buffer.push_str("\x1b[2K");
+            buffer.push_str(line);
+        }
+        buffer.push_str(ENABLE_AUTOWRAP);
+        buffer.push_str(END_SYNC);
+        write!(self.writer, "{buffer}")?;
+        self.writer.flush()?;
+        self.remember(
+            lines.to_vec(),
+            width,
+            height,
+            lines.len().saturating_sub(1),
+            volatile_tail,
+        );
+        self.state.previous_viewport_top = new_viewport_top;
+        Ok(())
+    }
+
+    fn write_append_replacing_volatile(
+        &mut self,
+        lines: &[String],
+        start: usize,
+        width: u16,
+        height: u16,
+        volatile_tail: usize,
+    ) -> io::Result<()> {
+        let mut buffer = String::from(BEGIN_SYNC);
+        buffer.push_str(DISABLE_AUTOWRAP);
+        move_to_row(
+            &mut buffer,
+            &mut self.state.hardware_cursor_row,
+            self.state.previous_viewport_top,
+            start,
+        );
+        buffer.push('\r');
+        buffer.push_str(CLEAR_TO_SCREEN_END);
+        for (offset, line) in lines[start..].iter().enumerate() {
+            if offset > 0 {
+                buffer.push_str("\r\n");
+            }
+            buffer.push_str("\x1b[2K");
+            buffer.push_str(line);
+        }
+        buffer.push_str(ENABLE_AUTOWRAP);
+        buffer.push_str(END_SYNC);
+        write!(self.writer, "{buffer}")?;
+        self.writer.flush()?;
+        self.remember(
+            lines.to_vec(),
+            width,
+            height,
+            lines.len().saturating_sub(1),
+            volatile_tail,
+        );
+        Ok(())
     }
 
     fn write_append(
@@ -232,6 +359,7 @@ impl<W: Write> TerminalSurface<W> {
         width: u16,
         height: u16,
         new_len: usize,
+        volatile_tail: usize,
     ) -> io::Result<()> {
         let mut buffer = String::from(BEGIN_SYNC);
         buffer.push_str(DISABLE_AUTOWRAP);
@@ -254,7 +382,7 @@ impl<W: Write> TerminalSurface<W> {
 
         let hardware_cursor_row = new_len.saturating_sub(1);
         self.state.previous_lines.extend(appended.iter().cloned());
-        self.remember_metadata(width, height, hardware_cursor_row);
+        self.remember_metadata(width, height, hardware_cursor_row, volatile_tail);
         Ok(())
     }
 
@@ -265,6 +393,7 @@ impl<W: Write> TerminalSurface<W> {
         height: u16,
         first_changed: usize,
         last_changed: usize,
+        volatile_tail: usize,
     ) -> io::Result<()> {
         let mut buffer = String::from(BEGIN_SYNC);
         buffer.push_str(DISABLE_AUTOWRAP);
@@ -287,7 +416,7 @@ impl<W: Write> TerminalSurface<W> {
         buffer.push_str(END_SYNC);
         write!(self.writer, "{buffer}")?;
         self.writer.flush()?;
-        self.remember(lines.to_vec(), width, height, last_changed);
+        self.remember(lines.to_vec(), width, height, last_changed, volatile_tail);
         Ok(())
     }
 
@@ -297,16 +426,24 @@ impl<W: Write> TerminalSurface<W> {
         width: u16,
         height: u16,
         hardware_cursor_row: usize,
+        volatile_tail: usize,
     ) {
         self.state.previous_lines = lines;
-        self.remember_metadata(width, height, hardware_cursor_row);
+        self.remember_metadata(width, height, hardware_cursor_row, volatile_tail);
     }
 
-    fn remember_metadata(&mut self, width: u16, height: u16, hardware_cursor_row: usize) {
+    fn remember_metadata(
+        &mut self,
+        width: u16,
+        height: u16,
+        hardware_cursor_row: usize,
+        volatile_tail: usize,
+    ) {
         self.state.previous_width = width;
         self.state.previous_height = height;
         self.state.previous_viewport_top = viewport_top(self.state.previous_lines.len(), height);
         self.state.hardware_cursor_row = hardware_cursor_row;
+        self.state.previous_volatile_tail = volatile_tail.min(self.state.previous_lines.len());
         self.state.first_render = false;
     }
 }
@@ -552,6 +689,42 @@ mod tests {
     }
 
     #[test]
+    fn append_replaces_volatile_tail_before_writing_new_history() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        surface.render_with_volatile_tail(
+            size(30, 4),
+            &[
+                Line::from("history one"),
+                Line::from("old editor"),
+                Line::from("old status"),
+            ],
+            2,
+        )?;
+        surface.writer_mut().clear();
+
+        let stats = surface.render_with_volatile_tail(
+            size(30, 4),
+            &[
+                Line::from("history one"),
+                Line::from("history two"),
+                Line::from("new editor"),
+                Line::from("new status"),
+            ],
+            2,
+        )?;
+
+        let raw = output(&surface);
+        let out = strip_ansi(&raw);
+        assert_eq!(stats.kind, RenderKind::Append);
+        assert!(raw.contains(CLEAR_TO_SCREEN_END), "{raw:?}");
+        assert!(!out.contains("old editor"), "{out:?}");
+        assert!(!out.contains("old status"), "{out:?}");
+        assert!(out.contains("history two"), "{out:?}");
+        assert!(out.contains("new editor"), "{out:?}");
+        Ok(())
+    }
+
+    #[test]
     fn width_resize_forces_coherent_full_replay() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         surface.render(size(20, 4), &[Line::from("abcdef")])?;
@@ -576,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn non_append_growth_replays_visible_slice_without_scrolling() -> io::Result<()> {
+    fn non_append_growth_replays_from_previous_viewport_to_preserve_scrollback() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         let initial = vec![
             Line::from("transcript 1"),
@@ -604,13 +777,50 @@ mod tests {
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
         let out = output(&surface);
-        assert!(out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
+        assert!(!out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
         let plain = strip_ansi(&out);
-        assert!(plain.contains("transcript 4"), "{plain:?}");
+        assert!(plain.contains("transcript 3"), "{plain:?}");
         assert!(plain.contains("transcript 6"), "{plain:?}");
         assert!(plain.contains("chrome 2"), "{plain:?}");
         assert!(!plain.contains("transcript 1"), "{plain:?}");
-        assert_eq!(plain.matches("\r\n").count(), 4, "{plain:?}");
+        assert_eq!(surface.state().previous_viewport_top, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn scrolling_replay_clears_stale_cells_before_shorter_rows() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let grey = Style::default().bg(Color::Rgb(50, 50, 56));
+        let initial = vec![
+            Line::from("history 1"),
+            Line::from("history 2"),
+            Line::from("history 3"),
+            Line::from("history 4"),
+            Line::from(vec![Span::styled("old shaded editor row", grey)]),
+            Line::from("old working details (17s tokens effort)"),
+        ];
+        surface.render(size(80, 4), &initial)?;
+        surface.writer_mut().clear();
+
+        let next = vec![
+            Line::from("history 1"),
+            Line::from("history 2"),
+            Line::from("history 3"),
+            Line::from("history 4"),
+            Line::from("new explored"),
+            Line::from("short"),
+            Line::from("editor"),
+        ];
+        let stats = surface.render(size(80, 4), &next)?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        let out = output(&surface);
+        assert!(out.matches("\x1b[2K").count() >= 5, "{out:?}");
+        assert!(
+            !strip_ansi(&out).contains("old shaded editor row"),
+            "{out:?}"
+        );
+        assert!(!strip_ansi(&out).contains("working details"), "{out:?}");
         Ok(())
     }
 

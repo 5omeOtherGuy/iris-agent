@@ -886,7 +886,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             }
             KeyCode::Enter if !alt && !ctrl && !shift => {
                 if let Some(cmd) = screen.palette.accept(&input) {
-                    return dispatch_command(cmd);
+                    return dispatch_command(screen, cmd);
                 }
                 return IdleKey::Continue;
             }
@@ -996,7 +996,8 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
 /// `Submit` submits the command name as a line so the shared model-switch
 /// handler routes it (the user may then add args; a bare submit is the
 /// read-only / usage view).
-fn dispatch_command(cmd: &SlashCommand) -> IdleKey {
+fn dispatch_command(screen: &mut Screen, cmd: &SlashCommand) -> IdleKey {
+    screen.clear_editor();
     match cmd.action {
         SlashAction::Exit => IdleKey::Exit,
         SlashAction::Submit => IdleKey::Submit(cmd.name.to_string()),
@@ -1223,6 +1224,10 @@ mod tests {
             IdleKey::Submit(text) => assert_eq!(text, "/model"),
             _ => panic!("expected submit of /model"),
         }
+        assert!(
+            screen.editor_is_empty(),
+            "editor cleared after palette submit"
+        );
     }
 
     #[test]

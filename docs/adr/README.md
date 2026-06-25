@@ -19,4 +19,11 @@
 | [0015](0015-assign-fragments-to-config-defined-named-slots.md) | Assign fragments to config-defined named slots instead of numeric slots | proposed | 2026-06-18 |
 | [0016](0016-preserve-provider-reasoning-continuity-in-flattened-transcripts.md) | Preserve provider reasoning continuity in flattened transcripts | accepted | 2026-06-20 |
 | [0017](0017-centralize-model-selection-and-switch-at-turn-boundaries.md) | Centralize model selection and switch at turn boundaries | accepted | 2026-06-21 |
-| [0022](0022-project-tool-declarations-per-provider-and-prefer-native-tools.md) | Project tool declarations per provider and prefer native tools | accepted | 2026-06-21 |
+| [0019](0019-formalize-correlation-ids.md) | Formalize correlation IDs | accepted | 2026-06-21 |
+| [0020](0020-expand-typed-runtime-events.md) | Expand typed runtime events | accepted | 2026-06-21 |
+| [0021](0021-structured-tool-result-contracts.md) | Define structured tool-result contracts without a schema platform | accepted | 2026-06-21 |
+| [0022](0022-use-default-off-provider-native-cache-and-context-management.md) | Use default-off provider-native cache and context-management controls | accepted | 2026-06-22 |
+| [0023](0023-project-tool-declarations-per-provider-and-prefer-native-tools.md) | Project tool declarations per provider and prefer native tools | accepted | 2026-06-21 |
+
+Note: ADR-0018 was not committed in repository history; numbering resumes at
+ADR-0019 to preserve existing file names and cross-references.

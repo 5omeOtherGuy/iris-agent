@@ -24,7 +24,7 @@ Iris is a terminal-first coding agent being built in Rust. The product is split 
 
 ## Current status
 
-**Status (2026-06-21): Milestone 1, the async-hard runtime, and the Milestone 2 foundations are complete.** The repository currently contains an interactive terminal-surface TUI with Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`, `anthropic`, or `antigravity`), runtime model/reasoning switching, streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, fragment-based system-prompt assembly, provider/model/context settings, JSONL transcript persistence/resume, large-output handles, and turn-boundary auto-compaction. Nexus runs a tokio async loop with turn-level cancellation: the provider is an async event stream raced against cancellation, tools are async with per-call child tokens, concurrency-safe tools run in parallel while everything else stays exclusive, and the transcript stays valid on abort. The next milestone gate is proving the token-efficiency thesis with benchmark evidence.
+**Status (2026-06-22): Milestone 1, the async-hard runtime, and the Milestone 2 foundations are complete.** The repository currently contains an interactive terminal-surface TUI with Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`, `anthropic`, or `antigravity`), runtime model/reasoning switching, streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, fragment-based system-prompt assembly, provider/model/context/cache settings, JSONL transcript persistence/resume, large-output handles, turn-boundary auto-compaction, and default-off provider-native prompt-cache/context-management controls. Nexus runs a tokio async loop with turn-level cancellation: the provider is an async event stream raced against cancellation, tools are async with per-call child tokens, concurrency-safe tools run in parallel while everything else stays exclusive, and the transcript stays valid on abort. The next milestone gate is proving the token-efficiency thesis with benchmark evidence.
 
 Implemented today:
 
@@ -35,6 +35,7 @@ Implemented today:
 - Approval decision/parser in `src/approval.rs`, with `y`/`yes` allowing mutating tool calls and anything else denying safely.
 - Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`, and `Role` types.
 - Runtime `/model` and `/reasoning` switching at safe turn boundaries, plus TUI pickers for model/provider/effort, scoped model cycling, `/settings`, `/login`, and `/logout`.
+- Default-off provider-native prompt-cache controls (`promptCacheRetention: "none" | "short" | "long"`), stable-prefix cache-break diagnostics, provider usage/cache accounting, and Anthropic-only `anthropicContextManagement` clear-edit opt-ins; Anthropic provider-side compact is intentionally rejected until compaction blocks can be persisted and replayed.
 - Workspace-scoped built-in tools under `src/tools/`: `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`, built and injected via `tools::built_in_tools()` (`src/tools/registry.rs`) as `Tool` trait impls that self-classify (`requires_approval`/`is_destructive`/`is_concurrency_safe`/`diff_preview`). `edit` uses Claude Code's exact-string contract (`file_path`/`old_string`/`new_string`/`replace_all`).
 - Approval enforcement for `write`, `edit`, and `bash`, with diff previews for file-mutating tools and model-readable denied-call results.
 - Atomic same-directory file replacement for `write` and `edit`.
@@ -44,8 +45,8 @@ Implemented today:
 - Best-effort JSONL session transcripts, linear `iris resume <id>`, model-selection audit entries, assistant-reasoning rows, compaction entries, and token estimates (`src/session.rs`).
 - Session-scoped large-output handle storage (`src/handles.rs`) and handle-backed tool results when output exceeds the context threshold.
 - Harness-owned system prompt assembly from materialized global fragments, repo fragments, project docs, runtime context, and the live tool registry (`src/wayland/system_prompt/`).
-- Mimir auth flows and token loading/refresh under `src/mimir/auth/`: OpenAI Codex browser/device-code OAuth, Anthropic Claude Code OAuth reuse, and Antigravity Google PKCE OAuth (with runtime or build-time client-secret injection).
-- Mimir providers under `src/mimir/providers/`: OpenAI Codex Responses, Anthropic Messages (Claude Code subscription lane), and Antigravity/Gemini Code Assist streaming, all translated into Nexus's `ChatProvider` contract with normalized reasoning controls where supported.
+- Mimir auth flows and token loading/refresh under `src/mimir/auth/`: shared cancellable loopback OAuth callback plumbing, OpenAI Codex browser/device-code OAuth, Anthropic Claude Code browser OAuth and credential reuse, and Antigravity Google PKCE OAuth (with runtime or build-time client-secret injection).
+- Mimir providers under `src/mimir/providers/`: OpenAI Codex Responses, Anthropic Messages (Claude Code subscription lane), and Antigravity/Gemini Code Assist streaming, all translated into Nexus's `ChatProvider` contract with normalized reasoning controls where supported. Anthropic signed/redacted thinking and Gemini `thoughtSignature` tool-call continuity round-trip through provider-neutral opaque continuity fields.
 - Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, runtime selection, prompt assembly, URL resolution, request shaping, and response parsing.
 
 Not implemented yet:
@@ -105,7 +106,7 @@ From a source checkout, replace `iris` with `cargo run --`.
 Provider notes:
 
 - `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the default provider if no setting is present.
-- `anthropic` uses an existing Claude Code OAuth login. `iris login anthropic` prints the required Claude Code sign-in instructions; Iris reads Claude Code's token from `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when it is not already in the Iris auth store.
+- `anthropic` uses the Claude Code OAuth lane. `iris login anthropic` runs a browser PKCE login with a manual paste fallback; Iris can also bootstrap from Claude Code's token at `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when Anthropic credentials are not already in the Iris auth store.
 - `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is not committed to source and must be supplied via `ANTIGRAVITY_CLIENT_SECRET` at runtime or when building Iris.
 
 Override the auth-file path with:
@@ -130,12 +131,14 @@ At the TUI prompt, use `/model` to view or switch provider/model and
 safe turn boundary. The TUI also exposes `/settings`, `/scoped-models`,
 `/login`, and `/logout` selectors. Recognized settings keys are
 `defaultProvider`, `defaultModel`, `baseUrl`, `contextTokenBudget`,
-`defaultReasoning`, and `enabledModels`.
+`defaultReasoning`, `promptCacheRetention`, `anthropicContextManagement`, and
+`enabledModels`.
 
 Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
 `defaultModel`, `defaultReasoning`, and `contextTokenBudget`; a cloned repo
-cannot choose your provider, scoped model cycle, or redirect OAuth bearer tokens
-with `baseUrl`.
+cannot choose your provider, scoped model cycle, provider-side cache retention,
+Anthropic server-side context-management behavior, or redirect OAuth bearer
+tokens with `baseUrl`.
 
 Environment variables:
 
@@ -171,5 +174,7 @@ cargo test
 - [Feature list](docs/FEATURES.md) — implemented/planned capability inventory.
 - [Pitch](docs/PITCH.md) — product direction and positioning.
 - [Current codemap](docs/CODEMAPS/INDEX.md) — source-grounded map of the current codebase.
+- [TUI design language](docs/TUI_DESIGN_LANGUAGE.md) — terminal layout, spacing, and menu rules.
+- [Architecture Decision Records](docs/adr/README.md) — accepted/proposed architecture decisions.
 - [Competitor matrix](docs/COMPETITOR_MATRIX.md) — verified competitor feature matrix.
 - [Competitor analysis](docs/COMPETITOR_ANALYSIS.md) — strategic competitor notes.

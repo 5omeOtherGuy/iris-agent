@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Documented current post-0.1.0 capabilities: terminal-surface TUI ownership,
+  provider/model/reasoning selectors, Mimir auth hardening, Anthropic browser
+  OAuth, Antigravity `thoughtSignature` continuity, structured runtime events,
+  provider usage/cache accounting, prompt-cache controls, and Anthropic
+  context-management opt-ins.
+- Added ADR-0022 for default-off provider-native prompt-cache and
+  context-management integration.
+
+### Changed
+
+- Refreshed README, roadmap, feature inventory, codemap, pitch, and ADR index
+  against merged PR and git history through PR #143.
+
 ## [0.1.0](https://github.com/5omeOtherGuy/iris-agent/releases/tag/v0.1.0) - 2026-06-17
 
 ### Added

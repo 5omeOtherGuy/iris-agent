@@ -38,6 +38,13 @@ format break later.
 The Anthropic/Claude Code OAuth lane is now live enough that this continuity
 state must survive ordinary tool loops and session resume.
 
+Later provider work confirmed the same neutral continuity channel is useful
+outside visible reasoning rows: Gemini 3 returns a `thoughtSignature` on
+`functionCall` parts and rejects follow-up requests unless that opaque signature
+is echoed back on the matching tool-call part. Iris now persists that value on
+assistant-tool-call rows through the same `continuity` field, while keeping the
+Gemini replay rule in the Antigravity adapter.
+
 ## Decision
 
 Extend the existing flattened-row transcript with one provider-neutral
@@ -75,6 +82,14 @@ reasoning row rather than introduce a content-block union.
   in token estimates (including the opaque `continuity` for redacted blocks),
   and compaction must not split a retained assistant tool-use turn from its
   preceding reasoning rows.
+
+- **Tool-call continuity extension.** The same opaque `continuity` field may be
+  present on an `AssistantToolCall` row when a provider requires per-tool-call
+  replay state. The first use is Antigravity/Gemini `thoughtSignature`: the
+  adapter captures it from `functionCall.thoughtSignature`, stores it on the
+  flattened tool-call row, and re-emits it as a sibling of the corresponding
+  `functionCall` part. Nexus and the session store still treat the value as an
+  opaque string.
 
 ## Alternatives Considered
 
@@ -128,7 +143,7 @@ reasoning row rather than introduce a content-block union.
 - The no-preference request path remains byte-identical, so today's behavior and
   the Codex lane are unaffected.
 - The opaque `continuity` + `origin` shape generalizes to other providers'
-  reasoning continuity later (subject to the deferral below).
+  reasoning and tool-call continuity later (subject to the deferral below).
 
 ### Negative
 - `Message` gains optional reasoning fields that ripple through every
