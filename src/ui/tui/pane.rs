@@ -6,17 +6,37 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::ui::markdown::render_markdown;
+use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 
 use super::rows::{FoldVis, TranscriptRow};
 use super::transcript::streaming_markdown_preview;
 use super::wrap::line_text;
-use super::{panel_style, prompt_style};
+use super::{TEXT_COLUMN_X_PADDING, panel_style, prompt_style};
 
-const ASSISTANT_TEXT_PREFIX: &str = "  ";
+pub(super) const ASSISTANT_TEXT_PREFIX: &str = "  ";
 
-pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
-    for (index, line) in render_markdown(text).into_iter().enumerate() {
+/// Columns the markdown table layout may use: the assistant content area minus
+/// the leading marker/continuation prefix that `assistant_row` prepends, so a
+/// full-width table line plus its prefix still fits the render width.
+fn markdown_width(content_width: usize) -> usize {
+    content_width
+        .saturating_sub(ASSISTANT_TEXT_PREFIX.len())
+        .max(1)
+}
+
+/// The assistant content column for a given full frame width, matching the
+/// inset `TranscriptRow::render` applies (`width - 2 * TEXT_COLUMN_X_PADDING`).
+/// Used by the streaming path, which is handed the full frame width.
+fn content_width(frame_width: usize) -> usize {
+    frame_width
+        .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+        .max(1)
+}
+
+pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, text: &str) {
+    let theme = MarkdownTheme::default();
+    let lines = render_markdown_themed(text, &theme, markdown_width(width));
+    for (index, line) in lines.into_iter().enumerate() {
         rows.push(assistant_row(line, index == 0));
     }
 }
@@ -24,9 +44,12 @@ pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
 /// Build the transient transcript rows for the in-flight streamed assistant
 /// text. The transcript composites these through the shared `Component` path
 /// after committed history, then commits them once on `AssistantTextEnd`.
-pub(super) fn streaming_assistant_rows(text: &str) -> Vec<TranscriptRow> {
+pub(super) fn streaming_assistant_rows(text: &str, width: usize) -> Vec<TranscriptRow> {
     let text = streaming_markdown_preview(text);
-    render_markdown(&text)
+    let theme = MarkdownTheme::default();
+    // `width` is the full frame here; reduce to the assistant content column
+    // so table layout matches the width these rows are rendered into.
+    render_markdown_themed(&text, &theme, markdown_width(content_width(width)))
         .into_iter()
         .enumerate()
         .map(|(index, line)| assistant_row(line, index == 0))
