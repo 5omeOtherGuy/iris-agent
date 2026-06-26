@@ -18,9 +18,6 @@ spending as few tokens as possible, with every detail available on demand. It
 keeps the expert in control: direct feedback, explicit approval, no autonomous
 overreach.
 
-The product is split into mythology-named tiers (see
-[Naming convention](docs/NAMING.md)):
-
 - **Iris** — the coding agent and overall product, and its terminal CLI (Tier 3).
 - **Wayland** — the harness equipping the core with sessions/config/execution env (Tier 2).
 - **Nexus** — the local agent runtime core (Tier 1).
