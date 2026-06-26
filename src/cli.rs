@@ -249,15 +249,19 @@ fn current_selection_lines(selection: &ModelSelection) -> Vec<String> {
     ]
 }
 
-/// Entry point for the interactive session. Selects the front-end exactly as the
-/// former `ui::tui::stdio()` did -- the persistent terminal-surface TUI when both
-/// stdin and stdout are terminals, otherwise the blocking text UI for pipes/CI
-/// -- and runs the matching driver.
+/// Entry point for the interactive session. Selects the front-end: the
+/// persistent terminal-surface TUI when both stdin and stdout are terminals and
+/// the plain renderer was not requested, otherwise the blocking, ANSI-free text
+/// UI (also used for pipes/CI). `force_plain` carries the `--plain` flag.
 pub(crate) fn run_interactive<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &mut Option<ModelSwitch<'_, P>>,
+    force_plain: bool,
 ) -> Result<()> {
-    if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+    if !use_plain_renderer(force_plain)
+        && std::io::stdout().is_terminal()
+        && std::io::stdin().is_terminal()
+    {
         match TuiUi::new() {
             Ok(tui) => return run_tui(harness, tui, switch),
             Err(error) => {
@@ -267,6 +271,18 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     }
     let mut ui = crate::ui::text::TextUi::stdio();
     run_session(harness, &mut ui, switch)
+}
+
+/// Whether to bypass the interactive TUI for the plain, ANSI-free text UI so the
+/// accessible renderer is reachable on a real terminal, not only on a pipe: true
+/// when `--plain` was passed, `IRIS_PLAIN` is set, or `NO_COLOR` is present.
+fn use_plain_renderer(force_plain: bool) -> bool {
+    force_plain || crate::config::iris_flag_enabled("IRIS_PLAIN") || no_color_requested()
+}
+
+/// `NO_COLOR` per no-color.org: honored when set to any non-empty value.
+fn no_color_requested() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
 }
 
 /// Drive the terminal-surface TUI: owns a Tier-3 current-thread runtime, hands

@@ -52,8 +52,12 @@ fn main() -> ExitCode {
 
 fn dispatch() -> Result<()> {
     match env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => run_agent(),
-        [command, session_id] if command == "resume" => resume_agent(session_id),
+        [] => run_agent(false),
+        [flag] if flag == "--plain" => run_agent(true),
+        [command, session_id] if command == "resume" => resume_agent(session_id, false),
+        [command, session_id, flag] if command == "resume" && flag == "--plain" => {
+            resume_agent(session_id, true)
+        }
         [command, provider] if command == "login" && provider == "openai-codex" => {
             login_openai_codex(LoginMethod::Browser)
         }
@@ -108,7 +112,7 @@ fn configured_provider() -> String {
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
 }
 
-fn run_agent() -> Result<()> {
+fn run_agent(force_plain: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
     // Materialize the shipped fragment defaults into ~/.iris/fragments (if
@@ -162,14 +166,14 @@ fn run_agent() -> Result<()> {
         &build,
         settings.enabled_models.clone(),
     ));
-    cli::run_interactive(&mut harness, &mut switch)
+    cli::run_interactive(&mut harness, &mut switch, force_plain)
 }
 
 /// Resume an existing session by id: load its transcript from the store,
 /// reconstruct the provider-visible messages, seed the agent with them, and
 /// continue appending future turns to the same log. Errors clearly when the id
 /// is unknown or the session cannot be read.
-fn resume_agent(session_id: &str) -> Result<()> {
+fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let store = session::SessionStore::open_default()?;
     let meta = store.find(session_id)?.ok_or_else(|| {
@@ -229,7 +233,7 @@ fn resume_agent(session_id: &str) -> Result<()> {
         &build,
         settings.enabled_models.clone(),
     ));
-    cli::run_interactive(&mut harness, &mut switch)
+    cli::run_interactive(&mut harness, &mut switch, force_plain)
 }
 
 /// Log the most recent prior session for `cwd` (if any) via the read side of
@@ -420,6 +424,7 @@ fn login_anthropic() -> Result<()> {
 fn print_help() {
     eprintln!("Usage:");
     eprintln!("  iris                              Start interactive agent");
+    eprintln!("  iris --plain                      Start in the plain, ANSI-free text UI");
     eprintln!("  iris resume <session-id>          Resume a prior session by id");
     eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
     eprintln!("  iris login openai-codex --browser Login with browser OAuth");
@@ -427,6 +432,13 @@ fn print_help() {
     eprintln!("  iris login antigravity            Login with Google account OAuth");
     eprintln!("  iris login anthropic              Login with Anthropic OAuth (browser)");
     eprintln!("  iris update                       Update Iris from GitHub");
+    eprintln!();
+    eprintln!("Accessibility (environment):");
+    eprintln!(
+        "  IRIS_PLAIN=1                      Use the plain, ANSI-free text UI (like --plain)"
+    );
+    eprintln!("  NO_COLOR                          Disable color; routes to the plain text UI");
+    eprintln!("  IRIS_REDUCED_MOTION=1             Freeze the working-indicator animation");
 }
 
 #[cfg(test)]
