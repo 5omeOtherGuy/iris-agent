@@ -174,6 +174,8 @@ cargo test
 - [Roadmap](docs/ROADMAP.md) — milestone sequencing and acceptance gates.
 - [Feature list](docs/FEATURES.md) — implemented/planned capability inventory.
 - [Pitch](docs/PITCH.md) — product direction and positioning.
+- [Product brief](PRODUCT.md) — target users, product purpose, voice, and product principles.
+- [Design system summary](DESIGN.md) — concise visual-system summary for the Iris TUI.
 - [Current codemap](docs/CODEMAPS/INDEX.md) — source-grounded map of the current codebase.
 - [TUI design language](docs/TUI_DESIGN_LANGUAGE.md) — terminal layout, spacing, and menu rules.
 - [TUI live testing](docs/TUI_LIVE_TESTING.md) — opt-in tmux harness for manual pane-rendering checks.

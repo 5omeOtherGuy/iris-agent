@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added root-level product and design-system briefs (`PRODUCT.md` and
+  `DESIGN.md`) and linked them from the README documentation index.
 - Documented the PR #170-#175 TUI/harness batch: compact tool durations,
   `ctrl+o` full-output reveal, word-level diff highlights, pi-mono-aligned
   harness limits, the reusable TUI component/focus layer, the shared text
