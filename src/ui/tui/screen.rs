@@ -41,6 +41,9 @@ struct Spinner {
     active: bool,
     frame: usize,
     started: Option<Instant>,
+    /// When set (`IRIS_REDUCED_MOTION`), the LED chase holds frame 0 instead of
+    /// animating, so the working indicator is static while the turn runs.
+    reduced_motion: bool,
 }
 
 struct ApprovalHint {
@@ -98,9 +101,11 @@ impl Spinner {
         self.started.map(|start| start.elapsed())
     }
 
-    /// Advance one frame; a no-op when idle so ticks cause no redraw at rest.
+    /// Advance one frame; idle ticks are a no-op, and under reduced motion the
+    /// frame is held so the indicator stays static. Still reports `active` so the
+    /// elapsed/telemetry readout keeps refreshing.
     fn tick(&mut self) -> bool {
-        if self.active {
+        if self.active && !self.reduced_motion {
             self.frame = (self.frame + 1) % WORKING_FRAMES.len();
         }
         self.active
@@ -109,6 +114,12 @@ impl Spinner {
     fn frame(&self) -> &'static str {
         WORKING_FRAMES[self.frame % WORKING_FRAMES.len()]
     }
+}
+
+/// Whether the working-indicator animation should be frozen
+/// (`IRIS_REDUCED_MOTION`); read once when the screen is constructed.
+fn reduced_motion() -> bool {
+    crate::config::iris_flag_enabled("IRIS_REDUCED_MOTION")
 }
 
 /// Session rail metadata.
@@ -310,7 +321,10 @@ impl Screen {
             transcript: Transcript::default(),
             editor: fresh_editor(),
             palette: Palette::default(),
-            spinner: Spinner::default(),
+            spinner: Spinner {
+                reduced_motion: reduced_motion(),
+                ..Spinner::default()
+            },
             turn_divider: TurnDivider::default(),
             approval_hint: None,
             footer: None,
@@ -1069,10 +1083,36 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApprovalHint, CONTEXT_METER_DOTS, approval_status_lines, context_meter_filled,
+        ApprovalHint, CONTEXT_METER_DOTS, Spinner, approval_status_lines, context_meter_filled,
         display_width, line_text, parse_context_window, truncate_cwd_middle, working_lines,
     };
     use crate::ui::tui::WORKING_FRAMES;
+
+    #[test]
+    fn reduced_motion_freezes_the_working_indicator() {
+        let mut animated = Spinner::default();
+        animated.start();
+        animated.tick();
+        assert_ne!(
+            animated.frame(),
+            WORKING_FRAMES[0],
+            "the LED chase advances by default"
+        );
+
+        let mut frozen = Spinner {
+            reduced_motion: true,
+            ..Spinner::default()
+        };
+        frozen.start();
+        for _ in 0..WORKING_FRAMES.len() + 2 {
+            assert!(frozen.tick(), "tick still reports the turn as active");
+            assert_eq!(
+                frozen.frame(),
+                WORKING_FRAMES[0],
+                "reduced motion holds the indicator at frame 0"
+            );
+        }
+    }
 
     #[test]
     fn parse_context_window_handles_k_m_and_plain() {

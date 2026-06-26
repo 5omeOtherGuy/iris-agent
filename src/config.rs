@@ -324,12 +324,42 @@ fn project_path(cwd: &Path) -> PathBuf {
     cwd.join(".iris/settings.json")
 }
 
+/// Truthy reading of an `IRIS_*` opt-in environment variable, using the same
+/// convention as `IRIS_SECURITY_OPT_IN` (`1`/`true`/`yes`/`on`). Lets the
+/// accessibility switches (`IRIS_PLAIN`, `IRIS_REDUCED_MOTION`) share one parser
+/// so they behave identically.
+pub(crate) fn iris_flag_enabled(name: &str) -> bool {
+    iris_flag_value(env::var(name).ok().as_deref())
+}
+
+fn iris_flag_value(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes" | "on"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn iris_flag_value_matches_the_opt_in_convention() {
+        for on in ["1", "true", "yes", "on"] {
+            assert!(iris_flag_value(Some(on)), "{on:?} should enable");
+        }
+        let off: [Option<&str>; 6] = [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ];
+        for value in off {
+            assert!(!iris_flag_value(value), "{value:?} should not enable");
+        }
+    }
 
     struct TempDir {
         path: PathBuf,
