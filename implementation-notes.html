@@ -98,15 +98,12 @@ width, not cluster count), the title truncation (<code>truncate_plain</code> &ra
 one column); CJK/emoji content that previously overran or misaligned the fixed-width frame now wraps
 and pads to fit. <code>wrap_plain</code> still returns the original ANSI-colored line unchanged when it
 fits, so colored diff lines keep their color.</li>
-<li><b>terminal_surface.rs (unit 5) &mdash; the width-math seam:</b> its <code>clip_to_width</code> now
-calls <code>textengine::clip_to_width</code> and the direct <code>unicode_width</code> import is gone.
-The old clip was per-<em>char</em> with width <code>unwrap_or(0)</code> (no <code>max(1)</code>); the
-engine clip is per-<em>grapheme</em>. These are byte-identical for ASCII/CJK/combining (all existing
-tests are ASCII and stay green). The <b>only</b> behavioral difference is at the exact right edge: an
-emoji ZWJ/flag cluster that no longer fits is dropped as a unit instead of being split into a broken
-half-cluster (which the terminal would have rendered as garbage anyway). A new
-<code>wide_glyph_line_clips_on_cluster_boundary_without_overrun</code> test pins the CJK behavior. The
-diff/replay/cursor logic was not touched.</li>
+<li><b>terminal_surface.rs (unit 5) &mdash; the width-math seam:</b> after the terminal-hardening
+merge, the surface no longer clips lines at the final rendering boundary. It renders spans, strips the
+internal cursor marker, measures visible display width, and fails before writing if upstream layout
+hands it a line wider than the terminal. The old clip helper and clipping-specific test coverage were
+removed; wide-glyph overflow is now covered by a no-terminal-write error test. The diff/replay logic
+still receives sanitized rendered lines.</li>
 </ul>
 
 <h2>ansi-to-tui kept, not replaced</h2>
@@ -519,6 +516,30 @@ precedence correct.</li>
       <code>~</code> parse; existing prose tests have none and still pass.</li>
   <li>The new exhaustive <code>UiEvent</code> arm had to be added in <code>ui/mod.rs</code> mapping and
       <code>ui/text.rs</code>; both done.</li>
+</ul>
+
+<h2>Terminal hardening (pi-mono parity)</h2>
+<ul>
+  <li><strong>Resize redraws:</strong> true terminal resizes now clear the screen and native scrollback,
+      then rebuild the whole Iris document from retained state. First render and normal append/diff updates
+      still preserve scrollback. Termux gets a height-only exception so soft-keyboard height changes do not
+      churn scrollback; width changes still force a full rebuild.</li>
+  <li><strong>Render coalescing:</strong> active-turn redraws are paced to a 16ms minimum interval. The
+      first render after idle remains immediate, but event bursts collapse into one scheduled flush.</li>
+  <li><strong>Over-width safety:</strong> the terminal surface no longer silently clips lines. If upstream
+      layout hands it a line wider than the terminal, rendering fails before writing corrupt output and writes
+      a best-effort diagnostic to <code>tui-crash.log</code> under the Iris crash/data directory (or
+      <code>IRIS_CRASH_LOG_DIR</code> in tests).</li>
+  <li><strong>IME cursor support:</strong> focused composer rendering inserts an internal zero-width cursor
+      marker, which the terminal surface strips before output and uses to position the hardware cursor for
+      IME candidate windows. The visible cursor stays hidden by default because Iris draws its own block
+      cursor.</li>
+  <li><strong>Keyboard protocol lifecycle:</strong> Iris now probes terminal support before pushing Kitty
+      keyboard-enhancement flags, requests disambiguation/event/alternate-key reporting when supported, and
+      pops the protocol only when it was actually negotiated.</li>
+  <li><strong>Integration decision:</strong> stale branch-era diff/transcript rendering was not restored.
+      The merge preserves main's newer panel renderer, folding behavior, diff gutter, and tool-renderer
+      registry while layering the terminal hardening onto the current TUI surface.</li>
 </ul>
 </body>
 </html>
