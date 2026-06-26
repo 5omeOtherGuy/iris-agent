@@ -700,7 +700,7 @@ fn context_meter_spans(filled: u64) -> Vec<Span<'static>> {
 }
 
 /// Build the editor's top border, which doubles as the primary statusline:
-/// `┌─ ● CODE ─ GPT-5.4 LOW ─ CTX 300K ●●●○○○○○○○ ───┐`. Returns `None` when
+/// `┌─ ◉ CODE ─ GPT-5.4 LOW ─ CTX 300K ●●●○○○○○○○ ───┐`. Returns `None` when
 /// there is no footer yet or even the minimum content cannot fit, in which case
 /// the caller leaves the plain `Block` border in place so the frame never breaks.
 pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
@@ -733,7 +733,7 @@ pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Lin
 
     let mode_seg = || {
         vec![
-            Span::styled("● ".to_string(), prompt_style()),
+            Span::styled("◉ ".to_string(), prompt_style()),
             Span::raw("CODE"),
         ]
     };
@@ -755,7 +755,7 @@ pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Lin
 
     // Candidates from fullest to minimum. The drop order is monotonic and
     // matches the spec: drop effort, then the meter, then the CTX label, leaving
-    // the minimum `● CODE ─ MODEL`. Effort never reappears once dropped.
+    // the minimum `◉ CODE ─ MODEL`. Effort never reappears once dropped.
     let mut candidates: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
     match (ctx_meter(true), ctx_meter(false)) {
         (Some(with_meter), Some(without_meter)) => {

@@ -83,7 +83,7 @@ fn user_row(text: &str) -> TranscriptRow {
 fn assistant_row(mut line: Line<'static>, first: bool) -> TranscriptRow {
     let text = line_text(&line);
     if first {
-        line.spans.insert(0, Span::styled("● ", prompt_style()));
+        line.spans.insert(0, Span::styled("› ", prompt_style()));
     } else {
         line.spans
             .insert(0, Span::styled(ASSISTANT_TEXT_PREFIX, Style::default()));

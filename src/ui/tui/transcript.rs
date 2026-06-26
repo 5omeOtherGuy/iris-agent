@@ -232,7 +232,7 @@ impl Transcript {
             meta: "decision".to_string(),
             right: vec![
                 (
-                    "●".to_string(),
+                    if failed { "■" } else { "◆" }.to_string(),
                     if failed { err_style() } else { ok_style() },
                 ),
                 (
@@ -417,7 +417,7 @@ impl Transcript {
                 title: spec.title,
                 meta: spec.meta.to_string(),
                 right: vec![
-                    ("●".to_string(), spec.state.dot_style()),
+                    (spec.state.symbol().to_string(), spec.state.dot_style()),
                     (spec.state.label().to_string(), panel_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
@@ -802,7 +802,7 @@ impl Transcript {
             .map(format_elapsed_compact)
             .unwrap_or_else(|| "0.0s".to_string());
         vec![
-            ("●".to_string(), state.dot_style()),
+            (state.symbol().to_string(), state.dot_style()),
             (format!("{:<13}", state.label()), panel_style()),
             // Fixed-width elapsed so the live timer does not shift the header
             // right edge as the compact label changes length (e.g. 9.9s -> 10s).
@@ -1155,7 +1155,7 @@ impl Transcript {
                     title: renderer.title(),
                     meta: renderer.header_meta(&call),
                     right: vec![
-                        ("●".to_string(), dim_style()),
+                        ("◇".to_string(), dim_style()),
                         (" PREVIEW     ".to_string(), panel_style()),
                     ],
                 }));
