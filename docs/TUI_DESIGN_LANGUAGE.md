@@ -1282,6 +1282,13 @@ Add golden/snapshot tests for:
 * Hidden-content affordance rendering.
 * Symbol vocabulary mapping for all tool states.
 
+These golden/snapshot tests are the source of truth and the CI gate. For the
+human-in-the-loop check they cannot give — live colour, the working-indicator
+chase, a full streamed tool turn in a real terminal — drive the binary with
+`scripts/tui-live.sh` (see [TUI_LIVE_TESTING.md](TUI_LIVE_TESTING.md)). It is a
+manual, opt-in spot check used only when changing pane rendering, never a routine
+step, and it complements the snapshots rather than replacing them.
+
 ## Final Design Rule
 
 The pane should feel like a precise transcript instrument.
