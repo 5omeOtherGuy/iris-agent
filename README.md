@@ -3,7 +3,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.svg">
-  <img alt="An Iris terminal session — an EXPLORE and EDIT tool turn, the turn divider, the LED working indicator, and the composer statusline." src="docs/assets/hero-dark.svg" width="760">
+  <img alt="Iris terminal banner. A user asks: What are you? The thinking indicator pulses, and the answer is: A precise, token-efficient coding agent for the terminal." src="docs/assets/hero-dark.svg" width="640">
 </picture>
 
 A fast coding agent for the terminal, built for token efficiency.
@@ -154,12 +154,13 @@ on demand (`ctrl+o` reveals a panel's full output).
   STATUSLINE   ◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○
 ```
 
-The hero above is rendered in exactly this language. The full system lives in
+The banner above is rendered in this same language — the assistant marker `›`
+and the LED working indicator. The full system lives in
 [DESIGN.md](DESIGN.md) (token/format summary) and
 [docs/TUI_DESIGN_LANGUAGE.md](docs/TUI_DESIGN_LANGUAGE.md) (the ground-truth pane
-grammar). The hero SVGs are regenerated with
-[`scripts/gen-hero-svg.py`](scripts/gen-hero-svg.py); a real recorded cast can
-replace them via [`scripts/record-demo.sh`](scripts/record-demo.sh).
+grammar). The banner SVGs are regenerated with
+[`scripts/gen-hero-svg.py`](scripts/gen-hero-svg.py); a full session can be
+recorded as an alternative via [`scripts/record-demo.sh`](scripts/record-demo.sh).
 
 ## Status
 
