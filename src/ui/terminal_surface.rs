@@ -6,17 +6,43 @@
 //! patch, or fully replay the terminal surface.
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 const BEGIN_SYNC: &str = "\x1b[?2026h";
 const END_SYNC: &str = "\x1b[?2026l";
 const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
 const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
 const CLEAR_TO_SCREEN_END: &str = "\x1b[J";
+/// Erase the entire display, home the cursor, then erase the saved-lines
+/// (native scrollback) buffer. Emitted only on a true resize redraw (see
+/// [`TerminalSurface::write_resize_redraw`]); never on first render or
+/// append/diff updates, which must preserve scrollback.
+const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[2J\x1b[H\x1b[3J";
+const SHOW_CURSOR: &str = "\x1b[?25h";
+const HIDE_CURSOR: &str = "\x1b[?25l";
+
+/// Zero-width internal marker a focused composer/editor emits at its cursor
+/// position. It is an APC (Application Program Command) sequence terminals
+/// ignore, but Iris never writes it to the terminal: [`render_line`] detects a
+/// span whose content is exactly this marker, records the cursor column, and
+/// strips it from the rendered output. The marker only ever travels as a
+/// structured ratatui span, so width accounting and the diff source of truth
+/// stay free of escape noise. Mirrors pi-mono's `CURSOR_MARKER` contract.
+pub(crate) const CURSOR_MARKER: &str = "\x1b_iris:c\x07";
+
+/// Environment override for the over-width crash/debug log directory. Defaults
+/// to the Iris data dir (`~/.iris`). Used to keep the diagnostic under the Iris
+/// data convention rather than `.pi`, and to redirect it in tests.
+const CRASH_LOG_DIR_ENV: &str = "IRIS_CRASH_LOG_DIR";
+const CRASH_LOG_FILE: &str = "tui-crash.log";
+
+/// Document-row and display-column of the focused-editor cursor marker.
+type CursorPos = (usize, usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RenderKind {
@@ -50,6 +76,21 @@ pub(crate) struct RenderState {
 pub(crate) struct TerminalSurface<W> {
     writer: W,
     state: RenderState,
+    /// When set, a height-only resize does not trigger a scrollback-clearing
+    /// full redraw (Termux toggles terminal height when the soft keyboard shows
+    /// or hides; a full redraw on every toggle would replay the whole history).
+    termux: bool,
+    /// When true the hardware cursor is shown at the IME marker position. Default
+    /// off: Iris draws its own reversed block cursor, so the hardware cursor is
+    /// only *positioned* (for IME candidate windows) and kept hidden. Mirrors
+    /// pi-mono's `showHardwareCursor` (opt-in).
+    show_hardware_cursor: bool,
+    /// Tracks whether the hardware cursor is currently shown, so we never emit a
+    /// redundant hide/show on renders that do not change cursor visibility.
+    cursor_visible: bool,
+    /// Directory for the over-width crash/debug log. `None` disables logging
+    /// (best-effort) when no data dir can be resolved.
+    crash_log_dir: Option<PathBuf>,
 }
 
 impl<W: Write> TerminalSurface<W> {
@@ -60,12 +101,31 @@ impl<W: Write> TerminalSurface<W> {
                 first_render: true,
                 ..RenderState::default()
             },
+            termux: is_termux_env(),
+            show_hardware_cursor: false,
+            cursor_visible: false,
+            crash_log_dir: resolve_crash_log_dir(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn state(&self) -> &RenderState {
         &self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_termux(&mut self, termux: bool) {
+        self.termux = termux;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_show_hardware_cursor(&mut self, show: bool) {
+        self.show_hardware_cursor = show;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_crash_log_dir(&mut self, dir: Option<PathBuf>) {
+        self.crash_log_dir = dir;
     }
 
     #[cfg(test)]
@@ -93,33 +153,37 @@ impl<W: Write> TerminalSurface<W> {
     ) -> io::Result<RenderStats> {
         let width = size.width.max(1);
         let height = size.height.max(1);
-        let new_lines = render_lines(lines, width)?;
+        let (new_lines, cursor) = render_lines(lines, width, self.crash_log_dir.as_deref())?;
         let volatile_tail = volatile_tail.min(new_lines.len());
 
         let width_changed = self.state.previous_width != 0 && self.state.previous_width != width;
         let height_changed =
             self.state.previous_height != 0 && self.state.previous_height != height;
 
-        if self.state.first_render && !width_changed && !height_changed {
+        // A true resize redraw clears native scrollback and rebuilds the whole
+        // surface from Iris state. A height-only change under Termux is excluded:
+        // its soft keyboard toggles height constantly, and clearing scrollback on
+        // every toggle would churn the entire history. Width changes always need
+        // a full redraw because wrapping changes.
+        let resize_redraw = width_changed || (height_changed && !self.termux);
+
+        let kind = if self.state.first_render && !width_changed && !height_changed {
             self.write_full(new_lines, width, height, false, volatile_tail)?;
-            return Ok(RenderStats {
-                kind: RenderKind::First,
-            });
-        }
+            RenderKind::First
+        } else if resize_redraw {
+            self.write_resize_redraw(new_lines, width, height, volatile_tail)?;
+            RenderKind::FullRedraw
+        } else {
+            self.write_diff_or_replay(&new_lines, width, height, volatile_tail)?
+        };
 
-        if width_changed || height_changed {
-            self.write_full(new_lines, width, height, true, volatile_tail)?;
-            return Ok(RenderStats {
-                kind: RenderKind::FullRedraw,
-            });
-        }
+        // Position the hardware cursor for IME on every render, including
+        // `Unchanged`: when only the cursor moves within an otherwise-identical
+        // row, the stripped line strings do not change, so cursor repositioning
+        // must be independent of the changed-range diff.
+        self.position_hardware_cursor(cursor)?;
 
-        match self.write_diff_or_replay(&new_lines, width, height, volatile_tail)? {
-            RenderKind::FullRedraw => Ok(RenderStats {
-                kind: RenderKind::FullRedraw,
-            }),
-            kind => Ok(RenderStats { kind }),
-        }
+        Ok(RenderStats { kind })
     }
 
     pub(crate) fn finish(&mut self) -> io::Result<()> {
@@ -182,6 +246,40 @@ impl<W: Write> TerminalSurface<W> {
         Ok(())
     }
 
+    /// True resize redraw: clear the screen AND native scrollback, then rebuild
+    /// the entire surface from Iris state starting at logical line 0. Because the
+    /// scrollback is wiped first, rewriting every line lets the history scroll
+    /// back into the freshly-cleared scrollback instead of duplicating it. This
+    /// intentionally overrides Iris's earlier "never clear scrollback on full
+    /// redraw" behavior: width/height resizes were leaving stale or duplicated
+    /// rows, and a clean clear+rebuild is the robust fix. First render and
+    /// append/diff updates never reach this path, so normal scrollback is
+    /// preserved.
+    fn write_resize_redraw(
+        &mut self,
+        lines: Vec<String>,
+        width: u16,
+        height: u16,
+        volatile_tail: usize,
+    ) -> io::Result<()> {
+        let mut buffer = String::from(BEGIN_SYNC);
+        buffer.push_str(DISABLE_AUTOWRAP);
+        buffer.push_str(CLEAR_SCREEN_AND_SCROLLBACK);
+        for (offset, line) in lines.iter().enumerate() {
+            if offset > 0 {
+                buffer.push_str("\r\n");
+            }
+            buffer.push_str(line);
+        }
+        buffer.push_str(ENABLE_AUTOWRAP);
+        buffer.push_str(END_SYNC);
+        write!(self.writer, "{buffer}")?;
+        self.writer.flush()?;
+        let hardware_cursor_row = lines.len().saturating_sub(1);
+        self.remember(lines, width, height, hardware_cursor_row, volatile_tail);
+        Ok(())
+    }
+
     fn move_to_viewport_top(&mut self, buffer: &mut String, viewport_top: usize) {
         let current_screen_row = self.state.hardware_cursor_row.saturating_sub(viewport_top);
         if current_screen_row > 0 {
@@ -198,6 +296,17 @@ impl<W: Write> TerminalSurface<W> {
         height: u16,
         volatile_tail: usize,
     ) -> io::Result<RenderKind> {
+        // A height-only change can reach here without a resize redraw (Termux).
+        // Recompute the effective previous viewport top for the new height before
+        // any movement/"above viewport" math, otherwise a shrink could patch rows
+        // that are no longer visible and corrupt the viewport. Mirrors pi-mono's
+        // `prevViewportTop = heightChanged ? max(0, prevBufferLen - height) : ...`.
+        if self.state.previous_height != 0 && self.state.previous_height != height {
+            let prev_buffer_len =
+                self.state.previous_viewport_top + usize::from(self.state.previous_height.max(1));
+            self.state.previous_viewport_top =
+                prev_buffer_len.saturating_sub(usize::from(height.max(1)));
+        }
         let previous_len = self.state.previous_lines.len();
         let new_len = lines.len();
         let previous_volatile_tail = self.state.previous_volatile_tail.min(previous_len);
@@ -413,6 +522,49 @@ impl<W: Write> TerminalSurface<W> {
         Ok(())
     }
 
+    /// Position the hardware cursor for IME candidate-window placement after a
+    /// render. When a focused composer/editor emitted a [`CURSOR_MARKER`], move
+    /// the hardware cursor to its (row, col); otherwise ensure it is hidden. By
+    /// default the cursor is only *positioned* and kept hidden (Iris draws its
+    /// own reversed block cursor); `show_hardware_cursor` opts into showing it.
+    fn position_hardware_cursor(&mut self, cursor: Option<CursorPos>) -> io::Result<()> {
+        let total = self.state.previous_lines.len();
+        match cursor {
+            Some((row, col)) if total > 0 => {
+                let target_row = row.min(total.saturating_sub(1));
+                let mut buffer = String::new();
+                let current = self.state.hardware_cursor_row;
+                if target_row > current {
+                    buffer.push_str(&format!("\x1b[{}B", target_row - current));
+                } else if current > target_row {
+                    buffer.push_str(&format!("\x1b[{}A", current - target_row));
+                }
+                // Absolute column (1-indexed); independent of the viewport.
+                buffer.push_str(&format!("\x1b[{}G", col + 1));
+                if self.show_hardware_cursor {
+                    if !self.cursor_visible {
+                        buffer.push_str(SHOW_CURSOR);
+                        self.cursor_visible = true;
+                    }
+                } else if self.cursor_visible {
+                    buffer.push_str(HIDE_CURSOR);
+                    self.cursor_visible = false;
+                }
+                write!(self.writer, "{buffer}")?;
+                self.writer.flush()?;
+                self.state.hardware_cursor_row = target_row;
+            }
+            _ => {
+                if self.cursor_visible {
+                    write!(self.writer, "{HIDE_CURSOR}")?;
+                    self.writer.flush()?;
+                    self.cursor_visible = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn remember(
         &mut self,
         lines: Vec<String>,
@@ -472,48 +624,156 @@ fn move_to_row(
     *hardware_cursor_row = target;
 }
 
-fn render_lines(lines: &[Line<'static>], width: u16) -> io::Result<Vec<String>> {
+/// Render every logical line to an ANSI string and locate the focused-editor
+/// cursor marker, if present. Returns the rendered lines and the cursor
+/// `(row, col)` (column = display width of the text before the marker).
+///
+/// Over-width safety: higher-level layout (`screen.rs`) is responsible for
+/// wrapping content to the terminal width. If a rendered line still exceeds the
+/// width, that is a renderer bug. Rather than silently clipping (which hides the
+/// bug and can still corrupt output at wide-char/ANSI boundaries), we write a
+/// diagnostic crash log and fail before any corrupting write reaches the
+/// terminal. Mirrors pi-mono's fail-fast over-width guard.
+fn render_lines(
+    lines: &[Line<'static>],
+    width: u16,
+    crash_log_dir: Option<&Path>,
+) -> io::Result<(Vec<String>, Option<CursorPos>)> {
     let max = usize::from(width.max(1));
-    lines.iter().map(|line| render_line(line, max)).collect()
+    let mut out = Vec::with_capacity(lines.len());
+    let mut cursor: Option<(usize, usize)> = None;
+    let mut rendered_for_log: Vec<String> = Vec::with_capacity(lines.len());
+    for (row, line) in lines.iter().enumerate() {
+        let rendered = render_line(line, max);
+        rendered_for_log.push(rendered.text.clone());
+        if let Some(col) = rendered.cursor_col {
+            cursor = Some((row, col));
+        }
+        if rendered.width > max {
+            // Finish rendering the remaining lines for the diagnostic, then fail.
+            for tail in &lines[row + 1..] {
+                rendered_for_log.push(render_line(tail, max).text);
+            }
+            write_overwidth_crash_log(crash_log_dir, max, &rendered_for_log, row, rendered.width);
+            let log_hint = crash_log_dir
+                .map(|dir| {
+                    format!(
+                        "; diagnostic log written to {}",
+                        dir.join(CRASH_LOG_FILE).display()
+                    )
+                })
+                .unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "rendered line {row} exceeds terminal width ({} > {max}); this is a renderer \
+                 bug (a line was not truncated to the terminal width before reaching the \
+                 terminal surface){log_hint}",
+                rendered.width
+            )));
+        }
+        out.push(rendered.text);
+    }
+    Ok((out, cursor))
 }
 
-fn render_line(line: &Line<'static>, max_width: usize) -> io::Result<String> {
-    // Autowrap is disabled while we write, so an over-wide line would otherwise
-    // be silently clipped by the terminal at an arbitrary byte. Clip it here at
-    // a display-width boundary instead, preserving ANSI styling and emitting a
-    // trailing reset so styles never leak past the line.
+struct RenderedLine {
+    text: String,
+    /// Total display width of the visible content (markers excluded).
+    width: usize,
+    /// Display-width column of the cursor marker on this line, if it carried one.
+    cursor_col: Option<usize>,
+}
+
+fn render_line(line: &Line<'static>, _max_width: usize) -> RenderedLine {
+    // Autowrap is disabled while we write. We do NOT clip here: over-width lines
+    // are caught and reported by `render_lines` instead of being silently hidden.
+    // We accumulate the visible display width so the caller can detect overflow,
+    // and strip any zero-width cursor marker (recording its column) so it never
+    // reaches the terminal or the diff source of truth.
     let mut out = String::new();
     let mut used = 0usize;
+    let mut cursor_col: Option<usize> = None;
     for span in &line.spans {
+        if span.content.as_ref() == CURSOR_MARKER {
+            cursor_col = Some(used);
+            continue;
+        }
         let style = line.style.patch(span.style);
         out.push_str("\x1b[0m");
         out.push_str(&style_sgr(style));
-        if used < max_width {
-            let (clipped, clipped_width) = clip_to_width(span.content.as_ref(), max_width - used);
-            out.push_str(&clipped);
-            used += clipped_width;
-        }
+        out.push_str(span.content.as_ref());
+        used += UnicodeWidthStr::width(span.content.as_ref());
     }
     out.push_str("\x1b[0m");
-    Ok(out)
+    RenderedLine {
+        text: out,
+        width: used,
+        cursor_col,
+    }
 }
 
-fn clip_to_width(content: &str, remaining: usize) -> (String, usize) {
-    let full_width = UnicodeWidthStr::width(content);
-    if full_width <= remaining {
-        return (content.to_string(), full_width);
+/// Resolve the over-width crash/debug log directory: `IRIS_CRASH_LOG_DIR`
+/// override, else the Iris data dir (`~/.iris`). Returns `None` when neither is
+/// resolvable, which disables (best-effort) logging.
+fn resolve_crash_log_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(CRASH_LOG_DIR_ENV)
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
     }
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    Some(Path::new(&home).join(".iris"))
+}
+
+/// Best-effort write of the over-width diagnostic. Failure to log never masks
+/// the original over-width error: the caller fails regardless.
+fn write_overwidth_crash_log(
+    dir: Option<&Path>,
+    width: usize,
+    rendered: &[String],
+    bad_index: usize,
+    bad_width: usize,
+) {
+    let Some(dir) = dir else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut body = String::new();
+    body.push_str(&format!(
+        "Over-width render at line {bad_index} (visible width {bad_width} > terminal width \
+         {width}).\nThis is likely a TUI component not truncating its output to the terminal \
+         width.\n\n=== All rendered lines (ANSI-stripped) ===\n"
+    ));
+    for (idx, line) in rendered.iter().enumerate() {
+        let plain = strip_ansi_for_log(line);
+        let line_width = UnicodeWidthStr::width(plain.as_str());
+        body.push_str(&format!("[{idx}] (w={line_width}) {plain}\n"));
+    }
+    let _ = std::fs::write(dir.join(CRASH_LOG_FILE), body);
+}
+
+fn strip_ansi_for_log(input: &str) -> String {
     let mut out = String::new();
-    let mut width = 0usize;
-    for ch in content.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > remaining {
-            break;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip the rest of the escape: APC strings end with BEL/ST, CSI/SGR
+            // end with an alphabetic byte. Drop until a terminator.
+            for next in chars.by_ref() {
+                if next == '\x07' || next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
         }
-        out.push(ch);
-        width += ch_width;
     }
-    (out, width)
+    out
+}
+
+fn is_termux_env() -> bool {
+    std::env::var_os("TERMUX_VERSION").is_some_and(|value| !value.is_empty())
 }
 
 fn style_sgr(style: Style) -> String {
@@ -748,15 +1008,10 @@ mod tests {
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
         let out = output(&surface);
-        assert!(out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
-        assert!(
-            !out.contains("\x1b[2J"),
-            "must not clear full screen: {out:?}"
-        );
-        assert!(
-            !out.contains("\x1b[3J"),
-            "must not clear native scrollback: {out:?}"
-        );
+        // A width resize now clears the screen AND native scrollback, then
+        // rebuilds the whole surface from Iris state (pi-mono parity). This
+        // intentionally overrides the earlier "never clear scrollback" behavior.
+        assert!(out.contains(CLEAR_SCREEN_AND_SCROLLBACK), "{out:?}");
         assert!(strip_ansi(&out).contains("abc\r\ndef"), "{out:?}");
         assert_eq!(surface.state().previous_width, 10);
         Ok(())
@@ -839,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn full_redraw_repaints_only_visible_slice_for_long_document() -> io::Result<()> {
+    fn width_resize_rebuilds_full_document_and_clears_scrollback() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         let doc: Vec<Line<'static>> = (1..=8).map(|n| Line::from(format!("line {n}"))).collect();
         surface.render(size(20, 5), &doc)?;
@@ -847,61 +1102,79 @@ mod tests {
         assert_eq!(surface.state().previous_viewport_top, 3);
         surface.writer_mut().clear();
 
-        // Width change forces a clearing full redraw.
+        // Width change forces a scrollback-clearing full redraw that rebuilds the
+        // entire document from Iris state, so history re-enters the freshly
+        // cleared scrollback rather than being lost or duplicated.
         let stats = surface.render(size(18, 5), &doc)?;
         assert_eq!(stats.kind, RenderKind::FullRedraw);
 
-        let plain = strip_ansi(&output(&surface));
-        // Only the visible slice (last 5 lines) is repainted; history above the
-        // viewport is not rewritten, avoiding scrollback duplication.
-        assert!(plain.contains("line 4"), "{plain:?}");
+        let raw = output(&surface);
+        assert!(raw.contains(CLEAR_SCREEN_AND_SCROLLBACK), "{raw:?}");
+        let plain = strip_ansi(&raw);
+        // Every line is rewritten, including the history above the viewport.
+        assert!(plain.contains("line 1"), "{plain:?}");
         assert!(plain.contains("line 8"), "{plain:?}");
-        assert!(!plain.contains("line 1"), "{plain:?}");
-        assert!(!plain.contains("line 3"), "{plain:?}");
-        assert!(!output(&surface).contains("\x1b[2J"), "{plain:?}");
+        // viewport_top tracks the last `height` lines of the rebuilt document.
+        assert_eq!(surface.state().previous_viewport_top, 3);
+        assert_eq!(surface.state().previous_width, 18);
         Ok(())
     }
 
     #[test]
-    fn height_grow_full_redraw_moves_to_new_visible_top() -> io::Result<()> {
+    fn height_resize_clears_scrollback_and_rebuilds_full_document() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         let doc: Vec<Line<'static>> = (1..=10).map(|n| Line::from(format!("line {n}"))).collect();
         surface.render(size(20, 4), &doc)?;
         assert_eq!(surface.state().previous_viewport_top, 6);
         surface.writer_mut().clear();
 
+        // Non-Termux height change is a true resize: clear scrollback + rebuild.
         let stats = surface.render(size(20, 8), &doc)?;
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
         let raw = output(&surface);
-        assert!(
-            raw.contains("\x1b[7A"),
-            "must move to the new taller viewport top: {raw:?}"
-        );
-        assert!(
-            !raw.contains("\x1b[3A"),
-            "old stale viewport-top replay risk: {raw:?}"
-        );
+        assert!(raw.contains(CLEAR_SCREEN_AND_SCROLLBACK), "{raw:?}");
         let plain = strip_ansi(&raw);
         let rows: Vec<&str> = plain.lines().map(|line| line.trim_matches('\r')).collect();
-        assert!(rows.contains(&"line 3"), "{plain:?}");
+        assert!(rows.contains(&"line 1"), "{plain:?}");
         assert!(rows.contains(&"line 10"), "{plain:?}");
-        assert!(!rows.contains(&"line 1"), "{plain:?}");
+        assert_eq!(surface.state().previous_height, 8);
         assert_eq!(surface.state().previous_viewport_top, 2);
         Ok(())
     }
 
     #[test]
-    fn height_resize_forces_coherent_full_replay() -> io::Result<()> {
+    fn termux_height_only_resize_does_not_clear_scrollback() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
-        surface.render(size(20, 8), &[Line::from("a"), Line::from("b")])?;
+        surface.set_termux(true);
+        let doc = [Line::from("a"), Line::from("b"), Line::from("c")];
+        surface.render(size(20, 8), &doc)?;
         surface.writer_mut().clear();
 
-        let stats = surface.render(size(20, 4), &[Line::from("a"), Line::from("b")])?;
+        // Height-only change under Termux (soft keyboard toggle): must NOT take
+        // the scrollback-clearing resize path. Content unchanged -> Unchanged.
+        let stats = surface.render(size(20, 4), &doc)?;
+
+        let raw = output(&surface);
+        assert_ne!(stats.kind, RenderKind::FullRedraw, "{raw:?}");
+        assert!(!raw.contains("\x1b[2J"), "{raw:?}");
+        assert!(!raw.contains("\x1b[3J"), "{raw:?}");
+        assert_eq!(surface.state().previous_height, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn termux_width_change_still_clears_scrollback() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        surface.set_termux(true);
+        surface.render(size(20, 8), &[Line::from("abcdef")])?;
+        surface.writer_mut().clear();
+
+        // Width change always forces a full redraw, even under Termux.
+        let stats = surface.render(size(10, 8), &[Line::from("abc"), Line::from("def")])?;
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
-        assert!(output(&surface).contains(CLEAR_TO_SCREEN_END));
-        assert_eq!(surface.state().previous_height, 4);
+        assert!(output(&surface).contains(CLEAR_SCREEN_AND_SCROLLBACK));
         Ok(())
     }
 
@@ -929,14 +1202,107 @@ mod tests {
     }
 
     #[test]
-    fn over_width_line_is_clipped_to_terminal_width() -> io::Result<()> {
+    fn over_width_line_errors_and_writes_crash_log_instead_of_clipping() {
+        let dir = std::env::temp_dir().join(format!("iris-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let mut surface = TerminalSurface::new(Vec::new());
-        surface.render(size(5, 3), &[Line::from("abcdef")])?;
-        let plain = strip_ansi(&output(&surface));
-        assert!(plain.contains("abcde"), "{plain:?}");
-        assert!(!plain.contains("abcdef"), "{plain:?}");
-        // Styles are always closed with a trailing reset even when clipped.
-        assert!(output(&surface).contains("\x1b[0m"));
+        surface.set_crash_log_dir(Some(dir.clone()));
+
+        let result = surface.render(size(5, 3), &[Line::from("abcdef")]);
+
+        // Over-width is a renderer bug: fail before writing corrupting output,
+        // never silently clip.
+        let error = result.expect_err("over-width render must error");
+        assert!(
+            error.to_string().contains("exceeds terminal width"),
+            "{error}"
+        );
+        // Nothing corrupting was written to the terminal.
+        assert!(output(&surface).is_empty(), "{:?}", output(&surface));
+        // A diagnostic log was written under the Iris-owned crash dir.
+        let log = std::fs::read_to_string(dir.join(CRASH_LOG_FILE)).expect("crash log written");
+        assert!(log.contains("abcdef"), "{log}");
+        assert!(log.contains("Over-width render"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_width_line_is_not_treated_as_over_width() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        // "abcde" is exactly width 5 and must render without error.
+        surface.render(size(5, 3), &[Line::from("abcde")])?;
+        assert!(strip_ansi(&output(&surface)).contains("abcde"));
+        Ok(())
+    }
+
+    #[test]
+    fn focused_cursor_marker_is_stripped_and_positions_hardware_cursor() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let editor = Line::from(vec![
+            Span::raw("ab"),
+            Span::raw(CURSOR_MARKER),
+            Span::raw("c"),
+        ]);
+        let stats = surface.render(size(20, 5), &[Line::from("prompt"), editor])?;
+
+        assert_eq!(stats.kind, RenderKind::First);
+        let raw = output(&surface);
+        // The marker never reaches the terminal output or the diff source.
+        assert!(!raw.contains(CURSOR_MARKER), "marker leaked: {raw:?}");
+        assert!(
+            !surface
+                .state()
+                .previous_lines
+                .iter()
+                .any(|l| l.contains(CURSOR_MARKER)),
+            "marker leaked into previous_lines"
+        );
+        // Visible content is intact (marker is zero-width).
+        assert!(strip_ansi(&raw).contains("abc"), "{raw:?}");
+        // The hardware cursor is positioned to the marker column (after "ab" ->
+        // column index 2 -> 1-indexed 3) on the editor row.
+        assert!(
+            raw.contains("\x1b[3G"),
+            "cursor column move missing: {raw:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_positioned_even_on_unchanged_render() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        // Identical document + marker on both renders: the stripped row strings
+        // do not change, so the changed-range diff yields `Unchanged`. The
+        // hardware cursor must still be positioned (independent of the diff).
+        let doc = || {
+            vec![
+                Line::from("prompt"),
+                Line::from(vec![Span::raw("abc"), Span::raw(CURSOR_MARKER)]),
+            ]
+        };
+        surface.render(size(20, 5), &doc())?;
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(20, 5), &doc())?;
+
+        assert_eq!(stats.kind, RenderKind::Unchanged);
+        let raw = output(&surface);
+        // Marker after "abc" -> column index 3 -> 1-indexed 4.
+        assert!(raw.contains("\x1b[4G"), "cursor not repositioned: {raw:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn show_hardware_cursor_emits_show_sequence_at_marker() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        surface.set_show_hardware_cursor(true);
+        let editor = Line::from(vec![Span::raw("x"), Span::raw(CURSOR_MARKER)]);
+        surface.render(size(20, 5), &[editor])?;
+        assert!(
+            output(&surface).contains(SHOW_CURSOR),
+            "{:?}",
+            output(&surface)
+        );
         Ok(())
     }
 

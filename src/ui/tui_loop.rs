@@ -28,7 +28,7 @@ use ratatui_textarea::CursorMove;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ModelSwitch;
@@ -49,6 +49,74 @@ use crate::wayland::Harness;
 /// only the spinner animation, not input latency; a 100ms beat is a smooth,
 /// CPU-cheap spinner with a redraw only when the frame actually advances.
 const TICK: Duration = Duration::from_millis(100);
+
+/// Minimum interval between coalesced renders during an active turn (~60fps).
+/// Mirrors pi-mono's 16ms render budget: an active turn can emit a burst of
+/// agent events, and drawing on each one is wasteful and causes flicker.
+const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+
+/// What a [`RenderScheduler`] decides to do for a pending render request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderAction {
+    /// A render is due now; the caller should draw and call [`RenderScheduler::mark_drawn`].
+    DrawNow,
+    /// A render is pending but not yet due; the caller should wait until this
+    /// instant, then draw.
+    Wait(Instant),
+    /// Nothing pending; stay idle (no timer wakeups).
+    Idle,
+}
+
+/// Coalesces a burst of render requests to roughly one draw per
+/// [`MIN_RENDER_INTERVAL`]. The first request after a draw (or after idle) draws
+/// immediately; subsequent requests within the interval are deferred to a single
+/// flush at the interval boundary. Pure and clock-injectable so the coalescing
+/// policy is unit-tested without real-time sleeps.
+struct RenderScheduler {
+    last_draw: Option<Instant>,
+    pending: bool,
+}
+
+impl RenderScheduler {
+    fn new() -> Self {
+        Self {
+            last_draw: None,
+            pending: false,
+        }
+    }
+
+    /// Mark a render as wanted. Coalesces: many requests collapse into one
+    /// pending flag until the next draw.
+    fn request(&mut self) {
+        self.pending = true;
+    }
+
+    /// Decide what to do for the current pending state at `now`.
+    fn poll(&self, now: Instant) -> RenderAction {
+        if !self.pending {
+            return RenderAction::Idle;
+        }
+        match self.last_draw {
+            // First draw after idle is immediate (startup/forced responsiveness).
+            None => RenderAction::DrawNow,
+            Some(last) => {
+                let next = last + MIN_RENDER_INTERVAL;
+                if now >= next {
+                    RenderAction::DrawNow
+                } else {
+                    RenderAction::Wait(next)
+                }
+            }
+        }
+    }
+
+    /// Record that a draw just happened at `now`, clearing the pending flag and
+    /// resetting the pacing window. Use for both coalesced and forced draws.
+    fn mark_drawn(&mut self, now: Instant) {
+        self.pending = false;
+        self.last_draw = Some(now);
+    }
+}
 
 /// The active turn's cancellation token, shared with the input thread so a raw
 /// Ctrl-C cancels even while a synchronous tool blocks the executor thread.
@@ -206,6 +274,19 @@ async fn session_loop<P: ChatProvider>(
             )
             .await?;
         }
+    }
+    Ok(())
+}
+
+/// Request a coalesced render during an active turn: draw immediately when the
+/// pacing window allows, otherwise leave the request pending for the loop's
+/// flush branch to draw at the [`MIN_RENDER_INTERVAL`] boundary.
+fn request_render(sched: &mut RenderScheduler, tui: &mut TuiUi) -> Result<()> {
+    sched.request();
+    let now = Instant::now();
+    if matches!(sched.poll(now), RenderAction::DrawNow) {
+        tui.draw()?;
+        sched.mark_drawn(now);
     }
     Ok(())
 }
@@ -403,9 +484,24 @@ async fn run_turn<P: ChatProvider>(
     // polled (a closed `recv()` is always ready and would otherwise busy-loop).
     let mut input_open = true;
 
+    // Coalesce the burst of agent events a turn emits to ~one draw per 16ms.
+    // The caller already drew immediately before this turn, so seed the pacing
+    // window as "just drawn" and let the first in-burst event defer to the flush.
+    let mut sched = RenderScheduler::new();
+    sched.mark_drawn(Instant::now());
+
     let result = {
         let mut turn = std::pin::pin!(harness.submit_turn(prompt, &bridge, &bridge, &token));
         loop {
+            // Compute the next coalesced-draw deadline. When nothing is pending
+            // the branch is disabled, so the loop stays CPU-idle (no timer).
+            let flush_at: Option<Instant> = match sched.poll(Instant::now()) {
+                RenderAction::Idle => None,
+                RenderAction::DrawNow => Some(Instant::now()),
+                RenderAction::Wait(at) => Some(at),
+            };
+            let flush_deadline =
+                flush_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 res = &mut turn => {
                     // The turn may finish in one poll after emitting a burst of
@@ -417,7 +513,7 @@ async fn run_turn<P: ChatProvider>(
                 }
                 Some(event) = event_rx.recv() => {
                     tui.screen.apply(event);
-                    tui.draw()?;
+                    request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
                     tui.screen.show_approval(&request.call, request.allow_always);
@@ -426,7 +522,7 @@ async fn run_turn<P: ChatProvider>(
                         reply: request.reply,
                         allow_always: request.allow_always,
                     });
-                    tui.draw()?;
+                    request_render(&mut sched, tui)?;
                 }
                 maybe = input_rx.recv(), if input_open => {
                     match maybe {
@@ -444,7 +540,7 @@ async fn run_turn<P: ChatProvider>(
                                 token.cancel();
                             }
                             if handle_running_event(&mut tui.screen, event, &mut pending) {
-                                tui.draw()?;
+                                request_render(&mut sched, tui)?;
                             }
                         }
                         None => {
@@ -458,8 +554,13 @@ async fn run_turn<P: ChatProvider>(
                 }
                 _ = tick.tick() => {
                     if tui.screen.tick() {
-                        tui.draw()?;
+                        request_render(&mut sched, tui)?;
                     }
+                }
+                _ = sleep_until(flush_deadline), if flush_at.is_some() => {
+                    // Flush a render coalesced earlier in the burst.
+                    tui.draw()?;
+                    sched.mark_drawn(Instant::now());
                 }
             }
         }
@@ -1119,6 +1220,49 @@ mod tests {
     use super::*;
     use crate::ui::tui::Screen;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn scheduler_first_request_after_idle_draws_immediately() {
+        let mut sched = RenderScheduler::new();
+        let t0 = Instant::now();
+        // Nothing pending -> idle, no timer wakeups.
+        assert_eq!(sched.poll(t0), RenderAction::Idle);
+        // First request with no prior draw -> draw immediately.
+        sched.request();
+        assert_eq!(sched.poll(t0), RenderAction::DrawNow);
+    }
+
+    #[test]
+    fn scheduler_coalesces_burst_within_interval_then_flushes() {
+        let mut sched = RenderScheduler::new();
+        let t0 = Instant::now();
+        sched.mark_drawn(t0);
+
+        // A request 5ms into the window is not yet due: defer to the boundary.
+        sched.request();
+        let t_burst = t0 + Duration::from_millis(5);
+        match sched.poll(t_burst) {
+            RenderAction::Wait(at) => assert_eq!(at, t0 + MIN_RENDER_INTERVAL),
+            other => panic!("expected Wait, got {other:?}"),
+        }
+        // More requests in the same window stay coalesced (still one pending).
+        sched.request();
+        assert!(matches!(sched.poll(t_burst), RenderAction::Wait(_)));
+
+        // At/after the interval boundary the coalesced render is due.
+        assert_eq!(sched.poll(t0 + MIN_RENDER_INTERVAL), RenderAction::DrawNow);
+    }
+
+    #[test]
+    fn scheduler_idle_after_draw_until_next_request() {
+        let mut sched = RenderScheduler::new();
+        let t0 = Instant::now();
+        sched.request();
+        assert_eq!(sched.poll(t0), RenderAction::DrawNow);
+        sched.mark_drawn(t0);
+        // No new request -> idle even long after the interval (no busy wakeups).
+        assert_eq!(sched.poll(t0 + Duration::from_secs(1)), RenderAction::Idle);
+    }
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))

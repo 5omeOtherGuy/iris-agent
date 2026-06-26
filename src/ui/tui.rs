@@ -15,7 +15,7 @@
 //! reads and holds no channels, so its state transitions and logical document
 //! output are unit-testable without a TTY.
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
@@ -26,8 +26,10 @@ use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, size as terminal_size, supports_keyboard_enhancement,
+};
+use ratatui::crossterm::{execute, queue};
 use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier, Style};
 #[cfg(test)]
@@ -192,6 +194,48 @@ fn panel_style() -> Style {
     Style::default()
 }
 
+/// Keyboard-enhancement (Kitty keyboard protocol) flags Iris requests when the
+/// terminal advertises support. Beyond `DISAMBIGUATE_ESCAPE_CODES` (an
+/// unambiguous Esc and reliably distinct modified keys) Iris also asks for event
+/// types and alternate keys so the enhanced layout is reported where available.
+/// Iris ignores key-release events (every key handler gates on Press/Repeat), so
+/// requesting event types is safe. Mirrors pi-mono's requested flag set (7).
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+/// Push the keyboard-enhancement flags only when the terminal supports them.
+/// Returns whether they were pushed, so shutdown/error paths pop exactly once
+/// and never emit a stray pop on terminals that never negotiated the protocol.
+///
+/// Safe fallback: when the terminal does not support the protocol Iris simply
+/// does not push (Crossterm still delivers usable key events). Iris does not
+/// emit pi-mono's raw `modifyOtherKeys` (`CSI >4;2m`) fallback because Crossterm
+/// does not model or parse it; that is a deliberate non-parity choice.
+fn enable_keyboard_enhancement<W: Write>(writer: &mut W, supported: bool) -> io::Result<bool> {
+    if !supported {
+        return Ok(false);
+    }
+    queue!(
+        writer,
+        PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+    )?;
+    writer.flush()?;
+    Ok(true)
+}
+
+/// Restore the keyboard protocol: pop the pushed flags exactly when they were
+/// pushed. A no-op otherwise, so it is safe to call on every shutdown/error path.
+fn disable_keyboard_enhancement<W: Write>(writer: &mut W, enabled: bool) -> io::Result<()> {
+    if enabled {
+        queue!(writer, PopKeyboardEnhancementFlags)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 /// Terminal driver: owns raw mode, paste/key flags, cursor visibility, terminal
 /// size reads, and the Iris terminal surface for the whole interactive session.
 /// It does NOT enter the alternate screen and does not use Ratatui `Terminal`:
@@ -200,6 +244,10 @@ pub(crate) struct TuiUi {
     surface: TerminalSurface<Stdout>,
     pub(crate) screen: Screen,
     active: bool,
+    /// Whether keyboard-enhancement flags were successfully pushed, so they are
+    /// popped exactly once on shutdown/error and never on terminals that did not
+    /// negotiate the protocol.
+    keyboard_enhanced: bool,
 }
 
 impl TuiUi {
@@ -214,27 +262,25 @@ impl TuiUi {
         crate::signals::save_termios_for_force_quit();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(
-            stdout,
-            EnableBracketedPaste,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-            Hide,
-        ) {
-            let _ = execute!(
-                stdout,
-                DisableBracketedPaste,
-                PopKeyboardEnhancementFlags,
-                Show,
-            );
+        // Probe Kitty keyboard-protocol support before negotiating so the push is
+        // gated and the matching pop is conditional. A probe error is treated as
+        // "unsupported" (safe fallback to plain Crossterm key events).
+        let supports_enhancement = supports_keyboard_enhancement().unwrap_or(false);
+        if let Err(error) = execute!(stdout, EnableBracketedPaste, Hide) {
+            let _ = execute!(stdout, DisableBracketedPaste, Show);
             let _ = disable_raw_mode();
             return Err(error.into());
         }
+        // Best-effort: a failure to negotiate the protocol must not abort startup.
+        let keyboard_enhanced =
+            enable_keyboard_enhancement(&mut stdout, supports_enhancement).unwrap_or(false);
         crate::signals::enable_terminal_restore_on_force_quit();
         crate::telemetry::set_tui_active(true);
         Ok(Self {
             surface: TerminalSurface::new(stdout),
             screen: Screen::new(),
             active: true,
+            keyboard_enhanced,
         })
     }
 
@@ -258,12 +304,12 @@ impl TuiUi {
                 let _ = self.surface.render(size, &transcript);
             }
             let _ = self.surface.finish();
-            let _ = execute!(
-                self.surface.writer_mut(),
-                DisableBracketedPaste,
-                PopKeyboardEnhancementFlags,
-                Show,
-            );
+            // Restore the keyboard protocol first (pop only if pushed), then the
+            // paste mode and cursor, then raw mode. Ordering mirrors setup in
+            // reverse so no terminal mode Iris toggled is left enabled.
+            let _ = disable_keyboard_enhancement(self.surface.writer_mut(), self.keyboard_enhanced);
+            self.keyboard_enhanced = false;
+            let _ = execute!(self.surface.writer_mut(), DisableBracketedPaste, Show);
             let _ = disable_raw_mode();
             crate::signals::disable_terminal_restore_on_force_quit();
             crate::telemetry::set_tui_active(false);
@@ -309,9 +355,12 @@ mod tests {
     }
 
     fn line_text(line: &Line<'static>) -> String {
+        // Skip the zero-width hardware-cursor (IME) marker: it is an internal
+        // artifact the terminal surface strips, never visible text.
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
+            .filter(|content| *content != crate::ui::terminal_surface::CURSOR_MARKER)
             .collect()
     }
 
@@ -1187,6 +1236,38 @@ mod tests {
         assert!(rendered.contains("Give Iris a task..."));
         assert!(!rendered.contains("Ask the agent anything..."));
         assert!(rendered.contains("↵ to send  •  shift+↵ for new line  •  / for commands"));
+    }
+
+    #[test]
+    fn keyboard_enhancement_pushed_only_when_supported() -> io::Result<()> {
+        // Unsupported terminal: never push (safe fallback to plain key events).
+        let mut out: Vec<u8> = Vec::new();
+        assert!(!enable_keyboard_enhancement(&mut out, false)?);
+        assert!(out.is_empty(), "{out:?}");
+
+        // Supported terminal: push the requested flags (DISAMBIGUATE | EVENT_TYPES
+        // | ALTERNATE_KEYS = 7) as CSI > 7 u.
+        let mut out: Vec<u8> = Vec::new();
+        assert!(enable_keyboard_enhancement(&mut out, true)?);
+        let seq = String::from_utf8(out).expect("utf8");
+        assert!(seq.starts_with("\x1b["), "{seq:?}");
+        assert!(seq.contains(">7u"), "{seq:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn keyboard_enhancement_popped_only_when_enabled() -> io::Result<()> {
+        // Never negotiated: popping is a no-op, so no stray sequence leaks.
+        let mut out: Vec<u8> = Vec::new();
+        disable_keyboard_enhancement(&mut out, false)?;
+        assert!(out.is_empty(), "{out:?}");
+
+        // Negotiated: restore by popping (CSI < u).
+        let mut out: Vec<u8> = Vec::new();
+        disable_keyboard_enhancement(&mut out, true)?;
+        let seq = String::from_utf8(out).expect("utf8");
+        assert!(seq.starts_with("\x1b[<") && seq.ends_with('u'), "{seq:?}");
+        Ok(())
     }
 
     #[test]

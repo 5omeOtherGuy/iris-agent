@@ -2,181 +2,190 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Anthropic OAuth stream robustness - implementation notes</title>
+<title>Terminal hardening (pi-mono parity) - implementation notes</title>
 </head>
 <body>
-<h1>Anthropic Messages OAuth stream robustness &mdash; implementation notes</h1>
-<p>Branch <code>anthropic-stream-robustness</code>. Records decisions not explicit in the
-spec, tradeoffs, and reviewer context. Not a step log.</p>
+<h1>Terminal hardening &mdash; full pi-mono parity (terminal slice)</h1>
+<p>Branch <code>terminal-hardening</code>. Reviewer-facing notes: decisions not obvious
+from the diff, tradeoffs, deliberate deviations from pi-mono, and where to look.
+Not a step log. All changes stay inside the Iris CLI/TUI tier
+(<code>TerminalSurface</code> / <code>Screen</code> / <code>tui_loop</code>); Nexus and
+Wayland are untouched, no alternate screen, no Ratatui <code>Terminal</code>/inline
+viewport lifecycle.</p>
 
-<h2>Verified failure being fixed</h2>
-<p><code>Anthropic stream ended before content_block_stop [status=200 ...]</code>. The parser
-only emits this when <code>message_stop</code> arrives while <code>open_tools</code> or
-<code>open_reasoning</code> is non-empty; plain text blocks cannot trigger it.</p>
+<h2>Verified base</h2>
+<ul>
+<li>Worktree <code>../iris-terminal-hardening</code>, branch <code>terminal-hardening</code>,
+based on the verified intended base <code>d1d9bce</code>
+(<em>feat(tui): compact tool durations, expand hint, intra-line diff highlights</em>),
+which is ahead of <code>origin/main</code>. That TUI commit is preserved as the base;
+<code>HEAD..origin/main</code> was empty at branch time.</li>
+<li>The unrelated <code>mydiff.txt</code> (and a stray <code>test_width.rs</code> that
+appeared in the primary checkout, not authored here) were left untouched.</li>
+</ul>
+
+<h2>Scope implemented</h2>
+<p>Full terminal-hardening slice: full-redraw clear/rebuild, Termux height handling,
+16ms render coalescing, changed-line rendering, over-width crash diagnostics, IME
+hardware-cursor markers, and keyboard-protocol negotiation/restoration.</p>
 
 <h2>Key decisions</h2>
+
+<h3>1. Full redraw now clears native scrollback &mdash; but only on a true resize</h3>
+<p><b>Why the override.</b> Iris previously refused to clear native scrollback on any
+full redraw and instead repainted only the visible viewport slice with
+<code>\x1b[J</code>. In practice that left stale/duplicated rows after width/height
+resizes (the reported scrollback/redraw bug). pi-mono clears screen+home+scrollback
+(<code>\x1b[2J\x1b[H\x1b[3J</code>) and rebuilds from state, which is the robust fix.</p>
+<p><b>The split (important).</b> &ldquo;Full redraw&rdquo; is not one thing. Two distinct
+paths now exist in <code>terminal_surface.rs</code>:</p>
 <ul>
-<li><b>Duplicate-delta prevention (scope item 5) &mdash; chosen strategy: gate retry on
-"no visible text emitted this attempt", NOT per-attempt buffering.</b>
-Rationale: buffering every attempt would kill live token streaming on the happy path
-(every turn, not just retried ones). Instead the parser carries an explicit
-<code>emitted_visible_text</code> flag (set only when a non-empty <code>text_delta</code>
-is successfully forwarded to the sink). A malformed status-200 stream is retried only
-when no visible text was emitted on that attempt. Because tool input
-(<code>input_json_delta</code>) and reasoning (<code>thinking_delta</code>/<code>signature_delta</code>)
-are buffered internally and never streamed live, the verified tool-only / thinking-only
-malformed turns always qualify for retry. If visible text was already streamed and then
-the stream malformed, we do NOT retry; we surface the typed protocol error (DoD permits
-"retried/recovered OR fails with a typed sanitized protocol error"). A retried attempt by
-definition emitted no text, so the next attempt starts with no prior visible text and
-duplicate user-visible deltas are impossible.
-<br><b>Caveat for reviewers:</b> this predicate is safe only because <code>text_delta</code>
-is the ONLY live event today. If reasoning/tool deltas ever stream live, the predicate must
-be revisited.</li>
+<li><b>Resize redraw</b> (<code>write_resize_redraw</code>): triggered only by a width
+change, or a height change when <em>not</em> Termux. Emits
+<code>\x1b[2J\x1b[H\x1b[3J</code> and rewrites <em>all</em> lines from index 0, so the
+history scrolls back into the freshly-cleared scrollback instead of being lost or
+duplicated. Writing all lines is required precisely because <code>3J</code> wipes the
+native scrollback; only the app can repopulate it. Transcript state is already bounded,
+so this is acceptable.</li>
+<li><b>In-place rebuild</b> (existing <code>write_full(clear=true)</code>, used for
+non-append shrink / change-above-viewport within <code>write_diff_or_replay</code>):
+keeps the viewport-down <code>\x1b[J</code> clear and repaints the visible slice. This
+path must <em>not</em> clear scrollback (e.g. closing the slash palette must not wipe
+the user's history view).</li>
+</ul>
+<p><b>Preserved invariants.</b> First render writes everything with no clear; append/diff
+updates never clear scrollback; only genuine resize wipes+rebuilds it.</p>
 
-<li><b>Transport retry placement (scope item 3):</b> added a new shared
-<code>run_with_retry</code> alongside the existing <code>run_with_reauth</code> rather than
-generalizing the latter. Antigravity stays on <code>run_with_reauth</code> with identical
-behavior; only Anthropic uses the retry loop. <code>classify_http_status</code> (Reauth/Fatal)
-is left untouched for Antigravity; a separate <code>classify_http_status_retryable</code>
-(Reauth/Retry/Fatal) is added for Anthropic. <code>Attempt::Retry</code> is added to the shared
-enum; <code>run_with_reauth</code> treats it as fatal for exhaustiveness (Antigravity never
-produces it).</li>
+<h3>2. Termux exception</h3>
+<p>Termux changes terminal height every time the soft keyboard shows/hides. A
+scrollback-clearing redraw on every toggle would replay the whole history and churn
+scrollback. So when <code>TERMUX_VERSION</code> is set, a height-only change (width
+unchanged) skips the resize-redraw path and falls through to the normal diff/replay
+(scrollback preserved). Width changes still force a full resize redraw, even under
+Termux (wrapping genuinely changed). Detection is read once at construction into a
+<code>termux</code> field (test-overridable) to avoid process-global env races in
+parallel tests.</p>
+<p><b>Oracle-flagged correctness fix.</b> A height-only change reaching the diff path
+must recompute the effective previous viewport top for the new height before any
+movement / &ldquo;above viewport&rdquo; math, or a shrink could patch rows that are no
+longer visible and corrupt the viewport. <code>write_diff_or_replay</code> now does this
+(mirrors pi-mono's <code>prevViewportTop = heightChanged ? max(0, prevBufferLen -
+height) : prevViewportTop</code>).</p>
 
-<li><b>Backoff constants:</b> mirrored from Codex (<code>MAX_TRANSIENT_RETRIES=3</code>,
-<code>BASE_BACKOFF=500ms</code>, <code>MAX_BACKOFF=8s</code>, up to 250ms jitter, integer
-<code>Retry-After</code> seconds honored). Intentional small duplication with Codex: Codex
-predates the shared transport module and keeps its own copy (see transport.rs module note);
-unifying both is out of scope.</li>
-
-<li><b>Typed protocol error:</b> <code>StreamProtocolAnomaly</code> carries only block-shape
-metadata (message_stop seen, open tool/reasoning counts, open block indexes, last event
-type) &mdash; never streamed content. It is attached via <code>anyhow::Error::new(..)</code>
-and the safe request diagnostics are added with <code>.context(..)</code> so the typed error
-stays downcastable for classification (per oracle review). Network send errors and 429/5xx
-also become <code>Attempt::Retry</code>; the transient budget is shared across all three and
-is not reset by the one-shot reauth.</li>
-
-<li><b>max_tokens (scope item 8):</b> base <code>max_tokens</code> changed from a fixed 8192
-to the selected model's <code>output_cap</code> (<code>DEFAULT_OUTPUT_CAP=64000</code> for
-unknown models). For manual-budget thinking, <code>resolve_manual_thinking(output_cap, budget,
-output_cap)</code> keeps <code>budget_tokens &lt; max_tokens</code>, so the invariant holds and
-<code>max_tokens=output_cap</code>. This directly removes the 8192 truncation that produced
-silently-dropped <code>stop_reason=max_tokens</code>.</li>
-
-<li><b>stop_reason (scope items 6/7):</b> parsed from <code>message_delta.delta.stop_reason</code>,
-mapped to a provider-neutral <code>CompletionReason</code> enum (EndTurn, ToolUse,
-MaxOutputTokens, ContextWindowExceeded, StopSequence, Paused, Refusal, Other).
-<b>Decision change:</b> <code>Other</code> is a unit variant (not <code>Other(String)</code>).
-Keeping the enum small and <code>Copy</code> avoids tripping clippy's
-<code>large_enum_variant</code> lint once <code>completion_reason</code> is embedded in
-<code>AssistantTurn</code> (which flows through <code>ProviderEvent::Completed</code> /
-<code>StreamResult::Completed</code>); the alternative was boxing <code>AssistantTurn</code>
-in three enums across six files, a larger blast radius. The raw unknown stop-reason token
-is still surfaced for diagnostics via a <code>tracing::debug</code> line at parse time
-(the token is an enumerated wire value, never response content), so observability is
-preserved without storing it. Truncation reasons
-(MaxOutputTokens / ContextWindowExceeded) additionally emit a <code>tracing::warn</code> so they
-are not silently dropped. Stored on <code>AssistantTurn</code> and propagated to
-<code>AgentEvent::ProviderTurnCompleted</code>.</li>
-
-<li><b>UiEvent left unchanged:</b> <code>completion_reason</code> is added to the Nexus
-<code>AgentEvent::ProviderTurnCompleted</code> (the provider-neutral metadata event) but NOT to
-<code>UiEvent::ProviderTurnCompleted</code>, since no UI surface renders it yet. The
-<code>ui/mod.rs</code> mapping drops it. This keeps the change minimal and leaves typed
-completion metadata available for later continuation/fallback work, per the goal.</li>
+<h3>3. 16ms render coalescing (scheduler design)</h3>
+<p>An active turn emits bursts of agent events; drawing on each one is wasteful and
+flickers. <code>RenderScheduler</code> in <code>tui_loop.rs</code> coalesces requests to
+roughly one draw per 16ms: the first request after a draw (or after idle) draws
+immediately; further requests within the window collapse into one pending flag flushed
+at the interval boundary by a <code>sleep_until</code> select branch. When nothing is
+pending the branch is disabled, so the loop stays CPU-idle (no timer wakeups).</p>
+<ul>
+<li><b>Scope.</b> Wired into <code>run_turn</code> (the bursty path). Idle/modal draws
+stay immediate &mdash; they are one-per-keystroke, not bursts, and immediate echo is
+better UX. Startup and turn-boundary draws bypass the scheduler (forced immediate).</li>
+<li><b>Testability.</b> The scheduler is pure and clock-injectable
+(<code>poll(now) -&gt; DrawNow | Wait(deadline) | Idle</code>), unit-tested with injected
+<code>Instant</code>s &mdash; no real-time sleeps. The 16ms latency added to coalesced
+input is imperceptible; the first event after idle still draws immediately.</li>
 </ul>
 
-<h2>Review follow-up fixes (second pass)</h2>
+<h3>4. Changed-line rendering</h3>
+<p>The existing changed-range diff path is preserved: single-line updates rewrite only
+the changed visible rows (<code>\x1b[2K</code>), and unsafe changes (shrink, change above
+the viewport) fall back to the in-place rebuild. Deletion/shrink stale-row clearing keeps
+using the viewport-down clear so scrollback is not corrupted (per the split in &sect;1).</p>
+
+<h3>5. Over-width diagnostics &mdash; fail fast, no silent clipping</h3>
+<p>Previously <code>render_line</code> silently clipped any over-width line to the
+terminal width, hiding renderer wrap bugs (and still risking corruption at wide-char/ANSI
+boundaries). Now <code>render_lines</code> measures each line's visible display width; if a
+line exceeds the terminal width it writes a diagnostic log and returns an error
+<em>before</em> any corrupting write. Higher-level layout (<code>screen.rs</code>) is
+responsible for wrapping to width, so an over-width line is a real bug the guard surfaces.</p>
+<p><b>Crash-log path (Iris data convention, not <code>.pi</code>).</b> The log is written to
+<code>$IRIS_CRASH_LOG_DIR</code> if set, else <code>~/.iris/tui-crash.log</code>, matching
+the <code>~/.iris</code> convention used by settings/auth/sessions. Logging is best-effort
+and never masks the original error. The directory is a test-overridable field, so the
+over-width test asserts both the error and the log without touching the real home dir.</p>
+
+<h3>6. IME hardware-cursor markers</h3>
+<p>Contract: a focused composer/editor emits a zero-width marker
+(<code>CURSOR_MARKER</code>, an APC sequence) at its cursor cell; the terminal surface
+finds it, records the cursor (row, col), strips it before any terminal write, and positions
+the hardware cursor for IME candidate-window placement.</p>
 <ul>
-<li><b>Retry-gate invariant hardened (review item 1):</b> the duplicate-delta predicate is
-unchanged in behavior, but the doc comment on <code>protocol_anomaly_retryable</code> now
-states an explicit INVARIANT: any future live UI event (live reasoning or tool deltas) MUST
-set the same <code>emitted_visible_text</code> gate, or the retry policy must change. Added
-<code>malformed_stream_after_visible_text_is_not_retryable</code> covering the
-<code>content_block_stop</code> variant after a real <code>text_delta</code> (the prior
-tests only covered the missing-<code>message_stop</code> variant).</li>
-
-<li><b>Truncation is now user-visible (review item 2):</b> a provider-neutral
-<code>completion_reason_notice(CompletionReason)</code> lives in <code>nexus.rs</code> and the
-provider loop emits <code>AgentEvent::Notice</code> right after
-<code>ProviderTurnCompleted</code> when the reason is <code>MaxOutputTokens</code> or
-<code>ContextWindowExceeded</code>. <b>Decision:</b> wording is model-neutral ("The model hit
-its maximum output-token limit..." / "...context-window limit...") rather than the
-Anthropic-specific "Claude ..." phrasing the request suggested, because the notice is emitted
-from provider-neutral Nexus completion metadata and the runtime must not hard-code a
-provider/model name (ADR-0003 / tier boundaries). The existing <code>tracing::warn</code> in
-the Anthropic adapter is retained. Notices ride the existing
-<code>AgentEvent::Notice -&gt; UiEvent::Notice</code> path; no new event type.</li>
-
-<li><b>Empty completed turns with a valid stop reason (review item 3):</b>
-<code>AnthropicStreamParser::finish</code> now treats a terminal stream with no
-text/reasoning/tool calls as a valid empty completion when a <code>stop_reason</code> was
-present (<code>completion_reason.is_some()</code>); a contentless stream with NO stop reason
-still errors as before. The presence of the stop reason (any mapped value, including
-<code>Other</code> for unknown-but-present tokens) is the gate, since a stop reason is the
-provider's terminal completion signal.</li>
-
-<li><b>Stale-doc fixes (review item 4):</b> the module headers in <code>transport.rs</code>
-and <code>anthropic_messages.rs</code> no longer claim "no transient backoff"; they now
-describe <code>run_with_retry</code> (Anthropic) vs <code>run_with_reauth</code>
-(Antigravity, reauth-only).</li>
+<li><b>Marker as a structured span, not embedded ANSI.</b> Rather than embedding the APC
+string in the rendered ANSI and re-parsing it with ANSI-aware width (pi-mono's approach),
+Iris carries the marker as a ratatui <code>Span</code> whose content equals
+<code>CURSOR_MARKER</code>. <code>render_line</code> detects that span, records the column as
+the accumulated display width of preceding spans, and skips emitting it. This keeps width
+accounting and the diff source of truth free of escape noise. The marker never reaches
+<code>previous_lines</code>.</li>
+<li><b>Producer.</b> <code>screen.rs</code> locates the editor's reversed block cursor
+(<code>ratatui-textarea</code> draws it with <code>Modifier::REVERSED</code>) within the
+editor text area and injects the marker span just before that cell &mdash; only when the
+composer owns focus (<code>!turn &amp;&amp; no modal &amp;&amp; no approval</code>).</li>
+<li><b>Positioning runs on every render, including <code>Unchanged</code></b> (oracle fix):
+when only the cursor moves within an otherwise-identical row, the stripped strings do not
+change, so cursor positioning is independent of the changed-range diff.</li>
+<li><b>Show vs position.</b> Default is &ldquo;position but keep hidden&rdquo; (the hardware
+cursor is <em>moved</em> for IME but stays hidden because Iris draws its own reversed block
+cursor, avoiding a double cursor) &mdash; matching pi-mono's opt-in
+<code>showHardwareCursor</code>. A test-only flag exercises the show path. Hidden when no
+marker; restored (shown) on shutdown via <code>restore()</code>.</li>
 </ul>
 
-<h2>Review follow-up fixes (third pass &mdash; 6 reviewer findings)</h2>
+<h3>7. Keyboard protocol negotiation/restoration</h3>
+<p>Setup previously pushed only <code>DISAMBIGUATE_ESCAPE_CODES</code> unconditionally. Now
+Iris probes <code>supports_keyboard_enhancement()</code> first and, when supported, pushes
+<code>DISAMBIGUATE_ESCAPE_CODES | REPORT_EVENT_TYPES | REPORT_ALTERNATE_KEYS</code> (flag set
+7, matching pi-mono). Requesting event types is safe because every Iris key handler gates on
+Press/Repeat and ignores releases. A <code>keyboard_enhanced</code> flag records whether the
+push happened, so the matching pop runs exactly once on shutdown/error and never leaks a stray
+pop on terminals that never negotiated. Negotiation is best-effort: a probe error or push
+failure does not abort startup.</p>
+<p><b>Deliberate non-parity.</b> pi-mono's <code>modifyOtherKeys</code> (<code>CSI &gt;4;2m</code>)
+fallback is <em>not</em> emitted: Crossterm does not model or parse it, and Crossterm still
+delivers usable key events without the protocol. The Crossterm-supported fallback (simply not
+pushing when unsupported) is used instead. The enable/disable sequences are factored into pure
+helpers and unit-tested with a fake writer.</p>
+
+<h2>Deliberate deviations from pi-mono (summary)</h2>
 <ul>
-<li><b>Mid-stream read failure is now retryable when safe (finding 1):</b> a
-<code>for_each_sse_event</code> failure in <code>send_once</code> previously always returned
-<code>Attempt::Fatal</code>, even though a pre-stream <code>send()</code> failure was already
-retried. A mid-stream connection drop/timeout is transient and is now retried on the SAME
-gate as a protocol anomaly: only when <code>!cancel.is_cancelled() && !emitted_visible_text</code>,
-so a retry can never duplicate user-visible output and cancellation is never swallowed.
-<b>No new unit test:</b> there is no HTTP-mock harness for <code>send_once</code> (provider
-tests operate at the parser level), and the decisive predicate is the already-tested
-<code>emitted_visible_text</code> gate plus the shared cancellation token; building a mock
-server purely for this path would dwarf the fix.</li>
-
-<li><b>Defensive redaction of serde errors (finding 2):</b> both
-<code>serde_json::from_str</code> sites (<code>ingest_event</code> SSE frame,
-<code>finalize_tool</code> tool JSON) now drop the serde error via <code>map_err(|_| ...)</code>
-and return a fixed message. Both deserialize to an untyped <code>Value</code>, so serde only
-produces positional syntax errors (never the input bytes) &mdash; this is belt-and-suspenders,
-not a live leak. Removing the last <code>Result::context</code> call made the <code>anyhow::Context</code>
-import unused; it was dropped.</li>
-
-<li><b>force_refresh in run_with_reauth (finding 3):</b> investigated the suggested
-"reset for consistency with <code>retry_loop</code>" and found a reset is actually DEAD CODE
-here (clippy <code>unused_assignments</code>): this loop's only loop-back is the <code>Reauth</code>
-arm, which immediately sets <code>force_refresh = true</code>, so a reset to <code>false</code>
-is never read on any path. Kept the original (no reset) and documented WHY it correctly differs
-from <code>retry_loop</code> (whose <code>Retry</code> arm loops without touching the flag and
-thus genuinely needs the reset). No behavior change.</li>
-
-<li><b>Empty-turn test coverage (finding 4):</b>
-<code>empty_turn_with_valid_stop_reason_completes</code> now also iterates <code>pause_turn</code>
-and <code>refusal</code>, the other contentless stop reasons <code>finish()</code> accepts.</li>
-
-<li><b>Content-less refusal notice (finding 5):</b> <code>completion_reason_notice</code> now
-takes <code>had_visible_content</code> and returns "The model declined to respond." for a
-<code>Refusal</code> that produced no text/reasoning/tool calls. A refusal that DID carry an
-explanation emits no extra notice (the user already sees it). <code>had_visible_content</code>
-is captured in the agent loop before <code>reasoning</code> is consumed. Wording stays
-provider/model-neutral. Tested both ways in <code>nexus_tests.rs</code>.</li>
-
-<li><b>Diagnostics key consistency (finding 6):</b> <code>StreamProtocolAnomaly</code>'s Display
-now uses the <code>last_event=</code> key (was <code>last_event_type=</code>) to match
-<code>AnthropicDiagnostics</code> and the original failure log, so logs are searchable on one
-field.</li>
+<li>Cursor marker travels as a structured span, not an embedded APC literal re-parsed from
+ANSI.</li>
+<li>No <code>modifyOtherKeys</code> raw fallback (Crossterm has no model for it).</li>
+<li>No KITTY image handling / over-width image exemptions (Iris renders no images), so the
+over-width guard has no image exemption branch.</li>
+<li>Coalescing is wired only into the active-turn burst path; idle/modal draws remain
+immediate.</li>
+<li>Crash log lives under <code>~/.iris</code> (Iris data convention), not
+<code>~/.pi/agent</code>.</li>
 </ul>
 
-<h2>Deferred (explicitly out of the smallest-correct scope)</h2>
+<h2>Tests</h2>
 <ul>
-<li><b>Automatic in-stream continuation / non-streaming fallback</b> (scope item 12): not
-implemented. Recovering a malformed stream <em>after</em> visible text without a UI rewind
-event would require buffering all live deltas (regressing streaming UX for every turn) or a
-new Nexus "discard partial" event. Both exceed the smallest correct fix. Typed error
-classification, bounded retry/recovery, safe diagnostics, stop-reason propagation, and the
-max-token cap correction are all implemented (not deferred).</li>
+<li><code>terminal_surface.rs</code>: first render no-clear; width resize and non-Termux height
+resize clear scrollback (<code>2J/H/3J</code>) and rebuild the full document; Termux height-only
+no scrollback clear; Termux width still clears; append/diff no full clear; changed-line-only diff;
+shrink stale-row clearing; over-width errors + writes crash log (no clipping); exact-width not
+flagged; cursor marker stripped + hardware cursor positioned (incl. on <code>Unchanged</code>);
+show-cursor opt-in.</li>
+<li><code>screen.rs</code>: focused composer emits the marker; a running turn does not.</li>
+<li><code>tui.rs</code>: keyboard-enhancement pushed only when supported; popped only when
+enabled (lifecycle/restoration) via a fake writer.</li>
+<li><code>tui_loop.rs</code>: render coalescing state machine (immediate first draw, burst
+coalesced then flushed at the 16ms boundary, idle after draw) with injected clocks.</li>
+</ul>
+
+<h2>Known limitations</h2>
+<ul>
+<li>The over-width guard uses <code>unicode-width</code> measurements, which can differ from a
+specific terminal's glyph widths for some emoji/CJK; this matches the prior clipping path's
+measurement and is the standard tradeoff.</li>
+<li>IME candidate-window placement relies on the terminal honoring a moved-but-hidden cursor
+position; the opt-in show path exists for terminals/users that prefer a visible hardware
+cursor.</li>
 </ul>
 </body>
 </html>
