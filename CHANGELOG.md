@@ -9,18 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Documented the PR #170-#175 TUI/harness batch: compact tool durations,
+  `ctrl+o` full-output reveal, word-level diff highlights, pi-mono-aligned
+  harness limits, the reusable TUI component/focus layer, the shared text
+  engine, the tool renderer registry, richer assistant Markdown, and collapsed
+  reasoning/thinking panels.
 - Documented current post-0.1.0 capabilities: terminal-surface TUI ownership,
   provider/model/reasoning selectors, Mimir auth hardening, Anthropic browser
   OAuth, Antigravity `thoughtSignature` continuity, structured runtime events,
   provider usage/cache accounting, prompt-cache controls, and Anthropic
   context-management opt-ins.
+- Added docs for the opt-in `scripts/tui-live.sh` manual live-rendering harness
+  used when changing pane rendering.
 - Added ADR-0022 for default-off provider-native prompt-cache and
   context-management integration.
 
 ### Changed
 
-- Refreshed README, roadmap, feature inventory, codemap, pitch, and ADR index
-  against merged PR and git history through PR #143.
+- Refreshed README, roadmap, and feature inventory against merged PR and git
+  history through PR #177.
+- Clarified current user-visible TUI behavior: state-specific panel symbols,
+  preview/full output folding, GFM table/task-list/strikethrough rendering,
+  collapsed thinking blocks, Unicode-aware wrapping, and generic safe fallback
+  rendering for unknown tools.
+- Clarified current harness/tool limits: no default bash timeout, no fixed
+  default tool-roundtrip cap, full safe-parallel batches for read-only search
+  tools, 50 KiB inline display threshold, and retained memory-safety rails.
 
 ## [0.1.0](https://github.com/5omeOtherGuy/iris-agent/releases/tag/v0.1.0) - 2026-06-17
 

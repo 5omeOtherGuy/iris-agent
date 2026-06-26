@@ -1,6 +1,6 @@
 # Iris — Feature List
 
-> Status (2026-06-22): Milestone 2 foundations are implemented; the remaining
+> Status (2026-06-26): Milestone 2 foundations are implemented; the remaining
 > Milestone 2 gate is benchmark proof plus consumer slices. Labels:
 > **[Implemented]** · **[Partial]** · **[Planned · MVP]** · **[Planned]** ·
 > **[Research]**. This file is
@@ -12,7 +12,9 @@
 - **CLI entrypoint** — `cargo run` starts Iris. [Implemented]
 - **Interactive terminal session** — terminal-surface TUI on real TTYs with an
   Iris-owned transcript replay/diff renderer, textarea editor, spinner, slash
-  palette, modal selectors, live bash exec cells, streamed Markdown rendering,
+  palette, modal selectors, live bash exec cells, compact tool timers,
+  state-specific panel symbols, `ctrl+o` output preview/reveal, word-level diff
+  highlights, streamed GFM-style Markdown rendering, collapsed reasoning panels,
   `/exit` and `/quit`; text REPL fallback for pipes/CI or TUI startup failure.
   [Implemented]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
@@ -20,12 +22,17 @@
   [Partial]
 - **Provider-neutral turn/message shape** — `ChatProvider`, `AssistantTurn`,
   `ToolCall`, `Message`, `Role`, and provider-neutral assistant-reasoning rows
-  in Nexus. [Partial]
+  plus display events in Nexus. [Partial]
 - **Provider error reporting** — provider errors print to stderr and the REPL
   continues. [Partial]
 - **Streaming responses** — incremental assistant text output via the async
   `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, consumed by
   the tokio agent loop and rendered as `UiEvent` deltas. [Implemented]
+- **TUI transcript rendering** — assistant text supports Markdown tables,
+  task-list checkboxes, strikethrough, themed spans, Unicode-aware
+  wrap/truncate behavior, and collapsed `Thinking...` panels for provider
+  reasoning when the provider supplies displayable reasoning. Redacted reasoning
+  never renders provider-hidden text. [Implemented]
 - **Runtime-hard cancellation** — per-turn `CancellationToken`, provider
   stream-vs-cancel race, tool-vs-cancel race, child cancellation per tool, and a
   real-or-synthetic cancelled tool result for every emitted call so the
@@ -117,9 +124,10 @@
 ## Agent Kernel MVP tools
 
 - **Tool-call loop** — send tool schemas, receive tool calls, execute async tools,
-  feed tool results back to the model, and stop after a bounded number of tool
-  iterations. Runs on the tokio loop with per-turn/per-tool cancellation and
-  safe-parallel batching of concurrency-safe calls. [Implemented]
+  and feed tool results back to the model. There is no fixed default round-trip
+  cap; `maxToolRoundtrips` can add a graceful soft cap when configured. Runs on
+  the tokio loop with per-turn/per-tool cancellation and safe-parallel batching
+  of concurrency-safe calls. [Implemented]
 - **`read` tool** — read a workspace text file with offset/limit; rejects
   binary/NUL-containing and invalid UTF-8 files rather than rendering lossy
   text. [Implemented]
@@ -132,8 +140,9 @@
   (Claude Code-compatible `file_path`/`old_string`/`new_string`/`replace_all`),
   including whitespace-normalized fallback matching and atomic replacement.
   [Implemented]
-- **`bash` tool** — run a bounded shell command in the workspace with captured
-  output, timeout handling, and nonzero-exit reporting. [Implemented]
+- **`bash` tool** — run a shell command in the workspace with captured output,
+  per-call timeout handling when requested, and nonzero-exit reporting. Iris no
+  longer applies a default timeout to every bash call. [Implemented]
 - **`grep` tool** — search workspace file contents in-process via the ripgrep
   library crates (no `rg` binary required). [Implemented]
 - **`find` tool** — find workspace files in-process via `ignore` + `globset`
@@ -144,7 +153,7 @@
 - **Tool result/error encoding** — structured success/error responses returned to
   the model, including a per-tool `metadata` object on success (e.g. `read`
   byte/line counts and `truncated`, `ls` entry count). Successful outputs over
-  16 KiB are stored out of context behind an `outputHandle` when a session store
+  50 KiB are stored out of context behind an `outputHandle` when a session store
   is attached. [Implemented]
 
 ## Safety and approvals
@@ -157,9 +166,10 @@
 - **Atomic file replacement** — `write` and `edit` write through a
   same-directory temp file, fsync, rename, cleanup-on-error path, and Unix
   permission preservation on overwrite. [Partial]
-- **Bash policy** — cwd, timeout, stdout/stderr capture, output limits,
-  nonzero-exit handling, process-group cleanup, persistent sessions, background
-  jobs, and Linux Landlock confinement where available. [Partial]
+- **Bash policy** — cwd, optional per-call timeout, stdout/stderr capture,
+  output limits, nonzero-exit handling, process-group cleanup, persistent
+  sessions, background jobs, and Linux Landlock confinement where available.
+  [Partial]
 - **File observation / stale mutation preflight** — session-scoped observation
   store records each file's `{mtime, content_hash}` on read/write/edit; `edit`
   and `write` reject mutating an existing file that was never read or has
