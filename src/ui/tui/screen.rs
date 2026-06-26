@@ -16,6 +16,7 @@ use crate::tool_display::run_target;
 use crate::ui::UiEvent;
 use crate::ui::modal::Modal;
 use crate::ui::slash::Palette;
+use crate::ui::terminal_surface::CURSOR_MARKER;
 
 use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
@@ -362,6 +363,14 @@ impl Screen {
         } else {
             FocusTarget::Editor
         }
+    }
+
+    /// Whether the composer editor currently owns input focus, i.e. the user can
+    /// type into it. False while a turn runs, a modal/picker is open, or a tool
+    /// is awaiting approval. Drives whether a hardware-cursor (IME) marker is
+    /// emitted at the editor cursor.
+    fn composer_focused(&self) -> bool {
+        !self.spinner.active && self.modal.is_none() && self.approval_hint.is_none()
     }
 
     // --- transcript ---
@@ -1023,11 +1032,18 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
             .max(1),
     };
+    // Cell of the editor's hardware-cursor (IME) marker, in buffer coordinates.
+    // Only emitted when the composer owns input focus (no turn/modal/approval),
+    // located by the reversed block cursor `ratatui-textarea` draws for us.
+    let mut cursor_cell: Option<(u16, u16)> = None;
     if let Some(hint) = &screen.approval_hint {
         let approval_lines = approval_status_lines(hint, usize::from(text_area.width));
         Paragraph::new(Text::from(approval_lines)).render(text_area, &mut buf);
     } else {
         (&screen.editor).render(text_area, &mut buf);
+        if screen.composer_focused() {
+            cursor_cell = find_reversed_cell(&buf, text_area);
+        }
     }
     let hint = if screen.approval_hint.is_some() || editor_area.height < MIN_EDITOR_H {
         Line::default()
@@ -1055,18 +1071,43 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     {
         Paragraph::new(Text::from(vec![line])).render(workspace_area, &mut buf);
     }
-    buffer_to_lines(&buf)
+    buffer_to_lines(&buf, cursor_cell)
 }
 
-fn buffer_to_lines(buf: &Buffer) -> Vec<Line<'static>> {
+/// Find the reversed block cursor `ratatui-textarea` draws, scanning only the
+/// editor's text area. Returns its buffer cell `(x, y)`, used to place the
+/// zero-width hardware-cursor (IME) marker.
+fn find_reversed_cell(buf: &Buffer, area: Rect) -> Option<(u16, u16)> {
+    for y in area.top()..area.bottom().min(buf.area.bottom()) {
+        for x in area.left()..area.right().min(buf.area.right()) {
+            if buf[(x, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+            {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for y in 0..buf.area.height {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for x in 0..buf.area.width {
+            // Inject the zero-width cursor marker as its own span immediately
+            // before the cursor cell so the terminal surface can recover the
+            // cursor column (it strips the marker before any terminal write).
+            if cursor_cell == Some((x, y)) {
+                spans.push(Span::raw(CURSOR_MARKER));
+            }
             let cell = &buf[(x, y)];
             let style = cell.style();
             if let Some(last) = spans.last_mut()
                 && last.style == style
+                && last.content.as_ref() != CURSOR_MARKER
             {
                 last.content.to_mut().push_str(cell.symbol());
                 continue;
@@ -1151,6 +1192,36 @@ mod tests {
         assert!(out.contains('…'), "{out:?}");
         // Fits untouched when there is room.
         assert_eq!(truncate_cwd_middle("~/repo", 40), "~/repo");
+    }
+
+    #[test]
+    fn focused_composer_emits_cursor_marker_and_running_turn_does_not() {
+        use super::{Screen, render_document_with_chrome_tail};
+        use crate::ui::terminal_surface::CURSOR_MARKER;
+        use ratatui::layout::Size;
+
+        let has_marker = |lines: &[ratatui::text::Line<'static>]| {
+            lines.iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == CURSOR_MARKER)
+            })
+        };
+
+        let mut screen = Screen::new();
+        let (focused, _) = render_document_with_chrome_tail(&mut screen, Size::new(80, 10));
+        assert!(
+            has_marker(&focused),
+            "focused composer must emit the IME marker"
+        );
+
+        // While a turn runs the composer is frozen: no marker (cursor hidden).
+        screen.start_turn();
+        let (running, _) = render_document_with_chrome_tail(&mut screen, Size::new(80, 10));
+        assert!(
+            !has_marker(&running),
+            "a running turn must not emit the composer cursor marker"
+        );
     }
 
     #[test]

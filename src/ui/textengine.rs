@@ -778,28 +778,6 @@ pub(crate) mod ansi_aware {
     }
 }
 
-/// Clip `content` to at most `remaining` display columns at a grapheme-cluster
-/// boundary, returning the clipped text and its width. Used by the terminal
-/// surface; grapheme-aware so an emoji/combining cluster at the right edge is
-/// dropped whole rather than split into a broken half-cluster.
-pub(crate) fn clip_to_width(content: &str, remaining: usize) -> (String, usize) {
-    let full = display_width(content);
-    if full <= remaining {
-        return (content.to_string(), full);
-    }
-    let mut out = String::new();
-    let mut width = 0usize;
-    for cluster in content.graphemes(true) {
-        let w = cluster_width(cluster);
-        if width + w > remaining {
-            break;
-        }
-        out.push_str(cluster);
-        width += w;
-    }
-    (out, width)
-}
-
 #[cfg(test)]
 mod tests {
     use super::ansi_aware::{slice_by_column, truncate_ansi, wrap_ansi};
@@ -996,14 +974,5 @@ mod tests {
         // The ANSI-aware wrap of the same input also terminates quickly.
         let rows = wrap_ansi(&pathological, 10);
         assert!(!rows.is_empty());
-    }
-
-    #[test]
-    fn clip_to_width_matches_unicode_width_for_plain_and_keeps_clusters() {
-        assert_eq!(clip_to_width("abcdef", 5), ("abcde".to_string(), 5));
-        assert_eq!(clip_to_width("ab", 5), ("ab".to_string(), 2));
-        assert_eq!(clip_to_width("中文", 3), ("中".to_string(), 2));
-        // ZWJ cluster dropped whole, not split.
-        assert_eq!(clip_to_width("😀x", 1), (String::new(), 0));
     }
 }
