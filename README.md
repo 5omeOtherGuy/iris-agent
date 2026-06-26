@@ -6,22 +6,25 @@
   <img alt="An Iris terminal session — an EXPLORE and EDIT tool turn, the turn divider, the LED working indicator, and the composer statusline." src="docs/assets/hero-dark.svg" width="760">
 </picture>
 
-An instrument for developers, not an autonomous magic act for vibe coders.
+A fast coding agent for the terminal, built for token efficiency.
 
 [Install](#install) · [Run](#run) · [The instrument](#the-instrument) · [Status](#status) · [Documentation](#documentation)
 
 ---
 
-Iris is built in Rust for terminal-native developers who already know the change
-they want made — the diff they would have written — and want it shipped while
-spending as few tokens as possible, with every detail available on demand. It
-keeps the expert in control: direct feedback, explicit approval, no autonomous
-overreach.
+Iris is a coding agent you run in your terminal, for developers who already know
+the change they want and read diffs faster than prose. Mutating tools require
+explicit approval; nothing runs autonomously. It is written in Rust and ships as
+a single binary.
 
-- **Iris** — the coding agent and overall product, and its terminal CLI (Tier 3).
-- **Wayland** — the harness equipping the core with sessions/config/execution env (Tier 2).
+For target users, product stance, and principles, see the [product brief](PRODUCT.md).
+
+The tiers are mythology-named (see [Naming convention](docs/NAMING.md)):
+
+- **Iris** — the coding agent, the overall product, and its terminal CLI (Tier 3).
+- **Wayland** — the harness: sessions, config, and execution environment (Tier 2).
 - **Nexus** — the local agent runtime core (Tier 1).
-- **Mimir** — the AI/provider package implementing Nexus's `ChatProvider` contract.
+- **Mimir** — the provider package implementing Nexus's `ChatProvider` contract.
 
 ## Install
 
@@ -154,22 +157,30 @@ on demand (`ctrl+o` reveals a panel's full output).
 The hero above is rendered in exactly this language. The full system lives in
 [DESIGN.md](DESIGN.md) (token/format summary) and
 [docs/TUI_DESIGN_LANGUAGE.md](docs/TUI_DESIGN_LANGUAGE.md) (the ground-truth pane
-grammar) — a Teenage-Engineering-lineage industrial design: restrained,
-mechanical, honest. The hero SVGs are regenerated with
+grammar). The hero SVGs are regenerated with
 [`scripts/gen-hero-svg.py`](scripts/gen-hero-svg.py); a real recorded cast can
 replace them via [`scripts/record-demo.sh`](scripts/record-demo.sh).
 
 ## Status
 
-**As of 2026-06-26: Milestone 1, the async-hard runtime, and the Milestone 2
-foundations are complete.** Iris today is an interactive terminal TUI (with a
-plain-text fallback for pipes/CI) driving a tokio async runtime with turn-level
-cancellation: selectable Mimir providers, runtime model/reasoning switching,
-streamed parsing, workspace-scoped built-in tools, terminal approval gates with
-diff previews, JSONL transcript persistence/resume, large-output handles, and
-turn-boundary auto-compaction. **The next milestone gate is proving the
-token-efficiency thesis with benchmark evidence** — honesty over hype is a
-product stance, so efficiency claims wait on measurement.
+As of 2026-06-26: Milestone 1, the async-hard runtime, and the Milestone 2
+foundations are complete. The next milestone gate is proving the token-efficiency
+thesis with benchmark evidence; efficiency claims wait on measurement.
+
+Implemented:
+
+- Interactive terminal TUI, with a plain-text fallback for pipes and CI.
+- Tokio async runtime with turn-level cancellation.
+- Selectable Mimir providers (OpenAI Codex, Anthropic, Antigravity) with runtime model/reasoning switching.
+- Workspace-scoped tools: read, write, edit, bash, grep, find, ls.
+- Approval gates with diff previews for mutating tools.
+- JSONL transcript persistence and linear resume.
+- Large-output handles and turn-boundary auto-compaction.
+
+Next:
+
+- Token-efficiency benchmark proof.
+- Persistent approval policies, in-session resume picker, transcript branching/rollback, modes, and subagents.
 
 <details>
 <summary><b>Implemented today</b></summary>
@@ -217,7 +228,6 @@ cargo test
 - [Naming convention](docs/NAMING.md) — how the Iris/Wayland/Nexus/Mimir tiers are named.
 - [Roadmap](docs/ROADMAP.md) — milestone sequencing and acceptance gates.
 - [Feature list](docs/FEATURES.md) — implemented/planned capability inventory.
-- [Pitch](docs/PITCH.md) — product direction and positioning.
 - [Product brief](PRODUCT.md) — target users, product purpose, voice, and product principles.
 - [Design system summary](DESIGN.md) — concise visual-system summary for the Iris TUI.
 - [Current codemap](docs/CODEMAPS/INDEX.md) — source-grounded map of the current codebase.

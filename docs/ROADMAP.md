@@ -882,7 +882,7 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
   Iris CLI, subagents, or future integrations.
 - Prefer standard Rust/runtime libraries and established crates for paths,
   processes, JSON, HTTP, and CLI parsing instead of hand-rolled equivalents.
-- Treat `PITCH.md` as direction, `FEATURES.md` as inventory, and this roadmap as
+- Treat `PRODUCT.md` as direction, `FEATURES.md` as inventory, and this roadmap as
   execution order.
 
 ## Immediate next steps
