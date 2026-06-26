@@ -1,32 +1,183 @@
-# Iris Agent
+# Iris
 
-```
-╭───────────────────────────────╮
-│                               │
-│   ██       ██                 │
-│   ██ ██▄▄▖ ██ ▄████           │
-│   ██ ███▀▘ ██ ▀▀▀██           │
-│   ██ ██    ██ ▄▄▄██           │
-│   ██ ██    ██ █████           │
-│                               │
-│   "I'd ship this one!"        │
-│        — Claude Code, 2026    │
-│                               │
-╰───────────────────────────────╯
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.svg">
+  <img alt="An Iris terminal session — an EXPLORE and EDIT tool turn, the turn divider, the LED working indicator, and the composer statusline." src="docs/assets/hero-dark.svg" width="760">
+</picture>
 
-Iris is a terminal-first coding agent being built in Rust. The product is split into mythology-named tiers (see [Naming convention](docs/NAMING.md)):
+A fast, token-efficient coding agent for the terminal. A precise instrument, not
+an autonomous magic act: **every token is deliberate, and the diff is the
+deliverable.**
+
+[Install](#install) · [Run](#run) · [The instrument](#the-instrument) · [Status](#status) · [Documentation](#documentation)
+
+---
+
+Iris is built in Rust for terminal-native developers who already know the change
+they want made — the diff they would have written — and want it shipped while
+spending as few tokens as possible, with every detail available on demand. It
+keeps the expert in control: direct feedback, explicit approval, no autonomous
+overreach.
+
+The product is split into mythology-named tiers (see
+[Naming convention](docs/NAMING.md)):
 
 - **Iris** — the coding agent and overall product, and its terminal CLI (Tier 3).
-- **Wayland** — the harness that equips the core with sessions/config/execution env (Tier 2).
+- **Wayland** — the harness equipping the core with sessions/config/execution env (Tier 2).
 - **Nexus** — the local agent runtime core (Tier 1).
 - **Mimir** — the AI/provider package implementing Nexus's `ChatProvider` contract.
 
-## Current status
+## Install
 
-**Status (2026-06-26): Milestone 1, the async-hard runtime, and the Milestone 2 foundations are complete.** The repository currently contains an interactive terminal-surface TUI with Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`, `anthropic`, or `antigravity`), runtime model/reasoning switching, streamed response parsing, workspace-scoped built-in tools, terminal approval gates with diff previews, fragment-based system-prompt assembly, provider/model/context/cache settings, JSONL transcript persistence/resume, large-output handles, turn-boundary auto-compaction, and default-off provider-native prompt-cache/context-management controls. The TUI now has compact tool timers, state-specific panel symbols, `ctrl+o` preview/full-output reveal, word-level diff highlights, richer assistant Markdown, Unicode-aware wrapping, reusable component/focus seams, and collapsed thinking panels for provider reasoning when available. Nexus runs a tokio async loop with turn-level cancellation: the provider is an async event stream raced against cancellation, tools are async with per-call child tokens, concurrency-safe tools run in parallel while everything else stays exclusive, and the transcript stays valid on abort. The next milestone gate is proving the token-efficiency thesis with benchmark evidence.
+Install the latest version from the remote repository:
 
-Implemented today:
+```bash
+cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked
+```
+
+Update an installed copy with:
+
+```bash
+iris update
+```
+
+Or run from a source checkout:
+
+```bash
+git clone https://github.com/5omeOtherGuy/iris-agent.git
+cd iris-agent
+cargo run
+```
+
+**Runtime dependencies: none beyond the binary.** The `grep` and `find` tools
+search in-process via the ripgrep library crates (`grep`, `ignore`, `globset`),
+so no `rg` or `fd` binary needs to be on `PATH`.
+
+## Run
+
+Create credentials for the provider you want, then start the REPL:
+
+```bash
+iris login openai-codex   # or: anthropic · antigravity
+iris                      # /exit or /quit to leave
+```
+
+From a source checkout, replace `iris` with `cargo run --`.
+
+At the prompt, `/model` views or switches provider/model and
+`/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
+turn boundary. `/settings`, `/scoped-models`, `/login`, and `/logout` open their
+selectors.
+
+<details>
+<summary><b>Providers, settings &amp; environment</b></summary>
+
+### Credentials and provider selection
+
+Iris stores OAuth credentials in an Iris auth file. By default it reads
+`~/.iris/auth.json`. Create or refresh credentials:
+
+```bash
+iris login openai-codex
+iris login openai-codex --device-code
+iris login anthropic
+ANTIGRAVITY_CLIENT_SECRET=... iris login antigravity
+```
+
+- `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the
+  default provider if no setting is present.
+- `anthropic` uses the Claude Code OAuth lane. `iris login anthropic` runs a
+  browser PKCE login with a manual paste fallback; Iris can also bootstrap from
+  Claude Code's token at `~/.claude/.credentials.json` (or
+  `CLAUDE_CONFIG_DIR/.credentials.json`) when Anthropic credentials are not
+  already in the Iris auth store.
+- `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app
+  client ID is public and decoded at runtime; the client secret is not committed
+  to source and must be supplied via `ANTIGRAVITY_CLIENT_SECRET` at runtime or
+  when building Iris.
+
+Override the auth-file path with `IRIS_AUTH_PATH=/path/to/auth.json iris`.
+
+### Settings
+
+Choose the provider for a run with `defaultProvider` in the global JSON settings
+file (`~/.iris/settings.json`, or `IRIS_CONFIG_PATH`):
+
+```json
+{
+  "defaultProvider": "antigravity",
+  "defaultModel": "gemini-3.5-flash"
+}
+```
+
+Supported provider ids are `openai-codex`, `anthropic`, and `antigravity`.
+Recognized settings keys are `defaultProvider`, `defaultModel`, `baseUrl`,
+`contextTokenBudget`, `defaultReasoning`, `promptCacheRetention`,
+`anthropicContextManagement`, and `enabledModels`.
+
+Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
+`defaultModel`, `defaultReasoning`, and `contextTokenBudget`; a cloned repo
+cannot choose your provider, scoped model cycle, provider-side cache retention,
+Anthropic server-side context-management behavior, or redirect OAuth bearer
+tokens with `baseUrl`.
+
+### Environment variables
+
+- `IRIS_AUTH_PATH` — auth-file path; defaults to `~/.iris/auth.json`.
+- `IRIS_MODEL` — OpenAI Codex model override; defaults to `gpt-5.5`.
+- `IRIS_CODEX_BASE_URL` — OpenAI Codex base URL; defaults to `https://chatgpt.com/backend-api`.
+- `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
+- `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
+- `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
+- `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.
+- `ANTIGRAVITY_PROJECT_ID` — optional Antigravity project-id override; when set it wins over any persisted project id, otherwise Iris discovers/persists one from `loadCodeAssist` and errors if discovery fails.
+
+</details>
+
+## The instrument
+
+The interface is a single scrolling transcript with a fixed composer. Plain
+language stays unboxed and light; only tool output and the composer earn chrome.
+State is carried by a small, consistent symbol vocabulary — never by color alone,
+fully legible in monochrome — so the surface stays calm at a glance and complete
+on demand (`ctrl+o` reveals a panel's full output).
+
+```text
+  STATE        ◉ active mode    ● running         ◆ done · approved
+               ◇ preview         ▲ review          ■ error · denied
+               □ skipped         ○ queued · empty  ›  assistant turn
+
+  PANELS       EXPLORE   read · grep · list · find
+               SHELL     command execution
+               EDIT      wrapped block diff  ( − removed · + added )
+               APPROVAL  authorization review
+
+  STATUSLINE   ◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○
+```
+
+The hero above is rendered in exactly this language. The full system lives in
+[DESIGN.md](DESIGN.md) (token/format summary) and
+[docs/TUI_DESIGN_LANGUAGE.md](docs/TUI_DESIGN_LANGUAGE.md) (the ground-truth pane
+grammar) — a Teenage-Engineering-lineage industrial design: restrained,
+mechanical, honest. The hero SVGs are regenerated with
+[`scripts/gen-hero-svg.py`](scripts/gen-hero-svg.py); a real recorded cast can
+replace them via [`scripts/record-demo.sh`](scripts/record-demo.sh).
+
+## Status
+
+**As of 2026-06-26: Milestone 1, the async-hard runtime, and the Milestone 2
+foundations are complete.** Iris today is an interactive terminal TUI (with a
+plain-text fallback for pipes/CI) driving a tokio async runtime with turn-level
+cancellation: selectable Mimir providers, runtime model/reasoning switching,
+streamed parsing, workspace-scoped built-in tools, terminal approval gates with
+diff previews, JSONL transcript persistence/resume, large-output handles, and
+turn-boundary auto-compaction. **The next milestone gate is proving the
+token-efficiency thesis with benchmark evidence** — honesty over hype is a
+product stance, so efficiency claims wait on measurement.
+
+<details>
+<summary><b>Implemented today</b></summary>
 
 - CLI entrypoint in `src/main.rs` with typed-error exit codes (`src/errors.rs`) and `RUST_LOG` tracing setup (`src/telemetry.rs`).
 - Iris CLI session loop in `src/cli.rs` driving the agent through a `Ui` front-end seam (`src/ui/`): the interactive TUI owns terminal-surface transcript replay, textarea input, slash/modals, live bash output cells, GFM-style streamed Markdown rendering, collapsed reasoning/thinking panels, capped-output preview/reveal, and word-level diff highlights; `src/ui/text.rs` remains the pipe/CI fallback.
@@ -50,119 +201,17 @@ Implemented today:
 - Mimir providers under `src/mimir/providers/`: OpenAI Codex Responses, Anthropic Messages (Claude Code subscription lane), and Antigravity/Gemini Code Assist streaming, all translated into Nexus's `ChatProvider` contract with normalized reasoning controls where supported. Anthropic signed/redacted thinking and Gemini `thoughtSignature` tool-call continuity round-trip through provider-neutral opaque continuity fields.
 - Unit tests for session/loop behavior, streaming, approval allow/deny paths, diff-preview ordering, workspace path safety, typed-error classification, telemetry redaction, tool implementations, OAuth auth-file handling, runtime selection, prompt assembly, URL resolution, request shaping, and response parsing.
 
-Not implemented yet:
+</details>
+
+<details>
+<summary><b>Not implemented yet</b></summary>
 
 - Persistent approval policies, in-session `/resume` picker, transcript-tree branching/rollback, modes, subagents, context ledger/planner, handle dereference UI/tool, token-efficiency benchmark proof, git automation, and GitHub integration.
 - A possible plugin system for third-party extensions (WASM/Extism is one candidate backend, a subprocess protocol another) — exploratory only, tracked in issue #18; Iris is not being built around it.
 
-## Running
-
-### Install from GitHub
-
-Install the latest version from the remote repository:
-
-```bash
-cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked
-```
-
-Update an installed copy with:
-
-```bash
-iris update
-```
-
-Or run from a source checkout:
-
-```bash
-git clone https://github.com/5omeOtherGuy/iris-agent.git
-cd iris-agent
-cargo run
-```
-
-### Runtime dependencies
-
-None beyond the binary itself. The `grep` and `find` tools search in-process via
-the ripgrep library crates (`grep`, `ignore`, `globset`), so no `rg` or `fd`
-binary needs to be on `PATH`.
-
-### Credentials and provider selection
-
-Iris stores OAuth credentials in an Iris auth file. By default it reads:
-
-```text
-~/.iris/auth.json
-```
-
-Create or refresh credentials for the provider you want to use:
-
-```bash
-iris login openai-codex
-iris login openai-codex --device-code
-iris login anthropic
-ANTIGRAVITY_CLIENT_SECRET=... iris login antigravity
-```
-
-From a source checkout, replace `iris` with `cargo run --`.
-
-Provider notes:
-
-- `openai-codex` uses OpenAI Codex OAuth (browser or device-code) and is the default provider if no setting is present.
-- `anthropic` uses the Claude Code OAuth lane. `iris login anthropic` runs a browser PKCE login with a manual paste fallback; Iris can also bootstrap from Claude Code's token at `~/.claude/.credentials.json` (or `CLAUDE_CONFIG_DIR/.credentials.json`) when Anthropic credentials are not already in the Iris auth store.
-- `antigravity` uses Google OAuth for Gemini Code Assist. Its installed-app client ID is public and decoded at runtime; the client secret is not committed to source and must be supplied via `ANTIGRAVITY_CLIENT_SECRET` at runtime or when building Iris.
-
-Override the auth-file path with:
-
-```bash
-IRIS_AUTH_PATH=/path/to/auth.json iris
-```
-
-Choose the provider for a run with `defaultProvider` in the global JSON settings
-file (`~/.iris/settings.json`, or `IRIS_CONFIG_PATH`). Example:
-
-```json
-{
-  "defaultProvider": "antigravity",
-  "defaultModel": "gemini-3.5-flash"
-}
-```
-
-Supported provider ids are `openai-codex`, `anthropic`, and `antigravity`.
-At the TUI prompt, use `/model` to view or switch provider/model and
-`/reasoning off|minimal|low|medium|high|xhigh` to change thinking effort at a
-safe turn boundary. The TUI also exposes `/settings`, `/scoped-models`,
-`/login`, and `/logout` selectors. Recognized settings keys are
-`defaultProvider`, `defaultModel`, `baseUrl`, `contextTokenBudget`,
-`defaultReasoning`, `promptCacheRetention`, `anthropicContextManagement`, and
-`enabledModels`.
-
-Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
-`defaultModel`, `defaultReasoning`, and `contextTokenBudget`; a cloned repo
-cannot choose your provider, scoped model cycle, provider-side cache retention,
-Anthropic server-side context-management behavior, or redirect OAuth bearer
-tokens with `baseUrl`.
-
-Environment variables:
-
-- `IRIS_AUTH_PATH` — auth-file path; defaults to `~/.iris/auth.json`.
-- `IRIS_MODEL` — OpenAI Codex model override; defaults to `gpt-5.5`.
-- `IRIS_CODEX_BASE_URL` — OpenAI Codex base URL; defaults to `https://chatgpt.com/backend-api`.
-- `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
-- `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
-- `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
-- `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.
-- `ANTIGRAVITY_PROJECT_ID` — optional Antigravity project-id override; when set it wins over any persisted project id, otherwise Iris discovers/persists one from `loadCodeAssist` and errors if discovery fails.
-
-Start the REPL:
-
-```bash
-iris
-```
-
-Exit with `/exit` or `/quit`.
+</details>
 
 ## Testing
-
-Run the current test suite with:
 
 ```bash
 cargo test
@@ -182,3 +231,7 @@ cargo test
 - [Architecture Decision Records](docs/adr/README.md) — accepted/proposed architecture decisions.
 - [Competitor matrix](docs/COMPETITOR_MATRIX.md) — verified competitor feature matrix.
 - [Competitor analysis](docs/COMPETITOR_ANALYSIS.md) — strategic competitor notes.
+
+## License
+
+[MIT](LICENSE).
