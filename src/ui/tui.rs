@@ -423,7 +423,7 @@ mod tests {
         assert!(!joined.contains("AGENT"), "{joined}");
         assert!(!joined.contains("USER"), "{joined}");
         assert!(
-            rendered.iter().any(|line| line.starts_with("    ● Title")),
+            rendered.iter().any(|line| line.starts_with("    › Title")),
             "{rendered:?}"
         );
         let title = line_matching(&lines, |line| line_text(line).contains("Title"));
@@ -463,7 +463,7 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(live_document.contains("● Title"), "{live_document}");
+        assert!(live_document.contains("› Title"), "{live_document}");
         assert!(!live_document.contains("AGENT"), "{live_document}");
         assert!(live.iter().any(|l| line_text(l).contains("Title")));
         assert!(!live.iter().any(|l| line_text(l).contains("# Title")));
@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(
             lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "    ● alpha".to_string(),
+                "    › alpha".to_string(),
                 "      beta".to_string(),
                 String::new()
             ]
@@ -585,7 +585,7 @@ mod tests {
             "user text and assistant text should share a column: {rendered:?}"
         );
         assert!(
-            rendered[reply_idx].starts_with("    ● Hi! What"),
+            rendered[reply_idx].starts_with("    › Hi! What"),
             "{rendered:?}"
         );
         assert_eq!(lines[reply_idx].style.bg, None);
@@ -1145,7 +1145,7 @@ mod tests {
 
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert!(replay.contains("hello there"), "{replay:?}");
-        assert!(replay.contains("● Done"), "{replay:?}");
+        assert!(replay.contains("› Done"), "{replay:?}");
         assert!(replay.contains("SHELL"), "{replay:?}");
         assert!(replay.contains("$ echo hi"), "{replay:?}");
         assert!(replay.contains("Give Iris a task"), "{replay:?}");
@@ -1203,7 +1203,7 @@ mod tests {
 
         // Runtime status is printed into the editor's top border, not a rail.
         assert!(
-            rendered.contains("┌─ ● CODE ─ SONNET 3.5 HIGH ─"),
+            rendered.contains("┌─ ◉ CODE ─ SONNET 3.5 HIGH ─"),
             "{rendered}"
         );
         // Workspace state is a quiet unboxed label below the editor.
@@ -1259,7 +1259,7 @@ mod tests {
 
         // Mode/model/effort/context + 10-dot meter, all uppercase, in the frame.
         assert!(
-            top.contains("┌─ ● CODE ─ GPT-5.4-MINI OFF ─ CTX 300K ○○○○○○○○○○ ─"),
+            top.contains("┌─ ◉ CODE ─ GPT-5.4-MINI OFF ─ CTX 300K ○○○○○○○○○○ ─"),
             "{top:?}"
         );
         assert!(top.trim_end().ends_with('┐'), "{top:?}");
@@ -1286,13 +1286,13 @@ mod tests {
             .map(|line| line_text(&line))
             .expect("top border");
 
-        assert!(status.contains("┌─ ● CODE ─ GPT-5.4-MINI "), "{status:?}");
+        assert!(status.contains("┌─ ◉ CODE ─ GPT-5.4-MINI "), "{status:?}");
         assert!(status.ends_with('┐'), "{status:?}");
         assert!(!status.contains("OFF"), "{status:?}");
         assert!(!status.contains("CTX"), "{status:?}");
         assert!(!status.contains('○'), "{status:?}");
         assert!(
-            !status.contains('●') || status.matches('●').count() == 1,
+            !status.contains('◉') || status.matches('◉').count() == 1,
             "{status:?}"
         );
         assert_eq!(display_width(&status), 30, "{status:?}");
@@ -1314,7 +1314,7 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let status_idx = texts
             .iter()
-            .position(|line| line.contains("● CODE"))
+            .position(|line| line.contains("◉ CODE"))
             .expect("top-border statusline remains visible");
         let editor_idx = texts
             .iter()
@@ -1530,7 +1530,7 @@ mod tests {
             .expect("working indicator");
         let status_idx = texts
             .iter()
-            .position(|line| line.contains("● CODE"))
+            .position(|line| line.contains("◉ CODE"))
             .expect("composer statusline");
 
         assert!(
@@ -1700,7 +1700,7 @@ mod tests {
             duration: Some(Duration::from_millis(3)),
         });
         let done = rendered_text(&mut screen, 100, 12);
-        assert!(done.contains("● DONE"), "{done}");
+        assert!(done.contains("◆ DONE"), "{done}");
         assert!(
             done.contains("Successfully replaced 1 occurrence."),
             "{done}"
@@ -1748,7 +1748,7 @@ mod tests {
         });
 
         let rendered = rendered_text(&mut screen, 100, 16);
-        assert!(rendered.contains("● DONE"), "{rendered}");
+        assert!(rendered.contains("◆ DONE"), "{rendered}");
         assert!(
             rendered.contains("Successfully replaced 1 occurrence."),
             "{rendered}"
@@ -1777,7 +1777,7 @@ mod tests {
 
         let rendered = rendered_text(&mut screen, 100, 18);
         assert!(rendered.contains("SHELL"), "{rendered}");
-        assert!(rendered.contains("● DONE"), "{rendered}");
+        assert!(rendered.contains("◆ DONE"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(rendered.contains("hi"), "{rendered}");
         assert!(rendered.contains("note: interleaved note"), "{rendered}");
@@ -2012,7 +2012,7 @@ mod tests {
 
         assert!(rendered.contains("SHELL"));
         assert!(rendered.contains("bash"));
-        assert!(rendered.contains("● DONE"));
+        assert!(rendered.contains("◆ DONE"));
         assert!(rendered.contains("$ pnpm test --filter user.auth"));
         assert!(rendered.contains("PASS    test/auth.service.test.ts"));
         assert!(rendered.contains("EDIT"));
@@ -2047,7 +2047,7 @@ mod tests {
         let rendered = rendered_text(&mut screen, 80, 10);
 
         // No footer yet: plain editor frame, no embedded status, no workspace label.
-        assert!(!rendered.contains("● CODE"), "{rendered}");
+        assert!(!rendered.contains("◉ CODE"), "{rendered}");
         assert!(!rendered.contains("┊ git"), "{rendered}");
         assert!(rendered.contains('┌'), "{rendered}");
     }
@@ -2060,7 +2060,7 @@ mod tests {
 
         // No effort token between the model and the CTX separator.
         assert!(
-            rendered.contains("● CODE ─ GPT-5.5 ─ CTX 300K"),
+            rendered.contains("◉ CODE ─ GPT-5.5 ─ CTX 300K"),
             "{rendered}"
         );
         // No branch: a bare cwd label with no git suffix.
@@ -2079,7 +2079,7 @@ mod tests {
         let rendered = rendered_text(&mut screen, 100, 10);
 
         assert!(
-            rendered.contains("● CODE ─ GPT-5.5 HIGH ─ CTX 300K"),
+            rendered.contains("◉ CODE ─ GPT-5.5 HIGH ─ CTX 300K"),
             "{rendered}"
         );
         assert!(rendered.contains("~/repo ┊ git branch"), "{rendered}");
@@ -2361,7 +2361,7 @@ mod tests {
                     "SHELL",
                     "bash",
                     &[
-                        ("●".to_string(), prompt_style()),
+                        ("◆".to_string(), prompt_style()),
                         (" DONE".to_string(), panel_style()),
                     ],
                 ),
@@ -2522,7 +2522,7 @@ mod tests {
         let mut screen = Screen::new();
         screen.commit_user(
             "┌────────────────────────────────────────────────────────────────────────────┐\n\
-             │ ▾  SHELL    bash                                     ● DONE        0ms   ▣│\n\
+             │ ▾  SHELL    bash                                     ◆ DONE        0ms   ▣│\n\
              ├────────────────────────────────────────────────────────────────────────────┤\n\
              │  $ edit /tmp/demo.txt                                                     │\n\
              └────────────────────────────────────────────────────────────────────────────┘",
@@ -2758,7 +2758,7 @@ mod tests {
             }),
         });
         let rendered = rendered_text(&mut screen, 120, 12);
-        assert!(rendered.contains("● CODE ─ OPUS-4.8 XHIGH"), "{rendered}");
+        assert!(rendered.contains("◉ CODE ─ OPUS-4.8 XHIGH"), "{rendered}");
         assert!(rendered.contains("↑100 ↓20"), "{rendered}");
         assert!(
             !rendered.contains("thinking with xhigh effort"),
@@ -2771,7 +2771,7 @@ mod tests {
             "~/repo (branch)".to_string(),
         );
         let refreshed = rendered_text(&mut screen, 120, 12);
-        assert!(refreshed.contains("● CODE ─ OPUS-4.8 HIGH"), "{refreshed}");
+        assert!(refreshed.contains("◉ CODE ─ OPUS-4.8 HIGH"), "{refreshed}");
         assert!(refreshed.contains("↑100 ↓20"), "{refreshed}");
         assert!(
             !refreshed.contains("thinking with high effort"),

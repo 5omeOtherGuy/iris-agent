@@ -187,6 +187,18 @@ impl PanelState {
         }
     }
 
+    /// State glyph from the symbol vocabulary in docs/TUI_DESIGN_LANGUAGE.md.
+    /// `●` is reserved for the live/running LED; settled states get their own
+    /// glyph so the header stays legible without color.
+    pub(super) fn symbol(self) -> &'static str {
+        match self {
+            Self::Running => "●",
+            Self::Done => "◆",
+            Self::Error => "■",
+            Self::Cancelled => "□",
+        }
+    }
+
     pub(super) fn dot_style(self) -> Style {
         match self {
             Self::Running => prompt_style(),
