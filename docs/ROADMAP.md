@@ -1,13 +1,14 @@
 # Iris — Roadmap
 
-> Status (2026-06-22): Milestone 1, the async-hard runtime completion, and the
+> Status (2026-06-26): Milestone 1, the async-hard runtime completion, and the
 > Milestone 2 foundations are done. Iris has a terminal-surface TUI with
 > Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`,
 > `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
 > response parsing, workspace-scoped tools, terminal approval gates with diff
-> previews, fragment-based system-prompt assembly, provider/model/reasoning/
-> context/cache settings, linear session resume, JSONL session persistence,
-> handle-backed large tool outputs, token estimates, turn-boundary
+> previews, compact/foldable tool panels, richer assistant Markdown, collapsed
+> reasoning panels, fragment-based system-prompt assembly, provider/model/
+> reasoning/context/cache settings, linear session resume, JSONL session
+> persistence, handle-backed large tool outputs, token estimates, turn-boundary
 > auto-compaction, and default-off provider-native prompt-cache/context-
 > management controls.
 > Nexus runs a tokio async loop with turn-level cancellation: the provider is an
@@ -59,25 +60,31 @@ Implemented today:
 - CLI entrypoint that starts Iris from `cargo run`.
 - Terminal-surface TUI with Iris-owned transcript replay/diff rendering,
   textarea editing, slash/modals, streamed Markdown rendering, live bash exec
-  cells, and a text fallback for pipes/CI, driven through a `Ui` front-end seam
+  cells, compact elapsed timers, state-specific panel symbols, `ctrl+o`
+  preview/full-output reveal, word-level diff highlights, collapsed reasoning
+  panels, and a text fallback for pipes/CI, driven through a `Ui` front-end seam
   (`src/ui/`, `src/cli.rs`).
 - Incremental terminal streaming of assistant text via the async
   `ChatProvider::respond_stream` → `Stream<ProviderEvent>` contract, rendered as
   `UiEvent` deltas.
 - Provider-neutral `ChatProvider`, `AssistantTurn`, `ToolCall`, `Message`,
   `Role`, Nexus-owned `provider_turn_id` correlation, and assistant-reasoning
-  continuity types.
+  continuity/display-event types.
 - Async tokio agent loop with a per-turn `CancellationToken`: provider stream /
   tool / approval reads raced against cancellation, async tools with child
   tokens, safe-parallel batching of concurrency-safe tools, and a valid
   transcript on abort.
-- Provider tool-call loop with bounded iterations, retry/backoff, and structured
-  tool result/error messages.
+- Provider tool-call loop with optional configured round-trip cap,
+  retry/backoff, and structured tool result/error messages.
 - Typed boundary errors with process exit codes (`src/errors.rs`) and `RUST_LOG`
   tracing to stderr (`src/telemetry.rs`).
 - Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,
   `find`, and `ls`. `edit` follows Claude Code's exact-string contract
   (`file_path`/`old_string`/`new_string`/`replace_all`).
+- Harness limits aligned with pi-mono where safe: no default tool-roundtrip cap,
+  no default bash timeout, full safe-parallel read-only tool batches, and a
+  50 KiB inline display threshold, while memory, capture, approval, and
+  workspace-safety rails remain in place.
 - Workspace path-safety enforcement for existing and newly written paths.
 - Terminal approval prompts with diff previews for file-mutating tools, and
   denied-call handling for `write`, `edit`, and `bash`.
@@ -119,6 +126,10 @@ Implemented today:
   calls, compactions, and output handles, plus typed observability events for
   provider-turn lifecycle, tool lifecycle, compaction metadata, and
   output-handle metadata.
+- TUI implementation foundations: reusable `Component`/`Container` composition,
+  explicit overlay focus routing, a shared Unicode/ANSI text engine, a built-in
+  tool renderer registry, and an opt-in tmux live-rendering harness for manual
+  visual checks of pane rendering.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.
@@ -700,7 +711,7 @@ Potential scope:
   `<session>.outputs/` directory (`src/handles.rs`).]
 - Handle-returning large tool outputs. [Foundation shipped
   ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): a successful
-  tool result over a 16 KiB threshold is persisted out of provider context
+  tool result over a 50 KiB threshold is persisted out of provider context
   behind a stable handle, and the transcript carries a compact head+tail preview
   plus an `outputHandle` metadata pointer (`id`/`bytes`/`lines`) instead of the
   full payload. Nexus owns the threshold/offload policy and a Tier-1
