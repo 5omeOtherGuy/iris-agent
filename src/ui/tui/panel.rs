@@ -63,7 +63,12 @@ pub(super) fn panel_header_line(
     let title_width = title.len().max(7);
     let mut left = vec![
         Span::styled(format!(" {arrow}  "), dim_style()),
-        Span::styled(format!("{title:<title_width$}"), panel_style()),
+        // The tool family is the panel's identity. With no type-scale axis,
+        // weight is the hierarchy lever (DESIGN.md: label = bold).
+        Span::styled(
+            format!("{title:<title_width$}"),
+            panel_style().add_modifier(Modifier::BOLD),
+        ),
     ];
     let meta = strip_ansi_for_text(meta);
     if !meta.is_empty() {
@@ -290,7 +295,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                     out.push(diff_span_row(
                         Some(old_line),
                         None,
-                        "-",
+                        "\u{2212}",
                         removed[0],
                         old_spans,
                         err_style(),
@@ -312,7 +317,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                         out.push(diff_plain_row(
                             Some(old_line),
                             None,
-                            "-",
+                            "\u{2212}",
                             code,
                             err_style(),
                             Some(DIFF_DEL_BG),
@@ -452,10 +457,16 @@ fn parse_hunk_start(part: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// The edit-table gutter from the visual spec (docs/TUI_DESIGN_LANGUAGE.md
+/// §EDIT): a single line-number column, the marker, then the content column.
+/// Removal rows carry the old line number, additions/context the new one — so a
+/// 1-for-1 modification shows the same number on both sides, as the spec mock
+/// does. No second number column and no `|` separator.
 fn diff_table_gutter(old: Option<usize>, new: Option<usize>, marker: &str) -> String {
-    let old = old.map_or_else(String::new, |line| line.to_string());
-    let new = new.map_or_else(String::new, |line| line.to_string());
-    format!("{old:>4}   {new:>7}  {marker}  |  ")
+    let num = new
+        .or(old)
+        .map_or_else(String::new, |line| line.to_string());
+    format!("{num:>4}  {marker}  ")
 }
 
 fn format_diff_table_row(
