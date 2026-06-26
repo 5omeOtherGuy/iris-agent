@@ -11,7 +11,7 @@ use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use super::rows::{FoldVis, TranscriptRow};
 use super::transcript::streaming_markdown_preview;
 use super::wrap::line_text;
-use super::{TEXT_COLUMN_X_PADDING, panel_style, prompt_style};
+use super::{TEXT_COLUMN_X_PADDING, dim_style, panel_style};
 
 pub(super) const ASSISTANT_TEXT_PREFIX: &str = "  ";
 
@@ -83,7 +83,9 @@ fn user_row(text: &str) -> TranscriptRow {
 fn assistant_row(mut line: Line<'static>, first: bool) -> TranscriptRow {
     let text = line_text(&line);
     if first {
-        line.spans.insert(0, Span::styled("› ", prompt_style()));
+        // The assistant marker is recessive transcript chrome, not a state dot:
+        // muted, never the active/live accent (docs/TUI_DESIGN_LANGUAGE.md §4).
+        line.spans.insert(0, Span::styled("› ", dim_style()));
     } else {
         line.spans
             .insert(0, Span::styled(ASSISTANT_TEXT_PREFIX, Style::default()));

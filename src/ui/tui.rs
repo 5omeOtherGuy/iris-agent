@@ -956,19 +956,19 @@ mod tests {
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(!texts.iter().any(|t| t.contains("--- a/note.txt")));
         assert!(!texts.iter().any(|t| t.contains("@@ -1 +1 @@")));
-        assert!(texts.iter().any(|t| t.contains("-  |  old")));
-        assert!(texts.iter().any(|t| t.contains("+  |  new")));
+        assert!(texts.iter().any(|t| t.contains("\u{2212}  old")));
+        assert!(texts.iter().any(|t| t.contains("+  new")));
         let add = screen
             .transcript
             .rows
             .iter()
-            .find(|row| row.text.contains("+  |  new"))
+            .find(|row| row.text.contains("+  new"))
             .expect("addition row");
         let remove = screen
             .transcript
             .rows
             .iter()
-            .find(|row| row.text.contains("-  |  old"))
+            .find(|row| row.text.contains("\u{2212}  old"))
             .expect("removal row");
         assert_eq!(add.style, ok_style());
         assert_eq!(remove.style, err_style());
@@ -1001,7 +1001,7 @@ mod tests {
             .transcript
             .rows
             .iter()
-            .find(|row| row.text.contains("+  |  foo qux baz"))
+            .find(|row| row.text.contains("+  foo qux baz"))
             .expect("addition row");
         let Some(ChromeRow::Body { line, .. }) = added.chrome.as_ref() else {
             panic!("expected body row");
@@ -1085,15 +1085,15 @@ mod tests {
         assert!(!texts.iter().any(|t| t.starts_with("--- ")));
         assert!(!texts.iter().any(|t| t.starts_with("+++ ")));
         // Both files' real changes remain.
-        assert!(texts.iter().any(|t| t.contains("+  |  new1")));
-        assert!(texts.iter().any(|t| t.contains("+  |  new2")));
-        assert!(texts.iter().any(|t| t.contains("-  |  old2")));
+        assert!(texts.iter().any(|t| t.contains("+  new1")));
+        assert!(texts.iter().any(|t| t.contains("+  new2")));
+        assert!(texts.iter().any(|t| t.contains("\u{2212}  old2")));
         // The second file's removal is red, not styled as plain context.
         let remove2 = screen
             .transcript
             .rows
             .iter()
-            .find(|row| row.text.contains("-  |  old2"))
+            .find(|row| row.text.contains("\u{2212}  old2"))
             .expect("second removal row");
         assert_eq!(remove2.style, err_style());
     }
@@ -2019,8 +2019,8 @@ mod tests {
         assert!(rendered.contains("PREVIEW"), "{rendered}");
         assert!(!rendered.contains("RUNNING"), "{rendered}");
         assert!(rendered.contains("packages/user.auth/src/auth.service.ts"));
-        assert!(rendered.contains("-  |  old"));
-        assert!(rendered.contains("+  |  new"));
+        assert!(rendered.contains("\u{2212}  old"));
+        assert!(rendered.contains("+  new"));
         assert!(!rendered.contains("--- a/file"));
         assert!(!rendered.contains("@@ -1 +1 @@"));
     }
