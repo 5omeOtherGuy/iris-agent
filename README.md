@@ -6,9 +6,7 @@
   <img alt="An Iris terminal session — an EXPLORE and EDIT tool turn, the turn divider, the LED working indicator, and the composer statusline." src="docs/assets/hero-dark.svg" width="760">
 </picture>
 
-A fast, token-efficient coding agent for the terminal. A precise instrument, not
-an autonomous magic act: **every token is deliberate, and the diff is the
-deliverable.**
+An instrument for developers, not an autonomous magic act for vibe coders.
 
 [Install](#install) · [Run](#run) · [The instrument](#the-instrument) · [Status](#status) · [Documentation](#documentation)
 
