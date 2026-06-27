@@ -57,16 +57,43 @@ pub(crate) fn run_target(call: &ToolCall) -> String {
     let Some(command) = call.arguments.get("command").and_then(Value::as_str) else {
         return fallback_summary(call);
     };
+    let mut target = bash_command_line(command);
+    match bash_timeout_secs(call) {
+        Some(0) => target.push_str(" (no timeout)"),
+        Some(n) => target.push_str(&format!(" (timeout {n}s)")),
+        None => {}
+    }
+    target
+}
+
+/// The shell command shown on the SHELL panel's `$ ...` row, with NO timeout
+/// text. Per the SHELL output spec the timeout is invocation metadata rendered
+/// separately (right-aligned on the command row), never part of the command
+/// string. Non-bash calls fall back to the one-line summary.
+pub(crate) fn command_display(call: &ToolCall) -> String {
+    if call.name != "bash" {
+        return summarize(call);
+    }
+    match call.arguments.get("command").and_then(Value::as_str) {
+        Some(command) => bash_command_line(command),
+        None => fallback_summary(call),
+    }
+}
+
+/// Explicit per-command timeout in whole seconds, when the call provides one.
+/// `Some(0)` means "no timeout"; `None` means the caller omitted it.
+pub(crate) fn bash_timeout_secs(call: &ToolCall) -> Option<u64> {
+    call.arguments.get("timeout").and_then(Value::as_u64)
+}
+
+/// The first meaningful script line plus a `(+N more lines)` hint, truncated to
+/// `MAX_SUMMARY_CHARS`. Shared by `run_target` and `command_display`.
+fn bash_command_line(command: &str) -> String {
     let (line, hidden) = bash_display_line(command);
     let mut target = truncate_inline(line, MAX_SUMMARY_CHARS);
     if hidden > 0 {
         let plural = if hidden == 1 { "" } else { "s" };
         target.push_str(&format!(" (+{hidden} more line{plural})"));
-    }
-    match call.arguments.get("timeout").and_then(Value::as_u64) {
-        Some(0) => target.push_str(" (no timeout)"),
-        Some(n) => target.push_str(&format!(" (timeout {n}s)")),
-        None => {}
     }
     target
 }
