@@ -19,6 +19,7 @@
 //! Nexus is untouched: this loop only consumes its `AgentObserver` /
 //! `ApprovalGate` seams via [`LoopBridge`].
 
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +43,7 @@ use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLogin
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
 use crate::ui::slash::{self, SlashAction, SlashCommand};
+use crate::ui::steering::SteeringQueue;
 use crate::ui::tui::{FocusTarget, Screen, TuiUi};
 use crate::wayland::Harness;
 
@@ -183,6 +185,13 @@ async fn session_loop<P: ChatProvider>(
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
 
+    // Mid-run steering/follow-up queue, shared with the harness so a turn drains
+    // what the user types while it runs. Installed once for the session; the
+    // loop keeps its own `Rc` clone to enqueue from the input arm. `Rc` is fine:
+    // the whole session runs on the current-thread runtime.
+    let steering = Rc::new(SteeringQueue::default());
+    harness.set_steering_source(steering.clone());
+
     let mut tick = interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -248,6 +257,7 @@ async fn session_loop<P: ChatProvider>(
                         &mut tick,
                         &current_turn,
                         &prompt,
+                        steering.as_ref(),
                     )
                     .await?;
                     tui.screen.end_turn();
@@ -468,6 +478,7 @@ async fn run_turn<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     current_turn: &CurrentTurn,
     prompt: &str,
+    steering: &SteeringQueue,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = unbounded_channel::<UiEvent>();
     let (appr_tx, mut appr_rx) = unbounded_channel::<ApprovalRequest>();
@@ -513,6 +524,9 @@ async fn run_turn<P: ChatProvider>(
                 }
                 Some(event) = event_rx.recv() => {
                     tui.screen.apply(event);
+                    // A drained (injected) steering/follow-up message lowers the
+                    // queued count; refresh it from the live queue before redraw.
+                    tui.screen.set_queued(steering.len());
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
@@ -539,7 +553,11 @@ async fn run_turn<P: ChatProvider>(
                             if is_ctrl_c(&event) {
                                 token.cancel();
                             }
-                            if handle_running_event(&mut tui.screen, event, &mut pending) {
+                            if handle_running_event(&mut tui.screen, event, &mut pending, steering)
+                            {
+                                // Reflect any just-enqueued (or cleared) steering
+                                // input on the working indicator.
+                                tui.screen.set_queued(steering.len());
                                 request_render(&mut sched, tui)?;
                             }
                         }
@@ -567,6 +585,15 @@ async fn run_turn<P: ChatProvider>(
     };
 
     *current_turn.lock().expect("turn token lock poisoned") = None;
+    // On cancellation, drop any still-queued steering/follow-up input even if
+    // the turn future won the select before the input arm processed the Ctrl-C
+    // event (`handle_running_event` clears the queue on the keystroke; this
+    // covers the race where that event is never observed here). Idempotent with
+    // that path.
+    if token.is_cancelled() {
+        steering.clear();
+        tui.screen.set_queued(0);
+    }
     // Any approval still pending here means the turn ended without resolving it
     // (cancellation); its receiver is already gone, so just drop it.
     drop(pending);
@@ -1005,7 +1032,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     }
 
     match key.code {
-        // --- control flow ---
+        // --- control flow (idle-only: exit / submit a prompt) ---
         KeyCode::Char('c') if ctrl => {
             if screen.editor_is_empty() {
                 return IdleKey::Exit;
@@ -1020,11 +1047,8 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             screen.editor.delete_next_char();
             return IdleKey::Continue;
         }
-        KeyCode::Char('u') if ctrl => {
-            screen.editor.delete_line_by_head();
-            return IdleKey::Continue;
-        }
-        KeyCode::Char('j') if ctrl => screen.editor.insert_newline(),
+        // Transcript scrolling is handled natively by the terminal over its
+        // scrollback (no in-app scroll offset), so PageUp/PageDown fall through.
         KeyCode::Enter if shift || ctrl => screen.editor.insert_newline(),
         KeyCode::Enter => {
             let text = screen.submit();
@@ -1033,11 +1057,34 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             }
             return IdleKey::Submit(text);
         }
+        // Everything else is pure text editing, shared with the running phase so
+        // the composer behaves identically whether or not a turn is in flight.
+        code => {
+            apply_editor_key(screen, code, ctrl, alt);
+        }
+    }
 
-        // Transcript scrolling is handled natively by the terminal over its
-        // scrollback (no in-app scroll offset), so PageUp/PageDown fall through.
+    screen.sync_palette();
+    IdleKey::Continue
+}
 
+/// Apply one pure text-editing key to the composer. Shared by the idle phase and
+/// the running (steering) phase so the composer edits identically in both;
+/// control-flow keys (submit, exit, palette, global chords, steer/follow-up) are
+/// resolved by the callers before they delegate here. Returns whether the key
+/// was an editing key (and thus a redraw is warranted).
+fn apply_editor_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    // Several `TextArea` edit methods return a bool (whether they mutated); the
+    // arms are wrapped in blocks so every arm evaluates to `()` and the caller's
+    // redraw flag is driven by whether a key matched, not by that return.
+    match code {
         // --- kill-ring / undo / redo ---
+        KeyCode::Char('j') if ctrl => {
+            screen.editor.insert_newline();
+        }
+        KeyCode::Char('u') if ctrl => {
+            screen.editor.delete_line_by_head();
+        }
         KeyCode::Char('k') if ctrl => {
             screen.editor.delete_line_by_end();
         }
@@ -1095,11 +1142,9 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
         KeyCode::Char(c) if !ctrl && !alt => {
             screen.editor.insert_char(c);
         }
-        _ => {}
+        _ => return false,
     }
-
-    screen.sync_palette();
-    IdleKey::Continue
+    true
 }
 
 /// Map a palette-accepted command to its idle outcome. `Exit` ends the session;
@@ -1129,33 +1174,49 @@ fn resolve_input_eof(
     }
 }
 
-/// While a turn runs, the editor is frozen: handle only scroll, Ctrl-C, and (if
-/// a tool is awaiting) the approval keys. Returns whether a redraw is needed.
+/// Handle one terminal event while a turn runs. The composer stays live so the
+/// user can queue a steering message (Enter) or a follow-up (Alt+Enter) without
+/// interrupting the turn; Ctrl-C aborts and Ctrl-O toggles the latest panel.
+/// While a tool is awaiting approval the composer is frozen and only the
+/// approval keys (plus Ctrl-C/-O) act, so a `y`/`n` can't be both an answer and
+/// typed text. Returns whether a redraw is needed.
 fn handle_running_event(
     screen: &mut Screen,
     event: Event,
     pending: &mut Option<PendingApproval>,
+    steering: &SteeringQueue,
 ) -> bool {
     match event {
+        // Paste composes into the live editor (but not while an approval is
+        // pending, when the composer is frozen).
+        Event::Paste(text) if pending.is_none() => {
+            insert_paste(screen, &text);
+            true
+        }
         // Mouse capture is off; the terminal scrolls its own scrollback. Resize
         // still triggers a redraw of the terminal surface.
         Event::Resize(..) => true,
         Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
                 screen.toggle_latest_panel();
                 return true;
             }
             if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-                // The input thread already cancelled the token; unblock a pending
+                // The input thread already cancelled the token. Aborting also
+                // discards anything the user queued, and unblocks a pending
                 // approval as Deny so Nexus observes the cancellation and aborts.
+                steering.clear();
                 if let Some(p) = pending.take() {
                     let _ = p.reply.send(ApprovalDecision::Deny);
                     screen.clear_approval();
                 }
                 return true;
             }
-            // Approval decision keys, only while a tool is awaiting one.
+            // While a tool is awaiting approval, the composer is frozen: only the
+            // approval keys act, and any other key is ignored (never typed).
             if let Some(p) = pending.as_ref() {
                 let decision = match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::Allow),
@@ -1174,8 +1235,33 @@ fn handle_running_event(
                     screen.clear_approval();
                     return true;
                 }
+                return false;
             }
-            false
+            // No approval pending: the composer is live for steering. Enter
+            // queues a steering message (injected before the next provider
+            // request), Alt+Enter a follow-up (injected when the agent would
+            // otherwise stop); everything else edits the composer.
+            match key.code {
+                KeyCode::Enter if alt => {
+                    let text = screen.submit();
+                    if !text.trim().is_empty() {
+                        steering.enqueue_follow_up(text);
+                    }
+                    true
+                }
+                KeyCode::Enter if shift || ctrl => {
+                    screen.editor.insert_newline();
+                    true
+                }
+                KeyCode::Enter => {
+                    let text = screen.submit();
+                    if !text.trim().is_empty() {
+                        steering.enqueue_steering(text);
+                    }
+                    true
+                }
+                code => apply_editor_key(screen, code, ctrl, alt),
+            }
         }
         _ => false,
     }
@@ -1223,6 +1309,7 @@ impl ApprovalGate for LoopBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nexus::SteeringSource;
     use crate::ui::tui::Screen;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
 
@@ -1523,6 +1610,7 @@ mod tests {
     #[test]
     fn running_event_approval_keys_resolve_oneshot() {
         let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
         // Allow.
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
@@ -1534,6 +1622,7 @@ mod tests {
             &mut screen,
             key(KeyCode::Char('y')),
             &mut pending,
+            &steering,
         ));
         assert!(pending.is_none());
         assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Allow);
@@ -1545,10 +1634,16 @@ mod tests {
             reply: tx,
             allow_always: false,
         });
-        handle_running_event(&mut screen, key(KeyCode::Char('n')), &mut pending);
+        handle_running_event(
+            &mut screen,
+            key(KeyCode::Char('n')),
+            &mut pending,
+            &steering,
+        );
         assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
 
-        // 'a' is ignored when always is not on offer.
+        // 'a' is ignored when always is not on offer (and not typed: the composer
+        // is frozen while an approval is pending).
         let (tx, mut rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
@@ -1559,14 +1654,19 @@ mod tests {
             &mut screen,
             key(KeyCode::Char('a')),
             &mut pending,
+            &steering,
         ));
         assert!(pending.is_some());
         assert!(rx.try_recv().is_err());
+        // The frozen-composer key did not leak into the editor.
+        assert!(screen.editor_is_empty());
     }
 
     #[test]
-    fn running_ctrl_c_denies_pending_approval() {
+    fn running_ctrl_c_denies_pending_approval_and_clears_queue() {
         let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        steering.enqueue_steering("queued".to_string());
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
@@ -1577,32 +1677,70 @@ mod tests {
             &mut screen,
             key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &mut pending,
+            &steering,
         ));
         assert!(pending.is_none());
         assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
+        // Aborting also discards what the user had queued.
+        assert_eq!(steering.len(), 0);
     }
 
     #[test]
-    fn running_non_decision_keys_are_ignored() {
+    fn running_enter_queues_steering_and_clears_editor() {
         let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
         let mut pending: Option<PendingApproval> = None;
-        // Scrolling is native now; PageUp and bare chars while computing are
-        // ignored (the editor is frozen and there is no in-app scroll offset).
-        assert!(!handle_running_event(
+        // Type some text, then Enter queues it as a steering message.
+        for ch in "go left".chars() {
+            handle_running_event(&mut screen, key(KeyCode::Char(ch)), &mut pending, &steering);
+        }
+        assert_eq!(screen.editor_text(), "go left");
+        assert!(handle_running_event(
             &mut screen,
-            key(KeyCode::PageUp),
-            &mut pending
-        ));
-        assert!(!handle_running_event(
-            &mut screen,
-            key(KeyCode::Char('x')),
+            key(KeyCode::Enter),
             &mut pending,
+            &steering,
         ));
+        assert_eq!(steering.take_steering(), vec!["go left"]);
+        // The composer is cleared, ready for more input.
+        assert!(screen.editor_is_empty());
+    }
+
+    #[test]
+    fn running_alt_enter_queues_follow_up() {
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let mut pending: Option<PendingApproval> = None;
+        for ch in "then test".chars() {
+            handle_running_event(&mut screen, key(KeyCode::Char(ch)), &mut pending, &steering);
+        }
+        assert!(handle_running_event(
+            &mut screen,
+            key_mod(KeyCode::Enter, KeyModifiers::ALT),
+            &mut pending,
+            &steering,
+        ));
+        assert!(
+            steering.take_steering().is_empty(),
+            "Alt+Enter is follow-up"
+        );
+        assert_eq!(steering.take_follow_up(), vec!["then test"]);
+        assert!(screen.editor_is_empty());
+    }
+
+    #[test]
+    fn running_empty_enter_does_not_queue() {
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let mut pending: Option<PendingApproval> = None;
+        handle_running_event(&mut screen, key(KeyCode::Enter), &mut pending, &steering);
+        assert_eq!(steering.len(), 0, "a blank submit queues nothing");
     }
 
     #[test]
     fn page_keys_do_not_consume_a_pending_approval() {
         let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
         let (tx, _rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
@@ -1613,7 +1751,8 @@ mod tests {
         assert!(!handle_running_event(
             &mut screen,
             key(KeyCode::PageUp),
-            &mut pending
+            &mut pending,
+            &steering,
         ));
         assert!(pending.is_some(), "a page key must not answer the approval");
     }

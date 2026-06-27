@@ -11,6 +11,7 @@ pub(crate) mod system_prompt;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
@@ -18,7 +19,8 @@ use tracing::Instrument;
 
 use crate::handles::HandleStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, ToolEnv,
+    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, SteeringSource,
+    ToolEnv,
 };
 use crate::session::{SessionLog, estimate_tokens, message_token_estimate};
 use crate::tools::ToolState;
@@ -56,6 +58,12 @@ pub(crate) struct Harness<P> {
     // when a transcript log is attached, since handles live beside the session
     // file; an in-memory session keeps every output inline.
     output_store: Option<HandleStore>,
+    // Mid-run user-message queue (steering + follow-up). `None` outside the
+    // interactive TUI: the text/non-TTY path and the loop tests never steer.
+    // Shared (`Rc`) with the Tier-3 input loop, which enqueues what the user
+    // typed while the turn ran; the bare agent drains it at safe injection
+    // points. Forwarded per-turn as a borrow; never owned by the bare agent.
+    steering: Option<Rc<dyn SteeringSource>>,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -138,7 +146,16 @@ impl<P: ChatProvider> Harness<P> {
             entry_ids,
             budget,
             output_store,
+            steering: None,
         }
+    }
+
+    /// Install the mid-run steering/follow-up source (the Tier-3 app's typed
+    /// queue). Shared via `Rc` so the input loop keeps enqueuing into the same
+    /// queue the turn drains. Set once per session; the text/non-TTY path leaves
+    /// it unset, so no steering is ever injected there.
+    pub(crate) fn set_steering_source(&mut self, steering: Rc<dyn SteeringSource>) {
+        self.steering = Some(steering);
     }
 
     /// Swap the active provider at a safe turn boundary, delegating to the bare
@@ -202,7 +219,7 @@ impl<P: ChatProvider> Harness<P> {
         // (a held `enter()` guard does not).
         let result = self
             .agent
-            .submit_turn(prompt, obs, gate, &env, token)
+            .submit_turn(prompt, obs, gate, &env, token, self.steering.as_deref())
             .instrument(tracing::info_span!("turn"))
             .await;
         // Persist whatever the turn produced even when it ended in an error, so

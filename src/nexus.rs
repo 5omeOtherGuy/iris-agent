@@ -172,6 +172,12 @@ pub(crate) enum AgentEvent {
         message: String,
     },
     ToolCancelled(ToolCall),
+    /// A user message the loop injected mid-run: a steering or follow-up message
+    /// the host queued while the turn was running. Emitted so the front-end
+    /// renders the user row in transcript order. The initial prompt is NOT
+    /// emitted (the front-end commits that itself); only injected messages are.
+    /// The message is also pushed into provider context.
+    UserMessage(String),
     Notice(String),
     TurnComplete,
 }
@@ -244,6 +250,28 @@ pub(crate) trait ToolOutputSink {
     /// Forward one freshly produced output chunk (lossy-UTF-8 decoded) to the
     /// front-end. Best-effort: a delivery failure never aborts the tool.
     fn emit_chunk(&self, chunk: &str);
+}
+
+/// Source of mid-run user messages the host queued while a turn was running.
+/// Provider- and UI-neutral, like [`ApprovalGate`]: Nexus owns the contract and
+/// the injection points; the Tier-3 app backs it with the user's typed queue and
+/// owns the drain policy (how many queued messages each poll yields). Mirrors
+/// pi's `getSteeringMessages` / `getFollowUpMessages` loop hooks
+/// (`packages/agent/src/types.ts`).
+///
+/// - **Steering** messages are injected before the next provider request (after
+///   the current round's tool calls finish), so they redirect work in flight.
+/// - **Follow-up** messages are injected only when the agent would otherwise
+///   stop (no tool calls and no steering), continuing the run with another turn.
+///
+/// Both drains are synchronous and must not block: the in-memory queue is polled
+/// from inside the loop between awaits. Each returns an empty vec when nothing is
+/// queued.
+pub(crate) trait SteeringSource {
+    /// Drain the steering messages to inject before the next provider request.
+    fn take_steering(&self) -> Vec<String>;
+    /// Drain the follow-up messages to inject after the agent would stop.
+    fn take_follow_up(&self) -> Vec<String>;
 }
 
 /// Request/response approval gate. Async so the loop can race a pending approval
@@ -629,20 +657,34 @@ impl<P: ChatProvider> Agent<P> {
         gate: &dyn ApprovalGate,
         env: &ToolEnv<'_>,
         token: &CancellationToken,
+        steer: Option<&dyn SteeringSource>,
     ) -> Result<()> {
+        // Index of the just-pushed prompt: the start of the unanswered user run
+        // a cancellation before any provider answer truncates back to.
+        let unanswered_start = self.messages.len();
         self.messages.push(Message::user(prompt));
         // The bare agent does no persistence: the harness diffs `messages()`
         // onto its session store after the turn returns (even on error).
-        self.complete_turn(obs, gate, env, token).await
+        self.complete_turn(unanswered_start, obs, gate, env, token, steer)
+            .await
     }
 
     async fn complete_turn(
         &mut self,
+        unanswered_start: usize,
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
         env: &ToolEnv<'_>,
         token: &CancellationToken,
+        steer: Option<&dyn SteeringSource>,
     ) -> Result<()> {
+        // Start of the current unanswered user-message run (the prompt, plus any
+        // injected steering/follow-up not yet answered by the provider). Cleared
+        // once a provider turn commits assistant content; a cancellation before
+        // that truncates exactly this run so no dangling trailing user message is
+        // persisted. Replaces the old `roundtrip == 0` heuristic, which could not
+        // see injected messages.
+        let mut unanswered_start: Option<usize> = Some(unanswered_start);
         // Unbounded by default: the loop ends when the model stops emitting
         // tool calls (or on cancellation). An optional configured soft cap
         // ends the turn gracefully after that many round-trips.
@@ -664,14 +706,24 @@ impl<P: ChatProvider> Agent<P> {
             }
             if token.is_cancelled() {
                 tracing::info!(roundtrips = roundtrip, "turn interrupted by user");
-                if roundtrip == 0 {
-                    // Nothing was produced this turn yet; drop the unanswered
-                    // prompt so the next turn does not push two consecutive
-                    // user messages (rejected by some providers).
-                    self.messages.pop();
+                // Drop any unanswered user run (the prompt and/or injected
+                // steering/follow-up not yet answered) so the next turn does not
+                // push two consecutive user messages (rejected by some
+                // providers) or persist a dangling trailing user message.
+                if let Some(start) = unanswered_start {
+                    self.messages.truncate(start);
                 }
                 self.emit_interrupted(obs)?;
                 return Ok(());
+            }
+
+            // Inject any queued steering before this provider request. Covers the
+            // initial poll (the user may have typed while the turn was starting)
+            // and the post-tool poll (steering queued while the prior round's
+            // tools ran). Mirrors pi polling `getSteeringMessages` before each
+            // assistant response.
+            if let Some(src) = steer {
+                self.inject_user(src.take_steering(), obs, &mut unanswered_start)?;
             }
 
             let provider_turn_id = self.next_provider_turn_id();
@@ -693,8 +745,8 @@ impl<P: ChatProvider> Agent<P> {
             match stream_result {
                 StreamResult::Cancelled { partial, saw_delta } => {
                     // Commit any partial assistant text so the transcript stays
-                    // valid (paired with the user prompt); otherwise drop the
-                    // unanswered first-round prompt.
+                    // valid (it answers the unanswered user run); otherwise drop
+                    // that whole run (prompt and/or injected steering/follow-up).
                     if !partial.is_empty() {
                         if saw_delta {
                             obs.on_event(AgentEvent::AssistantTextEnd(partial.clone()))?;
@@ -704,8 +756,8 @@ impl<P: ChatProvider> Agent<P> {
                         self.messages.push(
                             Message::assistant(&partial).with_provider_turn_id(&provider_turn_id),
                         );
-                    } else if roundtrip == 0 {
-                        self.messages.pop();
+                    } else if let Some(start) = unanswered_start {
+                        self.messages.truncate(start);
                     }
                     tracing::info!(
                         roundtrips = roundtrip,
@@ -766,6 +818,10 @@ impl<P: ChatProvider> Agent<P> {
                         obs.on_event(AgentEvent::AssistantTextEnd(String::new()))?;
                     }
 
+                    // A completed provider turn answers the current unanswered
+                    // user run: a later cancellation must not truncate it.
+                    unanswered_start = None;
+
                     obs.on_event(AgentEvent::ProviderTurnCompleted {
                         turn_id: provider_turn_id.clone(),
                         response_id,
@@ -782,9 +838,37 @@ impl<P: ChatProvider> Agent<P> {
                         obs.on_event(AgentEvent::Notice(notice.to_string()))?;
                     }
                     if tool_calls.is_empty() {
-                        tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
-                        obs.on_event(AgentEvent::TurnComplete)?;
-                        return Ok(());
+                        // The agent would stop here. Steering queued during this
+                        // (tool-less) response runs first, then follow-up. Either
+                        // keeps the loop alive with another turn; with neither,
+                        // the turn is complete. Mirrors pi polling steering after
+                        // every turn and follow-up only at the stop point.
+                        let injected = match steer {
+                            Some(src) => {
+                                let steering = src.take_steering();
+                                if steering.is_empty() {
+                                    src.take_follow_up()
+                                } else {
+                                    steering
+                                }
+                            }
+                            None => Vec::new(),
+                        };
+                        if injected.is_empty() {
+                            tracing::debug!(roundtrips = roundtrip + 1, "turn complete");
+                            obs.on_event(AgentEvent::TurnComplete)?;
+                            return Ok(());
+                        }
+                        self.inject_user(injected, obs, &mut unanswered_start)?;
+                        // A tool-less steering/follow-up continuation is not a
+                        // tool round-trip, so it must not advance the soft-cap
+                        // counter: counting it could trip the cap check at the
+                        // top of the next iteration and return before the
+                        // provider ever answers the injected message, leaving a
+                        // dangling unanswered user message. The injected turn
+                        // still gets a provider response; only genuine tool
+                        // rounds (below) advance the counter.
+                        continue;
                     }
                     for call in &tool_calls {
                         self.messages.push(
@@ -804,6 +888,54 @@ impl<P: ChatProvider> Agent<P> {
             }
             roundtrip += 1;
         }
+    }
+
+    /// Inject the host-queued user messages drained at one injection point
+    /// (steering or follow-up) and announce them so the front-end renders the
+    /// user row in transcript order. Enforces the transcript invariant "no two
+    /// consecutive same-role user messages" (some providers reject them, others
+    /// only coalesce on the wire): a batch drained together is merged with
+    /// `\n\n`, and if the turn's trailing message is already a user message (the
+    /// just-pushed prompt, or an earlier injection this turn) the merged text
+    /// extends it in place rather than pushing a second user message. That
+    /// trailing user is always from the current turn -- a completed turn ends on
+    /// assistant content and a cancellation truncates its unanswered user run --
+    /// so mutating it stays consistent with the harness's post-turn persistence
+    /// diff. Sets `unanswered_start` to the start of the unanswered run so a
+    /// cancellation before the provider answers truncates exactly these messages
+    /// and never an answered one. The announced event carries only the newly
+    /// injected text so it renders as its own row. A no-op for an empty batch,
+    /// so it never spuriously starts an unanswered run.
+    fn inject_user(
+        &mut self,
+        messages: Vec<String>,
+        obs: &dyn AgentObserver,
+        unanswered_start: &mut Option<usize>,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let text = messages.join("\n\n");
+        if self
+            .messages
+            .last()
+            .is_some_and(|last| last.role == Role::User)
+        {
+            let idx = self.messages.len() - 1;
+            let last = &mut self.messages[idx];
+            last.content.push_str("\n\n");
+            last.content.push_str(&text);
+            if unanswered_start.is_none() {
+                *unanswered_start = Some(idx);
+            }
+        } else {
+            if unanswered_start.is_none() {
+                *unanswered_start = Some(self.messages.len());
+            }
+            self.messages.push(Message::user(&text));
+        }
+        obs.on_event(AgentEvent::UserMessage(text))?;
+        Ok(())
     }
 
     /// Consume one provider stream to its terminal event, emitting text deltas
