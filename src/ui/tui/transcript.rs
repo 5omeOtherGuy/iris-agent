@@ -1213,6 +1213,12 @@ impl Transcript {
                     self.push_tool_cancelled(&call);
                 }
             }
+            UiEvent::UserMessage(text) => {
+                // A user message the loop injected mid-run (steering/follow-up).
+                // Rendered as a user row at this point so the transcript order
+                // matches provider context.
+                self.commit_user(&text);
+            }
             UiEvent::Notice(message) => {
                 self.begin_block();
                 self.push(&format!("note: {}", message), dim_style());

@@ -192,6 +192,7 @@ pub(super) fn working_indicator_line(
     elapsed: Duration,
     can_interrupt: bool,
     usage: Option<&ProviderUsage>,
+    queued: usize,
     width: usize,
 ) -> Line<'static> {
     let mut spans = led_frame_spans(frame);
@@ -200,6 +201,17 @@ pub(super) fn working_indicator_line(
     if can_interrupt {
         spans.push(working_sep());
         spans.push(Span::styled("ESC", panel_style()));
+    }
+    // Surface queued steering/follow-up the user typed during the turn but the
+    // loop has not injected yet, so submitted input visibly registers.
+    if queued > 0 {
+        spans.push(working_sep());
+        let label = if queued == 1 {
+            "1 queued".to_string()
+        } else {
+            format!("{queued} queued")
+        };
+        spans.push(Span::styled(label, dim_style()));
     }
     if let Some(usage) = usage {
         spans.push(working_sep());
@@ -226,6 +238,7 @@ fn working_lines(
     frame: &str,
     elapsed: Option<Duration>,
     footer: Option<&Footer>,
+    queued: usize,
     width: usize,
 ) -> Vec<Line<'static>> {
     vec![working_indicator_line(
@@ -233,6 +246,7 @@ fn working_lines(
         elapsed.unwrap_or_default(),
         true,
         footer.and_then(|footer| footer.usage.as_ref()),
+        queued,
         width,
     )]
 }
@@ -314,6 +328,11 @@ pub(crate) struct Screen {
     /// The active picker/dialog, when one is open. While present it renders
     /// above the editor and the loop routes keys to it instead of the editor.
     pub(crate) modal: Option<Modal>,
+    /// Count of mid-run messages the user has queued (steering + follow-up) that
+    /// the loop has not yet injected. Surfaced on the working indicator so the
+    /// user sees their queued input register before it is injected. Reset at
+    /// each turn boundary.
+    queued: usize,
 }
 
 impl Screen {
@@ -330,7 +349,15 @@ impl Screen {
             approval_hint: None,
             footer: None,
             modal: None,
+            queued: 0,
         }
+    }
+
+    /// Set the count of queued (not-yet-injected) steering/follow-up messages
+    /// shown on the working indicator. The loop refreshes it from the live queue
+    /// whenever input is enqueued or a queued message is injected.
+    pub(crate) fn set_queued(&mut self, queued: usize) {
+        self.queued = queued;
     }
 
     // --- modal/picker ---
@@ -394,6 +421,10 @@ impl Screen {
             footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
         }
+        // `UiEvent::UserMessage` (a mid-run injected steering/follow-up message)
+        // is committed as a user row inside `transcript.apply`, so order matches
+        // provider context; the initial prompt is committed by the session
+        // driver via `commit_user`.
         self.transcript.apply(event);
     }
 
@@ -511,12 +542,14 @@ impl Screen {
         self.spinner.start();
         self.turn_divider = TurnDivider::default();
         self.approval_hint = None;
+        self.queued = 0;
         if let Some(footer) = &mut self.footer {
             footer.usage = None;
         }
     }
 
     pub(crate) fn end_turn(&mut self) {
+        self.queued = 0;
         self.turn_divider.elapsed = self.spinner.elapsed();
         self.transcript.push_turn_divider(
             self.turn_divider.had_work,
@@ -577,6 +610,7 @@ impl Screen {
                 self.spinner.frame(),
                 self.spinner.elapsed(),
                 self.footer.as_ref(),
+                self.queued,
                 usize::from(width),
             )
         } else {
@@ -1237,8 +1271,13 @@ mod tests {
                     "width {width}: {line:?}"
                 );
             }
-            for line in working_lines(WORKING_FRAMES[0], Some(Duration::from_secs(1)), None, width)
-            {
+            for line in working_lines(
+                WORKING_FRAMES[0],
+                Some(Duration::from_secs(1)),
+                None,
+                0,
+                width,
+            ) {
                 assert!(
                     display_width(&line_text(&line)) <= width,
                     "width {width}: {line:?}"

@@ -513,6 +513,15 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 self.in_tool_block = false;
                 self.exploring_open = false;
             }
+            UiEvent::UserMessage(text) => {
+                // A mid-run injected user message (steering/follow-up). The text
+                // path does not enqueue steering today, so this only arrives if
+                // a future caller wires it; echo it as a user line for parity.
+                self.finish_assistant_stream()?;
+                self.in_tool_block = false;
+                self.exploring_open = false;
+                writeln!(self.out, "{}", sgr(self.ansi, "1", &format!("> {text}")))?;
+            }
             UiEvent::Notice(message) => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;

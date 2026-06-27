@@ -76,6 +76,14 @@ Implemented today:
   transcript on abort.
 - Provider tool-call loop with optional configured round-trip cap,
   retry/backoff, and structured tool result/error messages.
+- Mid-run steering and follow-up messages (pi-mono parity): the composer stays
+  live while a turn runs, so the user can queue input without interrupting it.
+  Enter queues a steering message (injected before the next provider request,
+  after the current round's tool calls), Alt+Enter queues a follow-up (injected
+  only when the agent would otherwise stop). Nexus owns the injection points and
+  a `SteeringSource` seam; the Tier-3 `SteeringQueue` owns the drain policy; the
+  working indicator shows a queued count and Ctrl-C clears the queue. The text/
+  non-TTY path never steers.
 - Typed boundary errors with process exit codes (`src/errors.rs`) and `RUST_LOG`
   tracing to stderr (`src/telemetry.rs`).
 - Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,

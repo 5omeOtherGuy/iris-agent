@@ -4141,3 +4141,488 @@ fn streaming_tool_deltas_stay_out_of_messages_and_exit_metadata_threads_through(
     }
     Ok(())
 }
+
+// --- steering / follow-up mid-run message injection (pi-mono parity) ---
+
+use std::collections::VecDeque;
+use std::rc::Rc;
+
+/// In-memory steering/follow-up queue test double. Implements the Tier-1
+/// [`SteeringSource`] contract with the same FIFO drain-all policy as the real
+/// Tier-3 `SteeringQueue`, kept here so the loop tests stay self-contained.
+#[derive(Default)]
+struct TestSteering {
+    steering: RefCell<VecDeque<String>>,
+    follow_up: RefCell<VecDeque<String>>,
+}
+
+impl TestSteering {
+    fn push_steer(&self, text: &str) {
+        self.steering.borrow_mut().push_back(text.to_string());
+    }
+    fn push_follow_up(&self, text: &str) {
+        self.follow_up.borrow_mut().push_back(text.to_string());
+    }
+}
+
+impl SteeringSource for TestSteering {
+    fn take_steering(&self) -> Vec<String> {
+        self.steering.borrow_mut().drain(..).collect()
+    }
+    fn take_follow_up(&self) -> Vec<String> {
+        self.follow_up.borrow_mut().drain(..).collect()
+    }
+}
+
+/// One enqueue a provider performs while a turn is in flight.
+#[derive(Clone)]
+enum Enqueue {
+    Steer(String),
+    Follow(String),
+}
+
+/// Provider that records `seen` like [`FakeProvider`] and, immediately before
+/// answering a chosen call index, enqueues into the shared steering queue --
+/// simulating the user typing while that provider turn streamed.
+struct EnqueueingProvider {
+    responses: RefCell<Vec<Result<AssistantTurn, String>>>,
+    seen: RefCell<Vec<Vec<Message>>>,
+    queue: Rc<TestSteering>,
+    on_call: RefCell<Vec<Vec<Enqueue>>>,
+    call: Cell<usize>,
+}
+
+impl EnqueueingProvider {
+    fn new(
+        responses: Vec<Result<AssistantTurn, &str>>,
+        queue: Rc<TestSteering>,
+        on_call: Vec<Vec<Enqueue>>,
+    ) -> Self {
+        Self {
+            responses: RefCell::new(
+                responses
+                    .into_iter()
+                    .map(|result| result.map_err(str::to_string))
+                    .rev()
+                    .collect(),
+            ),
+            seen: RefCell::new(Vec::new()),
+            queue,
+            on_call: RefCell::new(on_call),
+            call: Cell::new(0),
+        }
+    }
+}
+
+impl ChatProvider for EnqueueingProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        self.seen.borrow_mut().push(messages.to_vec());
+        let idx = self.call.get();
+        self.call.set(idx + 1);
+        let actions = self.on_call.borrow().get(idx).cloned().unwrap_or_default();
+        for action in actions {
+            match action {
+                Enqueue::Steer(text) => self.queue.push_steer(&text),
+                Enqueue::Follow(text) => self.queue.push_follow_up(&text),
+            }
+        }
+        let item = match self.responses.borrow_mut().pop() {
+            Some(Ok(turn)) => Ok(turn),
+            Some(Err(error)) => Err(error),
+            None => Err("unexpected call".to_string()),
+        };
+        Ok(turn_stream(item))
+    }
+}
+
+#[test]
+fn steering_injected_after_tool_round_reaches_next_provider_context() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "hello")?;
+    let queue = Rc::new(TestSteering::default());
+    let provider = EnqueueingProvider::new(
+        vec![
+            Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+            Ok(AssistantTurn::text("done")),
+        ],
+        queue.clone(),
+        // The user types a steering message while the first (tool) turn runs.
+        vec![vec![Enqueue::Steer("also check config".to_string())]],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("read note", &frontend, &frontend, &CancellationToken::new()))?;
+
+    // The second provider call sees the steering message injected after the tool
+    // result, before the model's next response.
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[1]
+            .iter()
+            .any(|m| m.role == Role::User && m.content == "also check config"),
+        "steering must reach the next provider context: {:?}",
+        seen[1]
+    );
+    // It is announced so the UI can render the row in transcript order.
+    assert!(
+        frontend
+            .events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessage(t) if t == "also check config"))
+    );
+    Ok(())
+}
+
+#[test]
+fn follow_up_injected_when_agent_would_stop() -> Result<()> {
+    let workspace = test_workspace()?;
+    let queue = Rc::new(TestSteering::default());
+    let provider = EnqueueingProvider::new(
+        vec![
+            Ok(AssistantTurn::text("working")),
+            Ok(AssistantTurn::text("done")),
+        ],
+        queue.clone(),
+        // The user queues a follow-up while the first (tool-less) response runs.
+        vec![vec![Enqueue::Follow("now write tests".to_string())]],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2, "a follow-up triggers a second provider turn");
+    assert!(
+        seen[1]
+            .iter()
+            .any(|m| m.role == Role::User && m.content == "now write tests"),
+        "follow-up must reach the continued turn: {:?}",
+        seen[1]
+    );
+    Ok(())
+}
+
+#[test]
+fn no_queued_messages_ends_the_turn_without_a_second_call() -> Result<()> {
+    let workspace = test_workspace()?;
+    let queue = Rc::new(TestSteering::default());
+    // Nothing is ever queued: the tool-less response ends the turn.
+    let provider = EnqueueingProvider::new(
+        vec![Ok(AssistantTurn::text("all done"))],
+        queue.clone(),
+        Vec::new(),
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        harness.agent.provider.seen.borrow().len(),
+        1,
+        "no queued messages means exactly one provider round trip"
+    );
+    assert!(
+        frontend
+            .events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnComplete))
+    );
+    Ok(())
+}
+
+#[test]
+fn would_stop_injects_steering_before_follow_up() -> Result<()> {
+    let workspace = test_workspace()?;
+    let queue = Rc::new(TestSteering::default());
+    let provider = EnqueueingProvider::new(
+        vec![
+            Ok(AssistantTurn::text("a")),
+            Ok(AssistantTurn::text("b")),
+            Ok(AssistantTurn::text("c")),
+        ],
+        queue.clone(),
+        // Both queued during the first (tool-less) response: steering injects
+        // first (continuing the loop), the follow-up only at the next stop.
+        vec![vec![
+            Enqueue::Steer("steer first".to_string()),
+            Enqueue::Follow("follow second".to_string()),
+        ]],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 3);
+    assert!(
+        seen[1].iter().any(|m| m.content == "steer first"),
+        "steering injected before the second response: {:?}",
+        seen[1]
+    );
+    assert!(
+        !seen[1].iter().any(|m| m.content == "follow second"),
+        "follow-up must NOT inject while steering is pending: {:?}",
+        seen[1]
+    );
+    assert!(
+        seen[2].iter().any(|m| m.content == "follow second"),
+        "follow-up injected only at the next stop point: {:?}",
+        seen[2]
+    );
+    Ok(())
+}
+
+#[test]
+fn batched_steering_merges_into_one_user_message() -> Result<()> {
+    let workspace = test_workspace()?;
+    let queue = Rc::new(TestSteering::default());
+    let provider = EnqueueingProvider::new(
+        vec![
+            Ok(AssistantTurn::text("a")),
+            Ok(AssistantTurn::text("done")),
+        ],
+        queue.clone(),
+        // Two steering messages queued during the same response: they drain
+        // together and must merge into one user message, never two consecutive
+        // user messages (which some providers reject).
+        vec![vec![
+            Enqueue::Steer("first".to_string()),
+            Enqueue::Steer("second".to_string()),
+        ]],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    // Exactly one merged user message was injected (no consecutive user rows).
+    let injected: Vec<&Message> = harness
+        .agent
+        .messages()
+        .iter()
+        .filter(|m| m.role == Role::User && m.content != "go")
+        .collect();
+    assert_eq!(
+        injected.len(),
+        1,
+        "batched steering merges into one message"
+    );
+    assert_eq!(injected[0].content, "first\n\nsecond");
+    // No two consecutive user messages anywhere in the transcript.
+    let messages = harness.agent.messages();
+    assert!(
+        !messages
+            .windows(2)
+            .any(|w| w[0].role == Role::User && w[1].role == Role::User),
+        "transcript must not contain consecutive user messages: {messages:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_injection_drops_unanswered_user_message() -> Result<()> {
+    // First response is tool-less, so the loop injects the queued follow-up and
+    // continues. The next provider turn cancels before answering; the injected,
+    // still-unanswered user message must be truncated so the transcript ends on
+    // the assistant reply (no dangling trailing user message).
+    struct CancelAfterInjection {
+        token: CancellationToken,
+        queue: Rc<TestSteering>,
+        call: Cell<usize>,
+    }
+    impl ChatProvider for CancelAfterInjection {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let idx = self.call.get();
+            self.call.set(idx + 1);
+            if idx == 0 {
+                // The user queues a follow-up during the (final) first response.
+                self.queue.push_follow_up("late instruction");
+                Ok(turn_stream(Ok(AssistantTurn::text("working"))))
+            } else {
+                // The continued turn is cancelled before it can answer.
+                self.token.cancel();
+                Ok(Box::pin(futures::stream::pending::<Result<ProviderEvent>>()))
+            }
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let token = CancellationToken::new();
+    let queue = Rc::new(TestSteering::default());
+    let provider = CancelAfterInjection {
+        token: token.clone(),
+        queue: queue.clone(),
+        call: Cell::new(0),
+    };
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &token))?;
+
+    // The injected-but-unanswered follow-up is dropped: transcript ends on the
+    // assistant reply, with no trailing user message and no duplicate prompt.
+    let messages = harness.agent.messages();
+    assert_eq!(messages.len(), 2, "messages: {messages:?}");
+    assert_eq!(messages[0].role, Role::User);
+    assert_eq!(messages[0].content, "hi");
+    assert_eq!(messages[1].role, Role::Assistant);
+    assert_eq!(messages[1].content, "working");
+    assert!(
+        !messages.iter().any(|m| m.content == "late instruction"),
+        "the unanswered injected message must be truncated on cancel"
+    );
+    Ok(())
+}
+
+#[test]
+fn steering_queued_before_first_request_coalesces_into_prompt() -> Result<()> {
+    // A steering message already queued when the turn starts (e.g. typed in the
+    // submit/arm gap, or left by a cancellation race) is drained at the top of
+    // the first loop iteration, where the trailing message is the prompt. It
+    // must coalesce into that prompt, never push a second consecutive user
+    // message (which some providers reject).
+    let workspace = test_workspace()?;
+    let queue = Rc::new(TestSteering::default());
+    queue.push_steer("and prefer ripgrep");
+    let provider = EnqueueingProvider::new(
+        vec![Ok(AssistantTurn::text("ok"))],
+        queue.clone(),
+        Vec::new(),
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn(
+        "search the code",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    let messages = harness.agent.messages();
+    let users: Vec<&Message> = messages.iter().filter(|m| m.role == Role::User).collect();
+    assert_eq!(users.len(), 1, "prompt + steering must be one user message");
+    assert_eq!(users[0].content, "search the code\n\nand prefer ripgrep");
+    assert!(
+        !messages
+            .windows(2)
+            .any(|w| w[0].role == Role::User && w[1].role == Role::User),
+        "no consecutive user messages: {messages:?}"
+    );
+    // The steering text is still announced as its own row for the transcript.
+    assert!(
+        frontend
+            .events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserMessage(t) if t == "and prefer ripgrep"))
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_completion_then_follow_up_does_not_make_consecutive_user_messages() -> Result<()> {
+    // A content-less completion (no text, tools, or reasoning -- allowed by some
+    // providers) pushes no assistant message. A follow-up injected at that
+    // would-stop point must coalesce into the still-unanswered prompt rather
+    // than appearing as a second consecutive user message.
+    let workspace = test_workspace()?;
+    let queue = Rc::new(TestSteering::default());
+    let provider = EnqueueingProvider::new(
+        vec![Ok(AssistantTurn::text("")), Ok(AssistantTurn::text("done"))],
+        queue.clone(),
+        vec![vec![Enqueue::Follow("please continue".to_string())]],
+    );
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2, "the follow-up drives a second provider turn");
+    assert!(
+        seen[1]
+            .iter()
+            .any(|m| m.role == Role::User && m.content.contains("please continue")),
+        "follow-up must reach the continued turn: {:?}",
+        seen[1]
+    );
+    let messages = harness.agent.messages();
+    assert!(
+        !messages
+            .windows(2)
+            .any(|w| w[0].role == Role::User && w[1].role == Role::User),
+        "no consecutive user messages after an empty completion: {messages:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn soft_cap_does_not_strand_an_injected_follow_up() -> Result<()> {
+    // The tool-roundtrip soft cap must not strand a would-stop follow-up: a
+    // tool-less continuation does not count toward the cap, so the injected
+    // message always gets a provider response and never dangles unanswered.
+    const CAP: usize = 1;
+    let workspace = test_workspace()?;
+    let queue = Rc::new(TestSteering::default());
+    let provider = EnqueueingProvider::new(
+        vec![
+            Ok(AssistantTurn::text("first")),
+            Ok(AssistantTurn::text("answered")),
+        ],
+        queue.clone(),
+        // Queue the follow-up during the first response; with CAP == 1 a path
+        // that counted the continuation would return before answering it.
+        vec![vec![Enqueue::Follow("keep going".to_string())]],
+    );
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()).with_max_tool_roundtrips(Some(CAP)),
+        workspace.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    harness.set_steering_source(queue.clone());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(
+        seen.len(),
+        2,
+        "the follow-up still gets a provider response"
+    );
+    let messages = harness.agent.messages();
+    assert_eq!(
+        messages.last().map(|m| m.role),
+        Some(Role::Assistant),
+        "transcript must not end on an unanswered injected user message: {messages:?}"
+    );
+    Ok(())
+}

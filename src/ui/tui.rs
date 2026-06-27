@@ -1688,6 +1688,59 @@ mod tests {
     }
 
     #[test]
+    fn working_indicator_shows_queued_steering_count() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        // No queued input: the indicator omits the segment.
+        let none = screen
+            .working_lines(100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!none.contains("queued"), "{none}");
+
+        screen.set_queued(2);
+        let two = screen
+            .working_lines(100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(two.contains("2 queued"), "{two}");
+
+        // A turn boundary clears the indicator.
+        screen.end_turn();
+        screen.start_turn();
+        let reset = screen
+            .working_lines(100)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!reset.contains("queued"), "{reset}");
+    }
+
+    #[test]
+    fn injected_user_message_renders_as_a_user_row() {
+        let mut screen = Screen::new();
+        screen.commit_user("first prompt");
+        screen.start_turn();
+        screen.apply(UiEvent::AssistantText("on it".to_string()));
+        // A mid-run injected steering/follow-up message renders in transcript
+        // order, after the assistant text that preceded it.
+        screen.apply(UiEvent::UserMessage("also do this".to_string()));
+        let rendered = rendered_text(&mut screen, 100, 24);
+        assert!(rendered.contains("also do this"), "{rendered}");
+        let prompt_idx = rendered.find("on it").expect("assistant text");
+        let injected_idx = rendered.find("also do this").expect("injected row");
+        assert!(
+            prompt_idx < injected_idx,
+            "injected row must follow: {rendered}"
+        );
+    }
+
+    #[test]
     fn working_indicator_renders_all_ping_pong_led_frames() {
         let frames: Vec<String> = (0..WORKING_FRAMES.len())
             .map(|frame| {
@@ -1696,6 +1749,7 @@ mod tests {
                     Duration::from_secs(87),
                     true,
                     None,
+                    0,
                     80,
                 ))
                 .trim()
@@ -1733,6 +1787,7 @@ mod tests {
             Duration::from_secs(87),
             true,
             None,
+            0,
             80,
         ))
         .trim()
@@ -1742,6 +1797,7 @@ mod tests {
             Duration::from_secs(87),
             false,
             Some(&usage),
+            0,
             80,
         ))
         .trim()
@@ -1751,6 +1807,7 @@ mod tests {
             Duration::from_secs(87),
             false,
             None,
+            0,
             80,
         ))
         .trim()
@@ -2868,6 +2925,7 @@ mod tests {
             Duration::from_millis(500),
             true,
             None,
+            0,
             80,
         ));
         assert!(under_ten.contains("0.5s"), "{under_ten}");
@@ -2879,6 +2937,7 @@ mod tests {
             Duration::from_secs(13),
             true,
             None,
+            0,
             80,
         ));
         assert!(over_ten.contains("13s"), "{over_ten}");
@@ -2888,6 +2947,7 @@ mod tests {
             Duration::from_secs(87),
             true,
             None,
+            0,
             80,
         ));
         assert!(over_minute.contains("1:27"), "{over_minute}");
@@ -2897,6 +2957,7 @@ mod tests {
             Duration::from_secs(3734),
             true,
             None,
+            0,
             80,
         ));
         assert!(over_hour.contains("1:02:14"), "{over_hour}");

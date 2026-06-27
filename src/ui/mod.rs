@@ -13,6 +13,7 @@ pub(crate) mod modal;
 pub(crate) mod picker;
 pub(crate) mod selector;
 pub(crate) mod slash;
+pub(crate) mod steering;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
 
@@ -135,6 +136,10 @@ pub(crate) enum UiEvent {
         message: String,
     },
     ToolCancelled(ToolCall),
+    /// A user message the loop injected mid-run (steering or follow-up). The
+    /// front-end renders it as a user row at this point so transcript order
+    /// matches provider context. See [`AgentEvent::UserMessage`].
+    UserMessage(String),
     Notice(String),
     TurnError {
         kind: TurnErrorKind,
@@ -241,6 +246,7 @@ impl UiEvent {
             }
             AgentEvent::ToolError { call, message } => UiEvent::ToolError { call, message },
             AgentEvent::ToolCancelled(call) => UiEvent::ToolCancelled(call),
+            AgentEvent::UserMessage(text) => UiEvent::UserMessage(text),
             AgentEvent::Notice(message) => UiEvent::Notice(message),
             AgentEvent::TurnComplete => UiEvent::TurnComplete,
         }
