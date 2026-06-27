@@ -30,9 +30,12 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::nexus::ToolCall;
-use crate::tool_display::{display_path, exploration_summary, run_target, summarize};
+use crate::tool_display::{
+    bash_timeout_secs, command_display, display_path, exploration_summary, run_target, summarize,
+};
 
 use super::rows::{ChromeRow, FoldVis, TranscriptRow};
+use super::shell_command::{self, ShellCommand};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::wrap::{clamp_output_line, display_width, truncate_chars, wrapped_row_estimate};
 use super::{MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, dim_style, err_style, panel_style};
@@ -123,6 +126,18 @@ pub(super) fn resolve(call: &ToolCall) -> &'static dyn ToolRenderer {
     }
 }
 
+/// The raw `bash` command string, when the call is a bash tool with a string
+/// `command` argument. The SHELL panel builds its structured command display
+/// from this; everything else keeps using `tool_display` summaries.
+fn raw_bash_command(call: &ToolCall) -> Option<&str> {
+    if call.name != "bash" {
+        return None;
+    }
+    call.arguments
+        .get("command")
+        .and_then(|value| value.as_str())
+}
+
 /// The path argument a file-style tool carries, if any.
 fn tool_path_arg(call: &ToolCall) -> Option<&str> {
     call.arguments
@@ -190,8 +205,22 @@ impl ToolRenderer for ShellRenderer {
 
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
         let mut body = PanelBody::new(ctx.width);
-        let target = run_target(call);
-        body.line(&format!("$ {target}"), panel_style());
+        let timeout = bash_timeout_secs(call);
+        match raw_bash_command(call) {
+            Some(raw) => {
+                // Clean ANSI/OSC/control sequences per line (so a `;`/`|`
+                // buried in an escape sequence can't wrongly split the command)
+                // while preserving newlines for heredoc detection.
+                let cleaned = raw
+                    .split('\n')
+                    .map(strip_ansi_for_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                body.command_block(&shell_command::build(&cleaned), timeout);
+            }
+            // Non-string/absent command: keep the single-row fallback.
+            None => body.command_row(&command_display(call), timeout),
+        }
         match outcome {
             ToolOutcome::Running { streamed } => {
                 if !streamed.is_empty() {
@@ -334,6 +363,115 @@ impl PanelBody {
 
     fn into_rows(self) -> Vec<TranscriptRow> {
         self.rows
+    }
+
+    /// Render the structured command region: the `$` prompt row (carrying the
+    /// timeout), operator-preserving continuation rows, an optional heredoc
+    /// payload section, and trailing commands after the heredoc.
+    fn command_block(&mut self, cmd: &ShellCommand, timeout: Option<u64>) {
+        let mut segments = cmd.command.iter();
+        let Some(first) = segments.next() else {
+            return;
+        };
+        self.command_row(first, timeout);
+        for cont in segments {
+            self.command_continuation(cont);
+        }
+        if let Some(payload) = &cmd.payload {
+            self.line("", panel_style());
+            self.line(&format!("  payload  {}", payload.lang), dim_style());
+            self.payload_rule();
+            self.payload_body(&payload.body);
+            self.payload_line(&payload.closing, FoldVis::Always);
+        }
+        for cont in &cmd.trailing {
+            self.command_continuation(cont);
+        }
+    }
+
+    /// A `  {text}` command continuation row (aligned under the command body,
+    /// not under `$`), keeping its leading operator. Bounded like output rows so
+    /// a pathological segment cannot balloon the stored row.
+    fn command_continuation(&mut self, text: &str) {
+        let text = truncate_chars(text, MAX_TOOL_OUTPUT_LINE_CHARS);
+        self.line(&format!("  {text}"), panel_style());
+    }
+
+    /// The dim rule under the `payload  <lang>` label.
+    fn payload_rule(&mut self) {
+        let rule = "\u{2500}".repeat(self.width.saturating_sub(2).max(1));
+        self.line(&format!("  {rule}"), dim_style());
+    }
+
+    /// One dim heredoc body / closing-delimiter row.
+    fn payload_line(&mut self, text: &str, fold: FoldVis) {
+        let clamped = truncate_chars(text, MAX_TOOL_OUTPUT_LINE_CHARS);
+        self.line_folded(&format!("  {clamped}"), dim_style(), fold);
+    }
+
+    /// Heredoc body with middle-folding: short bodies render whole; long bodies
+    /// show a head/tail slice plus a `\u{2026} N lines hidden` affordance while
+    /// collapsed, and the full body while expanded (ctrl+o toggles).
+    fn payload_body(&mut self, body: &[String]) {
+        const HEAD: usize = 4;
+        const TAIL: usize = 2;
+        if body.len() <= HEAD + TAIL + 1 {
+            for line in body {
+                self.payload_line(line, FoldVis::Always);
+            }
+            return;
+        }
+        let hidden = body.len() - HEAD - TAIL;
+        for line in &body[..HEAD] {
+            self.payload_line(line, FoldVis::WhenCollapsed);
+        }
+        self.fold_expand_hint(hidden, false);
+        for line in &body[body.len() - TAIL..] {
+            self.payload_line(line, FoldVis::WhenCollapsed);
+        }
+        for line in body {
+            self.payload_line(line, FoldVis::WhenExpanded);
+        }
+        self.fold_collapse_hint();
+    }
+
+    /// The SHELL `$ command` row with the timeout rendered as right-aligned
+    /// invocation metadata (never inside the command text). A positive timeout
+    /// hugs the right border on the same row when it fits; otherwise it drops to
+    /// its own right-aligned row so a long command is never truncated to make
+    /// room. `Some(0)` ("no timeout") and `None` omit the field entirely.
+    fn command_row(&mut self, command: &str, timeout: Option<u64>) {
+        let command = truncate_chars(command, MAX_TOOL_OUTPUT_LINE_CHARS);
+        let left = format!("$ {command}");
+        let Some(secs) = timeout.filter(|secs| *secs > 0) else {
+            self.line(&left, panel_style());
+            return;
+        };
+        let hint = format!("timeout {secs}s");
+        let width = self.fold_hint_width();
+        let left_w = display_width(&left);
+        let hint_w = display_width(&hint);
+        if left_w + 1 + hint_w <= width {
+            let gap = width - left_w - hint_w;
+            let plain = format!("{left}{}{hint}", " ".repeat(gap));
+            let spans = vec![
+                Span::styled(left, panel_style()),
+                Span::styled(" ".repeat(gap), panel_style()),
+                Span::styled(hint, dim_style()),
+            ];
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::from(spans),
+                    bg: None,
+                },
+                plain,
+                panel_style(),
+            ));
+        } else {
+            self.line(&left, panel_style());
+            let text = right_align_hint("", &hint, width);
+            self.line_folded(&text, dim_style(), FoldVis::Always);
+        }
     }
 
     /// Push a plain panel body line (ANSI stripped), one row per `\n` segment.
@@ -642,6 +780,136 @@ mod tests {
         assert_eq!(errored.len(), 1);
         assert_eq!(errored[0].text, "error: boom");
         assert_eq!(errored[0].style.fg, err_style().fg);
+    }
+
+    #[test]
+    fn shell_command_row_renders_timeout_as_right_aligned_metadata() {
+        let args = json!({ "command": "echo hi", "timeout": 120 });
+        let renderer = resolve(&call("bash", args.clone()));
+        let ctx = RenderCtx { width: 60 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", args),
+            &ToolOutcome::Done { content: "ok" },
+        );
+        let cmd = &rows[0];
+        assert!(cmd.text.starts_with("$ echo hi"), "{}", cmd.text);
+        assert!(cmd.text.ends_with("timeout 120s"), "{}", cmd.text);
+        // The timeout is invocation metadata, not part of the command string.
+        assert!(!cmd.text.contains("(timeout"), "{}", cmd.text);
+        let Some(ChromeRow::Body { line, .. }) = cmd.chrome.as_ref() else {
+            panic!("expected a Body chrome row");
+        };
+        assert_eq!(
+            line.spans.last().unwrap().style.fg,
+            dim_style().fg,
+            "timeout span should be dim metadata"
+        );
+    }
+
+    #[test]
+    fn shell_command_row_omits_timeout_when_none_or_zero() {
+        let ctx = RenderCtx { width: 60 };
+        for args in [
+            json!({ "command": "echo hi" }),
+            json!({ "command": "echo hi", "timeout": 0 }),
+        ] {
+            let renderer = resolve(&call("bash", args.clone()));
+            let rows = renderer.body(
+                &ctx,
+                &call("bash", args),
+                &ToolOutcome::Done { content: "" },
+            );
+            assert_eq!(rows[0].text, "$ echo hi", "timeout field must be omitted");
+        }
+    }
+
+    #[test]
+    fn shell_command_row_drops_timeout_below_when_command_fills_width() {
+        let command = "echo this is a fairly long command line that fills the panel width";
+        let args = json!({ "command": command, "timeout": 120 });
+        let renderer = resolve(&call("bash", args.clone()));
+        let ctx = RenderCtx { width: 40 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", args),
+            &ToolOutcome::Done { content: "" },
+        );
+        // The command keeps its own row (untruncated here), timeout drops below.
+        assert_eq!(rows[0].text, format!("$ {command}"));
+        assert!(rows[1].text.ends_with("timeout 120s"), "{}", rows[1].text);
+        assert_eq!(rows[1].text.trim(), "timeout 120s");
+    }
+
+    #[test]
+    fn shell_splits_and_command_into_prompt_and_continuation_rows() {
+        let args = json!({ "command": "cd \"/abs/path\" && cargo fmt" });
+        let renderer = resolve(&call("bash", args.clone()));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", args),
+            &ToolOutcome::Done { content: "" },
+        );
+        assert!(
+            rows[0].text.starts_with("$ cd \"/abs/path\""),
+            "{}",
+            rows[0].text
+        );
+        assert_eq!(rows[1].text, "  && cargo fmt");
+    }
+
+    #[test]
+    fn shell_renders_heredoc_payload_section_and_trailing_command() {
+        let command = "cd \"/abs\" && python3 - <<'PY'\nfrom pathlib import Path\np = Path('x')\nPY\ncargo fmt";
+        let args = json!({ "command": command });
+        let renderer = resolve(&call("bash", args.clone()));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", args),
+            &ToolOutcome::Done { content: "" },
+        );
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.trim() == "$ cd \"/abs\"".trim()),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&"  && python3 - <<'PY'"), "{texts:?}");
+        assert!(texts.contains(&"  payload  python"), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("from pathlib import Path")),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&"  PY"), "{texts:?}");
+        assert!(texts.contains(&"  cargo fmt"), "{texts:?}");
+    }
+
+    #[test]
+    fn shell_folds_long_heredoc_body_into_collapsed_preview_and_full() {
+        let mut command = String::from("python3 - <<'PY'\n");
+        for i in 0..40 {
+            command.push_str(&format!("line {i}\n"));
+        }
+        command.push_str("PY");
+        let args = json!({ "command": command });
+        let renderer = resolve(&call("bash", args.clone()));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", args),
+            &ToolOutcome::Done { content: "" },
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.fold == FoldVis::WhenCollapsed && r.text.contains("lines hidden")),
+            "expected a collapsed hidden-lines affordance"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.fold == FoldVis::WhenExpanded && r.text.contains("line 39")),
+            "expected the full body to include the elided tail"
+        );
     }
 
     #[test]

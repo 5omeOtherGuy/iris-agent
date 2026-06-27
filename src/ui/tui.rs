@@ -44,6 +44,7 @@ mod pane;
 mod panel;
 mod rows;
 mod screen;
+mod shell_command;
 mod text;
 mod tool_render;
 mod transcript;
