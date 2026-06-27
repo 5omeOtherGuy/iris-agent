@@ -209,7 +209,7 @@ impl ToolRenderer for ShellRenderer {
         match raw_bash_command(call) {
             Some(raw) => {
                 // Clean ANSI/OSC/control sequences per line (so a `;`/`|`
-                // buried in an escape sequence can't mis-split the command)
+                // buried in an escape sequence can't wrongly split the command)
                 // while preserving newlines for heredoc detection.
                 let cleaned = raw
                     .split('\n')
