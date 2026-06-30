@@ -3318,6 +3318,25 @@ mod tests {
         assert!(rendered.contains("ERROR"), "{rendered}");
         assert!(!rendered.contains("DONE"), "{rendered}");
         assert!(rendered.contains("boom"), "{rendered}");
+        assert!(rendered.contains("exit 1"), "{rendered}");
+    }
+
+    #[test]
+    fn shell_panel_closes_with_exit_status_result_row_end_to_end() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolStarted(call_args(
+            "bash",
+            json!({ "command": "cargo test" }),
+        )));
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "cargo test" })),
+            content: "test result: ok. 142 passed; 0 failed".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(120)),
+        });
+
+        let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("\u{25c6} exit 0"), "{rendered}");
     }
 
     #[test]

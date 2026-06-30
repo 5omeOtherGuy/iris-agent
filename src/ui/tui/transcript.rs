@@ -283,7 +283,7 @@ impl Transcript {
             panel_state(false, failed),
             duration,
             None,
-            ToolOutcome::Done { content },
+            ToolOutcome::Done { content, exit_code },
         );
     }
 
@@ -475,7 +475,10 @@ impl Transcript {
         } else if running {
             ToolOutcome::Running { streamed: content }
         } else {
-            ToolOutcome::Done { content }
+            ToolOutcome::Done {
+                content,
+                exit_code: Some(if failed { 1 } else { 0 }),
+            }
         };
         self.append_tool_panel(
             renderer,
@@ -633,7 +636,10 @@ impl Transcript {
             PanelState::Done,
             duration,
             Some(active.started),
-            ToolOutcome::Done { content },
+            ToolOutcome::Done {
+                content,
+                exit_code: None,
+            },
         );
         self.replace_active_tool_panel(&active, rows);
         true
@@ -741,7 +747,7 @@ impl Transcript {
             panel_state(false, failed),
             duration,
             Some(active.started),
-            ToolOutcome::Done { content },
+            ToolOutcome::Done { content, exit_code },
         );
         self.replace_active_exec_panel(&active, rows);
     }
@@ -925,7 +931,13 @@ impl Transcript {
 
     fn push_explore_body(&mut self, call: &ToolCall, failed: bool, duration: Option<Duration>) {
         let meta = self.explore_meta(call);
-        let (text, _) = self.explore_text_style(call, ToolOutcome::Done { content: "" });
+        let (text, _) = self.explore_text_style(
+            call,
+            ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
+        );
         let style = if failed { err_style() } else { dim_style() };
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
@@ -955,7 +967,13 @@ impl Transcript {
 
     fn push_explored_result(&mut self, call: &ToolCall, duration: Option<Duration>) {
         self.finish_stream();
-        let (text, style) = self.explore_text_style(call, ToolOutcome::Done { content: "" });
+        let (text, style) = self.explore_text_style(
+            call,
+            ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
+        );
         if self.finish_exploration(call, text, style, duration, false, false) {
             return;
         }
@@ -966,7 +984,13 @@ impl Transcript {
         self.finish_stream();
         let started = Instant::now();
         let meta = self.explore_meta(call);
-        let (text, style) = self.explore_text_style(call, ToolOutcome::Done { content: "" });
+        let (text, style) = self.explore_text_style(
+            call,
+            ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
+        );
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
         } else {
