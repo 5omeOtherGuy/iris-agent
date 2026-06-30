@@ -24,7 +24,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -84,12 +84,12 @@ impl Component for PaletteView<'_> {
             .map(|(i, cmd)| {
                 let selected_row = i == self.selected;
                 let name_style = if selected_row {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(crate::ui::palette::CYAN)
                 } else {
                     Style::default()
                 };
                 let description_style = if selected_row {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(crate::ui::palette::CYAN)
                 } else {
                     dim_style()
                 };
@@ -132,6 +132,7 @@ pub(super) fn render_menu_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'s
 mod tests {
     use super::*;
     use crate::ui::slash::Palette;
+    use ratatui::style::Color;
 
     #[test]
     fn focus_target_default_is_editor() {

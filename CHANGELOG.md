@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Design-system upgrade across the TUI pane: gated tool calls now render a
+  `▲ REVIEW` review line (review glyph + label, a `$ ` prompt for shell
+  actions) instead of a bare `approve …`; reasoning ("thinking") renders as a
+  chromeless muted `┊ THINKING` left rail rather than a bordered panel, keeping
+  its `ctrl+o` fold; and `EDIT` diff previews gain a quiet `+added −removed`
+  footer tinted to the diff inks (with a `┊ new file` note for new files).
+- Centralized the state/marker symbol vocabulary in `src/ui/symbols.rs` and the
+  terminal-relative color roles in `src/ui/palette.rs` (adding the `▲` review
+  glyph and a named `interactive`/Cyan role) as the single source of truth,
+  replacing scattered glyph and `Color::Cyan` literals.
 - Refreshed README, roadmap, and feature inventory against merged PR and git
   history through PR #177.
 - Clarified current user-visible TUI behavior: state-specific panel symbols,

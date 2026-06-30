@@ -10,10 +10,12 @@ use crate::nexus::{
 pub(crate) mod login;
 pub(crate) mod markdown;
 pub(crate) mod modal;
+pub(crate) mod palette;
 pub(crate) mod picker;
 pub(crate) mod selector;
 pub(crate) mod slash;
 pub(crate) mod steering;
+pub(crate) mod symbols;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
 

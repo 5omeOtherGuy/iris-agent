@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This document defines the ground-truth visual and structural design language for the Iris TUI main pane.
+This document is the supporting pane-grammar reference for the Iris TUI main pane. **Ground truth is the `iris-tui-design` design-system components (the "web version") and [DESIGN.md](../DESIGN.md).** Where this document and those components disagree, the components win; this document is reconciled to them.
 
-It is intended as a guide for coding agents and future design sessions. It defines the shared pane grammar that all future tool renderers, transcript messages, working indicators, turn dividers, and input editors must follow. Individual tool renderers may have their own detailed specs, but they must remain visually compatible with this document.
+It is intended as a guide for coding agents and future design sessions. It defines the shared pane grammar that all future tool renderers, transcript messages, working indicators, turn dividers, and input editors must follow, in alignment with the design-system components. Individual tool renderers may have their own detailed specs, but they must remain visually compatible with the components and this document.
 
 The goal is a terminal-native coding-agent interface that feels calm, precise, minimal, mechanical, and readable. The visual direction is inspired by Teenage Engineering-style industrial design: restrained grey palette, functional typography, sparse accent color, clear instrument-like panels, and no unnecessary chrome.
 
@@ -482,17 +482,23 @@ Operations that belong inside `EXPLORE`:
 
 Do not create top-level `READ`, `GREP`, `LS`, or `FIND` panels for normal agent workflow.
 
-Instead, render these as body lines inside an `EXPLORE` panel.
+Instead, render each read-side operation as its own body row inside an `EXPLORE` panel. Each op row has columns:
+
+* `verb` — `Read` / `Grep` / `List` / `Find` (the operation).
+* `target` — the path, in ink; or `code` — a search term/pattern, in the cyan interactive role, with a muted `after` scope (`in src/context`).
+* `meta` — a right-aligned, honest count (`142 lines`, `3 matches · 2 files`). Counts are real or omitted; never invented.
+
+A wide scan folds to a capped preview (`▸`) like any foldable panel.
 
 Good:
 
 ```text
-  ┌───────────────────────────────────────────────────────────────────────────────────────┐
-  │ ▾  EXPLORE  tmp                                              ◆ DONE        0.0s       │
-  ├───────────────────────────────────────────────────────────────────────────────────────┤
-  │    Find *.txt in ~/project                                                │
-  │    List ~/project                                                         │
-  └───────────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │ ▾  EXPLORE  src/context                                  ◆ DONE   0.0s │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │    Read  src/context/engine.rs                              142 lines  │
+  │    Grep  "fn emit" in src/context                   3 matches · 2 files │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
 
 Bad:
@@ -511,16 +517,26 @@ Top-level `READ` may only be considered if the product later introduces a user-f
 
 It remains a top-level panel.
 
-The shell panel uses the same framed panel grammar as other tools:
+The shell panel uses the same framed panel grammar as other tools. Body rows are typed, and the panel closes with an exit-status result row:
 
 ```text
-  ┌───────────────────────────────────────────────────────────────────────────────────────┐
-  │ ▾  SHELL                                                   ◆ DONE        0.5s         │
-  ├───────────────────────────────────────────────────────────────────────────────────────┤
-  │    $ command                                                         timeout 120s     │
-  │      output                                                                            │
-  └───────────────────────────────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │ ▾  SHELL  bash ┊ ~/iris-agent                            ◆ DONE   4.1s │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │    $ cargo test context::emit                                          │
+  │      test result: ok. 142 passed; 0 failed                            │
+  │    ◆ exit 0 · 142 passed · 0 failed                                    │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
+
+Body line types:
+
+* `cmd` — the bright `$ command` row (the `$ ` prompt is quiet).
+* `out` — recessive stdout.
+* `err` — stderr, in the danger (red) ink.
+* `note` — a muted aside.
+
+The final **result row** carries the exit status as symbol + label + meta: `◆ exit 0 · <meta>` on success, `■ exit <code> · <meta>` on failure (e.g. `■ exit 101 · 1 error · compile failed`). State is symbol + label, never color alone.
 
 Shell-specific command/output rules should follow the shell output rendering spec, but the shell panel must still obey this pane-level spec:
 
@@ -594,7 +610,22 @@ Examples:
 
 `APPROVAL` panels should be compact. They should not overwhelm the transcript.
 
-Use `▲ REVIEW`, `◆ APPROVED`, or `■ DENIED` depending on state.
+The header carries the decision state — `▲ REVIEW` (pending), `◆ APPROVED`, or `■ DENIED`. The body carries:
+
+* the **action** — the operation being authorized; a shell action is prefixed with a `$ ` prompt (`$ rm -rf build/`).
+* an optional **diff** being authorized (for an edit).
+* a **reason / risk** line (`Removes build/ — 142 files outside tracked sources.`), tinted red when denied.
+* when pending (`▲ REVIEW`), the **decision keys**: `↵ approve · esc deny · a always allow`.
+
+```text
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │ ▾  APPROVAL  shell                                          ▲ REVIEW   │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │    $ rm -rf build/                                                      │
+  │    Removes build/ — 142 files outside tracked sources.                 │
+  │    ↵ approve   esc deny   a always allow                               │
+  └───────────────────────────────────────────────────────────────────────┘
+```
 
 ### WORKING
 
@@ -677,6 +708,44 @@ Rules:
 * Add one blank line before and after the divider.
 * Do not render while the turn is still streaming.
 * Do not duplicate the working indicator.
+
+## Reasoning Trace
+
+Model reasoning ("thinking") is internal, verbose, and secondary — **not** a
+mechanical tool event — so it gets **no chrome**. It renders as a quiet muted
+left rail, never a bordered panel (borders are reserved for tool output and the
+composer).
+
+Canonical form (collapsed by default):
+
+```text
+  ┊ ▸ THINKING
+```
+
+While reasoning is live, the rail header pulses a `●` and shows a `▋` caret with
+elapsed time; once finished it folds, labeled with the generated reasoning-token
+count (`↓tokens`):
+
+```text
+  ┊ ● THINKING  0:08 ▋          (live — pulsing dot + caret)
+
+  ┊ ▾ THINKING                                          ↓2.4k
+  ┊ The diff routes inclusion through the budget, so emit() stops bypassing it.
+  ┊ 142 tests pass; report and stop.
+```
+
+Rules:
+
+* No box. The only chrome is the muted `┊` rail on every line.
+* Label is uppercase `THINKING`; the `▾`/`▸` disclosure arrow carries the fold
+  affordance (no `Thinking...` ellipsis).
+* Live reasoning pulses `●` and shows a `▋` caret; a finished trace folds by
+  default and is labeled with `↓tokens` (the generated reasoning-token count).
+* Body is dim and folds by default; `ctrl+o` reveals the full trace.
+* Reasoning withheld by the provider shows a single placeholder row; the
+  original text is never reconstructed.
+* Place the (folded) trace directly before the assistant reply it precedes.
+* It is the most recessive element in the pane.
 
 ## Composer / Editor
 

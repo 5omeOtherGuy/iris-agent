@@ -22,7 +22,7 @@
 use std::rc::Rc;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -78,7 +78,7 @@ impl Default for MarkdownTheme {
             italic: Style::default().add_modifier(Modifier::ITALIC),
             strikethrough: Style::default().add_modifier(Modifier::CROSSED_OUT),
             quote: dim,
-            inline_code: Style::default().fg(Color::Cyan),
+            inline_code: Style::default().fg(crate::ui::palette::CYAN),
             code_block: dim,
             link: Style::default(),
             link_url: dim,
@@ -791,6 +791,7 @@ fn line_is_empty(line: &Line<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     fn text_of(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

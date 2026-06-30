@@ -48,13 +48,16 @@ components:
 
 # Iris TUI — Design System
 
-> This file is the impeccable-format summary of the Iris terminal visual system.
-> The exhaustive, ground-truth spec is
-> [docs/TUI_DESIGN_LANGUAGE.md](docs/TUI_DESIGN_LANGUAGE.md) — pane grammar, every
-> tool family, golden-test requirements. Where the two ever disagree, the
-> design-language doc wins; update both together. Tokens here are sourced from
-> `src/ui/tui.rs` (`BORDER`, `ORANGE`, `GREEN`, `RED`, `DIFF_ADD_BG`,
-> `DIFF_DEL_BG`) and the modal/markdown styles in `src/ui/`.
+> This file, together with the `iris-tui-design` design-system components (the
+> "web version"), is the **ground-truth** specification of the Iris terminal
+> visual system. [docs/TUI_DESIGN_LANGUAGE.md](docs/TUI_DESIGN_LANGUAGE.md) is the
+> supporting pane-grammar reference (every tool family, golden-test
+> requirements); where it and the design-system components ever disagree, **the
+> design-system components win** — reconcile the pane-grammar doc to them. Color
+> tokens here are sourced
+> from `src/ui/palette.rs` (`BORDER`, `ORANGE`, `CYAN`, `GREEN`, `RED`,
+> `DIFF_ADD_BG`, `DIFF_DEL_BG` — the single source of truth, re-exported into
+> `src/ui/tui.rs`) and the state/marker glyphs from `src/ui/symbols.rs`.
 
 ## Overview
 
@@ -77,7 +80,7 @@ slots so the interface inherits the user's own light or dark terminal theme rath
 than imposing one. The hex values in the frontmatter are dark-mode reference
 approximations only.
 
-Role mapping (source: `src/ui/tui.rs`, `src/ui/modal.rs`, `src/ui/markdown.rs`):
+Role mapping (source: `src/ui/palette.rs`, with `src/ui/symbols.rs` for glyphs):
 
 | Role | ANSI slot | Used for |
 | --- | --- | --- |

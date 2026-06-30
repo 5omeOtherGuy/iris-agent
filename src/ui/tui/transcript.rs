@@ -12,7 +12,9 @@ use crate::ui::{TurnErrorKind, UiEvent};
 
 use super::component::{self, Component};
 use super::pane;
-use super::panel::{PanelHeaderSpec, PanelState, diff_table_rows, panel_state};
+use super::panel::{
+    PanelHeaderSpec, PanelState, diff_counts, diff_footer_row, diff_table_rows, panel_state,
+};
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
 use super::text::ansi_spans;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
@@ -23,12 +25,37 @@ use super::{
     tool_header_style, turn_divider_label,
 };
 
-/// Collapsed-state label for a reasoning panel (mirrors pi-mono's
-/// `hiddenThinkingLabel`).
-const THINKING_LABEL: &str = "Thinking...";
+/// Reasoning-rail label. Uppercase like the other structural labels; the rail
+/// (`┊`) and the `▾`/`▸` disclosure arrow carry the fold affordance, so no
+/// `Thinking...` ellipsis is needed (ThinkingBlock design-system component).
+const THINKING_LABEL: &str = "THINKING";
 /// Placeholder for reasoning the provider withheld; the original text is never
 /// available and is never rendered.
 const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
+
+/// One reasoning-trace row on the muted left rail: the dim `┊ ` rail prefix plus
+/// the line, word-wrapped with the rail carried onto continuation rows, and
+/// hidden until the block is expanded. A plain (chromeless) row — reasoning gets
+/// no box.
+fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
+    line.spans.insert(
+        0,
+        Span::styled(format!("{} ", crate::ui::symbols::SEP), dim_style()),
+    );
+    let text = line_text(&line);
+    TranscriptRow {
+        text,
+        style: dim_style(),
+        // "┊ " — keeps the rail on wrapped continuation lines.
+        continuation_prefix: Some("\u{250a} "),
+        line: Some(line),
+        fold: FoldVis::WhenExpanded,
+        word_wrap: true,
+        background: None,
+        hrule: false,
+        chrome: None,
+    }
+}
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
 /// exclusive, so at most one is ever open. `body_start` is the row index of the
@@ -117,66 +144,42 @@ impl Transcript {
         }
     }
 
-    /// Render a model reasoning ("thinking") trace as a collapsible panel.
-    ///
-    /// The panel is collapsed by default, showing only a `Thinking...` label;
-    /// the existing `ctrl+o` panel toggle (`toggle_latest_panel`) expands it to
-    /// the markdown-rendered trace, styled dim + italic. A `redacted` block has
-    /// no recoverable text, so a placeholder is shown and the original reasoning
-    /// is never rendered. Mirrors pi-mono's hide/show thinking block.
+    /// Render a model reasoning ("thinking") trace as a chromeless, foldable
+    /// left-rail block (the `ThinkingBlock` design-system component): reasoning is
+    /// internal, verbose, and secondary, so it gets **no box** — only a muted
+    /// `┊` rail and a `THINKING` label. Collapsed by default; the existing
+    /// `ctrl+o` panel toggle (`toggle_latest_panel`) reveals the dim,
+    /// markdown-rendered trace. A `redacted` block has no recoverable text, so a
+    /// placeholder is shown and the original reasoning is never rendered.
     fn push_thinking_block(&mut self, text: &str, redacted: bool) {
         // Intentionally do NOT finish the live stream here. Reasoning is emitted
         // at completion, after the answer's text deltas have already streamed
         // into `self.streaming` but before `AssistantTextEnd` commits them.
         // Committing the stream now (via `begin_block`) would render the answer
         // *above* the thinking block and double-commit it when `AssistantTextEnd`
-        // arrives. Adding the panel rows while the stream stays pending keeps the
-        // thinking block above the answer, which is committed afterwards.
+        // arrives. Adding the rail rows while the stream stays pending keeps the
+        // reasoning above the answer, which is committed afterwards.
         self.push_blank();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
-        self.rows.push(TranscriptRow::chrome_with_text(
-            ChromeRow::Header {
-                expanded: false,
-                title: "THINKING",
-                meta: String::new(),
-                right: vec![(THINKING_LABEL.to_string(), dim_style())],
-            },
-            THINKING_LABEL.to_string(),
-            dim_style(),
-        ));
-        // Separator + trace are tagged `WhenExpanded` so the new fold-based
-        // collapse model hides them while collapsed, leaving just the header's
-        // `Thinking...` label; `ctrl+o` (`toggle_latest_panel`) reveals them.
-        self.rows
-            .push(TranscriptRow::chrome(ChromeRow::Separator).with_fold(FoldVis::WhenExpanded));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
+            expanded: false,
+            label: THINKING_LABEL.to_string(),
+        }));
+        // Trace rows are tagged `WhenExpanded` so the fold pass hides them while
+        // collapsed, leaving just the `┊ ▸ THINKING` rail header; `ctrl+o`
+        // (`toggle_latest_panel`) reveals them.
         if redacted {
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: Line::from(Span::styled(REDACTED_THINKING_BODY, dim_style())),
-                        bg: None,
-                    },
-                    REDACTED_THINKING_BODY.to_string(),
-                    dim_style(),
-                )
-                .with_fold(FoldVis::WhenExpanded),
-            );
+            self.rows.push(rail_body_row(Line::from(Span::styled(
+                REDACTED_THINKING_BODY,
+                dim_style(),
+            ))));
         } else {
             let theme = MarkdownTheme::thinking();
             let width = self.markdown_content_width();
             for line in render_markdown_themed(text, &theme, width) {
-                let plain = line_text(&line);
-                self.rows.push(
-                    TranscriptRow::chrome_with_text(
-                        ChromeRow::Body { line, bg: None },
-                        plain,
-                        dim_style(),
-                    )
-                    .with_fold(FoldVis::WhenExpanded),
-                );
+                self.rows.push(rail_body_row(line));
             }
         }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::RailEnd));
     }
 
     pub(super) fn push_turn_divider(
@@ -531,7 +534,12 @@ impl Transcript {
     fn panel_end_from(&self, start: usize) -> usize {
         self.rows[start..]
             .iter()
-            .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)))
+            .position(|row| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Bottom | ChromeRow::RailEnd)
+                )
+            })
             .map_or(start, |offset| start + offset + 1)
     }
 
@@ -1155,12 +1163,17 @@ impl Transcript {
                     title: renderer.title(),
                     meta: renderer.header_meta(&call),
                     right: vec![
-                        ("◇".to_string(), dim_style()),
+                        (crate::ui::symbols::PREVIEW.to_string(), dim_style()),
                         (" PREVIEW     ".to_string(), panel_style()),
                     ],
                 }));
                 self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
                 self.rows.extend(diff_table_rows(&diff));
+                let (added, removed) = diff_counts(&diff);
+                if added + removed > 0 {
+                    let note = diff.contains("--- /dev/null").then_some("new file");
+                    self.rows.push(diff_footer_row(added, removed, note));
+                }
                 self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
             }
             UiEvent::ToolDenied(call) => {
@@ -1297,11 +1310,12 @@ impl Transcript {
     }
 
     pub(super) fn toggle_latest_panel(&mut self) -> bool {
-        let Some(header) = self
-            .rows
-            .iter()
-            .rposition(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Header { .. })))
-        else {
+        let Some(header) = self.rows.iter().rposition(|row| {
+            matches!(
+                row.chrome.as_ref(),
+                Some(ChromeRow::Header { .. } | ChromeRow::RailHeader { .. })
+            )
+        }) else {
             return false;
         };
         // Only foldable panels (those with capped output) respond to ctrl+o;
@@ -1313,11 +1327,12 @@ impl Transcript {
         {
             return false;
         }
-        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[header].chrome.as_mut() {
-            *expanded = !*expanded;
-            true
-        } else {
-            false
+        match self.rows[header].chrome.as_mut() {
+            Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. }) => {
+                *expanded = !*expanded;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1327,7 +1342,9 @@ impl Transcript {
             .iter()
             .rev()
             .find_map(|row| match row.chrome.as_ref() {
-                Some(ChromeRow::Header { expanded, .. }) => Some(!*expanded),
+                Some(
+                    ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. },
+                ) => Some(!*expanded),
                 _ => None,
             })
             .unwrap_or(false)
@@ -1358,7 +1375,10 @@ impl Transcript {
                 // resetting at Top guards against a missing Bottom leaking a
                 // prior panel's collapsed state into the next one.
                 Some(ChromeRow::Top) => expanded = true,
-                Some(ChromeRow::Header { expanded: e, .. }) => expanded = *e,
+                Some(
+                    ChromeRow::Header { expanded: e, .. }
+                    | ChromeRow::RailHeader { expanded: e, .. },
+                ) => expanded = *e,
                 _ => {}
             }
             let skip = match row.fold {
@@ -1369,7 +1389,10 @@ impl Transcript {
             if !skip {
                 visible.push(row);
             }
-            if matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)) {
+            if matches!(
+                row.chrome.as_ref(),
+                Some(ChromeRow::Bottom | ChromeRow::RailEnd)
+            ) {
                 expanded = true;
             }
         }
