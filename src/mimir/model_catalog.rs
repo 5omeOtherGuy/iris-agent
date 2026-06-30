@@ -68,6 +68,7 @@ const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
     (ProviderId::Anthropic, "claude-opus-4-8", "Opus 4.8", "1M"),
     (ProviderId::Anthropic, "claude-opus-4-7", "Opus 4.7", "1M"),
     (ProviderId::Anthropic, "claude-opus-4-6", "Opus 4.6", "1M"),
+    (ProviderId::Anthropic, "claude-sonnet-5", "Sonnet 5", "1M"),
     (
         ProviderId::Anthropic,
         "claude-sonnet-4-6",
@@ -277,6 +278,7 @@ mod tests {
         );
         assert_eq!(display_name("antigravity/gemini-3.1-pro"), "Gemini 3.1 Pro");
         assert_eq!(display_name("anthropic/claude-opus-4-7"), "Opus 4.7");
+        assert_eq!(display_name("anthropic/claude-sonnet-5"), "Sonnet 5");
         assert_eq!(display_name("anthropic/claude-haiku-4-5"), "Haiku 4.5");
         // Not in the catalog -> show the bare model id.
         assert_eq!(display_name("openai-codex/gpt-9-mystery"), "gpt-9-mystery");
@@ -289,6 +291,7 @@ mod tests {
         assert_eq!(ctx_label("openai-codex/gpt-5.4"), Some("300k"));
         assert_eq!(ctx_label("openai-codex/gpt-5.3-codex-spark"), Some("300k"));
         assert_eq!(ctx_label("antigravity/gemini-3.1-pro"), Some("1M"));
+        assert_eq!(ctx_label("anthropic/claude-sonnet-5"), Some("1M"));
         assert_eq!(ctx_label("anthropic/claude-sonnet-4-6"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-opus-4-8"), Some("1M"));

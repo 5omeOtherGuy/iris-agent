@@ -1806,8 +1806,28 @@ data: {\"type\":\"message_stop\"}\n\n";
         let messages = [Message::user("hi")];
         let tools = Tools::new(Vec::new());
 
-        // Opus 4.8 is adaptive: effort via output_config, adaptive thinking, and
+        // Sonnet 5 is adaptive: effort via output_config, adaptive thinking, and
         // max_tokens left at the base (no budget bump, no budget_tokens).
+        let sonnet = build_anthropic_request(
+            "claude-sonnet-5",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
+            &ContextManagement::default(),
+        );
+        assert_eq!(sonnet["model"], json!("claude-sonnet-5"));
+        assert_eq!(
+            sonnet["thinking"],
+            json!({ "type": "adaptive", "display": "summarized" })
+        );
+        assert_eq!(sonnet["output_config"], json!({ "effort": "xhigh" }));
+        const SONNET_5_CAP: u32 = 128000;
+        assert_eq!(sonnet["max_tokens"], json!(SONNET_5_CAP));
+        assert!(sonnet["thinking"].get("budget_tokens").is_none());
+
+        // Opus 4.8 is adaptive too.
         let body = build_anthropic_request(
             "claude-opus-4-8",
             "P",

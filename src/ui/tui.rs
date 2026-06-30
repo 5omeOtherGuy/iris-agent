@@ -2962,7 +2962,7 @@ mod tests {
         )));
 
         let rendered = rendered_text(&mut screen, 80, 16);
-        assert!(rendered.contains("Haiku 4.5"), "{rendered}");
+        assert!(rendered.contains("Sonnet 5"), "{rendered}");
         assert!(rendered.contains("xhigh effort"), "{rendered}");
         assert!(rendered.contains("Reasoning"), "{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");

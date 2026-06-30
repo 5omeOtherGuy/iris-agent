@@ -17,11 +17,12 @@
 //!   Responses `reasoning.effort` enum accepts `minimal..xhigh`).
 //! - anthropic: every Claude Code subscription model in
 //!   [`crate::mimir::anthropic_models`] accepts the full iris set off..`xhigh`.
-//!   Adaptive models (Opus 4.7/4.8, Fable 5) upshift each level onto Anthropic's
-//!   `low|medium|high|xhigh|max` effort scale (iris `xhigh` -> `max`); manual-
-//!   budget models (Haiku 4.5, Sonnet 4.6, Opus 4.6) map each level to a thinking
-//!   token budget and so must not reject `xhigh`. Unknown/older non-subscription
-//!   ids top out at `high` (`xhigh` clamps to `high`).
+//!   Adaptive models (Sonnet 5, Opus 4.7/4.8, Fable 5) upshift each level onto
+//!   Anthropic's `low|medium|high|xhigh|max` effort scale (iris `xhigh` ->
+//!   `max`); manual-budget models (Haiku 4.5, Sonnet 4.6, Opus 4.6) map each
+//!   level to a thinking token budget and so must not reject `xhigh`.
+//!   Unknown/older non-subscription ids top out at `high` (`xhigh` clamps to
+//!   `high`).
 //! - antigravity (gemini-3.5-flash): `off..high`; `xhigh` clamps to `high`
 //!   (gemini-pi `FLASH_THINKING = {minimal,low,medium,high}`, `xhigh -> null`).
 
@@ -39,8 +40,8 @@ pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [R
     match provider {
         // gpt-5.5 accepts the full effort range, including xhigh.
         ProviderId::OpenAiCodex => &[Off, Minimal, Low, Medium, High, XHigh],
-        // Anthropic depends on the model: adaptive-thinking Opus 4.6/4.7/4.8
-        // accept xhigh; Sonnet 4.6 and older budget models top out at high.
+        // Anthropic depends on the model: the subscription matrix accepts xhigh;
+        // unknown/older budget models top out at high.
         ProviderId::Anthropic => anthropic_supported_levels(model),
         // gemini-3.5-flash (Flash tier) tops out at high; xhigh down-clamps.
         ProviderId::Antigravity => &[Off, Minimal, Low, Medium, High],
@@ -48,8 +49,9 @@ pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [R
 }
 
 /// Anthropic supported levels, keyed by model. Every Claude Code subscription
-/// model (manual-budget Haiku 4.5 / Sonnet 4.6 / Opus 4.6 and adaptive Opus
-/// 4.7/4.8 / Fable 5) accepts the full iris set off..`xhigh`; the provider maps
+/// model (manual-budget Haiku 4.5 / Sonnet 4.6 / Opus 4.6 and adaptive Sonnet 5
+/// / Opus 4.7/4.8 / Fable 5) accepts the full iris set off..`xhigh`; the provider
+/// maps
 /// each level into the model's thinking encoding (`xhigh` -> Anthropic `max`
 /// effort, or the `xhigh` 32768 budget). Unknown/older non-subscription ids stay
 /// conservative and top out at `high` (`xhigh` clamps to `high`).
@@ -200,10 +202,10 @@ mod tests {
 
     #[test]
     fn anthropic_xhigh_is_model_specific() {
-        // The shipped adaptive models (Opus 4.6/4.7/4.8, Sonnet 4.6) accept xhigh
-        // natively (it maps up to Anthropic's `max`/`xhigh` effort): validate
-        // passes, clamp is identity.
+        // The shipped subscription models accept xhigh natively (it maps up to
+        // Anthropic's `max`/`xhigh` effort): validate passes, clamp is identity.
         for model in [
+            "claude-sonnet-5",
             "claude-opus-4-7",
             "claude-opus-4-8",
             "claude-opus-4-6",
