@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context-management opt-ins.
 - Added docs for the opt-in `scripts/tui-live.sh` manual live-rendering harness
   used when changing pane rendering.
-- Added ADR-0022 for default-off provider-native prompt-cache and
-  context-management integration.
+- Added ADR-0022 for default-short provider-native prompt-cache and
+  default-off context-management integration.
 
 ### Changed
 

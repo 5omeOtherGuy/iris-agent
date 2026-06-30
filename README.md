@@ -98,6 +98,9 @@ Recognized settings keys are `defaultProvider`, `defaultModel`, `baseUrl`,
 `contextTokenBudget`, `defaultReasoning`, `promptCacheRetention`,
 `anthropicContextManagement`, and `enabledModels`.
 
+If unset, `promptCacheRetention` defaults to `short`; set it to `none` to omit
+provider-native prompt-cache hints.
+
 Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
 `defaultModel`, `defaultReasoning`, and `contextTokenBudget`; a cloned repo
 cannot choose your provider, scoped model cycle, provider-side cache retention,

@@ -97,7 +97,7 @@
   Ctrl+P model cycling from global/user config only.
   [Partial]
 - **Provider-native prompt cache controls** — global-only `promptCacheRetention`
-  supports `none` (default), `short`, and `long`. OpenAI receives
+  supports `none`, `short` (default), and `long`. OpenAI receives
   `prompt_cache_key` and optional 24h retention; Anthropic receives
   `cache_control` markers with optional 1h TTL. Iris records provider usage/cache
   metadata and warns only on proven stable-prefix breaks, not ordinary cold
@@ -206,9 +206,10 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   and confidence. [Planned]
 - **Handle lifecycle** — session-scoped retention with ref-counting or
   pin-on-reference. [Planned]
-- **Prompt segment caching** — default-off provider-native cache hints for stable
-  prompt segments where providers expose public controls; local KV caching and
-  private/provider-specific continuity tricks remain deferred. [Partial]
+- **Prompt segment caching** — default-short provider-native cache hints for
+  stable prompt segments where providers expose public controls; local KV
+  caching and private/provider-specific continuity tricks remain deferred.
+  [Partial]
 - **Cache-aware prompt layout** — providers receive stable prompt/tool prefixes,
   prompt-cache opt-ins, provider usage/cache metadata, and proven cache-break
   diagnostics. More explicit layout planning remains planned. [Partial]

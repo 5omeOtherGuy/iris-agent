@@ -22,7 +22,7 @@
 | [0019](0019-formalize-correlation-ids.md) | Formalize correlation IDs | accepted | 2026-06-21 |
 | [0020](0020-expand-typed-runtime-events.md) | Expand typed runtime events | accepted | 2026-06-21 |
 | [0021](0021-structured-tool-result-contracts.md) | Define structured tool-result contracts without a schema platform | accepted | 2026-06-21 |
-| [0022](0022-use-default-off-provider-native-cache-and-context-management.md) | Use default-off provider-native cache and context-management controls | accepted | 2026-06-22 |
+| [0022](0022-use-default-short-provider-native-cache-and-context-management.md) | Use default-short provider-native cache and default-off context-management controls | accepted | 2026-06-22 |
 | [0023](0023-project-tool-declarations-per-provider-and-prefer-native-tools.md) | Project tool declarations per provider and prefer native tools | accepted | 2026-06-21 |
 | [0024](0024-introduce-tui-component-container-overlay-focus-abstraction.md) | Introduce a reusable TUI Component/Container/overlay/focus abstraction | accepted | 2026-06-26 |
 | [0025](0025-expose-stored-reasoning-as-a-display-event.md) | Expose stored reasoning as a display event | accepted | 2026-06-26 |

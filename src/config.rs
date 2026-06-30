@@ -56,9 +56,9 @@ pub(crate) struct Settings {
     /// [`Settings::context_token_budget`]).
     pub(crate) default_reasoning: Option<String>,
     /// Prompt cache retention (`none|short|long`). Global-only because a cloned
-    /// project must not silently increase how long provider-side prompt material
-    /// may live, or add cache-write cost, without the user opting in. Parsed by
-    /// `mimir::selection`; absent -> `none` (off, byte-identical request).
+    /// project must not silently change provider-side prompt-cache behavior.
+    /// Parsed by `mimir::selection`; absent -> the selection-layer default
+    /// (`short`).
     pub(crate) prompt_cache_retention: Option<String>,
     /// Anthropic server-side context-management opt-in
     /// (`context_management.edits`). Stored as a raw JSON object and parsed into

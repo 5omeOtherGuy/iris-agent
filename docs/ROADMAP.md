@@ -9,8 +9,8 @@
 > reasoning panels, fragment-based system-prompt assembly, provider/model/
 > reasoning/context/cache settings, linear session resume, JSONL session
 > persistence, handle-backed large tool outputs, token estimates, turn-boundary
-> auto-compaction, and default-off provider-native prompt-cache/context-
-> management controls.
+> auto-compaction, default-short provider-native prompt-cache controls, and
+> default-off context-management controls.
 > Nexus runs a tokio async loop with turn-level cancellation: the provider is an
 > async stream raced against cancellation, tools are async with child tokens,
 > concurrency-safe tools run in parallel while everything else stays exclusive,
@@ -102,7 +102,7 @@ Implemented today:
 - Runtime `/model` and `/reasoning` switching at safe turn boundaries, with TUI
   provider/model/effort pickers, scoped model cycling, `/settings`, `/login`,
   and `/logout`.
-- Default-off provider-native prompt-cache settings and diagnostics: OpenAI
+- Default-short provider-native prompt-cache settings and diagnostics: OpenAI
   prompt-cache keys/24h retention, Anthropic `cache_control`, provider
   usage/cache metadata, and cache-break warnings only when the stable prefix
   provably changed.
