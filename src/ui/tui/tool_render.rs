@@ -33,12 +33,15 @@ use crate::nexus::ToolCall;
 use crate::tool_display::{
     bash_timeout_secs, command_display, display_path, exploration_summary, run_target, summarize,
 };
+use crate::ui::symbols;
 
 use super::rows::{ChromeRow, FoldVis, TranscriptRow};
 use super::shell_command::{self, ShellCommand};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::wrap::{clamp_output_line, display_width, truncate_chars, wrapped_row_estimate};
-use super::{MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, dim_style, err_style, panel_style};
+use super::{
+    MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, dim_style, err_style, ok_style, panel_style,
+};
 
 /// The panel family a tool renders as. Selects the stateful dispatch path in
 /// [`super::transcript`] (grouped EXPLORE, streaming SHELL exec cell, or a
@@ -67,7 +70,16 @@ pub(super) enum ToolOutcome<'a> {
     /// Live cell: `streamed` is the bounded output tail so far (may be empty).
     Running { streamed: &'a str },
     /// Finalized success. `content` is the authoritative output (may be empty).
-    Done { content: &'a str },
+    /// `exit_code` is the process's exit status when one is known (e.g. a
+    /// shell command's exit code). SHELL is the only renderer that reads it
+    /// (for its closing result row); `None` means no status was reported at
+    /// all (a cancelled run, a timeout, or an exited session shell, per
+    /// `src/tools/bash/mod.rs`) and the row is omitted rather than guessed.
+    /// Other renderers ignore this field.
+    Done {
+        content: &'a str,
+        exit_code: Option<i32>,
+    },
     /// Failure. `streamed` is partial output captured before the error.
     Error { message: &'a str, streamed: &'a str },
     /// Cancelled. `streamed` is whatever streamed before cancellation.
@@ -168,14 +180,14 @@ impl ToolRenderer for ExploreRenderer {
             ToolOutcome::Error { message, .. } => (format!("error: {message}"), err_style()),
             _ => (exploration_summary(call), dim_style()),
         };
-        vec![explore_row(text, style)]
+        vec![styled_row(text, style)]
     }
 }
 
-/// Build the single EXPLORE body row exactly as the transcript grouping path
-/// stores it (a `Body` chrome row carrying both the styled line and its plain
-/// text mirror).
-fn explore_row(text: String, style: Style) -> TranscriptRow {
+/// Build a single-row, single-style panel body line carrying both the styled
+/// line and its plain text mirror: the EXPLORE grouped summary row, the SHELL
+/// exit-status row, and the panic-fallback error row.
+fn styled_row(text: String, style: Style) -> TranscriptRow {
     TranscriptRow::chrome_with_text(
         ChromeRow::Body {
             line: Line::from(Span::styled(text.clone(), style)),
@@ -228,8 +240,17 @@ impl ToolRenderer for ShellRenderer {
                 }
                 body.line("$ \u{2588}", panel_style());
             }
-            ToolOutcome::Done { content } => {
+            ToolOutcome::Done { content, exit_code } => {
                 body.output(content);
+                // `None` is not "an unknown but presumably fine" code: the bash
+                // tool only omits it for a cancelled run, a timeout, or a
+                // session shell that exited (`src/tools/bash/mod.rs`), each of
+                // which already says so in `content`. Asserting `exit 0` here
+                // would fabricate a status the run never reported, so the row
+                // is omitted rather than guessed.
+                if let Some(code) = exit_code {
+                    body.push(shell_result_row(*code));
+                }
             }
             ToolOutcome::Error { message, streamed } => {
                 if !streamed.is_empty() {
@@ -247,13 +268,31 @@ impl ToolRenderer for ShellRenderer {
     }
 }
 
+/// The SHELL panel's closing exit-status row: `◆ exit 0` on success, `■ exit
+/// <code>` on failure, glyph and label sharing one color (mirrors the
+/// design-system `ShellOutput` `ResultRow` and Iris's own EDIT diff footer).
+/// Always `FoldVis::Always`, by design: unlike the web reference (which hides
+/// its `ResultRow` while collapsed), the row stays visible even in a folded
+/// SHELL panel's capped preview, since exit status is exactly the kind of
+/// thing a glance at a collapsed panel should still answer.
+fn shell_result_row(code: i32) -> TranscriptRow {
+    let failed = code != 0;
+    let symbol = if failed {
+        symbols::ERROR
+    } else {
+        symbols::DONE
+    };
+    let style = if failed { err_style() } else { ok_style() };
+    styled_row(format!("{symbol} exit {code}"), style)
+}
+
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
 /// header title).
 fn generic_body(ctx: &RenderCtx, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
     let mut body = PanelBody::new(ctx.width);
     match outcome {
         ToolOutcome::Running { .. } => body.line("running\u{2026}", dim_style()),
-        ToolOutcome::Done { content } => body.output(content),
+        ToolOutcome::Done { content, .. } => body.output(content),
         ToolOutcome::Error { message, .. } => {
             body.line(&format!("error: {message}"), err_style());
         }
@@ -329,7 +368,7 @@ pub(super) fn render_body(
         Ok(rows) => rows,
         Err(_) => match catch_unwind(AssertUnwindSafe(|| GENERIC.body(ctx, call, outcome))) {
             Ok(rows) => rows,
-            Err(_) => vec![explore_row("(render error)".to_string(), err_style())],
+            Err(_) => vec![styled_row("(render error)".to_string(), err_style())],
         },
     }
 }
@@ -363,6 +402,11 @@ impl PanelBody {
 
     fn into_rows(self) -> Vec<TranscriptRow> {
         self.rows
+    }
+
+    /// Push a pre-built row (e.g. the SHELL exit-status row) verbatim.
+    fn push(&mut self, row: TranscriptRow) {
+        self.rows.push(row);
     }
 
     /// Render the structured command region: the `$` prompt row (carrying the
@@ -765,7 +809,10 @@ mod tests {
         let done = renderer.body(
             &ctx,
             &call("grep", json!({ "pattern": "needle", "path": "src" })),
-            &ToolOutcome::Done { content: "" },
+            &ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
         );
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].text, "Search needle in src");
@@ -790,7 +837,10 @@ mod tests {
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
-            &ToolOutcome::Done { content: "ok" },
+            &ToolOutcome::Done {
+                content: "ok",
+                exit_code: None,
+            },
         );
         let cmd = &rows[0];
         assert!(cmd.text.starts_with("$ echo hi"), "{}", cmd.text);
@@ -818,7 +868,10 @@ mod tests {
             let rows = renderer.body(
                 &ctx,
                 &call("bash", args),
-                &ToolOutcome::Done { content: "" },
+                &ToolOutcome::Done {
+                    content: "",
+                    exit_code: None,
+                },
             );
             assert_eq!(rows[0].text, "$ echo hi", "timeout field must be omitted");
         }
@@ -833,7 +886,10 @@ mod tests {
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
-            &ToolOutcome::Done { content: "" },
+            &ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
         );
         // The command keeps its own row (untruncated here), timeout drops below.
         assert_eq!(rows[0].text, format!("$ {command}"));
@@ -849,7 +905,10 @@ mod tests {
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
-            &ToolOutcome::Done { content: "" },
+            &ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
         );
         assert!(
             rows[0].text.starts_with("$ cd \"/abs/path\""),
@@ -868,7 +927,10 @@ mod tests {
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
-            &ToolOutcome::Done { content: "" },
+            &ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
         );
         let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
         assert!(
@@ -898,7 +960,10 @@ mod tests {
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
-            &ToolOutcome::Done { content: "" },
+            &ToolOutcome::Done {
+                content: "",
+                exit_code: None,
+            },
         );
         assert!(
             rows.iter()
@@ -961,6 +1026,119 @@ mod tests {
     }
 
     #[test]
+    fn shell_done_appends_success_exit_status_row() {
+        let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "echo hi" })),
+            &ToolOutcome::Done {
+                content: "hi",
+                exit_code: Some(0),
+            },
+        );
+        let last = rows.last().expect("expected a result row");
+        assert_eq!(last.text, "\u{25c6} exit 0", "{}", last.text);
+        assert_eq!(last.style.fg, ok_style().fg);
+    }
+
+    #[test]
+    fn shell_done_with_nonzero_exit_renders_red_error_result_row() {
+        let renderer = resolve(&call("bash", json!({ "command": "false" })));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "false" })),
+            &ToolOutcome::Done {
+                content: "",
+                exit_code: Some(1),
+            },
+        );
+        let last = rows.last().expect("expected a result row");
+        assert_eq!(last.text, "\u{25a0} exit 1", "{}", last.text);
+        assert_eq!(last.style.fg, err_style().fg);
+    }
+
+    #[test]
+    fn shell_done_with_unknown_exit_code_omits_result_row() {
+        // `None` means the shell reported no status at all -- a cancelled run,
+        // a timeout, or an exited session shell (`src/tools/bash/mod.rs`),
+        // each of which already says so in `content`. Asserting `exit 0` would
+        // fabricate a status the run never reported, so no row is shown.
+        let renderer = resolve(&call("bash", json!({ "command": "sleep 30" })));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "sleep 30" })),
+            &ToolOutcome::Done {
+                content: "Command cancelled by user",
+                exit_code: None,
+            },
+        );
+        assert!(
+            !rows.iter().any(|r| r.text.contains("exit")),
+            "{:?}",
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generic_done_outcome_has_no_exit_status_row() {
+        // The exit-status row is SHELL-specific; EDIT/generic panels never show
+        // a fabricated exit code.
+        let renderer = resolve(&call("zonk", json!({})));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("zonk", json!({})),
+            &ToolOutcome::Done {
+                content: "ok",
+                exit_code: Some(0),
+            },
+        );
+        assert!(
+            !rows.iter().any(|r| r.text.contains("exit")),
+            "{:?}",
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shell_result_row_survives_output_folding_in_both_collapsed_and_expanded_sets() {
+        // The result row is `FoldVis::Always` by design (unlike the web
+        // reference's `ResultRow`, which hides while collapsed): exit status
+        // should stay visible even when a long command's output is folded to a
+        // capped preview.
+        let content = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let renderer = resolve(&call("bash", json!({ "command": "seq 200" })));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "seq 200" })),
+            &ToolOutcome::Done {
+                content: &content,
+                exit_code: Some(0),
+            },
+        );
+        let result_rows: Vec<_> = rows.iter().filter(|r| r.text.contains("exit 0")).collect();
+        assert_eq!(
+            result_rows.len(),
+            1,
+            "expected exactly one result row, got {:?}",
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            result_rows[0].fold == FoldVis::Always,
+            "{}",
+            result_rows[0].text
+        );
+        assert_eq!(rows.last().unwrap().text, "\u{25c6} exit 0");
+    }
+
+    #[test]
     fn generic_done_output_capped_into_collapsed_preview_and_expanded_full() {
         // Far more logical lines than the physical-row budget forces a foldable
         // body: a capped preview (WhenCollapsed) with a hidden marker, plus the
@@ -974,7 +1152,10 @@ mod tests {
         let rows = renderer.body(
             &ctx,
             &call("zonk", json!({})),
-            &ToolOutcome::Done { content: &content },
+            &ToolOutcome::Done {
+                content: &content,
+                exit_code: None,
+            },
         );
         // The collapsed-visible set (Always + WhenCollapsed) stays within the
         // physical-row budget plus the single hidden-affordance row.
@@ -1012,6 +1193,7 @@ mod tests {
             &call("zonk", json!({})),
             &ToolOutcome::Done {
                 content: "\x1b[31mred\x1b[0m",
+                exit_code: None,
             },
         );
         let Some(ChromeRow::Body { line, .. }) = rows[0].chrome.as_ref() else {
@@ -1059,6 +1241,7 @@ mod tests {
             &c,
             &ToolOutcome::Done {
                 content: "hello world",
+                exit_code: None,
             },
         );
         std::panic::set_hook(prev);
