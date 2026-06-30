@@ -1,4 +1,4 @@
-# ADR-0022: Use default-off provider-native cache and context-management controls
+# ADR-0022: Use default-short provider-native cache and default-off context-management controls
 
 **Date**: 2026-06-22
 **Status**: accepted
@@ -19,11 +19,12 @@ repo-local config opt users into longer provider-side retention.
 
 ## Decision
 
-Iris supports provider-native prompt cache and context-management features only
-through explicit, default-off, global/user settings.
+Iris enables short-lived provider-native prompt-cache hints by default and keeps
+provider-native context-management features explicit, default-off, and
+global/user-only.
 
 - `promptCacheRetention` is global-only and parses as `none`, `short`, or
-  `long`; absent means `none`. OpenAI receives `prompt_cache_key` when caching is
+  `long`; absent means `short`. OpenAI receives `prompt_cache_key` when caching is
   enabled and `prompt_cache_retention: "24h"` only for `long`. Anthropic receives
   `cache_control: { type: "ephemeral" }` for `short` and adds `ttl: "1h"` for
   `long`.
@@ -33,7 +34,7 @@ through explicit, default-off, global/user settings.
   safely in the session store.
 - Mimir owns all provider-specific request fields and diagnostics. Nexus carries
   only provider-neutral completion usage/cache metadata and typed UI events.
-- Cache diagnostics distinguish request-side opt-in from provider-reported cache
+- Cache diagnostics distinguish the request-side cache setting from provider-reported cache
   hits. A zero cache-read count is not treated as a cache break. Iris warns only
   when it can prove the stable prompt prefix changed between cache-enabled turns
   (instructions/tools changed, history shrank, or an earlier message diverged).
@@ -44,14 +45,14 @@ through explicit, default-off, global/user settings.
 
 ## Alternatives Considered
 
-### Enable provider cache hints automatically
+### Keep provider cache hints default-off
 
-- **Pros**: More users may see cache hits without configuration.
-- **Cons**: Changes request shape, retention behavior, and possibly cost/privacy
-  without opt-in; cache behavior differs by provider.
-- **Why not**: Token efficiency must not come from hidden provider-side retention
-  or billing changes. Default-off preserves byte-identical requests unless the
-  user opts in.
+- **Pros**: Preserves byte-identical request behavior unless the user opts in.
+- **Cons**: Repeated tool loops can replay large stable prefixes uncached and
+  consume subscription quota far faster than comparable cached harnesses.
+- **Why not**: Short-lived cache hints are the safer default for Iris's coding
+  workload. Users who need byte-identical no-cache requests can set
+  `promptCacheRetention` to `none` globally.
 
 ### Let project config choose cache/context-management settings
 
@@ -83,7 +84,7 @@ through explicit, default-off, global/user settings.
 
 ### Positive
 
-- Existing users keep the same request behavior until they opt in.
+- Default sessions reuse stable prefixes through short-lived provider cache hints.
 - Cache and context controls sit at the provider boundary that understands their
   wire formats and caveats.
 - Repo-local config cannot silently expand prompt retention or enable server-side
@@ -92,7 +93,7 @@ through explicit, default-off, global/user settings.
 
 ### Negative
 
-- Users must opt in manually before seeing provider cache benefits.
+- Users must opt out manually when they need provider request cache hints omitted.
 - `promptCacheRetention` is a coarse cross-provider knob; exact cache semantics
   still differ between OpenAI and Anthropic.
 - Anthropic compact remains unavailable until the transcript/replay contract is
@@ -103,7 +104,7 @@ through explicit, default-off, global/user settings.
 - Provider APIs may change cache or context-management field names/semantics;
   mitigate with focused provider request-construction tests.
 - A future mode/subagent system may need per-worker cache policies; keep the same
-  default-off/global-owner invariant and pass resolved policy into each worker
-  rather than reading repo config directly.
+  global-owner invariant and pass resolved policy into each worker rather than
+  reading repo config directly.
 - Provider usage metadata may be incomplete or absent; UI and benchmarks must
   treat missing usage as unknown, not zero savings.

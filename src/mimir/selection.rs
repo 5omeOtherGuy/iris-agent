@@ -185,12 +185,12 @@ impl ReasoningEffort {
     }
 }
 
-/// Prompt-cache retention preference shared by provider adapters. `Short` opts
-/// into the provider default ephemeral cache (Anthropic 5-minute `cache_control`
-/// / OpenAI `prompt_cache_key`); `Long` opts into the provider's longer-lived
-/// cache marker (Anthropic `ttl: "1h"` / OpenAI `prompt_cache_retention:
-/// "24h"`); `None` (the default) disables every provider request cache hint so
-/// the request stays byte-identical to pre-cache behavior unless a user opts in.
+/// Prompt-cache retention preference shared by provider adapters. `Short` (the
+/// default) opts into the provider default ephemeral cache (Anthropic 5-minute
+/// `cache_control` / OpenAI `prompt_cache_key`); `Long` opts into the provider's
+/// longer-lived cache marker (Anthropic `ttl: "1h"` / OpenAI
+/// `prompt_cache_retention: "24h"`); `None` disables every provider request
+/// cache hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptCacheRetention {
     None,
@@ -199,11 +199,10 @@ pub(crate) enum PromptCacheRetention {
 }
 
 impl PromptCacheRetention {
-    /// Default cache retention: `None` (off). Prompt caching is a public
-    /// server-side opt-in, so the default emits no cache request fields and
-    /// preserves existing request behavior and cost for users who did not
-    /// enable it.
-    pub(crate) const DEFAULT: PromptCacheRetention = PromptCacheRetention::None;
+    /// Default cache retention: `Short`, matching minimalcc-pi's Claude
+    /// subscription default and avoiding repeated uncached stable prefixes in
+    /// multi-tool turns.
+    pub(crate) const DEFAULT: PromptCacheRetention = PromptCacheRetention::Short;
 
     #[cfg(test)]
     pub(crate) const ALL: [PromptCacheRetention; 3] = [
@@ -328,7 +327,7 @@ impl ModelSelection {
     /// - base_url: provider env (`IRIS_CODEX_BASE_URL` only today) ->
     ///   `settings.base_url` -> per-provider default
     /// - reasoning: `settings.default_reasoning` -> else `None`
-    /// - cache retention: `settings.prompt_cache_retention` -> `none` (off)
+    /// - cache retention: `settings.prompt_cache_retention` -> `short`
     /// - context management: `settings.anthropic_context_management` -> empty
     ///
     /// `settings.base_url` is already global-only (the security invariant is
@@ -445,7 +444,7 @@ mod tests {
         assert_eq!(resolved.model, "gpt-5.5");
         assert_eq!(resolved.base_url, "https://chatgpt.com/backend-api");
         assert_eq!(resolved.reasoning, None);
-        assert_eq!(resolved.cache_retention, PromptCacheRetention::None);
+        assert_eq!(resolved.cache_retention, PromptCacheRetention::Short);
         assert!(!resolved.context_management.is_enabled());
 
         // Settings values win over defaults.
@@ -556,11 +555,25 @@ mod tests {
     #[test]
     fn cache_retention_parses_defaults_and_rejects_unknown_values() {
         let mut s = settings(None, None, None, None);
-        // Default is off: prompt caching is opt-in, so an unconfigured session
-        // emits no cache request fields.
+        // Default is short-lived prompt caching so stable prefixes are cacheable
+        // unless the user explicitly opts out.
         assert_eq!(
             ModelSelection::resolve(&s).unwrap().cache_retention,
-            PromptCacheRetention::None
+            PromptCacheRetention::Short
+        );
+
+        // Existing users who update with a settings file that lacks
+        // `promptCacheRetention` also get the new default.
+        let mut existing = settings(
+            Some("anthropic"),
+            Some("claude-opus-4-8"),
+            None,
+            Some("low"),
+        );
+        existing.prompt_cache_retention = None;
+        assert_eq!(
+            ModelSelection::resolve(&existing).unwrap().cache_retention,
+            PromptCacheRetention::Short
         );
 
         s.prompt_cache_retention = Some("short".to_string());

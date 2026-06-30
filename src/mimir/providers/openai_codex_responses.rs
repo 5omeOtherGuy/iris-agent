@@ -349,7 +349,7 @@ impl OpenAiCodexResponsesProvider {
 
     fn record_usage(&self, usage: &ProviderUsage) {
         // Surface usage and the two distinct cache facts the diagnostics must
-        // separate: whether Iris SENT a cacheable request (request-side opt-in)
+        // separate: whether Iris SENT a cacheable request (cache setting enabled)
         // vs whether the provider REPORTED a cache hit (cache_read > 0).
         tracing::info!(
             provider = %usage.provider,
