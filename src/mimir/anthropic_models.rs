@@ -23,8 +23,8 @@ pub(crate) enum ThinkingMode {
     /// `1024 <= budget_tokens < max_tokens`). Haiku 4.5, Sonnet 4.6, Opus 4.6.
     ManualBudget,
     /// Adaptive: `thinking: { type: "adaptive", display: "summarized" }` plus
-    /// `output_config.effort`; the API allocates reasoning dynamically. Opus
-    /// 4.7/4.8 and Fable 5.
+    /// `output_config.effort`; the API allocates reasoning dynamically. Sonnet
+    /// 5, Opus 4.7/4.8, and Fable 5.
     Adaptive,
 }
 
@@ -54,6 +54,12 @@ pub(crate) const MODELS: &[AnthropicModel] = &[
         ui_id: "claude-haiku-4-5",
         output_cap: 64000,
         thinking: ManualBudget,
+        refusal_fallback: None,
+    },
+    AnthropicModel {
+        ui_id: "claude-sonnet-5",
+        output_cap: 128000,
+        thinking: Adaptive,
         refusal_fallback: None,
     },
     AnthropicModel {
@@ -111,12 +117,18 @@ mod tests {
             assert_eq!(by_id(id).thinking, ManualBudget, "{id}");
         }
         // Adaptive tier.
-        for id in ["claude-opus-4-7", "claude-opus-4-8", "claude-fable-5"] {
+        for id in [
+            "claude-sonnet-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-fable-5",
+        ] {
             assert_eq!(by_id(id).thinking, Adaptive, "{id}");
         }
-        // Output caps: 64k for Haiku/Sonnet, 128k for the Opus/Fable tier.
+        // Output caps: 64k for Haiku/Sonnet 4.6, 128k for the Sonnet 5/Opus/Fable tier.
         assert_eq!(by_id("claude-haiku-4-5").output_cap, 64000);
         assert_eq!(by_id("claude-sonnet-4-6").output_cap, 64000);
+        assert_eq!(by_id("claude-sonnet-5").output_cap, 128000);
         assert_eq!(by_id("claude-opus-4-6").output_cap, 128000);
         assert_eq!(by_id("claude-opus-4-8").output_cap, 128000);
     }
