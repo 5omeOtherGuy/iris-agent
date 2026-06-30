@@ -162,7 +162,7 @@ fn dim() -> Style {
 }
 
 fn accent() -> Style {
-    Style::default().fg(Color::Cyan)
+    Style::default().fg(crate::ui::palette::CYAN)
 }
 
 fn muted() -> Style {

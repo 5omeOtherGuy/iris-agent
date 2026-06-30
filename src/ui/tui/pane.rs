@@ -85,7 +85,10 @@ fn assistant_row(mut line: Line<'static>, first: bool) -> TranscriptRow {
     if first {
         // The assistant marker is recessive transcript chrome, not a state dot:
         // muted, never the active/live accent (docs/TUI_DESIGN_LANGUAGE.md §4).
-        line.spans.insert(0, Span::styled("› ", dim_style()));
+        line.spans.insert(
+            0,
+            Span::styled(format!("{} ", crate::ui::symbols::ASSISTANT), dim_style()),
+        );
     } else {
         line.spans
             .insert(0, Span::styled(ASSISTANT_TEXT_PREFIX, Style::default()));

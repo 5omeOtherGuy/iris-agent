@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use super::component::Component;
 use super::panel::{
     apply_width_bg, inset_rule_line, panel_body_line, panel_body_lines, panel_header_line,
-    panel_rule_line,
+    panel_rule_line, rail_header_line,
 };
 use super::wrap::{
     display_width, pad_line_left, pad_line_right, push_wrapped_line, push_wrapped_line_wordwise,
@@ -184,6 +184,18 @@ pub(super) enum ChromeRow {
         line: Line<'static>,
         bg: Option<Color>,
     },
+    /// A reasoning-rail header — a chromeless fold anchor. Carries the same
+    /// `expanded` flag the fold machinery reads (so `ctrl+o` and the visibility
+    /// pass treat it like a panel `Header`), but renders as a muted `┊ ▾ THINKING`
+    /// rail rather than a box, because reasoning is recessive (ThinkingBlock).
+    RailHeader {
+        expanded: bool,
+        label: String,
+    },
+    /// The end marker of a reasoning rail — the rail analogue of `Bottom`. Bounds
+    /// the block for `panel_end_from`/the visibility reset and renders as a single
+    /// blank line of breathing room (no border).
+    RailEnd,
 }
 
 impl ChromeRow {
@@ -199,6 +211,8 @@ impl ChromeRow {
             ChromeRow::Separator => panel_rule_line(width, '├', '┤'),
             ChromeRow::Bottom => panel_rule_line(width, '└', '┘'),
             ChromeRow::Body { line, bg } => panel_body_line(width, line.clone(), *bg),
+            ChromeRow::RailHeader { expanded, label } => rail_header_line(width, *expanded, label),
+            ChromeRow::RailEnd => Line::default(),
         }
     }
 }

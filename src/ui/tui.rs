@@ -31,7 +31,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{execute, queue};
 use ratatui::layout::Size;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 #[cfg(test)]
 use ratatui::text::{Line, Span};
 
@@ -101,12 +101,11 @@ const PANEL_BODY_SIDE_PADDING: usize = 1;
 const PANEL_BODY_BORDER_WIDTH: usize = 2;
 const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_BORDER_WIDTH + PANEL_BODY_SIDE_PADDING * 2;
 
-const BORDER: Color = Color::Gray;
-const ORANGE: Color = Color::Yellow;
-const GREEN: Color = Color::Green;
-const RED: Color = Color::Red;
-const DIFF_ADD_BG: Color = Color::Indexed(22);
-const DIFF_DEL_BG: Color = Color::Indexed(52);
+// Color roles live in `crate::ui::palette` (the single source of truth). They
+// are imported here under their long-standing names so the whole `tui` module
+// tree keeps referencing them as `BORDER`, `ORANGE`, … (and its child modules
+// as `super::BORDER`).
+use crate::ui::palette::{BORDER, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, ORANGE, RED};
 const COMPOSER_HINT: &str = "↵ to send  •  shift+↵ for new line  •  / for commands";
 
 const X_PADDING: usize = 2;
@@ -174,9 +173,10 @@ fn turn_divider_label(elapsed: Option<Duration>, usage: Option<&ProviderUsage>) 
         return String::new();
     };
     let elapsed = format_elapsed_compact(elapsed);
+    let sep = crate::ui::symbols::SEP;
     match usage {
         Some(usage) => format!(
-            "{elapsed} ┊ ↑{} ↓{}",
+            "{elapsed} {sep} ↑{} ↓{}",
             compact_count(usage.input_tokens),
             compact_count(usage.output_tokens)
         ),
@@ -342,6 +342,7 @@ mod tests {
     use crate::nexus::{ApprovalDecision, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::terminal_surface::{RenderKind, TerminalSurface};
+    use ratatui::style::Color;
     use serde_json::json;
 
     fn call(name: &str) -> ToolCall {
@@ -876,7 +877,8 @@ mod tests {
         let mut screen = Screen::new();
         screen.show_approval(&call_args("bash", json!({ "command": "echo hi" })), false);
         let rendered = rendered_text(&mut screen, 80, 12);
-        assert!(rendered.contains("approve echo hi"), "{rendered}");
+        assert!(rendered.contains("REVIEW"), "{rendered}");
+        assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(rendered.contains("[y] once"), "{rendered}");
         assert!(rendered.contains("[N] deny"), "{rendered}");
     }
@@ -902,7 +904,7 @@ mod tests {
             "{lines:?}"
         );
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("approve printf 'global:"));
+        assert!(rendered.contains("$ printf 'global:"));
         assert!(rendered.contains("120s)"), "{rendered}");
         assert!(rendered.contains("[N] deny"), "{rendered}");
         assert!(!rendered.contains(COMPOSER_HINT), "{rendered}");
@@ -1038,6 +1040,53 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn diff_preview_appends_added_removed_footer_tinted_to_diff_inks() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call("edit"),
+            diff: "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        });
+        let footer = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|row| row.text.contains("+1") && row.text.contains("\u{2212}1"))
+            .expect("added/removed footer row");
+        let Some(ChromeRow::Body { line, .. }) = footer.chrome.as_ref() else {
+            panic!("footer is a body row");
+        };
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.content.contains("+1") && s.style.fg == ok_style().fg),
+            "additions tinted to the add ink: {line:?}"
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.content.contains("\u{2212}1") && s.style.fg == err_style().fg),
+            "removals tinted to the del ink: {line:?}"
+        );
+    }
+
+    #[test]
+    fn diff_preview_new_file_footer_notes_new_file() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call("write"),
+            diff: "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+alpha\n+beta\n".to_string(),
+        });
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|row| row.text.contains("new file")),
+            "new-file preview footer carries a `new file` note"
+        );
     }
 
     #[test]
@@ -2375,7 +2424,7 @@ mod tests {
         });
         let collapsed = rendered_text(&mut screen, 80, 14);
         // Collapsed: label visible, body hidden, collapsed arrow shown.
-        assert!(collapsed.contains("Thinking..."), "{collapsed}");
+        assert!(collapsed.contains("THINKING"), "{collapsed}");
         assert!(collapsed.contains("▸"), "{collapsed}");
         assert!(
             !collapsed.contains("then the cache"),
@@ -2402,6 +2451,62 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_block_is_a_chromeless_left_rail() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "Weigh the options.".to_string(),
+            redacted: false,
+        });
+        // Reasoning is recessive: it never gets box chrome (Top/Bottom/Separator/
+        // Header/Body) — only the rail markers.
+        for row in &screen.transcript.rows {
+            assert!(
+                !matches!(
+                    row.chrome.as_ref(),
+                    Some(
+                        ChromeRow::Top
+                            | ChromeRow::Bottom
+                            | ChromeRow::Separator
+                            | ChromeRow::Header { .. }
+                            | ChromeRow::Body { .. }
+                    )
+                ),
+                "reasoning must not use box chrome: {:?}",
+                row.text
+            );
+        }
+        assert!(
+            screen.transcript.rows.iter().any(|r| matches!(
+                r.chrome.as_ref(),
+                Some(ChromeRow::RailHeader {
+                    expanded: false,
+                    ..
+                })
+            )),
+            "collapsed rail header missing"
+        );
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| matches!(r.chrome.as_ref(), Some(ChromeRow::RailEnd))),
+            "rail end marker missing"
+        );
+        // The header renders as a muted `┊ ▸ THINKING` rail (rail + arrow + label
+        // on one line), not a bordered header.
+        let header = rendered_lines(&mut screen, 80, 14)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .find(|t| t.contains("THINKING"))
+            .expect("THINKING rail header");
+        assert!(header.contains('\u{250a}'), "rail glyph ┊: {header}");
+        assert!(header.contains('\u{25b8}'), "collapsed arrow ▸: {header}");
+        assert!(!header.contains('\u{2502}'), "no box side │: {header}");
+    }
+
+    #[test]
     fn redacted_reasoning_never_renders_trace_text() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
@@ -2413,7 +2518,7 @@ mod tests {
         });
         assert!(screen.toggle_latest_panel());
         let expanded = rendered_text(&mut screen, 80, 14);
-        assert!(expanded.contains("Thinking..."), "{expanded}");
+        assert!(expanded.contains("THINKING"), "{expanded}");
         assert!(
             expanded.contains("withheld"),
             "redacted placeholder missing: {expanded}"
@@ -2435,7 +2540,7 @@ mod tests {
         });
         screen.apply(UiEvent::AssistantTextEnd("The answer.".to_string()));
         let out = rendered_text(&mut screen, 80, 16);
-        let thinking_at = out.find("Thinking...").expect("thinking label");
+        let thinking_at = out.find("THINKING").expect("thinking label");
         let answer_at = out.find("The answer.").expect("answer");
         assert!(
             thinking_at < answer_at,
@@ -2458,7 +2563,7 @@ mod tests {
         });
         screen.apply(UiEvent::AssistantText("Here is the answer.".to_string()));
         let out = rendered_text(&mut screen, 80, 16);
-        let thinking_at = out.find("Thinking...").expect("thinking label");
+        let thinking_at = out.find("THINKING").expect("thinking label");
         let answer_at = out.find("Here is the answer.").expect("answer");
         assert!(
             thinking_at < answer_at,
@@ -2566,6 +2671,10 @@ mod tests {
                     assert!(in_panel, "orphan panel bottom");
                     in_panel = false;
                 }
+                // The reasoning rail is chromeless (not a box panel): its header
+                // and end markers never open/close `in_panel`, and its trace rows
+                // are plain rows outside any box.
+                Some(ChromeRow::RailHeader { .. } | ChromeRow::RailEnd) => {}
                 None => assert!(!in_panel, "plain row inside panel: {:?}", row.text),
             }
         }

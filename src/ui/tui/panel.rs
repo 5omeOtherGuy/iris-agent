@@ -14,9 +14,10 @@ use super::wrap::{
 };
 use super::{
     BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_BORDER_WIDTH, PANEL_BODY_CHROME_WIDTH,
-    PANEL_BODY_SIDE_PADDING, border_style, dim_style, err_style, ok_style, panel_style,
-    prompt_style,
+    PANEL_BODY_SIDE_PADDING, TEXT_COLUMN_X_PADDING, border_style, dim_style, err_style, ok_style,
+    panel_style, prompt_style,
 };
+use crate::ui::symbols;
 
 fn panel_outer_padding(width: usize) -> usize {
     if width <= BOX_X_PADDING.saturating_mul(2).saturating_add(1) {
@@ -59,7 +60,11 @@ pub(super) fn panel_header_line(
 ) -> Line<'static> {
     let panel_width = panel_width(width);
     let inner_width = panel_width.saturating_sub(2);
-    let arrow = if expanded { "▾" } else { "▸" };
+    let arrow = if expanded {
+        symbols::EXPANDED
+    } else {
+        symbols::COLLAPSED
+    };
     let title_width = title.len().max(7);
     let mut left = vec![
         Span::styled(format!(" {arrow}  "), dim_style()),
@@ -150,6 +155,24 @@ pub(super) fn panel_body_lines(
     }
 }
 
+/// A reasoning-rail header: `┊ ▾ THINKING` (expanded) / `┊ ▸ THINKING`
+/// (collapsed), muted and indented to the transcript text column. No box —
+/// reasoning is recessive; the rail is the only chrome it gets (ThinkingBlock).
+pub(super) fn rail_header_line(width: usize, expanded: bool, label: &str) -> Line<'static> {
+    let arrow = if expanded {
+        symbols::EXPANDED
+    } else {
+        symbols::COLLAPSED
+    };
+    let mut line = Line::from(Span::styled(
+        format!("{} {arrow} {label}", symbols::SEP),
+        dim_style(),
+    ));
+    pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
+    truncate_line(&mut line, width.max(1));
+    line
+}
+
 pub(super) fn inset_rule_line(width: usize, label: &str) -> Line<'static> {
     let rule_width = width.saturating_sub(BOX_X_PADDING * 2).max(1);
     let mut line = hrule_line(label, rule_width);
@@ -197,10 +220,10 @@ impl PanelState {
     /// glyph so the header stays legible without color.
     pub(super) fn symbol(self) -> &'static str {
         match self {
-            Self::Running => "●",
-            Self::Done => "◆",
-            Self::Error => "■",
-            Self::Cancelled => "□",
+            Self::Running => symbols::RUNNING,
+            Self::Done => symbols::DONE,
+            Self::Error => symbols::ERROR,
+            Self::Cancelled => symbols::CANCELLED,
         }
     }
 
@@ -295,7 +318,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                     out.push(diff_span_row(
                         Some(old_line),
                         None,
-                        "\u{2212}",
+                        symbols::REMOVED,
                         removed[0],
                         old_spans,
                         err_style(),
@@ -305,7 +328,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                     out.push(diff_span_row(
                         None,
                         Some(new_line),
-                        "+",
+                        symbols::ADDED,
                         added[0],
                         new_spans,
                         ok_style(),
@@ -317,7 +340,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                         out.push(diff_plain_row(
                             Some(old_line),
                             None,
-                            "\u{2212}",
+                            symbols::REMOVED,
                             code,
                             err_style(),
                             Some(DIFF_DEL_BG),
@@ -328,7 +351,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                         out.push(diff_plain_row(
                             None,
                             Some(new_line),
-                            "+",
+                            symbols::ADDED,
                             code,
                             ok_style(),
                             Some(DIFF_ADD_BG),
@@ -341,7 +364,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                 out.push(diff_plain_row(
                     None,
                     Some(new_line),
-                    "+",
+                    symbols::ADDED,
                     code,
                     ok_style(),
                     Some(DIFF_ADD_BG),
@@ -366,6 +389,52 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
         }
     }
     out
+}
+
+/// Count content additions/removals in a unified diff, ignoring the `+++ `/`--- `
+/// file headers and `@@` hunk headers. Used for the quiet EDIT footer.
+pub(super) fn diff_counts(diff: &str) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in diff.lines() {
+        if line.starts_with("+++ ") || line.starts_with("--- ") {
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'+') => added += 1,
+            Some(b'-') => removed += 1,
+            _ => {}
+        }
+    }
+    (added, removed)
+}
+
+/// The quiet `+added  −removed` footer that closes an EDIT panel body, tinted to
+/// the diff inks (additions green, removals red) per the `EditOutput`
+/// design-system component. `note` adds a `┊ <note>` aside (e.g. `new file`).
+/// Symbol + color together carry the meaning; the counts read in monochrome.
+pub(super) fn diff_footer_row(added: usize, removed: usize, note: Option<&str>) -> TranscriptRow {
+    let mut plain = format!("{}{added}  {}{removed}", symbols::ADDED, symbols::REMOVED);
+    let mut spans = vec![
+        Span::styled(format!("{}{added}", symbols::ADDED), ok_style()),
+        Span::styled("  ", panel_style()),
+        Span::styled(format!("{}{removed}", symbols::REMOVED), err_style()),
+    ];
+    if let Some(note) = note {
+        plain.push_str(&format!("  {} {note}", symbols::SEP));
+        spans.push(Span::styled(
+            format!("  {} {note}", symbols::SEP),
+            dim_style(),
+        ));
+    }
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Body {
+            line: Line::from(spans),
+            bg: None,
+        },
+        plain,
+        panel_style(),
+    )
 }
 
 /// Build a diff table row whose code column is a single styled span.

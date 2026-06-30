@@ -50,6 +50,9 @@ struct Spinner {
 struct ApprovalHint {
     target: String,
     options: &'static str,
+    /// Whether the gated action is a shell command, so the action reads with a
+    /// `$ ` prompt (per the `ApprovalOutput` design-system component).
+    shell: bool,
 }
 
 #[derive(Default)]
@@ -251,9 +254,24 @@ fn working_lines(
     )]
 }
 
-fn approval_status_line(hint: &ApprovalHint) -> Line<'static> {
-    let mut spans = vec![Span::raw("approve ")];
+/// The `▲ REVIEW` lead and action for a gated tool call: the review glyph (orange
+/// accent) + label, then the action — prefixed with a `$ ` prompt for shell
+/// commands — matching the `ApprovalOutput` design-system component. State is
+/// carried by symbol + label, never color alone.
+fn approval_lead_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(format!("{} ", crate::ui::symbols::REVIEW), prompt_style()),
+        Span::raw("REVIEW  "),
+    ];
+    if hint.shell {
+        spans.push(Span::styled("$ ", dim_style()));
+    }
     spans.extend(ansi_spans(&hint.target, Style::default()));
+    spans
+}
+
+fn approval_status_line(hint: &ApprovalHint) -> Line<'static> {
+    let mut spans = approval_lead_spans(hint);
     spans.push(Span::raw("  "));
     spans.push(Span::styled(hint.options, dim_style()));
     Line::from(spans)
@@ -266,10 +284,13 @@ fn approval_status_lines(hint: &ApprovalHint, width: usize) -> Vec<Line<'static>
         return vec![full];
     }
 
-    let mut target = vec![Span::raw("approve ")];
-    target.extend(ansi_spans(&hint.target, Style::default()));
     let mut lines = Vec::new();
-    push_wrapped_line(&Line::from(target), width, Some("  "), &mut lines);
+    push_wrapped_line(
+        &Line::from(approval_lead_spans(hint)),
+        width,
+        Some("  "),
+        &mut lines,
+    );
     push_wrapped_line(
         &Line::from(Span::styled(hint.options, dim_style())),
         width,
@@ -584,6 +605,7 @@ impl Screen {
         self.approval_hint = Some(ApprovalHint {
             target: run_target(call),
             options,
+            shell: call.name == "bash",
         });
     }
 
@@ -746,11 +768,11 @@ fn context_meter_spans(filled: u64) -> Vec<Span<'static>> {
     (1..=CONTEXT_METER_DOTS)
         .map(|dot| {
             if filled == 0 || dot > filled {
-                Span::styled("○".to_string(), dim_style())
+                Span::styled(crate::ui::symbols::EMPTY.to_string(), dim_style())
             } else if dot == filled {
-                Span::styled("●".to_string(), prompt_style())
+                Span::styled(crate::ui::symbols::RUNNING.to_string(), prompt_style())
             } else {
-                Span::styled("●".to_string(), meter_used_style())
+                Span::styled(crate::ui::symbols::RUNNING.to_string(), meter_used_style())
             }
         })
         .collect()
@@ -790,7 +812,7 @@ pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Lin
 
     let mode_seg = || {
         vec![
-            Span::styled("◉ ".to_string(), prompt_style()),
+            Span::styled(format!("{} ", crate::ui::symbols::ACTIVE), prompt_style()),
             Span::raw("CODE"),
         ]
     };
@@ -1158,8 +1180,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApprovalHint, CONTEXT_METER_DOTS, Spinner, approval_status_lines, context_meter_filled,
-        display_width, line_text, parse_context_window, truncate_cwd_middle, working_lines,
+        ApprovalHint, CONTEXT_METER_DOTS, Spinner, approval_status_line, approval_status_lines,
+        context_meter_filled, display_width, line_text, parse_context_window, truncate_cwd_middle,
+        working_lines,
     };
     use crate::ui::tui::WORKING_FRAMES;
 
@@ -1263,6 +1286,7 @@ mod tests {
         let hint = ApprovalHint {
             target: "run an extremely long command".to_string(),
             options: "[y] once  [N] deny",
+            shell: true,
         };
         for width in 1..=4 {
             for line in approval_status_lines(&hint, width) {
@@ -1284,5 +1308,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn approval_review_line_leads_with_review_and_shell_prompt() {
+        // A gated shell action reads `▲ REVIEW  $ <command>  <keys>`; the `$ `
+        // prompt is shell-only (ApprovalOutput design-system component).
+        let shell = ApprovalHint {
+            target: "echo hi".to_string(),
+            options: "[y] once  [N] deny",
+            shell: true,
+        };
+        let non_shell = ApprovalHint {
+            target: "Write src/x.rs".to_string(),
+            options: "[y] once  [N] deny",
+            shell: false,
+        };
+        let shell_text = line_text(&approval_status_line(&shell));
+        let non_shell_text = line_text(&approval_status_line(&non_shell));
+        assert!(shell_text.contains("\u{25b2} REVIEW"), "{shell_text}");
+        assert!(shell_text.contains("$ echo hi"), "{shell_text}");
+        assert!(
+            non_shell_text.contains("\u{25b2} REVIEW"),
+            "{non_shell_text}"
+        );
+        assert!(
+            non_shell_text.contains("Write src/x.rs"),
+            "{non_shell_text}"
+        );
+        assert!(!non_shell_text.contains("$ "), "{non_shell_text}");
     }
 }
