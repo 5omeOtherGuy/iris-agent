@@ -738,8 +738,25 @@ fn parses_usage_response_id_and_encrypted_reasoning_from_stream() -> Result<()> 
     assert_eq!(turn.reasoning.len(), 1);
     assert_eq!(turn.reasoning[0].text, "thought");
     assert_eq!(turn.reasoning[0].continuity.as_deref(), Some("enc-1"));
-    assert!(turn.reasoning[0].redacted);
+    assert!(!turn.reasoning[0].redacted);
     Ok(())
+}
+
+#[test]
+fn encrypted_reasoning_without_summary_is_continuity_not_redaction() {
+    let origin = ModelOrigin::new("openai-codex", "openai-codex-responses", "gpt-test");
+    let block = extract_reasoning_block(
+        &json!({
+            "type": "reasoning",
+            "encrypted_content": "enc-only"
+        }),
+        &origin,
+    )
+    .expect("reasoning block");
+
+    assert_eq!(block.text, "");
+    assert_eq!(block.continuity.as_deref(), Some("enc-only"));
+    assert!(!block.redacted);
 }
 
 #[test]

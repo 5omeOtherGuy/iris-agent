@@ -854,7 +854,12 @@ fn extract_reasoning_block(value: &Value, origin: &ModelOrigin) -> Option<Reason
             .get("encrypted_content")
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty());
-        ReasoningBlock::new(&text, encrypted, encrypted.is_some(), origin.clone())
+        // OpenAI `encrypted_content` is opaque continuity for replay, not a
+        // redaction marker. When the provider also sends a summary/content block,
+        // surface that text; when it sends encrypted-only reasoning, Nexus stores
+        // the continuity row but emits no TUI reasoning block because the text is
+        // empty and `redacted` is false.
+        ReasoningBlock::new(&text, encrypted, false, origin.clone())
     })
 }
 
