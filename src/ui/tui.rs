@@ -74,10 +74,10 @@ const MAX_EDITOR_ROWS: u16 = 10;
 
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
-/// Minimum composer height: hairline + statusline + one input row.
-const MIN_EDITOR_H: u16 = 3;
-/// Composer chrome above the input rows: the hairline top edge + statusline.
-const EDITOR_VERTICAL_CHROME_ROWS: u16 = 2;
+/// Minimum composer height: hairline + statusline + blank spacer + one input row.
+const MIN_EDITOR_H: u16 = 4;
+/// Composer chrome above the input rows: the hairline top edge, statusline, and spacer.
+const EDITOR_VERTICAL_CHROME_ROWS: u16 = 3;
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
 /// bottom instead of immediately occupying the whole terminal height.
@@ -1364,9 +1364,14 @@ mod tests {
             .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
             .expect("hairline top edge");
 
-        // Statusline row (blank before a footer exists), then the input row.
+        // Statusline row (blank before a footer exists), spacer row, then the input row.
         assert!(!texts[top + 1].contains("Give Iris"), "{texts:?}");
-        assert!(texts[top + 2].contains("Give Iris a task..."), "{texts:?}");
+        assert_eq!(texts[top + 2].trim(), "", "{texts:?}");
+        assert!(texts[top + 3].contains("Give Iris a task..."), "{texts:?}");
+        assert!(
+            texts[top + 3].starts_with("      Give Iris a task..."),
+            "input should align with transcript text: {texts:?}"
+        );
         // No box: no side borders, no bottom border, no hint row.
         let composer = texts[top..].join("\n");
         assert!(!composer.contains('│'), "{composer:?}");
@@ -1398,6 +1403,16 @@ mod tests {
         );
         // The workspace right-aligns on the same line.
         assert!(status.trim_end().ends_with("~/project"), "{status:?}");
+        // The statusline is followed by a blank spacer, then the aligned input.
+        let status_idx = texts
+            .iter()
+            .position(|line| line.contains("◉ CODE"))
+            .expect("statusline");
+        assert_eq!(texts[status_idx + 1].trim(), "", "{texts:?}");
+        assert!(
+            texts[status_idx + 2].starts_with("      Give Iris a task..."),
+            "input should align with transcript text: {texts:?}"
+        );
         // No box corners anywhere in the composer chrome.
         assert!(!status.contains('┌'), "{status:?}");
         // Nothing overflows the terminal width.
@@ -1451,7 +1466,7 @@ mod tests {
             .iter()
             .position(|line| line.contains("Give Iris a task"))
             .expect("composer remains visible");
-        // The statusline sits directly above the input; the workspace label
+        // The statusline stays in the composer chrome above the spacer/input; the workspace label
         // right-aligns on the statusline itself.
         assert!(status_idx < editor_idx, "{texts:?}");
         assert!(
@@ -3145,7 +3160,7 @@ mod tests {
             crate::mimir::selection::ReasoningEffort::XHigh,
         )));
 
-        let rendered = rendered_text(&mut screen, 80, 16);
+        let rendered = rendered_text(&mut screen, 80, 17);
         assert!(rendered.contains("Sonnet 5"), "{rendered}");
         assert!(rendered.contains("effort (xhigh)"), "{rendered}");
         assert!(rendered.contains("SELECT MODEL"), "{rendered}");
@@ -3158,8 +3173,8 @@ mod tests {
         screen.editor.insert_str("abcdefghijklmnopqrst");
 
         let rendered = rendered_text(&mut screen, 18, 8);
-        assert!(rendered.contains("abcdefghijklmn"), "{rendered}");
-        assert!(rendered.contains("opqrst"), "{rendered}");
+        assert!(rendered.contains("abcdefghijk"), "{rendered}");
+        assert!(rendered.contains("lmnopqrst"), "{rendered}");
         for line in rendered.lines() {
             assert!(display_width(line) <= 18, "{line:?}");
         }
