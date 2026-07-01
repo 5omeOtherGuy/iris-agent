@@ -988,7 +988,7 @@ struct ChromeHeights {
 }
 
 /// Allocate chrome rows. The composer is protected first: the menu yields to
-/// `MIN_EDITOR_H` (hairline + statusline + one input row) before anything else
+/// `MIN_EDITOR_H` (hairline + statusline + spacer + one input row) before anything else
 /// is squeezed.
 fn chrome_heights(height: u16, menu_wanted: u16, editor_rows: u16) -> ChromeHeights {
     let menu = menu_wanted.min(height.saturating_sub(MIN_EDITOR_H));
@@ -1002,15 +1002,27 @@ fn chrome_heights(height: u16, menu_wanted: u16, editor_rows: u16) -> ChromeHeig
     ChromeHeights { menu, editor }
 }
 
+fn composer_text_x_offset(box_width: u16) -> u16 {
+    // `ratatui-textarea` paints the empty-editor cursor one cell before the
+    // placeholder, so anchor the widget one cell left of the transcript text
+    // column; the visible `Give Iris...` indicator then starts with messages.
+    u16::try_from(TEXT_COLUMN_X_PADDING.saturating_sub(1))
+        .unwrap_or(u16::MAX)
+        .min(box_width.saturating_sub(1))
+}
+
 fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
     let area = Rect::new(0, 0, width, height);
 
     let editor_rows = screen.approval_hint.as_ref().map_or_else(
         || editor_visual_rows(&screen.editor, area.width),
         |hint| {
-            let inner_width = area
+            let box_width = area
                 .width
                 .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
+                .max(1);
+            let inner_width = box_width
+                .saturating_sub(composer_text_x_offset(box_width))
                 .max(1);
             u16::try_from(approval_status_lines(hint, usize::from(inner_width)).len())
                 .unwrap_or(u16::MAX)
@@ -1042,10 +1054,10 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         })
         .unwrap_or(0);
 
-    // Bottom-anchored, clamped to the fixed viewport. The composer is the
-    // unconditional two-line-plus-input tail: a full hairline top edge, the
-    // statusline, then the input rows. No box, no hint row, no separate
-    // workspace label (the workspace lives right-aligned in the statusline).
+    // Bottom-anchored, clamped to the fixed viewport. The composer tail is a
+    // full hairline top edge, the statusline, a blank spacer, then the input
+    // rows. No box, no hint row, no separate workspace label (the workspace
+    // lives right-aligned in the statusline).
     let heights = chrome_heights(area.height, menu_wanted, editor_rows);
     let chrome_h = heights.menu.saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
@@ -1075,10 +1087,11 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             .max(1),
         height: editor_area.height,
     };
+    let text_x_offset = composer_text_x_offset(box_area.width);
     let text_area = Rect {
-        x: box_area.x,
-        y: editor_area.y + 2.min(editor_area.height.saturating_sub(1)),
-        width: box_area.width,
+        x: box_area.x + text_x_offset,
+        y: editor_area.y + EDITOR_VERTICAL_CHROME_ROWS.min(editor_area.height.saturating_sub(1)),
+        width: box_area.width.saturating_sub(text_x_offset).max(1),
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
@@ -1097,9 +1110,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             cursor_cell = find_reversed_cell(&buf, text_area);
         }
     }
-    // The composer's two chrome rows: the full-width hairline top edge, then
-    // the statusline. Painted last so they are never overwritten by the
-    // textarea/approval body at very small heights.
+    // The composer's chrome rows: the full-width hairline top edge, then the
+    // statusline, then a blank spacer before the input. Painted last so they
+    // are never overwritten by the textarea/approval body at very small heights.
     if heights.editor > 0 {
         let hairline = composer_hairline(usize::from(box_area.width));
         buf.set_line(box_area.x, box_area.y, &hairline, box_area.width);
