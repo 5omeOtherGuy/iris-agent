@@ -205,7 +205,11 @@ pub(super) fn push_wrapped_line_wordwise_with_prefix(
         let mut cursor = 0usize;
         for physical in wrap_to_width(&content_text, content_width) {
             let mut line = styled_physical_row(content_cells, &mut cursor, &physical);
-            pad_line_left(&mut line, prefix_width);
+            // Re-emit the prefix (the dim reasoning rail) on every physical
+            // line so the rail runs the full height of the block, instead of
+            // silently padding it away with spaces.
+            line.spans
+                .insert(0, Span::styled(continuation_prefix, dim_style()));
             out.push(line);
         }
         return;

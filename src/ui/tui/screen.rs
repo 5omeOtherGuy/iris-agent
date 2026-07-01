@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use ratatui_textarea::{TextArea, WrapMode};
 
 #[cfg(test)]
@@ -27,10 +27,9 @@ use super::wrap::{
     truncate_to_width, wrap_to_width,
 };
 use super::{
-    BOX_X_PADDING_U16, COMPOSER_HINT, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS, MAX_MENU_ROWS,
-    MIN_EDITOR_H, MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING_U16,
-    WORKING_FRAMES, WORKSPACE_LABEL_H, border_style, dim_style, format_elapsed_compact,
-    panel_style, prompt_style,
+    BOX_X_PADDING_U16, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS, MAX_MENU_ROWS, MIN_EDITOR_H,
+    MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, WORKING_FRAMES, border_style, dim_style,
+    format_elapsed_compact, panel_style, prompt_style,
 };
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -261,7 +260,10 @@ fn working_lines(
 fn approval_lead_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(format!("{} ", crate::ui::symbols::REVIEW), prompt_style()),
-        Span::raw("REVIEW  "),
+        Span::styled(
+            "REVIEW  ".to_string(),
+            prompt_style().add_modifier(Modifier::BOLD),
+        ),
     ];
     if hint.shell {
         spans.push(Span::styled("$ ", dim_style()));
@@ -318,7 +320,6 @@ pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
     let inner_width = usize::from(
         width
             .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
-            .saturating_sub(TEXT_X_PADDING_U16.saturating_mul(2))
             .max(1),
     );
     editor
@@ -778,15 +779,17 @@ fn context_meter_spans(filled: u64) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Build the editor's top border, which doubles as the primary statusline:
-/// `┌─ ◉ CODE ─ GPT-5.4 LOW ─ CTX 300K ●●●○○○○○○○ ───┐`. Returns `None` when
-/// there is no footer yet or even the minimum content cannot fit, in which case
-/// the caller leaves the plain `Block` border in place so the frame never breaks.
-pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
+/// Build the composer statusline — the composer's top content line, under the
+/// full-width hairline (`composer_hairline`):
+/// `◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○    ~/iris-agent ┊ git main`.
+/// The mode glyph is the orange accent; `CODE` is bold; the model name is the
+/// underlined model-picker button; effort and the CTX label are muted; the
+/// 10-dot meter follows; the workspace `cwd ┊ git branch` right-aligns when it
+/// fits. Returns `None` when there is no footer yet or even the minimum
+/// content cannot fit.
+pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
     let footer = screen.footer.as_ref()?;
     let width = usize::from(box_width);
-    // `┌` + `─ ` + content + ` ` + fill + `┐` needs at least the corners plus a
-    // one-character field.
     if width < 6 {
         return None;
     }
@@ -813,17 +816,30 @@ pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Lin
     let mode_seg = || {
         vec![
             Span::styled(format!("{} ", crate::ui::symbols::ACTIVE), prompt_style()),
-            Span::raw("CODE"),
+            Span::styled(
+                "CODE".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]
     };
-    let model_with_effort = || match &effort {
-        Some(effort) => vec![Span::raw(format!("{model} {effort}"))],
-        None => vec![Span::raw(model.clone())],
+    // The model name is the model-picker button: underlined, per the spec.
+    let model_span = || {
+        Span::styled(
+            model.clone(),
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )
     };
-    let model_only = || vec![Span::raw(model.clone())];
+    let model_with_effort = || match &effort {
+        Some(effort) => vec![
+            model_span(),
+            Span::styled(format!(" {effort}"), dim_style()),
+        ],
+        None => vec![model_span()],
+    };
+    let model_only = || vec![model_span()];
     let ctx_meter = |with_meter: bool| {
         context.as_ref().map(|context| {
-            let mut spans = vec![Span::raw(format!("CTX {context}"))];
+            let mut spans = vec![Span::styled(format!("CTX {context}"), dim_style())];
             if let (true, Some(filled)) = (with_meter, meter_filled) {
                 spans.push(Span::raw(" "));
                 spans.extend(context_meter_spans(filled));
@@ -849,63 +865,65 @@ pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Lin
     }
     candidates.push(vec![mode_seg(), model_only()]);
 
-    candidates
+    let left = candidates
         .into_iter()
-        .find_map(|segments| top_border_line(width, segments))
-}
-
-/// Assemble one top-border candidate at `width`, or `None` if its segments do
-/// not fit (`┌─ ` + segments joined by ` ─ ` + ` ` + `─` fill + `┐`).
-fn top_border_line(width: usize, segments: Vec<Vec<Span<'static>>>) -> Option<Line<'static>> {
-    let mut joined: Vec<Span<'static>> = Vec::new();
-    for (idx, segment) in segments.into_iter().enumerate() {
-        if idx > 0 {
-            joined.push(Span::styled(" ─ ".to_string(), border_style()));
+        .find_map(|segments| statusline_left(width, segments))?;
+    let left_w = spans_width(&left);
+    let mut spans = left;
+    // Right-aligned quiet workspace label: `~/iris-agent ┊ git main`.
+    if let Some(ws) = workspace_spans(footer, width.saturating_sub(left_w).saturating_sub(2)) {
+        let ws_w = spans_width(&ws);
+        let gap = width.saturating_sub(left_w).saturating_sub(ws_w);
+        if gap >= 2 {
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.extend(ws);
         }
-        joined.extend(segment);
-    }
-    let joined_w = spans_width(&joined);
-    // Fixed cells: `┌`, `─ ` (2), trailing ` ` (1), `┐` => 5.
-    let fill = width.checked_sub(joined_w + 5)?;
-    let mut spans = vec![Span::styled("┌─ ".to_string(), border_style())];
-    spans.extend(joined);
-    spans.push(Span::styled(" ".to_string(), border_style()));
-    if fill > 0 {
-        spans.push(Span::styled("─".repeat(fill), border_style()));
-    }
-    spans.push(Span::styled("┐".to_string(), border_style()));
-    Some(Line::from(spans))
-}
-
-/// Quiet unboxed workspace label rendered below the editor:
-/// `~/projects/iris ┊ git main`. Returns `None` when there is no footer/cwd.
-pub(super) fn workspace_label_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
-    let footer = screen.footer.as_ref()?;
-    let width = usize::from(width);
-    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
-    if cwd.is_empty() {
-        return None;
-    }
-    let indent = TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1));
-    let suffix = branch
-        .as_ref()
-        .map(|branch| format!(" ┊ git {branch}"))
-        .unwrap_or_default();
-    let avail = width
-        .saturating_sub(indent)
-        .saturating_sub(display_width(&suffix))
-        .max(1);
-    let cwd = truncate_cwd_middle(&cwd, avail);
-    let mut spans = vec![
-        Span::raw(" ".repeat(indent)),
-        Span::styled(cwd, dim_style()),
-    ];
-    if !suffix.is_empty() {
-        spans.push(Span::styled(suffix, dim_style()));
     }
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     Some(line)
+}
+
+/// Assemble one statusline candidate at `width`, or `None` if its segments do
+/// not fit (segments joined by dim ` ─ ` separators).
+fn statusline_left(width: usize, segments: Vec<Vec<Span<'static>>>) -> Option<Vec<Span<'static>>> {
+    let mut joined: Vec<Span<'static>> = Vec::new();
+    for (idx, segment) in segments.into_iter().enumerate() {
+        if idx > 0 {
+            joined.push(Span::styled(" ─ ".to_string(), dim_style()));
+        }
+        joined.extend(segment);
+    }
+    (spans_width(&joined) <= width).then_some(joined)
+}
+
+/// The dim `cwd ┊ git branch` workspace spans, middle-truncating the cwd to
+/// `max` columns. `None` when there is no cwd or no room at all.
+fn workspace_spans(footer: &Footer, max: usize) -> Option<Vec<Span<'static>>> {
+    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
+    if cwd.is_empty() || max == 0 {
+        return None;
+    }
+    let suffix = branch
+        .as_ref()
+        .map(|branch| format!(" ┊ git {branch}"))
+        .unwrap_or_default();
+    let avail = max.saturating_sub(display_width(&suffix)).max(1);
+    let cwd = truncate_cwd_middle(&cwd, avail);
+    if cwd.is_empty() {
+        return None;
+    }
+    let mut spans = vec![Span::styled(cwd, dim_style())];
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, dim_style()));
+    }
+    Some(spans)
+}
+
+/// The composer's top edge: a full-width hairline in the border role — the one
+/// rule separating the composer from the transcript (the composer has no box).
+fn composer_hairline(width: usize) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(width.max(1)), border_style()))
 }
 
 /// Middle-ellipsis truncation that preserves the final path segment (the
@@ -967,33 +985,21 @@ fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
 struct ChromeHeights {
     menu: u16,
     editor: u16,
-    workspace: u16,
 }
 
-/// Allocate chrome rows. The editor frame is protected first: the menu yields to
-/// `MIN_EDITOR_H`, then the workspace label yields to both, so a constrained
-/// height drops the workspace label before squeezing the editor frame.
-fn chrome_heights(
-    height: u16,
-    menu_wanted: u16,
-    workspace_wanted: u16,
-    editor_rows: u16,
-) -> ChromeHeights {
-    let workspace_wanted = workspace_wanted.min(WORKSPACE_LABEL_H);
+/// Allocate chrome rows. The composer is protected first: the menu yields to
+/// `MIN_EDITOR_H` (hairline + statusline + one input row) before anything else
+/// is squeezed.
+fn chrome_heights(height: u16, menu_wanted: u16, editor_rows: u16) -> ChromeHeights {
     let menu = menu_wanted.min(height.saturating_sub(MIN_EDITOR_H));
-    let workspace = workspace_wanted.min(height.saturating_sub(menu).saturating_sub(MIN_EDITOR_H));
-    let max_editor_h = height.saturating_sub(menu).saturating_sub(workspace).max(1);
+    let max_editor_h = height.saturating_sub(menu).max(1);
     let wanted_editor_h = editor_rows.saturating_add(EDITOR_VERTICAL_CHROME_ROWS);
     let editor = if max_editor_h >= MIN_EDITOR_H {
         wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
     } else {
         max_editor_h.max(1)
     };
-    ChromeHeights {
-        menu,
-        editor,
-        workspace,
-    }
+    ChromeHeights { menu, editor }
 }
 
 fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -1005,7 +1011,6 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             let inner_width = area
                 .width
                 .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
-                .saturating_sub(TEXT_X_PADDING_U16.saturating_mul(2))
                 .max(1);
             u16::try_from(approval_status_lines(hint, usize::from(inner_width)).len())
                 .unwrap_or(u16::MAX)
@@ -1037,27 +1042,20 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         })
         .unwrap_or(0);
 
-    // Bottom-anchored, clamped to the fixed viewport. The runtime statusline is
-    // printed into the editor's top border; the workspace label sits below the
-    // editor as a quiet unboxed line. There is no separate rail and no bottom
-    // telemetry bar.
-    let workspace_line = workspace_label_line(screen, area.width);
-    let workspace_wanted = u16::from(workspace_line.is_some());
-    let heights = chrome_heights(area.height, menu_wanted, workspace_wanted, editor_rows);
-    let chrome_h = heights
-        .menu
-        .saturating_add(heights.editor)
-        .saturating_add(heights.workspace);
+    // Bottom-anchored, clamped to the fixed viewport. The composer is the
+    // unconditional two-line-plus-input tail: a full hairline top edge, the
+    // statusline, then the input rows. No box, no hint row, no separate
+    // workspace label (the workspace lives right-aligned in the statusline).
+    let heights = chrome_heights(area.height, menu_wanted, editor_rows);
+    let chrome_h = heights.menu.saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(heights.menu),
         Constraint::Length(heights.editor),
-        Constraint::Length(heights.workspace),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
     let editor_area = chunks[1];
-    let workspace_area = chunks[2];
 
     let mut buf = Buffer::empty(chrome_area);
 
@@ -1066,6 +1064,8 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     {
         render_menu_lines(&mut buf, menu_area, lines);
     }
+    // The composer column: inset two cells from the pane edge, sharing the
+    // tool-panel measure.
     let box_area = Rect {
         x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),
         y: editor_area.y,
@@ -1075,14 +1075,10 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             .max(1),
         height: editor_area.height,
     };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style())
-        .render(box_area, &mut buf);
     let text_area = Rect {
-        x: box_area.x + 2.min(box_area.width.saturating_sub(1)),
+        x: box_area.x,
         y: editor_area.y + 2.min(editor_area.height.saturating_sub(1)),
-        width: box_area.width.saturating_sub(TEXT_X_PADDING_U16 * 2).max(1),
+        width: box_area.width,
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
@@ -1101,31 +1097,17 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             cursor_cell = find_reversed_cell(&buf, text_area);
         }
     }
-    let hint = if screen.approval_hint.is_some() || editor_area.height < MIN_EDITOR_H {
-        Line::default()
-    } else {
-        Line::from(Span::styled(COMPOSER_HINT, dim_style()))
-    };
-    let hint_area = Rect {
-        x: box_area.x + 2.min(box_area.width.saturating_sub(1)),
-        y: box_area.y.saturating_add(box_area.height.saturating_sub(2)),
-        width: box_area.width.saturating_sub(4).max(1),
-        height: 1,
-    };
-    if !hint.spans.is_empty() {
-        Paragraph::new(Text::from(vec![hint])).render(hint_area, &mut buf);
+    // The composer's two chrome rows: the full-width hairline top edge, then
+    // the statusline. Painted last so they are never overwritten by the
+    // textarea/approval body at very small heights.
+    if heights.editor > 0 {
+        let hairline = composer_hairline(usize::from(box_area.width));
+        buf.set_line(box_area.x, box_area.y, &hairline, box_area.width);
     }
-    // Print the statusline into the editor's top border last so it is never
-    // overwritten by the textarea/approval body at very small heights.
-    if heights.editor > 0
-        && let Some(top_border) = composer_top_border(screen, box_area.width)
+    if heights.editor > 1
+        && let Some(statusline) = composer_statusline(screen, box_area.width)
     {
-        buf.set_line(box_area.x, box_area.y, &top_border, box_area.width);
-    }
-    if heights.workspace > 0
-        && let Some(line) = workspace_line
-    {
-        Paragraph::new(Text::from(vec![line])).render(workspace_area, &mut buf);
+        buf.set_line(box_area.x, box_area.y + 1, &statusline, box_area.width);
     }
     buffer_to_lines(&buf, cursor_cell)
 }

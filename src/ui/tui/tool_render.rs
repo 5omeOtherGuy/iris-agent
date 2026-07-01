@@ -33,6 +33,7 @@ use crate::nexus::ToolCall;
 use crate::tool_display::{
     bash_timeout_secs, command_display, display_path, exploration_summary, run_target, summarize,
 };
+use crate::ui::palette;
 use crate::ui::symbols;
 
 use super::rows::{ChromeRow, FoldVis, TranscriptRow};
@@ -173,15 +174,151 @@ impl ToolRenderer for ExploreRenderer {
             .unwrap_or_else(|| "workspace".to_string())
     }
 
-    fn body(&self, _ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
+    fn plain_meta(&self, call: &ToolCall) -> String {
+        exploration_summary(call)
+    }
+
+    fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
         // The grouped EXPLORE panel replaces a single stored row in place, so
         // this renderer is constrained to exactly one row.
-        let (text, style) = match outcome {
-            ToolOutcome::Error { message, .. } => (format!("error: {message}"), err_style()),
-            _ => (exploration_summary(call), dim_style()),
-        };
-        vec![styled_row(text, style)]
+        vec![explore_op_row(ctx.width, call, outcome)]
     }
+}
+
+/// One EXPLORE op row (`ExploreOutput` design-system component):
+/// `VERB   target [code][after]                          meta(count)` — verb in
+/// a fixed 5-cell column, target in ink, a grep/find pattern in cyan, the scope
+/// muted, and a right-aligned honest count derived from the finished result.
+fn explore_op_row(width: usize, call: &ToolCall, outcome: &ToolOutcome) -> TranscriptRow {
+    if let ToolOutcome::Error { message, .. } = outcome {
+        return styled_row(format!("error: {message}"), err_style());
+    }
+    let verb = explore_verb(call);
+    let mut spans = vec![Span::styled(format!("{verb:<5}  "), panel_style())];
+    let mut plain = format!("{verb:<5}  ");
+    let path = tool_path_arg(call).map(display_path);
+    match call.name.as_str() {
+        "grep" | "find" => {
+            let pattern = call
+                .arguments
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<missing pattern>");
+            let code = format!("\"{pattern}\"");
+            spans.push(Span::styled(
+                code.clone(),
+                Style::default().fg(palette::CYAN),
+            ));
+            plain.push_str(&code);
+            let scope = path.unwrap_or_default();
+            if !scope.is_empty() {
+                let after = format!(" in {scope}");
+                spans.push(Span::styled(after.clone(), dim_style()));
+                plain.push_str(&after);
+            }
+        }
+        _ => {
+            let target = path.unwrap_or_else(|| ".".to_string());
+            spans.push(Span::styled(target.clone(), panel_style()));
+            plain.push_str(&target);
+        }
+    }
+    // Right-aligned count, only when the op finished and the count is real.
+    if let ToolOutcome::Done { content, .. } = outcome
+        && let Some(meta) = explore_result_meta(call, content)
+    {
+        let left_w = display_width(&plain);
+        let meta_w = display_width(&meta);
+        if left_w + 2 + meta_w <= width {
+            let gap = width - left_w - meta_w;
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(meta.clone(), dim_style()));
+            plain.push_str(&" ".repeat(gap));
+            plain.push_str(&meta);
+        }
+    }
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Body {
+            line: Line::from(spans),
+            bg: None,
+        },
+        plain,
+        panel_style(),
+    )
+}
+
+/// The fixed EXPLORE verb column: `Read` · `Grep` · `List` · `Find`.
+fn explore_verb(call: &ToolCall) -> &'static str {
+    match call.name.as_str() {
+        "read" => "Read",
+        "grep" => "Grep",
+        "ls" => "List",
+        "find" => "Find",
+        _ => "Read",
+    }
+}
+
+/// Honest right-aligned counts for a finished EXPLORE op, derived from the
+/// tool's own rendered output. Returns `None` when no real count is available
+/// (counts are real or omitted — never guessed).
+fn explore_result_meta(call: &ToolCall, content: &str) -> Option<String> {
+    match call.name.as_str() {
+        "read" => {
+            let lines = content
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.split_once('\u{2192}').is_some_and(|(num, _)| {
+                        !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())
+                    })
+                })
+                .count();
+            (lines > 0).then(|| format!("{lines} lines"))
+        }
+        "grep" => grep_result_meta(content),
+        "ls" | "find" => {
+            let entries = content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            Some(format!(
+                "{entries} {}",
+                if entries == 1 { "entry" } else { "entries" }
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Parse the grep tool's own summary header (`"3 matches in 2 files"` /
+/// `"Found 4 files"` / a no-matches note) into the compact `┊`-free meta
+/// (`3 matches · 2 files`).
+fn grep_result_meta(content: &str) -> Option<String> {
+    let first = content.lines().next()?.trim();
+    if let Some(rest) = first.strip_prefix("Found ") {
+        let mut words = rest.split_whitespace();
+        let count: usize = words.next()?.parse().ok()?;
+        return Some(format!(
+            "{count} {}",
+            if count == 1 { "file" } else { "files" }
+        ));
+    }
+    if first.starts_with("No matches") {
+        return Some("0 matches".to_string());
+    }
+    // "{N} match(es) in {M} file(s)"
+    let mut words = first.split_whitespace();
+    let matches: usize = words.next()?.parse().ok()?;
+    let match_word = words.next()?;
+    if !match_word.starts_with("match") || words.next()? != "in" {
+        return None;
+    }
+    let files: usize = words.next()?.parse().ok()?;
+    Some(format!(
+        "{matches} {} · {files} {}",
+        if matches == 1 { "match" } else { "matches" },
+        if files == 1 { "file" } else { "files" }
+    ))
 }
 
 /// Build a single-row, single-style panel body line carrying both the styled
@@ -249,7 +386,8 @@ impl ToolRenderer for ShellRenderer {
                 // would fabricate a status the run never reported, so the row
                 // is omitted rather than guessed.
                 if let Some(code) = exit_code {
-                    body.push(shell_result_row(*code));
+                    body.line("", panel_style());
+                    body.push(shell_result_row(*code, shell_result_meta(content, *code)));
                 }
             }
             ToolOutcome::Error { message, streamed } => {
@@ -268,14 +406,15 @@ impl ToolRenderer for ShellRenderer {
     }
 }
 
-/// The SHELL panel's closing exit-status row: `◆ exit 0` on success, `■ exit
-/// <code>` on failure, glyph and label sharing one color (mirrors the
-/// design-system `ShellOutput` `ResultRow` and Iris's own EDIT diff footer).
+/// The SHELL panel's closing exit-status row: `◆ EXIT 0  ┊ 142 passed · 0
+/// failed` on success, `■ EXIT <code>  ┊ <meta>` on failure — glyph + bold
+/// uppercase label sharing one color, then a muted `┊ meta` summary when the
+/// output yields an honest one (the design-system `ShellOutput` `ResultRow`).
 /// Always `FoldVis::Always`, by design: unlike the web reference (which hides
 /// its `ResultRow` while collapsed), the row stays visible even in a folded
 /// SHELL panel's capped preview, since exit status is exactly the kind of
 /// thing a glance at a collapsed panel should still answer.
-fn shell_result_row(code: i32) -> TranscriptRow {
+fn shell_result_row(code: i32, meta: Option<String>) -> TranscriptRow {
     let failed = code != 0;
     let symbol = if failed {
         symbols::ERROR
@@ -283,7 +422,79 @@ fn shell_result_row(code: i32) -> TranscriptRow {
         symbols::DONE
     };
     let style = if failed { err_style() } else { ok_style() };
-    styled_row(format!("{symbol} exit {code}"), style)
+    let label = format!("{symbol} EXIT {code}");
+    let mut plain = label.clone();
+    let mut spans = vec![Span::styled(
+        label,
+        style.add_modifier(ratatui::style::Modifier::BOLD),
+    )];
+    if let Some(meta) = meta {
+        let aside = format!("  {} {meta}", symbols::SEP);
+        plain.push_str(&aside);
+        spans.push(Span::styled(aside, dim_style()));
+    }
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Body {
+            line: Line::from(spans),
+            bg: None,
+        },
+        plain,
+        style,
+    )
+}
+
+/// A muted, honest one-line summary of a finished command's output for the
+/// exit row: test totals (`142 passed · 0 failed`) or an error count
+/// (`3 errors`). Derived only from what the output actually says; `None` when
+/// nothing summarizable is present (never asserts what the run didn't report).
+fn shell_result_meta(content: &str, code: i32) -> Option<String> {
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+    let mut saw_test_result = false;
+    for line in content.lines() {
+        // cargo test / libtest: "test result: ok. 142 passed; 0 failed; ..."
+        if let Some(rest) = line.trim_start().strip_prefix("test result:") {
+            for part in rest.split(&[';', '.'][..]) {
+                let mut words = part.split_whitespace();
+                let (Some(count), Some(noun)) = (words.next(), words.next()) else {
+                    continue;
+                };
+                let Ok(count) = count.parse::<u64>() else {
+                    continue;
+                };
+                match noun {
+                    "passed" => {
+                        passed += count;
+                        saw_test_result = true;
+                    }
+                    "failed" => {
+                        failed += count;
+                        saw_test_result = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if saw_test_result {
+        return Some(format!("{passed} passed · {failed} failed"));
+    }
+    if code != 0 {
+        let errors = content
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                t.starts_with("error:") || t.starts_with("error[")
+            })
+            .count();
+        if errors > 0 {
+            return Some(format!(
+                "{errors} {}",
+                if errors == 1 { "error" } else { "errors" }
+            ));
+        }
+    }
+    None
 }
 
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
@@ -487,8 +698,23 @@ impl PanelBody {
     fn command_row(&mut self, command: &str, timeout: Option<u64>) {
         let command = truncate_chars(command, MAX_TOOL_OUTPUT_LINE_CHARS);
         let left = format!("$ {command}");
+        // The `$ ` prompt is quiet chrome (muted); the command itself is the
+        // brightest thing in the body (ShellOutput `cmd` line grammar).
+        let cmd_spans = |command: &str| {
+            vec![
+                Span::styled("$ ", dim_style()),
+                Span::styled(command.to_string(), panel_style()),
+            ]
+        };
         let Some(secs) = timeout.filter(|secs| *secs > 0) else {
-            self.line(&left, panel_style());
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::from(cmd_spans(&command)),
+                    bg: None,
+                },
+                left,
+                panel_style(),
+            ));
             return;
         };
         let hint = format!("timeout {secs}s");
@@ -498,11 +724,9 @@ impl PanelBody {
         if left_w + 1 + hint_w <= width {
             let gap = width - left_w - hint_w;
             let plain = format!("{left}{}{hint}", " ".repeat(gap));
-            let spans = vec![
-                Span::styled(left, panel_style()),
-                Span::styled(" ".repeat(gap), panel_style()),
-                Span::styled(hint, dim_style()),
-            ];
+            let mut spans = cmd_spans(&command);
+            spans.push(Span::styled(" ".repeat(gap), panel_style()));
+            spans.push(Span::styled(hint, dim_style()));
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
                     line: Line::from(spans),
@@ -512,7 +736,14 @@ impl PanelBody {
                 panel_style(),
             ));
         } else {
-            self.line(&left, panel_style());
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::from(cmd_spans(&command)),
+                    bg: None,
+                },
+                left,
+                panel_style(),
+            ));
             let text = right_align_hint("", &hint, width);
             self.line_folded(&text, dim_style(), FoldVis::Always);
         }
@@ -815,7 +1046,7 @@ mod tests {
             },
         );
         assert_eq!(done.len(), 1);
-        assert_eq!(done[0].text, "Search needle in src");
+        assert_eq!(done[0].text, "Grep   \"needle\" in src");
         let errored = renderer.body(
             &ctx,
             &call("grep", json!({ "pattern": "needle", "path": "src" })),
@@ -1038,7 +1269,7 @@ mod tests {
             },
         );
         let last = rows.last().expect("expected a result row");
-        assert_eq!(last.text, "\u{25c6} exit 0", "{}", last.text);
+        assert_eq!(last.text, "\u{25c6} EXIT 0", "{}", last.text);
         assert_eq!(last.style.fg, ok_style().fg);
     }
 
@@ -1055,7 +1286,7 @@ mod tests {
             },
         );
         let last = rows.last().expect("expected a result row");
-        assert_eq!(last.text, "\u{25a0} exit 1", "{}", last.text);
+        assert_eq!(last.text, "\u{25a0} EXIT 1", "{}", last.text);
         assert_eq!(last.style.fg, err_style().fg);
     }
 
@@ -1123,7 +1354,7 @@ mod tests {
                 exit_code: Some(0),
             },
         );
-        let result_rows: Vec<_> = rows.iter().filter(|r| r.text.contains("exit 0")).collect();
+        let result_rows: Vec<_> = rows.iter().filter(|r| r.text.contains("EXIT 0")).collect();
         assert_eq!(
             result_rows.len(),
             1,
@@ -1135,7 +1366,7 @@ mod tests {
             "{}",
             result_rows[0].text
         );
-        assert_eq!(rows.last().unwrap().text, "\u{25c6} exit 0");
+        assert_eq!(rows.last().unwrap().text, "\u{25c6} EXIT 0");
     }
 
     #[test]

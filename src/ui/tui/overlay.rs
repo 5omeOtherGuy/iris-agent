@@ -24,15 +24,15 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::ui::slash::{self, Palette, SlashCommand};
 
 use super::component::Component;
-use super::wrap::display_width;
-use super::{TEXT_COLUMN_X_PADDING_U16, dim_style};
+use super::wrap::{display_width, line_text, truncate_line};
+use super::{TEXT_COLUMN_X_PADDING_U16, border_style, dim_style};
 
 /// Which layer currently owns keyboard input.
 ///
@@ -48,6 +48,82 @@ pub(crate) enum FocusTarget {
     Palette,
     /// A modal/picker/dialog docked above the composer.
     Modal,
+}
+
+/// Build a bordered top-layer overlay box (the `Picker`/`SlashMenu` idiom): an
+/// optional uppercase title row, selectable rows (the highlighted row gets the
+/// `surface` fill — never a colored border), and an optional dim footer of key
+/// hints, all inside one square box-drawing frame. Content-fit width, clamped
+/// to the available column.
+pub(crate) fn overlay_box(
+    title: Option<&str>,
+    rows: Vec<(Line<'static>, bool)>,
+    footer: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let max_inner = width.saturating_sub(4).max(8);
+    let content_max = rows
+        .iter()
+        .map(|(line, _)| display_width(&line_text(line)))
+        .chain(title.map(display_width))
+        .chain(footer.map(display_width))
+        .max()
+        .unwrap_or(0);
+    let inner = content_max.clamp(16, max_inner);
+    let rule = |left: char, right: char| {
+        Line::from(Span::styled(
+            format!("{left}{}{right}", "─".repeat(inner + 2)),
+            border_style(),
+        ))
+    };
+    let boxed_row = |mut line: Line<'static>, selected: bool| {
+        truncate_line(&mut line, inner);
+        let used = display_width(&line_text(&line));
+        if selected {
+            for span in &mut line.spans {
+                span.style = span.style.bg(crate::ui::palette::SURFACE);
+            }
+        }
+        let pad_style = if selected {
+            Style::default().bg(crate::ui::palette::SURFACE)
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![
+            Span::styled("│".to_string(), border_style()),
+            Span::styled(" ".to_string(), pad_style),
+        ];
+        spans.extend(line.spans);
+        if used < inner {
+            spans.push(Span::styled(" ".repeat(inner - used), pad_style));
+        }
+        spans.push(Span::styled(" ".to_string(), pad_style));
+        spans.push(Span::styled("│".to_string(), border_style()));
+        Line::from(spans)
+    };
+    let mut out = vec![rule('┌', '┐')];
+    if let Some(title) = title {
+        out.push(boxed_row(
+            Line::from(Span::styled(
+                title.to_uppercase(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            false,
+        ));
+        out.push(rule('├', '┤'));
+    }
+    for (line, selected) in rows {
+        out.push(boxed_row(line, selected));
+    }
+    if let Some(footer) = footer {
+        out.push(rule('├', '┤'));
+        out.push(boxed_row(
+            Line::from(Span::styled(footer.to_string(), dim_style())),
+            false,
+        ));
+    }
+    out.push(rule('└', '┘'));
+    out
 }
 
 /// A [`Component`] view over the slash palette's current matches and selection.
@@ -71,38 +147,44 @@ impl<'a> PaletteView<'a> {
 }
 
 impl Component for PaletteView<'_> {
-    fn render(&self, _width: usize) -> Vec<Line<'static>> {
+    fn render(&self, width: usize) -> Vec<Line<'static>> {
+        if self.matches.is_empty() {
+            return Vec::new();
+        }
         let command_width = self
             .matches
             .iter()
             .map(|cmd| display_width(cmd.name))
             .max()
             .unwrap_or(0);
-        self.matches
+        let rows: Vec<(Line<'static>, bool)> = self
+            .matches
             .iter()
             .enumerate()
             .map(|(i, cmd)| {
                 let selected_row = i == self.selected;
+                // The highlighted row gets the surface fill (overlay_box) plus
+                // a bold command name; the description stays muted. Never a
+                // color-only selection accent.
                 let name_style = if selected_row {
-                    Style::default().fg(crate::ui::palette::CYAN)
+                    Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                };
-                let description_style = if selected_row {
-                    Style::default().fg(crate::ui::palette::CYAN)
-                } else {
-                    dim_style()
                 };
                 let gap = command_width
                     .saturating_sub(display_width(cmd.name))
                     .saturating_add(2);
-                Line::from(vec![
-                    Span::styled(cmd.name.to_string(), name_style),
-                    Span::raw(" ".repeat(gap)),
-                    Span::styled(cmd.description, description_style),
-                ])
+                (
+                    Line::from(vec![
+                        Span::styled(cmd.name.to_string(), name_style),
+                        Span::raw(" ".repeat(gap)),
+                        Span::styled(cmd.description, dim_style()),
+                    ]),
+                    selected_row,
+                )
             })
-            .collect()
+            .collect();
+        overlay_box(None, rows, None, width)
     }
 }
 
@@ -140,26 +222,47 @@ mod tests {
     }
 
     #[test]
-    fn palette_view_renders_one_line_per_match_with_selection_accent() {
+    fn palette_view_renders_framed_rows_with_surface_selection() {
         let mut palette = Palette::default();
         palette.sync("/");
         palette.down("/"); // select row 1
         let view = PaletteView::for_palette(&palette, "/");
         let lines = view.render(80);
-        assert_eq!(lines.len(), slash::matches("/").len());
-        assert!(lines.len() > 1);
-        // The selected row (1) is accented cyan on both name and description.
-        let selected = &lines[1];
+        // One boxed row per match, plus the top and bottom frame rules.
+        assert_eq!(lines.len(), slash::matches("/").len() + 2);
+        // The selected row uses the surface fill + a bold command name — never
+        // a color-only (cyan) accent.
+        let selected = &lines[2];
         assert!(
             selected
                 .spans
                 .iter()
-                .any(|s| s.style.fg == Some(Color::Cyan)),
-            "selected row should be cyan-accented"
+                .any(|s| s.style.bg == Some(crate::ui::palette::SURFACE)),
+            "selected row should carry the surface fill: {selected:?}"
         );
-        // A non-selected row uses the default name style (no cyan name).
-        let other = &lines[0];
-        assert_ne!(other.spans[0].style.fg, Some(Color::Cyan));
+        assert!(
+            selected
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "selected command name should be bold: {selected:?}"
+        );
+        assert!(
+            selected
+                .spans
+                .iter()
+                .all(|s| s.style.fg != Some(Color::Cyan)),
+            "no cyan selection accent: {selected:?}"
+        );
+        // A non-selected row has no fill.
+        let other = &lines[1];
+        assert!(
+            other
+                .spans
+                .iter()
+                .all(|s| s.style.bg != Some(crate::ui::palette::SURFACE)),
+            "unselected rows are unfilled: {other:?}"
+        );
     }
 
     #[test]
