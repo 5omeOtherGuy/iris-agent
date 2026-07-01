@@ -249,7 +249,18 @@ impl ToolRenderer for ShellRenderer {
                 // would fabricate a status the run never reported, so the row
                 // is omitted rather than guessed.
                 if let Some(code) = exit_code {
-                    body.push(shell_result_row(*code));
+                    // Per the design-system `ShellOutput`, the exit-status row
+                    // hides in a collapsed capped preview and reappears when
+                    // expanded -- but only once the OUTPUT itself has made the
+                    // panel foldable. On a short panel that shows in full, the
+                    // row must stay `Always`, otherwise a non-`Always` row would
+                    // itself force an always-expanded panel to fold.
+                    let fold = if body.is_foldable() {
+                        FoldVis::WhenExpanded
+                    } else {
+                        FoldVis::Always
+                    };
+                    body.push(shell_result_row(*code, fold));
                 }
             }
             ToolOutcome::Error { message, streamed } => {
@@ -271,11 +282,10 @@ impl ToolRenderer for ShellRenderer {
 /// The SHELL panel's closing exit-status row: `◆ exit 0` on success, `■ exit
 /// <code>` on failure, glyph and label sharing one color (mirrors the
 /// design-system `ShellOutput` `ResultRow` and Iris's own EDIT diff footer).
-/// Always `FoldVis::Always`, by design: unlike the web reference (which hides
-/// its `ResultRow` while collapsed), the row stays visible even in a folded
-/// SHELL panel's capped preview, since exit status is exactly the kind of
-/// thing a glance at a collapsed panel should still answer.
-fn shell_result_row(code: i32) -> TranscriptRow {
+/// `fold` matches the `ShellOutput` reference: `WhenExpanded` (hidden in a
+/// collapsed capped preview, shown when expanded) for a foldable panel, and
+/// `Always` for a short panel whose output already shows in full.
+fn shell_result_row(code: i32, fold: FoldVis) -> TranscriptRow {
     let failed = code != 0;
     let symbol = if failed {
         symbols::ERROR
@@ -283,7 +293,7 @@ fn shell_result_row(code: i32) -> TranscriptRow {
         symbols::DONE
     };
     let style = if failed { err_style() } else { ok_style() };
-    styled_row(format!("{symbol} exit {code}"), style)
+    styled_row(format!("{symbol} exit {code}"), style).with_fold(fold)
 }
 
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
@@ -407,6 +417,15 @@ impl PanelBody {
     /// Push a pre-built row (e.g. the SHELL exit-status row) verbatim.
     fn push(&mut self, row: TranscriptRow) {
         self.rows.push(row);
+    }
+
+    /// Whether the body accumulated so far has made the panel foldable: true
+    /// once any row carries a non-`Always` fold (a capped-preview / expanded
+    /// pair). Mirrors the transcript's own foldability test so the SHELL result
+    /// row can track the panel's existing collapse state instead of creating
+    /// it.
+    fn is_foldable(&self) -> bool {
+        self.rows.iter().any(|row| row.fold != FoldVis::Always)
     }
 
     /// Render the structured command region: the `$` prompt row (carrying the
@@ -1104,11 +1123,11 @@ mod tests {
     }
 
     #[test]
-    fn shell_result_row_survives_output_folding_in_both_collapsed_and_expanded_sets() {
-        // The result row is `FoldVis::Always` by design (unlike the web
-        // reference's `ResultRow`, which hides while collapsed): exit status
-        // should stay visible even when a long command's output is folded to a
-        // capped preview.
+    fn shell_result_row_hides_when_collapsed_and_shows_when_expanded_for_folded_output() {
+        // Per the design-system `ShellOutput`, the exit-status row is hidden in
+        // a collapsed capped preview (`WhenExpanded`) and reappears when the
+        // panel is expanded -- so a folded panel's preview stays a clean
+        // head/tail slice.
         let content = (0..200)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1131,9 +1150,45 @@ mod tests {
             rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
         );
         assert!(
-            result_rows[0].fold == FoldVis::Always,
-            "{}",
+            result_rows[0].fold == FoldVis::WhenExpanded,
+            "folded panel's result row must hide while collapsed: {}",
             result_rows[0].text
+        );
+        // Hidden from the collapsed-visible set (fold != WhenExpanded), present
+        // in the expanded-visible set (fold != WhenCollapsed).
+        assert!(
+            !rows
+                .iter()
+                .filter(|r| r.fold != FoldVis::WhenExpanded)
+                .any(|r| r.text.contains("exit 0")),
+            "result row must not appear in the collapsed preview"
+        );
+        assert!(
+            rows.iter()
+                .filter(|r| r.fold != FoldVis::WhenCollapsed)
+                .any(|r| r.text.contains("exit 0")),
+            "result row must appear in the expanded set"
+        );
+    }
+
+    #[test]
+    fn shell_result_row_stays_always_visible_for_short_unfolded_output() {
+        // A short panel shows its output in full and is not foldable; the
+        // result row must stay `Always` so it never forces the panel to fold.
+        let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "echo hi" })),
+            &ToolOutcome::Done {
+                content: "hi",
+                exit_code: Some(0),
+            },
+        );
+        assert!(
+            rows.iter().all(|r| r.fold == FoldVis::Always),
+            "short shell panel must not become foldable: {:?}",
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
         );
         assert_eq!(rows.last().unwrap().text, "\u{25c6} exit 0");
     }
