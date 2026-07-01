@@ -23,6 +23,11 @@ pub(crate) const GREEN: Color = Color::Green;
 /// `danger` — ERROR / DENIED / diff removals. ANSI Red.
 pub(crate) const RED: Color = Color::Red;
 
+/// `surface` — selection / active-row fill (overlay row highlight). The single
+/// permitted tonal fill; never used behind whole panels or regions. Indexed(236)
+/// approximates the `#323238` dark reference while staying in the 256-color set.
+pub(crate) const SURFACE: Color = Color::Indexed(236);
+
 /// `add-bg` — diff addition row background. Indexed(22).
 pub(crate) const DIFF_ADD_BG: Color = Color::Indexed(22);
 

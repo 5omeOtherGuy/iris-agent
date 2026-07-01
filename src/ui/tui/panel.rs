@@ -155,19 +155,45 @@ pub(super) fn panel_body_lines(
     }
 }
 
-/// A reasoning-rail header: `┊ ▾ THINKING` (expanded) / `┊ ▸ THINKING`
-/// (collapsed), muted and indented to the transcript text column. No box —
-/// reasoning is recessive; the rail is the only chrome it gets (ThinkingBlock).
-pub(super) fn rail_header_line(width: usize, expanded: bool, label: &str) -> Line<'static> {
-    let arrow = if expanded {
-        symbols::EXPANDED
+/// A reasoning-rail header: `▾ THINKING` (expanded) / `▸ THINKING` (collapsed),
+/// muted, bold label, indented to the transcript text column, with optional
+/// right-aligned telemetry (`↓2.4k 12s`). No box — reasoning is recessive; the
+/// `┊` rail on its body rows is the only chrome it gets (ThinkingBlock). A
+/// non-foldable (short) block drops the disclosure arrow.
+pub(super) fn rail_header_line(
+    width: usize,
+    expanded: bool,
+    foldable: bool,
+    label: &str,
+    right: &str,
+) -> Line<'static> {
+    let left = if foldable {
+        let arrow = if expanded {
+            symbols::EXPANDED
+        } else {
+            symbols::COLLAPSED
+        };
+        format!("{arrow} {label}")
     } else {
-        symbols::COLLAPSED
+        label.to_string()
     };
-    let mut line = Line::from(Span::styled(
-        format!("{} {arrow} {label}", symbols::SEP),
-        dim_style(),
-    ));
+    let mut spans = vec![Span::styled(
+        left.clone(),
+        dim_style().add_modifier(Modifier::BOLD),
+    )];
+    if !right.is_empty() {
+        let content_width = width
+            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+            .max(1);
+        let gap = content_width
+            .saturating_sub(display_width(&left))
+            .saturating_sub(display_width(right));
+        if gap >= 1 {
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(right.to_string(), dim_style()));
+        }
+    }
+    let mut line = Line::from(spans);
     pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
     truncate_line(&mut line, width.max(1));
     line
@@ -203,6 +229,8 @@ pub(super) enum PanelState {
     Done,
     Error,
     Cancelled,
+    /// A pending mutation awaiting apply/approval (`◇ PREVIEW`, no elapsed).
+    Preview,
 }
 
 impl PanelState {
@@ -212,6 +240,7 @@ impl PanelState {
             Self::Done => " DONE",
             Self::Error => " ERROR",
             Self::Cancelled => " CANCELLED",
+            Self::Preview => " PREVIEW",
         }
     }
 
@@ -224,6 +253,7 @@ impl PanelState {
             Self::Done => symbols::DONE,
             Self::Error => symbols::ERROR,
             Self::Cancelled => symbols::CANCELLED,
+            Self::Preview => symbols::PREVIEW,
         }
     }
 
@@ -232,8 +262,14 @@ impl PanelState {
             Self::Running => prompt_style(),
             Self::Done => ok_style(),
             Self::Error => err_style(),
-            Self::Cancelled => dim_style(),
+            Self::Cancelled | Self::Preview => dim_style(),
         }
+    }
+
+    /// Header label style: the state color plus BOLD, so symbol + label share
+    /// one signal (the `StateSymbol` component: `◆ DONE` reads green as a unit).
+    pub(super) fn label_style(self) -> Style {
+        self.dot_style().add_modifier(Modifier::BOLD)
     }
 
     pub(super) fn plain_prefix(self) -> &'static str {
@@ -242,6 +278,7 @@ impl PanelState {
             Self::Done => "• Ran",
             Self::Error => "✗ Ran",
             Self::Cancelled => "• Cancelled",
+            Self::Preview => "• Preview",
         }
     }
 }

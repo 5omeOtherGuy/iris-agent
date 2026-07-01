@@ -191,6 +191,11 @@ pub(super) enum ChromeRow {
     RailHeader {
         expanded: bool,
         label: String,
+        /// Right-aligned dim telemetry (`↓2.4k 12s`); empty for none.
+        right: String,
+        /// Whether the block folds (drives the `▾`/`▸` disclosure arrow; a
+        /// short trace shown whole has no arrow and ignores ctrl+o).
+        foldable: bool,
     },
     /// The end marker of a reasoning rail — the rail analogue of `Bottom`. Bounds
     /// the block for `panel_end_from`/the visibility reset and renders as a single
@@ -211,7 +216,12 @@ impl ChromeRow {
             ChromeRow::Separator => panel_rule_line(width, '├', '┤'),
             ChromeRow::Bottom => panel_rule_line(width, '└', '┘'),
             ChromeRow::Body { line, bg } => panel_body_line(width, line.clone(), *bg),
-            ChromeRow::RailHeader { expanded, label } => rail_header_line(width, *expanded, label),
+            ChromeRow::RailHeader {
+                expanded,
+                label,
+                right,
+                foldable,
+            } => rail_header_line(width, *expanded, *foldable, label, right),
             ChromeRow::RailEnd => Line::default(),
         }
     }

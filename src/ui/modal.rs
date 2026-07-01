@@ -12,7 +12,7 @@
 //! gathered by the loop/cli layer and passed in at construction, keeping disk and
 //! auth lookups out of per-keystroke handling and out of this presentation code.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::mimir::model_capabilities;
@@ -161,61 +161,62 @@ fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
-fn accent() -> Style {
-    Style::default().fg(crate::ui::palette::CYAN)
-}
-
-fn muted() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
-
-/// Render the shared search line + windowed rows for a [`Selector`] into `out`.
-/// `empty` is the message shown when no rows match.
-fn render_selector(selector: &Selector, empty: &str, out: &mut Vec<Line<'static>>) {
+/// Render the shared search line + windowed rows for a [`Selector`] as overlay
+/// rows: `(line, selected)` pairs for [`overlay_box`], which gives the selected
+/// row the surface fill (never a colored accent). The selected label is bold;
+/// metadata stays muted; an enabled/disabled mark uses the `◉`/`○` glyphs from
+/// the closed vocabulary (never `[x]`). `empty` is the no-match message.
+fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'static>, bool)> {
+    let mut out: Vec<(Line<'static>, bool)> = Vec::new();
     if selector.searchable() {
         let search = selector.search().unwrap_or("");
-        out.push(Line::from(vec![
-            Span::styled("> ", dim()),
-            Span::raw(search.to_string()),
-        ]));
-        out.push(Line::from(""));
+        out.push((
+            Line::from(vec![
+                Span::styled("> ", dim()),
+                Span::raw(search.to_string()),
+            ]),
+            false,
+        ));
     }
     if selector.is_empty() {
-        out.push(Line::from(Span::styled(empty.to_string(), muted())));
-        return;
+        out.push((Line::from(Span::styled(empty.to_string(), dim())), false));
+        return out;
     }
     for row in selector.visible() {
         let mut spans = Vec::new();
         let base = if row.selected {
-            accent()
+            Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let secondary = if row.selected { accent() } else { dim() };
         if let Some(enabled) = row.item.enabled {
             spans.push(Span::styled(
-                if enabled { "[x] " } else { "[ ] " },
+                if enabled { "◉ " } else { "○ " },
                 if enabled {
-                    Style::default().fg(Color::Green)
+                    Style::default().fg(crate::ui::palette::ORANGE)
                 } else {
-                    muted()
+                    dim()
                 },
             ));
         }
         spans.push(Span::styled(row.item.label.clone(), base));
         if let Some(detail) = &row.item.detail {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("[{detail}]"), secondary));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(detail.clone(), dim()));
         }
         if let Some(trailing) = &row.item.trailing {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(trailing.clone(), secondary));
+            spans.push(Span::styled(trailing.clone(), dim()));
         }
-        out.push(Line::from(spans));
+        out.push((Line::from(spans), row.selected));
     }
     if selector.is_scrolled() {
-        out.push(Line::from(Span::styled(selector.position_label(), muted())));
+        out.push((
+            Line::from(Span::styled(selector.position_label(), dim())),
+            false,
+        ));
     }
+    out
 }
 
 // --- model picker ---
@@ -334,75 +335,57 @@ impl ModelPicker {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-
-        // Column widths so the label and name columns line up.
-        let default_w = "Default".len();
-        let current_w = "current".len();
+        // The Picker idiom from the design system: `◉` marks the current
+        // model (orange), the label is bold on the highlighted (surface-fill)
+        // row, and the provider is the muted right column. The default model
+        // carries a quiet `default` tag instead of a column of labels.
         let name_w = self
             .models
             .iter()
             .map(|m| model_catalog::display_name(&m.qualified()).len())
             .max()
             .unwrap_or(0);
-
+        let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
         for row in self.selector.visible() {
             let qualified = row.item.id.clone();
             let model = self.models.iter().find(|m| m.qualified() == qualified);
             let base = if row.selected {
-                accent()
+                Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let secondary = if row.selected { accent() } else { dim() };
-            let mut spans = Vec::new();
-            let default = if qualified == self.default {
-                "Default"
+            let marker = if qualified == self.current {
+                Span::styled("◉ ", Style::default().fg(crate::ui::palette::ORANGE))
             } else {
-                ""
-            };
-            let current = if qualified == self.current {
-                "current"
-            } else {
-                ""
+                Span::raw("  ")
             };
             let name = model_catalog::display_name(&qualified);
-            spans.push(Span::styled(format!("{default:<default_w$}  "), base));
-            spans.push(Span::styled(format!("{current:<current_w$}  "), base));
-            spans.push(Span::styled(format!("{name:<name_w$}  "), base));
-            if let Some(ctx) = model_catalog::ctx_label(&qualified) {
-                spans.push(Span::styled(format!("[ctx:{ctx}]  "), secondary));
-            }
+            let mut spans = vec![marker, Span::styled(format!("{name:<name_w$}"), base)];
             if let Some(m) = model {
-                spans.push(Span::styled(
-                    format!("[{}] ", m.provider.display_name()),
-                    secondary,
-                ));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(m.provider.display_name().to_string(), dim()));
             }
-            spans.push(Span::styled("[sub]", secondary));
-            out.push(Line::from(spans));
+            if qualified == self.default {
+                spans.push(Span::styled("  default", dim()));
+            }
+            rows.push((Line::from(spans), row.selected));
         }
         if self.selector.is_scrolled() {
-            out.push(Line::from(Span::styled(
-                self.selector.position_label(),
-                muted(),
-            )));
+            rows.push((
+                Line::from(Span::styled(self.selector.position_label(), dim())),
+                false,
+            ));
         }
-
-        out.push(Line::from(""));
-        out.push(Line::from(vec![
-            Span::styled("Reasoning  ", dim()),
-            Span::raw(self.display_effort().as_str()),
-            Span::styled(" effort ", dim()),
-            Span::styled("left/right to adjust", muted()),
-        ]));
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            "Enter to set as default | s to use this session only | Esc to cancel",
-            dim(),
-        )));
-        let _ = width;
-        out
+        let footer = format!(
+            "↑↓ move · ←→ effort ({}) · ↵ select · s session · esc cancel",
+            self.display_effort().as_str()
+        );
+        crate::ui::tui::overlay_box(
+            Some("Select model"),
+            rows,
+            Some(&footer),
+            usize::from(width),
+        )
     }
 }
 
@@ -699,29 +682,22 @@ impl ScopedModels {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No matching models", &mut out);
+        let rows = selector_rows(&self.selector, "No matching models");
         let count = if self.enabled.is_none() {
             "all enabled".to_string()
         } else {
             format!("{}/{} enabled", self.enabled_count(), self.candidates.len())
         };
-        let mut footer = vec![
-            Span::styled(
-                "Enter toggle  Ctrl+A all  Ctrl+X clear  Ctrl+P provider  Alt+Up/Down reorder  Ctrl+S save  ",
-                dim(),
-            ),
-            Span::raw(count),
-        ];
-        if self.dirty {
-            footer.push(Span::styled(
-                "  (unsaved)",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        out.push(Line::from(footer));
-        let _ = width;
-        out
+        let unsaved = if self.dirty { " · unsaved" } else { "" };
+        let footer = format!(
+            "↵ toggle · ctrl+a all · ctrl+x clear · ctrl+p provider · alt+↑↓ reorder · ctrl+s save · {count}{unsaved}"
+        );
+        crate::ui::tui::overlay_box(
+            Some("Scoped models"),
+            rows,
+            Some(&footer),
+            usize::from(width),
+        )
     }
 }
 
@@ -779,10 +755,13 @@ impl EffortPicker {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No levels", &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, "No levels");
+        crate::ui::tui::overlay_box(
+            Some("Reasoning effort"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -822,10 +801,13 @@ impl SettingsMenu {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No settings", &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, "No settings");
+        crate::ui::tui::overlay_box(
+            Some("Settings"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -882,10 +864,13 @@ impl MethodSelect {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No methods", &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, "No methods");
+        crate::ui::tui::overlay_box(
+            Some("Login"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -969,10 +954,17 @@ impl ProviderSelect {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, &self.empty, &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, &self.empty);
+        let title = match self.purpose {
+            ProviderPurpose::Login => "Select provider",
+            ProviderPurpose::Logout => "Logout",
+        };
+        crate::ui::tui::overlay_box(
+            Some(title),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -1040,30 +1032,30 @@ impl LoginDialog {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = vec![Line::from(vec![
-            Span::styled("Login to ", dim()),
-            Span::raw(self.provider_name.clone()),
-        ])];
-        // Wrap each body line (notably the long OAuth URL) to the modal width so
-        // it is shown in full and stays copyable, instead of being clipped by the
-        // non-wrapping Paragraph that draws the modal.
-        let wrap_at = usize::from(width).max(1);
+        let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
+        // Wrap each body line (notably the long OAuth URL) to the box's inner
+        // width so it is shown in full and stays copyable, instead of being
+        // clipped by the non-wrapping Paragraph that draws the modal.
+        let wrap_at = usize::from(width).saturating_sub(4).max(1);
         for line in &self.lines {
             for row in crate::ui::tui::wrap_to_width(line, wrap_at) {
-                out.push(Line::from(Span::raw(row)));
+                rows.push((Line::from(Span::raw(row)), false));
             }
         }
         if self.manual {
-            out.push(Line::from(Span::styled(
-                "Or paste the authorization code / full redirect URL, then Enter:",
-                dim(),
-            )));
+            rows.push((
+                Line::from(Span::styled(
+                    "Or paste the authorization code / full redirect URL, then Enter:",
+                    dim(),
+                )),
+                false,
+            ));
             for row in crate::ui::tui::wrap_to_width(&format!("> {}", self.input), wrap_at) {
-                out.push(Line::from(Span::raw(row)));
+                rows.push((Line::from(Span::raw(row)), false));
             }
         }
-        out.push(Line::from(Span::styled("Esc to cancel", dim())));
-        out
+        let title = format!("Login — {}", self.provider_name);
+        crate::ui::tui::overlay_box(Some(&title), rows, Some("esc cancel"), usize::from(width))
     }
 }
 
@@ -1132,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_render_shows_columns_effort_and_footer() {
+    fn model_picker_render_shows_picker_idiom_and_footer() {
         let picker = ModelPicker::new(
             models(),
             "openai-codex/gpt-5.5",
@@ -1140,50 +1132,59 @@ mod tests {
             ReasoningEffort::High,
         );
         let text = render_text(&picker);
-        // Text columns, active/default labels, ctx/provider/sub badges.
-        assert!(text.contains("Default"), "{text}");
-        assert!(text.contains("current"), "{text}");
-        assert!(text.contains("[ctx:300k]"), "{text}");
-        assert!(text.contains("[OpenAI]"), "{text}");
-        assert!(text.contains("[sub]"), "{text}");
-        // Inline effort + footer.
-        assert!(text.contains("high effort"), "{text}");
-        assert!(text.contains("left/right to adjust"), "{text}");
-        assert!(
-            text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
-            "{text}"
-        );
-        // The old search prompt, title, and symbolic selection markers are gone.
+        // Bordered box, uppercase title, ◉ current marker, provider meta.
+        assert!(text.contains("SELECT MODEL"), "{text}");
+        assert!(text.contains('┌') && text.contains('└'), "{text}");
+        assert!(text.contains("◉ GPT 5.5"), "{text}");
+        assert!(text.contains("OpenAI"), "{text}");
+        assert!(text.contains("default"), "{text}");
+        // Footer: honest key hints incl. the inline effort adjust.
+        assert!(text.contains("←→ effort (high)"), "{text}");
+        assert!(text.contains("↵ select"), "{text}");
+        assert!(text.contains("s session"), "{text}");
+        assert!(text.contains("esc cancel"), "{text}");
+        // The old columns/badges and search prompt are gone.
+        assert!(!text.contains("[ctx:"), "{text}");
+        assert!(!text.contains("[sub]"), "{text}");
+        assert!(!text.contains("Default  current"), "{text}");
         assert!(!text.contains("Switch between models"), "{text}");
         assert!(!text.contains('\u{276f}'), "{text}");
         assert!(!text.contains('\u{2714}'), "{text}");
-        assert!(!text.contains("tab scope"), "{text}");
-        assert!(!text.contains("Model Name:"), "{text}");
     }
 
     #[test]
-    fn selected_modal_rows_use_foreground_accent_without_bold() {
+    fn selected_modal_rows_use_surface_fill_with_bold_label() {
         let picker = ModelPicker::new(
             models(),
             "openai-codex/gpt-5.5",
             "openai-codex/gpt-5.5",
             ReasoningEffort::High,
         );
-        let selected = picker.render(80).remove(0);
+        let lines = picker.render(80);
+        let selected = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))
+            })
+            .expect("a surface-filled selected row");
 
+        // The selection is the surface fill + a bold label — never a
+        // color-only (cyan) accent.
         assert!(
             selected
                 .spans
                 .iter()
-                .any(|span| span.style.fg == Some(Color::Cyan)),
-            "selected row should be accented: {selected:?}"
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+            "selected row label should be bold: {selected:?}"
         );
         assert!(
             selected
                 .spans
                 .iter()
-                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
-            "selected row must not use bold: {selected:?}"
+                .all(|span| span.style.fg != Some(ratatui::style::Color::Cyan)),
+            "selected row must not use the cyan accent: {selected:?}"
         );
     }
 
@@ -1202,24 +1203,14 @@ mod tests {
         );
         let text = render_text(&picker);
 
-        assert!(text.contains("Default  current  Opus 4.8"), "{text}");
+        assert!(text.contains("◉ Opus 4.8"), "{text}");
         assert!(text.contains("Opus 4.8"), "{text}");
         assert!(text.contains("Sonnet 4.6"), "{text}");
         assert!(text.contains("Haiku 4.5"), "{text}");
         assert!(text.contains("GPT 5.5"), "{text}");
-        assert!(text.contains("[ctx:1M]"), "{text}");
-        assert!(text.contains("[ctx:200k]"), "{text}");
-        assert!(text.contains("[ctx:300k]"), "{text}");
-        assert!(text.contains("[Anthropic] [sub]"), "{text}");
-        assert!(text.contains("[OpenAI] [sub]"), "{text}");
-        assert!(
-            text.contains("Reasoning  xhigh effort left/right to adjust"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
-            "{text}"
-        );
+        assert!(text.contains("Anthropic"), "{text}");
+        assert!(text.contains("OpenAI"), "{text}");
+        assert!(text.contains("←→ effort (xhigh)"), "{text}");
         assert!(!text.contains("Only showing models"), "{text}");
         assert!(!text.contains("claude-opus-4-8"), "{text}");
         assert!(!text.contains("GPT-5.5"), "{text}");
@@ -1233,11 +1224,11 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::Medium,
         );
-        assert!(render_text(&picker).contains("medium effort"));
+        assert!(render_text(&picker).contains("effort (medium)"));
         picker.handle_key(ModalKey::Right);
-        assert!(render_text(&picker).contains("high effort"));
+        assert!(render_text(&picker).contains("effort (high)"));
         picker.handle_key(ModalKey::Left);
-        assert!(render_text(&picker).contains("medium effort"));
+        assert!(render_text(&picker).contains("effort (medium)"));
     }
 
     #[test]
@@ -1255,11 +1246,11 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::XHigh,
         );
-        assert!(render_text(&picker).contains("xhigh effort"));
+        assert!(render_text(&picker).contains("effort (xhigh)"));
         picker.handle_key(ModalKey::Down); // onto gemini (caps at high)
-        assert!(render_text(&picker).contains("high effort"));
+        assert!(render_text(&picker).contains("effort (high)"));
         picker.handle_key(ModalKey::Up); // back to gpt-5.5
-        assert!(render_text(&picker).contains("xhigh effort"));
+        assert!(render_text(&picker).contains("effort (xhigh)"));
     }
 
     #[test]
@@ -1272,7 +1263,7 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::Medium,
         );
-        let default_row = picker
+        let rows: Vec<String> = picker
             .render(80)
             .into_iter()
             .map(|l| {
@@ -1281,25 +1272,22 @@ mod tests {
                     .map(|s| s.content.to_string())
                     .collect::<String>()
             })
-            .find(|l| l.contains("Default"))
-            .expect("a Default row");
+            .collect();
+        let default_row = rows
+            .iter()
+            .find(|l| l.contains("default"))
+            .expect("a default-tagged row");
         assert!(default_row.contains("GPT 5.5"), "{default_row}");
         assert!(
-            !default_row.contains("current"),
+            !default_row.contains('◉'),
             "default is not active: {default_row}"
         );
-        let active_row = picker
-            .render(80)
-            .into_iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.to_string())
-                    .collect::<String>()
-            })
-            .find(|l| l.contains("current"))
+        let active_row = rows
+            .iter()
+            .find(|l| l.contains('◉') && !l.contains("SELECT"))
             .expect("an active row");
         assert!(active_row.contains("Sonnet 4.6"), "{active_row}");
+        assert!(!active_row.contains("default"), "{active_row}");
     }
 
     #[test]
@@ -1550,10 +1538,17 @@ mod tests {
         }
         // The complete URL survives wrapping (char-wrapped, contiguous), so the
         // copy/paste fallback is the full, working URL rather than a clipped one.
-        let joined: String = texts.join("");
+        // Strip the box chrome (│ + one padding cell each side) before joining.
+        let joined: String = texts
+            .iter()
+            .filter_map(|text| {
+                let inner = text.strip_prefix('│')?.strip_suffix('│')?;
+                Some(inner.trim_matches(' ').to_string())
+            })
+            .collect();
         assert!(
             joined.contains(url),
-            "wrapped rows must contain the full URL"
+            "wrapped rows must contain the full URL: {joined}"
         );
     }
 }
