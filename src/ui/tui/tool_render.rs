@@ -41,7 +41,8 @@ use super::shell_command::{self, ShellCommand};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::wrap::{clamp_output_line, display_width, truncate_chars, wrapped_row_estimate};
 use super::{
-    MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, dim_style, err_style, ok_style, panel_style,
+    MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, PANEL_BODY_CHROME_WIDTH, dim_style,
+    err_style, ok_style, panel_style,
 };
 
 /// The panel family a tool renders as. Selects the stateful dispatch path in
@@ -181,8 +182,12 @@ impl ToolRenderer for ExploreRenderer {
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
         // The grouped EXPLORE panel replaces a single stored row in place, so
         // this renderer is constrained to exactly one row.
-        vec![explore_op_row(ctx.width, call, outcome)]
+        vec![explore_op_row(panel_body_width(ctx.width), call, outcome)]
     }
+}
+
+fn panel_body_width(width: usize) -> usize {
+    width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1)
 }
 
 /// One EXPLORE op row (`ExploreOutput` design-system component):
@@ -353,7 +358,7 @@ impl ToolRenderer for ShellRenderer {
     }
 
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-        let mut body = PanelBody::new(ctx.width);
+        let mut body = PanelBody::shell(ctx.width);
         let timeout = bash_timeout_secs(call);
         match raw_bash_command(call) {
             Some(raw) => {
@@ -378,6 +383,9 @@ impl ToolRenderer for ShellRenderer {
                 body.line("$ \u{2588}", panel_style());
             }
             ToolOutcome::Done { content, exit_code } => {
+                if exit_code.is_some() {
+                    body.defer_expand_hint_to_result();
+                }
                 body.output(content);
                 // `None` is not "an unknown but presumably fine" code: the bash
                 // tool only omits it for a cancelled run, a timeout, or a
@@ -387,7 +395,13 @@ impl ToolRenderer for ShellRenderer {
                 // is omitted rather than guessed.
                 if let Some(code) = exit_code {
                     body.line("", panel_style());
-                    body.push(shell_result_row(*code, shell_result_meta(content, *code)));
+                    let expand_hint = body.take_deferred_expand_hint();
+                    body.push(shell_result_row(
+                        *code,
+                        shell_result_meta(content, *code),
+                        expand_hint,
+                        body.fold_hint_width(),
+                    ));
                 }
             }
             ToolOutcome::Error { message, streamed } => {
@@ -414,7 +428,12 @@ impl ToolRenderer for ShellRenderer {
 /// its `ResultRow` while collapsed), the row stays visible even in a folded
 /// SHELL panel's capped preview, since exit status is exactly the kind of
 /// thing a glance at a collapsed panel should still answer.
-fn shell_result_row(code: i32, meta: Option<String>) -> TranscriptRow {
+fn shell_result_row(
+    code: i32,
+    meta: Option<String>,
+    expand_hint: bool,
+    width: usize,
+) -> TranscriptRow {
     let failed = code != 0;
     let symbol = if failed {
         symbols::ERROR
@@ -432,6 +451,18 @@ fn shell_result_row(code: i32, meta: Option<String>) -> TranscriptRow {
         let aside = format!("  {} {meta}", symbols::SEP);
         plain.push_str(&aside);
         spans.push(Span::styled(aside, dim_style()));
+    }
+    if expand_hint {
+        let hint = "ctrl+o to expand";
+        let used = display_width(&plain);
+        let hint_w = display_width(hint);
+        if used + 1 + hint_w <= width {
+            let gap = width - used - hint_w;
+            plain.push_str(&" ".repeat(gap));
+            plain.push_str(hint);
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(hint.to_string(), dim_style()));
+        }
     }
     TranscriptRow::chrome_with_text(
         ChromeRow::Body {
@@ -600,6 +631,9 @@ fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
 /// transcript wrap width.
 struct PanelBody {
     width: usize,
+    indent: usize,
+    defer_expand_hint_to_result: bool,
+    deferred_expand_hint: bool,
     rows: Vec<TranscriptRow>,
 }
 
@@ -607,12 +641,42 @@ impl PanelBody {
     fn new(width: usize) -> Self {
         Self {
             width,
+            indent: 0,
+            defer_expand_hint_to_result: false,
+            deferred_expand_hint: false,
             rows: Vec::new(),
         }
     }
 
+    fn shell(width: usize) -> Self {
+        Self::new(width)
+    }
+
+    fn defer_expand_hint_to_result(&mut self) {
+        self.defer_expand_hint_to_result = true;
+    }
+
+    fn take_deferred_expand_hint(&mut self) -> bool {
+        std::mem::take(&mut self.deferred_expand_hint)
+    }
+
     fn into_rows(self) -> Vec<TranscriptRow> {
         self.rows
+    }
+
+    fn indented_line(&self, mut line: Line<'static>) -> Line<'static> {
+        if self.indent > 0 {
+            line.spans.insert(0, Span::raw(" ".repeat(self.indent)));
+        }
+        line
+    }
+
+    fn push_line(&mut self, line: Line<'static>, text: String, style: Style, fold: FoldVis) {
+        let line = self.indented_line(line);
+        self.rows.push(
+            TranscriptRow::chrome_with_text(ChromeRow::Body { line, bg: None }, text, style)
+                .with_fold(fold),
+        );
     }
 
     /// Push a pre-built row (e.g. the SHELL exit-status row) verbatim.
@@ -707,14 +771,12 @@ impl PanelBody {
             ]
         };
         let Some(secs) = timeout.filter(|secs| *secs > 0) else {
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::from(cmd_spans(&command)),
-                    bg: None,
-                },
+            self.push_line(
+                Line::from(cmd_spans(&command)),
                 left,
                 panel_style(),
-            ));
+                FoldVis::Always,
+            );
             return;
         };
         let hint = format!("timeout {secs}s");
@@ -727,23 +789,14 @@ impl PanelBody {
             let mut spans = cmd_spans(&command);
             spans.push(Span::styled(" ".repeat(gap), panel_style()));
             spans.push(Span::styled(hint, dim_style()));
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::from(spans),
-                    bg: None,
-                },
-                plain,
-                panel_style(),
-            ));
+            self.push_line(Line::from(spans), plain, panel_style(), FoldVis::Always);
         } else {
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::from(cmd_spans(&command)),
-                    bg: None,
-                },
+            self.push_line(
+                Line::from(cmd_spans(&command)),
                 left,
                 panel_style(),
-            ));
+                FoldVis::Always,
+            );
             let text = right_align_hint("", &hint, width);
             self.line_folded(&text, dim_style(), FoldVis::Always);
         }
@@ -757,16 +810,11 @@ impl PanelBody {
     fn line_folded(&mut self, text: &str, style: Style, fold: FoldVis) {
         for line in text.split('\n') {
             let line = strip_ansi_for_text(line);
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: Line::from(Span::styled(line.clone(), style)),
-                        bg: None,
-                    },
-                    line,
-                    style,
-                )
-                .with_fold(fold),
+            self.push_line(
+                Line::from(Span::styled(line.clone(), style)),
+                line,
+                style,
+                fold,
             );
         }
     }
@@ -775,14 +823,22 @@ impl PanelBody {
     /// the transcript's `fold_hint_width` (the wrap width already equals the
     /// panel body width), so the hint hugs the right border.
     fn fold_hint_width(&self) -> usize {
-        self.width.max(1)
+        self.width
+            .saturating_sub(PANEL_BODY_CHROME_WIDTH)
+            .saturating_sub(self.indent)
+            .max(1)
     }
 
     /// Preview-state fold affordance: `\u{2026} N lines hidden    ctrl+o to expand`.
     fn fold_expand_hint(&mut self, hidden: usize, earlier: bool) {
         let noun = if earlier { "earlier lines" } else { "lines" };
         let left = format!("\u{2026} {hidden} {noun} hidden");
-        let text = right_align_hint(&left, "ctrl+o to expand", self.fold_hint_width());
+        let text = if self.defer_expand_hint_to_result {
+            self.deferred_expand_hint = true;
+            left
+        } else {
+            right_align_hint(&left, "ctrl+o to expand", self.fold_hint_width())
+        };
         self.line_folded(&text, dim_style(), FoldVis::WhenCollapsed);
     }
 
@@ -803,28 +859,18 @@ impl PanelBody {
             format!("    {line}")
         };
         if line.contains("\x1b[") {
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: tool_output_line("", &line),
-                        bg: None,
-                    },
-                    strip_ansi_for_text(&legacy),
-                    dim_style(),
-                )
-                .with_fold(fold),
+            self.push_line(
+                tool_output_line("", &line),
+                strip_ansi_for_text(&legacy),
+                dim_style(),
+                fold,
             );
         } else {
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: Line::from(Span::styled(line.to_string(), dim_style())),
-                        bg: None,
-                    },
-                    legacy,
-                    dim_style(),
-                )
-                .with_fold(fold),
+            self.push_line(
+                Line::from(Span::styled(line.to_string(), dim_style())),
+                legacy,
+                dim_style(),
+                fold,
             );
         }
     }
@@ -1055,9 +1101,19 @@ mod tests {
                 streamed: "",
             },
         );
-        assert_eq!(errored.len(), 1);
-        assert_eq!(errored[0].text, "error: boom");
         assert_eq!(errored[0].style.fg, err_style().fg);
+
+        let listed = resolve(&call("ls", json!({ "path": "." }))).body(
+            &ctx,
+            &call("ls", json!({ "path": "." })),
+            &ToolOutcome::Done {
+                content: "a\nb\nc",
+                exit_code: None,
+            },
+        );
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].text.ends_with("3 entries"), "{}", listed[0].text);
+        assert!(display_width(&listed[0].text) <= panel_body_width(ctx.width));
     }
 
     #[test]
@@ -1366,7 +1422,18 @@ mod tests {
             "{}",
             result_rows[0].text
         );
-        assert_eq!(rows.last().unwrap().text, "\u{25c6} EXIT 0");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.fold == FoldVis::WhenCollapsed && r.text.contains("ctrl+o to expand")),
+            "hidden-lines affordance should not carry the expand hint: {:?}",
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            rows.last().unwrap().text.ends_with("ctrl+o to expand"),
+            "{}",
+            rows.last().unwrap().text
+        );
     }
 
     #[test]

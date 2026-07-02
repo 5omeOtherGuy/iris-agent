@@ -14,8 +14,8 @@ use super::wrap::{
 };
 use super::{
     BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_BORDER_WIDTH, PANEL_BODY_CHROME_WIDTH,
-    PANEL_BODY_SIDE_PADDING, TEXT_COLUMN_X_PADDING, border_style, dim_style, err_style, ok_style,
-    panel_style, prompt_style,
+    PANEL_BODY_LEFT_PADDING, PANEL_BODY_RIGHT_PADDING, TEXT_COLUMN_X_PADDING, border_style,
+    dim_style, err_style, ok_style, panel_style, prompt_style,
 };
 use crate::ui::symbols;
 
@@ -125,14 +125,15 @@ pub(super) fn panel_body_line(
         }
     }
     let outer = panel_outer_padding(width);
-    let side_padding = " ".repeat(PANEL_BODY_SIDE_PADDING);
+    let left_padding = " ".repeat(PANEL_BODY_LEFT_PADDING);
+    let right_padding = " ".repeat(PANEL_BODY_RIGHT_PADDING);
     let mut spans = vec![
         Span::raw(" ".repeat(outer)),
         Span::styled("│", border_style()),
-        Span::styled(side_padding.clone(), panel_style()),
+        Span::styled(left_padding, panel_style()),
     ];
     spans.extend(line.spans);
-    spans.push(Span::styled(side_padding, panel_style()));
+    spans.push(Span::styled(right_padding, panel_style()));
     spans.push(Span::styled("│", border_style()));
     spans.push(Span::raw(" ".repeat(outer)));
     let mut line = Line::from(spans);

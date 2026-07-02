@@ -227,14 +227,17 @@ impl ChromeRow {
     }
 }
 
+const TURN_DIVIDER_LEADER_WIDTH: usize = TEXT_COLUMN_X_PADDING + 4 - BOX_X_PADDING;
+
 /// Build a dim full-width horizontal rule, optionally wrapping a quiet turn
-/// summary label (`── 7.6s ┊ ↑18.2k ↓846 ───────`).
+/// summary label (`────── 7.6s ┊ ↑18.2k ↓846 ───────`).
 pub(super) fn hrule_line(label: &str, width: usize) -> Line<'static> {
     let width = width.max(1);
     if label.is_empty() {
         return Line::from(Span::styled("\u{2500}".repeat(width), dim_style()));
     }
-    let text = truncate_to_width(&format!("\u{2500}\u{2500} {label} \u{2500}"), width);
+    let leader = "\u{2500}".repeat(TURN_DIVIDER_LEADER_WIDTH);
+    let text = truncate_to_width(&format!("{leader} {label} \u{2500}"), width);
     let fill = width.saturating_sub(display_width(&text));
     Line::from(Span::styled(
         format!("{text}{}", "\u{2500}".repeat(fill)),
