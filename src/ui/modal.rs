@@ -88,6 +88,10 @@ pub(crate) enum ModalAction {
     /// Set this project's trust decision (`true` = trust repo Iris resources).
     /// Re-assembles the system prompt and rebuilds the provider at the boundary.
     SetTrust(bool),
+    /// Resume the persisted session with this id, swapping the live session at
+    /// the safe inter-turn boundary (reloads messages, session log, and harness
+    /// state). Emitted by the `/resume` picker on Enter.
+    ResumeSession(String),
     /// `/login` method chosen -> open the matching provider selector.
     ChooseLoginMethod(LoginMethod),
     /// Begin an OAuth/subscription login for this provider.
@@ -123,6 +127,7 @@ pub(crate) enum Modal {
     Effort(EffortPicker),
     Settings(SettingsMenu),
     Trust(TrustMenu),
+    Session(SessionPicker),
     LoginMethod(MethodSelect),
     Providers(ProviderSelect),
     LoginDialog(LoginDialog),
@@ -137,6 +142,7 @@ impl Modal {
             Modal::Effort(picker) => picker.handle_key(key),
             Modal::Settings(menu) => menu.handle_key(key),
             Modal::Trust(menu) => menu.handle_key(key),
+            Modal::Session(picker) => picker.handle_key(key),
             Modal::LoginMethod(menu) => menu.handle_key(key),
             Modal::Providers(picker) => picker.handle_key(key),
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
@@ -165,6 +171,7 @@ impl Modal {
             Modal::Effort(picker) => picker.render(width),
             Modal::Settings(menu) => menu.render(width),
             Modal::Trust(menu) => menu.render(width),
+            Modal::Session(picker) => picker.render(width),
             Modal::LoginMethod(menu) => menu.render(width),
             Modal::Providers(picker) => picker.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
@@ -893,6 +900,94 @@ impl TrustMenu {
             Some("Project trust"),
             rows,
             Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
+    }
+}
+
+// --- session resume picker ---
+
+/// One row for the `/resume` picker: the session id (stable selector key), a
+/// one-line first-user-message preview, and a human-relative age. Built by the
+/// orchestration layer from persisted session metadata so this presentation
+/// code stays disk-free and unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionRow {
+    pub(crate) id: String,
+    pub(crate) preview: String,
+    pub(crate) age: String,
+}
+
+/// Searchable list of resumable sessions for the current workspace. Confirming a
+/// row emits [`ModalAction::ResumeSession`]; the loop swaps the live session at
+/// the safe inter-turn boundary. Newest-first order is preserved from the input
+/// rows.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionPicker {
+    selector: Selector,
+}
+
+impl SessionPicker {
+    pub(crate) fn new(rows: Vec<SessionRow>) -> Self {
+        let items: Vec<SelectorItem> = rows
+            .into_iter()
+            .map(|row| {
+                let label = if row.preview.is_empty() {
+                    "(no messages yet)".to_string()
+                } else {
+                    row.preview
+                };
+                SelectorItem::new(row.id, label).detail(row.age)
+            })
+            .collect();
+        SessionPicker {
+            selector: Selector::new(items, true, false, MODEL_ROWS),
+        }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some(id) => ModalOutcome::Emit(ModalAction::ResumeSession(id.to_string())),
+                None => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc => ModalOutcome::Close,
+            ModalKey::CtrlC => {
+                if self.selector.clear_search() {
+                    ModalOutcome::Redraw
+                } else {
+                    ModalOutcome::Close
+                }
+            }
+            ModalKey::Backspace => {
+                if self.selector.backspace() {
+                    ModalOutcome::Redraw
+                } else {
+                    ModalOutcome::Ignore
+                }
+            }
+            ModalKey::Char(c) => {
+                self.selector.push_char(c);
+                ModalOutcome::Redraw
+            }
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let rows = selector_rows(&self.selector, "No sessions to resume");
+        crate::ui::tui::overlay_box(
+            Some("Resume session"),
+            rows,
+            Some("↑↓ move · type to filter · ↵ resume · esc cancel"),
             usize::from(width),
         )
     }
@@ -1786,5 +1881,49 @@ mod tests {
             joined.contains(url),
             "wrapped rows must contain the full URL: {joined}"
         );
+    }
+
+    fn session_rows() -> Vec<SessionRow> {
+        vec![
+            SessionRow {
+                id: "aaaa".to_string(),
+                preview: "fix the login bug".to_string(),
+                age: "5m ago".to_string(),
+            },
+            SessionRow {
+                id: "bbbb".to_string(),
+                preview: "add rate limiting".to_string(),
+                age: "2h ago".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn session_picker_enter_emits_resume_for_selected_id() {
+        let mut picker = SessionPicker::new(session_rows());
+        // First row is selected by default (newest first).
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::ResumeSession(id)) => assert_eq!(id, "aaaa"),
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+        // Down then Enter resumes the second session.
+        picker.handle_key(ModalKey::Down);
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::ResumeSession(id)) => assert_eq!(id, "bbbb"),
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_picker_search_filters_and_esc_closes() {
+        let mut picker = SessionPicker::new(session_rows());
+        for c in "rate".chars() {
+            picker.handle_key(ModalKey::Char(c));
+        }
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::ResumeSession(id)) => assert_eq!(id, "bbbb"),
+            other => panic!("expected the filtered row, got {other:?}"),
+        }
+        assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);
     }
 }

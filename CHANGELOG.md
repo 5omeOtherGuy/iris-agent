@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added session shortcuts and pickers (issue #201): `iris -c`/`--continue`
+  resumes the newest session for the current directory, `iris resume` opens the
+  resume picker on a rich TTY or prints the resumable-session list in plain
+  mode, and in-session `/resume` and `/new` swap the live session at a turn
+  boundary without restarting the process.
+
 - Added a headless `--print` mode (issue #200): `iris -p "prompt"` (or
   `iris --print "prompt"`) runs one agent turn-sequence, prints the final
   assistant answer to stdout, and exits 0 on success / nonzero on failure.

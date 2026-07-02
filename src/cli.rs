@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::io::IsTerminal;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -10,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
-use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider};
+use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider, Message};
+use crate::session::SessionLog;
 use crate::ui::tui::TuiUi;
 use crate::ui::{Ui, UiBridge, UiEvent, slash};
 use crate::wayland::Harness;
@@ -75,7 +78,81 @@ impl<'a, P> ModelSwitch<'a, P> {
     pub(crate) fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
+
+    /// Rebuild a provider for the current selection and system prompt without
+    /// changing the active selection. The session swap uses this after the app
+    /// updates the shared session-id cell, so the resumed/new session's id keys
+    /// the freshly built provider. Unlike [`apply_selection`], it neither
+    /// installs the provider nor records an audit event -- the caller installs it
+    /// via [`Harness::replace_provider`](crate::wayland::Harness::replace_provider).
+    pub(crate) fn rebuild_provider(&self) -> Result<P> {
+        (self.build)(&self.selection, &self.system_prompt)
+    }
 }
+
+/// Which session an in-session swap (`/resume`, `/new`) should load. The TUI
+/// loop hands one of these to the app-supplied loader, which builds the matching
+/// [`LoadedSource`] (a fresh transcript, or a persisted session's messages).
+#[derive(Debug, Clone)]
+pub(crate) enum SessionSource {
+    /// Start a brand-new session (new id, empty transcript, fresh log).
+    Fresh,
+    /// Resume the persisted session with this id.
+    Resume(String),
+}
+
+/// Rollback guard for the shared session id that provider builders read. A
+/// session swap must point the provider builder at the target id before the
+/// rebuild, but if the rebuild fails the live session stays unchanged; dropping
+/// this guard before commit restores the previous id so later rebuilds cannot
+/// key a provider to the wrong session.
+pub(crate) struct SessionIdGuard {
+    cell: Rc<RefCell<String>>,
+    previous: String,
+    committed: bool,
+}
+
+impl SessionIdGuard {
+    pub(crate) fn swap(cell: Rc<RefCell<String>>, next: String) -> Self {
+        let previous = cell.replace(next);
+        Self {
+            cell,
+            previous,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionIdGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.cell.replace(self.previous.clone());
+        }
+    }
+}
+
+/// The pieces the harness needs to swap to a different session at the safe
+/// inter-turn boundary: a transaction guard for the provider-builder session id,
+/// the reopened/new transcript log, the provider-visible messages to seed, and
+/// how many of them are already persisted (0 for a fresh session, the loaded
+/// count for a resume). The provider is rebuilt separately via
+/// [`ModelSwitch::rebuild_provider`] so the new session's id keys it.
+pub(crate) struct LoadedSource {
+    pub(crate) session_id: SessionIdGuard,
+    pub(crate) session_log: Option<SessionLog>,
+    pub(crate) messages: Vec<Message>,
+    pub(crate) resumed: usize,
+}
+
+/// Builds a [`LoadedSource`] for a requested [`SessionSource`]. The app
+/// (`main.rs`) owns session-store access and the shared session-id cell the
+/// provider builder reads, so it can generate/select the id, open or create the
+/// log, and load messages; the loop only asks for the swap.
+pub(crate) type SessionLoader<'a> = dyn Fn(&SessionSource) -> Result<LoadedSource> + 'a;
 
 /// Route a submitted line through the shared `/model` / `/reasoning` handler.
 /// Returns `None` when the line is not one of those commands (the caller then
@@ -260,6 +337,8 @@ fn picker_only_command(prompt: &str) -> Option<&'static str> {
         "/scoped-models" => Some("/scoped-models"),
         "/settings" => Some("/settings"),
         "/trust" => Some("/trust"),
+        "/resume" => Some("/resume"),
+        "/new" => Some("/new"),
         "/login" => Some("/login"),
         "/logout" => Some("/logout"),
         _ => None,
@@ -294,20 +373,39 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &mut Option<ModelSwitch<'_, P>>,
     force_plain: bool,
+    swap: &SessionLoader<'_>,
+    startup_modal: Option<crate::ui::modal::Modal>,
 ) -> Result<()> {
-    if !use_plain_renderer(force_plain)
-        && std::io::stdout().is_terminal()
-        && std::io::stdin().is_terminal()
-    {
+    if !prefers_text_ui(force_plain) {
         match TuiUi::new() {
-            Ok(tui) => return run_tui(harness, tui, switch),
+            Ok(tui) => return run_tui(harness, tui, switch, swap, startup_modal),
             Err(error) => {
+                if startup_modal.is_some() {
+                    bail!(
+                        "could not open resume picker because the TUI is unavailable: {error:#}; run `iris resume --plain` to list sessions"
+                    );
+                }
                 tracing::warn!(error = %format!("{error:#}"), "TUI unavailable; using text UI");
             }
         }
     }
+    // The text/plain path has no modal surface. Bare `iris resume` is routed to
+    // a list before this point whenever the plain renderer is requested or stdio
+    // is not a terminal; if TUI creation fails after requesting a startup modal,
+    // the branch above errors instead of silently starting a fresh session.
     let mut ui = crate::ui::text::TextUi::stdio();
     run_session(harness, &mut ui, switch)
+}
+
+/// Whether the interactive entry point will fall back to the plain, ANSI-free
+/// text UI rather than the terminal-surface TUI: the plain renderer was
+/// requested (`--plain`, `IRIS_PLAIN`, `NO_COLOR`) or either stdio end is not a
+/// terminal. `main.rs` consults this so `iris resume` (no id) prints a plain
+/// session list in exactly the cases the picker would be unavailable.
+pub(crate) fn prefers_text_ui(force_plain: bool) -> bool {
+    use_plain_renderer(force_plain)
+        || !std::io::stdout().is_terminal()
+        || !std::io::stdin().is_terminal()
 }
 
 /// Whether to bypass the interactive TUI for the plain, ANSI-free text UI so the
@@ -328,9 +426,11 @@ fn run_tui<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
+    swap: &SessionLoader<'_>,
+    startup_modal: Option<crate::ui::modal::Modal>,
 ) -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    let result = crate::ui::tui_loop::run(harness, &runtime, tui, switch);
+    let result = crate::ui::tui_loop::run(harness, &runtime, tui, switch, swap, startup_modal);
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
 }
@@ -539,6 +639,22 @@ mod tests {
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
         }
+    }
+
+    #[test]
+    fn session_id_guard_restores_uncommitted_swap_and_keeps_committed_one() {
+        let cell = Rc::new(RefCell::new("old".to_string()));
+        {
+            let _guard = SessionIdGuard::swap(cell.clone(), "new".to_string());
+            assert_eq!(&*cell.borrow(), "new");
+        }
+        assert_eq!(&*cell.borrow(), "old");
+
+        {
+            let mut guard = SessionIdGuard::swap(cell.clone(), "committed".to_string());
+            guard.commit();
+        }
+        assert_eq!(&*cell.borrow(), "committed");
     }
 
     #[test]

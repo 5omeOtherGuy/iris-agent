@@ -99,10 +99,26 @@ auto-approve them. When stdin is piped it is appended to the prompt after a
 blank line; on a TTY there is nothing to merge. Only the final assistant answer
 reaches stdout.
 
+### Resuming sessions
+
+```bash
+iris -c                    # or --continue: resume the newest session for this directory
+iris resume                # pick a session to resume (picker on a TTY; list otherwise)
+iris resume <session-id>   # resume a specific session by id
+```
+
+`iris -c`/`--continue` reopens the most recent session for the current
+directory; it errors clearly when the directory has no prior session. `iris
+resume` with no id opens a `/resume` picker on a rich TTY, or prints the
+directory's sessions (id, age, first-message preview) and exits on a plain/piped
+front-end. Mid-session, `/resume` opens the same picker and `/new` starts a
+fresh session — both swap the live session at a safe turn boundary without
+restarting the process.
+
 At the prompt, `/model` views or switches provider/model and
 `/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
-turn boundary. `/settings`, `/scoped-models`, `/trust`, `/login`, and `/logout`
-open their selectors.
+turn boundary. `/resume`, `/new`, `/settings`, `/scoped-models`, `/trust`,
+`/login`, and `/logout` open their selectors or actions.
 
 <details>
 <summary><b>Providers, settings &amp; environment</b></summary>
@@ -208,13 +224,14 @@ Implemented:
 - Multiple providers (OpenAI Codex, Anthropic, Antigravity) with runtime model/reasoning switching.
 - Workspace-scoped tools: read, write, edit, bash, grep, find, ls.
 - Approval gates with diff previews for mutating tools.
-- JSONL transcript persistence and linear resume.
+- JSONL transcript persistence and linear resume (`iris --continue`, `iris
+  resume`, in-session `/resume` picker and `/new`).
 - Large-output handles and turn-boundary auto-compaction.
 
 Next:
 
 - Token-efficiency benchmark proof.
-- Persistent approval policies, in-session resume picker, transcript branching/rollback, modes, and subagents.
+- Persistent approval policies, transcript branching/rollback, modes, and subagents.
 
 ## Testing
 

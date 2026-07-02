@@ -4625,3 +4625,79 @@ fn soft_cap_does_not_strand_an_injected_follow_up() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn swap_session_switches_log_resets_context_and_cursor() -> Result<()> {
+    use crate::session::SessionLog;
+    let workspace = test_workspace()?;
+    let root = workspace.path.join("sessions");
+    // Two turns of provider responses, one before and one after the swap.
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text("first answer")),
+        Ok(AssistantTurn::text("second answer")),
+    ]);
+    let log_a = SessionLog::create_in(&root, &workspace.path)?;
+    let path_a = log_a.path().to_path_buf();
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log_a),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    block_on(harness.submit_turn(
+        "first prompt",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    assert!(fs::read_to_string(&path_a)?.contains("first prompt"));
+
+    // Swap to a resumed session: a new log plus two preloaded messages already
+    // "on disk" (resumed = 2).
+    let log_b = SessionLog::create_in(&root, &workspace.path)?;
+    let path_b = log_b.path().to_path_buf();
+    let preload = vec![
+        Message::user("resumed prompt"),
+        Message::assistant("resumed answer"),
+    ];
+    harness.swap_session(Some(log_b), preload, 2);
+
+    // The agent context is now the resumed messages, not the pre-swap turn.
+    let after_swap = harness.agent.messages();
+    assert_eq!(
+        after_swap.len(),
+        2,
+        "context replaced with resumed messages"
+    );
+    assert_eq!(after_swap[0].content, "resumed prompt");
+    assert!(
+        !after_swap.iter().any(|m| m.content == "first prompt"),
+        "pre-swap context is gone: {after_swap:?}"
+    );
+
+    // The next turn appends only new messages to the new log; the resumed
+    // prefix (persisted cursor = 2) is not re-written, and the old log is
+    // untouched.
+    block_on(harness.submit_turn(
+        "second prompt",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    let b_contents = fs::read_to_string(&path_b)?;
+    assert!(
+        b_contents.contains("second prompt"),
+        "new turn lands in the swapped log"
+    );
+    assert!(
+        !b_contents.contains("resumed prompt"),
+        "the resumed prefix is not re-persisted (cursor honored): {b_contents}"
+    );
+    assert!(
+        !fs::read_to_string(&path_a)?.contains("second prompt"),
+        "the old session log receives no further turns"
+    );
+    Ok(())
+}

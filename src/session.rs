@@ -322,7 +322,7 @@ impl SessionStore {
                 }
             }
         }
-        sessions.sort_by_key(|meta| std::cmp::Reverse(meta.created_ms));
+        sessions.sort_by_key(|meta| std::cmp::Reverse(meta.updated_ms));
         Ok(sessions)
     }
 
@@ -349,6 +349,32 @@ impl SessionStore {
             context_tokens,
         })
     }
+
+    /// List resumable sessions for one workspace, newest first, each carrying a
+    /// short first-user-message preview for the `/resume` picker and the
+    /// `resume` listing. Reuses [`list`](Self::list) (cheap header read) then
+    /// scans each matching file only up to its first user message for the
+    /// preview, so listing a directory's sessions stays inexpensive.
+    pub(crate) fn resumable_for_cwd(&self, cwd: &str) -> Result<Vec<ResumableSession>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|meta| meta.cwd == cwd)
+            .map(|meta| {
+                let preview = first_user_preview(&meta.path)
+                    .unwrap_or_else(|| "(no messages yet)".to_string());
+                ResumableSession { meta, preview }
+            })
+            .collect())
+    }
+}
+
+/// One resumable session's listing metadata plus a short preview of its first
+/// user message, for the `/resume` picker and the plain `resume` listing.
+#[derive(Debug, Clone)]
+pub(crate) struct ResumableSession {
+    pub(crate) meta: SessionMeta,
+    pub(crate) preview: String,
 }
 
 /// Cheap listing metadata for one persisted session: enough to drive a future
@@ -900,6 +926,87 @@ fn cwd_slug(cwd: &Path) -> String {
 
 pub(crate) fn new_session_id() -> String {
     format!("{:032x}", rand::random::<u128>())
+}
+
+/// Pick the newest session for `cwd` from a [`list`](SessionStore::list) result.
+/// `metas` is assumed newest-updated-first (as `list` returns), so the first
+/// match for the directory is the most recently active one. `None` when the directory has no
+/// persisted session. Pure so `iris --continue` selection is unit-tested without
+/// disk.
+pub(crate) fn newest_for_cwd<'a>(metas: &'a [SessionMeta], cwd: &str) -> Option<&'a SessionMeta> {
+    metas.iter().find(|meta| meta.cwd == cwd)
+}
+
+/// Maximum characters kept in a session preview before an ellipsis.
+const PREVIEW_CHARS: usize = 80;
+
+/// Collapse a message body into a single-line preview: runs of whitespace
+/// (including newlines) become one space, and the result is truncated to
+/// [`PREVIEW_CHARS`] with a trailing ellipsis. Pure and char-boundary safe.
+pub(crate) fn preview_line(content: &str) -> String {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= PREVIEW_CHARS {
+        collapsed
+    } else {
+        let kept: String = collapsed.chars().take(PREVIEW_CHARS).collect();
+        format!("{kept}…")
+    }
+}
+
+/// Read a session file only far enough to extract a single-line preview of its
+/// first user message. Returns `None` when the file cannot be read or has no
+/// user message yet. Stops at the first user entry, so it never reads a whole
+/// transcript for the preview.
+fn first_user_preview(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let message = value.get("message");
+        let role = message.and_then(|m| m.get("role")).and_then(Value::as_str);
+        if role == Some("user") {
+            let content = message
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return Some(preview_line(content));
+        }
+    }
+    None
+}
+
+/// A short, human-relative age (`just now`, `5m ago`, `3h ago`, `2d ago`) for a
+/// session timestamp, measured against `now_ms`. Pure so the picker/list
+/// formatting is unit-tested without a clock. A future or malformed timestamp
+/// reads as `just now`.
+pub(crate) fn relative_age(now_ms: u128, timestamp_ms: u128) -> String {
+    let delta = now_ms.saturating_sub(timestamp_ms);
+    let seconds = delta / 1000;
+    if seconds < 60 {
+        "just now".to_string()
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+/// Current unix time in milliseconds, for age formatting at the call site.
+pub(crate) fn current_ms() -> u128 {
+    now_ms()
 }
 
 fn is_valid_session_id(id: &str) -> bool {
@@ -1669,5 +1776,103 @@ mod tests {
         let expected = total(&[Message::user("hello"), Message::assistant("hi there")]);
         assert_eq!(session.context_tokens, expected);
         assert!(session.context_tokens > 0);
+    }
+
+    fn meta_for(id: &str, cwd: &str, created_ms: u128) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            cwd: cwd.to_string(),
+            created_ms,
+            updated_ms: created_ms,
+        }
+    }
+
+    #[test]
+    fn newest_for_cwd_picks_first_match_for_directory() {
+        // list() returns newest-first, so the first matching cwd is the newest.
+        let metas = vec![
+            meta_for("newest-other", "/other", 300),
+            meta_for("newest-here", "/here", 200),
+            meta_for("older-here", "/here", 100),
+        ];
+        let picked = newest_for_cwd(&metas, "/here").expect("a session for /here");
+        assert_eq!(picked.id, "newest-here");
+        assert!(newest_for_cwd(&metas, "/absent").is_none());
+    }
+
+    #[test]
+    fn preview_line_collapses_whitespace_and_truncates() {
+        assert_eq!(
+            preview_line("  hello   world\n\tagain "),
+            "hello world again"
+        );
+        let long = "word ".repeat(40);
+        let preview = preview_line(&long);
+        assert!(preview.ends_with('…'), "{preview}");
+        assert_eq!(preview.chars().count(), PREVIEW_CHARS + 1);
+    }
+
+    #[test]
+    fn relative_age_buckets_by_magnitude() {
+        let minute = 60_000u128;
+        assert_eq!(relative_age(minute * 10, minute * 10), "just now");
+        assert_eq!(relative_age(minute * 10, minute * 9), "1m ago");
+        assert_eq!(relative_age(minute * 200, minute * 20), "3h ago");
+        assert_eq!(relative_age(minute * 60 * 24 * 3, 0), "3d ago");
+        // A future/malformed timestamp never underflows.
+        assert_eq!(relative_age(0, minute * 5), "just now");
+    }
+
+    #[test]
+    fn first_user_preview_stops_at_first_user_message() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::assistant("system-ish first")).unwrap();
+        log.append(&Message::user("please fix the   login\nbug"))
+            .unwrap();
+        log.append(&Message::user("second user turn")).unwrap();
+        let preview = first_user_preview(log.path()).expect("a user message preview");
+        assert_eq!(preview, "please fix the login bug");
+    }
+
+    #[test]
+    fn resumable_for_cwd_filters_and_previews_newest_first() {
+        let dir = temp_dir();
+        let store = SessionStore::with_root(dir.path.clone());
+        let mut here_old = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        here_old.append(&Message::user("old task")).unwrap();
+        // Ensure a distinct created timestamp so ordering is deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut here_new = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        here_new.append(&Message::user("new task")).unwrap();
+        let mut elsewhere = SessionLog::create_in(&dir.path, Path::new("/other")).unwrap();
+        elsewhere.append(&Message::user("unrelated")).unwrap();
+
+        let resumable = store.resumable_for_cwd("/proj").unwrap();
+        assert_eq!(resumable.len(), 2, "only /proj sessions");
+        assert_eq!(resumable[0].meta.id, here_new.id(), "newest first");
+        assert_eq!(resumable[0].preview, "new task");
+        assert_eq!(resumable[1].preview, "old task");
+    }
+
+    #[test]
+    fn list_orders_by_recent_activity_not_creation_time() {
+        let dir = temp_dir();
+        let store = SessionStore::with_root(dir.path.clone());
+        let mut older = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        older.append(&Message::user("older created")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        older
+            .append(&Message::assistant("recent activity"))
+            .unwrap();
+
+        let sessions = store.list().unwrap();
+        assert_eq!(sessions[0].id, older.id());
+        assert_eq!(sessions[1].id, newer.id());
+        assert!(sessions[0].created_ms < sessions[1].created_ms);
+        assert!(sessions[0].updated_ms >= sessions[1].updated_ms);
     }
 }

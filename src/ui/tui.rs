@@ -332,6 +332,15 @@ impl TuiUi {
     pub(crate) fn shutdown(&mut self) {
         self.restore();
     }
+
+    /// Replace the transcript/composer state with a fresh [`Screen`] for an
+    /// in-process session swap (`/new`, `/resume`). The terminal, raw mode, and
+    /// keyboard flags stay as-is; only the in-app conversation view is reset, so
+    /// the next draw starts the swapped session with an empty transcript. The
+    /// caller re-applies the banner and refreshes the footer afterward.
+    pub(crate) fn reset_screen(&mut self) {
+        self.screen = Screen::new();
+    }
 }
 
 impl Drop for TuiUi {

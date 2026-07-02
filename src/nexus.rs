@@ -638,6 +638,21 @@ impl<P: ChatProvider> Agent<P> {
         self.messages = messages;
     }
 
+    /// Reset the in-memory conversation to a different session's context at a
+    /// safe turn boundary (the in-session `/resume` and `/new` swap). Mirrors
+    /// [`resumed`](Self::resumed)'s message handling -- repair a crash-truncated
+    /// trailing tool call and recompute the provider-turn sequence -- and clears
+    /// the session allow-always policy so a new/other session never inherits the
+    /// prior one's approvals. The provider is swapped separately via
+    /// [`replace_provider`](Self::replace_provider); an empty `messages` starts a
+    /// fresh transcript.
+    pub(crate) fn reset_session(&mut self, mut messages: Vec<Message>) {
+        repair_dangling_tool_call(&mut messages);
+        self.next_provider_turn_seq = next_provider_turn_seq(&messages);
+        self.messages = messages;
+        self.session_allowed.clear();
+    }
+
     /// Swap the active provider at a safe turn boundary and re-plan the
     /// model-visible tool surface from the new provider's capabilities. The
     /// Tier-3 app rebuilds a provider on a `/model` `/reasoning` switch and

@@ -153,10 +153,10 @@ Implemented today:
 
 Not implemented yet:
 
-- Persistent approval policies, in-session `/resume` picker and transcript-tree
-  branching/rollback, modes, subagents, context ledger/planner, handle
-  dereference UI/tool, provider-side compact replay, token-efficiency benchmark
-  proof, git automation, and GitHub integration.
+- Persistent approval policies, transcript-tree branching/rollback, modes,
+  subagents, context ledger/planner, handle dereference UI/tool,
+  provider-side compact replay, token-efficiency benchmark proof, git
+  automation, and GitHub integration.
 
 ## Runtime completion — finish Nexus before Milestone 2 [SHIPPED 2026-06-17]
 
@@ -637,8 +637,12 @@ Potential scope:
   unknown id. A focused test
   (`resumed_session_feeds_prior_context_into_next_turn`) proves the loaded fact
   reaches the next model turn and that continuation does not duplicate history.
-  Still deferred (outside #47): the in-session `/resume` picker UI, branching,
-  rollback, and session search. Context Compaction Foundation
+  Session Commands MVP
+  ([#201](https://github.com/5omeOtherGuy/iris-agent/issues/201), shipped
+  2026-07-02) adds `iris -c` / `iris --continue` for the newest session in the
+  current directory, `iris resume` with a TTY picker or plain resumable-session
+  list, and in-session `/resume` plus `/new` swaps at a turn boundary. Still
+  deferred: branching, rollback, and session search. Context Compaction Foundation
   ([#49](https://github.com/5omeOtherGuy/iris-agent/issues/49), shipped
   2026-06-17) adds the first compaction slice on top of the resume path: a
   durable `compaction` JSONL entry records an inclusive range of covered

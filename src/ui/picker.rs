@@ -13,8 +13,10 @@ use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, CatalogModel, ExactMatch};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
+use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
-    EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SettingsMenu, TrustMenu,
+    EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
+    SettingsMenu, TrustMenu,
 };
 use crate::wayland::Harness;
 use crate::wayland::trust::{self, TrustDecision};
@@ -144,6 +146,35 @@ pub(crate) fn open_scoped<P>(switch: &ModelSwitch<'_, P>) -> ModelCommand {
     }
     let enabled = switch.scoped().map(<[String]>::to_vec);
     ModelCommand::Open(Modal::Scoped(ScopedModels::new(available, enabled)))
+}
+
+/// Build the `/resume` picker for the given workspace, or `None` when no prior
+/// session exists there. Reads the store's cheap listing (newest first) plus a
+/// first-user-message preview per session, then formats a human-relative age
+/// against `now_ms` into display rows. Pure row-building is split into
+/// [`session_rows`] so it is unit-tested without disk.
+pub(crate) fn open_resume(cwd: &std::path::Path) -> Option<Modal> {
+    let store = SessionStore::open_default().ok()?;
+    let entries = store.resumable_for_cwd(&cwd.to_string_lossy()).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let rows = session_rows(&entries, session::current_ms());
+    Some(Modal::Session(SessionPicker::new(rows)))
+}
+
+/// Turn resumable-session metadata into display rows (id, preview, relative
+/// age), preserving the newest-first input order. Pure, so the `/resume` picker
+/// construction is unit-tested without the session store.
+pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<SessionRow> {
+    entries
+        .iter()
+        .map(|entry| SessionRow {
+            id: entry.meta.id.clone(),
+            preview: entry.preview.clone(),
+            age: session::relative_age(now_ms, entry.meta.updated_ms),
+        })
+        .collect()
 }
 
 /// Build the `/trust` modal from the current recorded decision for the cwd. An
@@ -478,6 +509,43 @@ mod tests {
             model(ProviderId::OpenAiCodex, "gpt-5.5"),
             model(ProviderId::Anthropic, "claude-sonnet-4-6"),
         ]
+    }
+
+    #[test]
+    fn session_rows_carry_id_preview_and_relative_age() {
+        use crate::session::{ResumableSession, SessionMeta};
+        use std::path::PathBuf;
+        let minute = 60_000u128;
+        let entries = vec![
+            ResumableSession {
+                meta: SessionMeta {
+                    id: "newest".to_string(),
+                    path: PathBuf::from("/tmp/newest.jsonl"),
+                    cwd: "/proj".to_string(),
+                    created_ms: minute * 100,
+                    updated_ms: minute * 100,
+                },
+                preview: "recent task".to_string(),
+            },
+            ResumableSession {
+                meta: SessionMeta {
+                    id: "older".to_string(),
+                    path: PathBuf::from("/tmp/older.jsonl"),
+                    cwd: "/proj".to_string(),
+                    created_ms: minute * 40,
+                    updated_ms: minute * 40,
+                },
+                preview: "older task".to_string(),
+            },
+        ];
+        // now = 160 minutes: newest is 60m ago, older is 120m (2h) ago.
+        let rows = session_rows(&entries, minute * 160);
+        assert_eq!(rows.len(), 2, "order preserved (newest first)");
+        assert_eq!(rows[0].id, "newest");
+        assert_eq!(rows[0].preview, "recent task");
+        assert_eq!(rows[0].age, "1h ago");
+        assert_eq!(rows[1].id, "older");
+        assert_eq!(rows[1].age, "2h ago");
     }
 
     #[test]
