@@ -34,7 +34,7 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::ModelSwitch;
+use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource};
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
 use crate::nexus::{
@@ -143,10 +143,21 @@ pub(crate) fn run<P: ChatProvider>(
     runtime: &Runtime,
     mut tui: TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
+    swap: &SessionLoader<'_>,
+    startup_modal: Option<Modal>,
 ) -> Result<()> {
-    let result = runtime.block_on(session_loop(harness, &mut tui, switch));
+    let result = runtime.block_on(session_loop(harness, &mut tui, switch, swap, startup_modal));
     tui.shutdown();
     result
+}
+
+/// What routing a submitted `/` command decided. `Consumed` = handled (a modal
+/// may now be open); `Fall` = not a command, run it as a normal turn;
+/// `Swap` = perform an in-session session swap at the boundary.
+enum RouteOutcome {
+    Consumed,
+    Fall,
+    Swap(SessionSource),
 }
 
 /// Outcome of the idle (between-turns) input phase.
@@ -193,6 +204,8 @@ async fn session_loop<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
+    swap: &SessionLoader<'_>,
+    startup_modal: Option<Modal>,
 ) -> Result<()> {
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
@@ -217,11 +230,38 @@ async fn session_loop<P: ChatProvider>(
     // The production OAuth backend; `/login` drives it on a blocking task.
     let login_backend: Arc<dyn LoginBackend> = Arc::new(OAuthLoginBackend);
 
+    // `iris resume` (no id) on a rich TTY opens the resume picker on start by
+    // handing a pre-built modal here; the loop's top-of-iteration modal phase
+    // runs it before the first idle read.
+    if let Some(modal) = startup_modal {
+        tui.screen.open_modal(modal);
+    }
+
     loop {
         // Keep the status footer current: a model/effort change handled in the
         // previous iteration (chord, picker, or modal) is reflected before the
         // next idle draw.
         refresh_footer(tui, switch);
+        // Run any open picker/dialog first: the startup resume picker, or one a
+        // command/keybinding opened in the previous iteration. A `/resume`
+        // selection returns the chosen session to swap to at this safe boundary.
+        if tui.screen.focus() == FocusTarget::Modal {
+            let requested = run_modal_phase(
+                harness,
+                tui,
+                &mut input_rx,
+                &mut tick,
+                switch,
+                &login_backend,
+            )
+            .await?;
+            if let Some(source) = requested {
+                perform_swap(&source, swap, harness, tui, switch)?;
+            }
+            refresh_footer(tui, switch);
+            tui.draw()?;
+            continue;
+        }
         match idle_phase(tui, &mut input_rx, &mut tick).await? {
             IdleOutcome::Exit => break,
             IdleOutcome::OpenModelPicker => {
@@ -254,26 +294,32 @@ async fn session_loop<P: ChatProvider>(
                 if slash::is_exit(&prompt) {
                     break;
                 }
-                // Picker/model/reasoning commands are handled at this safe
-                // inter-turn boundary and never start a turn.
-                if route_command(&prompt, harness, tui, switch)? {
-                    // handled (a modal may now be open; run it below)
-                } else {
-                    tui.screen.commit_user(&prompt);
-                    tui.screen.start_turn();
-                    tui.draw()?;
-                    run_turn(
-                        harness,
-                        tui,
-                        &mut input_rx,
-                        &mut tick,
-                        &current_turn,
-                        &prompt,
-                        steering.as_ref(),
-                    )
-                    .await?;
-                    tui.screen.end_turn();
-                    tui.draw()?;
+                // Picker/model/reasoning/session commands are handled at this
+                // safe inter-turn boundary and never start a turn.
+                match route_command(&prompt, harness, tui, switch)? {
+                    RouteOutcome::Swap(source) => {
+                        perform_swap(&source, swap, harness, tui, switch)?;
+                    }
+                    // Consumed: a modal may now be open; the top-of-loop modal
+                    // phase runs it on the next iteration.
+                    RouteOutcome::Consumed => {}
+                    RouteOutcome::Fall => {
+                        tui.screen.commit_user(&prompt);
+                        tui.screen.start_turn();
+                        tui.draw()?;
+                        run_turn(
+                            harness,
+                            tui,
+                            &mut input_rx,
+                            &mut tick,
+                            &current_turn,
+                            &prompt,
+                            steering.as_ref(),
+                        )
+                        .await?;
+                        tui.screen.end_turn();
+                        tui.draw()?;
+                    }
                 }
             }
         }
@@ -282,21 +328,52 @@ async fn session_loop<P: ChatProvider>(
         // draw reflects the new selection immediately, not on the next keypress.
         refresh_footer(tui, switch);
         tui.draw()?;
-        // A command/keybinding may have opened a picker/dialog. Run it to
-        // completion here, where harness + switch are in scope; switches land at
-        // this same inter-turn boundary.
-        if tui.screen.focus() == FocusTarget::Modal {
-            run_modal_phase(
-                harness,
-                tui,
-                &mut input_rx,
-                &mut tick,
-                switch,
-                &login_backend,
-            )
-            .await?;
+    }
+    Ok(())
+}
+
+/// Swap the live session at the safe inter-turn boundary. Loads the target
+/// session (fresh transcript or a resumed session's messages) via the app
+/// loader, rebuilds the provider so the new session id keys it, installs the new
+/// transcript log and messages on the harness, and resets the on-screen
+/// transcript. A load/rebuild failure leaves the current session untouched and
+/// surfaces a notice.
+fn perform_swap<P: ChatProvider>(
+    source: &SessionSource,
+    swap: &SessionLoader<'_>,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+) -> Result<()> {
+    // The loader updates the shared session-id cell and opens/creates the target
+    // log before returning; the provider rebuild below then reads the new id.
+    let loaded: LoadedSource = match swap(source) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            apply_notices(tui, vec![format!("could not switch session: {error:#}")]);
+            return Ok(());
+        }
+    };
+    if let Some(sw) = switch.as_ref() {
+        match sw.rebuild_provider() {
+            Ok(provider) => harness.replace_provider(provider),
+            Err(error) => {
+                apply_notices(tui, vec![format!("could not switch session: {error:#}")]);
+                return Ok(());
+            }
         }
     }
+    let resumed = loaded.resumed;
+    harness.swap_session(loaded.session_log, loaded.messages, resumed);
+    tui.reset_screen();
+    tui.screen.apply(UiEvent::SessionStarted);
+    let notice = match source {
+        SessionSource::Fresh => "Started a new session.".to_string(),
+        SessionSource::Resume(_) => {
+            format!("Resumed session ({resumed} message(s) restored).")
+        }
+    };
+    apply_notices(tui, vec![notice]);
     Ok(())
 }
 
@@ -421,16 +498,17 @@ fn read_footer_branch(cwd: &std::path::Path) -> Option<String> {
     (!branch.is_empty()).then_some(branch)
 }
 
-/// Route a submitted `/` command to its picker/handler. Returns whether the line
-/// was consumed (so the loop does not start a turn). `/login`/`/logout` with
-/// arguments are intentionally not recognized (pi-mono parity) and fall through
-/// to a normal turn.
+/// Route a submitted `/` command to its picker/handler. Returns a
+/// [`RouteOutcome`]: `Consumed` (handled, a modal may be open), `Fall` (not a
+/// command; run it as a turn), or `Swap` (perform a session swap at the
+/// boundary). `/login`/`/logout` with arguments are intentionally not recognized
+/// (pi-mono parity) and fall through to a normal turn.
 fn route_command<P: ChatProvider>(
     prompt: &str,
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
-) -> Result<bool> {
+) -> Result<RouteOutcome> {
     let trimmed = prompt.trim();
     let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
         Some((cmd, rest)) => (cmd, rest.trim()),
@@ -439,47 +517,65 @@ fn route_command<P: ChatProvider>(
     match cmd {
         "/model" => {
             let Some(sw) = switch.as_mut() else {
-                return Ok(false);
+                return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
             match picker::model_command(rest, harness, sw) {
                 ModelCommand::Open(modal) => tui.screen.open_modal(modal),
                 ModelCommand::Lines(lines) => apply_notices(tui, lines),
             }
-            Ok(true)
+            Ok(RouteOutcome::Consumed)
         }
         "/scoped-models" => {
             let Some(sw) = switch.as_mut() else {
-                return Ok(false);
+                return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
             match picker::open_scoped(sw) {
                 ModelCommand::Open(modal) => tui.screen.open_modal(modal),
                 ModelCommand::Lines(lines) => apply_notices(tui, lines),
             }
-            Ok(true)
+            Ok(RouteOutcome::Consumed)
         }
         "/settings" => {
             let Some(sw) = switch.as_mut() else {
-                return Ok(false);
+                return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
             tui.screen.open_modal(picker::open_settings(sw));
-            Ok(true)
+            Ok(RouteOutcome::Consumed)
         }
         "/trust" if rest.is_empty() => {
             // Needs a switch to rebuild the provider with the re-assembled prompt.
             if switch.as_ref().is_none() {
-                return Ok(false);
+                return Ok(RouteOutcome::Fall);
             }
             tui.screen.commit_user(prompt);
             tui.screen.open_modal(picker::open_trust());
-            Ok(true)
+            Ok(RouteOutcome::Consumed)
+        }
+        "/resume" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            let cwd = std::env::current_dir().unwrap_or_default();
+            match picker::open_resume(&cwd) {
+                Some(modal) => tui.screen.open_modal(modal),
+                None => apply_notices(
+                    tui,
+                    vec!["No prior sessions to resume for this directory.".to_string()],
+                ),
+            }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/new" if rest.is_empty() => {
+            // Start a fresh session at this safe boundary (new id, empty
+            // transcript, fresh log) without restarting the process.
+            tui.screen.commit_user(prompt);
+            Ok(RouteOutcome::Swap(SessionSource::Fresh))
         }
         "/login" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             tui.screen.open_modal(login::open_login());
-            Ok(true)
+            Ok(RouteOutcome::Consumed)
         }
         "/logout" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
@@ -490,7 +586,7 @@ fn route_command<P: ChatProvider>(
                 },
                 Err(error) => apply_notices(tui, vec![format!("auth unavailable: {error:#}")]),
             }
-            Ok(true)
+            Ok(RouteOutcome::Consumed)
         }
         "/reasoning" => {
             // Legacy text effort path is preserved as a compatible alias. It
@@ -499,9 +595,9 @@ fn route_command<P: ChatProvider>(
             if let Some(lines) = crate::cli::handle_model_command(prompt, harness, switch) {
                 apply_notices(tui, lines);
             }
-            Ok(true)
+            Ok(RouteOutcome::Consumed)
         }
-        _ => Ok(false),
+        _ => Ok(RouteOutcome::Fall),
     }
 }
 
@@ -715,6 +811,8 @@ async fn run_turn<P: ChatProvider>(
 /// Drive an open picker/dialog to completion: route keys to the modal, apply the
 /// outcomes (model/effort switches, scoped edits, login/logout) at this safe
 /// inter-turn boundary, and return when the modal closes (or input ends).
+/// Returns the session to swap to when the `/resume` picker selected one, so the
+/// caller performs the swap with harness + switch + loader in scope.
 async fn run_modal_phase<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
@@ -722,7 +820,7 @@ async fn run_modal_phase<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
-) -> Result<()> {
+) -> Result<Option<SessionSource>> {
     while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
             maybe = input_rx.recv() => {
@@ -745,10 +843,13 @@ async fn run_modal_phase<P: ChatProvider>(
                         None => ModalOutcome::Ignore,
                     }
                 };
-                apply_modal_outcome(
+                let requested = apply_modal_outcome(
                     outcome, harness, tui, input_rx, tick, switch, login_backend,
                 )
                 .await?;
+                if requested.is_some() {
+                    return Ok(requested);
+                }
                 // The picker may have switched model/effort; refresh the
                 // footer before drawing so it never shows a stale model.
                 refresh_footer(tui, switch);
@@ -757,10 +858,11 @@ async fn run_modal_phase<P: ChatProvider>(
             _ = tick.tick() => {}
         }
     }
-    Ok(())
+    Ok(None)
 }
 
-/// Interpret one [`ModalOutcome`].
+/// Interpret one [`ModalOutcome`]. Returns a requested session swap (from the
+/// `/resume` picker) for the caller to perform.
 async fn apply_modal_outcome<P: ChatProvider>(
     outcome: ModalOutcome,
     harness: &mut Harness<P>,
@@ -769,19 +871,22 @@ async fn apply_modal_outcome<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
-) -> Result<()> {
+) -> Result<Option<SessionSource>> {
     match outcome {
-        ModalOutcome::Ignore | ModalOutcome::Redraw => {}
-        ModalOutcome::Close => tui.screen.close_modal(),
+        ModalOutcome::Ignore | ModalOutcome::Redraw => Ok(None),
+        ModalOutcome::Close => {
+            tui.screen.close_modal();
+            Ok(None)
+        }
         ModalOutcome::Emit(action) => {
-            dispatch_action(action, harness, tui, input_rx, tick, switch, login_backend).await?;
+            dispatch_action(action, harness, tui, input_rx, tick, switch, login_backend).await
         }
     }
-    Ok(())
 }
 
 /// Apply a [`ModalAction`]: model/scoped/effort actions go through the picker;
-/// login/logout actions are handled here (they need the auth store / backend).
+/// login/logout actions are handled here (they need the auth store / backend);
+/// a `/resume` selection is returned up as the session to swap to.
 async fn dispatch_action<P: ChatProvider>(
     action: ModalAction,
     harness: &mut Harness<P>,
@@ -790,8 +895,14 @@ async fn dispatch_action<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
-) -> Result<()> {
+) -> Result<Option<SessionSource>> {
     match action {
+        ModalAction::ResumeSession(id) => {
+            // Close the picker and hand the chosen session up to the loop, which
+            // performs the swap at the safe inter-turn boundary.
+            tui.screen.close_modal();
+            return Ok(Some(SessionSource::Resume(id)));
+        }
         ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {
             Ok(auth) => match login::provider_select(method, &auth) {
                 login::LoginStep::Open(modal) => tui.screen.open_modal(modal),
@@ -837,7 +948,7 @@ async fn dispatch_action<P: ChatProvider>(
         other => {
             let Some(sw) = switch.as_mut() else {
                 tui.screen.close_modal();
-                return Ok(());
+                return Ok(None);
             };
             match picker::apply_action(other, harness, sw) {
                 ActionResult::Close(lines) => {
@@ -852,7 +963,7 @@ async fn dispatch_action<P: ChatProvider>(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Resolution of the blocking login task.

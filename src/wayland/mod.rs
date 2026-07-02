@@ -168,6 +168,29 @@ impl<P: ChatProvider> Harness<P> {
         self.agent.replace_provider(provider);
     }
 
+    /// Swap the whole session at a safe turn boundary: install a different
+    /// transcript log (and its handle store), reset the persistence cursor and
+    /// entry-id tracking, and replace the agent's in-memory context. Drives the
+    /// in-session `/resume` (loaded messages, `resumed` already on disk) and
+    /// `/new` (empty messages, `resumed` = 0) swaps. The caller rebuilds and
+    /// installs the provider via [`replace_provider`](Self::replace_provider)
+    /// first; workspace, tool state, and budget are unchanged. Mirrors the
+    /// [`build`](Self::build) cursor setup so live and resumed persistence agree.
+    pub(crate) fn swap_session(
+        &mut self,
+        session: Option<SessionLog>,
+        messages: Vec<Message>,
+        resumed: usize,
+    ) {
+        self.output_store = session
+            .as_ref()
+            .map(|log| HandleStore::for_session(log.path()));
+        self.session = session;
+        self.persisted = resumed;
+        self.entry_ids = vec![None; resumed];
+        self.agent.reset_session(messages);
+    }
+
     /// Record a runtime mode switch as a first-class `modelSelection` entry in
     /// the transcript log. Best-effort (no-op without an attached log), mirroring
     /// message persistence: a switch is still applied even if it cannot be

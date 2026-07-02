@@ -48,6 +48,16 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/resume",
+        description: "Resume a prior session for this directory",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/new",
+        description: "Start a fresh session",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/scoped-models",
         description: "Enable/disable models for Ctrl+P cycling",
         action: SlashAction::Submit,
@@ -175,7 +185,7 @@ mod tests {
 
     #[test]
     fn matches_filters_by_prefix_case_insensitively() {
-        assert_eq!(matches("/").len(), 8);
+        assert_eq!(matches("/").len(), 10);
         let ex = matches("/EX");
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name, "/exit");
@@ -207,7 +217,7 @@ mod tests {
         for _ in 0..20 {
             p.down("/");
         }
-        assert_eq!(p.selected(), 7);
+        assert_eq!(p.selected(), 9);
         assert_eq!(p.accept("/").unwrap().name, "/logout");
         // Up returns toward the top.
         p.up();

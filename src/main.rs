@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::env;
 use std::io::{IsTerminal, Write};
 use std::process::{Command, ExitCode};
+use std::rc::Rc;
 use std::time::Duration;
 
 use std::path::Path;
@@ -66,6 +68,17 @@ fn dispatch() -> Result<()> {
     match args.as_slice() {
         [] => run_agent(false),
         [flag] if flag == "--plain" => run_agent(true),
+        // `-c`/`--continue` resumes the newest session for the cwd; parsed like
+        // the other bare flags, with an optional trailing `--plain`.
+        [flag] if is_continue(flag) => continue_agent(false),
+        [flag, plain] if is_continue(flag) && plain == "--plain" => continue_agent(true),
+        // `resume` with a trailing `--plain` (and no id) prints the plain list;
+        // this must precede the `resume <id>` arm so `--plain` is not read as an
+        // id.
+        [command, plain] if command == "resume" && plain == "--plain" => resume_pick(true),
+        // `resume` with no id: pick a session (picker on a rich TTY, plain list
+        // otherwise).
+        [command] if command == "resume" => resume_pick(false),
         [command, session_id] if command == "resume" => resume_agent(session_id, false),
         [command, session_id, flag] if command == "resume" && flag == "--plain" => {
             resume_agent(session_id, true)
@@ -126,6 +139,11 @@ enum LoginMethod {
     DeviceCode,
 }
 
+/// Whether a bare flag is the resume-newest shorthand (`-c` / `--continue`).
+fn is_continue(flag: &str) -> bool {
+    matches!(flag, "-c" | "--continue")
+}
+
 /// Provider used when the settings file selects none. Stays `openai-codex` for
 /// backward compatibility; `anthropic` and `antigravity` are opt-in via
 /// `defaultProvider` in settings.
@@ -146,6 +164,64 @@ fn configured_provider() -> String {
 }
 
 fn run_agent(force_plain: bool) -> Result<()> {
+    run_agent_inner(force_plain, None)
+}
+
+/// `iris --continue` / `iris -c`: resume the newest session for the current
+/// directory. A clear usage error when the directory has no prior session; on
+/// success it reuses the standard [`resume_agent`] path.
+fn continue_agent(force_plain: bool) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let store = session::SessionStore::open_default()?;
+    let metas = store.list()?;
+    let id = session::newest_for_cwd(&metas, &cwd.to_string_lossy())
+        .map(|meta| meta.id.clone())
+        .ok_or_else(|| {
+            errors::UsageError::new(
+                "no prior session found for this directory; run `iris` to start one",
+            )
+        })?;
+    resume_agent(&id, force_plain)
+}
+
+/// `iris resume` with no id. On a plain/non-TTY front-end, print the resumable
+/// session list (id, age, preview) for this directory and exit 0. On a rich TTY,
+/// start a session with the `/resume` picker open so the user selects one
+/// (cancelling leaves them in the fresh session).
+fn resume_pick(force_plain: bool) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let store = session::SessionStore::open_default()?;
+    let sessions = store.resumable_for_cwd(&cwd.to_string_lossy())?;
+    if cli::prefers_text_ui(force_plain) {
+        print_session_list(&sessions, session::current_ms());
+        return Ok(());
+    }
+    // `open_resume` returns `None` when there is nothing to resume; the session
+    // then simply starts fresh with no picker.
+    let startup_modal = ui::picker::open_resume(&cwd);
+    run_agent_inner(force_plain, startup_modal)
+}
+
+/// Print the resumable-session list for the plain/non-TTY `iris resume` path.
+fn print_session_list(sessions: &[session::ResumableSession], now_ms: u128) {
+    if sessions.is_empty() {
+        println!("No prior sessions to resume for this directory.");
+        return;
+    }
+    println!("Resumable sessions for this directory (newest first):");
+    for session in sessions {
+        println!(
+            "  {}  {:>8}  {}",
+            session.meta.id,
+            session::relative_age(now_ms, session.meta.created_ms),
+            session.preview,
+        );
+    }
+    println!();
+    println!("Resume one with: iris resume <session-id>");
+}
+
+fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
     // Materialize the shipped fragment defaults into ~/.iris/fragments (if
@@ -190,9 +266,12 @@ fn run_agent(force_plain: bool) -> Result<()> {
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
     // Tier-3 mode-switch state: `/model` `/reasoning` rebuild a provider from the
     // same system prompt via `build_provider` and install it at a turn boundary.
-    let build_session_id = session_id.clone();
+    // The session id lives in a shared cell so an in-session `/resume` `/new`
+    // swap can point the provider builder at the swapped session's id.
+    let session_cell = Rc::new(RefCell::new(session_id.clone()));
+    let build_cell = session_cell.clone();
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
-        build_provider(selection, prompt, &build_session_id)
+        build_provider(selection, prompt, &build_cell.borrow())
     };
     let mut switch = Some(cli::ModelSwitch::new(
         selection,
@@ -200,7 +279,61 @@ fn run_agent(force_plain: bool) -> Result<()> {
         &build,
         settings.enabled_models.clone(),
     ));
-    cli::run_interactive(&mut harness, &mut switch, force_plain)
+    let swap_cwd = cwd.clone();
+    let swap =
+        move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
+    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, startup_modal)
+}
+
+/// Load the transcript state for an in-session `/resume` `/new` swap and point
+/// the shared session-id cell at the swapped session, so the subsequent provider
+/// rebuild keys to it. `Fresh` opens a brand-new transcript; `Resume` reopens a
+/// persisted session by id (a clear error when the id is unknown). Log open
+/// failures degrade to in-memory persistence, like a normal start.
+fn load_session_source(
+    cwd: &Path,
+    cell: &Rc<RefCell<String>>,
+    source: &cli::SessionSource,
+) -> Result<cli::LoadedSource> {
+    match source {
+        cli::SessionSource::Fresh => {
+            let id = session::new_session_id();
+            let session_log = match session::SessionLog::create_with_id(cwd, &id) {
+                Ok(log) => Some(log),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "new-session persistence disabled");
+                    None
+                }
+            };
+            *cell.borrow_mut() = id;
+            Ok(cli::LoadedSource {
+                session_log,
+                messages: Vec::new(),
+                resumed: 0,
+            })
+        }
+        cli::SessionSource::Resume(id) => {
+            let store = session::SessionStore::open_default()?;
+            let meta = store.find(id)?.ok_or_else(|| {
+                errors::UsageError::new(format!("no session found with id '{id}'"))
+            })?;
+            let stored = store.open(&meta)?;
+            let resumed = stored.messages.len();
+            let session_log = match session::SessionLog::resume(&meta.path) {
+                Ok(log) => Some(log),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "resume persistence disabled");
+                    None
+                }
+            };
+            *cell.borrow_mut() = meta.id.clone();
+            Ok(cli::LoadedSource {
+                session_log,
+                messages: stored.messages,
+                resumed,
+            })
+        }
+    }
 }
 
 /// Run one headless turn-sequence for `iris -p`/`--print`: assemble the prompt
@@ -368,9 +501,10 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
         resumed,
         budget,
     );
-    let build_session_id = session_id.clone();
+    let session_cell = Rc::new(RefCell::new(session_id.clone()));
+    let build_cell = session_cell.clone();
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
-        build_provider(selection, prompt, &build_session_id)
+        build_provider(selection, prompt, &build_cell.borrow())
     };
     let mut switch = Some(cli::ModelSwitch::new(
         selection,
@@ -378,7 +512,10 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
         &build,
         settings.enabled_models.clone(),
     ));
-    cli::run_interactive(&mut harness, &mut switch, force_plain)
+    let swap_cwd = cwd.clone();
+    let swap =
+        move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
+    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, None)
 }
 
 /// Log the most recent prior session for `cwd` (if any) via the read side of
@@ -713,7 +850,10 @@ fn print_help() {
     );
     eprintln!("  iris --print \"prompt\" --approve   Print mode, auto-approving gated tools");
     eprintln!("    (piped stdin is merged into the prompt, e.g. `cat log | iris -p \"explain\"`)");
+    eprintln!("  iris -c, --continue               Resume the newest session for this directory");
+    eprintln!("  iris resume                       Pick a session to resume (picker on a TTY)");
     eprintln!("  iris resume <session-id>          Resume a prior session by id");
+    eprintln!("    (in-session: /resume picks a session, /new starts a fresh one)");
     eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
     eprintln!("  iris login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
@@ -739,6 +879,16 @@ mod tests {
     #[test]
     fn command_name_is_iris() {
         assert_eq!(command_name(), "iris");
+    }
+
+    #[test]
+    fn continue_flag_recognizes_short_and_long_forms_only() {
+        assert!(is_continue("-c"));
+        assert!(is_continue("--continue"));
+        assert!(!is_continue("--plain"));
+        assert!(!is_continue("resume"));
+        assert!(!is_continue("-p"));
+        assert!(!is_continue("continue"));
     }
 
     #[test]
