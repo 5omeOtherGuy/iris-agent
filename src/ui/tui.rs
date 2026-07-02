@@ -1888,6 +1888,98 @@ mod tests {
     }
 
     #[test]
+    fn short_transcript_is_top_anchored_with_filler_above_bottom_chrome() {
+        // Full-pane takeover: the conversation reads top-down from the first
+        // pane row, blank filler sits between the transcript and the composer,
+        // and the composer occupies the bottom rows of the pane.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextEnd("Short answer.".to_string()));
+
+        let height = 24u16;
+        let lines = rendered_lines(&mut screen, 100, height);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+        assert!(
+            texts[0].contains("Short answer."),
+            "transcript must start on the first pane row: {texts:?}"
+        );
+        let hairline = texts
+            .iter()
+            .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
+            .expect("composer hairline");
+        // Everything between the transcript and the composer hairline is blank
+        // filler (the transcript block ends with its own single blank row).
+        assert!(
+            texts[1..hairline].iter().all(|line| line.trim().is_empty()),
+            "filler between transcript and composer must be blank: {texts:?}"
+        );
+        assert!(hairline > 2, "filler rows expected on a short session");
+    }
+
+    #[test]
+    fn empty_launch_document_fills_viewport_with_composer_at_bottom() {
+        // At launch (empty transcript) the rendered document already spans the
+        // whole pane: filler on top, composer chrome pinned to the bottom rows.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::SessionStarted);
+
+        let height = 24u16;
+        let lines = rendered_lines(&mut screen, 80, height);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+        let input_idx = texts
+            .iter()
+            .position(|line| line.contains("Give Iris a task..."))
+            .expect("composer input");
+        assert_eq!(input_idx + 2, texts.len(), "{texts:?}");
+        let hairline = texts
+            .iter()
+            .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
+            .expect("composer hairline");
+        assert!(
+            texts[..hairline].iter().all(|line| line.trim().is_empty()),
+            "launch filler above the composer must be blank: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_growth_keeps_composer_pinned_without_scrolling_filler() -> std::io::Result<()> {
+        // While the padded document fits the pane, transcript growth shrinks
+        // the filler in place: the document stays exactly viewport-height and
+        // no blank filler row is ever pushed into native scrollback.
+        let size = Size::new(60, 16);
+        let mut screen = Screen::new();
+        let mut surface = TerminalSurface::new(Vec::new());
+        render_perf_cycle(&mut screen, &mut surface, size)?;
+        assert_eq!(surface.state().previous_lines.len(), 16);
+
+        for i in 0..2 {
+            screen.commit_user(&format!("prompt {i}"));
+            screen.apply(UiEvent::AssistantText(format!("answer {i}")));
+            render_perf_cycle(&mut screen, &mut surface, size)?;
+        }
+
+        assert_eq!(
+            surface.state().previous_lines.len(),
+            16,
+            "padded document must hold the viewport height while content fits"
+        );
+        assert!(
+            !surface.state().scrolled,
+            "filler shrinkage must not scroll rows into native scrollback"
+        );
+        let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
+        let first = replay.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("prompt 0"),
+            "transcript must stay anchored to the first pane row: {replay:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn composer_statusline_shows_status_with_context_meter() {
         let mut screen = Screen::new();
         screen.set_footer(
