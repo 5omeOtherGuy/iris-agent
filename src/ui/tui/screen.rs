@@ -1147,7 +1147,8 @@ fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'s
     let mut out = Vec::new();
     for y in 0..buf.area.height {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        for x in 0..buf.area.width {
+        let mut x = 0;
+        while x < buf.area.width {
             // Inject the zero-width cursor marker as its own span immediately
             // before the cursor cell so the terminal surface can recover the
             // cursor column (it strips the marker before any terminal write).
@@ -1156,14 +1157,17 @@ fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'s
             }
             let cell = &buf[(x, y)];
             let style = cell.style();
+            let symbol = cell.symbol();
             if let Some(last) = spans.last_mut()
                 && last.style == style
                 && last.content.as_ref() != CURSOR_MARKER
             {
-                last.content.to_mut().push_str(cell.symbol());
+                last.content.to_mut().push_str(symbol);
+                x = x.saturating_add(display_width(symbol).max(1) as u16);
                 continue;
             }
-            spans.push(Span::styled(cell.symbol().to_string(), style));
+            spans.push(Span::styled(symbol.to_string(), style));
+            x = x.saturating_add(display_width(symbol).max(1) as u16);
         }
         out.push(Line::from(spans));
     }
@@ -1274,6 +1278,32 @@ mod tests {
             !has_marker(&running),
             "a running turn must not emit the composer cursor marker"
         );
+    }
+
+    #[test]
+    fn composer_wide_glyphs_never_render_over_terminal_width() {
+        use super::{Screen, render_document_with_chrome_tail};
+        use crate::ui::terminal_surface::CURSOR_MARKER;
+        use ratatui::layout::Size;
+
+        for width in [12_u16, 44, 90, 120] {
+            let mut screen = Screen::new();
+            screen.set_editor("中🙂 wide glyphs");
+            let (lines, _) = render_document_with_chrome_tail(&mut screen, Size::new(width, 14));
+
+            for (index, line) in lines.iter().enumerate() {
+                let visible = line
+                    .spans
+                    .iter()
+                    .filter(|span| span.content.as_ref() != CURSOR_MARKER)
+                    .map(|span| display_width(span.content.as_ref()))
+                    .sum::<usize>();
+                assert!(
+                    visible <= usize::from(width),
+                    "width {width}, line {index} exceeded terminal width: {visible} > {width}: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]

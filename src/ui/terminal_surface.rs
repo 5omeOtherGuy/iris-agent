@@ -325,6 +325,10 @@ impl<W: Write> TerminalSurface<W> {
         let stable_append = new_stable_len > previous_stable_len
             && self.state.previous_lines[..previous_stable_len] == lines[..previous_stable_len];
         if stable_append && previous_volatile_tail > 0 {
+            if previous_stable_len < self.state.previous_viewport_top {
+                self.write_full(lines.to_vec(), width, height, true, volatile_tail)?;
+                return Ok(RenderKind::FullRedraw);
+            }
             self.write_append_replacing_volatile(
                 lines,
                 previous_stable_len,
@@ -995,6 +999,36 @@ mod tests {
         assert!(!out.contains("old status"), "{out:?}");
         assert!(out.contains("history two"), "{out:?}");
         assert!(out.contains("new editor"), "{out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn volatile_tail_taller_than_viewport_does_not_append_past_visible_rows() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let previous: Vec<Line<'static>> = std::iter::once(Line::from("stable 0"))
+            .chain((1..=9).map(|n| Line::from(format!("old volatile {n}"))))
+            .collect();
+        surface.render_with_volatile_tail(size(30, 6), &previous, 9)?;
+        assert_eq!(surface.state().previous_viewport_top, 4);
+        surface.writer_mut().clear();
+
+        let next: Vec<Line<'static>> = [Line::from("stable 0"), Line::from("stable 1")]
+            .into_iter()
+            .chain((1..=9).map(|n| Line::from(format!("new volatile {n}"))))
+            .collect();
+        surface.render_with_volatile_tail(size(30, 6), &next, 9)?;
+
+        let plain = strip_ansi(&output(&surface));
+        let content_rows: Vec<&str> = plain
+            .lines()
+            .filter(|line| line.contains("stable") || line.contains("volatile"))
+            .collect();
+        assert!(
+            content_rows.len() <= 6,
+            "wrote more rows than the viewport and would scroll: {plain:?}"
+        );
+        assert_eq!(surface.state().previous_viewport_top, 5);
+        assert_eq!(surface.state().hardware_cursor_row, next.len().saturating_sub(1));
         Ok(())
     }
 

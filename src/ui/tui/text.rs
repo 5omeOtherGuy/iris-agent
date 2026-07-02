@@ -9,9 +9,11 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 pub(super) use crate::ui::textengine::clean_text as strip_ansi_for_text;
+use crate::ui::textengine::expand_tabs;
 
 pub(super) fn ansi_spans(text: &str, default_style: Style) -> Vec<Span<'static>> {
-    if let Ok(parsed_text) = text.into_text() {
+    let expanded = expand_tabs(text);
+    if let Ok(parsed_text) = expanded.as_str().into_text() {
         // Flatten any parsed sub-lines (a stray \r can split one input line)
         // so no styled content is dropped.
         let mut spans = Vec::new();
@@ -34,5 +36,5 @@ pub(super) fn ansi_spans(text: &str, default_style: Style) -> Vec<Span<'static>>
             return spans;
         }
     }
-    vec![Span::styled(strip_ansi_for_text(text), default_style)]
+    vec![Span::styled(strip_ansi_for_text(&expanded), default_style)]
 }

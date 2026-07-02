@@ -5,13 +5,13 @@ use ratatui::text::{Line, Span};
 
 use super::component::Component;
 use super::panel::{
-    apply_width_bg, inset_rule_line, panel_body_line, panel_body_lines, panel_header_line,
-    panel_rule_line, rail_header_line,
+    apply_width_bg, inset_rule_line, panel_body_content_width, panel_body_line, panel_body_lines,
+    panel_header_line, panel_rule_line, rail_header_line,
 };
 use super::wrap::{
-    display_width, pad_line_left, pad_line_right, push_wrapped_line, push_wrapped_line_wordwise,
-    push_wrapped_line_wordwise_with_prefix, push_wrapped_row, push_wrapped_row_with_prefix,
-    truncate_to_width,
+    display_width, line_text, pad_line_left, pad_line_right, push_wrapped_line,
+    push_wrapped_line_wordwise, push_wrapped_line_wordwise_with_prefix, push_wrapped_row,
+    push_wrapped_row_with_prefix, truncate_line, truncate_to_width,
 };
 use super::{BOX_X_PADDING, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING, dim_style};
 
@@ -97,6 +97,26 @@ impl TranscriptRow {
             if let ChromeRow::Body { line, bg } = chrome {
                 panel_body_lines(width, line.clone(), *bg, out);
                 return;
+            }
+            if let ChromeRow::BodyRight {
+                left,
+                right,
+                right_style,
+                bg,
+            } = chrome
+            {
+                let content_width = panel_body_content_width(width);
+                let left_width = display_width(&line_text(left));
+                let right_width = display_width(right);
+                if !right.is_empty() && left_width + 1 + right_width > content_width {
+                    panel_body_lines(width, left.clone(), *bg, out);
+                    out.push(panel_body_line(
+                        width,
+                        right_aligned_line(Line::default(), right, *right_style, content_width),
+                        *bg,
+                    ));
+                    return;
+                }
             }
             out.push(chrome.render(width));
             return;
@@ -184,6 +204,24 @@ pub(super) enum ChromeRow {
         line: Line<'static>,
         bg: Option<Color>,
     },
+    BodyRight {
+        left: Line<'static>,
+        right: String,
+        right_style: Style,
+        bg: Option<Color>,
+    },
+    BodyRule {
+        prefix: String,
+        rule: char,
+        style: Style,
+        bg: Option<Color>,
+    },
+    Notice {
+        glyph: String,
+        glyph_style: Style,
+        message: String,
+        hint: String,
+    },
     /// A reasoning-rail header — a chromeless fold anchor. Carries the same
     /// `expanded` flag the fold machinery reads (so `ctrl+o` and the visibility
     /// pass treat it like a panel `Header`), but renders as a muted `┊ ▾ THINKING`
@@ -216,6 +254,37 @@ impl ChromeRow {
             ChromeRow::Separator => panel_rule_line(width, '├', '┤'),
             ChromeRow::Bottom => panel_rule_line(width, '└', '┘'),
             ChromeRow::Body { line, bg } => panel_body_line(width, line.clone(), *bg),
+            ChromeRow::BodyRight {
+                left,
+                right,
+                right_style,
+                bg,
+            } => panel_body_line(
+                width,
+                right_aligned_line(
+                    left.clone(),
+                    right,
+                    *right_style,
+                    panel_body_content_width(width),
+                ),
+                *bg,
+            ),
+            ChromeRow::BodyRule {
+                prefix,
+                rule,
+                style,
+                bg,
+            } => panel_body_line(
+                width,
+                body_rule_line(prefix, *rule, *style, panel_body_content_width(width)),
+                *bg,
+            ),
+            ChromeRow::Notice {
+                glyph,
+                glyph_style,
+                message,
+                hint,
+            } => notice_line(width, glyph, *glyph_style, message, hint),
             ChromeRow::RailHeader {
                 expanded,
                 label,
@@ -225,6 +294,69 @@ impl ChromeRow {
             ChromeRow::RailEnd => Line::default(),
         }
     }
+}
+
+fn right_aligned_line(
+    left: Line<'static>,
+    right: &str,
+    right_style: Style,
+    width: usize,
+) -> Line<'static> {
+    let right_w = display_width(right);
+    let left_w = display_width(&line_text(&left));
+    if right.is_empty() {
+        return left;
+    }
+    if left_w + 1 + right_w > width {
+        return Line::from(vec![
+            Span::raw(" ".repeat(width.saturating_sub(right_w))),
+            Span::styled(right.to_string(), right_style),
+        ]);
+    }
+    let mut spans = left.spans;
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(left_w).saturating_sub(right_w).max(1)),
+    ));
+    spans.push(Span::styled(right.to_string(), right_style));
+    Line::from(spans)
+}
+
+fn body_rule_line(prefix: &str, rule: char, style: Style, width: usize) -> Line<'static> {
+    let prefix_w = display_width(prefix);
+    let fill = width.saturating_sub(prefix_w).max(1);
+    Line::from(Span::styled(
+        format!("{prefix}{}", rule.to_string().repeat(fill)),
+        style,
+    ))
+}
+
+fn notice_line(
+    width: usize,
+    glyph: &str,
+    glyph_style: Style,
+    message: &str,
+    hint: &str,
+) -> Line<'static> {
+    let left = format!("{glyph} {message}");
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), glyph_style),
+        Span::styled(message.to_string(), dim_style()),
+    ];
+    if !hint.is_empty() {
+        let content_width = width
+            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+            .max(1);
+        let left_w = display_width(&left);
+        let hint_w = display_width(hint);
+        if left_w + 2 + hint_w <= content_width {
+            spans.push(Span::raw(" ".repeat(content_width - left_w - hint_w)));
+            spans.push(Span::styled(hint.to_string(), dim_style()));
+        }
+    }
+    let mut line = Line::from(spans);
+    pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
+    truncate_line(&mut line, width.max(1));
+    line
 }
 
 const TURN_DIVIDER_LEADER_WIDTH: usize = TEXT_COLUMN_X_PADDING + 4 - BOX_X_PADDING;

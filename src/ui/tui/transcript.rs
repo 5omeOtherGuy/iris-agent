@@ -284,23 +284,16 @@ impl Transcript {
     fn push_notice_row(&mut self, glyph: &str, glyph_style: Style, message: &str, hint: &str) {
         self.begin_block();
         let left = format!("{glyph} {message}");
-        let mut spans = vec![
-            Span::styled(format!("{glyph} "), glyph_style),
-            Span::styled(message.to_string(), dim_style()),
-        ];
-        let width = self.markdown_content_width();
-        if !hint.is_empty() {
-            let gap = width
-                .saturating_sub(display_width(&left))
-                .saturating_sub(display_width(hint));
-            if gap >= 2 {
-                spans.push(Span::raw(" ".repeat(gap)));
-                spans.push(Span::styled(hint.to_string(), dim_style()));
-            }
-        }
-        let mut row = TranscriptRow::new(left, dim_style());
-        row.line = Some(Line::from(spans));
-        self.rows.push(row);
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Notice {
+                glyph: glyph.to_string(),
+                glyph_style,
+                message: message.to_string(),
+                hint: hint.to_string(),
+            },
+            left,
+            dim_style(),
+        ));
         self.push_blank();
     }
 
@@ -696,8 +689,10 @@ impl Transcript {
             let hint = right_align_pair(&left, "ctrl+o to expand", self.wrap_width());
             self.rows.push(
                 TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: Line::from(Span::styled(hint.clone(), dim_style())),
+                    ChromeRow::BodyRight {
+                        left: Line::from(Span::styled(left.clone(), dim_style())),
+                        right: "ctrl+o to expand".to_string(),
+                        right_style: dim_style(),
                         bg: None,
                     },
                     hint,
@@ -1568,6 +1563,9 @@ impl Transcript {
         }
         let remove = self.panel_safe_trim_index(self.rows.len() - MAX_TRANSCRIPT_ROWS);
         self.rows.drain(..remove);
+        self.thinking_header_row = self
+            .thinking_header_row
+            .and_then(|index| index.checked_sub(remove));
         self.exploring_open = self.trailing_explore_panel_open();
     }
 
@@ -1586,6 +1584,8 @@ impl Transcript {
                 ChromeRow::Header { .. }
                     | ChromeRow::Separator
                     | ChromeRow::Body { .. }
+                    | ChromeRow::BodyRight { .. }
+                    | ChromeRow::BodyRule { .. }
                     | ChromeRow::Bottom
             )
         )

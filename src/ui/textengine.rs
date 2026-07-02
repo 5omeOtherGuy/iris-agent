@@ -56,9 +56,10 @@ pub(crate) fn cluster_advance(cluster: &str) -> usize {
 pub(crate) fn visible_width(text: &str) -> usize {
     // Fast path: with no ESC (0x1b) and no possible C1 lead byte (0xc2 prefixes
     // U+0080..U+00BF, which covers every C1 introducer), there are no escape
-    // sequences to strip. Control chars contribute 0 to UnicodeWidthStr either
-    // way, so this is identical to stripping first -- without the allocation.
-    if text.bytes().all(|b| b != 0x1b && b != 0xc2) {
+    // sequences to strip. With no tabs, control chars contribute 0 to
+    // UnicodeWidthStr either way, so this is identical to stripping first --
+    // without the allocation.
+    if text.bytes().all(|b| b != 0x1b && b != 0xc2 && b != b'\t') {
         return display_width(text);
     }
     display_width(&clean_text(text))
@@ -80,7 +81,111 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 /// `tui/text.rs::strip_ansi_for_text` (the `\r`-splitting / footer-cleaning
 /// path).
 pub(crate) fn clean_text(input: &str) -> String {
-    transform(input, true)
+    transform(&expand_tabs(input), true)
+}
+
+/// Expand TAB characters to standard 8-column tab stops, measured in display
+/// columns from the start of each logical line. ANSI/OSC/APC escapes are copied
+/// through without advancing the column so callers can expand before stripping
+/// or parsing SGR styling.
+pub(crate) fn expand_tabs(input: &str) -> String {
+    if !input.contains('\t') {
+        return input.to_string();
+    }
+    const TAB_STOP: usize = 8;
+
+    let mut out = String::with_capacity(input.len());
+    let mut col = 0usize;
+    let mut pos = 0usize;
+    while pos < input.len() {
+        if let Some(len) = ansi_sequence_len_at(input, pos) {
+            out.push_str(&input[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        let rest = &input[pos..];
+        let Some(cluster) = rest.graphemes(true).next() else {
+            break;
+        };
+        match cluster {
+            "\t" => {
+                let spaces = TAB_STOP - (col % TAB_STOP);
+                out.push_str(&" ".repeat(spaces));
+                col += spaces;
+            }
+            "\n" => {
+                out.push('\n');
+                col = 0;
+            }
+            _ => {
+                out.push_str(cluster);
+                if !cluster.chars().any(char::is_control) {
+                    col += cluster_width(cluster);
+                }
+            }
+        }
+        pos += cluster.len();
+    }
+    out
+}
+
+fn ansi_sequence_len_at(s: &str, pos: usize) -> Option<usize> {
+    if pos >= s.len() {
+        return None;
+    }
+    let rest = &s[pos..];
+    let mut iter = rest.char_indices();
+    let (_, intro) = iter.next()?;
+    match intro {
+        '\x1b' => {
+            let (_, second) = iter.next()?;
+            match second {
+                '[' => ansi_csi_len(rest),
+                ']' | 'P' | '^' | '_' | 'X' => ansi_string_control_len(rest),
+                _ => Some(rest.char_indices().nth(2).map_or(rest.len(), |(i, _)| i)),
+            }
+        }
+        '\u{009b}' => ansi_csi_len(rest),
+        '\u{009d}' | '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
+            ansi_string_control_len(rest)
+        }
+        _ => None,
+    }
+}
+
+fn ansi_csi_len(rest: &str) -> Option<usize> {
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\x1b' {
+        chars.next();
+    }
+    for (i, ch) in chars {
+        if ('\u{40}'..='\u{7e}').contains(&ch) {
+            return Some(i + ch.len_utf8());
+        }
+    }
+    Some(rest.len())
+}
+
+fn ansi_string_control_len(rest: &str) -> Option<usize> {
+    let mut chars = rest.char_indices().peekable();
+    chars.next()?;
+    if rest.starts_with('\x1b') {
+        chars.next();
+    }
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\u{7}' || ch == '\u{009c}' {
+            return Some(i + ch.len_utf8());
+        }
+        if ch == '\x1b'
+            && matches!(chars.peek(), Some((_, '\\')))
+        {
+            let (j, st) = chars.next()?;
+            return Some(j + st.len_utf8());
+        }
+    }
+    Some(rest.len())
 }
 
 fn transform(input: &str, drop_controls: bool) -> String {
@@ -187,6 +292,31 @@ pub(crate) fn truncate_to_width(text: &str, max: usize) -> String {
 pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     if width == 0 || display_width(text) <= width {
         return vec![text.to_string()];
+    }
+    let leading_spaces = text.bytes().take_while(|byte| *byte == b' ').count();
+    if leading_spaces > 0 {
+        let rest = &text[leading_spaces..];
+        let mut rows = Vec::new();
+        let mut remaining = leading_spaces;
+        while remaining >= width {
+            rows.push(" ".repeat(width));
+            remaining -= width;
+        }
+        if rest.is_empty() {
+            if remaining > 0 {
+                rows.push(" ".repeat(remaining));
+            }
+            return rows;
+        }
+        let first_width = width.saturating_sub(remaining).max(1);
+        let mut rest_rows = wrap_to_width(rest, first_width);
+        if remaining > 0
+            && let Some(first) = rest_rows.first_mut()
+        {
+            first.insert_str(0, &" ".repeat(remaining));
+        }
+        rows.extend(rest_rows);
+        return rows;
     }
     let mut rows: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -808,7 +938,8 @@ mod tests {
     #[test]
     fn strip_ansi_keeps_controls_clean_text_drops_them() {
         assert_eq!(strip_ansi("\x1b[31ma\tb\x1b[0m"), "a\tb");
-        assert_eq!(clean_text("\x1b[31ma\tb\x1b[0m"), "ab");
+        assert_eq!(clean_text("\x1b[31ma\tb\x1b[0m"), "a       b");
+        assert_eq!(clean_text("1234567\tb"), "1234567 b");
         // 8-bit C1 CSI and bracketed-paste markers are removed.
         assert_eq!(strip_ansi("\u{009b}31mx"), "x");
         assert_eq!(strip_ansi("\x1b[200~hi\x1b[201~"), "hi");
@@ -848,6 +979,14 @@ mod tests {
         );
         assert_eq!(wrap_to_width("abcdefgh", 3), vec!["abc", "def", "gh"]);
         assert_eq!(wrap_to_width("short", 80), vec!["short"]);
+    }
+
+    #[test]
+    fn wrap_to_width_preserves_leading_spaces_on_first_wrapped_row() {
+        let rows = wrap_to_width("  indented prompt wraps", 12);
+
+        assert!(rows[0].starts_with("  "), "{rows:?}");
+        assert!(rows.iter().all(|row| display_width(row) <= 12), "{rows:?}");
     }
 
     #[test]

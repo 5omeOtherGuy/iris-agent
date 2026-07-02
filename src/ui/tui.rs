@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn panel_headers_and_plain_body_rows_strip_terminal_controls() {
         let mut screen = Screen::new();
-        let command = "echo \u{1b}]0;owned\u{7}safe\u{1b}[31m red\u{1b}[0m\rboom";
+        let command = "echo \u{1b}]0;owned\u{7}safe\t\u{1b}[31mred\u{1b}[0m\rboom";
         let file = "src/\u{1b}]0;owned\u{7}safe.rs";
 
         screen.apply(UiEvent::ToolResult {
@@ -688,7 +688,7 @@ mod tests {
         assert!(!rendered.contains('\u{7}'), "{rendered:?}");
         assert!(!rendered.contains('\r'), "{rendered:?}");
         assert!(!rendered.contains("owned"), "{rendered:?}");
-        assert!(rendered.contains("echo safe redboom"), "{rendered:?}");
+        assert!(rendered.contains("echo safe       redboom"), "{rendered:?}");
         assert!(rendered.contains("src/safe.rs"), "{rendered:?}");
     }
 
@@ -2915,6 +2915,8 @@ mod tests {
                     ChromeRow::Header { .. }
                         | ChromeRow::Separator
                         | ChromeRow::Body { .. }
+                        | ChromeRow::BodyRight { .. }
+                        | ChromeRow::BodyRule { .. }
                         | ChromeRow::Bottom
                 )
             ),
@@ -2927,9 +2929,13 @@ mod tests {
                     assert!(!in_panel, "nested panel start");
                     in_panel = true;
                 }
-                Some(ChromeRow::Header { .. } | ChromeRow::Separator | ChromeRow::Body { .. }) => {
-                    assert!(in_panel, "orphan panel interior: {:?}", row.text);
-                }
+                Some(
+                    ChromeRow::Header { .. }
+                    | ChromeRow::Separator
+                    | ChromeRow::Body { .. }
+                    | ChromeRow::BodyRight { .. }
+                    | ChromeRow::BodyRule { .. },
+                ) => assert!(in_panel, "orphan panel interior: {:?}", row.text),
                 Some(ChromeRow::Bottom) => {
                     assert!(in_panel, "orphan panel bottom");
                     in_panel = false;
@@ -2938,10 +2944,57 @@ mod tests {
                 // and end markers never open/close `in_panel`, and its trace rows
                 // are plain rows outside any box.
                 Some(ChromeRow::RailHeader { .. } | ChromeRow::RailEnd) => {}
+                Some(ChromeRow::Notice { .. }) => {
+                    assert!(!in_panel, "notice row inside panel: {:?}", row.text);
+                }
                 None => assert!(!in_panel, "plain row inside panel: {:?}", row.text),
             }
         }
         assert!(!in_panel, "trim left an unterminated panel");
+    }
+
+    #[test]
+    fn trim_history_keeps_thinking_header_telemetry_index_aligned() {
+        let mut transcript = Transcript::default();
+        for i in 0..MAX_TRANSCRIPT_ROWS {
+            transcript
+                .rows
+                .push(TranscriptRow::new(format!("old {i}"), panel_style()));
+        }
+
+        transcript.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn_1".to_string(),
+        });
+        transcript.apply(UiEvent::AssistantReasoning {
+            text: "first paragraph\n\nsecond paragraph".to_string(),
+            redacted: false,
+        });
+        transcript.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 1_234,
+                total_tokens: 2,
+                cache_creation: None,
+            }),
+        });
+
+        let headers: Vec<&String> = transcript
+            .rows
+            .iter()
+            .filter_map(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::RailHeader { right, .. }) => Some(right),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers.len(), 1, "expected one thinking header");
+        assert!(headers[0].contains("↓1.2k"), "{:?}", headers[0]);
     }
 
     #[test]

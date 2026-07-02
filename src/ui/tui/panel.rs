@@ -33,6 +33,13 @@ fn panel_width(width: usize) -> usize {
         .max(1)
 }
 
+pub(super) fn panel_body_content_width(width: usize) -> usize {
+    panel_width(width)
+        .max(PANEL_BODY_BORDER_WIDTH)
+        .saturating_sub(PANEL_BODY_CHROME_WIDTH)
+        .max(1)
+}
+
 pub(super) fn panel_rule_line(width: usize, left: char, right: char) -> Line<'static> {
     let outer = panel_outer_padding(width);
     let rule_width = panel_width(width);
@@ -110,8 +117,7 @@ pub(super) fn panel_body_line(
     mut line: Line<'static>,
     bg: Option<Color>,
 ) -> Line<'static> {
-    let panel_width = panel_width(width).max(PANEL_BODY_BORDER_WIDTH);
-    let body_width = panel_width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
+    let body_width = panel_body_content_width(width);
     truncate_line(&mut line, body_width);
     if let Some(bg) = bg {
         apply_width_bg(&mut line, bg, body_width);
@@ -147,8 +153,7 @@ pub(super) fn panel_body_lines(
     bg: Option<Color>,
     out: &mut Vec<Line<'static>>,
 ) {
-    let panel_width = panel_width(width).max(PANEL_BODY_BORDER_WIDTH);
-    let body_width = panel_width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
+    let body_width = panel_body_content_width(width);
     let mut wrapped = Vec::new();
     push_wrapped_line(&line, body_width, None, &mut wrapped);
     for physical in wrapped {

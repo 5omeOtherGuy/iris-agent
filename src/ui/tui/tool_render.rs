@@ -465,23 +465,26 @@ fn shell_result_row(
         plain.push_str(&aside);
         spans.push(Span::styled(aside, dim_style()));
     }
-    if expand_hint {
+    let chrome = if expand_hint {
         let hint = "ctrl+o to expand";
-        let used = display_width(&plain);
-        let hint_w = display_width(hint);
-        if used + 1 + hint_w <= width {
-            let gap = width - used - hint_w;
-            plain.push_str(&" ".repeat(gap));
-            plain.push_str(hint);
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(hint.to_string(), dim_style()));
+        let text = right_align_hint(&plain, hint, width);
+        if !plain.is_empty() {
+            plain = text;
         }
-    }
-    TranscriptRow::chrome_with_text(
+        ChromeRow::BodyRight {
+            left: Line::from(spans),
+            right: hint.to_string(),
+            right_style: dim_style(),
+            bg: None,
+        }
+    } else {
         ChromeRow::Body {
             line: Line::from(spans),
             bg: None,
-        },
+        }
+    };
+    TranscriptRow::chrome_with_text(
+        chrome,
         plain,
         style,
     )
@@ -692,6 +695,32 @@ impl PanelBody {
         );
     }
 
+    fn push_right_line(
+        &mut self,
+        left: Line<'static>,
+        left_text: String,
+        right: &str,
+        row_style: Style,
+        right_style: Style,
+        fold: FoldVis,
+    ) {
+        let text = right_align_hint(&left_text, right, self.fold_hint_width());
+        let left = self.indented_line(left);
+        self.rows.push(
+            TranscriptRow::chrome_with_text(
+                ChromeRow::BodyRight {
+                    left,
+                    right: right.to_string(),
+                    right_style,
+                    bg: None,
+                },
+                text,
+                row_style,
+            )
+            .with_fold(fold),
+        );
+    }
+
     /// Push a pre-built row (e.g. the SHELL exit-status row) verbatim.
     fn push(&mut self, row: TranscriptRow) {
         self.rows.push(row);
@@ -731,8 +760,16 @@ impl PanelBody {
 
     /// The dim rule under the `payload  <lang>` label.
     fn payload_rule(&mut self) {
-        let rule = "\u{2500}".repeat(self.width.saturating_sub(2).max(1));
-        self.line(&format!("  {rule}"), dim_style());
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::BodyRule {
+                prefix: "  ".to_string(),
+                rule: '\u{2500}',
+                style: dim_style(),
+                bg: None,
+            },
+            "  \u{2500}".to_string(),
+            dim_style(),
+        ));
     }
 
     /// One dim heredoc body / closing-delimiter row.
@@ -797,12 +834,14 @@ impl PanelBody {
         let left_w = display_width(&left);
         let hint_w = display_width(&hint);
         if left_w + 1 + hint_w <= width {
-            let gap = width - left_w - hint_w;
-            let plain = format!("{left}{}{hint}", " ".repeat(gap));
-            let mut spans = cmd_spans(&command);
-            spans.push(Span::styled(" ".repeat(gap), panel_style()));
-            spans.push(Span::styled(hint, dim_style()));
-            self.push_line(Line::from(spans), plain, panel_style(), FoldVis::Always);
+            self.push_right_line(
+                Line::from(cmd_spans(&command)),
+                left,
+                &hint,
+                panel_style(),
+                dim_style(),
+                FoldVis::Always,
+            );
         } else {
             self.push_line(
                 Line::from(cmd_spans(&command)),
@@ -810,8 +849,14 @@ impl PanelBody {
                 panel_style(),
                 FoldVis::Always,
             );
-            let text = right_align_hint("", &hint, width);
-            self.line_folded(&text, dim_style(), FoldVis::Always);
+            self.push_right_line(
+                Line::default(),
+                String::new(),
+                &hint,
+                dim_style(),
+                dim_style(),
+                FoldVis::Always,
+            );
         }
     }
 
@@ -850,15 +895,29 @@ impl PanelBody {
             self.deferred_expand_hint = true;
             left
         } else {
-            right_align_hint(&left, "ctrl+o to expand", self.fold_hint_width())
+            self.push_right_line(
+                Line::from(Span::styled(left.clone(), dim_style())),
+                left,
+                "ctrl+o to expand",
+                dim_style(),
+                dim_style(),
+                FoldVis::WhenCollapsed,
+            );
+            return;
         };
         self.line_folded(&text, dim_style(), FoldVis::WhenCollapsed);
     }
 
     /// Expanded-state fold affordance: right-aligned `ctrl+o to collapse`.
     fn fold_collapse_hint(&mut self) {
-        let text = right_align_hint("", "ctrl+o to collapse", self.fold_hint_width());
-        self.line_folded(&text, dim_style(), FoldVis::WhenExpanded);
+        self.push_right_line(
+            Line::default(),
+            String::new(),
+            "ctrl+o to collapse",
+            dim_style(),
+            dim_style(),
+            FoldVis::WhenExpanded,
+        );
     }
 
     /// Push one gutter-prefixed tool-output line, preserving ANSI styling and
@@ -871,21 +930,12 @@ impl PanelBody {
         } else {
             format!("    {line}")
         };
-        if line.contains("\x1b[") {
-            self.push_line(
-                tool_output_line("", &line),
-                strip_ansi_for_text(&legacy),
-                dim_style(),
-                fold,
-            );
-        } else {
-            self.push_line(
-                Line::from(Span::styled(line.to_string(), dim_style())),
-                legacy,
-                dim_style(),
-                fold,
-            );
-        }
+        self.push_line(
+            tool_output_line("", &line),
+            strip_ansi_for_text(&legacy),
+            dim_style(),
+            fold,
+        );
     }
 
     /// Flood-safe AND compact tool output: wrap each line to the transcript
@@ -1155,11 +1205,11 @@ mod tests {
         assert!(cmd.text.ends_with("timeout 120s"), "{}", cmd.text);
         // The timeout is invocation metadata, not part of the command string.
         assert!(!cmd.text.contains("(timeout"), "{}", cmd.text);
-        let Some(ChromeRow::Body { line, .. }) = cmd.chrome.as_ref() else {
-            panic!("expected a Body chrome row");
+        let Some(ChromeRow::BodyRight { right_style, .. }) = cmd.chrome.as_ref() else {
+            panic!("expected a right-aligned Body chrome row");
         };
         assert_eq!(
-            line.spans.last().unwrap().style.fg,
+            right_style.fg,
             dim_style().fg,
             "timeout span should be dim metadata"
         );
@@ -1203,6 +1253,54 @@ mod tests {
         assert_eq!(rows[0].text, format!("$ {command}"));
         assert!(rows[1].text.ends_with("timeout 120s"), "{}", rows[1].text);
         assert_eq!(rows[1].text.trim(), "timeout 120s");
+    }
+
+    #[test]
+    fn shell_output_sanitizes_plain_tabs_carriage_returns_and_osc() {
+        let args = json!({ "command": "cat Makefile" });
+        let renderer = resolve(&call("bash", args.clone()));
+        let ctx = RenderCtx { width: 64 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", args),
+            &ToolOutcome::Done {
+                content: "a\tb\rclobber\x1b]0;owned\x07safe",
+                exit_code: None,
+            },
+        );
+        let output = rows
+            .iter()
+            .find(|row| row.text.contains("clobber") || row.text.contains("owned"))
+            .expect("sanitized output row");
+        assert!(output.text.contains("a   bclobbersafe"), "{}", output.text);
+        assert!(!output.text.contains("owned"), "{}", output.text);
+        for forbidden in ['\t', '\r', '\x1b', '\x07'] {
+            assert!(
+                !output.text.contains(forbidden),
+                "forbidden control {forbidden:?} leaked in {:?}",
+                output.text
+            );
+        }
+
+        let mut rendered = Vec::new();
+        output.render_rows(ctx.width, &mut rendered);
+        let mut rendered_has_expanded_content = false;
+        for line in rendered {
+            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            rendered_has_expanded_content |= text.contains("a       bclobbersafe");
+            assert!(!text.contains("owned"), "{text:?}");
+            for forbidden in ['\t', '\r', '\x1b', '\x07'] {
+                assert!(
+                    !text.contains(forbidden),
+                    "forbidden control {forbidden:?} leaked in rendered row {text:?}"
+                );
+            }
+            assert_eq!(display_width(&text), ctx.width, "{text:?}");
+        }
+        assert!(
+            rendered_has_expanded_content,
+            "rendered output should preserve standard tab stops"
+        );
     }
 
     #[test]
@@ -1282,6 +1380,81 @@ mod tests {
             rows.iter()
                 .any(|r| r.fold == FoldVis::WhenExpanded && r.text.contains("line 39")),
             "expected the full body to include the elided tail"
+        );
+    }
+
+    #[test]
+    fn width_dependent_shell_rows_recompose_after_resize() {
+        fn rendered_texts(row: &TranscriptRow, width: usize) -> Vec<String> {
+            let mut rendered = Vec::new();
+            row.render_rows(width, &mut rendered);
+            rendered
+                .into_iter()
+                .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+                .collect()
+        }
+
+        fn assert_single_right_aligned(row: &TranscriptRow, width: usize, right: &str) {
+            let rendered = rendered_texts(row, width);
+            assert_eq!(rendered.len(), 1, "width {width}: {rendered:?}");
+            assert_eq!(display_width(&rendered[0]), width, "{:?}", rendered[0]);
+            assert!(
+                rendered[0]
+                    .trim_end()
+                    .ends_with(&format!("{right}  │")),
+                "width {width}: {:?}",
+                rendered[0]
+            );
+        }
+
+        let mut command = String::from("printf 'this command is long enough to wrap at narrow widths' && python3 - <<'PY'\n");
+        for i in 0..40 {
+            command.push_str(&format!("line {i}\n"));
+        }
+        command.push_str("PY");
+        let args = json!({ "command": command, "timeout": 120 });
+        let renderer = resolve(&call("bash", args.clone()));
+        let rows = renderer.body(
+            &RenderCtx { width: 120 },
+            &call("bash", args),
+            &ToolOutcome::Done {
+                content: "ok",
+                exit_code: None,
+            },
+        );
+
+        let timeout = rows
+            .iter()
+            .find(|row| row.text.contains("timeout 120s"))
+            .expect("timeout row");
+        let fold_hint = rows
+            .iter()
+            .find(|row| row.text.contains("lines hidden") && row.text.contains("ctrl+o to expand"))
+            .expect("fold hint row");
+        let payload_rule = rows
+            .iter()
+            .find(|row| {
+                let trimmed = row.text.trim();
+                !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '─')
+            })
+            .expect("payload rule row");
+
+        for width in [120, 90, 130] {
+            assert_single_right_aligned(timeout, width, "timeout 120s");
+            assert_single_right_aligned(fold_hint, width, "ctrl+o to expand");
+            let rendered = rendered_texts(payload_rule, width);
+            assert_eq!(rendered.len(), 1, "width {width}: {rendered:?}");
+            assert_eq!(display_width(&rendered[0]), width, "{:?}", rendered[0]);
+        }
+
+        let narrow_timeout = rendered_texts(timeout, 44);
+        assert!(
+            narrow_timeout.iter().any(|row| row.contains("$ printf")),
+            "narrow resize must preserve command text: {narrow_timeout:?}"
+        );
+        assert!(
+            narrow_timeout.iter().any(|row| row.contains("timeout 120s")),
+            "narrow resize must still show timeout metadata: {narrow_timeout:?}"
         );
     }
 
