@@ -51,17 +51,16 @@ mod transcript;
 mod wrap;
 
 pub(crate) use component::Component;
-pub(crate) use overlay::FocusTarget;
+pub(crate) use overlay::{FocusTarget, overlay_box};
 #[cfg(test)]
 use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
 pub(crate) use screen::Screen;
-use screen::{compact_count, render_document_with_chrome_tail};
+use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
 use screen::{
-    composer_top_border, editor_visual_rows, fresh_editor, render_document, working_indicator_line,
-    workspace_label_line,
+    composer_statusline, editor_visual_rows, fresh_editor, render_document, working_indicator_line,
 };
 #[cfg(test)]
 use transcript::Transcript;
@@ -75,10 +74,10 @@ const MAX_EDITOR_ROWS: u16 = 10;
 
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
-const MIN_EDITOR_H: u16 = 6;
-const EDITOR_VERTICAL_CHROME_ROWS: u16 = 5;
-/// The quiet workspace label rendered below the editor box is a single row.
-const WORKSPACE_LABEL_H: u16 = 1;
+/// Minimum composer height: hairline + statusline + blank spacer + one input row.
+const MIN_EDITOR_H: u16 = 4;
+/// Composer chrome above the input rows: the hairline top edge, statusline, and spacer.
+const EDITOR_VERTICAL_CHROME_ROWS: u16 = 3;
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
 /// bottom instead of immediately occupying the whole terminal height.
@@ -97,23 +96,23 @@ const MAX_STREAMING_MARKDOWN_BYTES: usize = 64 * 1024;
 /// The model still receives the full output; only the terminal preview is
 /// bounded, and the omitted logical-line count is reported.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
-const PANEL_BODY_SIDE_PADDING: usize = 1;
+const PANEL_BODY_LEFT_PADDING: usize = 4;
+const PANEL_BODY_RIGHT_PADDING: usize = 2;
 const PANEL_BODY_BORDER_WIDTH: usize = 2;
-const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_BORDER_WIDTH + PANEL_BODY_SIDE_PADDING * 2;
+const PANEL_BODY_CHROME_WIDTH: usize =
+    PANEL_BODY_BORDER_WIDTH + PANEL_BODY_LEFT_PADDING + PANEL_BODY_RIGHT_PADDING;
 
 // Color roles live in `crate::ui::palette` (the single source of truth). They
 // are imported here under their long-standing names so the whole `tui` module
 // tree keeps referencing them as `BORDER`, `ORANGE`, … (and its child modules
 // as `super::BORDER`).
 use crate::ui::palette::{BORDER, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, ORANGE, RED};
-const COMPOSER_HINT: &str = "↵ to send  •  shift+↵ for new line  •  / for commands";
 
 const X_PADDING: usize = 2;
 const BOX_X_PADDING: usize = X_PADDING;
 const TEXT_X_PADDING: usize = X_PADDING;
 const TEXT_COLUMN_X_PADDING: usize = BOX_X_PADDING + TEXT_X_PADDING;
 const BOX_X_PADDING_U16: u16 = X_PADDING as u16;
-const TEXT_X_PADDING_U16: u16 = X_PADDING as u16;
 const TEXT_COLUMN_X_PADDING_U16: u16 = TEXT_COLUMN_X_PADDING as u16;
 
 /// Secondary guard: truncate any single output line to this many characters
@@ -294,9 +293,13 @@ impl TuiUi {
     pub(crate) fn draw(&mut self) -> Result<()> {
         let (width, height) = terminal_size()?;
         let size = Size::new(width.max(1), height.max(1));
-        let (document, chrome_tail) = render_document_with_chrome_tail(&mut self.screen, size);
-        self.surface
-            .render_with_volatile_tail(size, &document, chrome_tail)?;
+        let document = render_document_with_hints(&mut self.screen, size);
+        self.surface.render_with_hints(
+            size,
+            &document.lines,
+            document.chrome_tail,
+            document.stable_prefix,
+        )?;
         Ok(())
     }
 
@@ -308,7 +311,7 @@ impl TuiUi {
             if let Ok((width, height)) = terminal_size() {
                 let size = Size::new(width.max(1), height.max(1));
                 let transcript = self.screen.wrapped_lines(size.width);
-                let _ = self.surface.render(size, &transcript);
+                let _ = self.surface.render(size, &transcript.lines);
             }
             let _ = self.surface.finish();
             // Restore the keyboard protocol first (pop only if pushed), then the
@@ -337,7 +340,7 @@ impl Drop for TuiUi {
 
 #[cfg(test)]
 mod tests {
-    use super::panel::{panel_body_line, panel_header_line, panel_rule_line};
+    use super::panel::{inset_rule_line, panel_body_line, panel_header_line, panel_rule_line};
     use super::*;
     use crate::nexus::{ApprovalDecision, ToolCall};
     use crate::ui::UiEvent;
@@ -417,6 +420,270 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn synthetic_render_perf_screen() -> Screen {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "openai-codex/gpt-5.5".to_string(),
+            Some("xhigh".to_string()),
+            "~/iris-agent (main)".to_string(),
+        );
+
+        let mut i = 0usize;
+        while screen.transcript.rows.len() < MAX_TRANSCRIPT_ROWS.saturating_sub(96) {
+            match i % 6 {
+                0 => screen.commit_user(&format!(
+                    "inspect render hot path batch {i} with enough prose to wrap across several \
+                     words and preserve user transcript rhythm"
+                )),
+                1 => screen.apply(UiEvent::AssistantText(format!(
+                    "## Render batch {i}\n\nThe renderer keeps markdown prose, `inline_code`, \
+                     links, and lists byte-stable while the terminal surface diffs only the \
+                     rows that changed.\n\n- fold visibility remains semantic\n- rules stay muted\n\n---"
+                ))),
+                2 => {
+                    let call = call_args(
+                        "bash",
+                        json!({ "command": format!("printf 'line %04d\\n' {i}") }),
+                    );
+                    let content = (0..18)
+                        .map(|n| format!("shell output batch {i} row {n}: a moderately long line"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    screen.apply(UiEvent::ToolResult {
+                        call,
+                        content,
+                        exit_code: Some(0),
+                        duration: Some(Duration::from_millis((i % 97) as u64)),
+                    });
+                    let _ = screen.toggle_latest_panel();
+                }
+                3 => {
+                    let call = call_args("edit", json!({ "path": format!("src/file_{i}.rs") }));
+                    screen.apply(UiEvent::DiffPreview {
+                        call: call.clone(),
+                        diff: format!(
+                            "--- a/src/file_{i}.rs\n+++ b/src/file_{i}.rs\n@@ -1,3 +1,3 @@\n fn sample() {{\n-old_{i}();\n+new_{i}();\n }}\n"
+                        ),
+                    });
+                    screen.apply(UiEvent::ToolResult {
+                        call,
+                        content: "applied".to_string(),
+                        exit_code: Some(0),
+                        duration: Some(Duration::from_millis(3)),
+                    });
+                }
+                4 => screen.apply(UiEvent::AssistantReasoning {
+                    text: format!(
+                        "Candidate {i}: keep cached row wraps unless a fold toggle, trim, or \
+                         panel rewrite invalidates the row range.\n\nSecond paragraph is hidden behind \
+                         progressive disclosure for long traces."
+                    ),
+                    redacted: false,
+                }),
+                _ => screen.apply(UiEvent::Notice(format!(
+                    "synthetic notice {i}: resize replay and append diff remain stable"
+                ))),
+            }
+            i += 1;
+        }
+
+        screen.transcript.trim_history();
+        screen
+    }
+
+    fn render_perf_cycle(
+        screen: &mut Screen,
+        surface: &mut TerminalSurface<Vec<u8>>,
+        size: Size,
+    ) -> std::io::Result<RenderKind> {
+        let document = render_document_with_hints(screen, size);
+        surface
+            .render_with_hints(
+                size,
+                &document.lines,
+                document.chrome_tail,
+                document.stable_prefix,
+            )
+            .map(|stats| stats.kind)
+    }
+
+    #[test]
+    #[ignore = "timer benchmark; run explicitly with --ignored --nocapture"]
+    fn render_pipeline_near_retention_cap_benchmark() -> std::io::Result<()> {
+        let size = Size::new(120, 40);
+        let mut screen = synthetic_render_perf_screen();
+        eprintln!(
+            "render_perf rows={} width={} height={}",
+            screen.transcript.rows.len(),
+            size.width,
+            size.height
+        );
+
+        let mut surface = TerminalSurface::new(Vec::new());
+        let full_start = Instant::now();
+        let full_kind = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let full = full_start.elapsed();
+
+        screen.start_turn();
+        let spinner_start = Instant::now();
+        for _ in 0..100 {
+            let _ = screen.tick();
+            render_perf_cycle(&mut screen, &mut surface, size)?;
+        }
+        let spinner = spinner_start.elapsed();
+
+        screen.apply(UiEvent::Notice(
+            "synthetic append after spinner churn".to_string(),
+        ));
+        let append_start = Instant::now();
+        let append_kind = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let append = append_start.elapsed();
+
+        eprintln!(
+            "render_perf full={full:?} kind={full_kind:?}; spinner_100={spinner:?}; \
+             append={append:?} kind={append_kind:?}"
+        );
+        Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    enum CachedRenderOp {
+        User(usize),
+        Assistant(usize),
+        Shell(usize),
+        Diff(usize),
+        Reasoning(usize),
+        ToggleLatest,
+        Width(u16),
+        TrimBurst(usize),
+    }
+
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn pick(&mut self, count: usize) -> usize {
+            (self.next() as usize) % count
+        }
+    }
+
+    fn apply_cached_render_op(screen: &mut Screen, op: &CachedRenderOp) {
+        match *op {
+            CachedRenderOp::User(i) => screen.commit_user(&format!(
+                "cached render user prompt {i} with enough text to wrap on narrow widths"
+            )),
+            CachedRenderOp::Assistant(i) => screen.apply(UiEvent::AssistantText(format!(
+                "Assistant batch {i}\n\n- preserves markdown wrapping\n- keeps `code` styled\n\n---"
+            ))),
+            CachedRenderOp::Shell(i) => screen.apply(UiEvent::ToolResult {
+                call: call_args("bash", json!({ "command": format!("seq {i}") })),
+                content: (0..14)
+                    .map(|n| format!("foldable shell output {i}.{n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                exit_code: Some(0),
+                duration: Some(Duration::from_millis((i % 13) as u64)),
+            }),
+            CachedRenderOp::Diff(i) => {
+                let call = call_args("edit", json!({ "path": format!("src/cache_{i}.rs") }));
+                screen.apply(UiEvent::DiffPreview {
+                    call: call.clone(),
+                    diff: format!(
+                        "--- a/src/cache_{i}.rs\n+++ b/src/cache_{i}.rs\n@@ -1 +1 @@\n-old_{i}\n+new_{i}\n"
+                    ),
+                });
+                screen.apply(UiEvent::ToolResult {
+                    call,
+                    content: "applied".to_string(),
+                    exit_code: Some(0),
+                    duration: Some(Duration::from_millis(1)),
+                });
+            }
+            CachedRenderOp::Reasoning(i) => screen.apply(UiEvent::AssistantReasoning {
+                text: format!(
+                    "Reasoning preview {i}.\n\nHidden paragraph {i} exercises fold visibility."
+                ),
+                redacted: false,
+            }),
+            CachedRenderOp::ToggleLatest => {
+                let _ = screen.toggle_latest_panel();
+            }
+            CachedRenderOp::Width(_) => {}
+            CachedRenderOp::TrimBurst(i) => {
+                for n in 0..(MAX_TRANSCRIPT_ROWS + 24) {
+                    screen.transcript.rows.push(TranscriptRow::new(
+                        format!("trim burst {i} row {n}"),
+                        dim_style(),
+                    ));
+                }
+                screen.transcript.trim_history();
+            }
+        }
+    }
+
+    fn cached_render_signature(
+        screen: &mut Screen,
+        width: u16,
+    ) -> Vec<Vec<(String, Option<Color>, Modifier)>> {
+        let lines = screen.wrapped_lines(width);
+        line_signature(&lines)
+    }
+
+    #[test]
+    fn cached_transcript_render_matches_fresh_replay_after_mutations() {
+        let mut rng = TestRng(0x5eed_1ced_5eed_1ced);
+        let mut ops = Vec::new();
+        for i in 0..36 {
+            let op = match rng.pick(7) {
+                0 => CachedRenderOp::User(i),
+                1 => CachedRenderOp::Assistant(i),
+                2 => CachedRenderOp::Shell(i),
+                3 => CachedRenderOp::Diff(i),
+                4 => CachedRenderOp::Reasoning(i),
+                5 => CachedRenderOp::ToggleLatest,
+                _ => CachedRenderOp::Width([44, 72, 100, 132][rng.pick(4)]),
+            };
+            ops.push(op);
+        }
+        ops.push(CachedRenderOp::TrimBurst(99));
+        ops.push(CachedRenderOp::Width(88));
+        ops.push(CachedRenderOp::ToggleLatest);
+
+        let mut cached = Screen::new();
+        let mut applied = Vec::new();
+        let mut width = 80u16;
+        for (step, op) in ops.into_iter().enumerate() {
+            if let CachedRenderOp::Width(next) = &op {
+                width = *next;
+            }
+            apply_cached_render_op(&mut cached, &op);
+            applied.push(op.clone());
+
+            let cached_sig = cached_render_signature(&mut cached, width);
+            let mut fresh = Screen::new();
+            let mut fresh_width = 80u16;
+            let mut fresh_sig = Vec::new();
+            for prior in &applied {
+                if let CachedRenderOp::Width(next) = prior {
+                    fresh_width = *next;
+                }
+                apply_cached_render_op(&mut fresh, prior);
+                fresh_sig = cached_render_signature(&mut fresh, fresh_width);
+            }
+            assert_eq!(fresh_width, width);
+            assert_eq!(
+                cached_sig, fresh_sig,
+                "cached render diverged after step {step}: {op:?}"
+            );
+        }
     }
 
     fn strip_ansi(input: &str) -> String {
@@ -663,7 +930,7 @@ mod tests {
     #[test]
     fn panel_headers_and_plain_body_rows_strip_terminal_controls() {
         let mut screen = Screen::new();
-        let command = "echo \u{1b}]0;owned\u{7}safe\u{1b}[31m red\u{1b}[0m\rboom";
+        let command = "echo \u{1b}]0;owned\u{7}safe\t\u{1b}[31mred\u{1b}[0m\rboom";
         let file = "src/\u{1b}]0;owned\u{7}safe.rs";
 
         screen.apply(UiEvent::ToolResult {
@@ -689,7 +956,7 @@ mod tests {
         assert!(!rendered.contains('\u{7}'), "{rendered:?}");
         assert!(!rendered.contains('\r'), "{rendered:?}");
         assert!(!rendered.contains("owned"), "{rendered:?}");
-        assert!(rendered.contains("echo safe redboom"), "{rendered:?}");
+        assert!(rendered.contains("echo safe       redboom"), "{rendered:?}");
         assert!(rendered.contains("src/safe.rs"), "{rendered:?}");
     }
 
@@ -907,7 +1174,7 @@ mod tests {
         assert!(rendered.contains("$ printf 'global:"));
         assert!(rendered.contains("120s)"), "{rendered}");
         assert!(rendered.contains("[N] deny"), "{rendered}");
-        assert!(!rendered.contains(COMPOSER_HINT), "{rendered}");
+        assert!(!rendered.contains("\u{21b5} to send"), "{rendered}");
         assert!(
             !rendered.contains("Ask the agent anything..."),
             "{rendered}"
@@ -938,17 +1205,18 @@ mod tests {
         )));
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("APPROVAL"), "{rendered}");
-        assert!(
-            rendered.contains("You approved iris to run echo hi this time"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("$ echo hi"), "{rendered}");
+        assert!(rendered.contains("┊ approved this time"), "{rendered}");
         assert!(rendered.contains("┌"), "{rendered}");
         assert!(rendered.contains("└"), "{rendered}");
 
         let lines = screen.wrapped_lines(80);
-        let line = line_matching(&lines, |line| line_text(line).contains("You approved"));
-        let marker = span_matching(line, |span| span.content.as_ref() == "✔");
-        assert_eq!(marker.style, ok_style());
+        let line = line_matching(&lines, |line| {
+            line_text(line).contains("approved this time")
+        });
+        // The reason is a muted aside; the decision itself lives in the header.
+        let marker = span_matching(line, |span| span.content.as_ref().contains("approved"));
+        assert_eq!(marker.style, dim_style());
     }
 
     #[test]
@@ -962,10 +1230,11 @@ mod tests {
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("APPROVAL"), "{rendered}");
         assert!(rendered.contains("DENIED"), "{rendered}");
-        assert!(rendered.contains("✗ Denied echo hi"), "{rendered}");
+        assert!(rendered.contains("$ echo hi"), "{rendered}");
+        assert!(rendered.contains("┊ denied"), "{rendered}");
         let lines = screen.wrapped_lines(80);
-        let line = line_matching(&lines, |line| line_text(line).contains("Denied echo hi"));
-        let marker = span_matching(line, |span| span.content.as_ref() == "✗");
+        let line = line_matching(&lines, |line| line_text(line).contains("┊ denied"));
+        let marker = span_matching(line, |span| span.content.as_ref().contains("denied"));
         assert_eq!(marker.style, err_style());
     }
 
@@ -994,7 +1263,12 @@ mod tests {
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert_eq!(
             texts,
-            vec!["hi".to_string(), String::new(), "note: note".to_string()]
+            vec![
+                "hi".to_string(),
+                String::new(),
+                "┊ note".to_string(),
+                String::new(),
+            ]
         );
     }
 
@@ -1300,12 +1574,9 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 180, 12);
 
-        // Runtime status is printed into the editor's top border, not a rail.
-        assert!(
-            rendered.contains("┌─ ◉ CODE ─ SONNET 3.5 HIGH ─"),
-            "{rendered}"
-        );
-        // Workspace state is a quiet unboxed label below the editor.
+        // Runtime status is the composer statusline under the hairline edge.
+        assert!(rendered.contains("◉ CODE ─ SONNET 3.5 HIGH"), "{rendered}");
+        // Workspace state right-aligns on the statusline itself.
         assert!(
             rendered.contains("~/workspace/user-auth ┊ git feat/rate-limit"),
             "{rendered}"
@@ -1316,7 +1587,8 @@ mod tests {
         assert!(!rendered.contains("APPROVAL auto"), "{rendered}");
         assert!(rendered.contains("Give Iris a task..."));
         assert!(!rendered.contains("Ask the agent anything..."));
-        assert!(rendered.contains("↵ to send  •  shift+↵ for new line  •  / for commands"));
+        // The composer has no hint row and no box: statusline + input only.
+        assert!(!rendered.contains("↵ to send"), "{rendered}");
     }
 
     #[test]
@@ -1356,25 +1628,31 @@ mod tests {
         let mut screen = Screen::new();
         let lines = rendered_lines(&mut screen, 80, 8);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
+        // The composer top edge is a plain full hairline — no box corners.
         let top = texts
             .iter()
-            .position(|line| line.contains('┌'))
-            .expect("top border");
+            .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
+            .expect("hairline top edge");
 
-        assert!(texts[top + 1].contains("│"), "{texts:?}");
+        // Statusline row (blank before a footer exists), spacer row, then the input row.
         assert!(!texts[top + 1].contains("Give Iris"), "{texts:?}");
+        assert_eq!(texts[top + 2].trim(), "", "{texts:?}");
+        assert!(texts[top + 3].contains("Give Iris a task..."), "{texts:?}");
         assert!(
-            texts[top + 2].contains("│  Give Iris a task..."),
-            "{texts:?}"
+            texts[top + 3].starts_with("      Give Iris a task..."),
+            "input should align with transcript text: {texts:?}"
         );
-        assert!(texts[top + 3].contains("│"), "{texts:?}");
-        assert!(texts[top + 4].contains(COMPOSER_HINT), "{texts:?}");
-        assert!(texts[top + 5].contains('└'), "{texts:?}");
+        // No box: no side borders, no bottom border, no hint row.
+        let composer = texts[top..].join("\n");
+        assert!(!composer.contains('│'), "{composer:?}");
+        assert!(!composer.contains('┌'), "{composer:?}");
+        assert!(!composer.contains('└'), "{composer:?}");
+        assert!(!composer.contains("↵ to send"), "{composer:?}");
         assert!(!texts.join("\n").contains("Give iris a task"));
     }
 
     #[test]
-    fn composer_top_border_embeds_status_with_context_meter() {
+    fn composer_statusline_shows_status_with_context_meter() {
         let mut screen = Screen::new();
         screen.set_footer(
             "openai-codex/gpt-5.4-mini".to_string(),
@@ -1383,27 +1661,38 @@ mod tests {
         );
         let lines = rendered_lines(&mut screen, 120, 8);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        let top = texts
+        let status = texts
             .iter()
-            .find(|line| line.contains('┌'))
-            .expect("top border");
+            .find(|line| line.contains("◉ CODE"))
+            .expect("statusline");
 
-        // Mode/model/effort/context + 10-dot meter, all uppercase, in the frame.
+        // Mode/model/effort/context + 10-dot meter, all uppercase.
         assert!(
-            top.contains("┌─ ◉ CODE ─ GPT-5.4-MINI OFF ─ CTX 300K ○○○○○○○○○○ ─"),
-            "{top:?}"
+            status.contains("◉ CODE ─ GPT-5.4-MINI OFF ─ CTX 300K ○○○○○○○○○○"),
+            "{status:?}"
         );
-        assert!(top.trim_end().ends_with('┐'), "{top:?}");
-        // The top frame uses ─ as filler/separator and never ┊.
-        assert!(!top.contains('┊'), "{top:?}");
-        // Frame never overflows the terminal width.
+        // The workspace right-aligns on the same line.
+        assert!(status.trim_end().ends_with("~/project"), "{status:?}");
+        // The statusline is followed by a blank spacer, then the aligned input.
+        let status_idx = texts
+            .iter()
+            .position(|line| line.contains("◉ CODE"))
+            .expect("statusline");
+        assert_eq!(texts[status_idx + 1].trim(), "", "{texts:?}");
+        assert!(
+            texts[status_idx + 2].starts_with("      Give Iris a task..."),
+            "input should align with transcript text: {texts:?}"
+        );
+        // No box corners anywhere in the composer chrome.
+        assert!(!status.contains('┌'), "{status:?}");
+        // Nothing overflows the terminal width.
         for line in &texts {
             assert!(display_width(line) <= 120, "{line:?}");
         }
     }
 
     #[test]
-    fn composer_top_border_drops_lower_priority_fields_when_narrow() {
+    fn composer_statusline_drops_lower_priority_fields_when_narrow() {
         let mut screen = Screen::new();
         screen.set_footer(
             "openai-codex/gpt-5.4-mini".to_string(),
@@ -1411,22 +1700,18 @@ mod tests {
             "~/projects/iris (feat/composer-statusline)".to_string(),
         );
 
-        // At a constrained box width the frame falls back to the minimum:
+        // At a constrained width the statusline falls back to the minimum:
         // mode + model only (effort, meter, and CTX dropped, in that order).
-        let status = composer_top_border(&screen, 30)
+        let status = composer_statusline(&screen, 30)
             .map(|line| line_text(&line))
-            .expect("top border");
+            .expect("statusline");
 
-        assert!(status.contains("┌─ ◉ CODE ─ GPT-5.4-MINI "), "{status:?}");
-        assert!(status.ends_with('┐'), "{status:?}");
+        assert!(status.contains("◉ CODE ─ GPT-5.4-MINI"), "{status:?}");
         assert!(!status.contains("OFF"), "{status:?}");
         assert!(!status.contains("CTX"), "{status:?}");
         assert!(!status.contains('○'), "{status:?}");
-        assert!(
-            !status.contains('◉') || status.matches('◉').count() == 1,
-            "{status:?}"
-        );
-        assert_eq!(display_width(&status), 30, "{status:?}");
+        assert!(status.matches('◉').count() == 1, "{status:?}");
+        assert!(display_width(&status) <= 30, "{status:?}");
     }
 
     #[test]
@@ -1446,18 +1731,16 @@ mod tests {
         let status_idx = texts
             .iter()
             .position(|line| line.contains("◉ CODE"))
-            .expect("top-border statusline remains visible");
+            .expect("statusline remains visible");
         let editor_idx = texts
             .iter()
             .position(|line| line.contains("Give Iris a task"))
             .expect("composer remains visible");
-        // Status is the editor's top border (above the body); the workspace label
-        // is the last line below the editor.
+        // The statusline stays in the composer chrome above the spacer/input; the workspace label
+        // right-aligns on the statusline itself.
         assert!(status_idx < editor_idx, "{texts:?}");
         assert!(
-            texts
-                .last()
-                .is_some_and(|line| line.contains("~/repo ┊ git feat/pin-rail")),
+            texts[status_idx].contains("~/repo ┊ git feat/pin-rail"),
             "{texts:?}"
         );
     }
@@ -1472,7 +1755,7 @@ mod tests {
             "~/repo".to_string(),
         );
         // No usage yet: meter is all empty.
-        let empty = composer_top_border(&screen, 110)
+        let empty = composer_statusline(&screen, 110)
             .map(|l| line_text(&l))
             .expect("top");
         assert!(empty.contains("CTX 300K ○○○○○○○○○○"), "{empty:?}");
@@ -1495,14 +1778,14 @@ mod tests {
         });
         screen.end_turn();
         // 90k/300k => 30% => 3 lit dots (last is the orange edge).
-        let filled = composer_top_border(&screen, 110)
+        let filled = composer_statusline(&screen, 110)
             .map(|l| line_text(&l))
             .expect("top");
         assert!(filled.contains("CTX 300K ●●●○○○○○○○"), "{filled:?}");
 
         // The meter must NOT drop to empty at the start of the next turn.
         screen.start_turn();
-        let during = composer_top_border(&screen, 110)
+        let during = composer_statusline(&screen, 110)
             .map(|l| line_text(&l))
             .expect("top");
         assert!(during.contains("CTX 300K ●●●○○○○○○○"), "{during:?}");
@@ -1527,14 +1810,14 @@ mod tests {
                 cache_creation: None,
             }),
         });
-        let before = composer_top_border(&screen, 110)
+        let before = composer_statusline(&screen, 110)
             .map(|l| line_text(&l))
             .expect("top");
         assert!(before.contains("CTX 300K ●●●●●○○○○○"), "{before:?}");
 
         // Switching model clears the meter (prior usage no longer maps).
         screen.set_footer("gpt-5.4".to_string(), None, "~/repo".to_string());
-        let after = composer_top_border(&screen, 110)
+        let after = composer_statusline(&screen, 110)
             .map(|l| line_text(&l))
             .expect("top");
         assert!(after.contains("CTX 300K ○○○○○○○○○○"), "{after:?}");
@@ -1566,7 +1849,7 @@ mod tests {
                 cache_creation: None,
             }),
         });
-        let before = composer_top_border(&screen, 110)
+        let before = composer_statusline(&screen, 110)
             .map(|l| line_text(&l))
             .expect("top");
         assert!(before.contains("CTX 300K ●●●●●○○○○○"), "{before:?}");
@@ -1578,31 +1861,31 @@ mod tests {
             Some("300k".to_string()),
             "~/repo".to_string(),
         );
-        let after = composer_top_border(&screen, 110)
+        let after = composer_statusline(&screen, 110)
             .map(|l| line_text(&l))
             .expect("top");
         assert!(after.contains("CTX 300K ●●●●●○○○○○"), "{after:?}");
     }
 
     #[test]
-    fn workspace_label_truncates_cwd_preserving_project_and_branch() {
+    fn statusline_workspace_truncates_cwd_preserving_project_and_branch() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
             None,
             "~/projects/very/deeply/nested/path/iris-agent (main)".to_string(),
         );
-        let label = workspace_label_line(&screen, 40)
+        let label = composer_statusline(&screen, 80)
             .map(|line| line_text(&line))
-            .expect("workspace label");
-        assert!(display_width(&label) <= 40, "{label:?}");
+            .expect("statusline");
+        assert!(display_width(&label) <= 80, "{label:?}");
         assert!(label.contains("iris-agent"), "{label:?}");
         assert!(label.contains('…'), "{label:?}");
         assert!(label.trim_end().ends_with("┊ git main"), "{label:?}");
     }
 
     #[test]
-    fn composer_top_border_never_breaks_the_frame_at_any_width() {
+    fn composer_statusline_never_overflows_at_any_width() {
         let mut screen = Screen::new();
         screen.set_footer(
             "gpt-5.5".to_string(),
@@ -1610,18 +1893,15 @@ mod tests {
             "~/projects/iris (main)".to_string(),
         );
         for box_width in 6u16..=200 {
-            let Some(line) = composer_top_border(&screen, box_width) else {
+            let Some(line) = composer_statusline(&screen, box_width) else {
                 continue;
             };
             let text = line_text(&line);
-            assert_eq!(
-                display_width(&text),
-                usize::from(box_width),
+            assert!(
+                display_width(&text) <= usize::from(box_width),
                 "width {box_width}: {text:?}"
             );
-            assert!(text.starts_with('┌'), "width {box_width}: {text:?}");
-            assert!(text.ends_with('┐'), "width {box_width}: {text:?}");
-            assert!(!text.contains('┊'), "width {box_width}: {text:?}");
+            assert!(text.starts_with('◉'), "width {box_width}: {text:?}");
         }
     }
 
@@ -1672,7 +1952,8 @@ mod tests {
         );
         assert_eq!(texts[working_idx - 1].trim(), "", "{texts:?}");
         assert_eq!(texts[working_idx + 1].trim(), "", "{texts:?}");
-        assert_eq!(status_idx, working_idx + 2, "{texts:?}");
+        // blank, then the composer hairline, then the statusline.
+        assert_eq!(status_idx, working_idx + 3, "{texts:?}");
         assert!(texts[working_idx].contains("↑5.4k ↓137"), "{texts:?}");
     }
 
@@ -1941,7 +2222,7 @@ mod tests {
             rendered.contains("Successfully replaced 1 occurrence."),
             "{rendered}"
         );
-        assert!(rendered.contains("note: interleaved note"), "{rendered}");
+        assert!(rendered.contains("┊ interleaved note"), "{rendered}");
         assert!(!rendered.contains("running…"), "{rendered}");
     }
 
@@ -1968,7 +2249,7 @@ mod tests {
         assert!(rendered.contains("◆ DONE"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(rendered.contains("hi"), "{rendered}");
-        assert!(rendered.contains("note: interleaved note"), "{rendered}");
+        assert!(rendered.contains("┊ interleaved note"), "{rendered}");
         assert!(!rendered.contains("RUNNING"), "{rendered}");
     }
 
@@ -2108,8 +2389,200 @@ mod tests {
         assert_eq!(body_texts.len(), 2, "{body_texts:?}");
         assert!(body_texts.contains(&"error: not found"), "{body_texts:?}");
         assert!(
-            body_texts.iter().any(|text| text.contains("Search needle")),
+            body_texts
+                .iter()
+                .any(|text| text.contains("Grep") && text.contains("\"needle\" in src")),
             "{body_texts:?}"
+        );
+    }
+
+    #[test]
+    fn explore_rows_carry_verb_column_and_honest_counts() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("read", json!({ "path": "src/context/engine.rs" })),
+            content: "  1→fn a() {}\n  2→fn b() {}\n  3→fn c() {}".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        screen.apply(UiEvent::ToolResult {
+            call: call_args(
+                "grep",
+                json!({ "pattern": "fn emit", "path": "src/context" }),
+            ),
+            content: "3 matches in 2 files\nsrc/a.rs\n> 1│ fn emit".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        let rendered = rendered_text(&mut screen, 100, 22);
+        // Verb column + target, with a right-aligned real count per op.
+        assert!(
+            rendered.contains("Read   src/context/engine.rs"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("3 lines"), "{rendered}");
+        assert!(
+            rendered.contains("Grep   \"fn emit\" in src/context"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("│    Read   src/context/engine.rs"),
+            "EXPLORE body should use the framed-output inset: {rendered}"
+        );
+        assert!(
+            rendered.contains("│    Grep   \"fn emit\" in src/context"),
+            "EXPLORE body should use the framed-output inset: {rendered}"
+        );
+        assert!(rendered.contains("3 matches · 2 files"), "{rendered}");
+
+        let lines = screen.wrapped_lines(100);
+        let header_line = line_text(line_matching(&lines, |line| {
+            let text = line_text(line);
+            text.contains("EXPLORE") && text.contains("DONE")
+        }));
+        let done_col = header_line
+            .find("DONE")
+            .map(|idx| display_width(&header_line[..idx]))
+            .expect("DONE header label");
+        let read_line = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("Read   src/context/engine.rs")
+        }));
+        let grep_line = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("Grep   \"fn emit\" in src/context")
+        }));
+        let lines_col = read_line
+            .find("lines")
+            .map(|idx| display_width(&read_line[..idx]))
+            .expect("lines unit");
+        let files_col = grep_line
+            .find("files")
+            .map(|idx| display_width(&grep_line[..idx]))
+            .expect("files unit");
+        assert_eq!(lines_col, done_col, "{read_line:?} vs {header_line:?}");
+        assert_eq!(files_col, done_col, "{grep_line:?} vs {header_line:?}");
+    }
+
+    #[test]
+    fn shell_exit_row_summarizes_test_results() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "cargo test context::emit" })),
+            content: "running 142 tests\ntest result: ok. 142 passed; 0 failed; 0 ignored"
+                .to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(4100)),
+        });
+        let rendered = rendered_text(&mut screen, 90, 14);
+        assert!(rendered.contains("◆ EXIT 0"), "{rendered}");
+        assert!(rendered.contains("┊ 142 passed · 0 failed"), "{rendered}");
+    }
+
+    #[test]
+    fn edit_panel_keeps_diff_body_through_the_whole_lifecycle() {
+        let mut screen = Screen::new();
+        let call = call_args("edit", json!({ "file_path": "src/context/emit.rs" }));
+        let diff = "--- a/src/context/emit.rs\n+++ b/src/context/emit.rs\n@@ -40,3 +40,3 @@\n fn emit(&self, ctx: &Context) -> Prompt {\n-    let body = dump_everything(ctx);\n+    let body = self.budget.justify(ctx)?;\n";
+        screen.apply(UiEvent::DiffPreview {
+            call: call.clone(),
+            diff: diff.to_string(),
+        });
+        // Pending: ◇ PREVIEW with the diff and no elapsed time.
+        let preview = rendered_text(&mut screen, 100, 20);
+        assert!(preview.contains("EDIT"), "{preview}");
+        assert!(preview.contains("PREVIEW"), "{preview}");
+        assert!(preview.contains("dump_everything"), "{preview}");
+        assert!(!preview.contains("0.0s"), "{preview}");
+
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "Successfully replaced 1 occurrence.".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(400)),
+        });
+        // Applied: the same single EDIT panel, ◆ DONE, diff + footer.
+        let done = rendered_text(&mut screen, 100, 24);
+        assert!(done.contains("◆ DONE"), "{done}");
+        assert!(done.contains("self.budget.justify(ctx)?;"), "{done}");
+        assert!(done.contains("+1  −1"), "{done}");
+        assert_eq!(done.matches("EDIT").count(), 1, "one EDIT panel: {done}");
+        assert!(!done.contains("PREVIEW"), "{done}");
+        assert!(
+            !done.contains("Successfully replaced"),
+            "the diff is the canonical EDIT body: {done}"
+        );
+    }
+
+    #[test]
+    fn compaction_event_renders_quiet_info_notice() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::CompactionApplied {
+            compaction_id: "c1".to_string(),
+            covered_from: "m1".to_string(),
+            covered_to: "m9".to_string(),
+            covered_messages: 12,
+            original_tokens_estimate: 128_000,
+            summary_tokens_estimate: 41_000,
+            budget: 300_000,
+        });
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(
+            rendered.contains("┊ Context compacted — 128k → 41k tokens"),
+            "{rendered}"
+        );
+        // No undo keybind exists, so no undo hint is asserted into the UI.
+        assert!(!rendered.contains("ctrl+r"), "{rendered}");
+    }
+
+    #[test]
+    fn thinking_header_gains_token_telemetry_when_usage_arrives() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn_1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "Weigh the plan.\n\nThen check the emit path.".to_string(),
+            redacted: false,
+        });
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 10_000,
+                output_tokens: 3_000,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 2_400,
+                total_tokens: 13_000,
+                cache_creation: None,
+            }),
+        });
+        let lines = rendered_lines(&mut screen, 100, 18);
+        let header = lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("THINKING"))
+            .expect("thinking header");
+        assert!(header.contains("↓2.4k"), "{header}");
+    }
+
+    #[test]
+    fn statusline_model_is_the_underlined_picker_button() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        let line = composer_statusline(&screen, 100).expect("statusline");
+        let model = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "GPT-5.5")
+            .expect("model span");
+        assert!(
+            model.style.add_modifier.contains(Modifier::UNDERLINED),
+            "{model:?}"
         );
     }
 
@@ -2234,10 +2707,11 @@ mod tests {
         let mut screen = Screen::new();
         let rendered = rendered_text(&mut screen, 80, 10);
 
-        // No footer yet: plain editor frame, no embedded status, no workspace label.
+        // No footer yet: hairline + blank statusline + input, no status text.
         assert!(!rendered.contains("◉ CODE"), "{rendered}");
         assert!(!rendered.contains("┊ git"), "{rendered}");
-        assert!(rendered.contains('┌'), "{rendered}");
+        assert!(rendered.contains('─'), "{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
 
     #[test]
@@ -2419,17 +2893,37 @@ mod tests {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
-            text: "First I check the **config**, then the cache.".to_string(),
+            text: "First I check the **config**.\n\nThen the cache.\n\nThen I stop.".to_string(),
             redacted: false,
         });
-        let collapsed = rendered_text(&mut screen, 80, 14);
-        // Collapsed: label visible, body hidden, collapsed arrow shown.
+        let collapsed = rendered_text(&mut screen, 80, 18);
+        // Collapsed: label + collapsed arrow, the first-paragraph preview, and
+        // the paragraph-count fold affordance; later paragraphs hidden.
         assert!(collapsed.contains("THINKING"), "{collapsed}");
         assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(collapsed.contains("First I check"), "{collapsed}");
+        assert!(collapsed.contains("… 2 more paragraphs"), "{collapsed}");
+        assert!(collapsed.contains("ctrl+o to expand"), "{collapsed}");
         assert!(
-            !collapsed.contains("then the cache"),
-            "reasoning body should be hidden while collapsed: {collapsed}"
+            !collapsed.contains("Then the cache"),
+            "later paragraphs should be hidden while collapsed: {collapsed}"
         );
+    }
+
+    #[test]
+    fn short_reasoning_is_shown_whole_and_not_foldable() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "One short thought.".to_string(),
+            redacted: false,
+        });
+        let rendered = rendered_text(&mut screen, 80, 14);
+        assert!(rendered.contains("THINKING"), "{rendered}");
+        assert!(rendered.contains("One short thought."), "{rendered}");
+        assert!(!rendered.contains("more paragraph"), "{rendered}");
+        // Nothing hidden: ctrl+o has nothing to toggle.
+        assert!(!screen.toggle_latest_panel());
     }
 
     #[test]
@@ -2437,7 +2931,7 @@ mod tests {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
-            text: "Inspect the config then the cache.".to_string(),
+            text: "Inspect the config.\n\nThen inspect the cache.".to_string(),
             redacted: false,
         });
         // Thinking panel is the latest panel for a reasoning-only turn.
@@ -2445,9 +2939,10 @@ mod tests {
         let expanded = rendered_text(&mut screen, 80, 14);
         assert!(expanded.contains("▾"), "{expanded}");
         assert!(
-            expanded.contains("Inspect the config then the cache."),
+            expanded.contains("Then inspect the cache."),
             "expanded trace missing: {expanded}"
         );
+        assert!(!expanded.contains("more paragraph"), "{expanded}");
     }
 
     #[test]
@@ -2455,7 +2950,7 @@ mod tests {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
-            text: "Weigh the options.".to_string(),
+            text: "Weigh the options.\n\nPick one.".to_string(),
             redacted: false,
         });
         // Reasoning is recessive: it never gets box chrome (Top/Bottom/Separator/
@@ -2494,16 +2989,23 @@ mod tests {
                 .any(|r| matches!(r.chrome.as_ref(), Some(ChromeRow::RailEnd))),
             "rail end marker missing"
         );
-        // The header renders as a muted `┊ ▸ THINKING` rail (rail + arrow + label
-        // on one line), not a bordered header.
-        let header = rendered_lines(&mut screen, 80, 14)
+        // The header renders as a muted `▸ THINKING` line (arrow + label, no
+        // box); the rail glyph lives on the body rows.
+        let lines: Vec<String> = rendered_lines(&mut screen, 80, 14)
             .into_iter()
             .map(|line| line_text(&line))
+            .collect();
+        let header = lines
+            .iter()
             .find(|t| t.contains("THINKING"))
             .expect("THINKING rail header");
-        assert!(header.contains('\u{250a}'), "rail glyph ┊: {header}");
         assert!(header.contains('\u{25b8}'), "collapsed arrow ▸: {header}");
         assert!(!header.contains('\u{2502}'), "no box side │: {header}");
+        let body = lines
+            .iter()
+            .find(|t| t.contains("Weigh the options."))
+            .expect("preview body row");
+        assert!(body.contains('\u{250a}'), "rail glyph ┊ on body: {body}");
     }
 
     #[test]
@@ -2516,12 +3018,14 @@ mod tests {
             text: String::new(),
             redacted: true,
         });
-        assert!(screen.toggle_latest_panel());
-        let expanded = rendered_text(&mut screen, 80, 14);
-        assert!(expanded.contains("THINKING"), "{expanded}");
+        // A redacted block is a single placeholder paragraph: shown whole,
+        // nothing foldable.
+        assert!(!screen.toggle_latest_panel());
+        let rendered = rendered_text(&mut screen, 80, 14);
+        assert!(rendered.contains("THINKING"), "{rendered}");
         assert!(
-            expanded.contains("withheld"),
-            "redacted placeholder missing: {expanded}"
+            rendered.contains("withheld"),
+            "redacted placeholder missing: {rendered}"
         );
     }
 
@@ -2595,6 +3099,34 @@ mod tests {
     }
 
     #[test]
+    fn hidden_shell_output_keeps_expand_hint_on_hidden_affordance_when_finished() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        let content = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "seq" })),
+            content,
+            exit_code: Some(0),
+            duration: None,
+        });
+        let lines = screen.wrapped_lines(80);
+        let hidden = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("lines hidden")
+        }));
+
+        assert!(hidden.contains("ctrl+o to expand"), "{hidden}");
+        assert!(display_width(&hidden) <= 80, "{hidden}");
+        assert!(
+            !lines.iter().any(|line| line_text(line).contains("EXIT 0")),
+            "collapsed preview must hide the result row: {:?}",
+            lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn tiny_panel_rows_are_width_safe_with_visible_border_glyphs() {
         for width in 1..=5 {
             let rows = vec![
@@ -2652,6 +3184,8 @@ mod tests {
                     ChromeRow::Header { .. }
                         | ChromeRow::Separator
                         | ChromeRow::Body { .. }
+                        | ChromeRow::BodyRight { .. }
+                        | ChromeRow::BodyRule { .. }
                         | ChromeRow::Bottom
                 )
             ),
@@ -2664,9 +3198,13 @@ mod tests {
                     assert!(!in_panel, "nested panel start");
                     in_panel = true;
                 }
-                Some(ChromeRow::Header { .. } | ChromeRow::Separator | ChromeRow::Body { .. }) => {
-                    assert!(in_panel, "orphan panel interior: {:?}", row.text);
-                }
+                Some(
+                    ChromeRow::Header { .. }
+                    | ChromeRow::Separator
+                    | ChromeRow::Body { .. }
+                    | ChromeRow::BodyRight { .. }
+                    | ChromeRow::BodyRule { .. },
+                ) => assert!(in_panel, "orphan panel interior: {:?}", row.text),
                 Some(ChromeRow::Bottom) => {
                     assert!(in_panel, "orphan panel bottom");
                     in_panel = false;
@@ -2675,10 +3213,57 @@ mod tests {
                 // and end markers never open/close `in_panel`, and its trace rows
                 // are plain rows outside any box.
                 Some(ChromeRow::RailHeader { .. } | ChromeRow::RailEnd) => {}
+                Some(ChromeRow::Notice { .. }) => {
+                    assert!(!in_panel, "notice row inside panel: {:?}", row.text);
+                }
                 None => assert!(!in_panel, "plain row inside panel: {:?}", row.text),
             }
         }
         assert!(!in_panel, "trim left an unterminated panel");
+    }
+
+    #[test]
+    fn trim_history_keeps_thinking_header_telemetry_index_aligned() {
+        let mut transcript = Transcript::default();
+        for i in 0..MAX_TRANSCRIPT_ROWS {
+            transcript
+                .rows
+                .push(TranscriptRow::new(format!("old {i}"), panel_style()));
+        }
+
+        transcript.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn_1".to_string(),
+        });
+        transcript.apply(UiEvent::AssistantReasoning {
+            text: "first paragraph\n\nsecond paragraph".to_string(),
+            redacted: false,
+        });
+        transcript.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 1_234,
+                total_tokens: 2,
+                cache_creation: None,
+            }),
+        });
+
+        let headers: Vec<&String> = transcript
+            .rows
+            .iter()
+            .filter_map(|row| match row.chrome.as_ref() {
+                Some(ChromeRow::RailHeader { right, .. }) => Some(right),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers.len(), 1, "expected one thinking header");
+        assert!(headers[0].contains("↓1.2k"), "{:?}", headers[0]);
     }
 
     #[test]
@@ -2740,8 +3325,8 @@ mod tests {
         assert!(!rendered.contains("READ"), "{rendered}");
         assert!(!rendered.contains("GREP"), "{rendered}");
         assert!(rendered.contains("src/tool_display.rs"));
-        assert!(rendered.contains("Read src/tool_display.rs"));
-        assert!(rendered.contains("Search DiffPreview in src/ui (*.rs)"));
+        assert!(rendered.contains("Read   src/tool_display.rs"));
+        assert!(rendered.contains("Grep   \"DiffPreview\" in src/ui"));
         assert!(rendered.contains("src/ui"));
         assert!(rendered.contains("└"));
     }
@@ -2828,10 +3413,12 @@ mod tests {
                 CatalogModel {
                     provider: ProviderId::OpenAiCodex,
                     id: "gpt-5.5".to_string(),
+                    ctx_label: None,
                 },
                 CatalogModel {
                     provider: ProviderId::Anthropic,
                     id: "claude-sonnet-4-6".to_string(),
+                    ctx_label: None,
                 },
             ],
             "openai-codex/gpt-5.5",
@@ -2897,18 +3484,21 @@ mod tests {
         use crate::mimir::selection::ProviderId;
         use crate::ui::modal::{Modal, ModelPicker};
 
-        for height in [2u16, 3, 4] {
-            let mut screen = Screen::new();
-            screen.open_modal(Modal::Model(ModelPicker::new(
-                vec![CatalogModel {
-                    provider: ProviderId::OpenAiCodex,
-                    id: "gpt-5.5".to_string(),
-                }],
-                "openai-codex/gpt-5.5",
-                "openai-codex/gpt-5.5",
-                crate::mimir::selection::ReasoningEffort::Medium,
-            )));
-            let _ = rendered_lines(&mut screen, 40, height);
+        for width in [10u16, 16, 24, 40] {
+            for height in [2u16, 3, 4] {
+                let mut screen = Screen::new();
+                screen.open_modal(Modal::Model(ModelPicker::new(
+                    vec![CatalogModel {
+                        provider: ProviderId::OpenAiCodex,
+                        id: "gpt-5.5".to_string(),
+                        ctx_label: None,
+                    }],
+                    "openai-codex/gpt-5.5",
+                    "openai-codex/gpt-5.5",
+                    crate::mimir::selection::ReasoningEffort::Medium,
+                )));
+                let _ = rendered_lines(&mut screen, width, height);
+            }
         }
     }
 
@@ -2924,10 +3514,12 @@ mod tests {
             CatalogModel {
                 provider: ProviderId::OpenAiCodex,
                 id: "gpt-5.5".to_string(),
+                ctx_label: None,
             },
             CatalogModel {
                 provider: ProviderId::Anthropic,
                 id: "claude-sonnet-4-6".to_string(),
+                ctx_label: None,
             },
         ];
         screen.open_modal(Modal::Model(ModelPicker::new(
@@ -2961,10 +3553,10 @@ mod tests {
             crate::mimir::selection::ReasoningEffort::XHigh,
         )));
 
-        let rendered = rendered_text(&mut screen, 80, 16);
+        let rendered = rendered_text(&mut screen, 80, 17);
         assert!(rendered.contains("Sonnet 5"), "{rendered}");
-        assert!(rendered.contains("xhigh effort"), "{rendered}");
-        assert!(rendered.contains("Reasoning"), "{rendered}");
+        assert!(rendered.contains("effort (xhigh)"), "{rendered}");
+        assert!(rendered.contains("SELECT MODEL"), "{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
 
@@ -2974,8 +3566,8 @@ mod tests {
         screen.editor.insert_str("abcdefghijklmnopqrst");
 
         let rendered = rendered_text(&mut screen, 18, 8);
-        assert!(rendered.contains("abcdefghij"), "{rendered}");
-        assert!(rendered.contains("klmnopqrst"), "{rendered}");
+        assert!(rendered.contains("abcdefghijk"), "{rendered}");
+        assert!(rendered.contains("lmnopqrst"), "{rendered}");
         for line in rendered.lines() {
             assert!(display_width(line) <= 18, "{line:?}");
         }
@@ -3125,7 +3717,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("↑18.2k ↓846"))
             .expect("turn divider with telemetry");
-        assert!(divider.trim_start().starts_with("── "), "{divider}");
+        assert!(divider.trim_start().starts_with("────── "), "{divider}");
         assert!(divider.contains(" ┊ ↑18.2k ↓846 "), "{divider}");
         assert!(!divider.contains("Worked for"), "{divider}");
         assert!(!divider.contains("T+"), "{divider}");
@@ -3149,7 +3741,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.trim_start().starts_with("── ")),
+                .any(|line| line.trim_start().starts_with("────── ")),
             "runtime-error divider missing: {lines:?}"
         );
     }
@@ -3161,6 +3753,30 @@ mod tests {
         assert!(line.contains("── 16s ─"), "{line}");
         assert!(!line.contains('┊'), "{line}");
         assert_eq!(display_width(&line), 60);
+    }
+
+    #[test]
+    fn turn_divider_elapsed_aligns_with_working_indicator_elapsed() {
+        let divider = line_text(&inset_rule_line(
+            90,
+            &turn_divider_label(Some(Duration::from_secs(27)), None),
+        ));
+        let working = line_text(&working_indicator_line(
+            WORKING_FRAMES[1],
+            Duration::from_millis(700),
+            true,
+            None,
+            0,
+            90,
+        ));
+
+        let divider_at = divider
+            .find("27s")
+            .map(|idx| display_width(&divider[..idx]));
+        let working_at = working
+            .find("0.7s")
+            .map(|idx| display_width(&working[..idx]));
+        assert_eq!(divider_at, working_at);
     }
 
     #[test]
@@ -3192,35 +3808,47 @@ mod tests {
         let mut screen = Screen::new();
         screen.editor.insert_str("/");
         screen.sync_palette();
-        let lines = rendered_lines(&mut screen, 80, 12);
+        let lines = rendered_lines(&mut screen, 80, 18);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("/exit"));
+        // The palette is a bordered overlay box (SlashMenu idiom).
+        assert!(rendered.contains('┌'), "{rendered}");
+        assert!(rendered.contains('└'), "{rendered}");
         let exit = line_matching(&lines, |line| line_text(line).contains("/exit"));
-        assert!(line_text(exit).starts_with("    /exit"), "{exit:?}");
+        // The selected row carries the surface fill + a bold name; the
+        // description stays muted — never a cyan foreground accent.
         assert!(
             exit.spans
                 .iter()
-                .all(|span| !matches!(span.style.bg, Some(Color::Cyan))),
-            "selected slash row must not use a background highlight: {exit:?}"
+                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE)),
+            "selected slash row should use the surface fill: {exit:?}"
+        );
+        assert!(
+            exit.spans.iter().any(|span| {
+                span.content.as_ref().contains("/exit")
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "selected command name should be bold: {exit:?}"
         );
         assert!(
             exit.spans
                 .iter()
-                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
-            "selected slash row uses foreground color only: {exit:?}"
+                .all(|span| span.style.fg != Some(Color::Cyan)),
+            "no cyan selection accent: {exit:?}"
         );
-        assert!(exit.spans.iter().any(|span| {
-            span.content.as_ref().contains("End the session") && span.style.fg == Some(Color::Cyan)
-        }));
         let model = line_matching(&lines, |line| line_text(line).contains("/model"));
+        // Descriptions align in one column across rows.
         assert_eq!(
             line_text(exit).find("End the session"),
             line_text(model).find("Show or switch provider/model")
         );
-        assert_ne!(model.spans[0].style.fg, Some(Color::Cyan));
-        assert!(model.spans.iter().any(|span| {
-            span.content.as_ref().contains("Show") && span.style.fg != Some(Color::Cyan)
-        }));
+        assert!(
+            model
+                .spans
+                .iter()
+                .all(|span| span.style.bg != Some(crate::ui::palette::SURFACE)),
+            "unselected rows are unfilled: {model:?}"
+        );
     }
 
     #[test]
@@ -3318,7 +3946,7 @@ mod tests {
         assert!(rendered.contains("ERROR"), "{rendered}");
         assert!(!rendered.contains("DONE"), "{rendered}");
         assert!(rendered.contains("boom"), "{rendered}");
-        assert!(rendered.contains("exit 1"), "{rendered}");
+        assert!(rendered.contains("EXIT 1"), "{rendered}");
     }
 
     #[test]
@@ -3336,7 +3964,9 @@ mod tests {
         });
 
         let rendered = rendered_text(&mut screen, 80, 12);
-        assert!(rendered.contains("\u{25c6} exit 0"), "{rendered}");
+        assert!(rendered.contains("│    $ cargo test"), "{rendered}");
+        assert!(rendered.contains("│    test result"), "{rendered}");
+        assert!(rendered.contains("\u{25c6} EXIT 0"), "{rendered}");
     }
 
     #[test]

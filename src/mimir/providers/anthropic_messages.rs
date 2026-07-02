@@ -24,9 +24,14 @@ use super::transport::{
     Attempt, HttpClass, TurnSink, classify_http_status_retryable, for_each_sse_event,
     retry_after_hint, run_with_retry, spawn_stream,
 };
+use crate::errors::AuthError;
 use crate::mimir::anthropic_models::{self, ThinkingMode};
 use crate::mimir::auth::anthropic::AnthropicTokenStore;
-use crate::mimir::selection::{ContextManagement, PromptCacheRetention, ReasoningEffort};
+use crate::mimir::auth::api_key;
+use crate::mimir::auth::storage::{AuthStore, CredentialKind};
+use crate::mimir::selection::{
+    ContextManagement, PromptCacheRetention, ProviderId, ReasoningEffort,
+};
 use crate::nexus::{
     AssistantTurn, CacheCreation, ChatProvider, CompletionReason, Message, ModelOrigin,
     ProviderStream, ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
@@ -39,6 +44,7 @@ const DEFAULT_OUTPUT_CAP: u32 = 64000;
 /// `< max_tokens`, else the request 400s.
 const ANTHROPIC_MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
 /// Base betas every Claude Code OAuth request carries.
 const BASE_ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 /// Appended only for manual-budget thinking payloads (`thinking.type ==
@@ -70,8 +76,53 @@ pub(crate) struct AnthropicProvider {
     cache_retention: PromptCacheRetention,
     context_management: ContextManagement,
     cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
-    tokens: AnthropicTokenStore,
+    auth: AnthropicAuthSource,
     retry_policy: crate::mimir::retry::RetryPolicy,
+}
+
+#[derive(Clone)]
+enum AnthropicAuthSource {
+    OAuth(AnthropicTokenStore),
+    ApiKey(String),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum AnthropicAuth {
+    OAuthBearer(String),
+    ApiKey(String),
+}
+
+impl std::fmt::Debug for AnthropicAuthSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OAuth(store) => f.debug_tuple("OAuth").field(store).finish(),
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"<redacted>").finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AnthropicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OAuthBearer(_) => f.debug_tuple("OAuthBearer").field(&"<redacted>").finish(),
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"<redacted>").finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicAuthKind {
+    OAuth,
+    ApiKey,
+}
+
+impl AnthropicAuth {
+    fn kind(&self) -> AnthropicAuthKind {
+        match self {
+            AnthropicAuth::OAuthBearer(_) => AnthropicAuthKind::OAuth,
+            AnthropicAuth::ApiKey(_) => AnthropicAuthKind::ApiKey,
+        }
+    }
 }
 
 impl AnthropicProvider {
@@ -100,10 +151,25 @@ impl AnthropicProvider {
             cache_retention,
             context_management,
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
-            tokens: AnthropicTokenStore::from_env()?,
+            auth: resolve_anthropic_auth()?,
             retry_policy,
         })
     }
+}
+
+fn resolve_anthropic_auth() -> Result<AnthropicAuthSource> {
+    let auth_store = AuthStore::from_env()?;
+    if auth_store.credential_kind(PROVIDER_ID)? == Some(CredentialKind::ApiKey) {
+        return Ok(AnthropicAuthSource::ApiKey(
+            auth_store.api_key_credentials(PROVIDER_ID)?.key,
+        ));
+    }
+    if auth_store.credential_kind(PROVIDER_ID)? != Some(CredentialKind::OAuth)
+        && let Some(key) = api_key::api_key_for_provider(ProviderId::Anthropic, &auth_store)?
+    {
+        return Ok(AnthropicAuthSource::ApiKey(key));
+    }
+    Ok(AnthropicAuthSource::OAuth(AnthropicTokenStore::from_env()?))
 }
 
 impl ChatProvider for AnthropicProvider {
@@ -128,14 +194,21 @@ impl ChatProvider for AnthropicProvider {
                 "prompt cache prefix changed since the previous request; the cached prefix will not be reused this turn"
             );
         }
-        let request = build_anthropic_request(
+        let auth_kind = match &self.auth {
+            AnthropicAuthSource::OAuth(_) => AnthropicAuthKind::OAuth,
+            AnthropicAuthSource::ApiKey(_) => AnthropicAuthKind::ApiKey,
+        };
+        let request = build_anthropic_request_for_auth(
             &self.model,
             &self.system_prompt,
             messages,
             tools,
             self.reasoning,
-            self.cache_retention,
-            &self.context_management,
+            AnthropicRequestConfig {
+                cache_retention: self.cache_retention,
+                context_management: &self.context_management,
+                auth_kind,
+            },
         );
         let provider = self.clone();
         let cancel = cancel.clone();
@@ -150,18 +223,19 @@ impl ChatProvider for AnthropicProvider {
                     "anthropic",
                     &provider.retry_policy,
                     cancel,
-                    |force| {
-                        let token = if force {
-                            provider
-                                .tokens
-                                .force_refresh(&provider.client, last_token.as_deref())
-                        } else {
-                            provider.tokens.access_token(&provider.client)
-                        }?;
-                        last_token = Some(token.clone());
-                        Ok(token)
+                    |force| match &provider.auth {
+                        AnthropicAuthSource::OAuth(tokens) => {
+                            let token = if force {
+                                tokens.force_refresh(&provider.client, last_token.as_deref())
+                            } else {
+                                tokens.access_token(&provider.client)
+                            }?;
+                            last_token = Some(token.clone());
+                            Ok(AnthropicAuth::OAuthBearer(token))
+                        }
+                        AnthropicAuthSource::ApiKey(key) => Ok(AnthropicAuth::ApiKey(key.clone())),
                     },
-                    |token| provider.send_once(token, &request, sink, cancel),
+                    |auth| provider.send_once(auth, &request, sink, cancel),
                 )
             },
             cancel,
@@ -172,12 +246,12 @@ impl ChatProvider for AnthropicProvider {
 impl AnthropicProvider {
     fn send_once(
         &self,
-        token: &str,
+        auth: &AnthropicAuth,
         request: &Value,
         sink: &mut dyn TurnSink,
         cancel: &CancellationToken,
     ) -> Attempt {
-        let headers = match anthropic_headers(token, request) {
+        let headers = match anthropic_headers_for_auth(auth, request) {
             Ok(headers) => headers,
             Err(error) => return Attempt::Fatal(error),
         };
@@ -272,7 +346,14 @@ impl AnthropicProvider {
         };
         let error = anyhow!("Anthropic request failed [{diag}]");
         match classify_http_status_retryable(status.as_u16()) {
-            HttpClass::Reauth => Attempt::Reauth(error),
+            HttpClass::Reauth if auth.kind() == AnthropicAuthKind::OAuth => Attempt::Reauth(error),
+            HttpClass::Reauth => Attempt::Fatal(
+                AuthError::for_provider(
+                    PROVIDER_ID,
+                    format!("Anthropic API key was rejected (HTTP {})", status.as_u16()),
+                )
+                .into(),
+            ),
             HttpClass::Retry => Attempt::Retry(error, retry_after),
             HttpClass::Fatal => Attempt::Fatal(error),
         }
@@ -470,7 +551,13 @@ fn auth_kind_label(headers: &HeaderMap) -> &'static str {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("Bearer "));
-    if is_bearer { "oauth_bearer" } else { "none" }
+    if is_bearer {
+        return "oauth_bearer";
+    }
+    if headers.get("x-api-key").is_some() {
+        return "api_key";
+    }
+    "none"
 }
 
 /// Anthropic request id from response headers (`request-id`, falling back to
@@ -504,27 +591,38 @@ fn extract_error_type(body: &str) -> Option<String> {
 /// betas always, `interleaved-thinking` only for manual-budget thinking, and the
 /// server-side fallback beta only when a `fallbacks` array is present. The
 /// OAuth lane never sends `x-api-key` / `anthropic-api-key`.
+#[cfg(test)]
 fn anthropic_headers(token: &str, request: &Value) -> Result<HeaderMap> {
+    anthropic_headers_for_auth(&AnthropicAuth::OAuthBearer(token.to_string()), request)
+}
+
+fn anthropic_headers_for_auth(auth: &AnthropicAuth, request: &Value) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}"))?,
-    );
+    match auth {
+        AnthropicAuth::OAuthBearer(token) => {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}"))?,
+            );
+            headers.insert(
+                "anthropic-dangerous-direct-browser-access",
+                HeaderValue::from_static("true"),
+            );
+            headers.insert("x-app", HeaderValue::from_static("cli"));
+        }
+        AnthropicAuth::ApiKey(key) => {
+            headers.insert("x-api-key", HeaderValue::from_str(key)?);
+        }
+    }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(
         "anthropic-version",
         HeaderValue::from_static(ANTHROPIC_VERSION),
     );
-    headers.insert(
-        "anthropic-beta",
-        HeaderValue::from_str(&anthropic_beta(request))?,
-    );
-    headers.insert(
-        "anthropic-dangerous-direct-browser-access",
-        HeaderValue::from_static("true"),
-    );
-    headers.insert("x-app", HeaderValue::from_static("cli"));
+    if let Some(beta) = anthropic_beta_for_auth(request, auth.kind()) {
+        headers.insert("anthropic-beta", HeaderValue::from_str(&beta)?);
+    }
     headers.insert(USER_AGENT, HeaderValue::from_static("iris-agent"));
     Ok(headers)
 }
@@ -533,34 +631,41 @@ fn anthropic_headers(token: &str, request: &Value) -> Result<HeaderMap> {
 /// driven so header construction needs no model object: manual-budget thinking
 /// is `thinking.type == "enabled"`, the refusal fallback is a non-empty
 /// `fallbacks` array.
+#[cfg(test)]
 fn anthropic_beta(request: &Value) -> String {
-    let mut betas = String::from(BASE_ANTHROPIC_BETA);
+    anthropic_beta_for_auth(request, AnthropicAuthKind::OAuth).unwrap_or_default()
+}
+
+fn anthropic_beta_for_auth(request: &Value, auth_kind: AnthropicAuthKind) -> Option<String> {
+    let mut betas = Vec::new();
+    match auth_kind {
+        AnthropicAuthKind::OAuth => {
+            betas.extend(BASE_ANTHROPIC_BETA.split(',').map(str::to_string));
+        }
+        AnthropicAuthKind::ApiKey => betas.push(CLAUDE_CODE_BETA.to_string()),
+    }
     let manual_thinking = request
         .get("thinking")
         .and_then(|thinking| thinking.get("type"))
         .and_then(Value::as_str)
         == Some("enabled");
     if manual_thinking {
-        betas.push(',');
-        betas.push_str(INTERLEAVED_THINKING_BETA);
+        betas.push(INTERLEAVED_THINKING_BETA.to_string());
     }
     let has_fallbacks = request
         .get("fallbacks")
         .and_then(Value::as_array)
         .is_some_and(|fallbacks| !fallbacks.is_empty());
     if has_fallbacks {
-        betas.push(',');
-        betas.push_str(SERVER_SIDE_FALLBACK_BETA);
+        betas.push(SERVER_SIDE_FALLBACK_BETA.to_string());
     }
     if request_contains_one_hour_cache(request) {
-        betas.push(',');
-        betas.push_str(EXTENDED_CACHE_TTL_BETA);
+        betas.push(EXTENDED_CACHE_TTL_BETA.to_string());
     }
     if request_contains_context_management(request) {
-        betas.push(',');
-        betas.push_str(CONTEXT_MANAGEMENT_BETA);
+        betas.push(CONTEXT_MANAGEMENT_BETA.to_string());
     }
-    betas
+    (!betas.is_empty()).then(|| betas.join(","))
 }
 
 fn request_contains_context_management(request: &Value) -> bool {
@@ -586,6 +691,7 @@ fn request_contains_one_hour_cache(value: &Value) -> bool {
     }
 }
 
+#[cfg(test)]
 fn build_anthropic_request(
     model: &str,
     system_prompt: &str,
@@ -594,6 +700,34 @@ fn build_anthropic_request(
     reasoning: Option<ReasoningEffort>,
     cache_retention: PromptCacheRetention,
     context_management: &ContextManagement,
+) -> Value {
+    build_anthropic_request_for_auth(
+        model,
+        system_prompt,
+        messages,
+        tools,
+        reasoning,
+        AnthropicRequestConfig {
+            cache_retention,
+            context_management,
+            auth_kind: AnthropicAuthKind::OAuth,
+        },
+    )
+}
+
+struct AnthropicRequestConfig<'a> {
+    cache_retention: PromptCacheRetention,
+    context_management: &'a ContextManagement,
+    auth_kind: AnthropicAuthKind,
+}
+
+fn build_anthropic_request_for_auth(
+    model: &str,
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &Tools,
+    reasoning: Option<ReasoningEffort>,
+    config: AnthropicRequestConfig<'_>,
 ) -> Value {
     let meta = anthropic_models::find(model);
     let thinking_mode = meta
@@ -605,14 +739,18 @@ fn build_anthropic_request(
     // base used to truncate large outputs, surfacing as a silently-dropped
     // `stop_reason=max_tokens`; unknown models fall back to the conservative
     // DEFAULT_OUTPUT_CAP.
+    let system = match config.auth_kind {
+        AnthropicAuthKind::OAuth => json!([
+            { "type": "text", "text": CLAUDE_CODE_IDENTITY },
+            { "type": "text", "text": system_prompt },
+        ]),
+        AnthropicAuthKind::ApiKey => json!([{ "type": "text", "text": system_prompt }]),
+    };
     let mut body = json!({
         "model": model,
         "max_tokens": output_cap,
         "stream": true,
-        "system": [
-            { "type": "text", "text": CLAUDE_CODE_IDENTITY },
-            { "type": "text", "text": system_prompt },
-        ],
+        "system": system,
         // Origin (reasoning-replay continuity) is keyed on the selected model id,
         // so a turn replays against the same selection.
         "messages": build_messages(messages, &anthropic_origin(model)),
@@ -651,8 +789,8 @@ fn build_anthropic_request(
     if !declarations.is_empty() {
         body["tools"] = Value::Array(declarations);
     }
-    apply_anthropic_cache_control(&mut body, cache_retention);
-    apply_context_management(&mut body, context_management);
+    apply_anthropic_cache_control(&mut body, config.cache_retention);
+    apply_context_management(&mut body, config.context_management);
     body
 }
 
@@ -2183,6 +2321,54 @@ data: {\"type\":\"message_stop\"}
         let results = msgs[2]["content"].as_array().unwrap();
         assert_eq!(results.len(), 2, "both tool results in one user message");
         assert_eq!(results[0]["tool_use_id"], json!("toolu_1"));
+    }
+
+    #[test]
+    fn api_key_lane_sends_x_api_key_and_omits_claude_code_identity() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+        let body = build_anthropic_request_for_auth(
+            "claude-sonnet-4-6",
+            "P",
+            &messages,
+            &tools,
+            None,
+            AnthropicRequestConfig {
+                cache_retention: PromptCacheRetention::Short,
+                context_management: &ContextManagement::default(),
+                auth_kind: AnthropicAuthKind::ApiKey,
+            },
+        );
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(
+            system.len(),
+            1,
+            "API-key requests do not need Claude Code identity"
+        );
+        assert_eq!(system[0]["text"], json!("P"));
+
+        let headers =
+            anthropic_headers_for_auth(&AnthropicAuth::ApiKey("sk-ant".to_string()), &body)
+                .expect("headers");
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "sk-ant"
+        );
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert_eq!(auth_kind_label(&headers), "api_key");
+        assert_eq!(
+            headers.get("anthropic-version").unwrap().to_str().unwrap(),
+            ANTHROPIC_VERSION
+        );
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(
+            beta.contains(CLAUDE_CODE_BETA),
+            "API-key lane keeps Claude Code tool-format beta"
+        );
+        assert!(
+            !beta.contains("oauth"),
+            "API-key lane must not send OAuth-only beta"
+        );
     }
 
     #[test]

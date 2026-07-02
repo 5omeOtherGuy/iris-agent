@@ -109,15 +109,18 @@ Implemented today:
 - Anthropic-only server-side context-management clear edits, with provider-side
   compact rejected until Iris can persist and replay provider compaction blocks.
 - Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
-  subscription OAuth reuse, and Antigravity Google OAuth.
+  subscription OAuth reuse, Antigravity Google OAuth, Anthropic/OpenAI API keys,
+  and dedicated keys for configured OpenAI-compatible endpoints.
 - OpenAI Codex browser and device-code login flows; Antigravity browser PKCE
-  login; Anthropic browser PKCE login plus Claude Code credential reuse; shared
+  login; Anthropic browser PKCE login plus Claude Code credential reuse; API-key
+  login for Anthropic, OpenAI, and OpenAI-compatible providers; shared
   cancellable loopback OAuth callback plumbing with manual-paste fallback.
-- OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini Code Assist
-  request/response handling, including tool schemas, streamed-response parsing,
-  and normalized reasoning/thinking controls where supported; Anthropic preserves
-  same-origin reasoning continuity in flattened transcripts, and Antigravity
-  round-trips Gemini tool-call `thoughtSignature` continuity.
+- OpenAI Codex Responses, Anthropic Messages, OpenAI Chat Completions,
+  OpenAI-compatible Chat Completions, and Antigravity/Gemini Code Assist
+  request/response handling, including tool schemas, streamed-response parsing
+  where supported, and normalized reasoning/thinking controls where supported;
+  Anthropic preserves same-origin reasoning continuity in flattened transcripts,
+  and Antigravity round-trips Gemini tool-call `thoughtSignature` continuity.
 - Harness-owned fragment/slot system-prompt / project-instruction assembly
   ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56),
   [#74](https://github.com/5omeOtherGuy/iris-agent/pull/74)): the Tier-2
@@ -126,7 +129,13 @@ Implemented today:
   runtime context in one place; fresh and resumed sessions feed the same
   assembled string through the provider request path. Skills/templates remain
   deferred (issue #57); named slots and selector-driven assembly remain open
-  (#76/#73).
+  (#76/#73). Repo-provided fragments are gated behind a per-project trust
+  decision ([#202](https://github.com/5omeOtherGuy/iris-agent/issues/202)): a
+  Tier-2 trust store (`wayland::trust`, `~/.iris/trust.json`, keyed by canonical
+  dir) records trusted/untrusted/undecided; `assemble` skips repo fragments
+  unless trusted; a first-run interactive prompt (never in non-interactive
+  contexts) and the `/trust` command set the decision. Project docs stay
+  ungated.
 - Milestone 2 foundations: structured metadata, typed tool-result contracts,
   token estimates, handle-backed large tool outputs, session-scoped
   content-addressed sidecars, turn-boundary auto-compaction, formal
@@ -335,6 +344,11 @@ Execution order (by impact/effort, independent of the milestone sequence):
         `pre_exec`; fail-open is never silent (notice + `tracing::warn`).
         macOS Seatbelt is not implemented — Linux-only enforcement today;
         unsupported kernels run unconfined with a surfaced notice.
+        Launch platform matrix: Linux + macOS supported, Windows unsupported
+        for now. On non-Linux platforms the shell has no kernel sandbox, so the
+        `bash` approval prompt states `unsandboxed` at the decision point
+        ([#203](https://github.com/5omeOtherGuy/iris-agent/issues/203)); macOS
+        Seatbelt confinement is the follow-up.
      2. Persistent sessions (`src/tools/bash/session.rs`): opt-in `session` id;
         `cd`/env/shell vars persist via a co-process + sentinel-marker
         protocol; lazy create, explicit `reset`/`close`, Drop closes all.

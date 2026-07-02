@@ -14,10 +14,10 @@ use super::wrap::{
 };
 use super::{
     BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_BORDER_WIDTH, PANEL_BODY_CHROME_WIDTH,
-    PANEL_BODY_SIDE_PADDING, TEXT_COLUMN_X_PADDING, border_style, dim_style, err_style, ok_style,
-    panel_style, prompt_style,
+    PANEL_BODY_LEFT_PADDING, PANEL_BODY_RIGHT_PADDING, TEXT_COLUMN_X_PADDING, border_style,
+    dim_style, err_style, ok_style, panel_style, prompt_style,
 };
-use crate::ui::symbols;
+use crate::ui::{is_diff_file_header, symbols};
 
 fn panel_outer_padding(width: usize) -> usize {
     if width <= BOX_X_PADDING.saturating_mul(2).saturating_add(1) {
@@ -30,6 +30,13 @@ fn panel_outer_padding(width: usize) -> usize {
 fn panel_width(width: usize) -> usize {
     width
         .saturating_sub(panel_outer_padding(width).saturating_mul(2))
+        .max(1)
+}
+
+pub(super) fn panel_body_content_width(width: usize) -> usize {
+    panel_width(width)
+        .max(PANEL_BODY_BORDER_WIDTH)
+        .saturating_sub(PANEL_BODY_CHROME_WIDTH)
         .max(1)
 }
 
@@ -110,8 +117,7 @@ pub(super) fn panel_body_line(
     mut line: Line<'static>,
     bg: Option<Color>,
 ) -> Line<'static> {
-    let panel_width = panel_width(width).max(PANEL_BODY_BORDER_WIDTH);
-    let body_width = panel_width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
+    let body_width = panel_body_content_width(width);
     truncate_line(&mut line, body_width);
     if let Some(bg) = bg {
         apply_width_bg(&mut line, bg, body_width);
@@ -125,14 +131,15 @@ pub(super) fn panel_body_line(
         }
     }
     let outer = panel_outer_padding(width);
-    let side_padding = " ".repeat(PANEL_BODY_SIDE_PADDING);
+    let left_padding = " ".repeat(PANEL_BODY_LEFT_PADDING);
+    let right_padding = " ".repeat(PANEL_BODY_RIGHT_PADDING);
     let mut spans = vec![
         Span::raw(" ".repeat(outer)),
         Span::styled("│", border_style()),
-        Span::styled(side_padding.clone(), panel_style()),
+        Span::styled(left_padding, panel_style()),
     ];
     spans.extend(line.spans);
-    spans.push(Span::styled(side_padding, panel_style()));
+    spans.push(Span::styled(right_padding, panel_style()));
     spans.push(Span::styled("│", border_style()));
     spans.push(Span::raw(" ".repeat(outer)));
     let mut line = Line::from(spans);
@@ -146,8 +153,7 @@ pub(super) fn panel_body_lines(
     bg: Option<Color>,
     out: &mut Vec<Line<'static>>,
 ) {
-    let panel_width = panel_width(width).max(PANEL_BODY_BORDER_WIDTH);
-    let body_width = panel_width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
+    let body_width = panel_body_content_width(width);
     let mut wrapped = Vec::new();
     push_wrapped_line(&line, body_width, None, &mut wrapped);
     for physical in wrapped {
@@ -155,19 +161,45 @@ pub(super) fn panel_body_lines(
     }
 }
 
-/// A reasoning-rail header: `┊ ▾ THINKING` (expanded) / `┊ ▸ THINKING`
-/// (collapsed), muted and indented to the transcript text column. No box —
-/// reasoning is recessive; the rail is the only chrome it gets (ThinkingBlock).
-pub(super) fn rail_header_line(width: usize, expanded: bool, label: &str) -> Line<'static> {
-    let arrow = if expanded {
-        symbols::EXPANDED
+/// A reasoning-rail header: `▾ THINKING` (expanded) / `▸ THINKING` (collapsed),
+/// muted, bold label, indented to the transcript text column, with optional
+/// right-aligned telemetry (`↓2.4k 12s`). No box — reasoning is recessive; the
+/// `┊` rail on its body rows is the only chrome it gets (ThinkingBlock). A
+/// non-foldable (short) block drops the disclosure arrow.
+pub(super) fn rail_header_line(
+    width: usize,
+    expanded: bool,
+    foldable: bool,
+    label: &str,
+    right: &str,
+) -> Line<'static> {
+    let left = if foldable {
+        let arrow = if expanded {
+            symbols::EXPANDED
+        } else {
+            symbols::COLLAPSED
+        };
+        format!("{arrow} {label}")
     } else {
-        symbols::COLLAPSED
+        label.to_string()
     };
-    let mut line = Line::from(Span::styled(
-        format!("{} {arrow} {label}", symbols::SEP),
-        dim_style(),
-    ));
+    let mut spans = vec![Span::styled(
+        left.clone(),
+        dim_style().add_modifier(Modifier::BOLD),
+    )];
+    if !right.is_empty() {
+        let content_width = width
+            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+            .max(1);
+        let gap = content_width
+            .saturating_sub(display_width(&left))
+            .saturating_sub(display_width(right));
+        if gap >= 1 {
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(right.to_string(), dim_style()));
+        }
+    }
+    let mut line = Line::from(spans);
     pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
     truncate_line(&mut line, width.max(1));
     line
@@ -203,6 +235,8 @@ pub(super) enum PanelState {
     Done,
     Error,
     Cancelled,
+    /// A pending mutation awaiting apply/approval (`◇ PREVIEW`, no elapsed).
+    Preview,
 }
 
 impl PanelState {
@@ -212,6 +246,7 @@ impl PanelState {
             Self::Done => " DONE",
             Self::Error => " ERROR",
             Self::Cancelled => " CANCELLED",
+            Self::Preview => " PREVIEW",
         }
     }
 
@@ -224,6 +259,7 @@ impl PanelState {
             Self::Done => symbols::DONE,
             Self::Error => symbols::ERROR,
             Self::Cancelled => symbols::CANCELLED,
+            Self::Preview => symbols::PREVIEW,
         }
     }
 
@@ -232,8 +268,14 @@ impl PanelState {
             Self::Running => prompt_style(),
             Self::Done => ok_style(),
             Self::Error => err_style(),
-            Self::Cancelled => dim_style(),
+            Self::Cancelled | Self::Preview => dim_style(),
         }
+    }
+
+    /// Header label style: the state color plus BOLD, so symbol + label share
+    /// one signal (the `StateSymbol` component: `◆ DONE` reads green as a unit).
+    pub(super) fn label_style(self) -> Style {
+        self.dot_style().add_modifier(Modifier::BOLD)
     }
 
     pub(super) fn plain_prefix(self) -> &'static str {
@@ -242,6 +284,7 @@ impl PanelState {
             Self::Done => "• Ran",
             Self::Error => "✗ Ran",
             Self::Cancelled => "• Cancelled",
+            Self::Preview => "• Preview",
         }
     }
 }
@@ -276,8 +319,8 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            i += 1;
+        if is_diff_file_header(&lines, i) {
+            i += 2;
             continue;
         }
         if let Some((old_start, new_start)) = parse_hunk_header(line) {
@@ -299,7 +342,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                 let mut removed: Vec<&str> = vec![code];
                 i += 1;
                 while let Some(next) = lines.get(i) {
-                    if next.starts_with("--- ") || !next.starts_with('-') {
+                    if is_diff_header_line(&lines, i) || !next.starts_with('-') {
                         break;
                     }
                     removed.push(next.get('-'.len_utf8()..).unwrap_or_default());
@@ -307,7 +350,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                 }
                 let mut added: Vec<&str> = Vec::new();
                 while let Some(next) = lines.get(i) {
-                    if next.starts_with("+++ ") || !next.starts_with('+') {
+                    if is_diff_header_line(&lines, i) || !next.starts_with('+') {
                         break;
                     }
                     added.push(next.get('+'.len_utf8()..).unwrap_or_default());
@@ -396,8 +439,9 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
 pub(super) fn diff_counts(diff: &str) -> (usize, usize) {
     let mut added = 0;
     let mut removed = 0;
-    for line in diff.lines() {
-        if line.starts_with("+++ ") || line.starts_with("--- ") {
+    let lines: Vec<&str> = diff.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if is_diff_header_line(&lines, i) {
             continue;
         }
         match line.as_bytes().first() {
@@ -512,6 +556,12 @@ fn push_token(spans: &mut Vec<Span<'static>>, value: String, base: Style) {
     spans.push(Span::styled(value, style));
 }
 
+fn is_diff_header_line(lines: &[&str], i: usize) -> bool {
+    is_diff_file_header(lines, i)
+        || i.checked_sub(1)
+            .is_some_and(|prev| is_diff_file_header(lines, prev))
+}
+
 fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
     let rest = line.strip_prefix("@@ -")?;
     let (old_part, rest) = rest.split_once(" +")?;
@@ -545,4 +595,24 @@ fn format_diff_table_row(
     code: &str,
 ) -> String {
     format!("{}{code}", diff_table_gutter(old, new, marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_rows_count_removed_content_that_looks_like_file_header() {
+        let diff = "--- a/query.sql\n+++ b/query.sql\n@@ -1,2 +1 @@\n--- comment\n keep\n";
+
+        let rows = diff_table_rows(diff);
+        let rendered = rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("-- comment"), "{rendered}");
+        assert_eq!(diff_counts(diff), (0, 1));
+    }
 }

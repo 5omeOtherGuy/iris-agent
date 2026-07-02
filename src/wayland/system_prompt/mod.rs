@@ -8,6 +8,16 @@
 //! (`<workspace>/.iris/fragments`); a user adds, edits, or reorders blocks
 //! purely by dropping files, the same UX as Claude Code agents/skills.
 //!
+//! ## Project trust gate
+//!
+//! Repo fragments are attacker-controlled: cloning a hostile repo and running
+//! `iris` would inject arbitrary system-prompt text with zero ceremony. So the
+//! per-repo dir is only loaded when the workspace is **trusted** (see
+//! [`crate::wayland::trust`]); an untrusted or undecided project skips repo
+//! fragments entirely and falls back to the global dir / shipped defaults.
+//! Project docs (`AGENTS.md`/`CLAUDE.md`) are NOT gated -- only
+//! system-prompt-level fragments are.
+//!
 //! Mirrors pi's `harness/system-prompt.ts` (assembly owned by the harness, not
 //! the terminal UI) and `core/resource-loader.ts` (project-doc discovery walk)
 //! for the dynamic context. Intentionally NOT adopted: Codex's per-turn context
@@ -126,12 +136,16 @@ struct Fragment {
 /// exists in either dir, the in-memory shipped defaults are used so the prompt
 /// is never empty. Both fresh and resumed sessions call this with the same
 /// workspace, so they assemble identical instructions.
-pub(crate) fn assemble(workspace: &Path, tools: &Tools) -> String {
+pub(crate) fn assemble(workspace: &Path, tools: &Tools, trust_repo: bool) -> String {
     let mut fragments = Vec::new();
     if let Some(global) = global_fragments_dir() {
         fragments.extend(load_dir(&global, Source::Global));
     }
-    fragments.extend(load_repo_fragments(workspace));
+    // Repo fragments are attacker-controlled, so they load only for a trusted
+    // workspace. An untrusted/undecided project silently skips them.
+    if trust_repo {
+        fragments.extend(load_repo_fragments(workspace));
+    }
     if fragments.is_empty() {
         fragments = default_fragments();
     }
@@ -147,13 +161,44 @@ pub(crate) fn assemble(workspace: &Path, tools: &Tools) -> String {
 /// target and fold host `.md` files into the prompt. A missing dir (the normal
 /// case) and an escaping symlink both yield no fragments.
 fn load_repo_fragments(workspace: &Path) -> Vec<Fragment> {
-    let Ok(root) = crate::tools::path::workspace_root(workspace) else {
-        return Vec::new();
-    };
-    let Ok(dir) = crate::tools::path::resolve_existing(&root, ".iris/fragments") else {
-        return Vec::new();
-    };
-    load_dir(&dir, Source::Repo)
+    match repo_fragments_dir(workspace) {
+        Some(dir) => load_dir(&dir, Source::Repo),
+        None => Vec::new(),
+    }
+}
+
+/// Resolve the repo fragments dir through the workspace path sandbox, returning
+/// it only when it exists inside the workspace. `None` for the normal missing
+/// case and for an escaping symlink (which the sandbox rejects). Shared by
+/// [`load_repo_fragments`] and [`repo_provides_fragments`] so the trust prompt
+/// triggers on exactly the dir the loader would read.
+fn repo_fragments_dir(workspace: &Path) -> Option<PathBuf> {
+    let root = crate::tools::path::workspace_root(workspace).ok()?;
+    let resolved = crate::tools::path::resolve_existing(&root, ".iris/fragments").ok()?;
+    // Enforce workspace containment UNCONDITIONALLY, independent of the
+    // tool-path security opt-in. `resolve_existing` only confines paths when
+    // `IRIS_SECURITY_OPT_IN` is set (or under `cfg(test)`), so in the shipped
+    // default runtime a hostile repo could point `.iris/fragments` at an
+    // arbitrary host directory and have its `.md` files folded into the prompt.
+    // Both `resolved` and `root` are canonicalized; fail closed on any escape.
+    contain_in_workspace(resolved, &root)
+}
+
+/// Keep `resolved` only when it stays inside the canonicalized workspace
+/// `root`, else drop it. Applied unconditionally by [`repo_fragments_dir`] so
+/// repo-fragment containment does not depend on the tool-path security opt-in;
+/// both arguments must already be canonicalized.
+fn contain_in_workspace(resolved: PathBuf, root: &Path) -> Option<PathBuf> {
+    resolved.starts_with(root).then_some(resolved)
+}
+
+/// Whether the repo ships a `.iris/fragments` dir that would be folded into the
+/// system prompt if trusted. The first-run trust prompt only fires when this is
+/// true, so a project with no repo-provided fragments never prompts. Resolved
+/// through the same sandbox as the loader, so an escaping symlink reads as
+/// absent (nothing to trust).
+pub(crate) fn repo_provides_fragments(workspace: &Path) -> bool {
+    repo_fragments_dir(workspace).is_some()
 }
 
 /// Test-only: assemble from the in-memory shipped defaults with no fragment

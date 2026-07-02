@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
+use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
@@ -59,6 +60,20 @@ impl<'a, P> ModelSwitch<'a, P> {
     /// Replace the session cycle scope. `None`/empty clears it.
     pub(crate) fn set_scoped(&mut self, scoped: Option<Vec<String>>) {
         self.scoped = scoped.filter(|ids| !ids.is_empty());
+    }
+
+    /// Swap the system prompt used to rebuild providers. Used by `/trust` after
+    /// re-assembling the prompt under a new trust decision; the next
+    /// [`apply_selection`] rebuilds the provider with this prompt.
+    pub(crate) fn set_system_prompt(&mut self, prompt: String) {
+        self.system_prompt = prompt;
+    }
+
+    /// The system prompt currently used to rebuild providers. `/trust` snapshots
+    /// this before a rebuild so it can restore it if the rebuild fails, keeping
+    /// the session prompt in sync with the still-live provider.
+    pub(crate) fn system_prompt(&self) -> &str {
+        &self.system_prompt
     }
 }
 
@@ -164,11 +179,17 @@ pub(crate) fn candidate_for(
     let base_url = if provider == current.provider {
         current.base_url.clone()
     } else {
-        selection::base_url_for(provider, None)
+        let settings_base_url = settings_base_url_for_switch(provider);
+        selection::base_url_for(provider, settings_base_url.as_deref())
     };
-    let reasoning = current
-        .reasoning
-        .map(|level| model_capabilities::clamp(provider, model, level));
+    let reasoning =
+        if provider == ProviderId::OpenAiCompatible && !current.open_ai_compatible.reasoning {
+            None
+        } else {
+            current
+                .reasoning
+                .map(|level| model_capabilities::clamp(provider, model, level))
+        };
     ModelSelection {
         provider,
         model: model.to_string(),
@@ -176,9 +197,24 @@ pub(crate) fn candidate_for(
         reasoning,
         cache_retention: current.cache_retention,
         context_management: current.context_management.clone(),
-        // A runtime model switch keeps the configured retry policy.
+        // A runtime model switch keeps the configured retry policy and custom
+        // endpoint metadata.
         retry_policy: current.retry_policy,
+        open_ai_compatible: current.open_ai_compatible,
     }
+}
+
+fn settings_base_url_for_switch(provider: ProviderId) -> Option<String> {
+    let settings = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())?;
+    let configured_provider = settings
+        .default_provider
+        .as_deref()
+        .and_then(|value| ProviderId::parse(value).ok());
+    (configured_provider == Some(provider))
+        .then_some(settings.base_url)
+        .flatten()
 }
 
 /// Validate, rebuild the provider, install it at the safe boundary, and record
@@ -223,6 +259,7 @@ fn picker_only_command(prompt: &str) -> Option<&'static str> {
     match prompt.split_whitespace().next().unwrap_or("") {
         "/scoped-models" => Some("/scoped-models"),
         "/settings" => Some("/settings"),
+        "/trust" => Some("/trust"),
         "/login" => Some("/login"),
         "/logout" => Some("/logout"),
         _ => None,
@@ -470,6 +507,7 @@ mod tests {
             cache_retention: selection::PromptCacheRetention::Short,
             context_management: selection::ContextManagement::default(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
+            open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
         }
     }
 

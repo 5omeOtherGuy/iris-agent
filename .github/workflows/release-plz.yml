@@ -1,7 +1,12 @@
 # release-plz: the Rust-native release automation. On every push to main it
 # opens/updates a "release" PR that bumps the version and maintains CHANGELOG.md
-# from the merged commits. Publishing to crates.io is disabled (release-plz.toml),
-# so this only runs the release-PR step; merge that PR to cut a version.
+# from the merged commits. When a release PR is merged, the `release` job tags
+# the version, creates the GitHub release, and publishes to crates.io.
+#
+# The crates.io publish is gated on a `CARGO_REGISTRY_TOKEN` secret: until an
+# operator adds it, the `release` job is skipped and no publish is attempted.
+# Prebuilt binaries are produced separately by .github/workflows/release.yml
+# (cargo-dist), triggered by the git tag this job creates.
 # Docs: https://release-plz.dev/docs/github
 name: release-plz
 
@@ -37,3 +42,31 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Skip entirely until an operator configures the crates.io token, so no
+    # publish is attempted before the registry credential exists.
+    env:
+      HAS_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    steps:
+      - name: Checkout repository
+        if: env.HAS_REGISTRY_TOKEN == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        if: env.HAS_REGISTRY_TOKEN == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz release
+        if: env.HAS_REGISTRY_TOKEN == 'true'
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

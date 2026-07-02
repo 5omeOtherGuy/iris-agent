@@ -1,11 +1,10 @@
 //! `bash` — run a shell command with a timeout, process-group kill, and
 //! bounded output drain/truncation.
 
-use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -17,6 +16,8 @@ use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 mod jobs;
 mod sandbox;
 mod session;
+
+pub(crate) use sandbox::platform_can_sandbox;
 
 // How long a bounded wait (session marker read, job finalize) may block before
 // re-checking the turn cancellation token. Small enough that a Ctrl-C is
@@ -36,7 +37,7 @@ const BASH_DRAIN_TIMEOUT_SECS: u64 = 5;
 // streams. This stays a memory-safety rail and is intentionally unchanged.
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. No timeout by default; set `timeout` (seconds) to bound a call. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
+pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). No timeout by default; set `timeout` (seconds) to bound a call. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -486,7 +487,7 @@ fn bash(
 }
 
 /// Apply the shared output policy: keep the bounded tail, mark `(no output)`
-/// when empty, and spill the full output to a temp file when truncated.
+/// when empty, and report truncation without writing a temp-file spill.
 fn render_output(combined: &str) -> String {
     let (body, truncated, dropped_lines) =
         truncate_tail(combined, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
@@ -496,11 +497,7 @@ fn render_output(combined: &str) -> String {
         body
     };
     if truncated {
-        let location = write_overflow_file(combined)
-            .map_or_else(|| "(unavailable)".to_string(), |p| p.display().to_string());
-        out = format!(
-            "[output truncated, dropped {dropped_lines} earlier line(s); full output saved to {location}]\n{out}"
-        );
+        out = format!("[output truncated, dropped {dropped_lines} earlier line(s)]\n{out}");
     }
     out
 }
@@ -578,16 +575,6 @@ fn pump_pipe(pipe: &mut impl Read, stream: BashStream, tx: &std::sync::mpsc::Sen
     if truncated {
         let _ = tx.send(PumpMsg::Truncated);
     }
-}
-
-fn write_overflow_file(content: &str) -> Option<PathBuf> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("iris-bash-output-{nanos}.log"));
-    fs::write(&path, content).ok()?;
-    Some(path)
 }
 
 #[cfg(test)]
@@ -708,6 +695,17 @@ mod tests {
             "durationMs metadata missing on session path: {:?}",
             out.metadata
         );
+    }
+
+    #[test]
+    fn bash_truncation_does_not_spill_full_output_to_temp_file() {
+        let combined = format!("old\n{}", "x\n".repeat(DEFAULT_MAX_LINES + 1));
+
+        let out = render_output(&combined);
+
+        assert!(out.contains("output truncated"), "{out}");
+        assert!(!out.contains("full output saved to"), "{out}");
+        assert!(!out.contains("iris-bash-output-"), "{out}");
     }
 
     #[test]
@@ -871,7 +869,7 @@ mod tests {
         let outside = home.join(format!(
             ".iris-bash-escape-{}.txt",
             std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));

@@ -88,6 +88,23 @@ pub(crate) struct Settings {
     /// request load and cost, so an untrusted project file must not crank it up
     /// (same reasoning as `prompt_cache_retention`).
     pub(crate) retry: Option<RetrySettings>,
+    /// Generic OpenAI-compatible model metadata. The provider/model/base-url are
+    /// still resolved through the existing top-level defaults; this object holds
+    /// capability/display flags for the configured custom endpoint.
+    pub(crate) open_ai_compatible: Option<OpenAiCompatibleSettings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenAiCompatibleSettings {
+    /// Context-window size in tokens for the configured custom model.
+    pub(crate) context_window: Option<u64>,
+    /// Whether Iris may send OpenAI-style `reasoning_effort` for this endpoint.
+    pub(crate) reasoning: Option<bool>,
+    /// Whether an API key is required before the model is offered. Local servers
+    /// such as Ollama leave this false/absent and run with no Authorization
+    /// header.
+    pub(crate) api_key_required: Option<bool>,
 }
 
 /// Raw provider retry/backoff config (all fields optional). Resolved into the
@@ -162,6 +179,10 @@ impl Settings {
             // Retry tuning affects provider load/cost, so keep it global-only
             // like prompt cache retention; never taken from project config.
             retry: self.retry,
+            // Custom endpoint capability flags are global-only alongside the
+            // base URL, so a cloned project cannot change how a secret-bearing
+            // endpoint is called.
+            open_ai_compatible: self.open_ai_compatible,
         }
     }
 

@@ -205,7 +205,11 @@ pub(super) fn push_wrapped_line_wordwise_with_prefix(
         let mut cursor = 0usize;
         for physical in wrap_to_width(&content_text, content_width) {
             let mut line = styled_physical_row(content_cells, &mut cursor, &physical);
-            pad_line_left(&mut line, prefix_width);
+            // Re-emit the prefix (the dim reasoning rail) on every physical
+            // line so the rail runs the full height of the block, instead of
+            // silently padding it away with spaces.
+            line.spans
+                .insert(0, Span::styled(continuation_prefix, dim_style()));
             out.push(line);
         }
         return;
@@ -311,11 +315,7 @@ pub(super) fn push_wrapped_row(
     }
 
     let continuation_width = width.saturating_sub(display_width(prefix)).max(1);
-    let remainder = text
-        .strip_prefix(first)
-        .unwrap_or_default()
-        .strip_prefix(' ')
-        .unwrap_or_default();
+    let remainder = continuation_remainder(text, first);
     for physical in wrap_to_width(remainder, continuation_width) {
         if !physical.is_empty() {
             out.push(Line::from(vec![
@@ -326,9 +326,27 @@ pub(super) fn push_wrapped_row(
     }
 }
 
+fn continuation_remainder<'a>(text: &'a str, first: &str) -> &'a str {
+    if first.is_empty() {
+        return text;
+    }
+    if let Some(rest) = text.strip_prefix(first) {
+        return rest.strip_prefix(' ').unwrap_or(rest);
+    }
+    if let Some(start) = text.find(first) {
+        let rest = &text[start + first.len()..];
+        return rest.strip_prefix(' ').unwrap_or(rest);
+    }
+    debug_assert!(
+        false,
+        "first wrapped row should be recoverable from original text"
+    );
+    text
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{display_width, wrap_to_width};
+    use super::{continuation_remainder, display_width, wrap_to_width};
 
     #[test]
     fn wrap_breaks_long_line_at_spaces_and_hard_breaks_long_words() {
@@ -383,6 +401,14 @@ mod tests {
         assert_eq!(
             wrap_to_width("abcdefgh", 3),
             vec!["abc".to_string(), "def".to_string(), "gh".to_string()]
+        );
+    }
+
+    #[test]
+    fn continuation_remainder_fallback_preserves_text_when_first_is_not_prefix() {
+        assert_eq!(
+            continuation_remainder("  indented prompt wraps", "indented"),
+            "prompt wraps"
         );
     }
 }

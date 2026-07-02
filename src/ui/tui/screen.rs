@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use ratatui_textarea::{TextArea, WrapMode};
 
 #[cfg(test)]
@@ -21,16 +21,15 @@ use crate::ui::terminal_surface::CURSOR_MARKER;
 use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
 use super::text::{ansi_spans, strip_ansi_for_text};
-use super::transcript::Transcript;
+use super::transcript::{Transcript, TranscriptRender};
 use super::wrap::{
     display_width, line_text, pad_line_left, push_wrapped_line, spans_width, truncate_line,
     truncate_to_width, wrap_to_width,
 };
 use super::{
-    BOX_X_PADDING_U16, COMPOSER_HINT, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS, MAX_MENU_ROWS,
-    MIN_EDITOR_H, MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING_U16,
-    WORKING_FRAMES, WORKSPACE_LABEL_H, border_style, dim_style, format_elapsed_compact,
-    panel_style, prompt_style,
+    BOX_X_PADDING_U16, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS, MAX_MENU_ROWS, MIN_EDITOR_H,
+    MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, WORKING_FRAMES, border_style, dim_style,
+    format_elapsed_compact, panel_style, prompt_style,
 };
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -53,6 +52,15 @@ struct ApprovalHint {
     /// Whether the gated action is a shell command, so the action reads with a
     /// `$ ` prompt (per the `ApprovalOutput` design-system component).
     shell: bool,
+    /// Whether this platform ships no kernel sandbox backend for the shell at
+    /// all (non-Linux). Surfaces an honest `unsandboxed` posture at the
+    /// decision point, rather than only a startup notice that scrolls away.
+    ///
+    /// This reflects platform capability, not per-run confinement. Its ABSENCE
+    /// is NOT a guarantee that the run is confined: on Linux the marker is
+    /// always false even when runtime enforcement is off (Landlock unavailable
+    /// or approvals not opted in). Do not treat a missing marker as sandboxed.
+    sandbox_unavailable: bool,
 }
 
 #[derive(Default)]
@@ -261,12 +269,21 @@ fn working_lines(
 fn approval_lead_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(format!("{} ", crate::ui::symbols::REVIEW), prompt_style()),
-        Span::raw("REVIEW  "),
+        Span::styled(
+            "REVIEW  ".to_string(),
+            prompt_style().add_modifier(Modifier::BOLD),
+        ),
     ];
     if hint.shell {
         spans.push(Span::styled("$ ", dim_style()));
     }
     spans.extend(ansi_spans(&hint.target, Style::default()));
+    if hint.sandbox_unavailable {
+        spans.push(Span::styled(
+            format!("  {} unsandboxed", crate::ui::symbols::SEP),
+            dim_style(),
+        ));
+    }
     spans
 }
 
@@ -318,7 +335,6 @@ pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
     let inner_width = usize::from(
         width
             .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
-            .saturating_sub(TEXT_X_PADDING_U16.saturating_mul(2))
             .max(1),
     );
     editor
@@ -457,8 +473,12 @@ impl Screen {
     /// Render all transcript rows plus any in-flight stream, wrapped to `width`.
     /// Finalized history is intentionally retained here; the terminal surface
     /// owns append/diff/full-replay decisions instead of draining UI state.
-    pub(super) fn wrapped_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn wrapped_lines(&mut self, width: u16) -> TranscriptRender {
         self.transcript.render(width)
+    }
+
+    pub(super) fn wrapped_lines_incremental(&mut self, width: u16) -> TranscriptRender {
+        self.transcript.render_incremental(width)
     }
 
     // --- editor ---
@@ -602,10 +622,12 @@ impl Screen {
         } else {
             "[y] once  [N] deny"
         };
+        let shell = call.name == "bash";
         self.approval_hint = Some(ApprovalHint {
             target: run_target(call),
             options,
-            shell: call.name == "bash",
+            shell,
+            sandbox_unavailable: shell && !crate::tools::platform_can_sandbox(),
         });
     }
 
@@ -663,21 +685,45 @@ impl Component for LinesSection {
 /// transcript rows retained in Iris state, plus bottom-pinned
 /// menu/status/editor chrome. The terminal surface decides how much of this
 /// document can be patched and when it must be fully replayed.
-#[cfg(test)]
-pub(super) fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
-    render_document_with_chrome_tail(screen, size).0
+pub(super) struct RenderedDocument {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) chrome_tail: usize,
+    pub(super) stable_prefix: usize,
 }
 
+#[cfg(test)]
+pub(super) fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
+    render_document_inner(screen, size, false).lines
+}
+
+#[cfg(test)]
 pub(super) fn render_document_with_chrome_tail(
     screen: &mut Screen,
     size: Size,
 ) -> (Vec<Line<'static>>, usize) {
+    let rendered = render_document_inner(screen, size, false);
+    (rendered.lines, rendered.chrome_tail)
+}
+
+pub(super) fn render_document_with_hints(screen: &mut Screen, size: Size) -> RenderedDocument {
+    render_document_inner(screen, size, true)
+}
+
+fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> RenderedDocument {
     if size.height == 0 || size.width < 1 {
-        return (Vec::new(), 0);
+        return RenderedDocument {
+            lines: Vec::new(),
+            chrome_tail: 0,
+            stable_prefix: 0,
+        };
     }
     let width = size.width.max(1);
     let height = size.height.max(1);
-    let mut transcript = screen.wrapped_lines(width);
+    let mut transcript = if incremental {
+        screen.wrapped_lines_incremental(width)
+    } else {
+        screen.wrapped_lines(width)
+    };
     let working = screen.working_lines(width);
     let working_block = if working.is_empty() {
         Vec::new()
@@ -694,13 +740,16 @@ pub(super) fn render_document_with_chrome_tail(
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
     let min_transcript_rows =
         usize::from(target_rows).saturating_sub(chrome.len() + working_block.len());
-    if transcript.len() < min_transcript_rows {
+    if transcript.total_lines < min_transcript_rows {
+        transcript = screen.wrapped_lines(width);
         let mut padded = Vec::with_capacity(min_transcript_rows + chrome.len());
         padded.extend(
-            std::iter::repeat_with(Line::default).take(min_transcript_rows - transcript.len()),
+            std::iter::repeat_with(Line::default)
+                .take(min_transcript_rows - transcript.lines.len()),
         );
-        padded.extend(transcript);
-        transcript = padded;
+        padded.extend(transcript.lines);
+        transcript.lines = padded;
+        transcript.stable_prefix = 0;
     }
     // The transcript is the scrolling base, moved into the document and never
     // cloned. The bottom-pinned tail -- working indicator then composer chrome
@@ -711,7 +760,8 @@ pub(super) fn render_document_with_chrome_tail(
     let mut tail = Container::new();
     tail.add_child(Box::new(LinesSection(working_block)));
     tail.add_child(Box::new(LinesSection(chrome)));
-    let mut document = transcript;
+    let stable_prefix = transcript.stable_prefix;
+    let mut document = transcript.lines;
     tail.render_into(usize::from(width), &mut document);
     // Locate-and-strip any focus cursor marker before the document reaches the
     // terminal surface. The cursor only ever lives in the composer chrome, so
@@ -722,7 +772,11 @@ pub(super) fn render_document_with_chrome_tail(
     // returned row by `tail_start`.
     let tail_start = document.len().saturating_sub(volatile_tail);
     let _ = take_cursor_position(&mut document[tail_start..]);
-    (document, volatile_tail)
+    RenderedDocument {
+        lines: document,
+        chrome_tail: volatile_tail,
+        stable_prefix,
+    }
 }
 
 /// Number of dots in the top-frame context meter; each dot is ~10% usage.
@@ -778,15 +832,17 @@ fn context_meter_spans(filled: u64) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Build the editor's top border, which doubles as the primary statusline:
-/// `┌─ ◉ CODE ─ GPT-5.4 LOW ─ CTX 300K ●●●○○○○○○○ ───┐`. Returns `None` when
-/// there is no footer yet or even the minimum content cannot fit, in which case
-/// the caller leaves the plain `Block` border in place so the frame never breaks.
-pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
+/// Build the composer statusline — the composer's top content line, under the
+/// full-width hairline (`composer_hairline`):
+/// `◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○    ~/iris-agent ┊ git main`.
+/// The mode glyph is the orange accent; `CODE` is bold; the model name is the
+/// underlined model-picker button; effort and the CTX label are muted; the
+/// 10-dot meter follows; the workspace `cwd ┊ git branch` right-aligns when it
+/// fits. Returns `None` when there is no footer yet or even the minimum
+/// content cannot fit.
+pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
     let footer = screen.footer.as_ref()?;
     let width = usize::from(box_width);
-    // `┌` + `─ ` + content + ` ` + fill + `┐` needs at least the corners plus a
-    // one-character field.
     if width < 6 {
         return None;
     }
@@ -813,17 +869,30 @@ pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Lin
     let mode_seg = || {
         vec![
             Span::styled(format!("{} ", crate::ui::symbols::ACTIVE), prompt_style()),
-            Span::raw("CODE"),
+            Span::styled(
+                "CODE".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]
     };
-    let model_with_effort = || match &effort {
-        Some(effort) => vec![Span::raw(format!("{model} {effort}"))],
-        None => vec![Span::raw(model.clone())],
+    // The model name is the model-picker button: underlined, per the spec.
+    let model_span = || {
+        Span::styled(
+            model.clone(),
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )
     };
-    let model_only = || vec![Span::raw(model.clone())];
+    let model_with_effort = || match &effort {
+        Some(effort) => vec![
+            model_span(),
+            Span::styled(format!(" {effort}"), dim_style()),
+        ],
+        None => vec![model_span()],
+    };
+    let model_only = || vec![model_span()];
     let ctx_meter = |with_meter: bool| {
         context.as_ref().map(|context| {
-            let mut spans = vec![Span::raw(format!("CTX {context}"))];
+            let mut spans = vec![Span::styled(format!("CTX {context}"), dim_style())];
             if let (true, Some(filled)) = (with_meter, meter_filled) {
                 spans.push(Span::raw(" "));
                 spans.extend(context_meter_spans(filled));
@@ -849,63 +918,65 @@ pub(super) fn composer_top_border(screen: &Screen, box_width: u16) -> Option<Lin
     }
     candidates.push(vec![mode_seg(), model_only()]);
 
-    candidates
+    let left = candidates
         .into_iter()
-        .find_map(|segments| top_border_line(width, segments))
-}
-
-/// Assemble one top-border candidate at `width`, or `None` if its segments do
-/// not fit (`┌─ ` + segments joined by ` ─ ` + ` ` + `─` fill + `┐`).
-fn top_border_line(width: usize, segments: Vec<Vec<Span<'static>>>) -> Option<Line<'static>> {
-    let mut joined: Vec<Span<'static>> = Vec::new();
-    for (idx, segment) in segments.into_iter().enumerate() {
-        if idx > 0 {
-            joined.push(Span::styled(" ─ ".to_string(), border_style()));
+        .find_map(|segments| statusline_left(width, segments))?;
+    let left_w = spans_width(&left);
+    let mut spans = left;
+    // Right-aligned quiet workspace label: `~/iris-agent ┊ git main`.
+    if let Some(ws) = workspace_spans(footer, width.saturating_sub(left_w).saturating_sub(2)) {
+        let ws_w = spans_width(&ws);
+        let gap = width.saturating_sub(left_w).saturating_sub(ws_w);
+        if gap >= 2 {
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.extend(ws);
         }
-        joined.extend(segment);
-    }
-    let joined_w = spans_width(&joined);
-    // Fixed cells: `┌`, `─ ` (2), trailing ` ` (1), `┐` => 5.
-    let fill = width.checked_sub(joined_w + 5)?;
-    let mut spans = vec![Span::styled("┌─ ".to_string(), border_style())];
-    spans.extend(joined);
-    spans.push(Span::styled(" ".to_string(), border_style()));
-    if fill > 0 {
-        spans.push(Span::styled("─".repeat(fill), border_style()));
-    }
-    spans.push(Span::styled("┐".to_string(), border_style()));
-    Some(Line::from(spans))
-}
-
-/// Quiet unboxed workspace label rendered below the editor:
-/// `~/projects/iris ┊ git main`. Returns `None` when there is no footer/cwd.
-pub(super) fn workspace_label_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
-    let footer = screen.footer.as_ref()?;
-    let width = usize::from(width);
-    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
-    if cwd.is_empty() {
-        return None;
-    }
-    let indent = TEXT_COLUMN_X_PADDING.min(width.saturating_sub(1));
-    let suffix = branch
-        .as_ref()
-        .map(|branch| format!(" ┊ git {branch}"))
-        .unwrap_or_default();
-    let avail = width
-        .saturating_sub(indent)
-        .saturating_sub(display_width(&suffix))
-        .max(1);
-    let cwd = truncate_cwd_middle(&cwd, avail);
-    let mut spans = vec![
-        Span::raw(" ".repeat(indent)),
-        Span::styled(cwd, dim_style()),
-    ];
-    if !suffix.is_empty() {
-        spans.push(Span::styled(suffix, dim_style()));
     }
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     Some(line)
+}
+
+/// Assemble one statusline candidate at `width`, or `None` if its segments do
+/// not fit (segments joined by dim ` ─ ` separators).
+fn statusline_left(width: usize, segments: Vec<Vec<Span<'static>>>) -> Option<Vec<Span<'static>>> {
+    let mut joined: Vec<Span<'static>> = Vec::new();
+    for (idx, segment) in segments.into_iter().enumerate() {
+        if idx > 0 {
+            joined.push(Span::styled(" ─ ".to_string(), dim_style()));
+        }
+        joined.extend(segment);
+    }
+    (spans_width(&joined) <= width).then_some(joined)
+}
+
+/// The dim `cwd ┊ git branch` workspace spans, middle-truncating the cwd to
+/// `max` columns. `None` when there is no cwd or no room at all.
+fn workspace_spans(footer: &Footer, max: usize) -> Option<Vec<Span<'static>>> {
+    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
+    if cwd.is_empty() || max == 0 {
+        return None;
+    }
+    let suffix = branch
+        .as_ref()
+        .map(|branch| format!(" ┊ git {branch}"))
+        .unwrap_or_default();
+    let avail = max.saturating_sub(display_width(&suffix)).max(1);
+    let cwd = truncate_cwd_middle(&cwd, avail);
+    if cwd.is_empty() {
+        return None;
+    }
+    let mut spans = vec![Span::styled(cwd, dim_style())];
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, dim_style()));
+    }
+    Some(spans)
+}
+
+/// The composer's top edge: a full-width hairline in the border role — the one
+/// rule separating the composer from the transcript (the composer has no box).
+fn composer_hairline(width: usize) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(width.max(1)), border_style()))
 }
 
 /// Middle-ellipsis truncation that preserves the final path segment (the
@@ -967,33 +1038,30 @@ fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
 struct ChromeHeights {
     menu: u16,
     editor: u16,
-    workspace: u16,
 }
 
-/// Allocate chrome rows. The editor frame is protected first: the menu yields to
-/// `MIN_EDITOR_H`, then the workspace label yields to both, so a constrained
-/// height drops the workspace label before squeezing the editor frame.
-fn chrome_heights(
-    height: u16,
-    menu_wanted: u16,
-    workspace_wanted: u16,
-    editor_rows: u16,
-) -> ChromeHeights {
-    let workspace_wanted = workspace_wanted.min(WORKSPACE_LABEL_H);
+/// Allocate chrome rows. The composer is protected first: the menu yields to
+/// `MIN_EDITOR_H` (hairline + statusline + spacer + one input row) before anything else
+/// is squeezed.
+fn chrome_heights(height: u16, menu_wanted: u16, editor_rows: u16) -> ChromeHeights {
     let menu = menu_wanted.min(height.saturating_sub(MIN_EDITOR_H));
-    let workspace = workspace_wanted.min(height.saturating_sub(menu).saturating_sub(MIN_EDITOR_H));
-    let max_editor_h = height.saturating_sub(menu).saturating_sub(workspace).max(1);
+    let max_editor_h = height.saturating_sub(menu).max(1);
     let wanted_editor_h = editor_rows.saturating_add(EDITOR_VERTICAL_CHROME_ROWS);
     let editor = if max_editor_h >= MIN_EDITOR_H {
         wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
     } else {
         max_editor_h.max(1)
     };
-    ChromeHeights {
-        menu,
-        editor,
-        workspace,
-    }
+    ChromeHeights { menu, editor }
+}
+
+fn composer_text_x_offset(box_width: u16) -> u16 {
+    // `ratatui-textarea` paints the empty-editor cursor one cell before the
+    // placeholder, so anchor the widget one cell left of the transcript text
+    // column; the visible `Give Iris...` indicator then starts with messages.
+    u16::try_from(TEXT_COLUMN_X_PADDING.saturating_sub(1))
+        .unwrap_or(u16::MAX)
+        .min(box_width.saturating_sub(1))
 }
 
 fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -1002,10 +1070,12 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     let editor_rows = screen.approval_hint.as_ref().map_or_else(
         || editor_visual_rows(&screen.editor, area.width),
         |hint| {
-            let inner_width = area
+            let box_width = area
                 .width
                 .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
-                .saturating_sub(TEXT_X_PADDING_U16.saturating_mul(2))
+                .max(1);
+            let inner_width = box_width
+                .saturating_sub(composer_text_x_offset(box_width))
                 .max(1);
             u16::try_from(approval_status_lines(hint, usize::from(inner_width)).len())
                 .unwrap_or(u16::MAX)
@@ -1037,27 +1107,20 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         })
         .unwrap_or(0);
 
-    // Bottom-anchored, clamped to the fixed viewport. The runtime statusline is
-    // printed into the editor's top border; the workspace label sits below the
-    // editor as a quiet unboxed line. There is no separate rail and no bottom
-    // telemetry bar.
-    let workspace_line = workspace_label_line(screen, area.width);
-    let workspace_wanted = u16::from(workspace_line.is_some());
-    let heights = chrome_heights(area.height, menu_wanted, workspace_wanted, editor_rows);
-    let chrome_h = heights
-        .menu
-        .saturating_add(heights.editor)
-        .saturating_add(heights.workspace);
+    // Bottom-anchored, clamped to the fixed viewport. The composer tail is a
+    // full hairline top edge, the statusline, a blank spacer, then the input
+    // rows. No box, no hint row, no separate workspace label (the workspace
+    // lives right-aligned in the statusline).
+    let heights = chrome_heights(area.height, menu_wanted, editor_rows);
+    let chrome_h = heights.menu.saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
         Constraint::Length(heights.menu),
         Constraint::Length(heights.editor),
-        Constraint::Length(heights.workspace),
     ])
     .split(chrome_area);
     let menu_area = chunks[0];
     let editor_area = chunks[1];
-    let workspace_area = chunks[2];
 
     let mut buf = Buffer::empty(chrome_area);
 
@@ -1066,6 +1129,8 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     {
         render_menu_lines(&mut buf, menu_area, lines);
     }
+    // The composer column: inset two cells from the pane edge, sharing the
+    // tool-panel measure.
     let box_area = Rect {
         x: editor_area.x + BOX_X_PADDING_U16.min(editor_area.width.saturating_sub(1)),
         y: editor_area.y,
@@ -1075,14 +1140,11 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             .max(1),
         height: editor_area.height,
     };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style())
-        .render(box_area, &mut buf);
+    let text_x_offset = composer_text_x_offset(box_area.width);
     let text_area = Rect {
-        x: box_area.x + 2.min(box_area.width.saturating_sub(1)),
-        y: editor_area.y + 2.min(editor_area.height.saturating_sub(1)),
-        width: box_area.width.saturating_sub(TEXT_X_PADDING_U16 * 2).max(1),
+        x: box_area.x + text_x_offset,
+        y: editor_area.y + EDITOR_VERTICAL_CHROME_ROWS.min(editor_area.height.saturating_sub(1)),
+        width: box_area.width.saturating_sub(text_x_offset).max(1),
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
@@ -1101,31 +1163,17 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
             cursor_cell = find_reversed_cell(&buf, text_area);
         }
     }
-    let hint = if screen.approval_hint.is_some() || editor_area.height < MIN_EDITOR_H {
-        Line::default()
-    } else {
-        Line::from(Span::styled(COMPOSER_HINT, dim_style()))
-    };
-    let hint_area = Rect {
-        x: box_area.x + 2.min(box_area.width.saturating_sub(1)),
-        y: box_area.y.saturating_add(box_area.height.saturating_sub(2)),
-        width: box_area.width.saturating_sub(4).max(1),
-        height: 1,
-    };
-    if !hint.spans.is_empty() {
-        Paragraph::new(Text::from(vec![hint])).render(hint_area, &mut buf);
+    // The composer's chrome rows: the full-width hairline top edge, then the
+    // statusline, then a blank spacer before the input. Painted last so they
+    // are never overwritten by the textarea/approval body at very small heights.
+    if heights.editor > 0 {
+        let hairline = composer_hairline(usize::from(box_area.width));
+        buf.set_line(box_area.x, box_area.y, &hairline, box_area.width);
     }
-    // Print the statusline into the editor's top border last so it is never
-    // overwritten by the textarea/approval body at very small heights.
-    if heights.editor > 0
-        && let Some(top_border) = composer_top_border(screen, box_area.width)
+    if heights.editor > 1
+        && let Some(statusline) = composer_statusline(screen, box_area.width)
     {
-        buf.set_line(box_area.x, box_area.y, &top_border, box_area.width);
-    }
-    if heights.workspace > 0
-        && let Some(line) = workspace_line
-    {
-        Paragraph::new(Text::from(vec![line])).render(workspace_area, &mut buf);
+        buf.set_line(box_area.x, box_area.y + 1, &statusline, box_area.width);
     }
     buffer_to_lines(&buf, cursor_cell)
 }
@@ -1152,7 +1200,8 @@ fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'s
     let mut out = Vec::new();
     for y in 0..buf.area.height {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        for x in 0..buf.area.width {
+        let mut x = 0;
+        while x < buf.area.width {
             // Inject the zero-width cursor marker as its own span immediately
             // before the cursor cell so the terminal surface can recover the
             // cursor column (it strips the marker before any terminal write).
@@ -1161,14 +1210,17 @@ fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'s
             }
             let cell = &buf[(x, y)];
             let style = cell.style();
+            let symbol = cell.symbol();
             if let Some(last) = spans.last_mut()
                 && last.style == style
                 && last.content.as_ref() != CURSOR_MARKER
             {
-                last.content.to_mut().push_str(cell.symbol());
+                last.content.to_mut().push_str(symbol);
+                x = x.saturating_add(display_width(symbol).max(1) as u16);
                 continue;
             }
-            spans.push(Span::styled(cell.symbol().to_string(), style));
+            spans.push(Span::styled(symbol.to_string(), style));
+            x = x.saturating_add(display_width(symbol).max(1) as u16);
         }
         out.push(Line::from(spans));
     }
@@ -1282,11 +1334,38 @@ mod tests {
     }
 
     #[test]
+    fn composer_wide_glyphs_never_render_over_terminal_width() {
+        use super::{Screen, render_document_with_chrome_tail};
+        use crate::ui::terminal_surface::CURSOR_MARKER;
+        use ratatui::layout::Size;
+
+        for width in [12_u16, 44, 90, 120] {
+            let mut screen = Screen::new();
+            screen.set_editor("中🙂 wide glyphs");
+            let (lines, _) = render_document_with_chrome_tail(&mut screen, Size::new(width, 14));
+
+            for (index, line) in lines.iter().enumerate() {
+                let visible = line
+                    .spans
+                    .iter()
+                    .filter(|span| span.content.as_ref() != CURSOR_MARKER)
+                    .map(|span| display_width(span.content.as_ref()))
+                    .sum::<usize>();
+                assert!(
+                    visible <= usize::from(width),
+                    "width {width}, line {index} exceeded terminal width: {visible} > {width}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn approval_and_working_lines_stay_bounded_at_tiny_widths() {
         let hint = ApprovalHint {
             target: "run an extremely long command".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
+            sandbox_unavailable: true,
         };
         for width in 1..=4 {
             for line in approval_status_lines(&hint, width) {
@@ -1318,11 +1397,13 @@ mod tests {
             target: "echo hi".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
+            sandbox_unavailable: false,
         };
         let non_shell = ApprovalHint {
             target: "Write src/x.rs".to_string(),
             options: "[y] once  [N] deny",
             shell: false,
+            sandbox_unavailable: false,
         };
         let shell_text = line_text(&approval_status_line(&shell));
         let non_shell_text = line_text(&approval_status_line(&non_shell));
@@ -1337,5 +1418,41 @@ mod tests {
             "{non_shell_text}"
         );
         assert!(!non_shell_text.contains("$ "), "{non_shell_text}");
+    }
+
+    #[test]
+    fn approval_review_line_marks_platform_without_sandbox() {
+        // On a platform with no kernel sandbox backend the shell runs
+        // unconfined; the approval prompt states that posture at the decision
+        // point, in the calm dim aside, rather than only in a startup notice.
+        // The marker reflects platform capability, not per-run confinement.
+        let unavailable = ApprovalHint {
+            target: "echo hi".to_string(),
+            options: "[y] once  [N] deny",
+            shell: true,
+            sandbox_unavailable: true,
+        };
+        let has_backend = ApprovalHint {
+            target: "echo hi".to_string(),
+            options: "[y] once  [N] deny",
+            shell: true,
+            sandbox_unavailable: false,
+        };
+        let unavailable_text = line_text(&approval_status_line(&unavailable));
+        let has_backend_text = line_text(&approval_status_line(&has_backend));
+        assert!(
+            unavailable_text.contains("unsandboxed"),
+            "{unavailable_text}"
+        );
+        assert!(
+            unavailable_text.contains(crate::ui::symbols::SEP),
+            "{unavailable_text}"
+        );
+        // The posture aside is shell-only. A missing marker is not a
+        // confinement guarantee, so this only asserts the text is not rendered.
+        assert!(
+            !has_backend_text.contains("unsandboxed"),
+            "{has_backend_text}"
+        );
     }
 }

@@ -11,3 +11,14 @@ pub(crate) mod model_catalog;
 pub(crate) mod providers;
 pub(crate) mod retry;
 pub(crate) mod selection;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap()
+    }
+}

@@ -19,9 +19,11 @@
 //! Nexus is untouched: this loop only consumes its `AgentObserver` /
 //! `ApprovalGate` seams via [`LoopBridge`].
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -56,6 +58,16 @@ const TICK: Duration = Duration::from_millis(100);
 /// Mirrors pi-mono's 16ms render budget: an active turn can emit a burst of
 /// agent events, and drawing on each one is wasteful and causes flicker.
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Trailing-edge debounce for width-changing idle resize redraws. A width
+/// change forces a scrollback-clearing full replay, so drag storms collapse to
+/// one redraw after the terminal settles. Height-only resizes remain immediate
+/// unless a width replay is already pending.
+const RESIZE_REDRAW_DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// Footer git branch cache lifetime. The footer is presentation-only, so a
+/// branch can be a few seconds stale instead of shelling out on every loop.
+const FOOTER_BRANCH_TTL: Duration = Duration::from_secs(5);
 
 /// What a [`RenderScheduler`] decides to do for a pending render request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +332,14 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
         .reasoning
         .map(|effort| effort.as_str().to_string());
     let qualified_model = format!("{}/{}", selection.provider.as_str(), selection.model);
-    let context = model_catalog::ctx_label(&qualified_model).map(str::to_string);
+    let context = if selection.provider == crate::mimir::selection::ProviderId::OpenAiCompatible {
+        selection
+            .open_ai_compatible
+            .context_window
+            .map(model_catalog::context_window_label)
+    } else {
+        model_catalog::ctx_label(&qualified_model).map(str::to_string)
+    };
     tui.screen
         .set_footer_with_context(selection.model.clone(), effort, context, footer_cwd());
 }
@@ -352,7 +371,42 @@ fn footer_cwd() -> String {
     }
 }
 
+#[derive(Default)]
+struct FooterBranchCache {
+    entries: HashMap<PathBuf, FooterBranchEntry>,
+}
+
+struct FooterBranchEntry {
+    branch: Option<String>,
+    observed_at: StdInstant,
+}
+
 fn footer_branch(cwd: &std::path::Path) -> Option<String> {
+    static CACHE: OnceLock<Mutex<FooterBranchCache>> = OnceLock::new();
+    let now = StdInstant::now();
+    let key = cwd.to_path_buf();
+    let cache = CACHE.get_or_init(|| Mutex::new(FooterBranchCache::default()));
+    if let Ok(guard) = cache.lock()
+        && let Some(entry) = guard.entries.get(&key)
+        && now.duration_since(entry.observed_at) < FOOTER_BRANCH_TTL
+    {
+        return entry.branch.clone();
+    }
+
+    let branch = read_footer_branch(cwd);
+    if let Ok(mut guard) = cache.lock() {
+        guard.entries.insert(
+            key,
+            FooterBranchEntry {
+                branch: branch.clone(),
+                observed_at: now,
+            },
+        );
+    }
+    branch
+}
+
+fn read_footer_branch(cwd: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -413,6 +467,15 @@ fn route_command<P: ChatProvider>(
             tui.screen.open_modal(picker::open_settings(sw));
             Ok(true)
         }
+        "/trust" if rest.is_empty() => {
+            // Needs a switch to rebuild the provider with the re-assembled prompt.
+            if switch.as_ref().is_none() {
+                return Ok(false);
+            }
+            tui.screen.commit_user(prompt);
+            tui.screen.open_modal(picker::open_trust());
+            Ok(true)
+        }
         "/login" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             tui.screen.open_modal(login::open_login());
@@ -449,20 +512,64 @@ async fn idle_phase(
     input_rx: &mut UnboundedReceiver<Event>,
     tick: &mut tokio::time::Interval,
 ) -> Result<IdleOutcome> {
+    let mut last_resize_width = ratatui::crossterm::terminal::size()
+        .ok()
+        .map(|(width, _)| width);
+    let mut pending_width_resize: Option<Instant> = None;
     loop {
+        let resize_deadline =
+            pending_width_resize.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
         tokio::select! {
             maybe = input_rx.recv() => {
                 // The input thread only ends if terminal reads fail; treat as EOF.
                 let Some(event) = maybe else { return Ok(IdleOutcome::Exit); };
-                match handle_idle_event(&mut tui.screen, event) {
-                    IdleKey::Continue => tui.draw()?,
-                    IdleKey::Ignore => {}
-                    IdleKey::Submit(text) => return Ok(IdleOutcome::Submit(text)),
-                    IdleKey::Exit => return Ok(IdleOutcome::Exit),
-                    IdleKey::OpenModelPicker => return Ok(IdleOutcome::OpenModelPicker),
-                    IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
-                    IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
+                let mut draw_now = false;
+                let mut defer_width_resize = false;
+                let mut event = Some(event);
+                loop {
+                    let event = match event.take() {
+                        Some(event) => event,
+                        None => match input_rx.try_recv() {
+                            Ok(event) => event,
+                            Err(_) => break,
+                        },
+                    };
+                    let resize_width_changed = match &event {
+                        Event::Resize(width, _) => {
+                            let changed = last_resize_width.is_some_and(|last| last != *width)
+                                || last_resize_width.is_none();
+                            last_resize_width = Some(*width);
+                            Some(changed)
+                        }
+                        _ => None,
+                    };
+                    match handle_idle_event(&mut tui.screen, event) {
+                        IdleKey::Continue => match resize_width_changed {
+                            Some(true) => defer_width_resize = true,
+                            Some(false) if pending_width_resize.is_some() || defer_width_resize => {
+                                defer_width_resize = true;
+                            }
+                            Some(false) => draw_now = true,
+                            None => draw_now = true,
+                        },
+                        IdleKey::Ignore => {}
+                        IdleKey::Submit(text) => return Ok(IdleOutcome::Submit(text)),
+                        IdleKey::Exit => return Ok(IdleOutcome::Exit),
+                        IdleKey::OpenModelPicker => return Ok(IdleOutcome::OpenModelPicker),
+                        IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
+                        IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
+                    }
                 }
+                if draw_now {
+                    pending_width_resize = None;
+                    tui.draw()?;
+                } else if defer_width_resize {
+                    pending_width_resize = Some(Instant::now() + RESIZE_REDRAW_DEBOUNCE);
+                }
+            }
+            _ = sleep_until(resize_deadline), if pending_width_resize.is_some() => {
+                pending_width_resize = None;
+                tui.draw()?;
             }
             _ = tick.tick() => {}
         }
@@ -624,23 +731,28 @@ async fn run_modal_phase<P: ChatProvider>(
                     tui.screen.close_modal();
                     break;
                 };
-                match to_modal_key(&event) {
-                    Some(key) => {
-                        let outcome = match tui.screen.modal.as_mut() {
+                let outcome = if let Event::Paste(text) = &event {
+                    match tui.screen.modal.as_mut() {
+                        Some(modal) => modal.paste_text(text),
+                        None => break,
+                    }
+                } else {
+                    match to_modal_key(&event) {
+                        Some(key) => match tui.screen.modal.as_mut() {
                             Some(modal) => modal.handle_key(key),
                             None => break,
-                        };
-                        apply_modal_outcome(
-                            outcome, harness, tui, input_rx, tick, switch, login_backend,
-                        )
-                        .await?;
-                        // The picker may have switched model/effort; refresh the
-                        // footer before drawing so it never shows a stale model.
-                        refresh_footer(tui, switch);
-                        tui.draw()?;
+                        },
+                        None => ModalOutcome::Ignore,
                     }
-                    None => tui.draw()?,
-                }
+                };
+                apply_modal_outcome(
+                    outcome, harness, tui, input_rx, tick, switch, login_backend,
+                )
+                .await?;
+                // The picker may have switched model/effort; refresh the
+                // footer before drawing so it never shows a stale model.
+                refresh_footer(tui, switch);
+                tui.draw()?;
             }
             _ = tick.tick() => {}
         }
@@ -696,6 +808,22 @@ async fn dispatch_action<P: ChatProvider>(
         ModalAction::BackToLoginMethod => tui.screen.open_modal(login::open_login()),
         ModalAction::BeginLogin(provider) => {
             run_login(provider, tui, input_rx, tick, login_backend).await?;
+        }
+        ModalAction::OpenApiKeyDialog(provider_id) => {
+            tui.screen
+                .open_modal(login::open_api_key_dialog(&provider_id));
+        }
+        ModalAction::SaveApiKey(provider_id) => {
+            let key = match tui.screen.modal.as_mut() {
+                Some(Modal::ApiKeyDialog(dialog)) => dialog.take_input(),
+                _ => String::new(),
+            };
+            let lines = match AuthStore::from_env() {
+                Ok(auth) => login::apply_api_key_login(&provider_id, &key, &auth),
+                Err(error) => vec![format!("auth unavailable: {error:#}")],
+            };
+            apply_notices(tui, lines);
+            tui.screen.close_modal();
         }
         ModalAction::Logout(id) => {
             let lines = match AuthStore::from_env() {
@@ -780,9 +908,7 @@ async fn run_login(
                 match maybe {
                     Some(event) if is_modal_cancel(&event) => break LoginResolution::Cancelled,
                     Some(event) => {
-                        if dialog.accepts_manual_input()
-                            && apply_manual_key(&mut dialog, &event, &manual_tx)
-                        {
+                        if handle_login_input_event(&mut dialog, &event, &manual_tx) {
                             tui.screen.open_modal(Modal::LoginDialog(dialog.clone()));
                             tui.draw()?;
                         }
@@ -816,6 +942,17 @@ async fn run_login(
     tui.screen.close_modal();
     tui.draw()?;
     Ok(())
+}
+
+fn handle_login_input_event(
+    dialog: &mut LoginDialog,
+    event: &Event,
+    manual_tx: &std::sync::mpsc::Sender<String>,
+) -> bool {
+    if dialog.accepts_manual_input() {
+        let _ = apply_manual_key(dialog, event, manual_tx);
+    }
+    true
 }
 
 /// Apply a keystroke to the manual-paste buffer of an Anthropic login dialog.
@@ -1891,6 +2028,18 @@ mod tests {
             to_modal_key(&key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             None
         );
+    }
+
+    #[test]
+    fn login_input_resize_requests_redraw_without_manual_edit() {
+        let (manual_tx, _manual_rx) = std::sync::mpsc::channel::<String>();
+        let mut dialog = LoginDialog::new("openai-codex", false);
+
+        assert!(handle_login_input_event(
+            &mut dialog,
+            &Event::Resize(90, 30),
+            &manual_tx,
+        ));
     }
 
     #[test]

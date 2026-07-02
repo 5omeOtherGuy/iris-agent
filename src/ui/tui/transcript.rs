@@ -1,5 +1,6 @@
 //! Retained transcript state and event-to-row rendering.
 
+use std::ops::{Deref, Range};
 use std::time::{Duration, Instant};
 
 use ratatui::style::Style;
@@ -10,7 +11,6 @@ use crate::tool_display::run_target;
 use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use crate::ui::{TurnErrorKind, UiEvent};
 
-use super::component::{self, Component};
 use super::pane;
 use super::panel::{
     PanelHeaderSpec, PanelState, diff_counts, diff_footer_row, diff_table_rows, panel_state,
@@ -18,7 +18,7 @@ use super::panel::{
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
 use super::text::ansi_spans;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
-use super::wrap::line_text;
+use super::wrap::{display_width, line_text};
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TRANSCRIPT_ROWS,
     TEXT_COLUMN_X_PADDING, dim_style, err_style, format_elapsed_compact, ok_style, panel_style,
@@ -57,6 +57,17 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
     }
 }
 
+/// Pad `left` so `right` hugs the right edge of a `width`-column field; drops
+/// `right` when the field is too narrow rather than overflowing.
+fn right_align_pair(left: &str, right: &str, width: usize) -> String {
+    let left_w = display_width(left);
+    let right_w = display_width(right);
+    if left_w + 2 + right_w > width {
+        return left.to_string();
+    }
+    format!("{left}{}{right}", " ".repeat(width - left_w - right_w))
+}
+
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
 /// exclusive, so at most one is ever open. `body_start` is the row index of the
 /// block body (its `Running`/`Ran` header). `output` is the bounded live tail
@@ -84,6 +95,52 @@ struct ActiveTool {
     started: Instant,
 }
 
+/// The open EDIT panel for a mutation whose diff arrived via `DiffPreview`.
+/// The diff is the canonical EDIT body for the whole lifecycle: the same panel
+/// is rebuilt in place as `◇ PREVIEW` → `● RUNNING` → `◆ DONE`/`■ ERROR`.
+struct ActiveEdit {
+    call_id: String,
+    diff: String,
+    body_start: usize,
+    started: Option<Instant>,
+}
+
+#[derive(Default)]
+struct WrappedTranscriptCache {
+    width: usize,
+    rows: Vec<Range<usize>>,
+    lines: Vec<Line<'static>>,
+    dirty_from: usize,
+}
+
+impl WrappedTranscriptCache {
+    fn invalidate_all(&mut self, width: usize) {
+        self.width = width;
+        self.rows.clear();
+        self.lines.clear();
+        self.dirty_from = 0;
+    }
+
+    fn mark_dirty(&mut self, row: usize) {
+        self.dirty_from = self.dirty_from.min(row);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TranscriptRender {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) stable_prefix: usize,
+    pub(super) total_lines: usize,
+}
+
+impl Deref for TranscriptRender {
+    type Target = [Line<'static>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.lines
+    }
+}
+
 /// Transcript state and width-aware rendering, separate from editor/spinner UI.
 #[derive(Default)]
 pub(super) struct Transcript {
@@ -95,14 +152,35 @@ pub(super) struct Transcript {
     active_exec: Option<ActiveExec>,
     active_explorations: Vec<ActiveExploration>,
     active_tool: Option<ActiveTool>,
+    /// The open diff-bodied EDIT panel, if a mutation is pending/running.
+    active_edit: Option<ActiveEdit>,
     pub(super) exploring_open: bool,
+    /// Wall-clock start of the current provider turn; drives the honest
+    /// "time until reasoning arrived" telemetry on the thinking header.
+    provider_turn_started: Option<Instant>,
+    /// Row index of the thinking rail header pushed during the current provider
+    /// turn, so `ProviderTurnCompleted` can patch its `↓tokens` telemetry once
+    /// usage is known. Cleared at each provider-turn start.
+    thinking_header_row: Option<usize>,
+    /// The elapsed label already shown on that header (combined with the token
+    /// count when usage arrives).
+    thinking_elapsed: Option<String>,
     /// Last width the transcript was rendered/flushed at, so width-aware
     /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
     /// uses a realistic column count. Zero until the first render.
     last_width: usize,
+    wrapped_cache: WrappedTranscriptCache,
 }
 
 impl Transcript {
+    fn mark_dirty_from(&mut self, row: usize) {
+        self.wrapped_cache.mark_dirty(row.min(self.rows.len()));
+    }
+
+    fn mark_append_dirty(&mut self) {
+        self.mark_dirty_from(self.rows.len());
+    }
+
     /// Append a blank separator row before a new top-level block, unless the
     /// transcript is empty or already ends in a real separator row.
     fn push_blank(&mut self) {
@@ -110,9 +188,11 @@ impl Transcript {
         match self.rows.last() {
             None => {}
             Some(last) if is_separator_row(last) => {}
-            _ => self
-                .rows
-                .push(TranscriptRow::new(String::new(), Style::default())),
+            _ => {
+                self.mark_append_dirty();
+                self.rows
+                    .push(TranscriptRow::new(String::new(), Style::default()));
+            }
         }
     }
 
@@ -120,10 +200,12 @@ impl Transcript {
     fn begin_block(&mut self) {
         self.finish_stream();
         self.push_blank();
+        self.mark_append_dirty();
     }
 
     /// Push each line of `text` into the transcript with one style.
     fn push(&mut self, text: &str, style: Style) {
+        self.mark_append_dirty();
         for line in text.split('\n') {
             self.rows.push(TranscriptRow::new(line, style));
         }
@@ -131,6 +213,7 @@ impl Transcript {
 
     fn push_assistant_text(&mut self, text: &str) {
         let width = self.markdown_content_width();
+        self.mark_append_dirty();
         pane::push_assistant_rows(&mut self.rows, width, text);
     }
 
@@ -145,12 +228,14 @@ impl Transcript {
     }
 
     /// Render a model reasoning ("thinking") trace as a chromeless, foldable
-    /// left-rail block (the `ThinkingBlock` design-system component): reasoning is
-    /// internal, verbose, and secondary, so it gets **no box** — only a muted
-    /// `┊` rail and a `THINKING` label. Collapsed by default; the existing
-    /// `ctrl+o` panel toggle (`toggle_latest_panel`) reveals the dim,
-    /// markdown-rendered trace. A `redacted` block has no recoverable text, so a
-    /// placeholder is shown and the original reasoning is never rendered.
+    /// left-rail block (the `ThinkingBlock` design-system component): reasoning
+    /// is internal, verbose, and secondary, so it gets **no box** — only a muted
+    /// `┊` rail on its body and a `THINKING` label with honest telemetry.
+    /// Progressive disclosure: the first paragraph shows as a preview, the rest
+    /// folds behind an `… N more paragraphs   ctrl+o to expand` affordance
+    /// (`toggle_latest_panel`). Short (single-paragraph) reasoning is shown
+    /// whole and is not foldable. A `redacted` block has no recoverable text, so
+    /// a placeholder is shown and the original reasoning is never rendered.
     fn push_thinking_block(&mut self, text: &str, redacted: bool) {
         // Intentionally do NOT finish the live stream here. Reasoning is emitted
         // at completion, after the answer's text deltas have already streamed
@@ -160,26 +245,109 @@ impl Transcript {
         // arrives. Adding the rail rows while the stream stays pending keeps the
         // reasoning above the answer, which is committed afterwards.
         self.push_blank();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
-            expanded: false,
-            label: THINKING_LABEL.to_string(),
-        }));
-        // Trace rows are tagged `WhenExpanded` so the fold pass hides them while
-        // collapsed, leaving just the `┊ ▸ THINKING` rail header; `ctrl+o`
-        // (`toggle_latest_panel`) reveals them.
-        if redacted {
-            self.rows.push(rail_body_row(Line::from(Span::styled(
+        self.mark_append_dirty();
+        let elapsed = self
+            .provider_turn_started
+            .map(|started| format_elapsed_compact(started.elapsed()));
+        // Paragraph groups: rendered markdown lines split at blank lines. The
+        // first group is the collapsed preview; the rest hides behind the fold.
+        let groups: Vec<Vec<Line<'static>>> = if redacted {
+            vec![vec![Line::from(Span::styled(
                 REDACTED_THINKING_BODY,
                 dim_style(),
-            ))));
+            ))]]
         } else {
             let theme = MarkdownTheme::thinking();
             let width = self.markdown_content_width();
+            let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
+            let mut current: Vec<Line<'static>> = Vec::new();
             for line in render_markdown_themed(text, &theme, width) {
-                self.rows.push(rail_body_row(line));
+                if line_text(&line).trim().is_empty() {
+                    if !current.is_empty() {
+                        groups.push(std::mem::take(&mut current));
+                    }
+                } else {
+                    current.push(line);
+                }
+            }
+            if !current.is_empty() {
+                groups.push(current);
+            }
+            groups
+        };
+        let foldable = groups.len() > 1;
+        self.thinking_header_row = Some(self.rows.len());
+        self.thinking_elapsed = elapsed.clone();
+        self.rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
+            expanded: false,
+            label: THINKING_LABEL.to_string(),
+            right: elapsed.unwrap_or_default(),
+            foldable,
+        }));
+        let hidden = groups.len().saturating_sub(1);
+        for (index, group) in groups.into_iter().enumerate() {
+            if index > 0 {
+                self.rows
+                    .push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
+            }
+            let fold = if index == 0 {
+                FoldVis::Always
+            } else {
+                FoldVis::WhenExpanded
+            };
+            for line in group {
+                self.rows.push(rail_body_row(line).with_fold(fold));
             }
         }
+        if foldable {
+            let plural = if hidden == 1 { "" } else { "s" };
+            let left = format!("\u{2026} {hidden} more paragraph{plural}");
+            let text = right_align_pair(&left, "ctrl+o to expand", self.markdown_content_width());
+            self.rows
+                .push(TranscriptRow::new(text, dim_style()).with_fold(FoldVis::WhenCollapsed));
+        }
         self.rows.push(TranscriptRow::chrome(ChromeRow::RailEnd));
+    }
+
+    /// Patch the current turn's thinking header with the provider-reported
+    /// reasoning token count (`↓2.4k 12s`) once usage is known.
+    fn set_thinking_telemetry(&mut self, reasoning_tokens: u64) {
+        if reasoning_tokens == 0 {
+            return;
+        }
+        let Some(index) = self.thinking_header_row else {
+            return;
+        };
+        self.mark_dirty_from(index);
+        if let Some(ChromeRow::RailHeader { right, .. }) =
+            self.rows.get_mut(index).and_then(|row| row.chrome.as_mut())
+        {
+            let tokens = format!("↓{}", super::screen::compact_count(reasoning_tokens));
+            *right = match &self.thinking_elapsed {
+                Some(elapsed) => format!("{tokens} {elapsed}"),
+                None => tokens,
+            };
+        }
+    }
+
+    /// A quiet unboxed notice row (the `Notice` design-system component):
+    /// glyph + message, with an optional right-aligned dim hint. State is the
+    /// glyph + message, never color alone.
+    fn push_notice_row(&mut self, glyph: &str, glyph_style: Style, message: &str, hint: &str) {
+        self.begin_block();
+        self.mark_append_dirty();
+        let left = format!("{glyph} {message}");
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Notice {
+                glyph: glyph.to_string(),
+                glyph_style,
+                message: message.to_string(),
+                hint: hint.to_string(),
+            },
+            left,
+            dim_style(),
+        ));
+        self.push_blank();
     }
 
     pub(super) fn push_turn_divider(
@@ -193,6 +361,7 @@ impl Transcript {
         }
         self.finish_stream();
         self.push_blank();
+        self.mark_append_dirty();
         self.rows.push(TranscriptRow {
             text: turn_divider_label(elapsed, usage),
             style: dim_style(),
@@ -228,6 +397,7 @@ impl Transcript {
     }
 
     fn push_approval_panel(&mut self, line: Line<'static>, failed: bool) {
+        self.mark_append_dirty();
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
         self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
             expanded: true,
@@ -245,7 +415,8 @@ impl Transcript {
                         " APPROVED    "
                     }
                     .to_string(),
-                    panel_style(),
+                    if failed { err_style() } else { ok_style() }
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
             ],
         }));
@@ -272,7 +443,7 @@ impl Transcript {
     ) {
         let renderer = tool_render::resolve(call);
         if renderer.kind() == ToolPanelKind::Explore {
-            self.push_explored_result(call, duration);
+            self.push_explored_result(call, content, duration);
             return;
         }
         let failed = exit_code.is_some_and(|code| code != 0);
@@ -390,16 +561,26 @@ impl Transcript {
     /// Mark the most recent panel header as collapsed (preview) so foldable
     /// output starts capped; toggling reveals the hidden lines.
     fn mark_panel_preview(&mut self) {
-        for row in self.rows.iter_mut().rev() {
-            if let Some(ChromeRow::Header { expanded, .. }) = row.chrome.as_mut() {
-                *expanded = false;
-                return;
-            }
+        let Some(index) = self
+            .rows
+            .iter()
+            .rposition(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Header { .. })))
+        else {
+            return;
+        };
+        self.mark_dirty_from(index);
+        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[index].chrome.as_mut() {
+            *expanded = false;
         }
     }
 
     fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
-        let elapsed = if spec.state == PanelState::Running {
+        self.mark_append_dirty();
+        // A pending preview has no elapsed time by definition (`◇ PREVIEW`
+        // omits the duration; asserting one would fabricate a measurement).
+        let elapsed = if spec.state == PanelState::Preview {
+            String::new()
+        } else if spec.state == PanelState::Running {
             spec.started
                 .map(|started| format_elapsed_compact(started.elapsed()))
                 .unwrap_or_else(|| "0.0s".to_string())
@@ -421,7 +602,7 @@ impl Transcript {
                 meta: spec.meta.to_string(),
                 right: vec![
                     (spec.state.symbol().to_string(), spec.state.dot_style()),
-                    (spec.state.label().to_string(), panel_style()),
+                    (spec.state.label().to_string(), spec.state.label_style()),
                     (format!("     {elapsed:>10}  "), dim_style()),
                 ],
             },
@@ -534,6 +715,141 @@ impl Transcript {
         });
     }
 
+    /// Push a complete EDIT panel whose body is the canonical block diff plus
+    /// the quiet `+added  −removed` footer (`EditOutput` design-system
+    /// component). Long diffs fold to a capped preview.
+    fn push_edit_panel(
+        &mut self,
+        call: &ToolCall,
+        diff: &str,
+        state: PanelState,
+        duration: Option<Duration>,
+        started: Option<Instant>,
+        error: Option<&str>,
+    ) {
+        let renderer = tool_render::resolve(call);
+        let meta = renderer.header_meta(call);
+        let plain = renderer.plain_meta(call);
+        self.push_panel_header(PanelHeaderSpec {
+            title: "EDIT",
+            meta: &meta,
+            plain_meta: &plain,
+            state,
+            duration,
+            started,
+        });
+        let diff_rows = diff_table_rows(diff);
+        let cap = super::MAX_TOOL_OUTPUT_ROWS;
+        let foldable = diff_rows.len() > cap + 1;
+        if foldable {
+            let hidden = diff_rows.len() - cap;
+            for row in diff_rows.iter().take(cap).cloned() {
+                self.rows.push(row.with_fold(FoldVis::WhenCollapsed));
+            }
+            let left = format!("\u{2026} {hidden} more lines");
+            let hint = right_align_pair(&left, "ctrl+o to expand", self.wrap_width());
+            self.rows.push(
+                TranscriptRow::chrome_with_text(
+                    ChromeRow::BodyRight {
+                        left: Line::from(Span::styled(left.clone(), dim_style())),
+                        right: "ctrl+o to expand".to_string(),
+                        right_style: dim_style(),
+                        bg: None,
+                    },
+                    hint,
+                    dim_style(),
+                )
+                .with_fold(FoldVis::WhenCollapsed),
+            );
+            for row in diff_rows {
+                self.rows.push(row.with_fold(FoldVis::WhenExpanded));
+            }
+        } else {
+            self.rows.extend(diff_rows);
+        }
+        if let Some(message) = error {
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::from(Span::styled(format!("error: {message}"), err_style())),
+                    bg: None,
+                },
+                format!("error: {message}"),
+                err_style(),
+            ));
+        }
+        let (added, removed) = diff_counts(diff);
+        if added + removed > 0 {
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::default(),
+                    bg: None,
+                },
+                String::new(),
+                panel_style(),
+            ));
+            let note = diff.contains("--- /dev/null").then_some("new file");
+            self.rows.push(diff_footer_row(added, removed, note));
+        }
+        if foldable {
+            self.mark_panel_preview();
+        }
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+    }
+
+    /// Open (or reopen) the EDIT panel for a pending mutation: `◇ PREVIEW`,
+    /// diff body, tracked as the active edit so the same panel is finalized in
+    /// place when the tool runs.
+    fn begin_edit_preview(&mut self, call: &ToolCall, diff: String) {
+        self.clear_active_tool_for_preview(call);
+        self.begin_block();
+        let body_start = self.rows.len();
+        self.push_edit_panel(call, &diff, PanelState::Preview, None, None, None);
+        self.active_edit = Some(ActiveEdit {
+            call_id: call.id.clone(),
+            diff,
+            body_start,
+            started: None,
+        });
+    }
+
+    /// Rebuild the active EDIT panel in place for a new lifecycle state.
+    /// Returns false when `call` does not match the tracked edit. `keep_open`
+    /// (the running transition) retains the tracked edit for finalization.
+    fn rebuild_active_edit(
+        &mut self,
+        call: &ToolCall,
+        state: PanelState,
+        duration: Option<Duration>,
+        error: Option<&str>,
+        keep_open: bool,
+    ) -> bool {
+        let Some(mut active) = self.active_edit.take() else {
+            return false;
+        };
+        if active.call_id != call.id {
+            self.active_edit = Some(active);
+            return false;
+        }
+        if state == PanelState::Running && active.started.is_none() {
+            active.started = Some(Instant::now());
+        }
+        let diff = active.diff.clone();
+        let started = active.started;
+        let mut replacement = self.collect_rows(|this| {
+            this.push_edit_panel(call, &diff, state, duration, started, error);
+        });
+        let end = self.panel_end_from(active.body_start);
+        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+            Self::preserve_panel_expanded(&mut replacement, expanded);
+        }
+        self.mark_dirty_from(active.body_start);
+        self.rows.splice(active.body_start..end, replacement);
+        if keep_open {
+            self.active_edit = Some(active);
+        }
+        true
+    }
+
     fn panel_end_from(&self, start: usize) -> usize {
         self.rows[start..]
             .iter()
@@ -591,6 +907,7 @@ impl Transcript {
         if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
+        self.mark_dirty_from(active.body_start);
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -607,6 +924,7 @@ impl Transcript {
         if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
+        self.mark_dirty_from(active.body_start);
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -817,7 +1135,7 @@ impl Transcript {
             .unwrap_or_else(|| "0.0s".to_string());
         vec![
             (state.symbol().to_string(), state.dot_style()),
-            (format!("{:<13}", state.label()), panel_style()),
+            (format!("{:<13}", state.label()), state.label_style()),
             // Fixed-width elapsed so the live timer does not shift the header
             // right edge as the compact label changes length (e.g. 9.9s -> 10s).
             (format!("{elapsed:>8}  "), dim_style()),
@@ -863,17 +1181,25 @@ impl Transcript {
         tool_render::resolve(call).header_meta(call)
     }
 
-    /// EXPLORE body summary `(text, style)`, single-sourced from the renderer's
-    /// one-row body for the given outcome (falls back to an empty dim row only
-    /// if a misbehaving renderer produced nothing).
-    fn explore_text_style(&self, call: &ToolCall, outcome: ToolOutcome<'_>) -> (String, Style) {
+    /// EXPLORE body row, single-sourced from the renderer's one-row body for
+    /// the given outcome (falls back to an empty dim row only if a misbehaving
+    /// renderer produced nothing).
+    fn explore_row(&self, call: &ToolCall, outcome: ToolOutcome<'_>) -> TranscriptRow {
         let renderer = tool_render::resolve(call);
         let ctx = self.render_ctx();
         tool_render::render_body(renderer, &ctx, call, &outcome)
             .into_iter()
             .next()
-            .map(|row| (row.text, row.style))
-            .unwrap_or_else(|| (String::new(), dim_style()))
+            .unwrap_or_else(|| {
+                TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: Line::default(),
+                        bg: None,
+                    },
+                    String::new(),
+                    dim_style(),
+                )
+            })
     }
 
     fn set_explore_header(
@@ -889,6 +1215,7 @@ impl Transcript {
             Some(ChromeRow::Header { meta, expanded, .. }) => (meta.clone(), *expanded),
             _ => (self.explore_meta(call), true),
         };
+        self.mark_dirty_from(header);
         self.rows[header] = TranscriptRow::chrome(ChromeRow::Header {
             expanded,
             title: "EXPLORE",
@@ -925,23 +1252,24 @@ impl Transcript {
             self.rows.last().and_then(|row| row.chrome.as_ref()),
             Some(ChromeRow::Bottom)
         ) {
+            self.mark_dirty_from(self.rows.len().saturating_sub(1));
             self.rows.pop();
         }
     }
 
-    fn push_explore_body(&mut self, call: &ToolCall, failed: bool, duration: Option<Duration>) {
+    fn push_explore_body(&mut self, call: &ToolCall, content: &str, duration: Option<Duration>) {
+        self.mark_append_dirty();
         let meta = self.explore_meta(call);
-        let (text, _) = self.explore_text_style(
+        let row = self.explore_row(
             call,
             ToolOutcome::Done {
-                content: "",
+                content,
                 exit_code: None,
             },
         );
-        let style = if failed { err_style() } else { dim_style() };
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
-            self.set_explore_header(call, panel_state(false, failed), duration);
+            self.set_explore_header(call, panel_state(false, false), duration);
         } else {
             self.push_blank();
             self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
@@ -949,48 +1277,36 @@ impl Transcript {
                 expanded: true,
                 title: "EXPLORE",
                 meta,
-                right: Self::explore_header_right(panel_state(false, failed), duration),
+                right: Self::explore_header_right(panel_state(false, false), duration),
             }));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
-        self.rows.push(TranscriptRow::chrome_with_text(
-            ChromeRow::Body {
-                line: Line::from(Span::styled(text.clone(), style)),
-                bg: None,
-            },
-            text,
-            style,
-        ));
+        self.rows.push(row);
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.exploring_open = true;
     }
 
-    fn push_explored_result(&mut self, call: &ToolCall, duration: Option<Duration>) {
+    fn push_explored_result(&mut self, call: &ToolCall, content: &str, duration: Option<Duration>) {
         self.finish_stream();
-        let (text, style) = self.explore_text_style(
+        let row = self.explore_row(
             call,
             ToolOutcome::Done {
-                content: "",
+                content,
                 exit_code: None,
             },
         );
-        if self.finish_exploration(call, text, style, duration, false, false) {
+        if self.finish_exploration(call, row, duration, false, false) {
             return;
         }
-        self.push_explore_body(call, false, duration);
+        self.push_explore_body(call, content, duration);
     }
 
     fn push_explored_start(&mut self, call: &ToolCall) {
+        self.mark_append_dirty();
         self.finish_stream();
         let started = Instant::now();
         let meta = self.explore_meta(call);
-        let (text, style) = self.explore_text_style(
-            call,
-            ToolOutcome::Done {
-                content: "",
-                exit_code: None,
-            },
-        );
+        let body = self.explore_row(call, ToolOutcome::Running { streamed: "" });
         if self.exploring_open {
             self.pop_trailing_explore_bottom();
         } else {
@@ -1005,14 +1321,7 @@ impl Transcript {
             self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
         let row = self.rows.len();
-        self.rows.push(TranscriptRow::chrome_with_text(
-            ChromeRow::Body {
-                line: Line::from(Span::styled(text.clone(), style)),
-                bg: None,
-            },
-            text,
-            style,
-        ));
+        self.rows.push(body);
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
         self.exploring_open = true;
         self.active_explorations.push(ActiveExploration {
@@ -1027,29 +1336,22 @@ impl Transcript {
         self.update_explore_header_from_active(call);
     }
 
-    fn replace_explore_body_at(&mut self, row: usize, text: String, style: Style) -> bool {
-        let Some(slot) = self.rows.get_mut(row) else {
+    fn replace_explore_body_at(&mut self, row: usize, replacement: TranscriptRow) -> bool {
+        let Some(slot) = self.rows.get(row) else {
             return false;
         };
         if !matches!(slot.chrome.as_ref(), Some(ChromeRow::Body { .. })) {
             return false;
         }
-        *slot = TranscriptRow::chrome_with_text(
-            ChromeRow::Body {
-                line: Line::from(Span::styled(text.clone(), style)),
-                bg: None,
-            },
-            text,
-            style,
-        );
+        self.mark_dirty_from(row);
+        self.rows[row] = replacement;
         true
     }
 
     fn finish_exploration(
         &mut self,
         call: &ToolCall,
-        text: String,
-        style: Style,
+        row_body: TranscriptRow,
         duration: Option<Duration>,
         failed: bool,
         cancelled: bool,
@@ -1066,7 +1368,7 @@ impl Transcript {
         self.active_explorations[pos].failed = failed;
         self.active_explorations[pos].cancelled = cancelled;
         self.active_explorations[pos].done = true;
-        let replaced = self.replace_explore_body_at(row, text, style);
+        let replaced = self.replace_explore_body_at(row, row_body);
         debug_assert!(replaced);
         self.update_explore_header_from_active(call);
         true
@@ -1074,32 +1376,59 @@ impl Transcript {
 
     fn push_explored_error(&mut self, call: &ToolCall, message: &str) -> bool {
         self.finish_stream();
-        let (text, style) = self.explore_text_style(
+        let row = self.explore_row(
             call,
             ToolOutcome::Error {
                 message,
                 streamed: "",
             },
         );
-        self.finish_exploration(call, text, style, None, true, false)
+        self.finish_exploration(call, row, None, true, false)
     }
 
     fn push_explored_cancelled(&mut self, call: &ToolCall) -> bool {
         self.finish_stream();
-        let (text, style) = self.explore_text_style(call, ToolOutcome::Cancelled { streamed: "" });
-        self.finish_exploration(call, text, style, None, false, true)
+        let row = self.explore_row(call, ToolOutcome::Cancelled { streamed: "" });
+        self.finish_exploration(call, row, None, false, true)
     }
 
     /// Apply one semantic event to the transcript rows.
     pub(super) fn apply(&mut self, event: UiEvent) {
+        let old_len = self.rows.len();
         match event {
-            UiEvent::ProviderTurnStarted { .. }
-            | UiEvent::ProviderTurnCompleted { .. }
-            | UiEvent::ProviderTurnCancelled { .. }
+            UiEvent::ProviderTurnStarted { .. } => {
+                self.provider_turn_started = Some(Instant::now());
+                self.thinking_header_row = None;
+                self.thinking_elapsed = None;
+            }
+            UiEvent::ProviderTurnCompleted { usage, .. } => {
+                if let Some(usage) = usage {
+                    self.set_thinking_telemetry(usage.reasoning_output_tokens);
+                }
+            }
+            UiEvent::CompactionApplied {
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                ..
+            } => {
+                // A runtime event, not the assistant speaking: a quiet `┊` info
+                // notice with honest (runtime-measured) token counts.
+                self.finish_stream();
+                self.push_notice_row(
+                    crate::ui::symbols::SEP,
+                    dim_style(),
+                    &format!(
+                        "Context compacted — {} → {} tokens",
+                        super::screen::compact_count(original_tokens_estimate),
+                        super::screen::compact_count(summary_tokens_estimate),
+                    ),
+                    "",
+                );
+            }
+            UiEvent::ProviderTurnCancelled { .. }
             | UiEvent::ProviderTurnError { .. }
             | UiEvent::ToolLifecycle { .. }
-            | UiEvent::OutputHandleStored { .. }
-            | UiEvent::CompactionApplied { .. } => {}
+            | UiEvent::OutputHandleStored { .. } => {}
             UiEvent::AssistantTextDelta(delta) => {
                 if self.streaming.is_none() {
                     self.push_blank();
@@ -1152,7 +1481,13 @@ impl Transcript {
             UiEvent::ToolStarted(call) => match tool_render::resolve(&call).kind() {
                 ToolPanelKind::Explore => self.push_explored_start(&call),
                 ToolPanelKind::Shell => self.begin_exec(call),
-                ToolPanelKind::Generic => self.begin_tool(call),
+                ToolPanelKind::Generic => {
+                    // A mutation whose diff already arrived keeps its EDIT
+                    // panel: the preview flips to `● RUNNING` in place.
+                    if !self.rebuild_active_edit(&call, PanelState::Running, None, None, true) {
+                        self.begin_tool(call);
+                    }
+                }
             },
             UiEvent::ToolOutputDelta { call_id, chunk } => {
                 if self
@@ -1178,32 +1513,22 @@ impl Transcript {
                 self.record_approval(&call, ApprovalDecision::AllowAlways);
             }
             UiEvent::DiffPreview { call, diff } => {
-                self.clear_active_tool_for_preview(&call);
-                self.begin_block();
-                self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
-                let renderer = tool_render::resolve(&call);
-                self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
-                    expanded: true,
-                    title: renderer.title(),
-                    meta: renderer.header_meta(&call),
-                    right: vec![
-                        (crate::ui::symbols::PREVIEW.to_string(), dim_style()),
-                        (" PREVIEW     ".to_string(), panel_style()),
-                    ],
-                }));
-                self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
-                self.rows.extend(diff_table_rows(&diff));
-                let (added, removed) = diff_counts(&diff);
-                if added + removed > 0 {
-                    let note = diff.contains("--- /dev/null").then_some("new file");
-                    self.rows.push(diff_footer_row(added, removed, note));
-                }
-                self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+                self.begin_edit_preview(&call, diff);
             }
             UiEvent::ToolDenied(call) => {
+                // The pending EDIT panel (if any) stays as the `◇ PREVIEW`
+                // record of what was proposed; the decision is its own block.
+                self.active_edit = None;
                 self.begin_block();
-                let mut spans = vec![Span::styled("✗", err_style()), Span::raw(" Denied ")];
+                let mut spans = Vec::new();
+                if call.name == "bash" {
+                    spans.push(Span::styled("$ ", dim_style()));
+                }
                 spans.extend(ansi_spans(&run_target(&call), Style::default()));
+                spans.push(Span::styled(
+                    format!("  {} denied", crate::ui::symbols::SEP),
+                    err_style(),
+                ));
                 self.push_approval_panel(Line::from(spans), true);
             }
             UiEvent::ToolResult {
@@ -1218,6 +1543,7 @@ impl Transcript {
                     .is_some_and(|a| a.call.id == call.id)
                 {
                     self.finalize_active(&call, &content, exit_code, duration);
+                } else if self.rebuild_active_edit(&call, PanelState::Done, duration, None, false) {
                 } else if !self.finalize_active_tool(&call, &content, duration) {
                     self.push_tool_result(&call, &content, exit_code, duration);
                 }
@@ -1229,9 +1555,15 @@ impl Transcript {
                     .is_some_and(|a| a.call.id == call.id)
                 {
                     self.finalize_active_error(&call, &message);
-                } else if self.finalize_active_tool_error(&call, &message) {
-                } else if tool_render::resolve(&call).kind() != ToolPanelKind::Explore
-                    || !self.push_explored_error(&call, &message)
+                } else if !self.rebuild_active_edit(
+                    &call,
+                    PanelState::Error,
+                    None,
+                    Some(&message),
+                    false,
+                ) && !self.finalize_active_tool_error(&call, &message)
+                    && (tool_render::resolve(&call).kind() != ToolPanelKind::Explore
+                        || !self.push_explored_error(&call, &message))
                 {
                     self.push_tool_error(&call, &message);
                 }
@@ -1243,9 +1575,10 @@ impl Transcript {
                     .is_some_and(|a| a.call.id == call.id)
                 {
                     self.finalize_active_cancelled(&call);
-                } else if self.finalize_active_tool_cancelled(&call) {
-                } else if tool_render::resolve(&call).kind() != ToolPanelKind::Explore
-                    || !self.push_explored_cancelled(&call)
+                } else if !self.rebuild_active_edit(&call, PanelState::Cancelled, None, None, false)
+                    && !self.finalize_active_tool_cancelled(&call)
+                    && (tool_render::resolve(&call).kind() != ToolPanelKind::Explore
+                        || !self.push_explored_cancelled(&call))
                 {
                     self.push_tool_cancelled(&call);
                 }
@@ -1257,27 +1590,36 @@ impl Transcript {
                 self.commit_user(&text);
             }
             UiEvent::Notice(message) => {
-                self.begin_block();
-                self.push(&format!("note: {}", message), dim_style());
+                self.push_notice_row(crate::ui::symbols::SEP, dim_style(), &message, "");
             }
-            UiEvent::TurnError { kind, message } => {
-                self.begin_block();
-                match kind {
-                    TurnErrorKind::Auth => {
-                        self.push(&format!("auth error: {}", message), err_style());
-                        self.push(
-                            "authentication required; re-run the login command",
-                            err_style(),
-                        );
-                    }
-                    TurnErrorKind::Provider => {
-                        self.push(&format!("provider error: {}", message), err_style());
-                    }
+            UiEvent::TurnError { kind, message } => match kind {
+                TurnErrorKind::Auth => {
+                    self.push_notice_row(
+                        crate::ui::symbols::ERROR,
+                        err_style(),
+                        &format!("auth error: {message}"),
+                        "",
+                    );
+                    self.push(
+                        "authentication required; re-run the login command",
+                        dim_style(),
+                    );
                 }
-            }
+                TurnErrorKind::Provider => {
+                    self.push_notice_row(
+                        crate::ui::symbols::ERROR,
+                        err_style(),
+                        &format!("provider error: {message}"),
+                        "",
+                    );
+                }
+            },
             UiEvent::TurnComplete => {
                 self.finish_stream();
             }
+        }
+        if self.rows.len() > old_len {
+            self.mark_dirty_from(old_len);
         }
         self.trim_history();
     }
@@ -1287,12 +1629,17 @@ impl Transcript {
             || self.streaming.is_some()
             || self.active_exec.is_some()
             || self.active_tool.is_some()
+            || self.active_edit.is_some()
             || !self.active_explorations.is_empty()
         {
             return;
         }
         let remove = self.panel_safe_trim_index(self.rows.len() - MAX_TRANSCRIPT_ROWS);
+        self.mark_dirty_from(0);
         self.rows.drain(..remove);
+        self.thinking_header_row = self
+            .thinking_header_row
+            .and_then(|index| index.checked_sub(remove));
         self.exploring_open = self.trailing_explore_panel_open();
     }
 
@@ -1311,6 +1658,8 @@ impl Transcript {
                 ChromeRow::Header { .. }
                     | ChromeRow::Separator
                     | ChromeRow::Body { .. }
+                    | ChromeRow::BodyRight { .. }
+                    | ChromeRow::BodyRule { .. }
                     | ChromeRow::Bottom
             )
         )
@@ -1351,6 +1700,7 @@ impl Transcript {
         {
             return false;
         }
+        self.mark_dirty_from(header);
         match self.rows[header].chrome.as_mut() {
             Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. }) => {
                 *expanded = !*expanded;
@@ -1378,22 +1728,72 @@ impl Transcript {
     /// This is display-only; the raw prompt still goes to Nexus unchanged
     /// through the loop.
     pub(super) fn commit_user(&mut self, text: &str) {
+        self.mark_append_dirty();
         self.push_blank();
         pane::push_user_rows(&mut self.rows, text);
         self.trim_history();
     }
 
-    pub(super) fn render(&mut self, width: u16) -> Vec<Line<'static>> {
+    fn ensure_wrapped_cache(&mut self, width: usize) {
+        if self.wrapped_cache.width != width {
+            self.wrapped_cache.invalidate_all(width);
+        }
+
+        let dirty_from = self
+            .wrapped_cache
+            .dirty_from
+            .min(self.rows.len())
+            .min(self.wrapped_cache.rows.len());
+        if dirty_from < self.wrapped_cache.rows.len() {
+            let line_start = self.wrapped_cache.rows[dirty_from].start;
+            self.wrapped_cache.rows.truncate(dirty_from);
+            self.wrapped_cache.lines.truncate(line_start);
+        }
+
+        for row in &self.rows[self.wrapped_cache.rows.len()..] {
+            let start = self.wrapped_cache.lines.len();
+            row.render_rows(width, &mut self.wrapped_cache.lines);
+            let end = self.wrapped_cache.lines.len();
+            self.wrapped_cache.rows.push(start..end);
+        }
+
+        self.wrapped_cache.dirty_from = self.rows.len();
+    }
+
+    pub(super) fn render(&mut self, width: u16) -> TranscriptRender {
+        self.render_cached(width, false)
+    }
+
+    pub(super) fn render_incremental(&mut self, width: u16) -> TranscriptRender {
+        self.render_cached(width, true)
+    }
+
+    fn render_cached(&mut self, width: u16, suffix_only: bool) -> TranscriptRender {
         let width = usize::from(width);
         self.last_width = width
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
             .max(1);
-        // Select the visible fold-tagged rows, then composite them through the
-        // `Component` contract. Borrowing `&dyn Component` avoids boxing the
-        // rows every frame while still routing every row through the shared path.
-        let mut visible: Vec<&dyn Component> = Vec::with_capacity(self.rows.len());
+        let width_changed = self.wrapped_cache.width != width;
+        if width_changed {
+            self.wrapped_cache.invalidate_all(width);
+        }
+        let dirty_from = if width_changed {
+            0
+        } else {
+            self.wrapped_cache.dirty_from.min(self.rows.len())
+        };
+        self.ensure_wrapped_cache(width);
+
+        // Select the visible fold-tagged rows, then append the cached physical
+        // lines for each visible logical row. The fold pass remains a cheap
+        // no-allocation scan over retained rows, while width-aware wrapping and
+        // panel chrome composition only rerun for dirty rows. Production uses
+        // `suffix_only` so the stable prefix is counted, not cloned into the
+        // frame; tests use full output for direct render assertions.
+        let mut out = Vec::with_capacity(self.wrapped_cache.lines.len());
+        let mut stable_prefix = 0usize;
         let mut expanded = true;
-        for row in &self.rows {
+        for (index, row) in self.rows.iter().enumerate() {
             match row.chrome.as_ref() {
                 // A panel opens fully shown until its header sets the state;
                 // resetting at Top guards against a missing Bottom leaking a
@@ -1411,7 +1811,13 @@ impl Transcript {
                 FoldVis::WhenExpanded => !expanded,
             };
             if !skip {
-                visible.push(row);
+                let range = self.wrapped_cache.rows[index].clone();
+                let line_count = range.end.saturating_sub(range.start);
+                if suffix_only && index < dirty_from {
+                    stable_prefix += line_count;
+                } else {
+                    out.extend(self.wrapped_cache.lines[range].iter().cloned());
+                }
             }
             if matches!(
                 row.chrome.as_ref(),
@@ -1420,15 +1826,26 @@ impl Transcript {
                 expanded = true;
             }
         }
+        if !suffix_only {
+            stable_prefix = stable_prefix.min(out.len());
+        }
         // The in-flight stream renders as transient rows appended after history;
-        // hold them locally so they can join the same borrowed composite.
+        // keep it out of the committed cache so spinner/streaming frames never
+        // mutate retained row ranges.
         let streaming_rows = self
             .streaming
             .as_ref()
             .map(|text| pane::streaming_assistant_rows(text, width))
             .unwrap_or_default();
-        visible.extend(streaming_rows.iter().map(|row| row as &dyn Component));
-        component::composite(visible, width)
+        for row in &streaming_rows {
+            row.render_rows(width, &mut out);
+        }
+        let total_lines = stable_prefix + out.len();
+        TranscriptRender {
+            lines: out,
+            stable_prefix,
+            total_lines,
+        }
     }
 }
 
@@ -1443,12 +1860,18 @@ pub(super) fn streaming_markdown_preview(text: &str) -> String {
     )
 }
 
+/// The APPROVAL body line: the authorized action (with a `$ ` prompt for shell
+/// commands) plus a muted `┊ approved <scope>` reason. The decision itself is
+/// carried by the header (`◆ APPROVED`); the body never repeats a state glyph.
 fn approval_line(call: &ToolCall, scope: &str) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled("✔", ok_style()),
-        Span::raw(" You approved iris to run "),
-    ];
+    let mut spans = Vec::new();
+    if call.name == "bash" {
+        spans.push(Span::styled("$ ", dim_style()));
+    }
     spans.extend(ansi_spans(&run_target(call), Style::default()));
-    spans.push(Span::raw(format!(" {scope}")));
+    spans.push(Span::styled(
+        format!("  {} approved {scope}", crate::ui::symbols::SEP),
+        dim_style(),
+    ));
     Line::from(spans)
 }

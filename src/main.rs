@@ -1,10 +1,11 @@
 use std::env;
+use std::io::{IsTerminal, Write};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use nexus::{Agent, ChatProvider};
 use reqwest::blocking::Client;
 use tokio_util::sync::CancellationToken;
@@ -17,10 +18,12 @@ mod handles;
 mod mimir;
 mod nexus;
 mod process_group;
+mod selfupdate;
 mod session;
 mod signals;
 mod telemetry;
 mod tool_display;
+mod tool_summary;
 mod tools;
 mod ui;
 mod wayland;
@@ -61,6 +64,12 @@ fn dispatch() -> Result<()> {
         [command, provider] if command == "login" && provider == "openai-codex" => {
             login_openai_codex(LoginMethod::Browser)
         }
+        [command, provider] if command == "login" && provider == "openai" => {
+            login_api_key(mimir::selection::ProviderId::OpenAi)
+        }
+        [command, provider] if command == "login" && provider == "openai-compatible" => {
+            login_api_key(mimir::selection::ProviderId::OpenAiCompatible)
+        }
         [command, provider] if command == "login" && provider == "antigravity" => {
             login_antigravity()
         }
@@ -74,6 +83,21 @@ fn dispatch() -> Result<()> {
             if command == "login" && provider == "openai-codex" && flag == "--device-code" =>
         {
             login_openai_codex(LoginMethod::DeviceCode)
+        }
+        [command, provider, flag]
+            if command == "login" && provider == "anthropic" && flag == "--api-key" =>
+        {
+            login_api_key(mimir::selection::ProviderId::Anthropic)
+        }
+        [command, provider, flag]
+            if command == "login" && provider == "openai" && flag == "--api-key" =>
+        {
+            login_api_key(mimir::selection::ProviderId::OpenAi)
+        }
+        [command, provider, flag]
+            if command == "login" && provider == "openai-compatible" && flag == "--api-key" =>
+        {
+            login_api_key(mimir::selection::ProviderId::OpenAiCompatible)
         }
         [command] if command == "update" => update_agent(),
         [command] if command == "help" || command == "--help" || command == "-h" => {
@@ -122,7 +146,8 @@ fn run_agent(force_plain: bool) -> Result<()> {
     // from fragment files plus dynamic context (project docs, date, cwd) and the
     // live tool registry. Fresh and resume call the same function.
     let tools = tools::built_in_tools();
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let trust_repo = resolve_project_trust(&cwd);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, trust_repo);
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
@@ -169,6 +194,65 @@ fn run_agent(force_plain: bool) -> Result<()> {
     cli::run_interactive(&mut harness, &mut switch, force_plain)
 }
 
+/// Resolve whether this workspace's repo-provided Iris resources (system-prompt
+/// fragments) are trusted for this run. Security gate for issue #202: a cloned
+/// hostile repo must not inject system-prompt fragments without an explicit
+/// decision.
+///
+/// - A recorded `Trusted`/`Untrusted` decision is honored directly.
+/// - `Undecided` in an interactive terminal, when the repo actually ships
+///   `.iris/fragments`, prompts once and persists the answer.
+/// - `Undecided` in any non-interactive context (pipe/CI), or when the repo
+///   ships no fragments, defaults to untrusted WITHOUT writing a decision, so a
+///   later interactive run can still prompt.
+fn resolve_project_trust(cwd: &Path) -> bool {
+    use wayland::trust::TrustDecision;
+    match wayland::trust::decision_for(cwd) {
+        TrustDecision::Trusted => true,
+        TrustDecision::Untrusted => false,
+        TrustDecision::Undecided => {
+            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            if !interactive || !wayland::system_prompt::repo_provides_fragments(cwd) {
+                return false;
+            }
+            prompt_for_project_trust(cwd)
+        }
+    }
+}
+
+/// First-run interactive trust prompt. Presents the risk, reads a single
+/// yes/no answer from stdin, and persists the decision keyed by canonical dir.
+/// Defaults to untrusted on empty input or EOF. A persistence failure is
+/// surfaced but never blocks startup (the run proceeds untrusted).
+fn prompt_for_project_trust(cwd: &Path) -> bool {
+    println!(
+        "This project ships Iris resources under .iris/fragments that would be injected\n\
+         into the model's system prompt. Only trust them if you trust this repository."
+    );
+    print!("Trust this project's Iris resources? [y/N]: ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    let trusted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if let Err(error) = wayland::trust::set_decision(cwd, trusted) {
+        tracing::warn!(error = %format!("{error:#}"), "failed to persist project trust decision");
+        eprintln!("warning: could not save the trust decision: {error:#}");
+    }
+    println!(
+        "{}",
+        if trusted {
+            "Project trusted; repo fragments will load."
+        } else {
+            "Project not trusted; repo fragments are skipped. Use /trust to change this."
+        }
+    );
+    trusted
+}
+
 /// Resume an existing session by id: load its transcript from the store,
 /// reconstruct the provider-visible messages, seed the agent with them, and
 /// continue appending future turns to the same log. Errors clearly when the id
@@ -195,7 +279,8 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     // a fresh session, so a resumed turn gets identical fragment/context output.
     wayland::system_prompt::ensure_default_fragments();
     let tools = tools::built_in_tools();
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let trust_repo = resolve_project_trust(&cwd);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, trust_repo);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = meta.id.clone();
@@ -304,6 +389,25 @@ fn build_provider(
                 selection.retry_policy,
             )?,
         ),
+        ProviderId::OpenAi => {
+            let auth = mimir::auth::storage::AuthStore::from_env()?;
+            let api_key = mimir::auth::api_key::api_key_for_provider(ProviderId::OpenAi, &auth)?;
+            Box::new(
+                mimir::providers::openai_compatible_chat::OpenAiCompatibleChatProvider::new(
+                    mimir::providers::openai_compatible_chat::OpenAiCompatibleChatConfig {
+                        provider: ProviderId::OpenAi,
+                        model,
+                        base_url,
+                        reasoning,
+                        system_prompt,
+                        api_key,
+                        supports_reasoning: true,
+                        api_key_required: true,
+                        retry_policy: selection.retry_policy,
+                    },
+                )?,
+            )
+        }
         ProviderId::Anthropic => Box::new(
             mimir::providers::anthropic_messages::AnthropicProvider::new(
                 model,
@@ -323,6 +427,26 @@ fn build_provider(
                 system_prompt,
             )?)
         }
+        ProviderId::OpenAiCompatible => {
+            let auth = mimir::auth::storage::AuthStore::from_env()?;
+            let api_key =
+                mimir::auth::api_key::api_key_for_provider(ProviderId::OpenAiCompatible, &auth)?;
+            Box::new(
+                mimir::providers::openai_compatible_chat::OpenAiCompatibleChatProvider::new(
+                    mimir::providers::openai_compatible_chat::OpenAiCompatibleChatConfig {
+                        provider: ProviderId::OpenAiCompatible,
+                        model,
+                        base_url,
+                        reasoning,
+                        system_prompt,
+                        api_key,
+                        supports_reasoning: selection.open_ai_compatible.reasoning,
+                        api_key_required: selection.open_ai_compatible.api_key_required,
+                        retry_policy: selection.retry_policy,
+                    },
+                )?,
+            )
+        }
     };
     Ok(provider)
 }
@@ -340,6 +464,26 @@ fn update_args() -> &'static [&'static str] {
 }
 
 fn update_agent() -> Result<()> {
+    match selfupdate::update_strategy() {
+        selfupdate::UpdateStrategy::SelfReplace => update_self_replace(),
+        selfupdate::UpdateStrategy::CargoInstall => update_via_cargo(),
+    }
+}
+
+/// Download-and-replace path, compiled into prebuilt release binaries.
+#[cfg(feature = "self-update")]
+fn update_self_replace() -> Result<()> {
+    selfupdate::run()
+}
+
+/// Unreachable in source builds: `update_strategy()` only returns `SelfReplace`
+/// when the `self-update` feature is on, which also compiles `selfupdate::run`.
+#[cfg(not(feature = "self-update"))]
+fn update_self_replace() -> Result<()> {
+    update_via_cargo()
+}
+
+fn update_via_cargo() -> Result<()> {
     println!("Updating Iris from {UPDATE_REPO} ...");
     let status = Command::new("cargo")
         .args(update_args())
@@ -394,6 +538,85 @@ fn login_antigravity() -> Result<()> {
     Ok(())
 }
 
+fn login_api_key(provider: mimir::selection::ProviderId) -> Result<()> {
+    let key = read_api_key(provider)?;
+    if key.is_empty() {
+        bail!("API key is blank");
+    }
+    let auth = mimir::auth::storage::AuthStore::from_env()?;
+    auth.set_api_key_credentials(provider.as_str(), &key)?;
+    save_default_after_api_key_login(provider);
+    println!("Stored API key for {}.", provider.display_name());
+    Ok(())
+}
+
+fn read_api_key(provider: mimir::selection::ProviderId) -> Result<String> {
+    print!("Enter API key for {}: ", provider.display_name());
+    std::io::stdout().flush()?;
+    if !std::io::stdin().is_terminal() {
+        let mut key = String::new();
+        std::io::stdin().read_line(&mut key)?;
+        return Ok(key.trim().to_string());
+    }
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        }
+    }
+
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    let guard = RawModeGuard;
+    let mut key = String::new();
+    let result: Result<()> = loop {
+        match ratatui::crossterm::event::read()? {
+            ratatui::crossterm::event::Event::Key(event)
+                if event.kind == ratatui::crossterm::event::KeyEventKind::Press =>
+            {
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Enter => break Ok(()),
+                    ratatui::crossterm::event::KeyCode::Backspace => {
+                        key.pop();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('c')
+                        if event
+                            .modifiers
+                            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        break Err(anyhow!("API key entry cancelled"));
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(ch) => key.push(ch),
+                    _ => {}
+                }
+            }
+            ratatui::crossterm::event::Event::Paste(text) => key.push_str(&text),
+            _ => {}
+        }
+    };
+    drop(guard);
+    println!();
+    result?;
+    Ok(key.trim().to_string())
+}
+
+fn save_default_after_api_key_login(provider: mimir::selection::ProviderId) {
+    if !matches!(
+        provider,
+        mimir::selection::ProviderId::OpenAi | mimir::selection::ProviderId::Anthropic
+    ) {
+        return;
+    }
+    let already_default = env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())
+        .and_then(|settings| settings.default_provider)
+        .is_some_and(|default| default.trim() == provider.as_str());
+    if !already_default {
+        let _ = config::save_default_model(provider.as_str(), provider.default_model());
+    }
+}
+
 fn login_anthropic() -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
@@ -429,8 +652,11 @@ fn print_help() {
     eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
     eprintln!("  iris login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
+    eprintln!("  iris login openai                 Store an OpenAI API key");
+    eprintln!("  iris login openai-compatible      Store an OpenAI-compatible API key");
     eprintln!("  iris login antigravity            Login with Google account OAuth");
     eprintln!("  iris login anthropic              Login with Anthropic OAuth (browser)");
+    eprintln!("  iris login anthropic --api-key    Store an Anthropic API key");
     eprintln!("  iris update                       Update Iris from GitHub");
     eprintln!();
     eprintln!("Accessibility (environment):");

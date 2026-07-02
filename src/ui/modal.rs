@@ -12,7 +12,7 @@
 //! gathered by the loop/cli layer and passed in at construction, keeping disk and
 //! auth lookups out of per-keystroke handling and out of this presentation code.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::mimir::model_capabilities;
@@ -59,6 +59,7 @@ pub(crate) enum LoginMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderPurpose {
     Login,
+    ApiKeyLogin,
     Logout,
 }
 
@@ -84,10 +85,17 @@ pub(crate) enum ModalAction {
     SetEffort(ReasoningEffort),
     /// Settings menu -> open the thinking-level submenu.
     OpenEffortPicker,
+    /// Set this project's trust decision (`true` = trust repo Iris resources).
+    /// Re-assembles the system prompt and rebuilds the provider at the boundary.
+    SetTrust(bool),
     /// `/login` method chosen -> open the matching provider selector.
     ChooseLoginMethod(LoginMethod),
     /// Begin an OAuth/subscription login for this provider.
     BeginLogin(ProviderId),
+    /// Open an API-key entry dialog for this provider id.
+    OpenApiKeyDialog(String),
+    /// Store the API key currently buffered in the active API-key dialog.
+    SaveApiKey(String),
     /// Remove the stored credential for this provider id.
     Logout(String),
     /// Provider-select cancel during `/login` returns to the method selector.
@@ -114,9 +122,11 @@ pub(crate) enum Modal {
     Scoped(ScopedModels),
     Effort(EffortPicker),
     Settings(SettingsMenu),
+    Trust(TrustMenu),
     LoginMethod(MethodSelect),
     Providers(ProviderSelect),
     LoginDialog(LoginDialog),
+    ApiKeyDialog(ApiKeyDialog),
 }
 
 impl Modal {
@@ -126,9 +136,25 @@ impl Modal {
             Modal::Scoped(picker) => picker.handle_key(key),
             Modal::Effort(picker) => picker.handle_key(key),
             Modal::Settings(menu) => menu.handle_key(key),
+            Modal::Trust(menu) => menu.handle_key(key),
             Modal::LoginMethod(menu) => menu.handle_key(key),
             Modal::Providers(picker) => picker.handle_key(key),
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
+            Modal::ApiKeyDialog(dialog) => dialog.handle_key(key),
+        }
+    }
+
+    pub(crate) fn paste_text(&mut self, text: &str) -> ModalOutcome {
+        match self {
+            Modal::LoginDialog(dialog) if dialog.accepts_manual_input() => {
+                dialog.push_str(text);
+                ModalOutcome::Redraw
+            }
+            Modal::ApiKeyDialog(dialog) => {
+                dialog.push_str(text);
+                ModalOutcome::Redraw
+            }
+            _ => ModalOutcome::Ignore,
         }
     }
 
@@ -138,9 +164,11 @@ impl Modal {
             Modal::Scoped(picker) => picker.render(width),
             Modal::Effort(picker) => picker.render(width),
             Modal::Settings(menu) => menu.render(width),
+            Modal::Trust(menu) => menu.render(width),
             Modal::LoginMethod(menu) => menu.render(width),
             Modal::Providers(picker) => picker.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
+            Modal::ApiKeyDialog(dialog) => dialog.render(width),
         }
     }
 }
@@ -161,61 +189,62 @@ fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
-fn accent() -> Style {
-    Style::default().fg(crate::ui::palette::CYAN)
-}
-
-fn muted() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
-
-/// Render the shared search line + windowed rows for a [`Selector`] into `out`.
-/// `empty` is the message shown when no rows match.
-fn render_selector(selector: &Selector, empty: &str, out: &mut Vec<Line<'static>>) {
+/// Render the shared search line + windowed rows for a [`Selector`] as overlay
+/// rows: `(line, selected)` pairs for [`overlay_box`], which gives the selected
+/// row the surface fill (never a colored accent). The selected label is bold;
+/// metadata stays muted; an enabled/disabled mark uses the `◉`/`○` glyphs from
+/// the closed vocabulary (never `[x]`). `empty` is the no-match message.
+fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'static>, bool)> {
+    let mut out: Vec<(Line<'static>, bool)> = Vec::new();
     if selector.searchable() {
         let search = selector.search().unwrap_or("");
-        out.push(Line::from(vec![
-            Span::styled("> ", dim()),
-            Span::raw(search.to_string()),
-        ]));
-        out.push(Line::from(""));
+        out.push((
+            Line::from(vec![
+                Span::styled("> ", dim()),
+                Span::raw(search.to_string()),
+            ]),
+            false,
+        ));
     }
     if selector.is_empty() {
-        out.push(Line::from(Span::styled(empty.to_string(), muted())));
-        return;
+        out.push((Line::from(Span::styled(empty.to_string(), dim())), false));
+        return out;
     }
     for row in selector.visible() {
         let mut spans = Vec::new();
         let base = if row.selected {
-            accent()
+            Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let secondary = if row.selected { accent() } else { dim() };
         if let Some(enabled) = row.item.enabled {
             spans.push(Span::styled(
-                if enabled { "[x] " } else { "[ ] " },
+                if enabled { "◉ " } else { "○ " },
                 if enabled {
-                    Style::default().fg(Color::Green)
+                    Style::default().fg(crate::ui::palette::ORANGE)
                 } else {
-                    muted()
+                    dim()
                 },
             ));
         }
         spans.push(Span::styled(row.item.label.clone(), base));
         if let Some(detail) = &row.item.detail {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("[{detail}]"), secondary));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(detail.clone(), dim()));
         }
         if let Some(trailing) = &row.item.trailing {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(trailing.clone(), secondary));
+            spans.push(Span::styled(trailing.clone(), dim()));
         }
-        out.push(Line::from(spans));
+        out.push((Line::from(spans), row.selected));
     }
     if selector.is_scrolled() {
-        out.push(Line::from(Span::styled(selector.position_label(), muted())));
+        out.push((
+            Line::from(Span::styled(selector.position_label(), dim())),
+            false,
+        ));
     }
+    out
 }
 
 // --- model picker ---
@@ -334,75 +363,57 @@ impl ModelPicker {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-
-        // Column widths so the label and name columns line up.
-        let default_w = "Default".len();
-        let current_w = "current".len();
+        // The Picker idiom from the design system: `◉` marks the current
+        // model (orange), the label is bold on the highlighted (surface-fill)
+        // row, and the provider is the muted right column. The default model
+        // carries a quiet `default` tag instead of a column of labels.
         let name_w = self
             .models
             .iter()
             .map(|m| model_catalog::display_name(&m.qualified()).len())
             .max()
             .unwrap_or(0);
-
+        let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
         for row in self.selector.visible() {
             let qualified = row.item.id.clone();
             let model = self.models.iter().find(|m| m.qualified() == qualified);
             let base = if row.selected {
-                accent()
+                Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let secondary = if row.selected { accent() } else { dim() };
-            let mut spans = Vec::new();
-            let default = if qualified == self.default {
-                "Default"
+            let marker = if qualified == self.current {
+                Span::styled("◉ ", Style::default().fg(crate::ui::palette::ORANGE))
             } else {
-                ""
-            };
-            let current = if qualified == self.current {
-                "current"
-            } else {
-                ""
+                Span::raw("  ")
             };
             let name = model_catalog::display_name(&qualified);
-            spans.push(Span::styled(format!("{default:<default_w$}  "), base));
-            spans.push(Span::styled(format!("{current:<current_w$}  "), base));
-            spans.push(Span::styled(format!("{name:<name_w$}  "), base));
-            if let Some(ctx) = model_catalog::ctx_label(&qualified) {
-                spans.push(Span::styled(format!("[ctx:{ctx}]  "), secondary));
-            }
+            let mut spans = vec![marker, Span::styled(format!("{name:<name_w$}"), base)];
             if let Some(m) = model {
-                spans.push(Span::styled(
-                    format!("[{}] ", m.provider.display_name()),
-                    secondary,
-                ));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(m.provider.display_name().to_string(), dim()));
             }
-            spans.push(Span::styled("[sub]", secondary));
-            out.push(Line::from(spans));
+            if qualified == self.default {
+                spans.push(Span::styled("  default", dim()));
+            }
+            rows.push((Line::from(spans), row.selected));
         }
         if self.selector.is_scrolled() {
-            out.push(Line::from(Span::styled(
-                self.selector.position_label(),
-                muted(),
-            )));
+            rows.push((
+                Line::from(Span::styled(self.selector.position_label(), dim())),
+                false,
+            ));
         }
-
-        out.push(Line::from(""));
-        out.push(Line::from(vec![
-            Span::styled("Reasoning  ", dim()),
-            Span::raw(self.display_effort().as_str()),
-            Span::styled(" effort ", dim()),
-            Span::styled("left/right to adjust", muted()),
-        ]));
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            "Enter to set as default | s to use this session only | Esc to cancel",
-            dim(),
-        )));
-        let _ = width;
-        out
+        let footer = format!(
+            "↑↓ move · ←→ effort ({}) · ↵ select · s session · esc cancel",
+            self.display_effort().as_str()
+        );
+        crate::ui::tui::overlay_box(
+            Some("Select model"),
+            rows,
+            Some(&footer),
+            usize::from(width),
+        )
     }
 }
 
@@ -699,29 +710,22 @@ impl ScopedModels {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No matching models", &mut out);
+        let rows = selector_rows(&self.selector, "No matching models");
         let count = if self.enabled.is_none() {
             "all enabled".to_string()
         } else {
             format!("{}/{} enabled", self.enabled_count(), self.candidates.len())
         };
-        let mut footer = vec![
-            Span::styled(
-                "Enter toggle  Ctrl+A all  Ctrl+X clear  Ctrl+P provider  Alt+Up/Down reorder  Ctrl+S save  ",
-                dim(),
-            ),
-            Span::raw(count),
-        ];
-        if self.dirty {
-            footer.push(Span::styled(
-                "  (unsaved)",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        out.push(Line::from(footer));
-        let _ = width;
-        out
+        let unsaved = if self.dirty { " · unsaved" } else { "" };
+        let footer = format!(
+            "↵ toggle · ctrl+a all · ctrl+x clear · ctrl+p provider · alt+↑↓ reorder · ctrl+s save · {count}{unsaved}"
+        );
+        crate::ui::tui::overlay_box(
+            Some("Scoped models"),
+            rows,
+            Some(&footer),
+            usize::from(width),
+        )
     }
 }
 
@@ -779,10 +783,13 @@ impl EffortPicker {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No levels", &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, "No levels");
+        crate::ui::tui::overlay_box(
+            Some("Reasoning effort"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -822,10 +829,72 @@ impl SettingsMenu {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No settings", &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, "No settings");
+        crate::ui::tui::overlay_box(
+            Some("Settings"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
+    }
+}
+
+// --- project trust menu ---
+
+/// Change this project's trust decision for repo-provided Iris resources
+/// (system-prompt fragments). Confirming emits [`ModalAction::SetTrust`]; the
+/// loop persists the decision, re-assembles the prompt, and rebuilds the
+/// provider at the safe inter-turn boundary. The row matching the active state
+/// is marked `current`.
+#[derive(Debug, Clone)]
+pub(crate) struct TrustMenu {
+    selector: Selector,
+}
+
+impl TrustMenu {
+    pub(crate) fn new(trusted: bool) -> Self {
+        let mut trust =
+            SelectorItem::new("trust", "Trust this project").detail("load repo .iris/fragments");
+        let mut untrust =
+            SelectorItem::new("untrust", "Do not trust").detail("skip repo fragments");
+        if trusted {
+            trust = trust.trailing("current");
+        } else {
+            untrust = untrust.trailing("current");
+        }
+        let mut selector = Selector::new(vec![trust, untrust], false, false, 8);
+        selector.select_id(if trusted { "trust" } else { "untrust" });
+        TrustMenu { selector }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some("trust") => ModalOutcome::Emit(ModalAction::SetTrust(true)),
+                Some("untrust") => ModalOutcome::Emit(ModalAction::SetTrust(false)),
+                _ => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let rows = selector_rows(&self.selector, "No options");
+        crate::ui::tui::overlay_box(
+            Some("Project trust"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -882,10 +951,13 @@ impl MethodSelect {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, "No methods", &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, "No methods");
+        crate::ui::tui::overlay_box(
+            Some("Login"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -937,6 +1009,9 @@ impl ProviderSelect {
                         Ok(provider) => ModalOutcome::Emit(ModalAction::BeginLogin(provider)),
                         Err(_) => ModalOutcome::Ignore,
                     },
+                    ProviderPurpose::ApiKeyLogin => {
+                        ModalOutcome::Emit(ModalAction::OpenApiKeyDialog(id))
+                    }
                     ProviderPurpose::Logout => ModalOutcome::Emit(ModalAction::Logout(id)),
                 },
                 None => ModalOutcome::Ignore,
@@ -963,16 +1038,26 @@ impl ProviderSelect {
     /// Login cancel returns to the method selector; logout cancel closes.
     fn cancel(&self) -> ModalOutcome {
         match self.purpose {
-            ProviderPurpose::Login => ModalOutcome::Emit(ModalAction::BackToLoginMethod),
+            ProviderPurpose::Login | ProviderPurpose::ApiKeyLogin => {
+                ModalOutcome::Emit(ModalAction::BackToLoginMethod)
+            }
             ProviderPurpose::Logout => ModalOutcome::Close,
         }
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        render_selector(&self.selector, &self.empty, &mut out);
-        let _ = width;
-        out
+        let rows = selector_rows(&self.selector, &self.empty);
+        let title = match self.purpose {
+            ProviderPurpose::Login => "Select provider",
+            ProviderPurpose::ApiKeyLogin => "Store API key",
+            ProviderPurpose::Logout => "Logout",
+        };
+        crate::ui::tui::overlay_box(
+            Some(title),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -1021,6 +1106,13 @@ impl LoginDialog {
         }
     }
 
+    /// Append bracketed paste text to the manual-paste buffer.
+    pub(crate) fn push_str(&mut self, text: &str) {
+        if self.manual {
+            self.input.push_str(text.trim_end_matches(['\r', '\n']));
+        }
+    }
+
     /// Delete the last character of the manual-paste buffer.
     pub(crate) fn backspace(&mut self) {
         self.input.pop();
@@ -1040,30 +1132,101 @@ impl LoginDialog {
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = vec![Line::from(vec![
-            Span::styled("Login to ", dim()),
-            Span::raw(self.provider_name.clone()),
-        ])];
-        // Wrap each body line (notably the long OAuth URL) to the modal width so
-        // it is shown in full and stays copyable, instead of being clipped by the
-        // non-wrapping Paragraph that draws the modal.
-        let wrap_at = usize::from(width).max(1);
+        let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
+        // Wrap each body line (notably the long OAuth URL) to the box's inner
+        // width so it is shown in full and stays copyable, instead of being
+        // clipped by the non-wrapping Paragraph that draws the modal.
+        let wrap_at = usize::from(width).saturating_sub(4).max(1);
         for line in &self.lines {
             for row in crate::ui::tui::wrap_to_width(line, wrap_at) {
-                out.push(Line::from(Span::raw(row)));
+                rows.push((Line::from(Span::raw(row)), false));
             }
         }
         if self.manual {
-            out.push(Line::from(Span::styled(
-                "Or paste the authorization code / full redirect URL, then Enter:",
-                dim(),
-            )));
+            rows.push((
+                Line::from(Span::styled(
+                    "Or paste the authorization code / full redirect URL, then Enter:",
+                    dim(),
+                )),
+                false,
+            ));
             for row in crate::ui::tui::wrap_to_width(&format!("> {}", self.input), wrap_at) {
-                out.push(Line::from(Span::raw(row)));
+                rows.push((Line::from(Span::raw(row)), false));
             }
         }
-        out.push(Line::from(Span::styled("Esc to cancel", dim())));
-        out
+        let title = format!("Login — {}", self.provider_name);
+        crate::ui::tui::overlay_box(Some(&title), rows, Some("esc cancel"), usize::from(width))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ApiKeyDialog {
+    provider_id: String,
+    provider_name: String,
+    input: String,
+}
+
+impl std::fmt::Debug for ApiKeyDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyDialog")
+            .field("provider_id", &self.provider_id)
+            .field("provider_name", &self.provider_name)
+            .field("input", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ApiKeyDialog {
+    pub(crate) fn new(provider_id: &str, provider_name: &str) -> Self {
+        Self {
+            provider_id: provider_id.to_string(),
+            provider_name: provider_name.to_string(),
+            input: String::new(),
+        }
+    }
+
+    pub(crate) fn take_input(&mut self) -> String {
+        std::mem::take(&mut self.input)
+    }
+
+    pub(crate) fn push_str(&mut self, text: &str) {
+        self.input.push_str(text.trim_end_matches(['\r', '\n']));
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Enter => {
+                ModalOutcome::Emit(ModalAction::SaveApiKey(self.provider_id.clone()))
+            }
+            ModalKey::Backspace => {
+                self.input.pop();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Char(ch) => {
+                self.input.push(ch);
+                ModalOutcome::Redraw
+            }
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let masked = "•".repeat(self.input.chars().count());
+        let rows = vec![
+            (
+                Line::from(Span::styled("Paste the API key, then press Enter.", dim())),
+                false,
+            ),
+            (Line::from(Span::raw(format!("> {masked}"))), false),
+        ];
+        let title = format!("API key — {}", self.provider_name);
+        crate::ui::tui::overlay_box(
+            Some(&title),
+            rows,
+            Some("↵ save · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -1075,6 +1238,7 @@ mod tests {
         CatalogModel {
             provider,
             id: id.to_string(),
+            ctx_label: None,
         }
     }
 
@@ -1132,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_render_shows_columns_effort_and_footer() {
+    fn model_picker_render_shows_picker_idiom_and_footer() {
         let picker = ModelPicker::new(
             models(),
             "openai-codex/gpt-5.5",
@@ -1140,50 +1304,59 @@ mod tests {
             ReasoningEffort::High,
         );
         let text = render_text(&picker);
-        // Text columns, active/default labels, ctx/provider/sub badges.
-        assert!(text.contains("Default"), "{text}");
-        assert!(text.contains("current"), "{text}");
-        assert!(text.contains("[ctx:300k]"), "{text}");
-        assert!(text.contains("[OpenAI]"), "{text}");
-        assert!(text.contains("[sub]"), "{text}");
-        // Inline effort + footer.
-        assert!(text.contains("high effort"), "{text}");
-        assert!(text.contains("left/right to adjust"), "{text}");
-        assert!(
-            text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
-            "{text}"
-        );
-        // The old search prompt, title, and symbolic selection markers are gone.
+        // Bordered box, uppercase title, ◉ current marker, provider meta.
+        assert!(text.contains("SELECT MODEL"), "{text}");
+        assert!(text.contains('┌') && text.contains('└'), "{text}");
+        assert!(text.contains("◉ GPT 5.5"), "{text}");
+        assert!(text.contains("OpenAI"), "{text}");
+        assert!(text.contains("default"), "{text}");
+        // Footer: honest key hints incl. the inline effort adjust.
+        assert!(text.contains("←→ effort (high)"), "{text}");
+        assert!(text.contains("↵ select"), "{text}");
+        assert!(text.contains("s session"), "{text}");
+        assert!(text.contains("esc cancel"), "{text}");
+        // The old columns/badges and search prompt are gone.
+        assert!(!text.contains("[ctx:"), "{text}");
+        assert!(!text.contains("[sub]"), "{text}");
+        assert!(!text.contains("Default  current"), "{text}");
         assert!(!text.contains("Switch between models"), "{text}");
         assert!(!text.contains('\u{276f}'), "{text}");
         assert!(!text.contains('\u{2714}'), "{text}");
-        assert!(!text.contains("tab scope"), "{text}");
-        assert!(!text.contains("Model Name:"), "{text}");
     }
 
     #[test]
-    fn selected_modal_rows_use_foreground_accent_without_bold() {
+    fn selected_modal_rows_use_surface_fill_with_bold_label() {
         let picker = ModelPicker::new(
             models(),
             "openai-codex/gpt-5.5",
             "openai-codex/gpt-5.5",
             ReasoningEffort::High,
         );
-        let selected = picker.render(80).remove(0);
+        let lines = picker.render(80);
+        let selected = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))
+            })
+            .expect("a surface-filled selected row");
 
+        // The selection is the surface fill + a bold label — never a
+        // color-only (cyan) accent.
         assert!(
             selected
                 .spans
                 .iter()
-                .any(|span| span.style.fg == Some(Color::Cyan)),
-            "selected row should be accented: {selected:?}"
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+            "selected row label should be bold: {selected:?}"
         );
         assert!(
             selected
                 .spans
                 .iter()
-                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)),
-            "selected row must not use bold: {selected:?}"
+                .all(|span| span.style.fg != Some(ratatui::style::Color::Cyan)),
+            "selected row must not use the cyan accent: {selected:?}"
         );
     }
 
@@ -1202,24 +1375,14 @@ mod tests {
         );
         let text = render_text(&picker);
 
-        assert!(text.contains("Default  current  Opus 4.8"), "{text}");
+        assert!(text.contains("◉ Opus 4.8"), "{text}");
         assert!(text.contains("Opus 4.8"), "{text}");
         assert!(text.contains("Sonnet 4.6"), "{text}");
         assert!(text.contains("Haiku 4.5"), "{text}");
         assert!(text.contains("GPT 5.5"), "{text}");
-        assert!(text.contains("[ctx:1M]"), "{text}");
-        assert!(text.contains("[ctx:200k]"), "{text}");
-        assert!(text.contains("[ctx:300k]"), "{text}");
-        assert!(text.contains("[Anthropic] [sub]"), "{text}");
-        assert!(text.contains("[OpenAI] [sub]"), "{text}");
-        assert!(
-            text.contains("Reasoning  xhigh effort left/right to adjust"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Enter to set as default | s to use this session only | Esc to cancel"),
-            "{text}"
-        );
+        assert!(text.contains("Anthropic"), "{text}");
+        assert!(text.contains("OpenAI"), "{text}");
+        assert!(text.contains("←→ effort (xhigh)"), "{text}");
         assert!(!text.contains("Only showing models"), "{text}");
         assert!(!text.contains("claude-opus-4-8"), "{text}");
         assert!(!text.contains("GPT-5.5"), "{text}");
@@ -1233,11 +1396,11 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::Medium,
         );
-        assert!(render_text(&picker).contains("medium effort"));
+        assert!(render_text(&picker).contains("effort (medium)"));
         picker.handle_key(ModalKey::Right);
-        assert!(render_text(&picker).contains("high effort"));
+        assert!(render_text(&picker).contains("effort (high)"));
         picker.handle_key(ModalKey::Left);
-        assert!(render_text(&picker).contains("medium effort"));
+        assert!(render_text(&picker).contains("effort (medium)"));
     }
 
     #[test]
@@ -1255,11 +1418,11 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::XHigh,
         );
-        assert!(render_text(&picker).contains("xhigh effort"));
+        assert!(render_text(&picker).contains("effort (xhigh)"));
         picker.handle_key(ModalKey::Down); // onto gemini (caps at high)
-        assert!(render_text(&picker).contains("high effort"));
+        assert!(render_text(&picker).contains("effort (high)"));
         picker.handle_key(ModalKey::Up); // back to gpt-5.5
-        assert!(render_text(&picker).contains("xhigh effort"));
+        assert!(render_text(&picker).contains("effort (xhigh)"));
     }
 
     #[test]
@@ -1272,7 +1435,7 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::Medium,
         );
-        let default_row = picker
+        let rows: Vec<String> = picker
             .render(80)
             .into_iter()
             .map(|l| {
@@ -1281,25 +1444,22 @@ mod tests {
                     .map(|s| s.content.to_string())
                     .collect::<String>()
             })
-            .find(|l| l.contains("Default"))
-            .expect("a Default row");
+            .collect();
+        let default_row = rows
+            .iter()
+            .find(|l| l.contains("default"))
+            .expect("a default-tagged row");
         assert!(default_row.contains("GPT 5.5"), "{default_row}");
         assert!(
-            !default_row.contains("current"),
+            !default_row.contains('◉'),
             "default is not active: {default_row}"
         );
-        let active_row = picker
-            .render(80)
-            .into_iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.to_string())
-                    .collect::<String>()
-            })
-            .find(|l| l.contains("current"))
+        let active_row = rows
+            .iter()
+            .find(|l| l.contains('◉') && !l.contains("SELECT"))
             .expect("an active row");
         assert!(active_row.contains("Sonnet 4.6"), "{active_row}");
+        assert!(!active_row.contains("default"), "{active_row}");
     }
 
     #[test]
@@ -1320,6 +1480,41 @@ mod tests {
             picker.handle_key(ModalKey::CtrlC),
             ModalOutcome::Close
         ));
+    }
+
+    #[test]
+    fn trust_menu_marks_current_and_emits_decision() {
+        // Untrusted state: the "Do not trust" row is current and pre-selected.
+        let mut menu = TrustMenu::new(false);
+        let text: String = menu
+            .render(80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("PROJECT TRUST"), "{text}");
+        assert!(text.contains("current"), "{text}");
+        // Enter on the pre-selected untrusted row emits SetTrust(false).
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SetTrust(false))
+        );
+        // Moving up to the trust row and confirming emits SetTrust(true).
+        menu.handle_key(ModalKey::Up);
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SetTrust(true))
+        );
+        // Esc cancels.
+        assert_eq!(menu.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn trust_menu_trusted_state_preselects_trust_row() {
+        let mut menu = TrustMenu::new(true);
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SetTrust(true))
+        );
     }
 
     #[test]
@@ -1503,6 +1698,35 @@ mod tests {
     }
 
     #[test]
+    fn api_key_dialog_masks_secret_and_emits_save_without_secret() {
+        let mut dialog = ApiKeyDialog::new("openai", "OpenAI API");
+        for ch in "sk-secret".chars() {
+            dialog.handle_key(ModalKey::Char(ch));
+        }
+        let rendered = dialog
+            .render(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("sk-secret"), "{rendered}");
+        assert!(rendered.contains("•••••••••"), "{rendered}");
+        match dialog.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::SaveApiKey(provider_id)) => {
+                assert_eq!(provider_id, "openai");
+            }
+            other => panic!("expected SaveApiKey, got {other:?}"),
+        }
+        assert_eq!(dialog.take_input(), "sk-secret");
+        assert!(!format!("{dialog:?}").contains("sk-secret"));
+    }
+
+    #[test]
     fn manual_login_dialog_buffers_edits_and_takes_input() {
         let mut dialog = LoginDialog::new("anthropic", true);
         assert!(dialog.accepts_manual_input());
@@ -1550,10 +1774,17 @@ mod tests {
         }
         // The complete URL survives wrapping (char-wrapped, contiguous), so the
         // copy/paste fallback is the full, working URL rather than a clipped one.
-        let joined: String = texts.join("");
+        // Strip the box chrome (│ + one padding cell each side) before joining.
+        let joined: String = texts
+            .iter()
+            .filter_map(|text| {
+                let inner = text.strip_prefix('│')?.strip_suffix('│')?;
+                Some(inner.trim_matches(' ').to_string())
+            })
+            .collect();
         assert!(
             joined.contains(url),
-            "wrapped rows must contain the full URL"
+            "wrapped rows must contain the full URL: {joined}"
         );
     }
 }
