@@ -116,6 +116,16 @@ fn decide(abi: Option<u32>) -> SandboxStatus {
     }
 }
 
+/// Whether this platform ships a kernel sandbox backend for the shell at all.
+///
+/// Only Linux has one (Landlock). On macOS and Windows the shell always runs
+/// unconfined regardless of opt-in, so the approval UI surfaces that posture
+/// instead of implying confinement that does not exist. This reports platform
+/// capability, not whether confinement is currently opted in or enforced.
+pub(crate) fn platform_can_sandbox() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// Detect + apply: confine `command` to `policy` using the running kernel's
 /// Landlock support, returning what was actually enforced.
 pub(crate) fn confine(command: &mut Command, policy: &SandboxPolicy) -> SandboxStatus {

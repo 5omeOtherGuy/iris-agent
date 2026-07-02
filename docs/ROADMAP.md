@@ -338,6 +338,11 @@ Execution order (by impact/effort, independent of the milestone sequence):
         `pre_exec`; fail-open is never silent (notice + `tracing::warn`).
         macOS Seatbelt is not implemented — Linux-only enforcement today;
         unsupported kernels run unconfined with a surfaced notice.
+        Launch platform matrix: Linux + macOS supported, Windows unsupported
+        for now. On non-Linux platforms the shell has no kernel sandbox, so the
+        `bash` approval prompt states `unsandboxed` at the decision point
+        ([#203](https://github.com/5omeOtherGuy/iris-agent/issues/203)); macOS
+        Seatbelt confinement is the follow-up.
      2. Persistent sessions (`src/tools/bash/session.rs`): opt-in `session` id;
         `cd`/env/shell vars persist via a co-process + sentinel-marker
         protocol; lazy create, explicit `reset`/`close`, Drop closes all.

@@ -37,6 +37,7 @@ mod write;
 // The result contract lives in Tier-1 Nexus; tools produce it and re-export it
 // here so the per-tool modules can keep referring to `super::ToolOutput`.
 pub(crate) use crate::nexus::ToolOutput;
+pub(crate) use bash::platform_can_sandbox;
 pub(crate) use observe::ObservedFiles;
 pub(crate) use registry::built_in_tools;
 

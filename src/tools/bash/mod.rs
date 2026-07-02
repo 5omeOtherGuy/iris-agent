@@ -17,6 +17,8 @@ mod jobs;
 mod sandbox;
 mod session;
 
+pub(crate) use sandbox::platform_can_sandbox;
+
 // How long a bounded wait (session marker read, job finalize) may block before
 // re-checking the turn cancellation token. Small enough that a Ctrl-C is
 // observed promptly, large enough not to busy-poll.

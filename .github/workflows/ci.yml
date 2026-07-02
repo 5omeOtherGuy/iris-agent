@@ -45,3 +45,24 @@ jobs:
 
       - name: Build
         run: cargo build --locked
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # macOS is a supported launch platform (no kernel sandbox yet; the shell
+      # runs unconfined, surfaced in the approval UI). Verify the build so the
+      # Linux-only sandbox path stays cfg-gated correctly. A manual smoke pass
+      # is an ops follow-up tracked in the PR.
+      - name: Build
+        run: cargo build --locked
