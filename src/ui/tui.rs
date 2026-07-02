@@ -2101,6 +2101,38 @@ mod tests {
     }
 
     #[test]
+    fn assistant_paragraphs_keep_marker_before_following_user_message() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextEnd(
+            "First assistant paragraph.\n\nSecond assistant paragraph.".to_string(),
+        ));
+        screen.apply(UiEvent::UserMessage("Next user message.".to_string()));
+
+        let lines = rendered_lines(&mut screen, 100, 24);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        let second_assistant = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("Second assistant paragraph."))
+            .expect("second assistant paragraph");
+        assert!(
+            second_assistant.trim_start().starts_with("› "),
+            "assistant paragraphs need the visible marker before user text: {rendered}"
+        );
+
+        let next_user = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("Next user message."))
+            .expect("next user message");
+        assert!(
+            !next_user.trim_start().starts_with("› "),
+            "user message must stay unmarked: {rendered}"
+        );
+    }
+
+    #[test]
     fn working_indicator_renders_all_ping_pong_led_frames() {
         let frames: Vec<String> = (0..WORKING_FRAMES.len())
             .map(|frame| {
