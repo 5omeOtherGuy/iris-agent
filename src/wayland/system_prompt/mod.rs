@@ -174,7 +174,22 @@ fn load_repo_fragments(workspace: &Path) -> Vec<Fragment> {
 /// triggers on exactly the dir the loader would read.
 fn repo_fragments_dir(workspace: &Path) -> Option<PathBuf> {
     let root = crate::tools::path::workspace_root(workspace).ok()?;
-    crate::tools::path::resolve_existing(&root, ".iris/fragments").ok()
+    let resolved = crate::tools::path::resolve_existing(&root, ".iris/fragments").ok()?;
+    // Enforce workspace containment UNCONDITIONALLY, independent of the
+    // tool-path security opt-in. `resolve_existing` only confines paths when
+    // `IRIS_SECURITY_OPT_IN` is set (or under `cfg(test)`), so in the shipped
+    // default runtime a hostile repo could point `.iris/fragments` at an
+    // arbitrary host directory and have its `.md` files folded into the prompt.
+    // Both `resolved` and `root` are canonicalized; fail closed on any escape.
+    contain_in_workspace(resolved, &root)
+}
+
+/// Keep `resolved` only when it stays inside the canonicalized workspace
+/// `root`, else drop it. Applied unconditionally by [`repo_fragments_dir`] so
+/// repo-fragment containment does not depend on the tool-path security opt-in;
+/// both arguments must already be canonicalized.
+fn contain_in_workspace(resolved: PathBuf, root: &Path) -> Option<PathBuf> {
+    resolved.starts_with(root).then_some(resolved)
 }
 
 /// Whether the repo ships a `.iris/fragments` dir that would be folded into the

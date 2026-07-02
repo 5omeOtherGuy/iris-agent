@@ -68,6 +68,13 @@ impl<'a, P> ModelSwitch<'a, P> {
     pub(crate) fn set_system_prompt(&mut self, prompt: String) {
         self.system_prompt = prompt;
     }
+
+    /// The system prompt currently used to rebuild providers. `/trust` snapshots
+    /// this before a rebuild so it can restore it if the rebuild fails, keeping
+    /// the session prompt in sync with the still-live provider.
+    pub(crate) fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
 }
 
 /// Route a submitted line through the shared `/model` / `/reasoning` handler.

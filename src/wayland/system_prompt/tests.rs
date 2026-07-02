@@ -766,6 +766,37 @@ fn untrusted_workspace_skips_repo_fragments_but_keeps_project_docs() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn repo_fragment_containment_rejects_out_of_root_symlink_in_production() {
+    use std::os::unix::fs::symlink;
+    // Production defense: repo-fragment containment must hold in the shipped
+    // default runtime, where `crate::tools::path::resolve_existing` does NOT
+    // confine paths (it only confines under `IRIS_SECURITY_OPT_IN`/`cfg(test)`).
+    // Test the containment predicate directly with a resolved dir outside the
+    // workspace root, so it stays meaningful even though cfg(test) enables the
+    // tool-path sandbox globally and would mask the gap in `assemble`.
+    let outside = temp_dir();
+    let root = temp_dir();
+    let escape = root.path.join("escape");
+    symlink(&outside.path, &escape).unwrap();
+    // Canonicalize as the loader does; the resolved dir points outside root.
+    let resolved = escape.canonicalize().unwrap();
+    let canonical_root = root.path.canonicalize().unwrap();
+    assert!(
+        contain_in_workspace(resolved, &canonical_root).is_none(),
+        "a resolved dir escaping the workspace root must be rejected unconditionally"
+    );
+    // An in-root dir is accepted (the normal case still works).
+    let inside = root.path.join("inside");
+    fs::create_dir_all(&inside).unwrap();
+    let resolved_inside = inside.canonicalize().unwrap();
+    assert_eq!(
+        contain_in_workspace(resolved_inside.clone(), &canonical_root),
+        Some(resolved_inside)
+    );
+}
+
 #[test]
 fn repo_provides_fragments_is_false_without_the_dir() {
     let ws = temp_dir();

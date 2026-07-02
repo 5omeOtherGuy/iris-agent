@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`AGENTS.md`/`CLAUDE.md`) stay ungated. Added the `/trust` command to change
   the decision mid-session (re-assembles the prompt and rebuilds the provider at
   the turn boundary).
+  - Hardened the gate: repo `.iris/fragments` resolution now enforces workspace
+    containment unconditionally (independent of the tool-path security opt-in),
+    so the shipped default runtime rejects a `.iris/fragments` symlink escaping
+    the workspace instead of folding host files into the prompt.
+  - `/trust` now rebuilds the provider before committing: on a rebuild failure it
+    restores the prior prompt and reports the failure without a success notice
+    (untrust fails closed), instead of claiming the prompt changed while the old
+    prompt stays live.
 
 - Added root-level product and design-system briefs (`PRODUCT.md` and
   `DESIGN.md`) and linked them from the README documentation index.
