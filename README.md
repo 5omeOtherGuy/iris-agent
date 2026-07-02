@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/iris-agent/main/instal
 
 Override the install directory with `IRIS_INSTALL_DIR` or pin a version with
 `IRIS_VERSION=vX.Y.Z`. To install manually, download the
-`iris-<target>.tar.gz` archive and its `.sha256` sidecar from the
+`iris-agent-<target>.tar.gz` archive and its `.sha256` sidecar from the
 [latest release](https://github.com/5omeOtherGuy/iris-agent/releases/latest),
 verify the checksum, extract, and move `iris` onto your `PATH`.
 

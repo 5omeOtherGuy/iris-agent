@@ -9,10 +9,14 @@
 #   IRIS_VERSION       release tag to install (default: latest)
 #
 # POSIX sh; no bashisms. Artifact names match the cargo-dist config in
-# Cargo.toml (`iris-<target>.tar.gz` + `.tar.gz.sha256`).
+# Cargo.toml, which names archives after the cargo package (`iris-agent`), not
+# the binary (`iris`): `iris-agent-<target>.tar.gz` + `.tar.gz.sha256`.
 set -eu
 
 REPO="5omeOtherGuy/iris-agent"
+# Package name, used for the release archive filename (cargo-dist names archives
+# after the package). The binary inside the archive is $BIN.
+PKG="iris-agent"
 BIN="iris"
 
 say() { printf 'install: %s\n' "$1" >&2; }
@@ -103,7 +107,7 @@ main() {
 	target=$(detect_target)
 	version=$(resolve_version)
 	dir=$(install_dir)
-	archive="$BIN-$target.tar.gz"
+	archive="$PKG-$target.tar.gz"
 	base="https://github.com/$REPO/releases/download/$version"
 
 	say "installing $BIN $version ($target) to $dir"
@@ -119,9 +123,16 @@ main() {
 	found=$(find "$workdir" -type f -name "$BIN" | head -n1)
 	[ -n "$found" ] || err "binary '$BIN' not found in archive"
 
+	# Stage the verified binary into a temp file inside the install directory so
+	# the final install is an atomic same-filesystem rename. Moving straight from
+	# the mktemp workdir can cross filesystems (copy+unlink), where an interrupt
+	# could leave a truncated binary at the destination.
 	mkdir -p "$dir"
-	chmod +x "$found"
-	mv -f "$found" "$dir/$BIN"
+	staged="$dir/.$BIN.tmp.$$"
+	trap 'rm -rf "$workdir"; rm -f "$staged"' EXIT INT TERM
+	cp "$found" "$staged"
+	chmod +x "$staged"
+	mv -f "$staged" "$dir/$BIN"
 
 	say "installed $dir/$BIN"
 	case ":$PATH:" in

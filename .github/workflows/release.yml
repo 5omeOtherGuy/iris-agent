@@ -6,9 +6,13 @@
 # `[workspace.metadata.dist]` in Cargo.toml.
 #
 # This file delegates every step to the pinned `dist` CLI rather than
-# hand-rolling a build matrix. Regenerate the canonical, fully hash-pinned
-# version with `dist init` + `dist generate` once the dist CLI is available in
-# CI; keep `dist-version` in sync with `cargo-dist-version` in Cargo.toml.
+# hand-rolling a build matrix. `dist` is installed with `cargo install
+# cargo-dist --locked --version ${DIST_VERSION}` rather than an unpinned
+# `curl | sh`: cargo pins the exact version and verifies the crate against the
+# immutable crates.io registry checksum, and `--locked` reproduces its
+# dependency tree. Keep `DIST_VERSION` in sync with `cargo-dist-version` in
+# Cargo.toml. Regenerate the canonical version with `dist init` + `dist
+# generate` once the dist CLI is available in CI.
 name: release
 
 on:
@@ -32,8 +36,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
       - name: Install dist
-        run: curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
+        run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Plan
         id: plan
         run: dist plan --output-format=json > dist-manifest.json
@@ -59,6 +65,10 @@ jobs:
             runner: macos-latest
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    # Build prebuilt release binaries with the dist marker so `iris update`
+    # self-replaces (build.rs turns IRIS_DIST=1 into the `iris_dist` cfg).
+    env:
+      IRIS_DIST: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -68,7 +78,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Install dist
-        run: curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
+        run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Build artifacts
         run: dist build --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest.json
       - name: Upload artifacts
@@ -88,8 +98,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
       - name: Install dist
-        run: curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
+        run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:

@@ -19,11 +19,22 @@ pub enum UpdateStrategy {
     CargoInstall,
 }
 
-/// Select the update strategy for this build. Prebuilt release binaries are
-/// built with the `self-update` feature and self-replace; every other build
+/// Select the update strategy for this build. Prebuilt release binaries carry
+/// both the `self-update` feature *and* the `iris_dist` build marker (set only
+/// by the release pipeline via `IRIS_DIST=1`, see `build.rs`), so they
+/// self-replace. Any other build — including a source build with
+/// `--all-features`, which turns the feature on but leaves the marker unset —
 /// falls back to the cargo path.
 pub fn update_strategy() -> UpdateStrategy {
-    if cfg!(feature = "self-update") {
+    select_strategy(cfg!(iris_dist), cfg!(feature = "self-update"))
+}
+
+/// Pure decision function behind [`update_strategy`], split out so the gating
+/// logic is unit-testable without depending on this build's cfg flags. A
+/// prebuilt release binary requires both the dist marker and the compiled
+/// self-update path; everything else uses the cargo fallback.
+fn select_strategy(dist_build: bool, self_update_feature: bool) -> UpdateStrategy {
+    if dist_build && self_update_feature {
         UpdateStrategy::SelfReplace
     } else {
         UpdateStrategy::CargoInstall
@@ -35,13 +46,14 @@ pub fn update_strategy() -> UpdateStrategy {
 #[allow(dead_code)]
 pub const TARGET: &str = env!("IRIS_TARGET");
 
-/// Release archive name for a target triple. Matches the cargo-dist
-/// `unix-archive = ".tar.gz"` naming (`iris-<target>.tar.gz`).
+/// Release archive name for a target triple. cargo-dist names archives after
+/// the cargo package (`iris-agent`), not the binary (`iris`), so this matches
+/// its `unix-archive = ".tar.gz"` output (`iris-agent-<target>.tar.gz`).
 // Consumed by the feature-gated updater and the unit tests; unused in a plain
 // source build, which is expected.
 #[allow(dead_code)]
 pub fn asset_name(target: &str) -> String {
-    format!("iris-{target}.tar.gz")
+    format!("iris-agent-{target}.tar.gz")
 }
 
 /// Checksum sidecar name for an archive, matching cargo-dist's
@@ -222,18 +234,26 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(not(feature = "self-update"))]
-    fn strategy_is_cargo_install_without_feature() {
-        // The committed (source) build has `self-update` off, so the default
-        // strategy is the cargo fallback.
-        assert_eq!(update_strategy(), UpdateStrategy::CargoInstall);
+    fn select_strategy_requires_dist_marker_and_feature() {
+        // Only a prebuilt release binary (dist marker + self-update feature)
+        // self-replaces. A source build with `--all-features` sets the feature
+        // but not the marker, so it must still use the cargo fallback.
+        assert_eq!(select_strategy(false, false), UpdateStrategy::CargoInstall);
+        assert_eq!(select_strategy(false, true), UpdateStrategy::CargoInstall);
+        assert_eq!(select_strategy(true, false), UpdateStrategy::CargoInstall);
+        assert_eq!(select_strategy(true, true), UpdateStrategy::SelfReplace);
     }
 
     #[test]
-    #[cfg(feature = "self-update")]
-    fn strategy_is_self_replace_with_feature() {
-        // Prebuilt release binaries are built with the feature and self-replace.
-        assert_eq!(update_strategy(), UpdateStrategy::SelfReplace);
+    fn update_strategy_matches_build_configuration() {
+        // In every build config, `update_strategy()` must agree with the pure
+        // gate over this build's actual cfg flags.
+        let expected = if cfg!(all(iris_dist, feature = "self-update")) {
+            UpdateStrategy::SelfReplace
+        } else {
+            UpdateStrategy::CargoInstall
+        };
+        assert_eq!(update_strategy(), expected);
     }
 
     #[test]
@@ -247,11 +267,13 @@ mod tests {
 
     #[test]
     fn asset_and_checksum_names_match_cargo_dist() {
+        // cargo-dist names archives after the package (`iris-agent`), not the
+        // binary (`iris`); the checksum sidecar appends `.sha256`.
         let archive = asset_name("x86_64-unknown-linux-gnu");
-        assert_eq!(archive, "iris-x86_64-unknown-linux-gnu.tar.gz");
+        assert_eq!(archive, "iris-agent-x86_64-unknown-linux-gnu.tar.gz");
         assert_eq!(
             checksum_name(&archive),
-            "iris-x86_64-unknown-linux-gnu.tar.gz.sha256"
+            "iris-agent-x86_64-unknown-linux-gnu.tar.gz.sha256"
         );
     }
 
