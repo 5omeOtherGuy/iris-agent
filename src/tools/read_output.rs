@@ -141,7 +141,11 @@ mod tests {
             "window must stay near the 50KB cap, got {}",
             out.content.len()
         );
-        assert!(out.content.contains("50KB limit"), "{}", &out.content[out.content.len() - 200..]);
+        assert!(
+            out.content.contains("50KB limit"),
+            "{}",
+            &out.content[out.content.len() - 200..]
+        );
     }
 
     #[test]

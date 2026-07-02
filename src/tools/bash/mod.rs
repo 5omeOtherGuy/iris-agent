@@ -766,7 +766,11 @@ mod tests {
 
         assert!(out.contains("LAST-LINE"), "tail must survive");
         assert!(!out.contains("FIRST-LINE"), "head must be dropped");
-        assert!(out.contains("output truncated: showing the last"), "{}", &out[..200]);
+        assert!(
+            out.contains("output truncated: showing the last"),
+            "{}",
+            &out[..200]
+        );
         assert!(out.contains("earlier line(s) dropped"), "{}", &out[..200]);
     }
 

@@ -49,8 +49,9 @@ pub(super) fn execute(
     args: &Value,
     observed: &mut ObservedFiles,
 ) -> Result<super::ToolOutput> {
-    let input: EditInput = serde_json::from_value(args.clone())
-        .context("edit tool arguments must include file_path plus old_string/new_string or edits")?;
+    let input: EditInput = serde_json::from_value(args.clone()).context(
+        "edit tool arguments must include file_path plus old_string/new_string or edits",
+    )?;
     edit(root, &input, observed)
 }
 
@@ -599,11 +600,7 @@ mod tests {
         // The first edit grows its line; the second edit's match positions are
         // still those of the ORIGINAL content, not the shifted intermediate.
         fs::write(dir.path.join("o.txt"), "aa\nbb\n").unwrap();
-        run_input(
-            &root,
-            &batch("o.txt", &[("aa", "aaaaaaaa"), ("bb", "BB")]),
-        )
-        .unwrap();
+        run_input(&root, &batch("o.txt", &[("aa", "aaaaaaaa"), ("bb", "BB")])).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path.join("o.txt")).unwrap(),
             "aaaaaaaa\nBB\n"
@@ -675,7 +672,10 @@ mod tests {
         let mut all = batch("r.txt", &[("one", "ONE")]);
         all.replace_all = true;
         let err = run_input(&root, &all).unwrap_err().to_string();
-        assert!(err.contains("replace_all is not supported with edits"), "{err}");
+        assert!(
+            err.contains("replace_all is not supported with edits"),
+            "{err}"
+        );
     }
 
     #[test]

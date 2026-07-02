@@ -2210,6 +2210,84 @@ fn provider_context_overflow_compacts_and_retries_once() -> Result<()> {
 }
 
 #[test]
+fn harness_accumulates_and_persists_the_usage_ledger_across_resume() -> Result<()> {
+    fn usage(input: u64, output: u64, cache_read: u64) -> crate::nexus::ProviderUsage {
+        crate::nexus::ProviderUsage {
+            provider: "fake".into(),
+            model: "fake-1".into(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cache_read,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: input + output,
+            cache_creation: None,
+        }
+    }
+    let turn_with_usage = |text: &str, u: crate::nexus::ProviderUsage| AssistantTurn {
+        usage: Some(u),
+        ..AssistantTurn::text(text)
+    };
+
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(turn_with_usage("one", usage(1000, 50, 200))),
+        Ok(turn_with_usage("two", usage(2000, 100, 1500))),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("a", &frontend, &frontend, &CancellationToken::new()))?;
+    block_on(harness.submit_turn("b", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let totals = harness.usage_totals();
+    assert_eq!(totals.turns, 2);
+    assert_eq!(totals.input_tokens, 3000);
+    assert_eq!(totals.output_tokens, 150);
+    assert_eq!(totals.cache_read_input_tokens, 1700);
+    assert_eq!(harness.last_usage().unwrap().input_tokens, 2000);
+    drop(harness);
+
+    // The ledger is persisted: a resumed harness over the same log continues
+    // the cumulative totals instead of starting from zero.
+    let resumed_provider = FakeProvider::new(vec![]);
+    let resumed_agent = Agent::new(resumed_provider, crate::tools::built_in_tools());
+    let resumed_log = crate::session::SessionLog::resume(&log_path)?;
+    let resumed = Harness::resumed(
+        resumed_agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(resumed_log),
+        0,
+        None,
+    );
+    let totals = resumed.usage_totals();
+    assert_eq!(totals.turns, 2, "resumed ledger continues");
+    assert_eq!(totals.input_tokens, 3000);
+    assert!(
+        resumed.last_usage().is_none(),
+        "last-turn usage is per-process"
+    );
+
+    // The on-disk ledger alone reproduces the totals (what a resume reads).
+    let from_disk = crate::session::read_usage_totals(&log_path);
+    assert_eq!(from_disk.turns, 2);
+    assert_eq!(from_disk.input_tokens, 3000);
+    assert_eq!(from_disk.output_tokens, 150);
+    Ok(())
+}
+
+#[test]
 fn provider_non_overflow_error_is_not_retried() -> Result<()> {
     let workspace = test_workspace()?;
     let root = test_workspace()?;
@@ -2226,13 +2304,9 @@ fn provider_non_overflow_error_is_not_retried() -> Result<()> {
     );
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
-    let error = block_on(harness.submit_turn(
-        "hi",
-        &frontend,
-        &frontend,
-        &CancellationToken::new(),
-    ))
-    .unwrap_err();
+    let error =
+        block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))
+            .unwrap_err();
 
     assert!(error.to_string().contains("boom"), "{error:#}");
     assert_eq!(

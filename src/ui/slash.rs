@@ -71,6 +71,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/usage",
+        description: "Show token usage and cost for the last turn and session",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/copy",
         description: "Copy the last assistant reply to the clipboard",
         action: SlashAction::Submit,

@@ -20,10 +20,12 @@ use tracing::Instrument;
 
 use crate::handles::HandleStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, SteeringSource,
-    ToolEnv,
+    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderUsage, Role,
+    SteeringSource, ToolEnv,
 };
-use crate::session::{SessionLog, estimate_tokens, message_token_estimate};
+use crate::session::{
+    SessionLog, UsageTotals, estimate_tokens, message_token_estimate, read_usage_totals,
+};
 use crate::tools::ToolState;
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
@@ -65,6 +67,12 @@ pub(crate) struct Harness<P> {
     // typed while the turn ran; the bare agent drains it at safe injection
     // points. Forwarded per-turn as a borrow; never owned by the bare agent.
     steering: Option<Rc<dyn SteeringSource>>,
+    // Cumulative provider-reported token ledger for this session (issue #206).
+    // Seeded from the log's persisted `usage` entries (so a resumed session's
+    // ledger continues) and extended after every provider turn.
+    usage_totals: UsageTotals,
+    // The most recent provider turn's usage, for the on-demand per-turn readout.
+    last_usage: Option<ProviderUsage>,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -138,6 +146,11 @@ impl<P: ChatProvider> Harness<P> {
         let output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
+        // Continue the persisted cumulative usage ledger (zero for a new file).
+        let usage_totals = session
+            .as_ref()
+            .map(|log| read_usage_totals(log.path()))
+            .unwrap_or_default();
         Self {
             agent,
             workspace,
@@ -148,6 +161,8 @@ impl<P: ChatProvider> Harness<P> {
             budget,
             output_store,
             steering: None,
+            usage_totals,
+            last_usage: None,
         }
     }
 
@@ -185,6 +200,11 @@ impl<P: ChatProvider> Harness<P> {
         self.output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
+        self.usage_totals = session
+            .as_ref()
+            .map(|log| read_usage_totals(log.path()))
+            .unwrap_or_default();
+        self.last_usage = None;
         self.session = session;
         self.persisted = resumed;
         self.entry_ids = vec![None; resumed];
@@ -301,15 +321,55 @@ impl<P: ChatProvider> Harness<P> {
             // exclusive path. The harness env carries none.
             output_sink: None,
         };
+        // Capture provider-reported usage as the turn's events stream through,
+        // so the harness owns the session ledger without any front-end wiring.
+        let capture = UsageCapture {
+            inner: obs,
+            seen: RefCell::new(Vec::new()),
+        };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
         let result = self
             .agent
-            .submit_turn(prompt, obs, gate, &env, token, self.steering.as_deref())
+            .submit_turn(
+                prompt,
+                &capture,
+                gate,
+                &env,
+                token,
+                self.steering.as_deref(),
+            )
             .instrument(tracing::info_span!("turn"))
             .await;
         self.persist_new_messages();
+        self.record_usage(capture.seen.into_inner());
         result
+    }
+
+    /// Fold one turn's provider usage reports into the cumulative ledger and
+    /// persist each as a `usage` entry. Best-effort like message persistence:
+    /// a write failure is logged, never fatal to the session.
+    fn record_usage(&mut self, reports: Vec<ProviderUsage>) {
+        for usage in reports {
+            self.usage_totals.add(&usage);
+            if let Some(log) = self.session.as_mut()
+                && let Err(error) = log.append_usage(&usage)
+            {
+                tracing::warn!(error = %format!("{error:#}"), "failed to persist usage entry");
+            }
+            self.last_usage = Some(usage);
+        }
+    }
+
+    /// Cumulative provider-reported token totals for this session, including
+    /// turns persisted before a resume.
+    pub(crate) fn usage_totals(&self) -> UsageTotals {
+        self.usage_totals
+    }
+
+    /// The most recent provider turn's reported usage, when any turn has run.
+    pub(crate) fn last_usage(&self) -> Option<&ProviderUsage> {
+        self.last_usage.as_ref()
     }
 
     /// Append messages not yet written to the transcript log, advancing the
@@ -524,6 +584,26 @@ impl<P: ChatProvider> Harness<P> {
             from_id: self.entry_ids[start].clone()?,
             to_id: self.entry_ids[end - 1].clone()?,
         })
+    }
+}
+
+/// Pass-through observer that also captures each provider turn's reported
+/// usage, so the harness can extend its session ledger after the turn without
+/// requiring any front-end to forward events back (issue #206).
+struct UsageCapture<'a> {
+    inner: &'a dyn AgentObserver,
+    seen: RefCell<Vec<ProviderUsage>>,
+}
+
+impl AgentObserver for UsageCapture<'_> {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if let AgentEvent::ProviderTurnCompleted {
+            usage: Some(usage), ..
+        } = &event
+        {
+            self.seen.borrow_mut().push(usage.clone());
+        }
+        self.inner.on_event(event)
     }
 }
 

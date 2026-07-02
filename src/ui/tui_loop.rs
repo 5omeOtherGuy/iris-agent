@@ -594,6 +594,11 @@ fn route_command<P: ChatProvider>(
             apply_notices(tui, crate::cli::session_info_lines(harness, switch));
             Ok(RouteOutcome::Consumed)
         }
+        "/usage" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            apply_notices(tui, crate::cli::usage_info_lines(harness, switch));
+            Ok(RouteOutcome::Consumed)
+        }
         "/copy" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             apply_notices(tui, crate::cli::copy_command_lines(harness));

@@ -10,7 +10,9 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
 use crate::config;
+use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_capabilities;
+use crate::mimir::model_catalog::{self, AuthStatus};
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
 use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider, Message, Role};
 use crate::session::SessionLog;
@@ -424,6 +426,95 @@ pub(crate) fn session_info_lines<P: ChatProvider>(
         ));
     }
     lines
+}
+
+/// `/usage`: on-demand per-turn and cumulative token/cost readout (issue
+/// #206). Numbers are real provider-reported usage (not the chars/4 context
+/// estimate). A dollar cost is shown only when the active lane is API-metered
+/// (API-key credential) AND the model has a verified published price; OAuth
+/// subscription lanes have no marginal dollar price, so they show tokens and
+/// cache share only -- a fabricated dollar figure is never shown.
+pub(crate) fn usage_info_lines<P: ChatProvider>(
+    harness: &Harness<P>,
+    switch: &Option<ModelSwitch<'_, P>>,
+) -> Vec<String> {
+    let selection = switch.as_ref().map(|sw| sw.selection());
+    let pricing = selection.and_then(priced_lane);
+    let cache_share = |read: u64, input: u64| {
+        if input > 0 {
+            format!(", {}% cache hit", read.saturating_mul(100) / input)
+        } else {
+            String::new()
+        }
+    };
+
+    let mut lines = Vec::new();
+    match harness.last_usage() {
+        Some(usage) => {
+            let cost = pricing
+                .map(|price| format!(", ~${:.4}", price.cost(usage)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "last turn: {} in / {} out{}{cost}",
+                usage.input_tokens,
+                usage.output_tokens,
+                cache_share(usage.cache_read_input_tokens, usage.input_tokens),
+            ));
+        }
+        None => lines.push("last turn: no provider usage reported yet".to_string()),
+    }
+
+    let totals = harness.usage_totals();
+    if totals.turns == 0 {
+        lines.push("session: no usage recorded yet".to_string());
+    } else {
+        let cost = pricing
+            .map(|price| format!(", ~${:.4}", price.cost_of_totals(&totals)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "session: {} in / {} out over {} provider turn(s){}{cost}",
+            totals.input_tokens,
+            totals.output_tokens,
+            totals.turns,
+            cache_share(totals.cache_read_input_tokens, totals.input_tokens),
+        ));
+    }
+
+    // Say WHY no dollar figure appears, so tokens-only is legible honesty
+    // rather than a missing feature.
+    if pricing.is_none()
+        && let Some(selection) = selection
+    {
+        let auth = AuthStore::from_env().ok();
+        let status = auth
+            .as_ref()
+            .map(|auth| model_catalog::provider_status(auth, selection.provider));
+        let reason = match status {
+            Some(AuthStatus::StoredOAuth) | Some(AuthStatus::ClaudeCode) => {
+                "subscription lane has no marginal dollar price; showing tokens only"
+            }
+            Some(AuthStatus::StoredApiKey) | Some(AuthStatus::EnvApiKey) => {
+                "no verified price for this model; showing tokens only"
+            }
+            _ => "cost unavailable; showing tokens only",
+        };
+        lines.push(format!("cost: {reason}"));
+    }
+    lines
+}
+
+/// Published pricing for the active selection, only when its credential lane
+/// is API-metered. OAuth/subscription lanes always resolve to `None`.
+fn priced_lane(selection: &ModelSelection) -> Option<model_catalog::ModelPricing> {
+    let auth = AuthStore::from_env().ok()?;
+    match model_catalog::provider_status(&auth, selection.provider) {
+        AuthStatus::StoredApiKey | AuthStatus::EnvApiKey => model_catalog::pricing(&format!(
+            "{}/{}",
+            selection.provider.as_str(),
+            selection.model
+        )),
+        _ => None,
+    }
 }
 
 /// Read-only `/model` view: current provider/model/reasoning + supported levels.
