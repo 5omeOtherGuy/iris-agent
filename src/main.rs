@@ -18,6 +18,7 @@ mod handles;
 mod mimir;
 mod nexus;
 mod process_group;
+mod selfupdate;
 mod session;
 mod signals;
 mod telemetry;
@@ -401,6 +402,26 @@ fn update_args() -> &'static [&'static str] {
 }
 
 fn update_agent() -> Result<()> {
+    match selfupdate::update_strategy() {
+        selfupdate::UpdateStrategy::SelfReplace => update_self_replace(),
+        selfupdate::UpdateStrategy::CargoInstall => update_via_cargo(),
+    }
+}
+
+/// Download-and-replace path, compiled into prebuilt release binaries.
+#[cfg(feature = "self-update")]
+fn update_self_replace() -> Result<()> {
+    selfupdate::run()
+}
+
+/// Unreachable in source builds: `update_strategy()` only returns `SelfReplace`
+/// when the `self-update` feature is on, which also compiles `selfupdate::run`.
+#[cfg(not(feature = "self-update"))]
+fn update_self_replace() -> Result<()> {
+    update_via_cargo()
+}
+
+fn update_via_cargo() -> Result<()> {
     println!("Updating Iris from {UPDATE_REPO} ...");
     let status = Command::new("cargo")
         .args(update_args())

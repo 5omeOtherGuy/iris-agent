@@ -1,9 +1,11 @@
 # release-plz configuration. https://release-plz.dev/docs/config
 [workspace]
-# Do not publish to crates.io; only maintain version + CHANGELOG via release PR.
-# Flip to a real publish later by adding a CARGO_REGISTRY_TOKEN secret and a
-# `release` command step.
-publish = false
+# Publish to crates.io on release. This requires a `CARGO_REGISTRY_TOKEN`
+# secret in the repository (an ops follow-up); until it is set, the `release`
+# job in .github/workflows/release-plz.yml is skipped, so no publish is
+# attempted. Prebuilt binaries (cargo-dist) are the primary install path; the
+# crates.io publish keeps `cargo install iris-agent` working too.
+publish = true
 # Keep a Keep-a-Changelog style CHANGELOG.md generated from conventional commits.
 changelog_update = true
 git_release_enable = true
