@@ -323,7 +323,11 @@ fn bash_command_is_destructive(args: &Value) -> bool {
     ];
     let token_danger = lower
         .split(|c: char| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '(' | ')' | '`'))
-        .any(|token| DANGER_TOKENS.contains(&token));
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            let command = token.rsplit('/').next().unwrap_or(token);
+            DANGER_TOKENS.contains(&command) || command.starts_with("mkfs.")
+        });
     if token_danger {
         return true;
     }

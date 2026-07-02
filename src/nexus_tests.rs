@@ -2189,14 +2189,17 @@ fn invariant_2_destructive_bash_reprompts_despite_project_grants() -> Result<()>
     // grant are stored; the destructive floor still forces the prompt.
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![
-        Ok(single_call_turn("bash", json!({ "command": "rm -rf sub" }))),
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "/bin/rm -rf sub" }),
+        )),
         Ok(AssistantTurn::text("done")),
     ]);
     let mut harness = test_harness_with_policy(
         provider,
         &workspace.path,
         crate::tools::built_in_tools(),
-        policy(&[], &["rm -rf sub"], &["rm"]),
+        policy(&[], &["/bin/rm -rf sub"], &["/bin/rm"]),
         None,
     );
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
@@ -2225,6 +2228,44 @@ fn invariant_2_destructive_bash_reprompts_despite_project_grants() -> Result<()>
 }
 
 #[test]
+fn invariant_2_prefix_grant_does_not_auto_approve_destructive_compound_suffix() -> Result<()> {
+    // A safe-looking granted prefix must not auto-approve a compound command
+    // whose suffix is path-qualified destructive bash (`/bin/rm`).
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "git status; /bin/rm -rf sub" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        policy(&[], &[], &["git"]),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("status", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "a destructive suffix under a granted prefix must still prompt"
+    );
+    assert!(
+        frontend
+            .events
+            .borrow()
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::ToolAutoApproved(_))),
+        "a granted prefix cannot bypass the destructive floor"
+    );
+    Ok(())
+}
+
+#[test]
 fn invariant_2_allow_project_on_a_destructive_call_is_never_persisted() -> Result<()> {
     // Defense in depth: even if a front-end answers AllowProject for a
     // destructive call (the option is not offered), the call runs once and no
@@ -2232,8 +2273,14 @@ fn invariant_2_allow_project_on_a_destructive_call_is_never_persisted() -> Resul
     let workspace = test_workspace()?;
     fs::create_dir_all(workspace.path.join("sub"))?;
     let provider = FakeProvider::new(vec![
-        Ok(single_call_turn("bash", json!({ "command": "rm -rf sub" }))),
-        Ok(single_call_turn("bash", json!({ "command": "rm -rf sub" }))),
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "mkfs.ext4 /dev/sdz" }),
+        )),
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "mkfs.ext4 /dev/sdz" }),
+        )),
         Ok(AssistantTurn::text("done")),
     ]);
     let grants = std::rc::Rc::new(RefCell::new(Vec::new()));
