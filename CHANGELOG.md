@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- System-prompt fragments are now fully internal (ADR-0026): the prompt is
+  assembled only from the fragments built into the binary plus
+  `AGENTS.md`/`CLAUDE.md` project docs, cwd, and date. Iris no longer
+  materializes defaults into `~/.iris/fragments` and no longer loads `.md`
+  fragments from `~/.iris/fragments` or a repo's `<cwd>/.iris/fragments`,
+  removing the system-prompt-injection surface entirely. The per-project
+  fragment-trust gate, its first-run prompt, and the fragment meaning of
+  `/trust` are gone with it. Migration: previously materialized
+  `~/.iris/fragments/*.md` files are left in place but are inert (never read);
+  delete them freely. Users who relied on custom fragments should move that
+  steering into `AGENTS.md`.
+
+### Added
+
+- Repurposed the per-cwd trust store as a persistent project permission policy
+  (ADR-0027, issue #209). `~/.iris/trust.json` (HOME-owned, canonical-directory
+  keyed, `IRIS_TRUST_PATH` override) now stores per-project grants: per-tool
+  approval defaults for `write`/`edit`, per-command `bash` allows (exact
+  command or prefix), and a stored (not yet enforced) sandbox posture. A new
+  `[p]` ("always for this project") approval option persists a grant, so
+  granted tools/commands auto-approve across sessions in that directory;
+  `/trust` becomes the project-permissions editor (toggle `write`/`edit`,
+  revoke bash grants). Precedence is session > project > global default.
+  Invariants: the store is never read from a repo-committed file (a clone
+  cannot pre-approve its own tools); destructive commands (`rm`, `dd`, ...)
+  always re-prompt and can never be granted; policy loosens only through
+  deliberate user action. Legacy tri-state `"trusted"`/`"untrusted"` entries in
+  `trust.json` are ignored (fail closed) and overwritten on the next grant.
+
 ### Fixed
 
 - Corrected install documentation to state that prebuilt binaries, `install.sh`,
@@ -54,8 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`cat log | iris -p "explain this failure"`); on a TTY there is nothing to
   merge. Print mode is non-interactive and never prompts: gated tools are denied
   by default, or auto-approved with `--approve`, so a pipe/CI run cannot hang.
-  It does not prompt for project trust (defaults untrusted per issue #202) and
-  persists its session like a normal run.
+  It persists its session like a normal run. (The project-trust default
+  mentioned here was removed by ADR-0026; persisted project permission grants,
+  ADR-0027, apply headless too.)
 
 - Added a per-project trust gate for repo-provided Iris resources (issue #202):
   system-prompt fragments under `<cwd>/.iris/fragments` now load only for a

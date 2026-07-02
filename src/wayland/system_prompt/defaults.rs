@@ -1,21 +1,17 @@
-//! Shipped default fragment bodies.
+//! Shipped fragment bodies: the single source of truth for the system prompt
+//! (ADR-0026).
 //!
-//! This is data, not logic: one entry per non-generated block from the
-//! authoritative `system-prompt.md`, body verbatim. These defaults are
-//! materialized into `~/.iris/fragments` on startup (if absent) so a user can
-//! edit/reorder them, and they double as the in-memory fallback when no
-//! fragment files exist on disk at all.
+//! This is data, not logic: one entry per non-generated block, body verbatim.
+//! Fragments are fully internal -- never materialized to or loaded from disk.
 //!
 //! `available_tools` and `available_tool_guidelines` are NOT here: they are
 //! generated from the live tool registry, never authored.
 
-/// A shipped default fragment: its name (xml tag), optional slot ordering key,
-/// a one-line `description` (frontmatter metadata for humans/agents -- never
-/// rendered into the prompt), and verbatim body.
+/// A shipped fragment: its name (xml tag), optional slot ordering key
+/// (`Some(0)` disables), and verbatim body.
 pub(super) struct Default {
     pub(super) name: &'static str,
     pub(super) slot: Option<u32>,
-    pub(super) description: &'static str,
     pub(super) body: &'static str,
 }
 
@@ -26,106 +22,64 @@ pub(super) const DEFAULTS: &[Default] = &[
     Default {
         name: "identity",
         slot: None,
-        description: "Who iris is.",
         body: IDENTITY,
     },
     Default {
         name: "mission",
         slot: Some(1),
-        description: "The assistant's core goal and how to treat user messages.",
         body: MISSION,
     },
     Default {
         name: "response_style",
         slot: Some(2),
-        description: "Reply length, directness, and how to handle mistakes.",
         body: RESPONSE_STYLE,
     },
     Default {
         name: "working_with_the_user",
         slot: Some(3),
-        description: "Handling mid-turn messages, status requests, and post-compaction continuation.",
         body: WORKING_WITH_THE_USER,
     },
     Default {
         name: "default_to_action",
         slot: Some(4),
-        description: "When to act versus plan; persistence and not reverting others' work.",
         body: DEFAULT_TO_ACTION,
     },
     Default {
         name: "investigate_before_acting",
         slot: Some(5),
-        description: "Read files and verify before claiming or editing.",
         body: INVESTIGATE_BEFORE_ACTING,
     },
     Default {
         name: "pragmatism_and_scope",
         slot: Some(6),
-        description: "Smallest correct change, reuse over new code, and avoiding over-engineering.",
         body: PRAGMATISM_AND_SCOPE,
     },
     Default {
         name: "verify_and_report_honestly",
         slot: Some(7),
-        description: "Verify before declaring done and report outcomes truthfully.",
         body: VERIFY_AND_REPORT_HONESTLY,
     },
     Default {
         name: "execute_actions_with_care",
         slot: Some(8),
-        description: "Confirm before destructive, irreversible, or externally visible actions.",
         body: EXECUTE_ACTIONS_WITH_CARE,
     },
     Default {
         name: "diagrams",
         slot: Some(9),
-        description: "When and how to draw box-drawing diagrams instead of Mermaid.",
         body: DIAGRAMS,
     },
     Default {
         name: "file_links",
         slot: Some(10),
-        description: "Formatting file references as Markdown file links.",
         body: FILE_LINKS,
     },
     Default {
         name: "tool_use",
         slot: None,
-        description: "General tool-use discipline: context first, safe parallelism, diagnosing failures.",
         body: TOOL_USE,
     },
-    Default {
-        name: "template",
-        slot: Some(0),
-        description: "Copy-ready, inert example of the fragment format (slot 0 = disabled).",
-        body: TEMPLATE,
-    },
 ];
-
-// A self-documenting, copy-ready template materialized into ~/.iris/fragments.
-// It carries slot 0 so it is disabled: it is never folded into the prompt, it
-// just sits in the directory as a starting point a user copies and edits.
-const TEMPLATE: &str = r#"This file is a copy-ready template. It is disabled (slot: 0), so it never
-appears in the system prompt. Copy it to a new file in this directory --
-name it <something>.md -- and edit it to add your own instructions.
-
-Frontmatter keys (between the --- fences):
-  name         XML tag that wraps this block in the prompt. Defaults to the
-               filename without .md.
-  slot         Integer ordering key; lower numbers appear earlier. Set it to 0
-               to disable the fragment entirely. Omit it to place the block
-               after every slotted fragment (then alphabetical by name).
-  description  One line of intent for humans and agents. Never rendered.
-
-The body is everything after the closing --- fence: the literal text injected
-inside <name>...</name>. A blank body emits nothing.
-
-Shipped slots, for reference when choosing one:
-  identity (anchored first), mission 1, response_style 2, working_with_the_user
-  3, default_to_action 4, investigate_before_acting 5, pragmatism_and_scope 6,
-  verify_and_report_honestly 7, execute_actions_with_care 8, diagrams 9,
-  file_links 10, then the generated tool blocks and tool_use (anchored last)."#;
 
 const IDENTITY: &str = r#"You are iris, a coding assistant collaborating with the user in this workspace on coding tasks."#;
 

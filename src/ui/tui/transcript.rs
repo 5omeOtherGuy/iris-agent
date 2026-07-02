@@ -421,6 +421,7 @@ impl Transcript {
         let scope = match decision {
             ApprovalDecision::Allow => "this time",
             ApprovalDecision::AllowAlways => "this session",
+            ApprovalDecision::AllowProject => "this project",
             ApprovalDecision::Deny => return,
         };
         self.begin_block();

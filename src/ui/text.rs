@@ -560,14 +560,18 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
         &mut self,
         call: &ToolCall,
         allow_always: bool,
+        allow_project: bool,
     ) -> Result<ApprovalDecision> {
         self.finish_assistant_stream()?;
         self.start_block()?;
         let summary = summarize(call);
-        let prompt = if allow_always {
-            "[y] once  [a] always this session  [N] deny"
-        } else {
-            "[y] once  [N] deny"
+        let prompt = match (allow_always, allow_project) {
+            (true, true) => {
+                "[y] once  [a] always this session  [p] always for this project  [N] deny"
+            }
+            (true, false) => "[y] once  [a] always this session  [N] deny",
+            (false, true) => "[y] once  [p] always for this project  [N] deny",
+            (false, false) => "[y] once  [N] deny",
         };
         loop {
             let options = sgr(self.ansi, "2", prompt);
@@ -584,7 +588,10 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
 
             let trimmed = cleaned.trim().to_ascii_lowercase();
             let always = matches!(trimmed.as_str(), "a" | "always");
-            if matches!(trimmed.as_str(), "" | "y" | "yes" | "n" | "no") || (always && allow_always)
+            let project = matches!(trimmed.as_str(), "p" | "project");
+            if matches!(trimmed.as_str(), "" | "y" | "yes" | "n" | "no")
+                || (always && allow_always)
+                || (project && allow_project)
             {
                 let decision = parse_decision(&cleaned);
                 match decision {
@@ -602,6 +609,16 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                             &format!("You approved iris to run {} this session", run_target(call)),
                         )?;
                     }
+                    ApprovalDecision::AllowProject => {
+                        self.write_header(
+                            "32",
+                            "✔",
+                            &format!(
+                                "You approved iris to run {} for this project",
+                                run_target(call)
+                            ),
+                        )?;
+                    }
                     ApprovalDecision::Deny => {}
                 }
                 // Leave `in_tool_block` set so the result/denied row Nexus emits
@@ -609,10 +626,16 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 return Ok(decision);
             }
 
-            let retry = if allow_always {
-                "please answer y, a, or n"
-            } else {
-                "please answer y or n"
+            let mut keys = vec!["y"];
+            if allow_always {
+                keys.push("a");
+            }
+            if allow_project {
+                keys.push("p");
+            }
+            let retry = match keys.as_slice() {
+                [only] => format!("please answer {only} or n"),
+                many => format!("please answer {}, or n", many.join(", ")),
             };
             writeln!(self.out, "{retry}")?;
         }
@@ -669,7 +692,7 @@ mod tests {
 
         assert_eq!(ui.next_prompt()?.as_deref(), Some("hello\n"));
         assert_eq!(
-            ui.request_approval(&call("write"), true)?,
+            ui.request_approval(&call("write"), true, false)?,
             ApprovalDecision::Allow
         );
 
@@ -683,7 +706,7 @@ mod tests {
     fn approval_always_is_parsed() -> Result<()> {
         let mut ui = TextUi::new("a\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("write"), true)?,
+            ui.request_approval(&call("write"), true, false)?,
             ApprovalDecision::AllowAlways
         );
         Ok(())
@@ -694,7 +717,7 @@ mod tests {
         // allow_always=false: prompt omits the "always" choice and "a" is invalid.
         let mut ui = TextUi::new("a\ny\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("bash"), false)?,
+            ui.request_approval(&call("bash"), false, false)?,
             ApprovalDecision::Allow
         );
         let (_, out, _) = ui.into_parts();
@@ -705,11 +728,39 @@ mod tests {
     }
 
     #[test]
+    fn approval_project_grant_is_parsed_when_offered() -> Result<()> {
+        let mut ui = TextUi::new("p\n".as_bytes(), Vec::new(), Vec::new());
+        assert_eq!(
+            ui.request_approval(&call("write"), false, true)?,
+            ApprovalDecision::AllowProject
+        );
+        let (_, out, _) = ui.into_parts();
+        assert!(String::from_utf8(out)?.contains("always for this project"));
+        Ok(())
+    }
+
+    #[test]
+    fn approval_without_allow_project_rejects_p() -> Result<()> {
+        // allow_project=false (e.g. a destructive call): "p" is invalid input
+        // and re-prompts; it must never resolve to a project grant.
+        let mut ui = TextUi::new("p\nn\n".as_bytes(), Vec::new(), Vec::new());
+        assert_eq!(
+            ui.request_approval(&call("bash"), false, false)?,
+            ApprovalDecision::Deny
+        );
+        let (_, out, _) = ui.into_parts();
+        let rendered = String::from_utf8(out)?;
+        assert!(!rendered.contains("always for this project"));
+        assert!(rendered.contains("please answer y or n"));
+        Ok(())
+    }
+
+    #[test]
     fn approval_eof_denies() -> Result<()> {
         let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
 
         assert_eq!(
-            ui.request_approval(&call("write"), true)?,
+            ui.request_approval(&call("write"), true, false)?,
             ApprovalDecision::Deny
         );
         Ok(())
@@ -720,7 +771,7 @@ mod tests {
         let mut ui = TextUi::new("huh?\ny\n".as_bytes(), Vec::new(), Vec::new());
 
         assert_eq!(
-            ui.request_approval(&call("write"), true)?,
+            ui.request_approval(&call("write"), true, false)?,
             ApprovalDecision::Allow
         );
 
@@ -739,7 +790,7 @@ mod tests {
         let input = format!("{PASTE_START}garbage1\ngarbage2{PASTE_END}\ny\n");
         let mut ui = TextUi::new(input.as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("write"), true)?,
+            ui.request_approval(&call("write"), true, false)?,
             ApprovalDecision::Allow
         );
         let (_, out, _) = ui.into_parts();
@@ -771,7 +822,7 @@ mod tests {
         assert_eq!(ui.next_prompt()?.as_deref(), Some("line1\nline2\nline3\n"));
         // The very next read is the approval answer, proving no paste line leaked.
         assert_eq!(
-            ui.request_approval(&call("write"), true)?,
+            ui.request_approval(&call("write"), true, false)?,
             ApprovalDecision::Allow
         );
         Ok(())

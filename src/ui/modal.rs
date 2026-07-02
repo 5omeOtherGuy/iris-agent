@@ -63,6 +63,18 @@ pub(crate) enum ProviderPurpose {
     Logout,
 }
 
+/// One `/trust` project-permission edit (ADR-0027): grant or revoke a
+/// persistent per-tool approval, or revoke a stored `bash` command grant.
+/// Grants for bash commands are minted at the approval prompt (`[p]`), not
+/// here, so the editor can only toggle tools and revoke command grants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PolicyEdit {
+    GrantTool(String),
+    RevokeTool(String),
+    RevokeBashExact(String),
+    RevokeBashPrefix(String),
+}
+
 /// A side effect or navigation step the loop performs after a modal key. The
 /// loop owns the harness, model-switch state, settings, and auth store; the
 /// modal only names the intent.
@@ -85,9 +97,10 @@ pub(crate) enum ModalAction {
     SetEffort(ReasoningEffort),
     /// Settings menu -> open the thinking-level submenu.
     OpenEffortPicker,
-    /// Set this project's trust decision (`true` = trust repo Iris resources).
-    /// Re-assembles the system prompt and rebuilds the provider at the boundary.
-    SetTrust(bool),
+    /// Edit this project's persistent permission policy (ADR-0027). The loop
+    /// persists the edit to the HOME-owned store and refreshes the live agent's
+    /// in-memory policy at the safe inter-turn boundary.
+    EditPolicy(PolicyEdit),
     /// Resume the persisted session with this id, swapping the live session at
     /// the safe inter-turn boundary (reloads messages, session log, and harness
     /// state). Emitted by the `/resume` picker on Enter.
@@ -846,32 +859,79 @@ impl SettingsMenu {
     }
 }
 
-// --- project trust menu ---
+// --- project permissions menu (/trust) ---
 
-/// Change this project's trust decision for repo-provided Iris resources
-/// (system-prompt fragments). Confirming emits [`ModalAction::SetTrust`]; the
-/// loop persists the decision, re-assembles the prompt, and rebuilds the
-/// provider at the safe inter-turn boundary. The row matching the active state
-/// is marked `current`.
+/// View and edit this project's persistent permission policy (ADR-0027): toggle
+/// per-tool approval grants (`write`/`edit`) and revoke stored `bash` command
+/// grants. Confirming a row emits [`ModalAction::EditPolicy`]; the loop
+/// persists the edit and refreshes the live agent's policy. Presentation-only:
+/// the caller supplies the current policy snapshot, so this stays disk-free.
 #[derive(Debug, Clone)]
 pub(crate) struct TrustMenu {
     selector: Selector,
+    /// Row id -> the edit Enter emits for it.
+    edits: Vec<(String, PolicyEdit)>,
+    /// Stored sandbox posture, shown read-only (enforcement deferred).
+    sandbox: Option<String>,
 }
 
+/// The per-tool grants the `/trust` editor can toggle. Matches the ADR-0027
+/// per-tool approval defaults; `bash` is intentionally absent (bash grants are
+/// per-command, minted at the approval prompt).
+const POLICY_TOOLS: &[&str] = &["write", "edit"];
+
 impl TrustMenu {
-    pub(crate) fn new(trusted: bool) -> Self {
-        let mut trust =
-            SelectorItem::new("trust", "Trust this project").detail("load repo .iris/fragments");
-        let mut untrust =
-            SelectorItem::new("untrust", "Do not trust").detail("skip repo fragments");
-        if trusted {
-            trust = trust.trailing("current");
-        } else {
-            untrust = untrust.trailing("current");
+    pub(crate) fn new(
+        granted_tools: &[String],
+        bash_exact: &[String],
+        bash_prefix: &[String],
+        sandbox: Option<String>,
+    ) -> Self {
+        let mut items = Vec::new();
+        let mut edits = Vec::new();
+        for tool in POLICY_TOOLS {
+            let granted = granted_tools.iter().any(|t| t == tool);
+            let id = format!("tool:{tool}");
+            let mut item = SelectorItem::new(&id, *tool).detail(if granted {
+                "always allowed for this project · ↵ revoke"
+            } else {
+                "prompts for approval · ↵ always allow for this project"
+            });
+            if granted {
+                item = item.trailing("granted");
+            }
+            items.push(item);
+            let edit = if granted {
+                PolicyEdit::RevokeTool((*tool).to_string())
+            } else {
+                PolicyEdit::GrantTool((*tool).to_string())
+            };
+            edits.push((id, edit));
         }
-        let mut selector = Selector::new(vec![trust, untrust], false, false, 8);
-        selector.select_id(if trusted { "trust" } else { "untrust" });
-        TrustMenu { selector }
+        for command in bash_exact {
+            let id = format!("bash:{command}");
+            items.push(
+                SelectorItem::new(&id, format!("bash: {command}"))
+                    .detail("↵ revoke")
+                    .trailing("granted"),
+            );
+            edits.push((id, PolicyEdit::RevokeBashExact(command.clone())));
+        }
+        for prefix in bash_prefix {
+            let id = format!("pfx:{prefix}");
+            items.push(
+                SelectorItem::new(&id, format!("bash prefix: {prefix}"))
+                    .detail("↵ revoke")
+                    .trailing("granted"),
+            );
+            edits.push((id, PolicyEdit::RevokeBashPrefix(prefix.clone())));
+        }
+        let selector = Selector::new(items, false, false, 12);
+        TrustMenu {
+            selector,
+            edits,
+            sandbox,
+        }
     }
 
     fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
@@ -884,22 +944,30 @@ impl TrustMenu {
                 self.selector.down();
                 ModalOutcome::Redraw
             }
-            ModalKey::Enter => match self.selector.selected_id() {
-                Some("trust") => ModalOutcome::Emit(ModalAction::SetTrust(true)),
-                Some("untrust") => ModalOutcome::Emit(ModalAction::SetTrust(false)),
-                _ => ModalOutcome::Ignore,
-            },
+            ModalKey::Enter => {
+                let Some(id) = self.selector.selected_id() else {
+                    return ModalOutcome::Ignore;
+                };
+                match self.edits.iter().find(|(row, _)| row == id) {
+                    Some((_, edit)) => ModalOutcome::Emit(ModalAction::EditPolicy(edit.clone())),
+                    None => ModalOutcome::Ignore,
+                }
+            }
             ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
             _ => ModalOutcome::Ignore,
         }
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let rows = selector_rows(&self.selector, "No options");
+        let rows = selector_rows(&self.selector, "No grants");
+        let hint = match &self.sandbox {
+            Some(posture) => format!("sandbox: {posture} · ↑↓ move · ↵ toggle/revoke · esc close"),
+            None => "↑↓ move · ↵ toggle/revoke · esc close".to_string(),
+        };
         crate::ui::tui::overlay_box(
-            Some("Project trust"),
+            Some("Project permissions"),
             rows,
-            Some("↑↓ move · ↵ select · esc cancel"),
+            Some(hint.as_str()),
             usize::from(width),
         )
     }
@@ -1578,38 +1646,74 @@ mod tests {
     }
 
     #[test]
-    fn trust_menu_marks_current_and_emits_decision() {
-        // Untrusted state: the "Do not trust" row is current and pre-selected.
-        let mut menu = TrustMenu::new(false);
+    fn trust_menu_toggles_tool_grants_and_revokes_bash_grants() {
+        // No grants: write/edit rows offer a grant; Enter on write grants it.
+        let mut menu = TrustMenu::new(&[], &[], &[], None);
         let text: String = menu
             .render(80)
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains("PROJECT TRUST"), "{text}");
-        assert!(text.contains("current"), "{text}");
-        // Enter on the pre-selected untrusted row emits SetTrust(false).
+        assert!(text.contains("PROJECT PERMISSIONS"), "{text}");
         assert_eq!(
             menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::SetTrust(false))
+            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::GrantTool(
+                "write".to_string()
+            )))
         );
-        // Moving up to the trust row and confirming emits SetTrust(true).
-        menu.handle_key(ModalKey::Up);
-        assert_eq!(
-            menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::SetTrust(true))
-        );
-        // Esc cancels.
+        // Esc closes.
         assert_eq!(menu.handle_key(ModalKey::Esc), ModalOutcome::Close);
+
+        // With grants: the write row revokes, and a stored bash grant lists a
+        // revoke row.
+        let mut menu = TrustMenu::new(
+            &["write".to_string()],
+            &["cargo test".to_string()],
+            &["git ".to_string()],
+            None,
+        );
+        let text: String = menu
+            .render(80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("granted"), "{text}");
+        assert!(text.contains("cargo test"), "{text}");
+        assert!(text.contains("git "), "{text}");
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::RevokeTool(
+                "write".to_string()
+            )))
+        );
+        // Down past edit (row 2) to the bash grant (row 3): Enter revokes it.
+        menu.handle_key(ModalKey::Down);
+        menu.handle_key(ModalKey::Down);
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::RevokeBashExact(
+                "cargo test".to_string()
+            )))
+        );
+        // The prefix grant is the last row.
+        menu.handle_key(ModalKey::Down);
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::RevokeBashPrefix(
+                "git ".to_string()
+            )))
+        );
     }
 
     #[test]
-    fn trust_menu_trusted_state_preselects_trust_row() {
-        let mut menu = TrustMenu::new(true);
-        assert_eq!(
-            menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::SetTrust(true))
-        );
+    fn trust_menu_shows_stored_sandbox_posture_read_only() {
+        let menu = TrustMenu::new(&[], &[], &[], Some("restricted".to_string()));
+        let text: String = menu
+            .render(80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("sandbox: restricted"), "{text}");
     }
 
     #[test]

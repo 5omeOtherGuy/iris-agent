@@ -209,27 +209,26 @@ cannot choose your provider, scoped model cycle, provider-side cache retention,
 Anthropic server-side context-management behavior, or redirect OAuth bearer
 tokens with `baseUrl`.
 
-### Project trust (repo Iris resources)
+### Project permissions (`/trust`)
 
-A repo may ship system-prompt fragments under `<cwd>/.iris/fragments`. Because
-those fragments are folded into the model's system prompt, a cloned hostile repo
-would otherwise be arbitrary prompt injection with no ceremony. Iris gates them
-behind a per-project trust decision:
+The system prompt is assembled entirely from fragments built into the binary
+plus your `AGENTS.md`/`CLAUDE.md` project docs — no `.md` fragment files are
+read from `~/.iris/fragments` or a repo's `.iris/fragments`, so a cloned repo
+cannot inject system-prompt text (ADR-0026). Steer Iris through
+`AGENTS.md`/`CLAUDE.md`.
 
-- The first interactive run in a directory whose repo ships `.iris/fragments`
-  prompts once: trust this project's Iris resources? The answer (trusted or
-  untrusted) is persisted in `~/.iris/trust.json` keyed by the canonical
-  (symlink-resolved) directory.
-- Until a project is trusted, repo fragments are skipped. Project docs
-  (`AGENTS.md`/`CLAUDE.md`) keep loading regardless — only system-prompt-level
-  fragments are gated.
-- Non-interactive runs (pipes/CI) never prompt and default to untrusted without
-  recording a decision, so a later interactive run can still ask.
-- `/trust` changes the decision mid-session; it re-assembles the prompt and
-  rebuilds the provider at the next turn boundary. Override the store path with
-  `IRIS_TRUST_PATH`.
+Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
+(symlink-resolved) working directory (ADR-0027):
 
-The global fragments dir (`~/.iris/fragments`) is user-owned and always trusted.
+- At an approval prompt, `[p]` ("always for this project") persists a grant:
+  the tool name for `write`/`edit`, the exact command for `bash`. Granted
+  tools/commands auto-approve in this directory from then on, across sessions.
+- Destructive commands (`rm`, `dd`, `mkfs`, ...) always re-prompt and can never
+  be granted — no `[p]` is offered for them.
+- `/trust` opens the project-permissions editor: toggle `write`/`edit` grants
+  and revoke stored `bash` command/prefix grants.
+- The store is HOME-owned; a repo-committed file can never grant permissions.
+  Override the store path with `IRIS_TRUST_PATH`.
 
 ### Environment variables
 
@@ -237,7 +236,7 @@ The global fragments dir (`~/.iris/fragments`) is user-owned and always trusted.
 - `IRIS_MODEL` — OpenAI Codex model override; defaults to `gpt-5.5`.
 - `IRIS_CODEX_BASE_URL` — OpenAI Codex base URL; defaults to `https://chatgpt.com/backend-api`.
 - `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
-- `IRIS_TRUST_PATH` — project-trust store path; defaults to `~/.iris/trust.json`.
+- `IRIS_TRUST_PATH` — project-permission policy store path; defaults to `~/.iris/trust.json`.
 - `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
 - `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
 - `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.

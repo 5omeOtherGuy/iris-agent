@@ -15,11 +15,11 @@ use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
-    EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
-    SettingsMenu, TrustMenu,
+    EffortPicker, Modal, ModalAction, ModelPicker, PolicyEdit, ScopedModels, SessionPicker,
+    SessionRow, SettingsMenu, TrustMenu,
 };
 use crate::wayland::Harness;
-use crate::wayland::trust::{self, TrustDecision};
+use crate::wayland::trust;
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -177,78 +177,57 @@ pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<Se
         .collect()
 }
 
-/// Build the `/trust` modal from the current recorded decision for the cwd. An
-/// undecided project shows the untrusted row as current (the effective state).
+/// Build the `/trust` project-permissions modal from the persisted policy for
+/// the cwd (ADR-0027). The modal is a snapshot; every applied edit rebuilds it.
 pub(crate) fn open_trust() -> Modal {
-    let trusted = std::env::current_dir()
+    let record = std::env::current_dir()
         .ok()
-        .map(|cwd| trust::decision_for(&cwd) == TrustDecision::Trusted)
-        .unwrap_or(false);
-    Modal::Trust(TrustMenu::new(trusted))
+        .map(|cwd| trust::policy_for(&cwd))
+        .unwrap_or_default();
+    Modal::Trust(TrustMenu::new(
+        &record.allow_tools.iter().cloned().collect::<Vec<_>>(),
+        &record.allow_bash.iter().cloned().collect::<Vec<_>>(),
+        &record.allow_bash_prefix.iter().cloned().collect::<Vec<_>>(),
+        record.sandbox.clone(),
+    ))
 }
 
-/// Apply a `/trust` decision: persist it (keyed by canonical cwd), re-assemble
-/// the system prompt under the new trust, and rebuild the provider at the safe
-/// inter-turn boundary so the change takes effect this session. The provider is
-/// rebuilt first; the decision is persisted and the success notice shown only
-/// after the rebuild succeeds. A rebuild failure restores the prior prompt and
-/// is reported honestly (no success-looking notice), failing closed on untrust.
-fn apply_trust<P: ChatProvider>(
-    trusted: bool,
-    harness: &mut Harness<P>,
-    switch: &mut ModelSwitch<'_, P>,
-) -> Vec<String> {
+/// Apply one `/trust` policy edit: persist it to the HOME-owned store (keyed by
+/// canonical cwd) and refresh the live agent's in-memory project policy so the
+/// change applies this session. Deliberate user action only (ADR-0027
+/// invariant 4): this is the sole loosening path besides the approval prompt's
+/// `[p]`. The stored sandbox posture is never touched here (invariant 3).
+fn apply_policy_edit<P: ChatProvider>(edit: PolicyEdit, harness: &mut Harness<P>) -> Vec<String> {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(error) => return vec![format!("could not resolve working directory: {error:#}")],
     };
-    // Re-assemble the prompt under the requested trust and rebuild the provider
-    // with it BEFORE committing anything. Mirrors `/model` / `/reasoning`: build
-    // first, commit only after the rebuild succeeds. If the rebuild fails we
-    // restore the prior prompt and report the failure honestly -- for an untrust
-    // that means failing closed: never leave a success-looking notice while the
-    // old trusted prompt is still live.
-    let tools = crate::tools::built_in_tools();
-    let prompt = crate::wayland::system_prompt::assemble(&cwd, &tools, trusted);
-    let previous_prompt = switch.system_prompt().to_string();
-    switch.set_system_prompt(prompt);
-    let candidate = switch.selection().clone();
-    let rebuild = cli::apply_selection(candidate, harness, switch);
-    let (rebuilt, mut lines) = finalize_trust(trusted, rebuild);
-    if !rebuilt {
-        // Rebuild failed: restore the prompt so the session keeps matching the
-        // still-live provider, and do not persist the decision.
-        switch.set_system_prompt(previous_prompt);
-        return lines;
-    }
-    // Rebuild succeeded; commit the decision so future sessions honor it too.
-    if let Err(error) = trust::set_decision(&cwd, trusted) {
-        lines.push(format!("could not save trust decision: {error:#}"));
-    }
-    lines
-}
-
-/// Finalize a `/trust` change after the provider rebuild attempt. `rebuild` is
-/// the output of [`cli::apply_selection`]; a line containing "could not" marks a
-/// failed rebuild. Returns `(rebuilt, lines)`: on failure `rebuilt` is `false`
-/// and `lines` carries only the failure -- no trust notice, so the session never
-/// claims the prompt changed (fail closed); on success `rebuilt` is `true` with
-/// the trust confirmation. The generic "switched to <model>" line is dropped
-/// either way, as it would be misleading for a trust change.
-fn finalize_trust(trusted: bool, rebuild: Vec<String>) -> (bool, Vec<String>) {
-    let failures: Vec<String> = rebuild
-        .into_iter()
-        .filter(|line| line.contains("could not"))
-        .collect();
-    if !failures.is_empty() {
-        return (false, failures);
-    }
-    let notice = if trusted {
-        "Project trusted; repo fragments now load.".to_string()
-    } else {
-        "Project not trusted; repo fragments are skipped.".to_string()
+    let mut record = trust::policy_for(&cwd);
+    let notice = match &edit {
+        PolicyEdit::GrantTool(tool) => {
+            record.allow_tools.insert(tool.clone());
+            format!("`{tool}` is now always allowed for this project")
+        }
+        PolicyEdit::RevokeTool(tool) => {
+            record.allow_tools.remove(tool);
+            format!("`{tool}` now prompts for approval")
+        }
+        PolicyEdit::RevokeBashExact(command) => {
+            record.allow_bash.remove(command);
+            format!("revoked bash grant `{command}`")
+        }
+        PolicyEdit::RevokeBashPrefix(prefix) => {
+            record.allow_bash_prefix.remove(prefix);
+            format!("revoked bash prefix grant `{prefix}`")
+        }
     };
-    (true, vec![notice])
+    if let Err(error) = trust::set_policy(&cwd, &record) {
+        // Fail closed: do not update the live policy either, so the session
+        // never runs looser (or claims tighter) than what is persisted.
+        return vec![format!("could not save project policy: {error:#}")];
+    }
+    harness.agent.set_project_policy(record.to_policy());
+    vec![notice]
 }
 
 /// Build the `/settings` modal (effort picker entry).
@@ -319,8 +298,11 @@ pub(crate) fn apply_action<P: ChatProvider>(
             }
             ActionResult::Keep(lines)
         }
-        ModalAction::SetTrust(trusted) => {
-            ActionResult::Close(apply_trust(trusted, harness, switch))
+        ModalAction::EditPolicy(edit) => {
+            // Re-open the modal on the refreshed policy so the row states
+            // (granted / prompts) reflect the applied edit.
+            let lines = apply_policy_edit(edit, harness);
+            ActionResult::Replace(Box::new(open_trust()), lines)
         }
         ModalAction::SetEffort(level) => ActionResult::Close(apply_effort(level, harness, switch)),
         ModalAction::OpenEffortPicker => {
@@ -546,52 +528,6 @@ mod tests {
         assert_eq!(rows[0].age, "1h ago");
         assert_eq!(rows[1].id, "older");
         assert_eq!(rows[1].age, "2h ago");
-    }
-
-    #[test]
-    fn finalize_trust_fails_closed_when_rebuild_fails() {
-        // A failed rebuild must not commit and must not emit a trust notice --
-        // otherwise an untrust would keep the old trusted prompt live while
-        // claiming success. Only the honest failure is surfaced.
-        let (rebuilt, lines) = finalize_trust(false, vec!["could not switch: boom".to_string()]);
-        assert!(!rebuilt, "a failed rebuild must not be committed");
-        assert!(
-            lines.iter().any(|l| l.contains("could not switch")),
-            "the rebuild failure is surfaced: {lines:?}"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("not trusted")),
-            "no success-looking notice on a failed untrust: {lines:?}"
-        );
-        // A trust that fails to rebuild is equally uncommitted and silent.
-        let (rebuilt, lines) = finalize_trust(true, vec!["could not switch: boom".to_string()]);
-        assert!(!rebuilt);
-        assert!(
-            !lines.iter().any(|l| l.contains("repo fragments now load")),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn finalize_trust_reports_notice_after_a_clean_rebuild() {
-        // A clean rebuild commits and shows the trust notice, dropping the
-        // generic "switched to <model>" confirmation.
-        let (rebuilt, lines) = finalize_trust(
-            true,
-            vec!["switched to anthropic/claude (reasoning: none)".to_string()],
-        );
-        assert!(rebuilt);
-        assert_eq!(
-            lines,
-            vec!["Project trusted; repo fragments now load.".to_string()]
-        );
-        let (rebuilt, lines) =
-            finalize_trust(false, vec!["switched to x/y (reasoning: none)".to_string()]);
-        assert!(rebuilt);
-        assert_eq!(
-            lines,
-            vec!["Project not trusted; repo fragments are skipped.".to_string()]
-        );
     }
 
     #[test]

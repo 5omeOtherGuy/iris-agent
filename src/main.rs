@@ -224,23 +224,21 @@ fn print_session_list(sessions: &[session::ResumableSession], now_ms: u128) {
 fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    // Materialize the shipped fragment defaults into ~/.iris/fragments (if
-    // absent) so users can edit/reorder them on disk; best-effort.
-    wayland::system_prompt::ensure_default_fragments();
     // Harness-owned assembly: the fragment/slot baukasten composes the prompt
-    // from fragment files plus dynamic context (project docs, date, cwd) and the
-    // live tool registry. Fresh and resume call the same function.
+    // from the in-binary shipped fragments plus dynamic context (project docs,
+    // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
+    // the same function.
     let tools = tools::built_in_tools();
-    let trust_repo = resolve_project_trust(&cwd);
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, trust_repo);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = session::new_session_id();
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
-    let agent =
-        Agent::new(provider, tools).with_max_tool_roundtrips(settings.max_tool_roundtrips());
+    let agent = Agent::new(provider, tools)
+        .with_max_tool_roundtrips(settings.max_tool_roundtrips())
+        .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd));
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
     let session = match session::SessionLog::create_with_id(&cwd, &session_id) {
@@ -339,23 +337,23 @@ fn load_session_source(
 /// Run one headless turn-sequence for `iris -p`/`--print`: assemble the prompt
 /// (merging any piped stdin), run the model loop with tool roundtrips, print the
 /// final assistant answer to stdout, and return an error (nonzero exit) on
-/// failure. Non-interactive throughout: it never prompts for project trust
-/// (defaults untrusted per issue #202) and its approval gate denies gated tools
+/// failure. Non-interactive throughout: its approval gate denies gated tools
 /// by default, or auto-approves with `--approve`, so a piped/CI run cannot hang.
 /// The session is persisted like a normal run.
 fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    wayland::system_prompt::ensure_default_fragments();
     let tools = tools::built_in_tools();
-    // Headless and non-interactive: never prompt for trust, default untrusted.
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, false);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = session::new_session_id();
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
-    let agent =
-        Agent::new(provider, tools).with_max_tool_roundtrips(settings.max_tool_roundtrips());
+    // The persisted project policy applies headless too (a granted tool/command
+    // auto-approves), but the print gate cannot mint new grants, so no sink.
+    let agent = Agent::new(provider, tools)
+        .with_max_tool_roundtrips(settings.max_tool_roundtrips())
+        .with_project_policy(project_policy(&cwd), None);
     // Persist the print run's transcript like a normal run; best-effort.
     let session = match session::SessionLog::create_with_id(&cwd, &session_id) {
         Ok(log) => {
@@ -387,63 +385,17 @@ fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolve whether this workspace's repo-provided Iris resources (system-prompt
-/// fragments) are trusted for this run. Security gate for issue #202: a cloned
-/// hostile repo must not inject system-prompt fragments without an explicit
-/// decision.
-///
-/// - A recorded `Trusted`/`Untrusted` decision is honored directly.
-/// - `Undecided` in an interactive terminal, when the repo actually ships
-///   `.iris/fragments`, prompts once and persists the answer.
-/// - `Undecided` in any non-interactive context (pipe/CI), or when the repo
-///   ships no fragments, defaults to untrusted WITHOUT writing a decision, so a
-///   later interactive run can still prompt.
-fn resolve_project_trust(cwd: &Path) -> bool {
-    use wayland::trust::TrustDecision;
-    match wayland::trust::decision_for(cwd) {
-        TrustDecision::Trusted => true,
-        TrustDecision::Untrusted => false,
-        TrustDecision::Undecided => {
-            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-            if !interactive || !wayland::system_prompt::repo_provides_fragments(cwd) {
-                return false;
-            }
-            prompt_for_project_trust(cwd)
-        }
-    }
+/// The persisted per-project permission policy for `cwd` (ADR-0027), loaded
+/// from the HOME-owned store into the enforcement-layer shape Nexus consumes.
+fn project_policy(cwd: &Path) -> nexus::ProjectPolicy {
+    wayland::trust::policy_for(cwd).to_policy()
 }
 
-/// First-run interactive trust prompt. Presents the risk, reads a single
-/// yes/no answer from stdin, and persists the decision keyed by canonical dir.
-/// Defaults to untrusted on empty input or EOF. A persistence failure is
-/// surfaced but never blocks startup (the run proceeds untrusted).
-fn prompt_for_project_trust(cwd: &Path) -> bool {
-    println!(
-        "This project ships Iris resources under .iris/fragments that would be injected\n\
-         into the model's system prompt. Only trust them if you trust this repository."
-    );
-    print!("Trust this project's Iris resources? [y/N]: ");
-    if std::io::stdout().flush().is_err() {
-        return false;
-    }
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return false;
-    }
-    let trusted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-    if let Err(error) = wayland::trust::set_decision(cwd, trusted) {
-        tracing::warn!(error = %format!("{error:#}"), "failed to persist project trust decision");
-        eprintln!("warning: could not save the trust decision: {error:#}");
-    }
-    println!(
-        "{}",
-        if trusted {
-            "Project trusted; repo fragments will load."
-        } else {
-            "Project not trusted; repo fragments are skipped. Use /trust to change this."
-        }
-    );
-    trusted
+/// The persistence sink new project grants are written through.
+fn project_policy_sink(cwd: &Path) -> Option<Box<dyn nexus::ProjectPolicySink>> {
+    Some(Box::new(wayland::trust::PolicyStoreSink::new(
+        cwd.to_path_buf(),
+    )))
 }
 
 /// Resume an existing session by id: load its transcript from the store,
@@ -470,16 +422,15 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     let budget = Some(settings.context_token_budget());
     // Resume assembles instructions through the same harness-owned baukasten as
     // a fresh session, so a resumed turn gets identical fragment/context output.
-    wayland::system_prompt::ensure_default_fragments();
     let tools = tools::built_in_tools();
-    let trust_repo = resolve_project_trust(&cwd);
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, trust_repo);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = meta.id.clone();
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::resumed(provider, tools, stored.messages)
-        .with_max_tool_roundtrips(settings.max_tool_roundtrips());
+        .with_max_tool_roundtrips(settings.max_tool_roundtrips())
+        .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd));
 
     // Reopen the same transcript for append so continued turns extend it rather
     // than starting a new file. Best-effort, like new-session persistence: if

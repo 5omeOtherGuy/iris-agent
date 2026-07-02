@@ -169,6 +169,13 @@
   files. [Partial]
 - **Approval gates** — explicit confirmation for `write`, `edit`, and `bash`
   (every mutating file/shell tool), with denied-call handling. [Implemented]
+- **Per-project permission policy** — persistent per-cwd grants (ADR-0027,
+  #209): per-tool approval defaults for `write`/`edit` and per-command `bash`
+  allows (exact or prefix), stored HOME-owned in `~/.iris/trust.json` keyed by
+  canonical directory; `[p]` at the approval prompt persists a grant and
+  `/trust` lists/toggles/revokes them. Destructive commands always re-prompt
+  and are never grantable; a repo-committed file can never grant. Sandbox
+  posture is stored per project but not yet enforced. [Implemented]
 - **Atomic file replacement** — `write` and `edit` write through a
   same-directory temp file, fsync, rename, cleanup-on-error path, and Unix
   permission preservation on overwrite. [Partial]
@@ -246,12 +253,12 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 ## Prompt assembly
 
 - **Fragment-based system prompt** — Wayland assembles provider-visible
-  instructions from shipped defaults materialized into `~/.iris/fragments`,
-  repo `.iris/fragments`, project docs (`AGENTS.md`/`CLAUDE.md`), runtime
-  context, and generated live-tool blocks. [Implemented]
-- **Fragment frontmatter** — fragments use `name` for XML tags and numeric
-  `slot` ordering (`slot: 0` disables); selector keys are parse-tolerated but
-  not active yet. [Partial]
+  instructions from in-binary shipped fragments (the single source of truth,
+  ADR-0026), project docs (`AGENTS.md`/`CLAUDE.md`), runtime context, and
+  generated live-tool blocks. No `.md` fragment files are loaded from disk.
+  [Implemented]
+- **Fragment ordering** — internal fragments use `name` for XML tags and
+  numeric `slot` ordering (`slot: 0` disables). [Implemented]
 - **Named slots and selector schema** — replace numeric slots with named slots
   and drive prompt/tool inclusion from resolved provider/model/thinking/mode.
   [Planned]

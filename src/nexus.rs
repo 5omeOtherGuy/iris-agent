@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -53,8 +53,93 @@ pub(crate) enum ApprovalDecision {
     /// Allow this call and auto-approve later calls of the same tool for the
     /// rest of the session. Nexus owns and enforces that session policy.
     AllowAlways,
+    /// Allow this call and record a persistent per-project grant (ADR-0027):
+    /// the tool name for a non-bash tool, or the exact command for `bash`.
+    /// Nexus derives and applies the grant; a destructive call is never
+    /// granted (the ADR-0010 floor).
+    AllowProject,
     /// Refuse this call. Default for empty/invalid/EOF input (safe-by-default).
     Deny,
+}
+
+/// A single persistent project-policy grant (ADR-0027), derived by Nexus from
+/// an approved call. Data only: how it is persisted is the host's concern (a
+/// [`ProjectPolicySink`] injected at construction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PolicyGrant {
+    /// Auto-approve every call of this (non-bash) tool, e.g. `write`/`edit`.
+    Tool(String),
+    /// Auto-approve this exact `bash` command string.
+    BashExact(String),
+}
+
+/// Persists a project grant when the user chooses "always for this project".
+/// Implemented by the Tier-2 store; Nexus only calls it after a deliberate
+/// user decision (ADR-0014: nothing self-waives).
+pub(crate) trait ProjectPolicySink {
+    fn persist(&self, grant: &PolicyGrant) -> Result<()>;
+}
+
+/// The persistent per-project (per-cwd) permission policy the approval loop
+/// consults as the "project" precedence layer (ADR-0027): session
+/// (`session_allowed`) > project (this) > global default (prompt). All layers
+/// are allow-only, so consulting them is a union; the destructive floor
+/// (ADR-0010) is applied before any layer. Data only -- loaded by the host
+/// from the HOME-owned store, never read from any repo-controlled file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProjectPolicy {
+    /// Non-bash tools whose calls are auto-approved (e.g. `write`, `edit`).
+    pub(crate) tools: BTreeSet<String>,
+    /// Exact `bash` command strings that are auto-approved.
+    pub(crate) bash_exact: BTreeSet<String>,
+    /// `bash` command prefixes that are auto-approved (token-boundary match).
+    pub(crate) bash_prefix: BTreeSet<String>,
+}
+
+impl ProjectPolicy {
+    /// Whether this policy grants the call. `bash` is matched per command
+    /// (exact or token-boundary prefix), never per tool name: a blanket bash
+    /// grant is intentionally not expressible. Destructiveness is NOT checked
+    /// here -- the loop applies the destructive floor before consulting any
+    /// allow layer.
+    fn allows(&self, name: &str, args: &Value) -> bool {
+        if name == "bash" {
+            let Some(command) = args.get("command").and_then(Value::as_str) else {
+                return false;
+            };
+            let command = command.trim();
+            self.bash_exact.contains(command)
+                || self
+                    .bash_prefix
+                    .iter()
+                    .any(|prefix| bash_prefix_matches(prefix, command))
+        } else {
+            self.tools.contains(name)
+        }
+    }
+
+    /// Apply a grant to the in-memory policy (mirrors what the sink persists).
+    fn apply(&mut self, grant: &PolicyGrant) {
+        match grant {
+            PolicyGrant::Tool(name) => {
+                self.tools.insert(name.clone());
+            }
+            PolicyGrant::BashExact(command) => {
+                self.bash_exact.insert(command.clone());
+            }
+        }
+    }
+}
+
+/// Token-boundary prefix match for a bash command grant: `git ` (or `git`)
+/// matches `git status` and `git`, but never `gitevil`. Prevents a stored
+/// prefix from silently widening to lexically-adjacent commands.
+fn bash_prefix_matches(prefix: &str, command: &str) -> bool {
+    let prefix = prefix.trim_end();
+    if prefix.is_empty() || !command.starts_with(prefix) {
+        return false;
+    }
+    command.len() == prefix.len() || command[prefix.len()..].starts_with(char::is_whitespace)
 }
 
 /// The semantic events the loop emits during a turn. Provider- and UI-neutral:
@@ -142,8 +227,9 @@ pub(crate) enum AgentEvent {
     /// run, on both the exclusive and parallel paths). Lets a front-end open a
     /// live progress cell before any output arrives. Display-only.
     ToolStarted(ToolCall),
-    /// A gated tool was auto-approved by the session allow-policy. Emitted by
-    /// Nexus, never inferred by a front-end, so the policy stays Nexus-owned.
+    /// A gated tool was auto-approved by the session allow-policy or the
+    /// persistent project policy (ADR-0027). Emitted by Nexus, never inferred
+    /// by a front-end, so the policy stays Nexus-owned.
     ToolAutoApproved(ToolCall),
     DiffPreview {
         call: ToolCall,
@@ -282,8 +368,15 @@ pub(crate) trait SteeringSource {
 pub(crate) trait ApprovalGate {
     /// `allow_always` mirrors the tool's [`Tool::supports_allow_always`] so the
     /// front-end only offers an "always allow" choice the loop will honor (shell
-    /// tools opt out, so their prompt is y/N only).
-    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a>;
+    /// tools opt out, so their prompt is y/N only). `allow_project` is true when
+    /// a persistent per-project grant (ADR-0027) is on offer -- never for a
+    /// destructive call (ADR-0010 floor).
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        allow_always: bool,
+        allow_project: bool,
+    ) -> ApprovalFuture<'a>;
 }
 
 /// Structured result of a successful tool call: the model-facing text plus
@@ -531,10 +624,19 @@ pub(crate) struct Agent<P> {
     // ponytail: per-tool-name always-allow. The mutating tools (`bash`, `write`,
     // `edit`) opt out (`supports_allow_always() == false`), so an "always" on
     // them never sticks and every call re-prompts -- a blanket allow would
-    // authorize arbitrary later effects. Upgrade path = per-exact-command/path
-    // keys (e.g. `bash:<cmd>`, `write:<path>`) once a real audit trail exists
-    // (roadmap #14).
+    // authorize arbitrary later effects. Persistent per-project grants (the
+    // finer per-tool/per-exact-command layer) live in `project_policy` below
+    // (ADR-0027, issue #209).
     session_allowed: HashSet<String>,
+    // Persistent per-project (per-cwd) permission policy: the "project" layer
+    // between the session allow-set and the global prompt default (ADR-0027).
+    // Loaded by the host from the HOME-owned store and kept in sync as grants
+    // are made; enforced here, never in a front-end. Survives reset_session
+    // (it is keyed to the cwd, not the conversation).
+    project_policy: ProjectPolicy,
+    // Persistence seam for new project grants. `None` (e.g. headless print)
+    // keeps a grant in-memory for the process lifetime only.
+    policy_sink: Option<Box<dyn ProjectPolicySink>>,
     // Provider/model round-trip id sequence. Nexus owns these ids because it
     // owns the provider loop; Wayland may persist them, but never mints them.
     next_provider_turn_seq: u32,
@@ -591,9 +693,30 @@ impl<P: ChatProvider> Agent<P> {
             messages: Vec::new(),
             tools,
             session_allowed: HashSet::new(),
+            project_policy: ProjectPolicy::default(),
+            policy_sink: None,
             next_provider_turn_seq: 0,
             max_tool_roundtrips: None,
         }
+    }
+
+    /// Install the persistent per-project permission policy and its persistence
+    /// sink (ADR-0027). The host loads the policy from the HOME-owned store for
+    /// the session's cwd; the sink writes new grants back to it.
+    pub(crate) fn with_project_policy(
+        mut self,
+        policy: ProjectPolicy,
+        sink: Option<Box<dyn ProjectPolicySink>>,
+    ) -> Self {
+        self.project_policy = policy;
+        self.policy_sink = sink;
+        self
+    }
+
+    /// Replace the in-memory project policy (the `/trust` editor applies
+    /// grant/revoke edits at the safe inter-turn boundary).
+    pub(crate) fn set_project_policy(&mut self, policy: ProjectPolicy) {
+        self.project_policy = policy;
     }
 
     /// Install an optional graceful soft cap on tool round-trips per turn.
@@ -619,6 +742,8 @@ impl<P: ChatProvider> Agent<P> {
             messages,
             tools,
             session_allowed: HashSet::new(),
+            project_policy: ProjectPolicy::default(),
+            policy_sink: None,
             next_provider_turn_seq,
             max_tool_roundtrips: None,
         }
@@ -1107,19 +1232,25 @@ impl<P: ChatProvider> Agent<P> {
             if !tool.requires_approval() {
                 obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
             } else {
-                // A destructive call (e.g. `rm`) always re-prompts, even when its
-                // tool was "always allowed" this session: a blanket bash allow must
-                // not silently auto-run data-losing commands.
+                // The destructive floor (ADR-0010): a destructive call (e.g.
+                // `rm`) always re-prompts, before any allow layer is consulted.
+                // Neither a session allow-always nor a persistent project grant
+                // (ADR-0027) can silently auto-run a data-losing command.
                 let destructive = tool.is_destructive(&call.arguments);
-                let session_allowed = self.session_allowed.contains(&call.name);
-                let auto_approved = session_allowed && !destructive && tool.supports_allow_always();
+                let session_allowed =
+                    self.session_allowed.contains(&call.name) && tool.supports_allow_always();
+                // Precedence session > project > global default (prompt). Every
+                // layer is allow-only, so "most specific wins" reduces to a
+                // union of the allow layers over the prompting default.
+                let project_allowed = self.project_policy.allows(&call.name, &call.arguments);
+                let auto_approved = !destructive && (session_allowed || project_allowed);
                 if auto_approved {
                     obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
                     emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
                 }
                 if !auto_approved {
-                    if destructive && session_allowed {
-                        let message = "destructive command: approval required even though this tool is allow-always";
+                    if destructive && (session_allowed || project_allowed) {
+                        let message = "destructive command: approval required even though this tool is allowed";
                         obs.on_event(AgentEvent::Notice(message.to_string()))?;
                     }
                     // Race the approval against cancellation so a pending prompt
@@ -1135,7 +1266,9 @@ impl<P: ChatProvider> Agent<P> {
                     let decision = tokio::select! {
                         biased;
                         _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
-                        decision = gate.review(call, tool.supports_allow_always()) => decision?,
+                        // A project grant is never offered for a destructive
+                        // call: it must not be persistable (ADR-0010 floor).
+                        decision = gate.review(call, tool.supports_allow_always(), !destructive) => decision?,
                     };
                     // A blocking front-end prompt (real terminal) cannot observe
                     // the token mid-read, so it may still return a decision after a
@@ -1160,6 +1293,18 @@ impl<P: ChatProvider> Agent<P> {
                                     call.name
                                 );
                                 obs.on_event(AgentEvent::Notice(message))?;
+                            }
+                        }
+                        ApprovalDecision::AllowProject => {
+                            // Defense in depth: even if a front-end returns
+                            // AllowProject for a destructive call (it was not
+                            // offered), the grant is refused -- the call still
+                            // runs once, but nothing is persisted (invariant 2).
+                            if destructive {
+                                let message = "destructive command: cannot be granted for this project; allowed once";
+                                obs.on_event(AgentEvent::Notice(message.to_string()))?;
+                            } else {
+                                self.record_project_grant(call, obs)?;
                             }
                         }
                         ApprovalDecision::Allow => {}
@@ -1198,6 +1343,50 @@ impl<P: ChatProvider> Agent<P> {
             None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
         };
         Ok(outcome)
+    }
+
+    /// Apply and persist a per-project grant derived from an approved,
+    /// non-destructive call (ADR-0027): the exact command for `bash`, the tool
+    /// name otherwise. The in-memory policy always updates (this session honors
+    /// the grant immediately); a missing sink or a persistence failure is
+    /// reported and degrades to session-lifetime scope, never blocks the call.
+    fn record_project_grant(&mut self, call: &ToolCall, obs: &dyn AgentObserver) -> Result<()> {
+        let grant = if call.name == "bash" {
+            match call.arguments.get("command").and_then(Value::as_str) {
+                Some(command) if !command.trim().is_empty() => {
+                    PolicyGrant::BashExact(command.trim().to_string())
+                }
+                _ => {
+                    let message =
+                        "could not derive a project grant from this call; allowed once".to_string();
+                    return obs.on_event(AgentEvent::Notice(message));
+                }
+            }
+        } else {
+            PolicyGrant::Tool(call.name.clone())
+        };
+        self.project_policy.apply(&grant);
+        let notice = match &self.policy_sink {
+            Some(sink) => match sink.persist(&grant) {
+                Ok(()) => match &grant {
+                    PolicyGrant::Tool(name) => {
+                        format!("`{name}` is now always allowed for this project")
+                    }
+                    PolicyGrant::BashExact(command) => {
+                        format!("`{command}` is now always allowed for this project")
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to persist project grant");
+                    format!(
+                        "could not save the project grant ({error:#}); it applies to this session only"
+                    )
+                }
+            },
+            None => "project grants are not persisted in this run; allowed for this session only"
+                .to_string(),
+        };
+        obs.on_event(AgentEvent::Notice(notice))
     }
 
     fn emit_interrupted(&self, obs: &dyn AgentObserver) -> Result<()> {

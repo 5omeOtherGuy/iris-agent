@@ -65,20 +65,6 @@ impl<'a, P> ModelSwitch<'a, P> {
         self.scoped = scoped.filter(|ids| !ids.is_empty());
     }
 
-    /// Swap the system prompt used to rebuild providers. Used by `/trust` after
-    /// re-assembling the prompt under a new trust decision; the next
-    /// [`apply_selection`] rebuilds the provider with this prompt.
-    pub(crate) fn set_system_prompt(&mut self, prompt: String) {
-        self.system_prompt = prompt;
-    }
-
-    /// The system prompt currently used to rebuild providers. `/trust` snapshots
-    /// this before a rebuild so it can restore it if the rebuild fails, keeping
-    /// the session prompt in sync with the still-live provider.
-    pub(crate) fn system_prompt(&self) -> &str {
-        &self.system_prompt
-    }
-
     /// Rebuild a provider for the current selection and system prompt without
     /// changing the active selection. The session swap uses this after the app
     /// updates the shared session-id cell, so the resumed/new session's id keys

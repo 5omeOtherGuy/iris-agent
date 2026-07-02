@@ -50,9 +50,15 @@ pub(crate) trait Ui {
     fn emit(&mut self, event: UiEvent) -> Result<()>;
 
     /// Block for the user's decision on a gated tool call. `allow_always` is the
-    /// tool's allow-always capability; when false the front-end offers y/N only.
-    fn request_approval(&mut self, call: &ToolCall, allow_always: bool)
-    -> Result<ApprovalDecision>;
+    /// tool's allow-always capability; `allow_project` is whether a persistent
+    /// per-project grant is on offer (never for a destructive call). When both
+    /// are false the front-end offers y/N only.
+    fn request_approval(
+        &mut self,
+        call: &ToolCall,
+        allow_always: bool,
+        allow_project: bool,
+    ) -> Result<ApprovalDecision>;
 
     /// Release any terminal state acquired for the session (e.g. bracketed
     /// paste). Called once when the session loop ends. Default: no-op.
@@ -293,8 +299,17 @@ impl AgentObserver for UiBridge<'_> {
 }
 
 impl ApprovalGate for UiBridge<'_> {
-    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a> {
-        Box::pin(async move { self.ui.borrow_mut().request_approval(call, allow_always) })
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        allow_always: bool,
+        allow_project: bool,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async move {
+            self.ui
+                .borrow_mut()
+                .request_approval(call, allow_always, allow_project)
+        })
         // The interactive production front-end is the raw-mode TUI
         // (`ui::tui::TuiUi`): it reads Ctrl-C at an approval as a key event,
         // calls `signals::interrupt_from_terminal()` (which trips the per-turn

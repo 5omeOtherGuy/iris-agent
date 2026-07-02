@@ -207,12 +207,14 @@ struct PendingApproval {
     call: ToolCall,
     reply: oneshot::Sender<ApprovalDecision>,
     allow_always: bool,
+    allow_project: bool,
 }
 
 /// A review request crossing from the turn future into the loop.
 struct ApprovalRequest {
     call: ToolCall,
     allow_always: bool,
+    allow_project: bool,
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -563,7 +565,8 @@ fn route_command<P: ChatProvider>(
             Ok(RouteOutcome::Consumed)
         }
         "/trust" if rest.is_empty() => {
-            // Needs a switch to rebuild the provider with the re-assembled prompt.
+            // Modal actions dispatch through picker::apply_action, which takes
+            // the switch; keep the same guard as the other pickers.
             if switch.as_ref().is_none() {
                 return Ok(RouteOutcome::Fall);
             }
@@ -829,11 +832,12 @@ async fn run_turn<P: ChatProvider>(
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
-                    tui.screen.show_approval(&request.call, request.allow_always);
+                    tui.screen.show_approval(&request.call, request.allow_always, request.allow_project);
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,
                         allow_always: request.allow_always,
+                        allow_project: request.allow_project,
                     });
                     request_render(&mut sched, tui)?;
                 }
@@ -1604,6 +1608,9 @@ fn handle_running_event(
                     KeyCode::Char('a') | KeyCode::Char('A') if p.allow_always => {
                         Some(ApprovalDecision::AllowAlways)
                     }
+                    KeyCode::Char('p') | KeyCode::Char('P') if p.allow_project => {
+                        Some(ApprovalDecision::AllowProject)
+                    }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter | KeyCode::Esc => {
                         Some(ApprovalDecision::Deny)
                     }
@@ -1666,7 +1673,12 @@ impl AgentObserver for LoopBridge {
 }
 
 impl ApprovalGate for LoopBridge {
-    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        allow_always: bool,
+        allow_project: bool,
+    ) -> ApprovalFuture<'a> {
         let appr_tx = self.appr_tx.clone();
         let call = call.clone();
         Box::pin(async move {
@@ -1675,6 +1687,7 @@ impl ApprovalGate for LoopBridge {
                 .send(ApprovalRequest {
                     call,
                     allow_always,
+                    allow_project,
                     reply,
                 })
                 .is_err()
@@ -2106,6 +2119,7 @@ mod tests {
             call: call(),
             reply: tx,
             allow_always: true,
+            allow_project: false,
         });
         assert!(handle_running_event(
             &mut screen,
@@ -2122,6 +2136,7 @@ mod tests {
             call: call(),
             reply: tx,
             allow_always: false,
+            allow_project: false,
         });
         handle_running_event(
             &mut screen,
@@ -2138,6 +2153,7 @@ mod tests {
             call: call(),
             reply: tx,
             allow_always: false,
+            allow_project: false,
         });
         assert!(!handle_running_event(
             &mut screen,
@@ -2161,6 +2177,7 @@ mod tests {
             call: call(),
             reply: tx,
             allow_always: true,
+            allow_project: false,
         });
         assert!(handle_running_event(
             &mut screen,
@@ -2235,6 +2252,7 @@ mod tests {
             call: call(),
             reply: tx,
             allow_always: true,
+            allow_project: false,
         });
         // PageUp is a no-op (native scroll) and must not answer the approval.
         assert!(!handle_running_event(
@@ -2255,6 +2273,7 @@ mod tests {
             call: call(),
             reply: tx,
             allow_always: true,
+            allow_project: false,
         });
         resolve_input_eof(&mut screen, &mut pending, &token);
         assert!(token.is_cancelled(), "EOF cancels the turn token");

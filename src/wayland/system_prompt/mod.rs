@@ -1,22 +1,18 @@
 //! Tier-2 harness-owned system prompt assembly: a fragment/slot "baukasten".
 //!
-//! The provider-visible instruction string is composed from user-droppable
-//! `.md` fragment files plus auto-injected dynamic context, re-implementing
-//! pi-agent's system-prompt behavior. Each fragment is one XML block; its
-//! frontmatter `name` is the tag and its body is the inner text. Fragments load
-//! from a global dir (`~/.iris/fragments`) and a per-repo dir
-//! (`<workspace>/.iris/fragments`); a user adds, edits, or reorders blocks
-//! purely by dropping files, the same UX as Claude Code agents/skills.
+//! The provider-visible instruction string is composed from the shipped
+//! in-binary fragments ([`defaults::DEFAULTS`], the single source of truth per
+//! ADR-0026) plus auto-injected dynamic context. Each fragment is one XML
+//! block; its `name` is the tag and its body is the inner text. Fragments are
+//! never loaded from disk: ADR-0026 removed the user (`~/.iris/fragments`) and
+//! repo (`<workspace>/.iris/fragments`) file loading -- and with it the
+//! system-prompt-injection surface and the fragment-trust gate. User and
+//! project steering happens through `AGENTS.md`/`CLAUDE.md`, which are still
+//! folded in as `<project_context>`.
 //!
-//! ## Project trust gate
-//!
-//! Repo fragments are attacker-controlled: cloning a hostile repo and running
-//! `iris` would inject arbitrary system-prompt text with zero ceremony. So the
-//! per-repo dir is only loaded when the workspace is **trusted** (see
-//! [`crate::wayland::trust`]); an untrusted or undecided project skips repo
-//! fragments entirely and falls back to the global dir / shipped defaults.
-//! Project docs (`AGENTS.md`/`CLAUDE.md`) are NOT gated -- only
-//! system-prompt-level fragments are.
+//! Fragments remain the internal assembly abstraction: the selector schema
+//! (ADR-0013) and named slots (ADR-0015) still order and conditionally include
+//! them; only their provenance is in-binary.
 //!
 //! Mirrors pi's `harness/system-prompt.ts` (assembly owned by the harness, not
 //! the terminal UI) and `core/resource-loader.ts` (project-doc discovery walk)
@@ -27,10 +23,9 @@
 //!
 //! ## Order
 //!
-//! 1. `identity` (anchored first; authored, loaded from a fragment file),
-//! 2. middle fragments: slotted by ascending `slot` (same slot: global-source
-//!    before repo-source, then alphabetical by `name`), then unslotted
-//!    fragments alphabetically,
+//! 1. `identity` (anchored first),
+//! 2. middle fragments: slotted by ascending `slot` (same slot: alphabetical by
+//!    `name`), then unslotted fragments alphabetically,
 //! 3. dynamic context: `<project_context>` (AGENTS.md/CLAUDE.md), then the
 //!    skills seam (deferred -- no skill registry yet), then the `Current date` /
 //!    `Current working directory` lines,
@@ -42,20 +37,11 @@
 //! `slot: 0` is the off switch: a fragment opts out entirely by setting it, so
 //! it is dropped before anchoring/ordering -- anchors included.
 //!
-//! ## Frontmatter keys
-//!
-//! `name` is the xml tag and `slot` the ordering key (`0` = disabled). Every
-//! other key -- including `description`, the one-line intent the shipped
-//! defaults carry for humans/agents reading the file -- is metadata only: it is
-//! ignored by the parser and never rendered into the prompt (forward-compat).
-//!
 //! ## Purity
 //!
 //! [`assemble`] is read-only (it never writes), and the core [`build_prompt`] is
 //! a pure function of its inputs, so per-turn re-assembly (deferred) is a later
 //! no-restructure change: call it again with fresh dynamic context.
-//! Materialization of the shipped defaults is the one side effect, isolated in
-//! [`ensure_default_fragments`] and run once at startup.
 //!
 //! ## Path safety
 //!
@@ -64,23 +50,22 @@
 //! config (the same trust class as `~/.iris/settings.json`, which the harness
 //! already reads from `HOME`): a normal cloned repo only controls files inside
 //! the workspace, not ancestor directories. Every file folded into the prompt
-//! (project docs AND fragment files) is read through [`read_regular_bounded`],
-//! which refuses symlinks (via `symlink_metadata`), opens the final component
-//! with `O_NOFOLLOW` to close the check/open race, and caps the bytes read. So a
-//! cloned repo cannot plant `AGENTS.md -> ~/.ssh/id_rsa` (or a symlinked
-//! `.iris/fragments/*.md`) to exfiltrate host files into the prompt.
+//! (the project docs) is read through [`read_regular_bounded`], which refuses
+//! symlinks (via `symlink_metadata`), opens the final component with
+//! `O_NOFOLLOW` to close the check/open race, and caps the bytes read. So a
+//! cloned repo cannot plant `AGENTS.md -> ~/.ssh/id_rsa` to exfiltrate host
+//! files into the prompt.
 
 mod defaults;
 
-use std::collections::{HashMap, HashSet};
-use std::env;
+use std::collections::HashSet;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::nexus::Tools;
 
-use defaults::{DEFAULTS, Default};
+use defaults::DEFAULTS;
 
 /// Anchored fragment name pinned first.
 const ANCHOR_IDENTITY: &str = "identity";
@@ -99,131 +84,32 @@ const DOC_CANDIDATES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 /// runaway or hostile file cannot balloon every request / OOM the process.
 const MAX_DOC_BYTES: u64 = 32 * 1024;
 
-/// Upper bound on bytes read per fragment file, so a committed huge fragment
-/// cannot bloat every provider request.
-const MAX_FRAGMENT_BYTES: u64 = 64 * 1024;
-
-/// Source a fragment was loaded from. Ordering precedence: global before repo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
-    Global,
-    Repo,
-}
-
-fn source_rank(source: Source) -> u8 {
-    match source {
-        Source::Global => 0,
-        Source::Repo => 1,
-    }
-}
-
-/// One parsed fragment: `name` (the xml tag), an optional `slot` sort key
-/// (`Some(0)` disables the fragment), the source it came from, and the body
-/// (surrounding whitespace trimmed).
+/// One fragment: `name` (the xml tag), an optional `slot` sort key (`Some(0)`
+/// disables the fragment), and the body (surrounding whitespace trimmed).
 #[derive(Debug, Clone)]
 struct Fragment {
     name: String,
     slot: Option<u32>,
-    source: Source,
     body: String,
 }
 
-/// Assemble the full provider-visible system prompt for `workspace`.
+/// Assemble the full provider-visible system prompt for `workspace` from the
+/// in-binary shipped fragments plus dynamic context (project docs, cwd, date).
 ///
-/// Read-only: loads the global (`~/.iris/fragments`) and repo
-/// (`<workspace>/.iris/fragments`) fragment dirs, discovers project docs, and
-/// builds the prompt. A missing/empty dir is normal. When no fragment file
-/// exists in either dir, the in-memory shipped defaults are used so the prompt
-/// is never empty. Both fresh and resumed sessions call this with the same
-/// workspace, so they assemble identical instructions.
-pub(crate) fn assemble(workspace: &Path, tools: &Tools, trust_repo: bool) -> String {
-    let mut fragments = Vec::new();
-    if let Some(global) = global_fragments_dir() {
-        fragments.extend(load_dir(&global, Source::Global));
-    }
-    // Repo fragments are attacker-controlled, so they load only for a trusted
-    // workspace. An untrusted/undecided project silently skips them.
-    if trust_repo {
-        fragments.extend(load_repo_fragments(workspace));
-    }
-    if fragments.is_empty() {
-        fragments = default_fragments();
-    }
-
+/// Read-only: no fragment file is discovered, materialized, or loaded from disk
+/// (ADR-0026); the only filesystem access is the bounded project-doc discovery.
+/// Both fresh and resumed sessions call this with the same workspace, so they
+/// assemble identical instructions.
+pub(crate) fn assemble(workspace: &Path, tools: &Tools) -> String {
     let docs = discover_project_docs(workspace);
-    build_prompt(fragments, tools, workspace, &docs, &today_ymd())
+    build_prompt(default_fragments(), tools, workspace, &docs, &today_ymd())
 }
 
-/// Load the per-repo fragments through the workspace path sandbox. The dir is
-/// canonicalized and required to stay inside the workspace, so a clone-committed
-/// `.iris` or `.iris/fragments` symlink that escapes the workspace is rejected
-/// instead of followed -- otherwise `read_dir` would enumerate the symlink
-/// target and fold host `.md` files into the prompt. A missing dir (the normal
-/// case) and an escaping symlink both yield no fragments.
-fn load_repo_fragments(workspace: &Path) -> Vec<Fragment> {
-    match repo_fragments_dir(workspace) {
-        Some(dir) => load_dir(&dir, Source::Repo),
-        None => Vec::new(),
-    }
-}
-
-/// Resolve the repo fragments dir through the workspace path sandbox, returning
-/// it only when it exists inside the workspace. `None` for the normal missing
-/// case and for an escaping symlink (which the sandbox rejects). Shared by
-/// [`load_repo_fragments`] and [`repo_provides_fragments`] so the trust prompt
-/// triggers on exactly the dir the loader would read.
-fn repo_fragments_dir(workspace: &Path) -> Option<PathBuf> {
-    let root = crate::tools::path::workspace_root(workspace).ok()?;
-    let resolved = crate::tools::path::resolve_existing(&root, ".iris/fragments").ok()?;
-    // Enforce workspace containment UNCONDITIONALLY, independent of the
-    // tool-path security opt-in. `resolve_existing` only confines paths when
-    // `IRIS_SECURITY_OPT_IN` is set (or under `cfg(test)`), so in the shipped
-    // default runtime a hostile repo could point `.iris/fragments` at an
-    // arbitrary host directory and have its `.md` files folded into the prompt.
-    // Both `resolved` and `root` are canonicalized; fail closed on any escape.
-    contain_in_workspace(resolved, &root)
-}
-
-/// Keep `resolved` only when it stays inside the canonicalized workspace
-/// `root`, else drop it. Applied unconditionally by [`repo_fragments_dir`] so
-/// repo-fragment containment does not depend on the tool-path security opt-in;
-/// both arguments must already be canonicalized.
-fn contain_in_workspace(resolved: PathBuf, root: &Path) -> Option<PathBuf> {
-    resolved.starts_with(root).then_some(resolved)
-}
-
-/// Whether the repo ships a `.iris/fragments` dir that would be folded into the
-/// system prompt if trusted. The first-run trust prompt only fires when this is
-/// true, so a project with no repo-provided fragments never prompts. Resolved
-/// through the same sandbox as the loader, so an escaping symlink reads as
-/// absent (nothing to trust).
-pub(crate) fn repo_provides_fragments(workspace: &Path) -> bool {
-    repo_fragments_dir(workspace).is_some()
-}
-
-/// Test-only: assemble from the in-memory shipped defaults with no fragment
-/// files, project docs, or `HOME`/disk access -- a hermetic instruction string
-/// for provider request-shaping tests.
+/// Test-only: assemble from the shipped defaults with no project docs or disk
+/// access -- a hermetic instruction string for provider request-shaping tests.
 #[cfg(test)]
 pub(crate) fn assemble_defaults(workspace: &Path, tools: &Tools) -> String {
     build_prompt(default_fragments(), tools, workspace, &[], &today_ymd())
-}
-
-/// Materialize the shipped defaults into `~/.iris/fragments` if absent. Run once
-/// at startup. Best-effort: a missing `HOME` or a write failure is logged, never
-/// fatal. Never overwrites an existing file, so user edits survive.
-pub(crate) fn ensure_default_fragments() {
-    let Some(dir) = global_fragments_dir() else {
-        tracing::debug!("no HOME set; skipping default fragment materialization");
-        return;
-    };
-    if let Err(error) = materialize_defaults(&dir) {
-        tracing::warn!(
-            error = %format!("{error:#}"),
-            dir = %dir.display(),
-            "failed to materialize default fragments"
-        );
-    }
 }
 
 /// Pure core: build the prompt from an explicit fragment set, the live tool
@@ -241,7 +127,7 @@ fn build_prompt(
     // rule applies uniformly to anchors and middles alike.
     fragments.retain(|f| f.slot != Some(0));
     // Anchored authored blocks are consumed by name; the generated tool blocks
-    // are never loaded from files, so a user-authored copy is dropped.
+    // are never authored, so a stray fragment carrying their name is dropped.
     let identity = take_anchor(&mut fragments, ANCHOR_IDENTITY);
     let tool_use = take_anchor(&mut fragments, ANCHOR_TOOL_USE);
     fragments.retain(|f| f.name != GEN_AVAILABLE_TOOLS && f.name != GEN_TOOL_GUIDELINES);
@@ -289,70 +175,27 @@ fn push_block(blocks: &mut Vec<String>, name: &str, body: Option<&str>) {
     blocks.push(format!("<{name}>\n{trimmed}\n</{name}>"));
 }
 
-/// Remove every fragment named `name` and return the winning body. Repo source
-/// overrides global for an anchored singleton; `None` when no such fragment
-/// exists. Removing all matches keeps a stray duplicate out of the middles.
+/// Remove every fragment named `name` and return the winning body (the last
+/// occurrence wins); `None` when no such fragment exists. Removing all matches
+/// keeps a stray duplicate out of the middles.
 fn take_anchor(fragments: &mut Vec<Fragment>, name: &str) -> Option<String> {
-    let mut winner: Option<usize> = None;
-    for (i, fragment) in fragments.iter().enumerate() {
-        if fragment.name != name {
-            continue;
-        }
-        match winner {
-            None => winner = Some(i),
-            Some(j) if source_rank(fragment.source) >= source_rank(fragments[j].source) => {
-                winner = Some(i)
-            }
-            Some(_) => {}
-        }
-    }
-    let body = winner.map(|i| fragments[i].body.clone());
+    let body = fragments
+        .iter()
+        .rev()
+        .find(|fragment| fragment.name == name)
+        .map(|fragment| fragment.body.clone());
     fragments.retain(|fragment| fragment.name != name);
     body
 }
 
-/// Collapse same-name fragments to one winner (repo beats global; among equal
-/// source the later one wins, matching [`take_anchor`]). Keeps the winner's own
-/// slot and body. Distinct names are untouched even when they share a slot.
-fn dedup_by_name(fragments: Vec<Fragment>) -> Vec<Fragment> {
-    let mut winner: HashMap<&str, usize> = HashMap::new();
-    for (i, fragment) in fragments.iter().enumerate() {
-        match winner.get(fragment.name.as_str()) {
-            Some(&j) if source_rank(fragment.source) < source_rank(fragments[j].source) => {}
-            _ => {
-                winner.insert(fragment.name.as_str(), i);
-            }
-        }
-    }
-    let keep: HashSet<usize> = winner.into_values().collect();
-    fragments
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, f)| keep.contains(&i).then_some(f))
-        .collect()
-}
-
-/// Order the middle fragments: slotted by ascending slot (ties: global before
-/// repo, then alphabetical by name), then all unslotted fragments alphabetically
-/// after every slotted one.
-///
-/// Dedup is by `name` only (never by slot): same-name fragments collapse to one
-/// so a repo `.iris/fragments/foo.md` overrides the materialized global default
-/// of the same name, matching how [`take_anchor`] dedups anchors. The winner
-/// keeps its own slot and body, so its position follows its own slot. Repo beats
-/// global; among same-name same-source ties the later fragment wins (same
-/// "later wins" rule as [`take_anchor`]). Distinct names sharing a slot both
-/// survive -- slot is a sort key, not a uniqueness constraint.
+/// Order the middle fragments: slotted by ascending slot (ties: alphabetical by
+/// name), then all unslotted fragments alphabetically after every slotted one.
+/// Slot is a sort key, not a uniqueness constraint: distinct names sharing a
+/// slot both survive.
 fn order_middles(fragments: Vec<Fragment>) -> Vec<Fragment> {
-    let (mut slotted, mut unslotted): (Vec<Fragment>, Vec<Fragment>) = dedup_by_name(fragments)
-        .into_iter()
-        .partition(|f| f.slot.is_some());
-    slotted.sort_by(|a, b| {
-        a.slot
-            .cmp(&b.slot)
-            .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    let (mut slotted, mut unslotted): (Vec<Fragment>, Vec<Fragment>) =
+        fragments.into_iter().partition(|f| f.slot.is_some());
+    slotted.sort_by(|a, b| a.slot.cmp(&b.slot).then_with(|| a.name.cmp(&b.name)));
     unslotted.sort_by(|a, b| a.name.cmp(&b.name));
     slotted.into_iter().chain(unslotted).collect()
 }
@@ -423,133 +266,16 @@ fn runtime_context_block(workspace: &Path, date: &str) -> String {
     format!("Current date: {date}\nCurrent working directory: {cwd}")
 }
 
-/// The in-memory shipped defaults, used when no fragment file exists on disk.
+/// The shipped in-binary fragments, the single fragment source (ADR-0026).
 fn default_fragments() -> Vec<Fragment> {
     DEFAULTS
         .iter()
         .map(|d| Fragment {
             name: d.name.to_string(),
             slot: d.slot,
-            source: Source::Global,
             body: d.body.trim().to_string(),
         })
         .collect()
-}
-
-/// Load every `*.md` fragment file in `dir`. A missing dir, a non-`.md` entry,
-/// a non-regular entry (symlink/dir), or a read error contributes nothing -- a
-/// missing/empty fragments dir is normal, never an error.
-fn load_dir(dir: &Path, source: Source) -> Vec<Fragment> {
-    // Reject a symlinked fragments dir: read_dir would follow it, and the
-    // per-file symlink guard cannot catch a dir whose *target* holds real
-    // regular files. (For the repo dir this is belt-and-suspenders;
-    // load_repo_fragments already resolved it inside the workspace sandbox.)
-    if std::fs::symlink_metadata(dir)
-        .map(|m| m.is_symlink())
-        .unwrap_or(false)
-    {
-        return Vec::new();
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        // A missing dir is the normal "no fragments here" case.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        // A real failure (permissions, corruption) must not silently produce a
-        // bare prompt without a trace.
-        Err(error) => {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                dir = %dir.display(),
-                "could not read fragments dir"
-            );
-            return Vec::new();
-        }
-    };
-    // Sort by path so duplicate (slot, source, name) fragments -- or duplicate
-    // anchors -- resolve deterministically regardless of the OS read_dir order.
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("md"))
-        .collect();
-    paths.sort();
-
-    let mut out = Vec::new();
-    for path in paths {
-        let Some(raw) = read_regular_bounded(&path, MAX_FRAGMENT_BYTES) else {
-            continue;
-        };
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("fragment");
-        out.push(parse_fragment(stem, source, &raw));
-    }
-    out
-}
-
-/// Parse one fragment file: optional leading `---` frontmatter followed by the
-/// body. Only `name` (the xml tag) and `slot` (ordering key) are read; every
-/// other key -- `description` and any future key -- is metadata, ignored here so
-/// it never reaches the rendered prompt. `name` defaults to the file stem when
-/// frontmatter omits it. The body is everything after the closing `---`,
-/// surrounding whitespace trimmed.
-fn parse_fragment(stem: &str, source: Source, raw: &str) -> Fragment {
-    // Tolerate a leading UTF-8 BOM (some editors prepend one); otherwise the
-    // frontmatter fence would not match and the whole file, frontmatter
-    // included, would be ingested as the body.
-    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
-    let mut name = stem.to_string();
-    let mut slot = None;
-
-    let body = match strip_frontmatter_open(raw).and_then(split_at_closing_fence) {
-        Some((front, rest)) => {
-            for line in front.lines() {
-                let Some((key, value)) = line.split_once(':') else {
-                    continue;
-                };
-                let value = value.trim().trim_matches(['"', '\'']).trim();
-                match key.trim() {
-                    "name" if !value.is_empty() => name = value.to_string(),
-                    "slot" => slot = value.parse::<u32>().ok(),
-                    // Everything else (description, future model/mode/... keys)
-                    // is metadata: ignored so it never reaches the prompt body.
-                    _ => {}
-                }
-            }
-            rest
-        }
-        // No frontmatter (or no closing fence): the whole file is the body.
-        None => raw,
-    };
-
-    Fragment {
-        name,
-        slot,
-        source,
-        body: body.trim().to_string(),
-    }
-}
-
-/// If `raw` opens with a `---` frontmatter fence, return the text right after
-/// it; otherwise `None`.
-fn strip_frontmatter_open(raw: &str) -> Option<&str> {
-    let rest = raw.strip_prefix("---")?;
-    rest.strip_prefix('\n')
-        .or_else(|| rest.strip_prefix("\r\n"))
-}
-
-/// Split frontmatter content at its closing `---` line, returning
-/// (frontmatter, body). `None` when there is no closing fence.
-fn split_at_closing_fence(after: &str) -> Option<(&str, &str)> {
-    let mut offset = 0;
-    for line in after.split_inclusive('\n') {
-        if line.trim() == "---" {
-            return Some((&after[..offset], &after[offset + line.len()..]));
-        }
-        offset += line.len();
-    }
-    None
 }
 
 /// Discover project docs walking `cwd` -> filesystem root, deduping by path, and
@@ -592,12 +318,11 @@ fn read_doc_in_dir(dir: &Path) -> Option<(String, String)> {
 }
 
 /// Read a regular file's first `max` bytes as lossy UTF-8, refusing symlinks.
-/// Shared by fragment files and project docs so the same exfiltration guard (a
-/// planted `*.md` symlink to a host secret) applies to every file folded into
-/// the prompt. `symlink_metadata` rejects a symlink/non-regular entry before
-/// opening, and the final component is opened with `O_NOFOLLOW` (Unix) so a
-/// check/open race cannot swap a regular file for a symlink between the type
-/// check and the read. `None` on any miss.
+/// The exfiltration guard (a planted symlink to a host secret) applies to every
+/// file folded into the prompt. `symlink_metadata` rejects a symlink/non-regular
+/// entry before opening, and the final component is opened with `O_NOFOLLOW`
+/// (Unix) so a check/open race cannot swap a regular file for a symlink between
+/// the type check and the read. `None` on any miss.
 fn read_regular_bounded(path: &Path, max: u64) -> Option<String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => {}
@@ -628,44 +353,6 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(not(unix))]
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
-}
-
-/// Global fragments dir: `~/.iris/fragments`. `None` when `HOME` is unset/empty,
-/// so the global layer is simply skipped (mirrors `config::global_path`).
-fn global_fragments_dir() -> Option<PathBuf> {
-    let home = env::var("HOME").ok().filter(|home| !home.is_empty())?;
-    Some(Path::new(&home).join(".iris/fragments"))
-}
-
-/// Write each shipped default into `dir` if the file does not already exist.
-fn materialize_defaults(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    for default in DEFAULTS {
-        let path = dir.join(format!("{}.md", default.name));
-        if path.exists() {
-            continue;
-        }
-        std::fs::write(&path, default_file_contents(default))?;
-    }
-    Ok(())
-}
-
-/// Render a shipped default to its on-disk `.md` form: `---` frontmatter
-/// (`name`, `description`, optional `slot`) then the body. The `description`
-/// makes each materialized file self-documenting without leaking into the
-/// prompt.
-fn default_file_contents(default: &Default) -> String {
-    let mut out = format!(
-        "---\nname: {}\ndescription: {}\n",
-        default.name, default.description
-    );
-    if let Some(slot) = default.slot {
-        out.push_str(&format!("slot: {slot}\n"));
-    }
-    out.push_str("---\n");
-    out.push_str(default.body);
-    out.push('\n');
-    out
 }
 
 /// Today's date as `YYYY-MM-DD` (UTC), pi-style.
