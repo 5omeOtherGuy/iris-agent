@@ -61,6 +61,20 @@ impl<'a, P> ModelSwitch<'a, P> {
     pub(crate) fn set_scoped(&mut self, scoped: Option<Vec<String>>) {
         self.scoped = scoped.filter(|ids| !ids.is_empty());
     }
+
+    /// Swap the system prompt used to rebuild providers. Used by `/trust` after
+    /// re-assembling the prompt under a new trust decision; the next
+    /// [`apply_selection`] rebuilds the provider with this prompt.
+    pub(crate) fn set_system_prompt(&mut self, prompt: String) {
+        self.system_prompt = prompt;
+    }
+
+    /// The system prompt currently used to rebuild providers. `/trust` snapshots
+    /// this before a rebuild so it can restore it if the rebuild fails, keeping
+    /// the session prompt in sync with the still-live provider.
+    pub(crate) fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
 }
 
 /// Route a submitted line through the shared `/model` / `/reasoning` handler.
@@ -245,6 +259,7 @@ fn picker_only_command(prompt: &str) -> Option<&'static str> {
     match prompt.split_whitespace().next().unwrap_or("") {
         "/scoped-models" => Some("/scoped-models"),
         "/settings" => Some("/settings"),
+        "/trust" => Some("/trust"),
         "/login" => Some("/login"),
         "/logout" => Some("/logout"),
         _ => None,

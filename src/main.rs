@@ -145,7 +145,8 @@ fn run_agent(force_plain: bool) -> Result<()> {
     // from fragment files plus dynamic context (project docs, date, cwd) and the
     // live tool registry. Fresh and resume call the same function.
     let tools = tools::built_in_tools();
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let trust_repo = resolve_project_trust(&cwd);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, trust_repo);
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
@@ -192,6 +193,65 @@ fn run_agent(force_plain: bool) -> Result<()> {
     cli::run_interactive(&mut harness, &mut switch, force_plain)
 }
 
+/// Resolve whether this workspace's repo-provided Iris resources (system-prompt
+/// fragments) are trusted for this run. Security gate for issue #202: a cloned
+/// hostile repo must not inject system-prompt fragments without an explicit
+/// decision.
+///
+/// - A recorded `Trusted`/`Untrusted` decision is honored directly.
+/// - `Undecided` in an interactive terminal, when the repo actually ships
+///   `.iris/fragments`, prompts once and persists the answer.
+/// - `Undecided` in any non-interactive context (pipe/CI), or when the repo
+///   ships no fragments, defaults to untrusted WITHOUT writing a decision, so a
+///   later interactive run can still prompt.
+fn resolve_project_trust(cwd: &Path) -> bool {
+    use wayland::trust::TrustDecision;
+    match wayland::trust::decision_for(cwd) {
+        TrustDecision::Trusted => true,
+        TrustDecision::Untrusted => false,
+        TrustDecision::Undecided => {
+            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            if !interactive || !wayland::system_prompt::repo_provides_fragments(cwd) {
+                return false;
+            }
+            prompt_for_project_trust(cwd)
+        }
+    }
+}
+
+/// First-run interactive trust prompt. Presents the risk, reads a single
+/// yes/no answer from stdin, and persists the decision keyed by canonical dir.
+/// Defaults to untrusted on empty input or EOF. A persistence failure is
+/// surfaced but never blocks startup (the run proceeds untrusted).
+fn prompt_for_project_trust(cwd: &Path) -> bool {
+    println!(
+        "This project ships Iris resources under .iris/fragments that would be injected\n\
+         into the model's system prompt. Only trust them if you trust this repository."
+    );
+    print!("Trust this project's Iris resources? [y/N]: ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    let trusted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if let Err(error) = wayland::trust::set_decision(cwd, trusted) {
+        tracing::warn!(error = %format!("{error:#}"), "failed to persist project trust decision");
+        eprintln!("warning: could not save the trust decision: {error:#}");
+    }
+    println!(
+        "{}",
+        if trusted {
+            "Project trusted; repo fragments will load."
+        } else {
+            "Project not trusted; repo fragments are skipped. Use /trust to change this."
+        }
+    );
+    trusted
+}
+
 /// Resume an existing session by id: load its transcript from the store,
 /// reconstruct the provider-visible messages, seed the agent with them, and
 /// continue appending future turns to the same log. Errors clearly when the id
@@ -218,7 +278,8 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     // a fresh session, so a resumed turn gets identical fragment/context output.
     wayland::system_prompt::ensure_default_fragments();
     let tools = tools::built_in_tools();
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let trust_repo = resolve_project_trust(&cwd);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, trust_repo);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = meta.id.clone();

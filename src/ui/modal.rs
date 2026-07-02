@@ -85,6 +85,9 @@ pub(crate) enum ModalAction {
     SetEffort(ReasoningEffort),
     /// Settings menu -> open the thinking-level submenu.
     OpenEffortPicker,
+    /// Set this project's trust decision (`true` = trust repo Iris resources).
+    /// Re-assembles the system prompt and rebuilds the provider at the boundary.
+    SetTrust(bool),
     /// `/login` method chosen -> open the matching provider selector.
     ChooseLoginMethod(LoginMethod),
     /// Begin an OAuth/subscription login for this provider.
@@ -119,6 +122,7 @@ pub(crate) enum Modal {
     Scoped(ScopedModels),
     Effort(EffortPicker),
     Settings(SettingsMenu),
+    Trust(TrustMenu),
     LoginMethod(MethodSelect),
     Providers(ProviderSelect),
     LoginDialog(LoginDialog),
@@ -132,6 +136,7 @@ impl Modal {
             Modal::Scoped(picker) => picker.handle_key(key),
             Modal::Effort(picker) => picker.handle_key(key),
             Modal::Settings(menu) => menu.handle_key(key),
+            Modal::Trust(menu) => menu.handle_key(key),
             Modal::LoginMethod(menu) => menu.handle_key(key),
             Modal::Providers(picker) => picker.handle_key(key),
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
@@ -159,6 +164,7 @@ impl Modal {
             Modal::Scoped(picker) => picker.render(width),
             Modal::Effort(picker) => picker.render(width),
             Modal::Settings(menu) => menu.render(width),
+            Modal::Trust(menu) => menu.render(width),
             Modal::LoginMethod(menu) => menu.render(width),
             Modal::Providers(picker) => picker.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
@@ -833,6 +839,65 @@ impl SettingsMenu {
     }
 }
 
+// --- project trust menu ---
+
+/// Change this project's trust decision for repo-provided Iris resources
+/// (system-prompt fragments). Confirming emits [`ModalAction::SetTrust`]; the
+/// loop persists the decision, re-assembles the prompt, and rebuilds the
+/// provider at the safe inter-turn boundary. The row matching the active state
+/// is marked `current`.
+#[derive(Debug, Clone)]
+pub(crate) struct TrustMenu {
+    selector: Selector,
+}
+
+impl TrustMenu {
+    pub(crate) fn new(trusted: bool) -> Self {
+        let mut trust =
+            SelectorItem::new("trust", "Trust this project").detail("load repo .iris/fragments");
+        let mut untrust =
+            SelectorItem::new("untrust", "Do not trust").detail("skip repo fragments");
+        if trusted {
+            trust = trust.trailing("current");
+        } else {
+            untrust = untrust.trailing("current");
+        }
+        let mut selector = Selector::new(vec![trust, untrust], false, false, 8);
+        selector.select_id(if trusted { "trust" } else { "untrust" });
+        TrustMenu { selector }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some("trust") => ModalOutcome::Emit(ModalAction::SetTrust(true)),
+                Some("untrust") => ModalOutcome::Emit(ModalAction::SetTrust(false)),
+                _ => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let rows = selector_rows(&self.selector, "No options");
+        crate::ui::tui::overlay_box(
+            Some("Project trust"),
+            rows,
+            Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
+    }
+}
+
 // --- login method selector ---
 
 #[derive(Debug, Clone)]
@@ -1415,6 +1480,41 @@ mod tests {
             picker.handle_key(ModalKey::CtrlC),
             ModalOutcome::Close
         ));
+    }
+
+    #[test]
+    fn trust_menu_marks_current_and_emits_decision() {
+        // Untrusted state: the "Do not trust" row is current and pre-selected.
+        let mut menu = TrustMenu::new(false);
+        let text: String = menu
+            .render(80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("PROJECT TRUST"), "{text}");
+        assert!(text.contains("current"), "{text}");
+        // Enter on the pre-selected untrusted row emits SetTrust(false).
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SetTrust(false))
+        );
+        // Moving up to the trust row and confirming emits SetTrust(true).
+        menu.handle_key(ModalKey::Up);
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SetTrust(true))
+        );
+        // Esc cancels.
+        assert_eq!(menu.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn trust_menu_trusted_state_preselects_trust_row() {
+        let mut menu = TrustMenu::new(true);
+        assert_eq!(
+            menu.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SetTrust(true))
+        );
     }
 
     #[test]

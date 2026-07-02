@@ -85,8 +85,8 @@ From a source checkout, replace `iris` with `cargo run --`.
 
 At the prompt, `/model` views or switches provider/model and
 `/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
-turn boundary. `/settings`, `/scoped-models`, `/login`, and `/logout` open their
-selectors.
+turn boundary. `/settings`, `/scoped-models`, `/trust`, `/login`, and `/logout`
+open their selectors.
 
 <details>
 <summary><b>Providers, settings &amp; environment</b></summary>
@@ -143,12 +143,35 @@ cannot choose your provider, scoped model cycle, provider-side cache retention,
 Anthropic server-side context-management behavior, or redirect OAuth bearer
 tokens with `baseUrl`.
 
+### Project trust (repo Iris resources)
+
+A repo may ship system-prompt fragments under `<cwd>/.iris/fragments`. Because
+those fragments are folded into the model's system prompt, a cloned hostile repo
+would otherwise be arbitrary prompt injection with no ceremony. Iris gates them
+behind a per-project trust decision:
+
+- The first interactive run in a directory whose repo ships `.iris/fragments`
+  prompts once: trust this project's Iris resources? The answer (trusted or
+  untrusted) is persisted in `~/.iris/trust.json` keyed by the canonical
+  (symlink-resolved) directory.
+- Until a project is trusted, repo fragments are skipped. Project docs
+  (`AGENTS.md`/`CLAUDE.md`) keep loading regardless — only system-prompt-level
+  fragments are gated.
+- Non-interactive runs (pipes/CI) never prompt and default to untrusted without
+  recording a decision, so a later interactive run can still ask.
+- `/trust` changes the decision mid-session; it re-assembles the prompt and
+  rebuilds the provider at the next turn boundary. Override the store path with
+  `IRIS_TRUST_PATH`.
+
+The global fragments dir (`~/.iris/fragments`) is user-owned and always trusted.
+
 ### Environment variables
 
 - `IRIS_AUTH_PATH` — auth-file path; defaults to `~/.iris/auth.json`.
 - `IRIS_MODEL` — OpenAI Codex model override; defaults to `gpt-5.5`.
 - `IRIS_CODEX_BASE_URL` — OpenAI Codex base URL; defaults to `https://chatgpt.com/backend-api`.
 - `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
+- `IRIS_TRUST_PATH` — project-trust store path; defaults to `~/.iris/trust.json`.
 - `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
 - `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
 - `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.

@@ -58,6 +58,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/trust",
+        description: "Trust or untrust this project's Iris resources",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/login",
         description: "Configure provider authentication",
         action: SlashAction::Submit,
@@ -170,7 +175,7 @@ mod tests {
 
     #[test]
     fn matches_filters_by_prefix_case_insensitively() {
-        assert_eq!(matches("/").len(), 7);
+        assert_eq!(matches("/").len(), 8);
         let ex = matches("/EX");
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name, "/exit");
@@ -202,7 +207,7 @@ mod tests {
         for _ in 0..20 {
             p.down("/");
         }
-        assert_eq!(p.selected(), 6);
+        assert_eq!(p.selected(), 7);
         assert_eq!(p.accept("/").unwrap().name, "/logout");
         // Up returns toward the top.
         p.up();
