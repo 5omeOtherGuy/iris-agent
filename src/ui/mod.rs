@@ -7,6 +7,7 @@ use crate::nexus::{
     ToolCall,
 };
 
+pub(crate) mod clipboard;
 pub(crate) mod login;
 pub(crate) mod markdown;
 pub(crate) mod modal;

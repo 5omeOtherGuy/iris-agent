@@ -126,6 +126,12 @@ pub(crate) fn overlay_box(
     out
 }
 
+/// Max command rows the palette shows at once. A longer match list scrolls to
+/// keep the selection visible (the [`crate::ui::selector::Selector`] windowing
+/// idiom) with a dim `(n/total)` position row, so the boxed palette always fits
+/// the docked menu budget instead of clipping its bottom frame.
+const PALETTE_WINDOW: usize = 8;
+
 /// A [`Component`] view over the slash palette's current matches and selection.
 ///
 /// The palette's STATE lives in [`Palette`] (`slash.rs`); this is its render
@@ -157,10 +163,20 @@ impl Component for PaletteView<'_> {
             .map(|cmd| display_width(cmd.name))
             .max()
             .unwrap_or(0);
-        let rows: Vec<(Line<'static>, bool)> = self
+        // Scrolled window over the matches, keeping the selection visible
+        // (same offset math as `Selector::scroll_offset`).
+        let scrolled = self.matches.len() > PALETTE_WINDOW;
+        let offset = if self.selected < PALETTE_WINDOW {
+            0
+        } else {
+            self.selected - PALETTE_WINDOW + 1
+        };
+        let mut rows: Vec<(Line<'static>, bool)> = self
             .matches
             .iter()
             .enumerate()
+            .skip(offset)
+            .take(PALETTE_WINDOW)
             .map(|(i, cmd)| {
                 let selected_row = i == self.selected;
                 // The highlighted row gets the surface fill (overlay_box) plus
@@ -184,6 +200,15 @@ impl Component for PaletteView<'_> {
                 )
             })
             .collect();
+        if scrolled {
+            rows.push((
+                Line::from(Span::styled(
+                    format!("({}/{})", self.selected + 1, self.matches.len()),
+                    dim_style(),
+                )),
+                false,
+            ));
+        }
         overlay_box(None, rows, None, width)
     }
 }
@@ -224,12 +249,12 @@ mod tests {
     #[test]
     fn palette_view_renders_framed_rows_with_surface_selection() {
         let mut palette = Palette::default();
-        palette.sync("/");
-        palette.down("/"); // select row 1
-        let view = PaletteView::for_palette(&palette, "/");
+        palette.sync("/re");
+        palette.down("/re"); // select row 1 (/resume)
+        let view = PaletteView::for_palette(&palette, "/re");
         let lines = view.render(80);
         // One boxed row per match, plus the top and bottom frame rules.
-        assert_eq!(lines.len(), slash::matches("/").len() + 2);
+        assert_eq!(lines.len(), slash::matches("/re").len() + 2);
         // The selected row uses the surface fill + a bold command name — never
         // a color-only (cyan) accent.
         let selected = &lines[2];
@@ -270,5 +295,47 @@ mod tests {
         let palette = Palette::default();
         let view = PaletteView::for_palette(&palette, "no-slash");
         assert!(view.render(80).is_empty());
+    }
+
+    #[test]
+    fn palette_view_windows_long_match_lists_and_follows_the_selection() {
+        let total = slash::matches("/").len();
+        assert!(
+            total > PALETTE_WINDOW,
+            "registry no longer exercises palette windowing"
+        );
+        let text = |line: &Line<'static>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        // Unscrolled top: window rows + position row + two frame rules, with a
+        // complete bottom frame (the docked menu budget stays honest).
+        let mut palette = Palette::default();
+        palette.sync("/");
+        let lines = PaletteView::for_palette(&palette, "/").render(80);
+        assert_eq!(lines.len(), PALETTE_WINDOW + 3);
+        assert!(text(lines.last().unwrap()).contains('└'));
+        let rendered = lines.iter().map(&text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("/exit"), "{rendered}");
+        assert!(rendered.contains(&format!("(1/{total})")), "{rendered}");
+        assert!(!rendered.contains("/logout"), "{rendered}");
+
+        // Walking past the window scrolls it: the last command becomes visible
+        // and the first scrolls out.
+        for _ in 0..total {
+            palette.down("/");
+        }
+        let lines = PaletteView::for_palette(&palette, "/").render(80);
+        assert_eq!(lines.len(), PALETTE_WINDOW + 3);
+        let rendered = lines.iter().map(&text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("/logout"), "{rendered}");
+        assert!(!rendered.contains("/exit "), "{rendered}");
+        assert!(
+            rendered.contains(&format!("({total}/{total})")),
+            "{rendered}"
+        );
     }
 }

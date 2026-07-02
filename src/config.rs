@@ -345,6 +345,14 @@ fn project_path(cwd: &Path) -> PathBuf {
     cwd.join(".iris/settings.json")
 }
 
+/// Where `/debug` writes its snapshot: `~/.iris/iris-debug.log` (mirroring
+/// pi-mono's `~/.pi/agent/pi-debug.log`). `None` when `HOME` is unset, so the
+/// command reports the problem instead of writing a relative path.
+pub(crate) fn debug_log_path() -> Option<PathBuf> {
+    let home = env::var("HOME").ok().filter(|home| !home.is_empty())?;
+    Some(Path::new(&home).join(".iris/iris-debug.log"))
+}
+
 /// Truthy reading of an `IRIS_*` opt-in environment variable, using the same
 /// convention as `IRIS_SECURITY_OPT_IN` (`1`/`true`/`yes`/`on`). Lets the
 /// accessibility switches (`IRIS_PLAIN`, `IRIS_REDUCED_MOTION`) share one parser

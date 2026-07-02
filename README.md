@@ -142,7 +142,11 @@ restarting the process.
 At the prompt, `/model` views or switches provider/model and
 `/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
 turn boundary. `/resume`, `/new`, `/settings`, `/scoped-models`, `/trust`,
-`/login`, and `/logout` open their selectors or actions.
+`/login`, and `/logout` open their selectors or actions. `/session` shows the
+current session's file, id, message counts, and context-token estimate;
+`/copy` puts the last assistant reply on the system clipboard (OSC 52 fallback
+over SSH); `/debug` writes a debug snapshot of the rendered screen and the
+conversation context to `~/.iris/iris-debug.log`.
 
 <details>
 <summary><b>Providers, settings &amp; environment</b></summary>

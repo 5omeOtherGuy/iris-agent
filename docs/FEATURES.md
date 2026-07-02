@@ -112,6 +112,12 @@
   persisted defaults at safe turn boundaries. [Implemented]
 - **TUI auth selectors** — `/login` and `/logout` modals show no-secret provider
   status and drive existing OAuth/subscription flows where available. [Implemented]
+- **Session utility commands** — `/session` (transcript file, id, message counts,
+  context-token estimate, active model), `/copy` (last assistant reply to the
+  system clipboard via pbcopy/wl-copy/xclip/xsel with an OSC 52 fallback for SSH
+  sessions), and `/debug` (pi-mono-style snapshot of the rendered screen and the
+  provider-visible context written to `~/.iris/iris-debug.log`; `/dbug` alias).
+  `/copy` and `/session` also work in the text fallback. [Implemented]
 - **Model catalog** — hand-maintained provider/model list for picker display and
   authenticated-model filtering, including current Codex, Anthropic subscription,
   and Antigravity entries. [Implemented]

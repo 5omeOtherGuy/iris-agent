@@ -589,6 +589,26 @@ fn route_command<P: ChatProvider>(
             tui.screen.commit_user(prompt);
             Ok(RouteOutcome::Swap(SessionSource::Fresh))
         }
+        "/session" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            apply_notices(tui, crate::cli::session_info_lines(harness, switch));
+            Ok(RouteOutcome::Consumed)
+        }
+        "/copy" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            apply_notices(tui, crate::cli::copy_command_lines(harness));
+            Ok(RouteOutcome::Consumed)
+        }
+        // pi-mono spells it `/debug`; `/dbug` is accepted as an unlisted alias.
+        "/debug" | "/dbug" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            let lines = match write_debug_snapshot(harness, tui) {
+                Ok(path) => vec![format!("debug snapshot written to {}", path.display())],
+                Err(error) => vec![format!("could not write debug snapshot: {error:#}")],
+            };
+            apply_notices(tui, lines);
+            Ok(RouteOutcome::Consumed)
+        }
         "/login" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             tui.screen.open_modal(login::open_login());
@@ -616,6 +636,60 @@ fn route_command<P: ChatProvider>(
         }
         _ => Ok(RouteOutcome::Fall),
     }
+}
+
+/// `/debug`: write a snapshot of the rendered document and the provider-visible
+/// context to `~/.iris/iris-debug.log` (pi-mono's debug dump shape: every
+/// rendered line with its visible width, then the messages as JSONL). Returns
+/// the written path for the confirmation notice.
+fn write_debug_snapshot<P: ChatProvider>(
+    harness: &Harness<P>,
+    tui: &mut TuiUi,
+) -> Result<std::path::PathBuf> {
+    use anyhow::Context;
+    let path = crate::config::debug_log_path()
+        .context("cannot resolve the debug log path: HOME is not set")?;
+    let (size, rendered) = tui.debug_render_lines()?;
+    let contents = debug_snapshot_contents(size.width, size.height, &rendered, harness.messages());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Assemble the `/debug` snapshot body. Pure so the shape is unit-testable.
+fn debug_snapshot_contents(
+    width: u16,
+    height: u16,
+    rendered: &[String],
+    messages: &[crate::nexus::Message],
+) -> String {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(rendered.len() + messages.len() + 8);
+    out.push(format!(
+        "Iris {} debug snapshot at unix-ms {unix_ms}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    out.push(format!("Terminal: {width}x{height}"));
+    out.push(format!("Total lines: {}", rendered.len()));
+    out.push(String::new());
+    out.push("=== Rendered lines with visible widths ===".to_string());
+    out.extend(rendered.iter().cloned());
+    out.push(String::new());
+    out.push("=== Context messages (JSONL) ===".to_string());
+    out.extend(
+        messages
+            .iter()
+            .map(|message| crate::session::message_body(message).to_string()),
+    );
+    out.push(String::new());
+    out.join("\n")
 }
 
 /// Read and edit until the user submits a non-empty prompt or exits. The spinner
@@ -1619,6 +1693,32 @@ mod tests {
     use crate::nexus::SteeringSource;
     use crate::ui::tui::Screen;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn debug_snapshot_contents_carry_size_rendered_lines_and_messages() {
+        let rendered = vec!["[0] (w=2) \"hi\"".to_string(), "[1] (w=0) \"\"".to_string()];
+        let messages = vec![
+            crate::nexus::Message::user("question"),
+            crate::nexus::Message::assistant("answer"),
+        ];
+        let contents = debug_snapshot_contents(80, 24, &rendered, &messages);
+        assert!(contents.contains("Iris "), "{contents}");
+        assert!(contents.contains("Terminal: 80x24"), "{contents}");
+        assert!(contents.contains("Total lines: 2"), "{contents}");
+        assert!(contents.contains("[0] (w=2) \"hi\""), "{contents}");
+        assert!(
+            contents.contains("=== Context messages (JSONL) ==="),
+            "{contents}"
+        );
+        assert!(
+            contents.contains(r#"{"content":"question","role":"user"}"#),
+            "{contents}"
+        );
+        assert!(
+            contents.contains(r#"{"content":"answer","role":"assistant"}"#),
+            "{contents}"
+        );
+    }
 
     #[test]
     fn scheduler_first_request_after_idle_draws_immediately() {
