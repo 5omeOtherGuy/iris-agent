@@ -45,11 +45,13 @@ so no `rg` or `fd` binary needs to be on `PATH`.
 | Windows | Unsupported | — |
 
 macOS caveat: the `bash` sandbox is Linux-only. On macOS every shell command
-runs without kernel confinement. Iris does not hide this: the `bash` approval
-prompt states `unsandboxed` at the point you approve a command, so the posture
-is visible where you decide, not buried in a startup line. macOS Seatbelt
-confinement is a planned follow-up ([docs/ROADMAP.md](docs/ROADMAP.md)); until it
-lands, treat macOS shell commands as unsandboxed.
+runs without kernel confinement. Approval prompts appear only when
+`IRIS_SECURITY_OPT_IN=1` enables them; a default run may auto-approve and show
+no prompt at all. When a `bash` approval prompt is shown on macOS, it states
+`unsandboxed` at the point you approve a command, so the posture is visible
+where you decide, not buried in a startup line. macOS Seatbelt confinement is a
+planned follow-up ([docs/ROADMAP.md](docs/ROADMAP.md)); until it lands, treat
+macOS shell commands as unsandboxed whether or not a prompt is shown.
 
 ## Run
 

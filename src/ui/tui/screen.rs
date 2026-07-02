@@ -52,10 +52,15 @@ struct ApprovalHint {
     /// Whether the gated action is a shell command, so the action reads with a
     /// `$ ` prompt (per the `ApprovalOutput` design-system component).
     shell: bool,
-    /// Whether the shell will run unconfined because this platform has no kernel
-    /// sandbox. Surfaces an honest `unsandboxed` posture at the decision point
-    /// on non-Linux, rather than only a startup notice that scrolls away.
-    unsandboxed: bool,
+    /// Whether this platform ships no kernel sandbox backend for the shell at
+    /// all (non-Linux). Surfaces an honest `unsandboxed` posture at the
+    /// decision point, rather than only a startup notice that scrolls away.
+    ///
+    /// This reflects platform capability, not per-run confinement. Its ABSENCE
+    /// is NOT a guarantee that the run is confined: on Linux the marker is
+    /// always false even when runtime enforcement is off (Landlock unavailable
+    /// or approvals not opted in). Do not treat a missing marker as sandboxed.
+    sandbox_unavailable: bool,
 }
 
 #[derive(Default)]
@@ -273,7 +278,7 @@ fn approval_lead_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
         spans.push(Span::styled("$ ", dim_style()));
     }
     spans.extend(ansi_spans(&hint.target, Style::default()));
-    if hint.unsandboxed {
+    if hint.sandbox_unavailable {
         spans.push(Span::styled(
             format!("  {} unsandboxed", crate::ui::symbols::SEP),
             dim_style(),
@@ -618,7 +623,7 @@ impl Screen {
             target: run_target(call),
             options,
             shell,
-            unsandboxed: shell && !crate::tools::platform_can_sandbox(),
+            sandbox_unavailable: shell && !crate::tools::platform_can_sandbox(),
         });
     }
 
@@ -1294,7 +1299,7 @@ mod tests {
             target: "run an extremely long command".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
-            unsandboxed: true,
+            sandbox_unavailable: true,
         };
         for width in 1..=4 {
             for line in approval_status_lines(&hint, width) {
@@ -1326,13 +1331,13 @@ mod tests {
             target: "echo hi".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
-            unsandboxed: false,
+            sandbox_unavailable: false,
         };
         let non_shell = ApprovalHint {
             target: "Write src/x.rs".to_string(),
             options: "[y] once  [N] deny",
             shell: false,
-            unsandboxed: false,
+            sandbox_unavailable: false,
         };
         let shell_text = line_text(&approval_status_line(&shell));
         let non_shell_text = line_text(&approval_status_line(&non_shell));
@@ -1350,33 +1355,38 @@ mod tests {
     }
 
     #[test]
-    fn approval_review_line_marks_unsandboxed_shell() {
-        // On a platform without a kernel sandbox the shell runs unconfined; the
-        // approval prompt states that posture at the decision point, in the
-        // calm dim aside, rather than only in a startup notice.
-        let unsandboxed = ApprovalHint {
+    fn approval_review_line_marks_platform_without_sandbox() {
+        // On a platform with no kernel sandbox backend the shell runs
+        // unconfined; the approval prompt states that posture at the decision
+        // point, in the calm dim aside, rather than only in a startup notice.
+        // The marker reflects platform capability, not per-run confinement.
+        let unavailable = ApprovalHint {
             target: "echo hi".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
-            unsandboxed: true,
+            sandbox_unavailable: true,
         };
-        let sandboxed = ApprovalHint {
+        let has_backend = ApprovalHint {
             target: "echo hi".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
-            unsandboxed: false,
+            sandbox_unavailable: false,
         };
-        let unsandboxed_text = line_text(&approval_status_line(&unsandboxed));
-        let sandboxed_text = line_text(&approval_status_line(&sandboxed));
+        let unavailable_text = line_text(&approval_status_line(&unavailable));
+        let has_backend_text = line_text(&approval_status_line(&has_backend));
         assert!(
-            unsandboxed_text.contains("unsandboxed"),
-            "{unsandboxed_text}"
+            unavailable_text.contains("unsandboxed"),
+            "{unavailable_text}"
         );
         assert!(
-            unsandboxed_text.contains(crate::ui::symbols::SEP),
-            "{unsandboxed_text}"
+            unavailable_text.contains(crate::ui::symbols::SEP),
+            "{unavailable_text}"
         );
-        // The posture aside is shell-only and never claims confinement.
-        assert!(!sandboxed_text.contains("unsandboxed"), "{sandboxed_text}");
+        // The posture aside is shell-only. A missing marker is not a
+        // confinement guarantee, so this only asserts the text is not rendered.
+        assert!(
+            !has_backend_text.contains("unsandboxed"),
+            "{has_backend_text}"
+        );
     }
 }
