@@ -23,8 +23,8 @@ use std::time::Instant;
 use anyhow::Result;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, size as terminal_size, supports_keyboard_enhancement,
@@ -275,8 +275,12 @@ impl TuiUi {
         // gated and the matching pop is conditional. A probe error is treated as
         // "unsupported" (safe fallback to plain Crossterm key events).
         let supports_enhancement = supports_keyboard_enhancement().unwrap_or(false);
-        if let Err(error) = execute!(stdout, EnableBracketedPaste, Hide) {
-            let _ = execute!(stdout, DisableBracketedPaste, Show);
+        // Focus reporting drives the unfocused-pane animation pause (tmux with
+        // `focus-events on`, most terminals natively). Terminals without it
+        // ignore the mode and simply never send focus events, so Iris stays in
+        // its default focused state.
+        if let Err(error) = execute!(stdout, EnableBracketedPaste, EnableFocusChange, Hide) {
+            let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -322,7 +326,12 @@ impl TuiUi {
             // reverse so no terminal mode Iris toggled is left enabled.
             let _ = disable_keyboard_enhancement(self.surface.writer_mut(), self.keyboard_enhanced);
             self.keyboard_enhanced = false;
-            let _ = execute!(self.surface.writer_mut(), DisableBracketedPaste, Show);
+            let _ = execute!(
+                self.surface.writer_mut(),
+                DisableBracketedPaste,
+                DisableFocusChange,
+                Show
+            );
             let _ = disable_raw_mode();
             crate::signals::disable_terminal_restore_on_force_quit();
             crate::telemetry::set_tui_active(false);

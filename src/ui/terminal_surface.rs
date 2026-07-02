@@ -19,11 +19,15 @@ const END_SYNC: &str = "\x1b[?2026l";
 const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
 const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
 const CLEAR_TO_SCREEN_END: &str = "\x1b[J";
-/// Erase the entire display, home the cursor, then erase the saved-lines
-/// (native scrollback) buffer. Emitted only on a true resize redraw (see
-/// [`TerminalSurface::write_resize_redraw`]); never on first render or
-/// append/diff updates, which must preserve scrollback.
-const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[2J\x1b[H\x1b[3J";
+/// Erase the entire display and home the cursor. Emitted only on a true resize
+/// redraw (see [`TerminalSurface::write_resize_redraw`]); never on first render
+/// or append/diff updates.
+const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
+/// Erase the saved-lines (native scrollback) buffer. Appended to
+/// [`CLEAR_SCREEN`] only when Iris rows have scrolled into native scrollback
+/// and the rebuild would otherwise duplicate them; a session that never
+/// scrolled keeps the user's pre-Iris pane history intact across resizes.
+const CLEAR_SCROLLBACK: &str = "\x1b[3J";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 
@@ -86,6 +90,12 @@ pub(crate) struct RenderState {
     pub(crate) hardware_cursor_row: usize,
     pub(crate) previous_volatile_tail: usize,
     pub(crate) first_render: bool,
+    /// Sticky: set once the document has ever scrolled past the viewport, i.e.
+    /// Iris rows have entered native scrollback. Until then a resize redraw can
+    /// repaint in place instead of clearing scrollback, preserving whatever the
+    /// user had in the terminal (shell history, other program output) before
+    /// Iris started -- the common case in a freshly split tmux pane.
+    pub(crate) scrolled: bool,
 }
 
 pub(crate) struct TerminalSurface<W> {
@@ -207,7 +217,22 @@ impl<W: Write> TerminalSurface<W> {
             self.write_full(new_lines, width, height, false, volatile_tail)?;
             RenderKind::First
         } else if resize_redraw {
-            self.write_resize_redraw(new_lines, width, height, volatile_tail)?;
+            if self.resize_can_repaint_in_place(&new_lines, width, height) {
+                self.write_full(new_lines, width, height, true, volatile_tail)?;
+            } else {
+                // Until the document has scrolled, nothing of Iris's is in
+                // native scrollback, so the rebuild only needs to erase the
+                // screen; wiping scrollback too would destroy the user's
+                // pre-Iris pane history (tmux resizes on every split/drag).
+                let clear_scrollback = self.state.scrolled;
+                self.write_resize_redraw(
+                    new_lines,
+                    width,
+                    height,
+                    volatile_tail,
+                    clear_scrollback,
+                )?;
+            }
             RenderKind::FullRedraw
         } else {
             self.write_diff_or_replay(new_lines, width, height, volatile_tail, reusable_prefix)?
@@ -282,25 +307,30 @@ impl<W: Write> TerminalSurface<W> {
         Ok(())
     }
 
-    /// True resize redraw: clear the screen AND native scrollback, then rebuild
-    /// the entire surface from Iris state starting at logical line 0. Because the
-    /// scrollback is wiped first, rewriting every line lets the history scroll
-    /// back into the freshly-cleared scrollback instead of duplicating it. This
-    /// intentionally overrides Iris's earlier "never clear scrollback on full
-    /// redraw" behavior: width/height resizes were leaving stale or duplicated
-    /// rows, and a clean clear+rebuild is the robust fix. First render and
-    /// append/diff updates never reach this path, so normal scrollback is
-    /// preserved.
+    /// True resize redraw: clear the screen (from an absolute home, so terminal
+    /// reflow of on-screen rows cannot skew relative positioning) and rebuild
+    /// the entire surface from Iris state starting at logical line 0. Rows past
+    /// the viewport scroll off the top into native scrollback as they are
+    /// written. `clear_scrollback` additionally wipes native scrollback first:
+    /// required once Iris rows have scrolled into it (rewriting every line lets
+    /// the history re-enter the freshly-cleared scrollback instead of
+    /// duplicating it), and deliberately withheld before then so a resize never
+    /// destroys the user's pre-Iris pane history. First render and append/diff
+    /// updates never reach this path, so normal scrollback is preserved.
     fn write_resize_redraw(
         &mut self,
         lines: Vec<SurfaceLine>,
         width: u16,
         height: u16,
         volatile_tail: usize,
+        clear_scrollback: bool,
     ) -> io::Result<()> {
         let mut buffer = String::from(BEGIN_SYNC);
         buffer.push_str(DISABLE_AUTOWRAP);
-        buffer.push_str(CLEAR_SCREEN_AND_SCROLLBACK);
+        buffer.push_str(CLEAR_SCREEN);
+        if clear_scrollback {
+            buffer.push_str(CLEAR_SCROLLBACK);
+        }
         for (offset, line) in lines.iter().enumerate() {
             if offset > 0 {
                 buffer.push_str("\r\n");
@@ -314,6 +344,40 @@ impl<W: Write> TerminalSurface<W> {
         let hardware_cursor_row = lines.len().saturating_sub(1);
         self.remember(lines, width, height, hardware_cursor_row, volatile_tail);
         Ok(())
+    }
+
+    /// Whether a resize redraw can repaint in place ([`Self::write_full`] with
+    /// `clear`) instead of homing to the screen origin and rebuilding
+    /// ([`Self::write_resize_redraw`]). In-place is the gentlest path: it keeps
+    /// native scrollback AND whatever occupied the screen above the document
+    /// (the shell prompt Iris was started under). It is only trustworthy when:
+    ///
+    /// - the document never scrolled (sticky [`RenderState::scrolled`]) and
+    ///   still fits the new viewport, so the in-place repaint covers all of it;
+    /// - on narrowing, no previously written row is wider than the new width.
+    ///   Terminals and multiplexers that reflow on resize (tmux, kitty) rewrap
+    ///   such rows, which shifts the cursor-relative position of the document
+    ///   top that the in-place repaint navigates by.
+    fn resize_can_repaint_in_place(
+        &self,
+        new_lines: &[SurfaceLine],
+        width: u16,
+        height: u16,
+    ) -> bool {
+        if self.state.scrolled
+            || self.state.previous_viewport_top != 0
+            || viewport_top(new_lines.len(), height) != 0
+        {
+            return false;
+        }
+        if width >= self.state.previous_width {
+            return true;
+        }
+        let max = usize::from(width.max(1));
+        self.state
+            .previous_lines
+            .iter()
+            .all(|line| UnicodeWidthStr::width(strip_ansi_for_log(line).as_str()) <= max)
     }
 
     fn move_to_viewport_top(&mut self, buffer: &mut String, viewport_top: usize) {
@@ -362,6 +426,9 @@ impl<W: Write> TerminalSurface<W> {
             self.state.previous_height = height;
             self.state.previous_viewport_top = viewport_top(new_len, height);
             self.state.previous_volatile_tail = volatile_tail;
+            if self.state.previous_viewport_top > 0 {
+                self.state.scrolled = true;
+            }
             return Ok(RenderKind::Unchanged);
         };
 
@@ -627,6 +694,9 @@ impl<W: Write> TerminalSurface<W> {
         self.state.hardware_cursor_row = hardware_cursor_row;
         self.state.previous_volatile_tail = volatile_tail.min(self.state.previous_lines.len());
         self.state.first_render = false;
+        if self.state.previous_viewport_top > 0 {
+            self.state.scrolled = true;
+        }
     }
 }
 
@@ -1102,12 +1172,113 @@ mod tests {
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
         let out = output(&surface);
-        // A width resize now clears the screen AND native scrollback, then
-        // rebuilds the whole surface from Iris state (pi-mono parity). This
-        // intentionally overrides the earlier "never clear scrollback" behavior.
-        assert!(out.contains(CLEAR_SCREEN_AND_SCROLLBACK), "{out:?}");
+        // The document never scrolled and every previous row fits the new
+        // width, so the resize repaints in place: native scrollback (the
+        // user's shell history before Iris started) survives the resize.
+        assert!(!out.contains("\x1b[3J"), "{out:?}");
+        assert!(out.contains(CLEAR_TO_SCREEN_END), "{out:?}");
         assert!(strip_ansi(&out).contains("abc\r\ndef"), "{out:?}");
         assert_eq!(surface.state().previous_width, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn short_session_width_grow_preserves_scrollback() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        surface.render(size(20, 6), &[Line::from("hello"), Line::from("hi")])?;
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(30, 6), &[Line::from("hello"), Line::from("hi")])?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        let out = output(&surface);
+        assert!(!out.contains("\x1b[2J"), "{out:?}");
+        assert!(!out.contains("\x1b[3J"), "{out:?}");
+        assert!(strip_ansi(&out).contains("hello"), "{out:?}");
+        assert!(!surface.state().scrolled);
+        Ok(())
+    }
+
+    #[test]
+    fn short_session_height_resize_preserves_scrollback() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        let doc = [Line::from("a"), Line::from("b")];
+        surface.render(size(20, 8), &doc)?;
+        surface.writer_mut().clear();
+
+        // Height-only resize with the document still fitting: repaint in place,
+        // never clear native scrollback.
+        let stats = surface.render(size(20, 5), &doc)?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        let out = output(&surface);
+        assert!(!out.contains("\x1b[2J"), "{out:?}");
+        assert!(!out.contains("\x1b[3J"), "{out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn width_shrink_below_previous_row_width_clears_screen_but_not_scrollback() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        // Row wider than the new width: a reflowing terminal (tmux, kitty)
+        // rewraps it on shrink, so the in-place repaint cannot trust the
+        // cursor-relative document top and must rebuild from the screen origin.
+        // Nothing of Iris's is in native scrollback yet, so only the screen is
+        // cleared: the user's pre-Iris pane history survives.
+        surface.render(size(20, 6), &[Line::from("abcdefghijkl")])?;
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(10, 6), &[Line::from("abcdefghij"), Line::from("kl")])?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        let out = output(&surface);
+        assert!(out.contains(CLEAR_SCREEN), "{out:?}");
+        assert!(!out.contains(CLEAR_SCROLLBACK), "{out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn never_scrolled_resize_overflow_rebuilds_without_clearing_scrollback() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        // Fits the tall screen; after the height shrink it no longer fits, so
+        // the in-place repaint is off the table. The rebuild homes to the
+        // screen origin and lets the overflow scroll off naturally -- there are
+        // no Iris rows in scrollback to duplicate, so scrollback is kept.
+        let doc: Vec<Line<'static>> = (1..=8).map(|n| Line::from(format!("line {n}"))).collect();
+        surface.render(size(20, 10), &doc)?;
+        assert!(!surface.state().scrolled);
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(20, 5), &doc)?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        let out = output(&surface);
+        assert!(out.contains(CLEAR_SCREEN), "{out:?}");
+        assert!(!out.contains(CLEAR_SCROLLBACK), "{out:?}");
+        // The whole document was rewritten and the surface now scrolls.
+        assert!(strip_ansi(&out).contains("line 1"), "{out:?}");
+        assert!(strip_ansi(&out).contains("line 8"), "{out:?}");
+        assert!(surface.state().scrolled);
+        Ok(())
+    }
+
+    #[test]
+    fn resize_after_scrolled_history_always_clears_scrollback() -> io::Result<()> {
+        let mut surface = TerminalSurface::new(Vec::new());
+        // Scroll Iris rows into native scrollback...
+        let long: Vec<Line<'static>> = (1..=8).map(|n| Line::from(format!("line {n}"))).collect();
+        surface.render(size(20, 5), &long)?;
+        assert!(surface.state().scrolled);
+        // ...then shrink the document back to fitting. The flag is sticky:
+        // scrollback still holds Iris rows a preserving repaint would leave
+        // stale/duplicated, so a resize must keep taking the clearing rebuild.
+        surface.render(size(20, 5), &[Line::from("short")])?;
+        surface.writer_mut().clear();
+
+        let stats = surface.render(size(15, 5), &[Line::from("short")])?;
+
+        assert_eq!(stats.kind, RenderKind::FullRedraw);
+        assert!(output(&surface).contains(CLEAR_SCROLLBACK));
         Ok(())
     }
 
@@ -1203,7 +1374,8 @@ mod tests {
         assert_eq!(stats.kind, RenderKind::FullRedraw);
 
         let raw = output(&surface);
-        assert!(raw.contains(CLEAR_SCREEN_AND_SCROLLBACK), "{raw:?}");
+        assert!(raw.contains(CLEAR_SCREEN), "{raw:?}");
+        assert!(raw.contains(CLEAR_SCROLLBACK), "{raw:?}");
         let plain = strip_ansi(&raw);
         // Every line is rewritten, including the history above the viewport.
         assert!(plain.contains("line 1"), "{plain:?}");
@@ -1227,7 +1399,8 @@ mod tests {
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
         let raw = output(&surface);
-        assert!(raw.contains(CLEAR_SCREEN_AND_SCROLLBACK), "{raw:?}");
+        assert!(raw.contains(CLEAR_SCREEN), "{raw:?}");
+        assert!(raw.contains(CLEAR_SCROLLBACK), "{raw:?}");
         let plain = strip_ansi(&raw);
         let rows: Vec<&str> = plain.lines().map(|line| line.trim_matches('\r')).collect();
         assert!(rows.contains(&"line 1"), "{plain:?}");
@@ -1258,17 +1431,19 @@ mod tests {
     }
 
     #[test]
-    fn termux_width_change_still_clears_scrollback() -> io::Result<()> {
+    fn termux_width_change_still_takes_the_resize_rebuild() -> io::Result<()> {
         let mut surface = TerminalSurface::new(Vec::new());
         surface.set_termux(true);
-        surface.render(size(20, 8), &[Line::from("abcdef")])?;
+        // Row wider than the new width, so the in-place repaint is off the
+        // table and the width change must clear the screen + rebuild, even
+        // under Termux (its height-only exemption never covers width).
+        surface.render(size(20, 8), &[Line::from("abcdefghijkl")])?;
         surface.writer_mut().clear();
 
-        // Width change always forces a full redraw, even under Termux.
-        let stats = surface.render(size(10, 8), &[Line::from("abc"), Line::from("def")])?;
+        let stats = surface.render(size(10, 8), &[Line::from("abcdefghij"), Line::from("kl")])?;
 
         assert_eq!(stats.kind, RenderKind::FullRedraw);
-        assert!(output(&surface).contains(CLEAR_SCREEN_AND_SCROLLBACK));
+        assert!(output(&surface).contains(CLEAR_SCREEN));
         Ok(())
     }
 
