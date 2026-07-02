@@ -1,4 +1,6 @@
-use std::io::{BufRead, BufReader};
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -466,6 +468,7 @@ fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
     )
 }
 
+#[cfg(test)]
 fn parse_response_stream_reader(
     reader: impl BufRead,
     sink: &mut dyn TurnSink,
