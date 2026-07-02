@@ -7,6 +7,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier, Style};
@@ -44,6 +45,20 @@ const CRASH_LOG_FILE: &str = "tui-crash.log";
 /// Document-row and display-column of the focused-editor cursor marker.
 type CursorPos = (usize, usize);
 
+/// One rendered terminal line (ANSI styling included). Reference-counted so the
+/// per-frame stable-prefix reuse in [`render_lines`] is a pointer copy instead
+/// of an O(line length) `String` clone: on a long retained transcript the
+/// unchanged prefix dominates every frame, and cloning it used to be the single
+/// largest per-frame cost. Shared lines also let the diff short-circuit on
+/// pointer equality before falling back to content comparison.
+pub(crate) type SurfaceLine = Rc<str>;
+
+/// Equality with a pointer fast path: prefix lines reused from the previous
+/// frame are the same allocation, so the common case never touches the bytes.
+fn line_eq(a: &SurfaceLine, b: &SurfaceLine) -> bool {
+    Rc::ptr_eq(a, b) || a == b
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RenderKind {
     First,
@@ -62,7 +77,7 @@ pub(crate) struct RenderStats {
 pub(crate) struct RenderState {
     /// Previous rendered terminal lines, including ANSI styling but excluding
     /// row separators. This is the diff source of truth.
-    pub(crate) previous_lines: Vec<String>,
+    pub(crate) previous_lines: Vec<SurfaceLine>,
     pub(crate) previous_width: u16,
     pub(crate) previous_height: u16,
     pub(crate) previous_viewport_top: usize,
@@ -230,7 +245,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_full(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         width: u16,
         height: u16,
         clear: bool,
@@ -278,7 +293,7 @@ impl<W: Write> TerminalSurface<W> {
     /// preserved.
     fn write_resize_redraw(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         width: u16,
         height: u16,
         volatile_tail: usize,
@@ -312,7 +327,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_diff_or_replay(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         width: u16,
         height: u16,
         volatile_tail: usize,
@@ -352,7 +367,10 @@ impl<W: Write> TerminalSurface<W> {
 
         let stable_append = if new_stable_len > previous_stable_len {
             previous_stable_len <= stable_prefix
-                || self.state.previous_lines[..previous_stable_len] == lines[..previous_stable_len]
+                || self.state.previous_lines[..previous_stable_len]
+                    .iter()
+                    .zip(&lines[..previous_stable_len])
+                    .all(|(a, b)| line_eq(a, b))
         } else {
             false
         };
@@ -408,7 +426,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_scrolling_replay(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         width: u16,
         height: u16,
         new_viewport_top: usize,
@@ -443,7 +461,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_append_replacing_volatile(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         start: usize,
         width: u16,
         height: u16,
@@ -477,7 +495,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_append(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         previous_len: usize,
         width: u16,
         height: u16,
@@ -509,7 +527,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_visible_diff(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         width: u16,
         height: u16,
         first_changed: usize,
@@ -586,7 +604,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn remember(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<SurfaceLine>,
         width: u16,
         height: u16,
         hardware_cursor_row: usize,
@@ -613,15 +631,20 @@ impl<W: Write> TerminalSurface<W> {
 }
 
 fn changed_range_from(
-    previous: &[String],
-    next: &[String],
+    previous: &[SurfaceLine],
+    next: &[SurfaceLine],
     start: usize,
 ) -> Option<(usize, usize)> {
+    let differs = |i: usize| match (previous.get(i), next.get(i)) {
+        (Some(a), Some(b)) => !line_eq(a, b),
+        (None, None) => false,
+        _ => true,
+    };
     let max_len = previous.len().max(next.len());
-    let first = (start.min(max_len)..max_len).find(|&i| previous.get(i) != next.get(i))?;
+    let first = (start.min(max_len)..max_len).find(|&i| differs(i))?;
     let last = (first..max_len)
         .rev()
-        .find(|&i| previous.get(i) != next.get(i))
+        .find(|&i| differs(i))
         .unwrap_or(first);
     Some((first, last))
 }
@@ -661,12 +684,15 @@ fn render_lines(
     lines: &[Line<'static>],
     width: u16,
     crash_log_dir: Option<&Path>,
-    previous_lines: &[String],
+    previous_lines: &[SurfaceLine],
     stable_prefix: usize,
-) -> io::Result<(Vec<String>, Option<CursorPos>)> {
+) -> io::Result<(Vec<SurfaceLine>, Option<CursorPos>)> {
     let max = usize::from(width.max(1));
     let stable_prefix = stable_prefix.min(previous_lines.len());
     let mut out = Vec::with_capacity(stable_prefix + lines.len());
+    // Reference-counted reuse: the stable prefix is shared with the previous
+    // frame (pointer copies), so per-frame cost is proportional to the changed
+    // suffix, not the whole retained document.
     out.extend(previous_lines[..stable_prefix].iter().cloned());
     let mut cursor: Option<(usize, usize)> = None;
     for (offset, line) in lines.iter().enumerate() {
@@ -694,18 +720,18 @@ fn render_lines(
                 rendered.width
             )));
         }
-        out.push(rendered.text);
+        out.push(SurfaceLine::from(rendered.text));
     }
     Ok((out, cursor))
 }
 
 fn render_lines_for_log(
-    stable_prefix: &[String],
+    stable_prefix: &[SurfaceLine],
     lines: &[Line<'static>],
     max: usize,
 ) -> Vec<String> {
     let mut rendered = Vec::with_capacity(stable_prefix.len() + lines.len());
-    rendered.extend(stable_prefix.iter().cloned());
+    rendered.extend(stable_prefix.iter().map(|line| line.to_string()));
     rendered.extend(lines.iter().map(|line| render_line(line, max).text));
     rendered
 }
