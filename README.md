@@ -12,10 +12,25 @@ A fast coding agent for the terminal, built for token efficiency.
 
 ## Install
 
-Install the latest version from the remote repository:
+No Rust toolchain required. The install script downloads the prebuilt binary
+for your platform (Linux and macOS, x86_64 and aarch64), verifies its SHA-256
+checksum, and installs it:
 
 ```bash
-cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked
+curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/iris-agent/main/install.sh | sh
+```
+
+Override the install directory with `IRIS_INSTALL_DIR` or pin a version with
+`IRIS_VERSION=vX.Y.Z`. To install manually, download the
+`iris-<target>.tar.gz` archive and its `.sha256` sidecar from the
+[latest release](https://github.com/5omeOtherGuy/iris-agent/releases/latest),
+verify the checksum, extract, and move `iris` onto your `PATH`.
+
+With a Rust toolchain you can also install from crates.io or from source:
+
+```bash
+cargo install iris-agent --locked                                     # crates.io
+cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked  # git HEAD
 ```
 
 Update an installed copy with:
@@ -23,6 +38,10 @@ Update an installed copy with:
 ```bash
 iris update
 ```
+
+Prebuilt binaries self-update: `iris update` downloads the latest release,
+verifies its checksum, and atomically replaces the running binary. A binary
+built from source instead re-runs `cargo install`.
 
 Or run from a source checkout:
 
