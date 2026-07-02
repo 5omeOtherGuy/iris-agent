@@ -25,7 +25,7 @@ h2 { border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
 <li><code>assemble_defaults</code> kept as the single <code>#[cfg(test)]</code> seam (used by provider request-shaping tests); it is not a second runtime path — <code>assemble</code> is the only runtime entry and differs only by doing real project-doc discovery.</li>
 <li><code>defaults.rs</code>: dropped the <code>description</code> field (it existed only for materialized frontmatter; keeping it would be dead code under <code>-D warnings</code>) and the <code>template</code> fragment + <code>TEMPLATE</code> const (a copy-ready template for a file format that no longer exists; it was slot-0-disabled, so the rendered prompt is unchanged).</li>
 <li><code>cli.rs</code>: removed <code>ModelSwitch::{system_prompt, set_system_prompt}</code> — their only caller was the old <code>/trust</code> prompt-reassembly path.</li>
-<li>"No writes to <code>~/.iris/fragments</code> at startup" is guaranteed structurally (the materialization function no longer exists; the module does no writes at all) plus a test that <code>assemble</code> creates no files. A HOME-pointing env-var test was deliberately avoided: mutating <code>HOME</code>/env in parallel tests poisons unrelated tests.</li>
+<li>"No writes to <code>~/.iris/fragments</code> at startup" is guaranteed structurally (the materialization function no longer exists; the module does no writes at all) plus tests that <code>assemble</code> creates no workspace files and ignores a temp <code>HOME/.iris/fragments/identity.md</code> without materializing or rewriting HOME fragments. The HOME test is serialized under an env lock.</li>
 </ul>
 
 <h2>ADR-0027 — store shape</h2>
@@ -44,7 +44,7 @@ Legacy string entries fail the record parse and read as the empty policy (fail c
 
 <h2>ADR-0027 — enforcement wiring</h2>
 <ul>
-<li><strong>Tier split</strong>: <code>nexus::ProjectPolicy</code> (data: tool set, bash exact set, bash prefix set) is the enforcement-layer shape; <code>wayland::trust::ProjectPolicyRecord</code> is the persistence shape. Nexus never touches disk: the host (<code>main.rs</code>) loads the policy via <code>wayland::trust::policy_for(cwd).to_policy()</code> and injects it with <code>Agent::with_project_policy(policy, sink)</code>. New grants persist through the injected <code>ProjectPolicySink</code> trait (<code>wayland::trust::PolicyStoreSink</code>), keeping enforcement in Nexus and IO in Wayland (ADR-0005 direction preserved).</li>
+<li><strong>Tier split</strong>: <code>nexus::ProjectPolicy</code> (data: tool set, bash exact set, bash prefix set) is the enforcement-layer shape; <code>wayland::trust::ProjectPolicyRecord</code> is the persistence shape. Nexus never touches disk: the host (<code>main.rs</code>) loads the policy via <code>wayland::trust::policy_for(cwd).to_policy()</code> and injects it with <code>Agent::with_project_policy(policy, sink)</code>. New grants persist through the injected <code>ProjectPolicySink</code> trait (<code>wayland::trust::PolicyStoreSink</code>). The <code>/trust</code>/<code>/permissions</code> editor now calls <code>wayland::Harness::{project_policy_record,apply_project_policy_edit}</code>, so Tier 3 no longer reads/writes the store directly; enforcement stays in Nexus and IO/edit application stays in Wayland (ADR-0005 direction preserved).</li>
 <li><strong>Precedence computation</strong>: in <code>run_gated_single</code>, <code>auto_approved = !destructive &amp;&amp; (session_allowed || project_allowed)</code>. All three layers are allow-only (there are no deny grants), so "most-specific wins" degenerates to a union of the allow layers over the prompting global default; the destructive floor is applied <em>before</em> any layer.</li>
 <li><strong>bash is never grantable per-tool</strong>: <code>ProjectPolicy::allows</code> consults the tool-name set only for non-bash tools; bash goes exclusively through exact/prefix command matching, so a blanket bash allow is not expressible in the policy.</li>
 <li><strong>Prefix matching is token-boundary</strong>: <code>git</code>/<code>git&nbsp;</code> matches <code>git status</code> but not <code>gitevil</code> (<code>bash_prefix_matches</code>), so a stored prefix cannot widen to lexically adjacent commands.</li>
@@ -53,14 +53,13 @@ Legacy string entries fail the record parse and read as the empty policy (fail c
 <li>A bash call with a missing/empty <code>command</code> cannot mint a grant (allowed once with a notice).</li>
 <li>A failed sink persist degrades to session-lifetime scope with an honest notice; headless <code>--print</code> loads the policy (grants auto-approve headless too) but installs no sink (its gate cannot return <code>AllowProject</code>).</li>
 <li><code>reset_session</code> (/new, in-session /resume) clears <code>session_allowed</code> but keeps <code>project_policy</code> — it is keyed to the cwd, not the conversation.</li>
-<li><code>/trust</code> editor (<code>picker::apply_policy_edit</code>) fails closed: if the store write fails, the in-memory policy is <em>not</em> updated either, so the live session never runs looser than what is persisted. Edits refresh the live agent via <code>harness.agent.set_project_policy</code>; no provider rebuild is needed anymore (the prompt no longer depends on trust).</li>
+<li><code>/trust</code>/<code>/permissions</code> editor (<code>Harness::apply_project_policy_edit</code>) fails closed: if the store write fails, the in-memory policy is <em>not</em> updated either, so the live session never runs looser than what is persisted. Edits refresh the live agent via <code>agent.set_project_policy</code>; no provider rebuild is needed anymore (the prompt no longer depends on trust).</li>
 </ul>
 
 <h2>Deferrals</h2>
 <ul>
 <li><strong>Sandbox-posture enforcement</strong>: the <code>sandbox</code> field is stored, round-tripped, shown read-only in the <code>/trust</code> modal, and covered by the invariant-3 test (grant writes never create or alter it). Wiring it into <code>src/tools/bash/sandbox.rs</code> is deferred — it touches the Landlock layer and would balloon the diff; nothing currently writes the field, so there is no way to loosen it.</li>
-<li><strong><code>/permissions</code> alias</strong>: cosmetic, deferred; <code>/trust</code> keeps its name per the ADR.</li>
-<li><strong>Full <code>/settings</code> review-and-revoke surface</strong>: deferred; the <code>/trust</code> modal covers list/grant(write/edit)/revoke.</li>
+<li><strong>Full <code>/settings</code> review-and-revoke surface</strong>: deferred; the <code>/trust</code>/<code>/permissions</code> modal covers list/grant(write/edit)/revoke.</li>
 <li><strong>Text/non-TTY <code>/trust</code> editor</strong>: deferred (TUI-only, matching the prior precedent); the text UI approval prompt does offer <code>[p]</code>, so grants can still be minted in the text fallback.</li>
 </ul>
 
@@ -77,7 +76,7 @@ Legacy string entries fail the record parse and read as the empty policy (fail c
 <li>Invariant 2 (destructive floor): <code>nexus::tests::invariant_2_destructive_bash_reprompts_despite_project_grants</code> + <code>nexus::tests::invariant_2_prefix_grant_does_not_auto_approve_destructive_compound_suffix</code> + <code>nexus::tests::invariant_2_allow_project_on_a_destructive_call_is_never_persisted</code>.</li>
 <li>Invariant 3 (sandbox never loosened automatically): <code>wayland::trust::tests::invariant_3_grant_writes_preserve_and_never_create_sandbox_posture</code>.</li>
 <li>Invariant 4 (nothing self-waives / grants stay narrow): <code>nexus::tests::invariants_3_and_4_grants_do_not_loosen_anything_ungranted</code>.</li>
-<li>Precedence: <code>nexus::tests::precedence_session_project_then_global_prompt</code>; cross-session persistence: <code>wayland::trust::tests::grants_round_trip_and_persist_across_reads</code> + <code>nexus::tests::project_grant_for_write_auto_approves_without_prompting</code>.</li>
+<li>Precedence: <code>nexus::tests::precedence_session_project_then_global_prompt</code>; cross-session persistence: <code>wayland::trust::tests::grants_round_trip_and_persist_across_reads</code> + <code>nexus::tests::project_grant_for_write_auto_approves_without_prompting</code> + <code>nexus::tests::allow_project_persists_to_disk_and_fresh_agent_auto_approves</code>.</li>
 </ul>
 </body>
 </html>

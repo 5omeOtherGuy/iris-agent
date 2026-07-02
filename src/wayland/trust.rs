@@ -60,6 +60,17 @@ pub(crate) struct ProjectPolicyRecord {
     pub(crate) sandbox: Option<String>,
 }
 
+/// One project-permission edit requested by the `/trust` modal. This lives in
+/// Wayland with the policy store so Tier 3 names intent but does not perform
+/// persistence itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectPolicyEdit {
+    GrantTool(String),
+    RevokeTool(String),
+    RevokeBashExact(String),
+    RevokeBashPrefix(String),
+}
+
 impl ProjectPolicyRecord {
     /// Convert to the enforcement-layer policy data consumed by Nexus. The
     /// sandbox posture is intentionally not part of the approval policy.
@@ -86,6 +97,27 @@ impl ProjectPolicyRecord {
             }
             PolicyGrant::BashExact(command) => {
                 self.allow_bash.insert(command.clone());
+            }
+        }
+    }
+
+    pub(crate) fn apply_edit(&mut self, edit: &ProjectPolicyEdit) -> String {
+        match edit {
+            ProjectPolicyEdit::GrantTool(tool) => {
+                self.allow_tools.insert(tool.clone());
+                format!("`{tool}` is now always allowed for this project")
+            }
+            ProjectPolicyEdit::RevokeTool(tool) => {
+                self.allow_tools.remove(tool);
+                format!("`{tool}` now prompts for approval")
+            }
+            ProjectPolicyEdit::RevokeBashExact(command) => {
+                self.allow_bash.remove(command);
+                format!("revoked bash grant `{command}`")
+            }
+            ProjectPolicyEdit::RevokeBashPrefix(prefix) => {
+                self.allow_bash_prefix.remove(prefix);
+                format!("revoked bash prefix grant `{prefix}`")
             }
         }
     }

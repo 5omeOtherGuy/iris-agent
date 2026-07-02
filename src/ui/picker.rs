@@ -15,11 +15,10 @@ use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
-    EffortPicker, Modal, ModalAction, ModelPicker, PolicyEdit, ScopedModels, SessionPicker,
-    SessionRow, SettingsMenu, TrustMenu,
+    EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
+    SettingsMenu, TrustMenu,
 };
 use crate::wayland::Harness;
-use crate::wayland::trust;
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -177,57 +176,16 @@ pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<Se
         .collect()
 }
 
-/// Build the `/trust` project-permissions modal from the persisted policy for
-/// the cwd (ADR-0027). The modal is a snapshot; every applied edit rebuilds it.
-pub(crate) fn open_trust() -> Modal {
-    let record = std::env::current_dir()
-        .ok()
-        .map(|cwd| trust::policy_for(&cwd))
-        .unwrap_or_default();
+/// Build the `/trust` project-permissions modal from the harness-owned policy
+/// snapshot (ADR-0027). The modal is a snapshot; every applied edit rebuilds it.
+pub(crate) fn open_trust<P: ChatProvider>(harness: &Harness<P>) -> Modal {
+    let record = harness.project_policy_record();
     Modal::Trust(TrustMenu::new(
         &record.allow_tools.iter().cloned().collect::<Vec<_>>(),
         &record.allow_bash.iter().cloned().collect::<Vec<_>>(),
         &record.allow_bash_prefix.iter().cloned().collect::<Vec<_>>(),
         record.sandbox.clone(),
     ))
-}
-
-/// Apply one `/trust` policy edit: persist it to the HOME-owned store (keyed by
-/// canonical cwd) and refresh the live agent's in-memory project policy so the
-/// change applies this session. Deliberate user action only (ADR-0027
-/// invariant 4): this is the sole loosening path besides the approval prompt's
-/// `[p]`. The stored sandbox posture is never touched here (invariant 3).
-fn apply_policy_edit<P: ChatProvider>(edit: PolicyEdit, harness: &mut Harness<P>) -> Vec<String> {
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(error) => return vec![format!("could not resolve working directory: {error:#}")],
-    };
-    let mut record = trust::policy_for(&cwd);
-    let notice = match &edit {
-        PolicyEdit::GrantTool(tool) => {
-            record.allow_tools.insert(tool.clone());
-            format!("`{tool}` is now always allowed for this project")
-        }
-        PolicyEdit::RevokeTool(tool) => {
-            record.allow_tools.remove(tool);
-            format!("`{tool}` now prompts for approval")
-        }
-        PolicyEdit::RevokeBashExact(command) => {
-            record.allow_bash.remove(command);
-            format!("revoked bash grant `{command}`")
-        }
-        PolicyEdit::RevokeBashPrefix(prefix) => {
-            record.allow_bash_prefix.remove(prefix);
-            format!("revoked bash prefix grant `{prefix}`")
-        }
-    };
-    if let Err(error) = trust::set_policy(&cwd, &record) {
-        // Fail closed: do not update the live policy either, so the session
-        // never runs looser (or claims tighter) than what is persisted.
-        return vec![format!("could not save project policy: {error:#}")];
-    }
-    harness.agent.set_project_policy(record.to_policy());
-    vec![notice]
 }
 
 /// Build the `/settings` modal (effort picker entry).
@@ -299,10 +257,13 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Keep(lines)
         }
         ModalAction::EditPolicy(edit) => {
-            // Re-open the modal on the refreshed policy so the row states
-            // (granted / prompts) reflect the applied edit.
-            let lines = apply_policy_edit(edit, harness);
-            ActionResult::Replace(Box::new(open_trust()), lines)
+            // Wayland owns the policy store edit and live Nexus refresh; re-open
+            // the modal on the refreshed policy so row states reflect it.
+            let lines = match harness.apply_project_policy_edit(&edit) {
+                Ok(notice) => vec![notice],
+                Err(error) => vec![format!("could not save project policy: {error:#}")],
+            };
+            ActionResult::Replace(Box::new(open_trust(harness)), lines)
         }
         ModalAction::SetEffort(level) => ActionResult::Close(apply_effort(level, harness, switch)),
         ModalAction::OpenEffortPicker => {

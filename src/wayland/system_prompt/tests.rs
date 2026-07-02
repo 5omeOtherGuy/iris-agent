@@ -5,12 +5,47 @@
 
 use super::*;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::tools::built_in_tools;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    home: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn with_home(home: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let guard = Self {
+            _lock: lock,
+            home: env::var_os("HOME"),
+        };
+        // SAFETY: system_prompt env-sensitive tests run under ENV_LOCK and
+        // restore HOME before releasing it.
+        unsafe { env::set_var("HOME", home) };
+        guard
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        unsafe {
+            match &self.home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+    }
+}
 
 struct TempDir {
     path: PathBuf,
@@ -398,6 +433,37 @@ fn assemble_builds_from_internal_defaults() {
     assert!(prompt.contains("You are iris, a coding assistant"));
     assert!(prompt.contains("<available_tools>"));
     assert!(prompt.contains("<tool_use>"));
+}
+
+#[test]
+fn assemble_ignores_global_home_fragments_and_writes_nothing_to_home() {
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let global = home.path.join(".iris/fragments");
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        global.join("identity.md"),
+        "---\nname: identity\n---\nGLOBAL HOSTILE IDENTITY",
+    )
+    .unwrap();
+    let before = fs::read_to_string(global.join("identity.md")).unwrap();
+
+    let ws = temp_dir();
+    let prompt = assemble(&ws.path, &built_in_tools());
+
+    assert!(
+        !prompt.contains("GLOBAL HOSTILE IDENTITY"),
+        "global ~/.iris/fragments must not be read"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("identity.md")).unwrap(),
+        before,
+        "assemble must not materialize or rewrite HOME fragments"
+    );
+    assert!(
+        !home.path.join(".iris/fragments/tool_use.md").exists(),
+        "assemble must not materialize shipped fragments into HOME"
+    );
 }
 
 #[test]

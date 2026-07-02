@@ -19,6 +19,7 @@ use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, CatalogModel};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::ui::selector::{Selector, SelectorItem};
+use crate::wayland::trust::ProjectPolicyEdit;
 
 /// Max rows shown in above-editor menus before windowing. Keep enough room for
 /// footer controls plus the editor/status chrome on a compact terminal.
@@ -63,18 +64,6 @@ pub(crate) enum ProviderPurpose {
     Logout,
 }
 
-/// One `/trust` project-permission edit (ADR-0027): grant or revoke a
-/// persistent per-tool approval, or revoke a stored `bash` command grant.
-/// Grants for bash commands are minted at the approval prompt (`[p]`), not
-/// here, so the editor can only toggle tools and revoke command grants.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PolicyEdit {
-    GrantTool(String),
-    RevokeTool(String),
-    RevokeBashExact(String),
-    RevokeBashPrefix(String),
-}
-
 /// A side effect or navigation step the loop performs after a modal key. The
 /// loop owns the harness, model-switch state, settings, and auth store; the
 /// modal only names the intent.
@@ -100,7 +89,7 @@ pub(crate) enum ModalAction {
     /// Edit this project's persistent permission policy (ADR-0027). The loop
     /// persists the edit to the HOME-owned store and refreshes the live agent's
     /// in-memory policy at the safe inter-turn boundary.
-    EditPolicy(PolicyEdit),
+    EditPolicy(ProjectPolicyEdit),
     /// Resume the persisted session with this id, swapping the live session at
     /// the safe inter-turn boundary (reloads messages, session log, and harness
     /// state). Emitted by the `/resume` picker on Enter.
@@ -870,7 +859,7 @@ impl SettingsMenu {
 pub(crate) struct TrustMenu {
     selector: Selector,
     /// Row id -> the edit Enter emits for it.
-    edits: Vec<(String, PolicyEdit)>,
+    edits: Vec<(String, ProjectPolicyEdit)>,
     /// Stored sandbox posture, shown read-only (enforcement deferred).
     sandbox: Option<String>,
 }
@@ -902,9 +891,9 @@ impl TrustMenu {
             }
             items.push(item);
             let edit = if granted {
-                PolicyEdit::RevokeTool((*tool).to_string())
+                ProjectPolicyEdit::RevokeTool((*tool).to_string())
             } else {
-                PolicyEdit::GrantTool((*tool).to_string())
+                ProjectPolicyEdit::GrantTool((*tool).to_string())
             };
             edits.push((id, edit));
         }
@@ -915,7 +904,7 @@ impl TrustMenu {
                     .detail("↵ revoke")
                     .trailing("granted"),
             );
-            edits.push((id, PolicyEdit::RevokeBashExact(command.clone())));
+            edits.push((id, ProjectPolicyEdit::RevokeBashExact(command.clone())));
         }
         for prefix in bash_prefix {
             let id = format!("pfx:{prefix}");
@@ -924,7 +913,7 @@ impl TrustMenu {
                     .detail("↵ revoke")
                     .trailing("granted"),
             );
-            edits.push((id, PolicyEdit::RevokeBashPrefix(prefix.clone())));
+            edits.push((id, ProjectPolicyEdit::RevokeBashPrefix(prefix.clone())));
         }
         let selector = Selector::new(items, false, false, 12);
         TrustMenu {
@@ -1657,7 +1646,7 @@ mod tests {
         assert!(text.contains("PROJECT PERMISSIONS"), "{text}");
         assert_eq!(
             menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::GrantTool(
+            ModalOutcome::Emit(ModalAction::EditPolicy(ProjectPolicyEdit::GrantTool(
                 "write".to_string()
             )))
         );
@@ -1682,7 +1671,7 @@ mod tests {
         assert!(text.contains("git "), "{text}");
         assert_eq!(
             menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::RevokeTool(
+            ModalOutcome::Emit(ModalAction::EditPolicy(ProjectPolicyEdit::RevokeTool(
                 "write".to_string()
             )))
         );
@@ -1691,7 +1680,7 @@ mod tests {
         menu.handle_key(ModalKey::Down);
         assert_eq!(
             menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::RevokeBashExact(
+            ModalOutcome::Emit(ModalAction::EditPolicy(ProjectPolicyEdit::RevokeBashExact(
                 "cargo test".to_string()
             )))
         );
@@ -1699,9 +1688,9 @@ mod tests {
         menu.handle_key(ModalKey::Down);
         assert_eq!(
             menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::EditPolicy(PolicyEdit::RevokeBashPrefix(
-                "git ".to_string()
-            )))
+            ModalOutcome::Emit(ModalAction::EditPolicy(
+                ProjectPolicyEdit::RevokeBashPrefix("git ".to_string())
+            ))
         );
     }
 

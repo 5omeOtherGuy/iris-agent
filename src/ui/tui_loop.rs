@@ -564,14 +564,14 @@ fn route_command<P: ChatProvider>(
             tui.screen.open_modal(picker::open_settings(sw));
             Ok(RouteOutcome::Consumed)
         }
-        "/trust" if rest.is_empty() => {
+        "/trust" | "/permissions" if rest.is_empty() => {
             // Modal actions dispatch through picker::apply_action, which takes
             // the switch; keep the same guard as the other pickers.
             if switch.as_ref().is_none() {
                 return Ok(RouteOutcome::Fall);
             }
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(picker::open_trust());
+            tui.screen.open_modal(picker::open_trust(harness));
             Ok(RouteOutcome::Consumed)
         }
         "/resume" if rest.is_empty() => {

@@ -173,7 +173,7 @@
   #209): per-tool approval defaults for `write`/`edit` and per-command `bash`
   allows (exact or prefix), stored HOME-owned in `~/.iris/trust.json` keyed by
   canonical directory; `[p]` at the approval prompt persists a grant and
-  `/trust` lists/toggles/revokes them. Destructive commands always re-prompt
+  `/trust` (alias: `/permissions`) lists/toggles/revokes them. Destructive commands always re-prompt
   and are never grantable; a repo-committed file can never grant. Sandbox
   posture is stored per project but not yet enforced. [Implemented]
 - **Atomic file replacement** — `write` and `edit` write through a

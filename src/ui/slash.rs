@@ -96,6 +96,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/permissions",
+        description: "Alias for /trust project permissions",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/login",
         description: "Configure provider authentication",
         action: SlashAction::Submit,

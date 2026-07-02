@@ -147,8 +147,10 @@ restarting the process.
 
 At the prompt, `/model` views or switches provider/model and
 `/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
-turn boundary. `/resume`, `/new`, `/settings`, `/scoped-models`, `/trust`,
-`/login`, and `/logout` open their selectors or actions. `/session` shows the
+turn boundary. In the rich TUI, `/resume`, `/new`, `/settings`,
+`/scoped-models`, `/trust` (or `/permissions`), `/login`, and `/logout` open
+selectors or actions; in the text fallback those selector commands report that
+they are TUI-only. `/session` shows the
 current session's file, id, message counts, and context-token estimate;
 `/copy` puts the last assistant reply on the system clipboard (OSC 52 fallback
 over SSH); `/debug` writes a debug snapshot of the rendered screen and the
@@ -226,8 +228,10 @@ Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
   tools/commands auto-approve in this directory from then on, across sessions.
 - Destructive commands (`rm`, `dd`, `mkfs`, ...) always re-prompt and can never
   be granted — no `[p]` is offered for them.
-- `/trust` opens the project-permissions editor: toggle `write`/`edit` grants
-  and revoke stored `bash` command/prefix grants.
+- `/trust` (alias: `/permissions`) opens the rich-TUI project-permissions
+  editor: toggle `write`/`edit` grants and revoke stored `bash` command/prefix
+  grants. The text fallback has no editor, but its approval prompt still
+  supports `[p]` grants.
 - The store is HOME-owned; a repo-committed file can never grant permissions.
   `IRIS_TRUST_PATH` may override the store only with an absolute path outside
   the project directory.

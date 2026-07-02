@@ -5,9 +5,11 @@ use crate::ui::text::TextUi;
 use crate::wayland::Harness;
 use anyhow::anyhow;
 use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
@@ -2121,6 +2123,39 @@ fn test_harness_with_policy<P: ChatProvider>(
     )
 }
 
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    trust_path: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn with_trust_path(path: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let guard = Self {
+            _lock: lock,
+            trust_path: std::env::var_os("IRIS_TRUST_PATH"),
+        };
+        // SAFETY: nexus env-sensitive tests run under ENV_LOCK and restore the
+        // process-global var before releasing it.
+        unsafe { std::env::set_var("IRIS_TRUST_PATH", path) };
+        guard
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        unsafe {
+            match &self.trust_path {
+                Some(value) => std::env::set_var("IRIS_TRUST_PATH", value),
+                None => std::env::remove_var("IRIS_TRUST_PATH"),
+            }
+        }
+    }
+}
+
 /// Records every grant Nexus asks to persist, standing in for the Tier-2 store.
 struct RecordingSink {
     grants: std::rc::Rc<RefCell<Vec<PolicyGrant>>>,
@@ -2507,6 +2542,78 @@ fn allow_project_persists_the_grant_and_covers_later_calls() -> Result<()> {
     );
     assert!(workspace.path.join("a.txt").exists());
     assert!(workspace.path.join("b.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn allow_project_persists_to_disk_and_fresh_agent_auto_approves() -> Result<()> {
+    // End-to-end ADR-0027 #209 path: a text approval prompt's `p` answer writes
+    // the HOME-owned policy store through PolicyStoreSink; a fresh Agent loads
+    // policy_for(cwd) and auto-approves a later write without consulting its
+    // denial gate.
+    let workspace = test_workspace()?;
+    let store = test_workspace()?;
+    let store_file = store.path.join("trust.json");
+    let _env = EnvGuard::with_trust_path(&store_file);
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "a.txt", "content": "one" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        ProjectPolicy::default(),
+        Some(Box::new(crate::wayland::trust::PolicyStoreSink::new(
+            workspace.path.clone(),
+        ))),
+    );
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    run_text_session(
+        &mut harness,
+        "go\np\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+    assert!(workspace.path.join("a.txt").exists());
+    assert!(
+        String::from_utf8(output)?.contains("for this project"),
+        "text prompt used the project-grant path"
+    );
+
+    let fresh_policy = crate::wayland::trust::policy_for(&workspace.path).to_policy();
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "b.txt", "content": "two" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        fresh_policy,
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    block_on(harness.submit_turn(
+        "fresh write",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "fresh agent should auto-approve from persisted project policy"
+    );
+    assert_eq!(fs::read_to_string(workspace.path.join("b.txt"))?, "two");
     Ok(())
 }
 

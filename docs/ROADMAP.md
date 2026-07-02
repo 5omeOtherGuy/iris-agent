@@ -137,7 +137,7 @@ Implemented today:
   as a persistent project permission policy
   ([#209](https://github.com/5omeOtherGuy/iris-agent/issues/209)): per-tool
   `write`/`edit` grants and per-command `bash` allows (exact/prefix), granted
-  via `[p]` at the approval prompt and edited via `/trust`; destructive
+  via `[p]` at the approval prompt and edited via `/trust` (`/permissions` alias); destructive
   commands always re-prompt and are never grantable; per-project sandbox
   posture is stored but not yet enforced.
 - Milestone 2 foundations: structured metadata, typed tool-result contracts,
