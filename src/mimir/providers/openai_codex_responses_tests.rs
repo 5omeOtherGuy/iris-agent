@@ -1,16 +1,7 @@
 use super::*;
-use crate::mimir::retry::RetryPolicy;
 use crate::mimir::selection::PromptCacheRetention;
 use crate::nexus::ModelOrigin;
-use std::cell::Cell;
 use std::path::Path;
-
-fn fake_token() -> AccessToken {
-    AccessToken {
-        bearer: "bearer-value".to_string(),
-        account_id: "acct".to_string(),
-    }
-}
 
 #[derive(Default)]
 struct RecordingSink {
@@ -24,10 +15,6 @@ impl TurnSink for RecordingSink {
     }
 }
 
-fn is_auth_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<AuthError>().is_some()
-}
-
 fn test_system_prompt() -> String {
     // The harness-owned baukasten is the single source of the instruction string
     // providers forward. Use the hermetic in-memory-defaults assembler (no HOME,
@@ -39,194 +26,149 @@ fn test_system_prompt() -> String {
 }
 
 #[test]
-fn retry_loop_exhausts_transient_then_returns_error() {
-    let max = RetryPolicy::default().max_retries;
-    let sends = Cell::new(0u32);
-    let sleeps = Cell::new(0u32);
-    let result = run_retry_loop(
-        &RetryPolicy::default(),
-        |_force| Ok(fake_token()),
-        |_token| {
-            sends.set(sends.get() + 1);
-            Attempt::Retry(anyhow!("503"), None)
-        },
-        |_delay| sleeps.set(sleeps.get() + 1),
-        || false,
+fn codex_retry_auth_error_preserves_provider_and_safe_cause() {
+    let cancel = CancellationToken::new();
+    let err = run_with_retry(
+        PROVIDER_ID,
+        &crate::mimir::retry::RetryPolicy::default(),
+        &cancel,
+        |_force| Ok(()),
+        |&()| Attempt::Reauth(anyhow!("HTTP 401 token rejected")),
+    )
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains(PROVIDER_ID), "{message}");
+    assert!(message.contains("HTTP 401 token rejected"), "{message}");
+    assert_eq!(
+        err.downcast_ref::<crate::errors::AuthError>()
+            .and_then(crate::errors::AuthError::provider),
+        Some(PROVIDER_ID)
     );
-    assert!(result.is_err());
-    assert!(!is_auth_error(&result.unwrap_err()));
-    // One initial attempt plus MAX retries, sleeping before each retry.
-    assert_eq!(sends.get(), max + 1);
-    assert_eq!(sleeps.get(), max);
 }
 
 #[test]
-fn retry_loop_stops_immediately_when_cancelled() {
-    // A turn-level cancellation ends the loop before any attempt fires, so a
-    // cancelled turn issues no request and does not retry.
-    let sends = Cell::new(0u32);
-    let result = run_retry_loop(
-        &RetryPolicy::default(),
-        |_force| Ok(fake_token()),
-        |_token| {
-            sends.set(sends.get() + 1);
-            Attempt::Done(AssistantTurn::text("unreached"))
-        },
-        |_delay| {},
-        || true,
+fn streamed_failure_redacts_free_text_message() {
+    let stream = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"code\":\"rate_limited\",\"message\":\"leak /home/alice/project secret sk-abc prompt text\"}}}\n\n",
     );
-    assert!(result.is_err());
-    assert_eq!(sends.get(), 0, "no request should be sent once cancelled");
+
+    let err = parse_response_stream(stream).unwrap_err().to_string();
+
+    assert!(err.contains("Codex response failed"), "{err}");
+    assert!(err.contains("type=server_error"), "{err}");
+    assert!(err.contains("code=rate_limited"), "{err}");
+    assert!(!err.contains("/home/alice"), "{err}");
+    assert!(!err.contains("sk-abc"), "{err}");
+    assert!(!err.contains("prompt text"), "{err}");
 }
 
 #[test]
-fn retry_loop_reauths_exactly_once_then_succeeds() {
-    let forces: Cell<Vec<bool>> = Cell::new(Vec::new());
-    let sends = Cell::new(0u32);
-    let result = run_retry_loop(
-        &RetryPolicy::default(),
-        |force| {
-            let mut seen = forces.take();
-            seen.push(force);
-            forces.set(seen);
-            Ok(fake_token())
-        },
-        |_token| {
-            sends.set(sends.get() + 1);
-            if sends.get() == 1 {
-                Attempt::Reauth(anyhow!("401"))
-            } else {
-                Attempt::Done(AssistantTurn::text("ok"))
-            }
-        },
-        |_delay| {},
-        || false,
+fn non_success_body_diagnostics_redact_free_text_message() {
+    let body = r#"{"error":{"type":"invalid_request_error","code":"bad_request","message":"leak /tmp/work prompt sk-secret"}}"#;
+
+    let diag = CodexDiagnostics {
+        status: 400,
+        error_type: extract_error_field(body, "type"),
+        error_code: extract_error_field(body, "code"),
+        model: "gpt-test".to_string(),
+        endpoint: "/codex/responses",
+        last_event_type: None,
+    }
+    .to_string();
+
+    assert!(diag.contains("error_type=invalid_request_error"), "{diag}");
+    assert!(diag.contains("error_code=bad_request"), "{diag}");
+    assert!(!diag.contains("/tmp/work"), "{diag}");
+    assert!(!diag.contains("sk-secret"), "{diag}");
+    assert!(!diag.contains("prompt"), "{diag}");
+}
+
+#[test]
+fn hostile_type_and_code_tokens_are_omitted() {
+    let body =
+        r#"{"error":{"type":"leak_/home/alice","code":"sk-secret","message":"prompt text"}}"#;
+    let diag = CodexDiagnostics {
+        status: 400,
+        error_type: extract_error_field(body, "type"),
+        error_code: extract_error_field(body, "code"),
+        model: "gpt-test".to_string(),
+        endpoint: "/codex/responses",
+        last_event_type: None,
+    }
+    .to_string();
+
+    assert!(!diag.contains("/home/alice"), "{diag}");
+    assert!(!diag.contains("sk-secret"), "{diag}");
+    assert!(!diag.contains("prompt text"), "{diag}");
+    assert!(!diag.contains("error_type="), "{diag}");
+    assert!(!diag.contains("error_code="), "{diag}");
+}
+
+#[test]
+fn malformed_stream_before_visible_text_is_retryable_protocol_anomaly() {
+    let err = parse_response_stream("data: {not json}\n\n").unwrap_err();
+
+    assert!(protocol_anomaly_retryable(&err, false), "{err}");
+}
+
+#[test]
+fn malformed_stream_after_visible_text_is_not_retryable() {
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "data: {not json}\n\n",
     );
-    assert!(result.is_ok());
-    assert_eq!(forces.take(), vec![false, true]);
-    assert_eq!(sends.get(), 2);
+    let err = parse_response_stream(stream).unwrap_err();
+
+    assert!(!protocol_anomaly_retryable(&err, true), "{err}");
+}
+
+struct FailingReader;
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ))
+    }
+}
+
+impl std::io::BufRead for FailingReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ))
+    }
+
+    fn consume(&mut self, _amt: usize) {}
 }
 
 #[test]
-fn retry_loop_second_auth_rejection_returns_auth_error() {
-    let result = run_retry_loop(
-        &RetryPolicy::default(),
-        |_force| Ok(fake_token()),
-        |_token| Attempt::Reauth(anyhow!("401")),
-        |_delay| {},
-        || false,
-    );
-    let error = result.unwrap_err();
-    assert!(is_auth_error(&error));
+fn stream_read_error_before_visible_text_is_retryable() {
+    let mut sink = RecordingSink::default();
+    let err = parse_response_stream_reader(
+        FailingReader,
+        &mut sink,
+        &CancellationToken::new(),
+        "gpt-test",
+    )
+    .unwrap_err();
+
+    assert!(protocol_anomaly_retryable(&err, false), "{err}");
 }
 
 #[test]
-fn retry_loop_force_refresh_failure_returns_auth_error() {
-    let sends = Cell::new(0u32);
-    let result = run_retry_loop(
-        &RetryPolicy::default(),
-        |force| {
-            if force {
-                Err(anyhow!("refresh failed"))
-            } else {
-                Ok(fake_token())
-            }
-        },
-        |_token| {
-            sends.set(sends.get() + 1);
-            Attempt::Reauth(anyhow!("401"))
-        },
-        |_delay| {},
-        || false,
-    );
-    assert!(is_auth_error(&result.unwrap_err()));
-    // First attempt sent (got 401); refresh then failed before any resend.
-    assert_eq!(sends.get(), 1);
-}
+fn protocol_anomaly_redacts_hostile_last_event_type() {
+    let stream = "data: {\"type\":\"sk-secret prompt /home/alice\"}\n\n";
+    let err = parse_response_stream(stream).unwrap_err().to_string();
 
-#[test]
-fn retry_loop_reauth_does_not_reset_transient_budget() {
-    // Retry, Retry, Reauth, Retry, Retry: with the budget retained the
-    // fifth send exhausts the default max retries (=3) and returns.
-    let sends = Cell::new(0u32);
-    let result = run_retry_loop(
-        &RetryPolicy::default(),
-        |_force| Ok(fake_token()),
-        |_token| {
-            sends.set(sends.get() + 1);
-            match sends.get() {
-                3 => Attempt::Reauth(anyhow!("401")),
-                _ => Attempt::Retry(anyhow!("503"), None),
-            }
-        },
-        |_delay| {},
-        || false,
-    );
-    assert!(result.is_err());
-    assert!(!is_auth_error(&result.unwrap_err()));
-    assert_eq!(sends.get(), 5);
-}
-
-#[test]
-fn retry_loop_passes_retry_after_delay_to_sleeper() {
-    let delays: Cell<Vec<Duration>> = Cell::new(Vec::new());
-    let sends = Cell::new(0u32);
-    let _ = run_retry_loop(
-        &RetryPolicy::default(),
-        |_force| Ok(fake_token()),
-        |_token| {
-            sends.set(sends.get() + 1);
-            if sends.get() == 1 {
-                Attempt::Retry(anyhow!("429"), Some(Duration::from_secs(2)))
-            } else {
-                Attempt::Done(AssistantTurn::text("ok"))
-            }
-        },
-        |delay| {
-            let mut seen = delays.take();
-            seen.push(delay);
-            delays.set(seen);
-        },
-        || false,
-    );
-    let seen = delays.take();
-    assert_eq!(seen.len(), 1);
-    // Retry-After of 2s, plus up to 250ms of jitter.
-    assert!(seen[0] >= Duration::from_secs(2));
-    assert!(seen[0] < Duration::from_secs(2) + Duration::from_millis(250));
-}
-
-#[test]
-fn classifies_http_status_into_retry_policy() {
-    assert_eq!(classify_http_status(401), HttpClass::Reauth);
-    assert_eq!(classify_http_status(403), HttpClass::Reauth);
-    assert_eq!(classify_http_status(429), HttpClass::Retry);
-    assert_eq!(classify_http_status(408), HttpClass::Retry);
-    assert_eq!(classify_http_status(503), HttpClass::Retry);
-    assert_eq!(classify_http_status(500), HttpClass::Retry);
-    assert_eq!(classify_http_status(400), HttpClass::Fatal);
-    assert_eq!(classify_http_status(404), HttpClass::Fatal);
-    assert_eq!(classify_http_status(422), HttpClass::Fatal);
-}
-
-// Backoff growth/clamping/`Retry-After` behavior is covered by
-// `mimir::retry::tests` since the computation moved to the shared `RetryPolicy`.
-
-#[test]
-fn parse_retry_after_reads_integer_seconds() {
-    let mut headers = HeaderMap::new();
-    headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
-    assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
-}
-
-#[test]
-fn parse_retry_after_ignores_non_integer() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        RETRY_AFTER,
-        HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
-    );
-    assert_eq!(parse_retry_after(&headers), None);
+    assert!(!err.contains("sk-secret"), "{err}");
+    assert!(!err.contains("prompt"), "{err}");
+    assert!(!err.contains("/home/alice"), "{err}");
 }
 
 #[test]

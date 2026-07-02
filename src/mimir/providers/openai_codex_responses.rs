@@ -1,57 +1,26 @@
-use std::io::{BufRead, BufReader};
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::BufReader;
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use reqwest::blocking::Client;
-use reqwest::header::{
-    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT,
-};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::errors::AuthError;
+use super::transport::{
+    Attempt, HttpClass, StreamReadError, TurnSink, classify_http_status_retryable,
+    for_each_sse_event, retry_after_hint, run_with_retry, spawn_stream,
+};
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::mimir::selection::{PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
-    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderEvent, ProviderStream,
-    ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
+    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ProviderUsage,
+    ReasoningBlock, Role, ToolCall, Tools,
 };
-use crate::telemetry;
-use futures::channel::mpsc;
-
-/// Provider-internal seam for incremental assistant text. The streamed SSE
-/// parser pushes deltas here; the live provider forwards them onto the
-/// [`ProviderStream`] channel, while tests use a no-op sink. Not part of the
-/// Nexus contract: `ChatProvider` is async-streaming, so deltas reach the loop
-/// as `ProviderEvent::TextDelta` rather than through a sink argument.
-trait TurnSink {
-    /// Forward one text delta. Returns `Err` when the consumer has dropped the
-    /// stream (cancellation): the SSE read loop then stops early instead of
-    /// draining the rest of the response, mirroring Codex's dropped-stream
-    /// cancellation.
-    fn on_text_delta(&mut self, delta: &str) -> Result<()>;
-}
-
-/// [`TurnSink`] that forwards each text delta onto the provider's event channel.
-/// `unbounded_send` is synchronous, so it is safe to call from the blocking
-/// request thread.
-struct ChannelSink {
-    tx: mpsc::UnboundedSender<Result<ProviderEvent>>,
-}
-
-impl TurnSink for ChannelSink {
-    fn on_text_delta(&mut self, delta: &str) -> Result<()> {
-        // A send error means the consumer dropped the stream (cancellation):
-        // surface it so the SSE read loop breaks immediately rather than
-        // downloading and discarding the rest of the response on a leaked thread.
-        self.tx
-            .unbounded_send(Ok(ProviderEvent::TextDelta(delta.to_string())))
-            .map_err(|_| anyhow!("response stream dropped by consumer"))
-    }
-}
 
 // Transport resilience for Codex requests. Transient failures (network, 429,
 // 5xx) are retried with exponential backoff plus jitter; a single auth
@@ -150,23 +119,10 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
         let url = resolve_codex_url(&self.base_url)?;
         let provider = self.clone();
         let cancel = cancel.clone();
-        let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
-        // The blocking reqwest+SSE work runs off the loop's executor; it streams
-        // text deltas through the channel and ends with one terminal item.
-        // Mirrors Codex's `map_response_events` (spawn + channel), minus the
-        // unused transport/telemetry machinery. The turn token is checked
-        // cooperatively (before each attempt, across retry backoff, and between
-        // SSE lines) so a cancelled turn stops promptly instead of draining the
-        // whole response on a leaked thread.
-        tokio::task::spawn_blocking(move || {
-            let mut sink = ChannelSink { tx: tx.clone() };
-            let terminal = match provider.run_blocking(url, &request, &mut sink, &cancel) {
-                Ok(turn) => Ok(ProviderEvent::Completed(turn)),
-                Err(error) => Err(error),
-            };
-            let _ = tx.unbounded_send(terminal);
-        });
-        Ok(Box::pin(rx))
+        Ok(spawn_stream(
+            move |sink, cancel| provider.run_blocking(url, &request, sink, cancel),
+            cancel,
+        ))
     }
 }
 
@@ -184,8 +140,10 @@ impl OpenAiCodexResponsesProvider {
         let span = tracing::info_span!("codex_roundtrip", model = %self.model);
         let _guard = span.enter();
 
-        run_retry_loop(
+        run_with_retry(
+            PROVIDER_ID,
             &self.retry_policy,
+            cancel,
             |force_refresh| {
                 if force_refresh {
                     self.tokens.force_refresh(&self.client)
@@ -193,104 +151,9 @@ impl OpenAiCodexResponsesProvider {
                     self.tokens.access_token(&self.client)
                 }
             },
-            |token| {
-                let started = Instant::now();
-                let attempt = self.send_once(url.clone(), token, request, sink, cancel);
-                tracing::debug!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "codex attempt complete"
-                );
-                attempt
-            },
-            // Sleep in slices so a turn-level Ctrl-C interrupts retry backoff;
-            // the loop's cancellation check then ends the attempt without
-            // firing another request.
-            |delay| sleep_cancellable(delay, cancel),
-            || cancel.is_cancelled(),
+            |token| self.send_once(url.clone(), token, request, sink, cancel),
         )
     }
-}
-
-/// Drive the transient-retry / one-shot-reauth state machine.
-///
-/// Pure of HTTP and timing concerns so it can be unit-tested with scripted
-/// closures: `get_token(force_refresh)` obtains a token (cached, or forcibly
-/// refreshed after an auth rejection), `send` performs one attempt, and `sleep`
-/// applies a backoff delay. Termination is guaranteed: reauth fires at most
-/// once, transient retries are bounded by `policy.max_retries` and are not
-/// reset by a reauth, and every other branch returns.
-fn run_retry_loop(
-    policy: &crate::mimir::retry::RetryPolicy,
-    mut get_token: impl FnMut(bool) -> Result<AccessToken>,
-    mut send: impl FnMut(&AccessToken) -> Attempt,
-    mut sleep: impl FnMut(Duration),
-    is_cancelled: impl Fn() -> bool,
-) -> Result<AssistantTurn> {
-    let mut transient_retries: u32 = 0;
-    let mut reauth_used = false;
-    let mut force_refresh = false;
-
-    loop {
-        // Checked before every attempt and after each backoff sleep: a cancelled
-        // turn stops here rather than issuing or retrying a request.
-        if is_cancelled() {
-            return Err(anyhow!("Codex request cancelled"));
-        }
-        let token = match get_token(force_refresh) {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::error!(error = %format!("{error:#}"), "failed to obtain access token");
-                return Err(AuthError::new("authentication failed").into());
-            }
-        };
-        force_refresh = false;
-        tracing::debug!(token = %telemetry::redact_secret(&token.bearer), "using access token");
-
-        match send(&token) {
-            Attempt::Done(turn) => return Ok(turn),
-            Attempt::Reauth(error) => {
-                if reauth_used {
-                    tracing::error!(error = %format!("{error:#}"), "codex auth rejected after refresh");
-                    return Err(AuthError::new("authentication failed").into());
-                }
-                reauth_used = true;
-                force_refresh = true;
-                tracing::warn!(error = %format!("{error:#}"), "codex auth rejected; refreshing token and retrying");
-                continue;
-            }
-            Attempt::Retry(error, retry_after) => {
-                if transient_retries >= policy.max_retries {
-                    tracing::error!(error = %format!("{error:#}"), retries = transient_retries, "codex transient error; retries exhausted");
-                    return Err(error);
-                }
-                transient_retries += 1;
-                let delay = policy.backoff_delay(transient_retries, retry_after);
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    attempt = transient_retries,
-                    delay_ms = delay.as_millis() as u64,
-                    "codex transient error; retrying"
-                );
-                sleep(delay);
-                continue;
-            }
-            Attempt::Fatal(error) => {
-                tracing::error!(error = %format!("{error:#}"), "codex request failed");
-                return Err(error);
-            }
-        }
-    }
-}
-
-/// Outcome of a single HTTP attempt, classified for the retry loop.
-enum Attempt {
-    Done(AssistantTurn),
-    /// Auth rejected (401/403): force one token refresh, then retry.
-    Reauth(anyhow::Error),
-    /// Transient (network/429/5xx): retry with backoff; carries any server hint.
-    Retry(anyhow::Error, Option<Duration>),
-    /// Non-retryable (4xx other, malformed response): give up now.
-    Fatal(anyhow::Error),
 }
 
 impl OpenAiCodexResponsesProvider {
@@ -318,29 +181,47 @@ impl OpenAiCodexResponsesProvider {
 
         let status = response.status();
         if status.is_success() {
-            return match parse_response_stream_reader(
-                BufReader::new(response),
-                sink,
-                cancel,
-                &self.model,
-            ) {
+            let mut parser = ResponseStreamParser::new(&self.model);
+            if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                parser.ingest_event(data, sink)
+            }) {
+                if !cancel.is_cancelled()
+                    && protocol_anomaly_retryable(&error, parser.emitted_visible_text)
+                {
+                    return Attempt::Retry(error, None);
+                }
+                return Attempt::Fatal(error);
+            }
+            let emitted_visible_text = parser.emitted_visible_text;
+            return match parser.finish() {
                 Ok(turn) => {
                     if let Some(usage) = &turn.usage {
                         self.record_usage(usage);
                     }
-                    Attempt::Done(turn)
+                    Attempt::Done(Box::new(turn))
                 }
-                Err(error) => Attempt::Fatal(error),
+                Err(error) => {
+                    if protocol_anomaly_retryable(&error, emitted_visible_text) {
+                        Attempt::Retry(error, None)
+                    } else {
+                        Attempt::Fatal(error)
+                    }
+                }
             };
         }
 
-        let retry_after = parse_retry_after(response.headers());
+        let retry_after = retry_after_hint(response.headers());
         let body = response.text().unwrap_or_default();
-        let error = match telemetry::sanitize_external_body(&body) {
-            Some(detail) => anyhow!("Codex request failed ({status}): {detail}"),
-            None => anyhow!("Codex request failed ({status})"),
+        let diag = CodexDiagnostics {
+            status: status.as_u16(),
+            error_type: extract_error_field(&body, "type"),
+            error_code: extract_error_field(&body, "code"),
+            model: self.model.clone(),
+            endpoint: "/codex/responses",
+            last_event_type: None,
         };
-        match classify_http_status(status.as_u16()) {
+        let error = anyhow!("Codex request failed [{diag}]");
+        match classify_http_status_retryable(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
             HttpClass::Retry => Attempt::Retry(error, retry_after),
             HttpClass::Fatal => Attempt::Fatal(error),
@@ -365,36 +246,6 @@ impl OpenAiCodexResponsesProvider {
             "provider token usage"
         );
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HttpClass {
-    Reauth,
-    Retry,
-    Fatal,
-}
-
-/// Classify an HTTP status into a retry policy class.
-fn classify_http_status(status: u16) -> HttpClass {
-    match status {
-        401 | 403 => HttpClass::Reauth,
-        408 | 425 | 429 => HttpClass::Retry,
-        500..=599 => HttpClass::Retry,
-        _ => HttpClass::Fatal,
-    }
-}
-
-/// Parse an integer-seconds `Retry-After` header. The HTTP-date form is
-/// uncommon for 429s and is intentionally ignored.
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let seconds: u64 = headers
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_secs(seconds))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -606,20 +457,6 @@ fn parse_response_json(value: Value) -> Result<AssistantTurn> {
     Ok(turn)
 }
 
-/// Sleep up to `delay`, but in slices so `cancel` is observed promptly; returns
-/// early once cancelled.
-fn sleep_cancellable(delay: Duration, cancel: &CancellationToken) {
-    const SLICE: Duration = Duration::from_millis(100);
-    let deadline = Instant::now() + delay;
-    while Instant::now() < deadline {
-        if cancel.is_cancelled() {
-            return;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        sleep(remaining.min(SLICE));
-    }
-}
-
 #[cfg(test)]
 fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
     let mut sink = NoopSink;
@@ -631,6 +468,7 @@ fn parse_response_stream(body: &str) -> Result<AssistantTurn> {
     )
 }
 
+#[cfg(test)]
 fn parse_response_stream_reader(
     reader: impl BufRead,
     sink: &mut dyn TurnSink,
@@ -638,29 +476,7 @@ fn parse_response_stream_reader(
     model: &str,
 ) -> Result<AssistantTurn> {
     let mut parser = ResponseStreamParser::new(model);
-    let mut event = String::new();
-
-    for line in reader.lines() {
-        // Between lines: a cancelled turn stops draining an actively streaming
-        // response promptly (an idle socket read still blocks until the next
-        // byte or the client timeout -- blocking reqwest cannot be force-aborted
-        // mid-read).
-        if cancel.is_cancelled() {
-            bail!("Codex stream cancelled");
-        }
-        let line = line.context("failed to read Codex stream response")?;
-        if line.trim_end_matches('\r').is_empty() {
-            parser.ingest_event(&event, sink)?;
-            event.clear();
-        } else {
-            event.push_str(&line);
-            event.push('\n');
-        }
-    }
-    if !event.is_empty() {
-        parser.ingest_event(&event, sink)?;
-    }
-
+    for_each_sse_event(reader, cancel, |data| parser.ingest_event(data, sink))?;
     parser.finish()
 }
 
@@ -672,6 +488,8 @@ struct ResponseStreamParser {
     completed_response: Option<Value>,
     response_id: Option<String>,
     saw_completed: bool,
+    emitted_visible_text: bool,
+    last_event_type: Option<String>,
 }
 
 impl ResponseStreamParser {
@@ -684,21 +502,32 @@ impl ResponseStreamParser {
             completed_response: None,
             response_id: None,
             saw_completed: false,
+            emitted_visible_text: false,
+            last_event_type: None,
         }
     }
 
     fn ingest_event(&mut self, event: &str, sink: &mut dyn TurnSink) -> Result<()> {
-        let data = event_data(event);
-        if data.is_empty() || data == "[DONE]" {
+        if event.is_empty() || event == "[DONE]" {
             return Ok(());
         }
 
-        let value: Value = serde_json::from_str(&data).context("failed to parse Codex SSE data")?;
-        match value.get("type").and_then(Value::as_str) {
+        let value: Value = serde_json::from_str(event).map_err(|_| {
+            anyhow::Error::new(CodexStreamProtocolAnomaly::invalid_json(
+                self.last_event_type.clone(),
+            ))
+        })?;
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.last_event_type = event_type.clone();
+        match event_type.as_deref() {
             Some("response.output_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                     self.text.push_str(delta);
                     sink.on_text_delta(delta)?;
+                    self.emitted_visible_text = true;
                 }
             }
             Some("response.created") => {
@@ -744,7 +573,10 @@ impl ResponseStreamParser {
 
     fn finish(mut self) -> Result<AssistantTurn> {
         if !self.saw_completed {
-            bail!("Codex stream closed before response.completed");
+            return Err(CodexStreamProtocolAnomaly::closed_before_completed(
+                self.last_event_type.clone(),
+            )
+            .into());
         }
         let mut usage = None;
         if let Some(response) = self.completed_response.as_ref() {
@@ -788,23 +620,127 @@ impl TurnSink for NoopSink {
     }
 }
 
-fn event_data(event: &str) -> String {
-    event
-        .lines()
-        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n")
+#[derive(Debug, Clone)]
+struct CodexDiagnostics {
+    status: u16,
+    error_type: Option<String>,
+    error_code: Option<String>,
+    model: String,
+    endpoint: &'static str,
+    last_event_type: Option<String>,
+}
+
+impl std::fmt::Display for CodexDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "status={} endpoint={} model={}",
+            self.status, self.endpoint, self.model
+        )?;
+        if let Some(kind) = self.error_type.as_deref().and_then(safe_error_field) {
+            write!(f, " error_type={kind}")?;
+        }
+        if let Some(code) = self.error_code.as_deref().and_then(safe_error_field) {
+            write!(f, " error_code={code}")?;
+        }
+        if let Some(event) = self.last_event_type.as_deref().and_then(safe_error_field) {
+            write!(f, " last_event={event}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CodexStreamProtocolAnomaly {
+    kind: &'static str,
+    last_event_type: Option<String>,
+}
+
+impl CodexStreamProtocolAnomaly {
+    fn invalid_json(last_event_type: Option<String>) -> Self {
+        Self {
+            kind: "invalid_json",
+            last_event_type,
+        }
+    }
+
+    fn closed_before_completed(last_event_type: Option<String>) -> Self {
+        Self {
+            kind: "closed_before_response_completed",
+            last_event_type,
+        }
+    }
+}
+
+impl std::fmt::Display for CodexStreamProtocolAnomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Codex stream protocol anomaly kind={}", self.kind)?;
+        if let Some(event) = self.last_event_type.as_deref().and_then(safe_error_field) {
+            write!(f, " last_event={event}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CodexStreamProtocolAnomaly {}
+
+fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_text: bool) -> bool {
+    !emitted_visible_text
+        && (error.downcast_ref::<CodexStreamProtocolAnomaly>().is_some()
+            || error.downcast_ref::<StreamReadError>().is_some())
+}
+
+fn extract_error_field(body: &str, field: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("error")
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("error"))
+        })
+        .and_then(|error| error.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn safe_error_field(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let sensitive = ["secret", "token", "password", "api_key", "prompt", "sk-"];
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && !sensitive.iter().any(|fragment| lower.contains(fragment)))
+    .then_some(value)
 }
 
 fn response_error(value: &Value) -> String {
-    value
+    let error = value
         .get("response")
-        .and_then(|response| response.get("error"))
-        .and_then(|error| error.get("message"))
+        .and_then(|response| response.get("error"));
+    let mut fields = Vec::new();
+    if let Some(kind) = error
+        .and_then(|error| error.get("type"))
         .and_then(Value::as_str)
-        .unwrap_or("response.failed event received")
-        .to_string()
+        .and_then(safe_error_field)
+    {
+        fields.push(format!("type={kind}"));
+    }
+    if let Some(code) = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .and_then(safe_error_field)
+    {
+        fields.push(format!("code={code}"));
+    }
+    if fields.is_empty() {
+        "response.failed event received".to_string()
+    } else {
+        fields.join(" ")
+    }
 }
 
 fn incomplete_reason(value: &Value) -> String {

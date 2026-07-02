@@ -21,6 +21,7 @@ pub(crate) struct AuthError {
 }
 
 impl AuthError {
+    #[cfg(test)]
     pub(crate) fn new(cause: impl std::fmt::Display) -> Self {
         Self {
             message: cause.to_string(),
@@ -28,8 +29,8 @@ impl AuthError {
         }
     }
 
-    /// Like [`AuthError::new`], but records the failing provider id so callers
-    /// can render a provider-specific re-login hint at the UI boundary.
+    /// Records the failing provider id so callers can render a
+    /// provider-specific re-login hint at the UI boundary.
     pub(crate) fn for_provider(provider: impl Into<String>, cause: impl std::fmt::Display) -> Self {
         Self {
             message: cause.to_string(),

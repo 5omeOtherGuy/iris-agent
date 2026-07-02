@@ -11,6 +11,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
 
@@ -101,6 +102,7 @@ pub(crate) fn init() {
 /// Returns a short SHA-256 digest prefix plus the length, never any byte of the
 /// secret itself, so a debug log can answer "which token am I using / did it
 /// change?" without leaking the credential.
+#[cfg(test)]
 pub(crate) fn redact_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     let prefix: String = digest
