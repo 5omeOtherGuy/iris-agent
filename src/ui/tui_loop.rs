@@ -188,6 +188,9 @@ enum RouteOutcome {
     Consumed,
     Fall,
     Swap(SessionSource),
+    /// Run an on-demand compaction at the boundary (driven like a turn, so the
+    /// provider-backed summarizer stays cancellable and the spinner runs).
+    Compact,
 }
 
 /// Outcome of the idle (between-turns) input phase.
@@ -422,17 +425,35 @@ async fn session_loop<P: ChatProvider>(
                     // Consumed: a modal may now be open; the top-of-loop modal
                     // phase runs it on the next iteration.
                     RouteOutcome::Consumed => {}
-                    RouteOutcome::Fall => {
-                        tui.screen.commit_user(&prompt);
+                    RouteOutcome::Compact => {
                         tui.screen.start_turn();
                         tui.draw()?;
-                        run_turn(
+                        run_harness_op(
                             harness,
                             tui,
                             &mut input_rx,
                             &mut tick,
                             &current_turn,
-                            &prompt,
+                            HarnessOp::Compact,
+                            steering.as_ref(),
+                            &git_cache,
+                            &mut git_generation,
+                        )
+                        .await?;
+                        tui.screen.end_turn();
+                        tui.draw()?;
+                    }
+                    RouteOutcome::Fall => {
+                        tui.screen.commit_user(&prompt);
+                        tui.screen.start_turn();
+                        tui.draw()?;
+                        run_harness_op(
+                            harness,
+                            tui,
+                            &mut input_rx,
+                            &mut tick,
+                            &current_turn,
+                            HarnessOp::Turn(&prompt),
                             steering.as_ref(),
                             &git_cache,
                             &mut git_generation,
@@ -1053,6 +1074,10 @@ fn route_command<P: ChatProvider>(
             apply_notices(tui, lines);
             Ok(RouteOutcome::Consumed)
         }
+        "/compact" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            Ok(RouteOutcome::Compact)
+        }
         "/copy" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             apply_notices(tui, crate::cli::copy_command_lines(harness));
@@ -1305,16 +1330,26 @@ async fn idle_phase(
     }
 }
 
-/// Drive one agent turn, staying responsive to input, agent events, approval
-/// requests, and the spinner tick. Returns when the turn future completes.
+/// Which cancellable harness operation the shared driver runs: a normal agent
+/// turn, or an on-demand compaction (`/compact`, whose provider-backed
+/// summarizer awaits a model request and deserves the same spinner/cancel
+/// treatment as a turn).
+enum HarnessOp<'a> {
+    Turn(&'a str),
+    Compact,
+}
+
+/// Drive one cancellable harness operation (a turn or an on-demand
+/// compaction), staying responsive to input, agent events, approval requests,
+/// and the spinner tick. Returns when the operation future completes.
 #[allow(clippy::too_many_arguments)]
-async fn run_turn<P: ChatProvider>(
+async fn run_harness_op<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     input_rx: &mut UnboundedReceiver<Event>,
     tick: &mut tokio::time::Interval,
     current_turn: &CurrentTurn,
-    prompt: &str,
+    op: HarnessOp<'_>,
     steering: &SteeringQueue,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
@@ -1346,7 +1381,12 @@ async fn run_turn<P: ChatProvider>(
         .map(|(width, _)| width);
 
     let result = {
-        let mut turn = std::pin::pin!(harness.submit_turn(prompt, &bridge, &bridge, &token));
+        let mut turn: futures::future::LocalBoxFuture<'_, Result<()>> = match op {
+            HarnessOp::Turn(prompt) => {
+                Box::pin(harness.submit_turn(prompt, &bridge, &bridge, &token))
+            }
+            HarnessOp::Compact => Box::pin(harness.compact_now(&bridge, &token)),
+        };
         loop {
             // Compute the next coalesced-draw deadline. When nothing is pending
             // the branch is disabled, so the loop stays CPU-idle (no timer).

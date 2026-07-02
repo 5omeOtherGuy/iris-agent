@@ -385,6 +385,7 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
     // Post-change verification (issue #265): engaged only when a `verify` block
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
+    harness.set_summarizer(settings.compaction_summarizer());
     // Tier-3 mode-switch state: `/model` `/reasoning` rebuild a provider from the
     // same system prompt via `build_provider` and install it at a turn boundary.
     // The session id lives in a shared cell so an in-session `/resume` `/new`
@@ -504,6 +505,7 @@ fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
     let mut harness =
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
     harness.set_verification(settings.verification());
+    harness.set_summarizer(settings.compaction_summarizer());
 
     // Merge piped stdin (when not a TTY) into the prompt before the turn.
     let piped = print::read_piped_stdin()?;
@@ -589,6 +591,7 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
         budget,
     );
     harness.set_verification(settings.verification());
+    harness.set_summarizer(settings.compaction_summarizer());
     let session_cell = Rc::new(RefCell::new(session_id.clone()));
     let build_cell = session_cell.clone();
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {

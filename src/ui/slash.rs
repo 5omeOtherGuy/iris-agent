@@ -7,7 +7,8 @@
 //! end the session, and every `Submit` command routes to a real handler --
 //! `/model`/`/reasoning` to the shared model-switch handler
 //! (`crate::cli::handle_model_command`), `/copy`/`/session` to the shared line
-//! builders in `crate::cli`, and the rest to their TUI pickers/handlers in
+//! builders in `crate::cli`, `/compact` to the harness's on-demand compaction,
+//! and the rest to their TUI pickers/handlers in
 //! `crate::ui::tui_loop::route_command`. Adding a command with no action would
 //! lie to the user, so the list stays honest and short.
 
@@ -83,6 +84,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/copy",
         description: "Copy the last assistant reply to the clipboard",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "Summarize older context to free the window before a switch",
         action: SlashAction::Submit,
     },
     SlashCommand {

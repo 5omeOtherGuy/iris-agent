@@ -16,14 +16,15 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::Result;
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::config::VerificationConfig;
 use crate::handles::HandleStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, SteeringSource,
-    ToolEnv, VerificationOutcome, VerifyRun,
+    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderEvent, Role,
+    SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
 };
 use crate::session::{SessionLog, estimate_tokens, message_token_estimate, preview_line};
 use crate::tools::ToolState;
@@ -34,6 +35,41 @@ use crate::tools::ToolState;
 const MAX_SUMMARY_CHARS: usize = 4000;
 /// Per-message excerpt cap inside the summary.
 const MAX_EXCERPT_CHARS: usize = 160;
+/// Recent-tail token target for a manual `/compact`: keep roughly the latest
+/// exchange so a follow-up prompt still has its immediate referent verbatim,
+/// and cover everything older with the summary.
+const MANUAL_COMPACT_KEEP_TOKENS: u64 = 1_000;
+
+/// Instruction appended after the carried context for the provider-backed
+/// summarizer. Mirrors pi-mono's compaction ask: a structured handoff another
+/// model (possibly a different provider) can resume from, preferring exact
+/// identifiers over prose.
+const SUMMARY_PROMPT: &str = "Summarize this coding session so another model can take over \
+seamlessly. Reply with only the summary, no preamble. Use short sections: Goal (what the user \
+is trying to achieve), State (what has been done and what is verified working), Key facts \
+(exact file paths, symbols, commands, decisions, and constraints that still matter), and Next \
+steps (unresolved work, in order). Prefer exact identifiers over prose; omit pleasantries and \
+tool-call mechanics.";
+
+/// How compaction produces its summary text (ADR-0041). `Provider` asks the
+/// active model for a structured handoff summary and falls back to `Excerpts`
+/// when the request fails or fails to shrink; `Excerpts` is the deterministic
+/// bounded-excerpt stand-in. The harness default is `Excerpts` so bare/test
+/// constructions never issue surprise provider calls; the Tier-3 app installs
+/// the configured kind (default `Provider`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SummarizerKind {
+    #[default]
+    Excerpts,
+    Provider,
+}
+
+/// What a completed compaction changed, for the caller's user-facing notice.
+struct CompactionOutcome {
+    covered: usize,
+    original_tokens: u64,
+    summary_tokens: u64,
+}
 
 /// Wraps a bare [`Agent`] with the execution env it runs against and the
 /// optional transcript log it persists to.
@@ -78,6 +114,9 @@ pub(crate) struct Harness<P> {
     // `Some` with no command reports skipped-unconfigured. Installed by the
     // Tier-3 host from the resolved `Settings`.
     verify: Option<VerificationConfig>,
+    // How compaction produces its summary text (ADR-0041). Defaults to the
+    // deterministic excerpts; the Tier-3 app installs the configured kind.
+    summarizer: SummarizerKind,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -170,6 +209,7 @@ impl<P: ChatProvider> Harness<P> {
             steering: None,
             git_safety,
             verify: None,
+            summarizer: SummarizerKind::default(),
         }
     }
 
@@ -178,6 +218,13 @@ impl<P: ChatProvider> Harness<P> {
     /// the feature off. Set once per session alongside the steering source.
     pub(crate) fn set_verification(&mut self, config: Option<VerificationConfig>) {
         self.verify = config;
+    }
+
+    /// Install the configured compaction summarizer. Set once at startup by the
+    /// Tier-3 app; the harness default stays `Excerpts` so bare constructions
+    /// never issue surprise provider calls.
+    pub(crate) fn set_summarizer(&mut self, summarizer: SummarizerKind) {
+        self.summarizer = summarizer;
     }
 
     /// Install the mid-run steering/follow-up source (the Tier-3 app's typed
@@ -469,7 +516,7 @@ impl<P: ChatProvider> Harness<P> {
         // current context exceeds the configured budget. The prior turn's
         // transcript is complete here (every tool call answered), so the
         // covered range never splits a pending tool-call/result pair.
-        self.maybe_auto_compact(obs)?;
+        self.maybe_auto_compact(obs, token).await?;
         // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
         // the current session id to the guard before the turn. The guard stamps
         // them as opaque display payload onto any task this turn opens; a
@@ -686,8 +733,13 @@ impl<P: ChatProvider> Harness<P> {
     /// replace the in-memory context with `summary + retained tail`, so the
     /// next provider request uses the summary instead of the covered messages.
     /// No-op when auto-compaction is disabled, no log is attached, the context
-    /// is within budget, or nothing coverable remains.
-    fn maybe_auto_compact(&mut self, obs: &dyn AgentObserver) -> Result<()> {
+    /// is within budget, nothing coverable remains, or the summary request was
+    /// cancelled (the turn's own cancellation handling takes over).
+    async fn maybe_auto_compact(
+        &mut self,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+    ) -> Result<()> {
         let Some(budget) = self.budget else {
             return Ok(());
         };
@@ -705,22 +757,84 @@ impl<P: ChatProvider> Harness<P> {
         }
 
         let messages = self.agent.messages().to_vec();
-        let Some(plan) = self.plan_compaction(&messages, budget) else {
+        // Keep the recent tail within a low-water target below the budget, not
+        // the full budget: the new summary contributes its own tokens, so a
+        // tail filling the whole budget would push the context back over budget
+        // immediately and cause per-turn compaction thrash. Three-quarters
+        // leaves headroom for the summary and the next prompt.
+        let keep_target = budget.saturating_mul(3) / 4;
+        let Some(plan) = self.plan_compaction(&messages, keep_target) else {
             // Nothing coverable (e.g. resumed id-less history or a single
             // oversized message at a tool boundary): a no-op, never history
             // destruction or a faked token count.
             return Ok(());
         };
 
+        let Some(outcome) = self.compact_range(&messages, plan, obs, token).await? else {
+            return Ok(());
+        };
+        obs.on_event(AgentEvent::Notice(format!(
+            "compacted {} earlier message(s) to stay within the {budget}-token context budget.",
+            outcome.covered
+        )))
+    }
+
+    /// Compact on demand at a safe inter-turn boundary (`/compact`), keeping a
+    /// small recent tail and covering everything older with the summary. Unlike
+    /// [`maybe_auto_compact`](Self::maybe_auto_compact) it needs no budget and
+    /// reports why nothing happened instead of silently no-oping, because the
+    /// user asked.
+    pub(crate) async fn compact_now(
+        &mut self,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+    ) -> Result<()> {
+        if self.session.is_none() {
+            return obs.on_event(AgentEvent::Notice(
+                "compaction needs a persisted session; this one is in-memory.".to_string(),
+            ));
+        }
+        let messages = self.agent.messages().to_vec();
+        let Some(plan) = self.plan_compaction(&messages, MANUAL_COMPACT_KEEP_TOKENS) else {
+            return obs.on_event(AgentEvent::Notice(
+                "nothing to compact yet: the context is only recent or not yet persisted turns."
+                    .to_string(),
+            ));
+        };
+        let Some(outcome) = self.compact_range(&messages, plan, obs, token).await? else {
+            return obs.on_event(AgentEvent::Notice("compaction cancelled.".to_string()));
+        };
+        obs.on_event(AgentEvent::Notice(format!(
+            "compacted {} earlier message(s): ~{} tokens replaced by a ~{}-token summary.",
+            outcome.covered, outcome.original_tokens, outcome.summary_tokens
+        )))
+    }
+
+    /// Shared compaction core: produce the summary for a chosen range, append
+    /// the durable `compaction` entry, and rebuild the in-memory context as
+    /// `kept prefix + summary + retained tail`. Returns `None` (nothing
+    /// changed) when the summary request was cancelled.
+    async fn compact_range(
+        &mut self,
+        messages: &[Message],
+        plan: CompactionPlan,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+    ) -> Result<Option<CompactionOutcome>> {
         let covered = plan.end - plan.start;
         let original_tokens = context_tokens(&messages[plan.start..plan.end]);
-        let summary = summarize(&messages[plan.start..plan.end]);
+        let Some(summary) = self
+            .summarize_range(messages, &plan, original_tokens, token)
+            .await
+        else {
+            return Ok(None);
+        };
         let summary_tokens = estimate_tokens(&summary);
 
         let log = self
             .session
             .as_mut()
-            .expect("session present checked above");
+            .expect("compaction callers check the session first");
         let compaction_id =
             log.append_compaction(&plan.from_id, &plan.to_id, &summary, Some(summary_tokens))?;
         tracing::info!(
@@ -728,7 +842,7 @@ impl<P: ChatProvider> Harness<P> {
             from = %plan.from_id,
             to = %plan.to_id,
             compaction_id = %compaction_id,
-            "auto-compacted context over token budget"
+            "compacted context range"
         );
 
         // Rebuild the in-memory context in place: anything before the covered
@@ -776,27 +890,76 @@ impl<P: ChatProvider> Harness<P> {
             covered_messages: covered,
             original_tokens_estimate: original_tokens,
             summary_tokens_estimate: summary_tokens,
-            budget,
+            budget: self.budget.unwrap_or(0),
         })?;
-        obs.on_event(AgentEvent::Notice(format!(
-            "compacted {covered} earlier message(s) to stay within the {budget}-token context budget."
-        )))
+        Ok(Some(CompactionOutcome {
+            covered,
+            original_tokens,
+            summary_tokens,
+        }))
+    }
+
+    /// Produce the summary text for a covered range: the provider-backed
+    /// summarizer when installed (falling back to the deterministic excerpts on
+    /// failure or a non-shrinking answer), otherwise the excerpts directly.
+    /// `None` only when the request was cancelled -- compaction is then skipped
+    /// entirely rather than falling back, because the user is aborting the
+    /// operation, not choosing a worse summary.
+    async fn summarize_range(
+        &self,
+        messages: &[Message],
+        plan: &CompactionPlan,
+        original_tokens: u64,
+        token: &CancellationToken,
+    ) -> Option<String> {
+        if self.summarizer == SummarizerKind::Provider {
+            match provider_summary(
+                &self.agent.provider,
+                self.agent.tools(),
+                &messages[..plan.end],
+                token,
+            )
+            .await
+            {
+                Ok(text) => {
+                    let framed = format!(
+                        "[compacted summary of {} earlier message(s)]\n{}",
+                        plan.end - plan.start,
+                        text.trim()
+                    );
+                    // Shrink guard: a summary that fails to compress is worse
+                    // than the deterministic floor.
+                    if estimate_tokens(&framed) < original_tokens {
+                        return Some(framed);
+                    }
+                    tracing::warn!(
+                        "provider summary did not shrink the covered range; using excerpts"
+                    );
+                }
+                Err(error) => {
+                    if token.is_cancelled() {
+                        return None;
+                    }
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "provider summary failed; using excerpts"
+                    );
+                }
+            }
+        }
+        Some(summarize(&messages[plan.start..plan.end]))
     }
 
     /// Choose the message range to compact. Keeps the largest recent tail whose
-    /// token sum stays within budget and compacts the older coverable messages
-    /// before it, clamped to the persisted/id-bearing region and adjusted so the
-    /// covered range never splits a tool-call/tool-result pair. `None` when no
-    /// coverable range remains.
-    fn plan_compaction(&self, messages: &[Message], budget: u64) -> Option<CompactionPlan> {
+    /// token sum stays within `keep_target` and compacts the older coverable
+    /// messages before it, clamped to the persisted/id-bearing region and
+    /// adjusted so the covered range never splits a tool-call/tool-result pair.
+    /// `None` when no coverable range remains. Auto-compaction passes a
+    /// low-water fraction of the budget; `/compact` passes the small
+    /// [`MANUAL_COMPACT_KEEP_TOKENS`] tail.
+    fn plan_compaction(&self, messages: &[Message], keep_target: u64) -> Option<CompactionPlan> {
         // Coverable region: the persisted prefix with known entry ids.
         let n = self.persisted.min(messages.len());
-        // Keep the recent tail within a low-water target below the budget, not
-        // the full budget: the new summary contributes its own tokens, so a
-        // tail filling the whole budget would push the context back over budget
-        // immediately and cause per-turn compaction thrash. Three-quarters
-        // leaves headroom for the summary and the next prompt.
-        let keep_target = budget.saturating_mul(3) / 4;
         let mut k = messages.len();
         let mut tail = 0u64;
         while k > 0 {
@@ -846,6 +1009,38 @@ impl<P: ChatProvider> Harness<P> {
             from_id: self.entry_ids[start].clone()?,
             to_id: self.entry_ids[end - 1].clone()?,
         })
+    }
+}
+
+/// One-shot, tool-free summarization request against the active provider
+/// (ADR-0041). The request replays the live context prefix through the end of
+/// the covered range plus a final user instruction, and advertises the normal
+/// tool declarations, so the provider's cached prompt prefix (tools + system +
+/// history) is reused instead of re-billed at the uncached rate. Only a
+/// completed text answer is accepted; a tool-calling or empty response is an
+/// error the caller turns into the deterministic fallback.
+async fn provider_summary<P: ChatProvider>(
+    provider: &P,
+    tools: &Tools,
+    prefix: &[Message],
+    token: &CancellationToken,
+) -> Result<String> {
+    let mut request = prefix.to_vec();
+    request.push(Message::user(SUMMARY_PROMPT));
+    let mut stream = provider.respond_stream(&request, tools, token)?;
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = token.cancelled() => anyhow::bail!("summarization cancelled"),
+            event = stream.next() => event
+                .ok_or_else(|| anyhow::anyhow!("provider stream ended before completing a summary"))??,
+        };
+        if let ProviderEvent::Completed(turn) = event {
+            return turn
+                .text
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("provider returned no summary text"));
+        }
     }
 }
 

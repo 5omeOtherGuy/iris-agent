@@ -1,7 +1,8 @@
 # ADR-0016: Preserve provider reasoning continuity in flattened transcripts
 
 **Date**: 2026-06-20
-**Status**: accepted
+**Status**: accepted; wire rule amended by ADR-0041 (a foreign-origin visible
+block is dropped from requests, not downgraded to `text`)
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context
