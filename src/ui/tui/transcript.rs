@@ -1,5 +1,6 @@
 //! Retained transcript state and event-to-row rendering.
 
+use std::ops::{Deref, Range};
 use std::time::{Duration, Instant};
 
 use ratatui::style::Style;
@@ -10,7 +11,6 @@ use crate::tool_display::run_target;
 use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use crate::ui::{TurnErrorKind, UiEvent};
 
-use super::component::{self, Component};
 use super::pane;
 use super::panel::{
     PanelHeaderSpec, PanelState, diff_counts, diff_footer_row, diff_table_rows, panel_state,
@@ -105,6 +105,42 @@ struct ActiveEdit {
     started: Option<Instant>,
 }
 
+#[derive(Default)]
+struct WrappedTranscriptCache {
+    width: usize,
+    rows: Vec<Range<usize>>,
+    lines: Vec<Line<'static>>,
+    dirty_from: usize,
+}
+
+impl WrappedTranscriptCache {
+    fn invalidate_all(&mut self, width: usize) {
+        self.width = width;
+        self.rows.clear();
+        self.lines.clear();
+        self.dirty_from = 0;
+    }
+
+    fn mark_dirty(&mut self, row: usize) {
+        self.dirty_from = self.dirty_from.min(row);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TranscriptRender {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) stable_prefix: usize,
+    pub(super) total_lines: usize,
+}
+
+impl Deref for TranscriptRender {
+    type Target = [Line<'static>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.lines
+    }
+}
+
 /// Transcript state and width-aware rendering, separate from editor/spinner UI.
 #[derive(Default)]
 pub(super) struct Transcript {
@@ -133,9 +169,18 @@ pub(super) struct Transcript {
     /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
     /// uses a realistic column count. Zero until the first render.
     last_width: usize,
+    wrapped_cache: WrappedTranscriptCache,
 }
 
 impl Transcript {
+    fn mark_dirty_from(&mut self, row: usize) {
+        self.wrapped_cache.mark_dirty(row.min(self.rows.len()));
+    }
+
+    fn mark_append_dirty(&mut self) {
+        self.mark_dirty_from(self.rows.len());
+    }
+
     /// Append a blank separator row before a new top-level block, unless the
     /// transcript is empty or already ends in a real separator row.
     fn push_blank(&mut self) {
@@ -143,9 +188,11 @@ impl Transcript {
         match self.rows.last() {
             None => {}
             Some(last) if is_separator_row(last) => {}
-            _ => self
-                .rows
-                .push(TranscriptRow::new(String::new(), Style::default())),
+            _ => {
+                self.mark_append_dirty();
+                self.rows
+                    .push(TranscriptRow::new(String::new(), Style::default()));
+            }
         }
     }
 
@@ -153,10 +200,12 @@ impl Transcript {
     fn begin_block(&mut self) {
         self.finish_stream();
         self.push_blank();
+        self.mark_append_dirty();
     }
 
     /// Push each line of `text` into the transcript with one style.
     fn push(&mut self, text: &str, style: Style) {
+        self.mark_append_dirty();
         for line in text.split('\n') {
             self.rows.push(TranscriptRow::new(line, style));
         }
@@ -164,6 +213,7 @@ impl Transcript {
 
     fn push_assistant_text(&mut self, text: &str) {
         let width = self.markdown_content_width();
+        self.mark_append_dirty();
         pane::push_assistant_rows(&mut self.rows, width, text);
     }
 
@@ -195,6 +245,7 @@ impl Transcript {
         // arrives. Adding the rail rows while the stream stays pending keeps the
         // reasoning above the answer, which is committed afterwards.
         self.push_blank();
+        self.mark_append_dirty();
         let elapsed = self
             .provider_turn_started
             .map(|started| format_elapsed_compact(started.elapsed()));
@@ -267,6 +318,7 @@ impl Transcript {
         let Some(index) = self.thinking_header_row else {
             return;
         };
+        self.mark_dirty_from(index);
         if let Some(ChromeRow::RailHeader { right, .. }) =
             self.rows.get_mut(index).and_then(|row| row.chrome.as_mut())
         {
@@ -283,24 +335,18 @@ impl Transcript {
     /// glyph + message, never color alone.
     fn push_notice_row(&mut self, glyph: &str, glyph_style: Style, message: &str, hint: &str) {
         self.begin_block();
+        self.mark_append_dirty();
         let left = format!("{glyph} {message}");
-        let mut spans = vec![
-            Span::styled(format!("{glyph} "), glyph_style),
-            Span::styled(message.to_string(), dim_style()),
-        ];
-        let width = self.markdown_content_width();
-        if !hint.is_empty() {
-            let gap = width
-                .saturating_sub(display_width(&left))
-                .saturating_sub(display_width(hint));
-            if gap >= 2 {
-                spans.push(Span::raw(" ".repeat(gap)));
-                spans.push(Span::styled(hint.to_string(), dim_style()));
-            }
-        }
-        let mut row = TranscriptRow::new(left, dim_style());
-        row.line = Some(Line::from(spans));
-        self.rows.push(row);
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Notice {
+                glyph: glyph.to_string(),
+                glyph_style,
+                message: message.to_string(),
+                hint: hint.to_string(),
+            },
+            left,
+            dim_style(),
+        ));
         self.push_blank();
     }
 
@@ -315,6 +361,7 @@ impl Transcript {
         }
         self.finish_stream();
         self.push_blank();
+        self.mark_append_dirty();
         self.rows.push(TranscriptRow {
             text: turn_divider_label(elapsed, usage),
             style: dim_style(),
@@ -350,6 +397,7 @@ impl Transcript {
     }
 
     fn push_approval_panel(&mut self, line: Line<'static>, failed: bool) {
+        self.mark_append_dirty();
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
         self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
             expanded: true,
@@ -513,15 +561,21 @@ impl Transcript {
     /// Mark the most recent panel header as collapsed (preview) so foldable
     /// output starts capped; toggling reveals the hidden lines.
     fn mark_panel_preview(&mut self) {
-        for row in self.rows.iter_mut().rev() {
-            if let Some(ChromeRow::Header { expanded, .. }) = row.chrome.as_mut() {
-                *expanded = false;
-                return;
-            }
+        let Some(index) = self
+            .rows
+            .iter()
+            .rposition(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Header { .. })))
+        else {
+            return;
+        };
+        self.mark_dirty_from(index);
+        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[index].chrome.as_mut() {
+            *expanded = false;
         }
     }
 
     fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
+        self.mark_append_dirty();
         // A pending preview has no elapsed time by definition (`◇ PREVIEW`
         // omits the duration; asserting one would fabricate a measurement).
         let elapsed = if spec.state == PanelState::Preview {
@@ -696,8 +750,10 @@ impl Transcript {
             let hint = right_align_pair(&left, "ctrl+o to expand", self.wrap_width());
             self.rows.push(
                 TranscriptRow::chrome_with_text(
-                    ChromeRow::Body {
-                        line: Line::from(Span::styled(hint.clone(), dim_style())),
+                    ChromeRow::BodyRight {
+                        left: Line::from(Span::styled(left.clone(), dim_style())),
+                        right: "ctrl+o to expand".to_string(),
+                        right_style: dim_style(),
                         bg: None,
                     },
                     hint,
@@ -786,6 +842,7 @@ impl Transcript {
         if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
+        self.mark_dirty_from(active.body_start);
         self.rows.splice(active.body_start..end, replacement);
         if keep_open {
             self.active_edit = Some(active);
@@ -850,6 +907,7 @@ impl Transcript {
         if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
+        self.mark_dirty_from(active.body_start);
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -866,6 +924,7 @@ impl Transcript {
         if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
+        self.mark_dirty_from(active.body_start);
         self.rows.splice(active.body_start..end, replacement);
     }
 
@@ -1156,6 +1215,7 @@ impl Transcript {
             Some(ChromeRow::Header { meta, expanded, .. }) => (meta.clone(), *expanded),
             _ => (self.explore_meta(call), true),
         };
+        self.mark_dirty_from(header);
         self.rows[header] = TranscriptRow::chrome(ChromeRow::Header {
             expanded,
             title: "EXPLORE",
@@ -1192,11 +1252,13 @@ impl Transcript {
             self.rows.last().and_then(|row| row.chrome.as_ref()),
             Some(ChromeRow::Bottom)
         ) {
+            self.mark_dirty_from(self.rows.len().saturating_sub(1));
             self.rows.pop();
         }
     }
 
     fn push_explore_body(&mut self, call: &ToolCall, content: &str, duration: Option<Duration>) {
+        self.mark_append_dirty();
         let meta = self.explore_meta(call);
         let row = self.explore_row(
             call,
@@ -1240,6 +1302,7 @@ impl Transcript {
     }
 
     fn push_explored_start(&mut self, call: &ToolCall) {
+        self.mark_append_dirty();
         self.finish_stream();
         let started = Instant::now();
         let meta = self.explore_meta(call);
@@ -1274,13 +1337,14 @@ impl Transcript {
     }
 
     fn replace_explore_body_at(&mut self, row: usize, replacement: TranscriptRow) -> bool {
-        let Some(slot) = self.rows.get_mut(row) else {
+        let Some(slot) = self.rows.get(row) else {
             return false;
         };
         if !matches!(slot.chrome.as_ref(), Some(ChromeRow::Body { .. })) {
             return false;
         }
-        *slot = replacement;
+        self.mark_dirty_from(row);
+        self.rows[row] = replacement;
         true
     }
 
@@ -1330,6 +1394,7 @@ impl Transcript {
 
     /// Apply one semantic event to the transcript rows.
     pub(super) fn apply(&mut self, event: UiEvent) {
+        let old_len = self.rows.len();
         match event {
             UiEvent::ProviderTurnStarted { .. } => {
                 self.provider_turn_started = Some(Instant::now());
@@ -1553,6 +1618,9 @@ impl Transcript {
                 self.finish_stream();
             }
         }
+        if self.rows.len() > old_len {
+            self.mark_dirty_from(old_len);
+        }
         self.trim_history();
     }
 
@@ -1567,7 +1635,11 @@ impl Transcript {
             return;
         }
         let remove = self.panel_safe_trim_index(self.rows.len() - MAX_TRANSCRIPT_ROWS);
+        self.mark_dirty_from(0);
         self.rows.drain(..remove);
+        self.thinking_header_row = self
+            .thinking_header_row
+            .and_then(|index| index.checked_sub(remove));
         self.exploring_open = self.trailing_explore_panel_open();
     }
 
@@ -1586,6 +1658,8 @@ impl Transcript {
                 ChromeRow::Header { .. }
                     | ChromeRow::Separator
                     | ChromeRow::Body { .. }
+                    | ChromeRow::BodyRight { .. }
+                    | ChromeRow::BodyRule { .. }
                     | ChromeRow::Bottom
             )
         )
@@ -1626,6 +1700,7 @@ impl Transcript {
         {
             return false;
         }
+        self.mark_dirty_from(header);
         match self.rows[header].chrome.as_mut() {
             Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. }) => {
                 *expanded = !*expanded;
@@ -1653,22 +1728,72 @@ impl Transcript {
     /// This is display-only; the raw prompt still goes to Nexus unchanged
     /// through the loop.
     pub(super) fn commit_user(&mut self, text: &str) {
+        self.mark_append_dirty();
         self.push_blank();
         pane::push_user_rows(&mut self.rows, text);
         self.trim_history();
     }
 
-    pub(super) fn render(&mut self, width: u16) -> Vec<Line<'static>> {
+    fn ensure_wrapped_cache(&mut self, width: usize) {
+        if self.wrapped_cache.width != width {
+            self.wrapped_cache.invalidate_all(width);
+        }
+
+        let dirty_from = self
+            .wrapped_cache
+            .dirty_from
+            .min(self.rows.len())
+            .min(self.wrapped_cache.rows.len());
+        if dirty_from < self.wrapped_cache.rows.len() {
+            let line_start = self.wrapped_cache.rows[dirty_from].start;
+            self.wrapped_cache.rows.truncate(dirty_from);
+            self.wrapped_cache.lines.truncate(line_start);
+        }
+
+        for row in &self.rows[self.wrapped_cache.rows.len()..] {
+            let start = self.wrapped_cache.lines.len();
+            row.render_rows(width, &mut self.wrapped_cache.lines);
+            let end = self.wrapped_cache.lines.len();
+            self.wrapped_cache.rows.push(start..end);
+        }
+
+        self.wrapped_cache.dirty_from = self.rows.len();
+    }
+
+    pub(super) fn render(&mut self, width: u16) -> TranscriptRender {
+        self.render_cached(width, false)
+    }
+
+    pub(super) fn render_incremental(&mut self, width: u16) -> TranscriptRender {
+        self.render_cached(width, true)
+    }
+
+    fn render_cached(&mut self, width: u16, suffix_only: bool) -> TranscriptRender {
         let width = usize::from(width);
         self.last_width = width
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
             .max(1);
-        // Select the visible fold-tagged rows, then composite them through the
-        // `Component` contract. Borrowing `&dyn Component` avoids boxing the
-        // rows every frame while still routing every row through the shared path.
-        let mut visible: Vec<&dyn Component> = Vec::with_capacity(self.rows.len());
+        let width_changed = self.wrapped_cache.width != width;
+        if width_changed {
+            self.wrapped_cache.invalidate_all(width);
+        }
+        let dirty_from = if width_changed {
+            0
+        } else {
+            self.wrapped_cache.dirty_from.min(self.rows.len())
+        };
+        self.ensure_wrapped_cache(width);
+
+        // Select the visible fold-tagged rows, then append the cached physical
+        // lines for each visible logical row. The fold pass remains a cheap
+        // no-allocation scan over retained rows, while width-aware wrapping and
+        // panel chrome composition only rerun for dirty rows. Production uses
+        // `suffix_only` so the stable prefix is counted, not cloned into the
+        // frame; tests use full output for direct render assertions.
+        let mut out = Vec::with_capacity(self.wrapped_cache.lines.len());
+        let mut stable_prefix = 0usize;
         let mut expanded = true;
-        for row in &self.rows {
+        for (index, row) in self.rows.iter().enumerate() {
             match row.chrome.as_ref() {
                 // A panel opens fully shown until its header sets the state;
                 // resetting at Top guards against a missing Bottom leaking a
@@ -1686,7 +1811,13 @@ impl Transcript {
                 FoldVis::WhenExpanded => !expanded,
             };
             if !skip {
-                visible.push(row);
+                let range = self.wrapped_cache.rows[index].clone();
+                let line_count = range.end.saturating_sub(range.start);
+                if suffix_only && index < dirty_from {
+                    stable_prefix += line_count;
+                } else {
+                    out.extend(self.wrapped_cache.lines[range].iter().cloned());
+                }
             }
             if matches!(
                 row.chrome.as_ref(),
@@ -1695,15 +1826,26 @@ impl Transcript {
                 expanded = true;
             }
         }
+        if !suffix_only {
+            stable_prefix = stable_prefix.min(out.len());
+        }
         // The in-flight stream renders as transient rows appended after history;
-        // hold them locally so they can join the same borrowed composite.
+        // keep it out of the committed cache so spinner/streaming frames never
+        // mutate retained row ranges.
         let streaming_rows = self
             .streaming
             .as_ref()
             .map(|text| pane::streaming_assistant_rows(text, width))
             .unwrap_or_default();
-        visible.extend(streaming_rows.iter().map(|row| row as &dyn Component));
-        component::composite(visible, width)
+        for row in &streaming_rows {
+            row.render_rows(width, &mut out);
+        }
+        let total_lines = stable_prefix + out.len();
+        TranscriptRender {
+            lines: out,
+            stable_prefix,
+            total_lines,
+        }
     }
 }
 

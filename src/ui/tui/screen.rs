@@ -21,7 +21,7 @@ use crate::ui::terminal_surface::CURSOR_MARKER;
 use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
 use super::text::{ansi_spans, strip_ansi_for_text};
-use super::transcript::Transcript;
+use super::transcript::{Transcript, TranscriptRender};
 use super::wrap::{
     display_width, line_text, pad_line_left, push_wrapped_line, spans_width, truncate_line,
     truncate_to_width, wrap_to_width,
@@ -458,8 +458,12 @@ impl Screen {
     /// Render all transcript rows plus any in-flight stream, wrapped to `width`.
     /// Finalized history is intentionally retained here; the terminal surface
     /// owns append/diff/full-replay decisions instead of draining UI state.
-    pub(super) fn wrapped_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    pub(super) fn wrapped_lines(&mut self, width: u16) -> TranscriptRender {
         self.transcript.render(width)
+    }
+
+    pub(super) fn wrapped_lines_incremental(&mut self, width: u16) -> TranscriptRender {
+        self.transcript.render_incremental(width)
     }
 
     // --- editor ---
@@ -664,21 +668,45 @@ impl Component for LinesSection {
 /// transcript rows retained in Iris state, plus bottom-pinned
 /// menu/status/editor chrome. The terminal surface decides how much of this
 /// document can be patched and when it must be fully replayed.
-#[cfg(test)]
-pub(super) fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
-    render_document_with_chrome_tail(screen, size).0
+pub(super) struct RenderedDocument {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) chrome_tail: usize,
+    pub(super) stable_prefix: usize,
 }
 
+#[cfg(test)]
+pub(super) fn render_document(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
+    render_document_inner(screen, size, false).lines
+}
+
+#[cfg(test)]
 pub(super) fn render_document_with_chrome_tail(
     screen: &mut Screen,
     size: Size,
 ) -> (Vec<Line<'static>>, usize) {
+    let rendered = render_document_inner(screen, size, false);
+    (rendered.lines, rendered.chrome_tail)
+}
+
+pub(super) fn render_document_with_hints(screen: &mut Screen, size: Size) -> RenderedDocument {
+    render_document_inner(screen, size, true)
+}
+
+fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> RenderedDocument {
     if size.height == 0 || size.width < 1 {
-        return (Vec::new(), 0);
+        return RenderedDocument {
+            lines: Vec::new(),
+            chrome_tail: 0,
+            stable_prefix: 0,
+        };
     }
     let width = size.width.max(1);
     let height = size.height.max(1);
-    let mut transcript = screen.wrapped_lines(width);
+    let mut transcript = if incremental {
+        screen.wrapped_lines_incremental(width)
+    } else {
+        screen.wrapped_lines(width)
+    };
     let working = screen.working_lines(width);
     let working_block = if working.is_empty() {
         Vec::new()
@@ -695,13 +723,16 @@ pub(super) fn render_document_with_chrome_tail(
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
     let min_transcript_rows =
         usize::from(target_rows).saturating_sub(chrome.len() + working_block.len());
-    if transcript.len() < min_transcript_rows {
+    if transcript.total_lines < min_transcript_rows {
+        transcript = screen.wrapped_lines(width);
         let mut padded = Vec::with_capacity(min_transcript_rows + chrome.len());
         padded.extend(
-            std::iter::repeat_with(Line::default).take(min_transcript_rows - transcript.len()),
+            std::iter::repeat_with(Line::default)
+                .take(min_transcript_rows - transcript.lines.len()),
         );
-        padded.extend(transcript);
-        transcript = padded;
+        padded.extend(transcript.lines);
+        transcript.lines = padded;
+        transcript.stable_prefix = 0;
     }
     // The transcript is the scrolling base, moved into the document and never
     // cloned. The bottom-pinned tail -- working indicator then composer chrome
@@ -712,7 +743,8 @@ pub(super) fn render_document_with_chrome_tail(
     let mut tail = Container::new();
     tail.add_child(Box::new(LinesSection(working_block)));
     tail.add_child(Box::new(LinesSection(chrome)));
-    let mut document = transcript;
+    let stable_prefix = transcript.stable_prefix;
+    let mut document = transcript.lines;
     tail.render_into(usize::from(width), &mut document);
     // Locate-and-strip any focus cursor marker before the document reaches the
     // terminal surface. The cursor only ever lives in the composer chrome, so
@@ -723,7 +755,11 @@ pub(super) fn render_document_with_chrome_tail(
     // returned row by `tail_start`.
     let tail_start = document.len().saturating_sub(volatile_tail);
     let _ = take_cursor_position(&mut document[tail_start..]);
-    (document, volatile_tail)
+    RenderedDocument {
+        lines: document,
+        chrome_tail: volatile_tail,
+        stable_prefix,
+    }
 }
 
 /// Number of dots in the top-frame context meter; each dot is ~10% usage.
@@ -1147,7 +1183,8 @@ fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'s
     let mut out = Vec::new();
     for y in 0..buf.area.height {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        for x in 0..buf.area.width {
+        let mut x = 0;
+        while x < buf.area.width {
             // Inject the zero-width cursor marker as its own span immediately
             // before the cursor cell so the terminal surface can recover the
             // cursor column (it strips the marker before any terminal write).
@@ -1156,14 +1193,17 @@ fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'s
             }
             let cell = &buf[(x, y)];
             let style = cell.style();
+            let symbol = cell.symbol();
             if let Some(last) = spans.last_mut()
                 && last.style == style
                 && last.content.as_ref() != CURSOR_MARKER
             {
-                last.content.to_mut().push_str(cell.symbol());
+                last.content.to_mut().push_str(symbol);
+                x = x.saturating_add(display_width(symbol).max(1) as u16);
                 continue;
             }
-            spans.push(Span::styled(cell.symbol().to_string(), style));
+            spans.push(Span::styled(symbol.to_string(), style));
+            x = x.saturating_add(display_width(symbol).max(1) as u16);
         }
         out.push(Line::from(spans));
     }
@@ -1274,6 +1314,32 @@ mod tests {
             !has_marker(&running),
             "a running turn must not emit the composer cursor marker"
         );
+    }
+
+    #[test]
+    fn composer_wide_glyphs_never_render_over_terminal_width() {
+        use super::{Screen, render_document_with_chrome_tail};
+        use crate::ui::terminal_surface::CURSOR_MARKER;
+        use ratatui::layout::Size;
+
+        for width in [12_u16, 44, 90, 120] {
+            let mut screen = Screen::new();
+            screen.set_editor("中🙂 wide glyphs");
+            let (lines, _) = render_document_with_chrome_tail(&mut screen, Size::new(width, 14));
+
+            for (index, line) in lines.iter().enumerate() {
+                let visible = line
+                    .spans
+                    .iter()
+                    .filter(|span| span.content.as_ref() != CURSOR_MARKER)
+                    .map(|span| display_width(span.content.as_ref()))
+                    .sum::<usize>();
+                assert!(
+                    visible <= usize::from(width),
+                    "width {width}, line {index} exceeded terminal width: {visible} > {width}: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]

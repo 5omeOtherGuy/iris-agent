@@ -1,11 +1,8 @@
 //! Shared provider transport: the `spawn_blocking` + channel streaming glue, a
 //! one-shot reauth control flow, HTTP retry classification, and an SSE event
-//! splitter. Used by the streaming providers (Anthropic, Antigravity) so each
-//! adapter only owns its wire format (request build, message mapping, SSE event
-//! parsing) and not the executor/cancellation plumbing.
-//!
-//! The OpenAI Codex adapter predates this module and keeps its own copy of the
-//! same patterns; the newer providers share this version.
+//! splitter. Used by the streaming providers so each adapter only owns its wire
+//! format (request build, message mapping, SSE event parsing) and not the
+//! executor/cancellation plumbing.
 //!
 //! Two control flows are offered: `run_with_reauth` (one-shot reauth only, used
 //! by Antigravity) and `run_with_retry` (bounded exponential backoff for
@@ -14,7 +11,7 @@
 //! [`RetryPolicy`](crate::mimir::retry::RetryPolicy) and is not reset by the
 //! reauth.
 
-use std::io::BufRead;
+use std::io::{BufRead, Error as IoError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -310,6 +307,21 @@ fn auth_error(provider: &str, cause: &anyhow::Error) -> crate::errors::AuthError
     crate::errors::AuthError::for_provider(provider, message)
 }
 
+/// Status-200 SSE body read failure. Carries only the local IO error string,
+/// never response bytes.
+#[derive(Debug)]
+pub(super) struct StreamReadError {
+    source: IoError,
+}
+
+impl std::fmt::Display for StreamReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to read provider stream: {}", self.source)
+    }
+}
+
+impl std::error::Error for StreamReadError {}
+
 /// Iterate SSE events from a blocking reader. Events are separated by a blank
 /// line; for each event the joined `data:` payload is passed to `on_event`
 /// (terminal `[DONE]` and empty payloads are skipped by the caller). `cancel`
@@ -326,7 +338,7 @@ pub(super) fn for_each_sse_event(
         if cancel.is_cancelled() {
             bail!("provider stream cancelled");
         }
-        let line = line.map_err(|error| anyhow!("failed to read provider stream: {error}"))?;
+        let line = line.map_err(|source| anyhow::Error::new(StreamReadError { source }))?;
         if line.trim_end_matches('\r').is_empty() {
             let data = event_data(&event);
             if !data.is_empty() {
