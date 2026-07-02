@@ -17,6 +17,7 @@ mod errors;
 mod handles;
 mod mimir;
 mod nexus;
+mod print;
 mod process_group;
 mod selfupdate;
 mod session;
@@ -54,7 +55,15 @@ fn main() -> ExitCode {
 }
 
 fn dispatch() -> Result<()> {
-    match env::args().skip(1).collect::<Vec<_>>().as_slice() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    // Headless `--print` mode is detected before the command table so `-p`/
+    // `--print` (with an optional `--approve` in any position) dispatches to the
+    // one-shot runner; a malformed print invocation falls through to the usage
+    // error below.
+    if let Some(invocation) = print::parse_print_args(&args) {
+        return run_print(&invocation.prompt, invocation.approve);
+    }
+    match args.as_slice() {
         [] => run_agent(false),
         [flag] if flag == "--plain" => run_agent(true),
         [command, session_id] if command == "resume" => resume_agent(session_id, false),
@@ -192,6 +201,57 @@ fn run_agent(force_plain: bool) -> Result<()> {
         settings.enabled_models.clone(),
     ));
     cli::run_interactive(&mut harness, &mut switch, force_plain)
+}
+
+/// Run one headless turn-sequence for `iris -p`/`--print`: assemble the prompt
+/// (merging any piped stdin), run the model loop with tool roundtrips, print the
+/// final assistant answer to stdout, and return an error (nonzero exit) on
+/// failure. Non-interactive throughout: it never prompts for project trust
+/// (defaults untrusted per issue #202) and its approval gate denies gated tools
+/// by default, or auto-approves with `--approve`, so a piped/CI run cannot hang.
+/// The session is persisted like a normal run.
+fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let settings = config::Settings::load(&cwd)?;
+    wayland::system_prompt::ensure_default_fragments();
+    let tools = tools::built_in_tools();
+    // Headless and non-interactive: never prompt for trust, default untrusted.
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools, false);
+    let selection = mimir::selection::ModelSelection::resolve(&settings)?;
+    mimir::model_capabilities::validate(&selection)?;
+    let session_id = session::new_session_id();
+    let provider = build_provider(&selection, &system_prompt, &session_id)?;
+    let agent =
+        Agent::new(provider, tools).with_max_tool_roundtrips(settings.max_tool_roundtrips());
+    // Persist the print run's transcript like a normal run; best-effort.
+    let session = match session::SessionLog::create_with_id(&cwd, &session_id) {
+        Ok(log) => {
+            tracing::info!(id = %log.id(), path = %log.path().display(), "session transcript");
+            Some(log)
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "session persistence disabled");
+            None
+        }
+    };
+    let budget = Some(settings.context_token_budget());
+    let mut harness =
+        wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+
+    // Merge piped stdin (when not a TTY) into the prompt before the turn.
+    let piped = print::read_piped_stdin()?;
+    let prompt = print::merge_prompt(prompt_arg, piped.as_deref());
+
+    let observer = print::PrintObserver::default();
+    let gate = print::PrintApprovalGate::new(approve);
+    cli::run_print_turn(&mut harness, &prompt, &observer, &gate)?;
+
+    // Only the final assistant answer reaches stdout; everything else is
+    // suppressed by the observer.
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "{}", observer.final_text())?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// Resolve whether this workspace's repo-provided Iris resources (system-prompt
@@ -648,6 +708,11 @@ fn print_help() {
     eprintln!("Usage:");
     eprintln!("  iris                              Start interactive agent");
     eprintln!("  iris --plain                      Start in the plain, ANSI-free text UI");
+    eprintln!(
+        "  iris -p \"prompt\"                  Print mode: run one turn, print the answer, exit"
+    );
+    eprintln!("  iris --print \"prompt\" --approve   Print mode, auto-approving gated tools");
+    eprintln!("    (piped stdin is merged into the prompt, e.g. `cat log | iris -p \"explain\"`)");
     eprintln!("  iris resume <session-id>          Resume a prior session by id");
     eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
     eprintln!("  iris login openai-codex --browser Login with browser OAuth");
