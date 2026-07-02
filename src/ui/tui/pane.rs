@@ -36,9 +36,7 @@ fn content_width(frame_width: usize) -> usize {
 pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, text: &str) {
     let theme = MarkdownTheme::default();
     let lines = render_markdown_themed(text, &theme, markdown_width(width));
-    for (index, line) in lines.into_iter().enumerate() {
-        rows.push(assistant_row(line, index == 0));
-    }
+    push_assistant_markdown_lines(rows, lines);
 }
 
 /// Build the transient transcript rows for the in-flight streamed assistant
@@ -49,11 +47,10 @@ pub(super) fn streaming_assistant_rows(text: &str, width: usize) -> Vec<Transcri
     let theme = MarkdownTheme::default();
     // `width` is the full frame here; reduce to the assistant content column
     // so table layout matches the width these rows are rendered into.
-    render_markdown_themed(&text, &theme, markdown_width(content_width(width)))
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| assistant_row(line, index == 0))
-        .collect()
+    let mut rows = Vec::new();
+    let lines = render_markdown_themed(&text, &theme, markdown_width(content_width(width)));
+    push_assistant_markdown_lines(&mut rows, lines);
+    rows
 }
 
 pub(super) fn push_user_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
@@ -80,9 +77,19 @@ fn user_row(text: &str) -> TranscriptRow {
     }
 }
 
-fn assistant_row(mut line: Line<'static>, first: bool) -> TranscriptRow {
+fn push_assistant_markdown_lines(rows: &mut Vec<TranscriptRow>, lines: Vec<Line<'static>>) {
+    let mut at_block_start = true;
+    for line in lines {
+        let is_blank = line_text(&line).trim().is_empty();
+        let show_marker = at_block_start && !is_blank;
+        rows.push(assistant_row(line, show_marker));
+        at_block_start = is_blank;
+    }
+}
+
+fn assistant_row(mut line: Line<'static>, show_marker: bool) -> TranscriptRow {
     let text = line_text(&line);
-    if first {
+    if show_marker {
         // The assistant marker is recessive transcript chrome, not a state dot:
         // muted, never the active/live accent (docs/TUI_DESIGN_LANGUAGE.md §4).
         line.spans.insert(
