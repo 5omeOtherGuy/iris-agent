@@ -10,13 +10,14 @@
 //! real need shows up.
 
 use std::io::BufReader;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio_util::sync::CancellationToken;
 
 use super::transport::{
@@ -60,6 +61,7 @@ const PROVIDER_ID: &str = "anthropic";
 const API_ID: &str = "anthropic-messages";
 /// Endpoint path surfaced in failure diagnostics (never the full base URL).
 const ENDPOINT_PATH: &str = "/v1/messages";
+static SERVER_SIDE_FALLBACK_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 /// First system block required on the OAuth lane: omitting it gets the request
 /// rejected as not coming from the Claude Code client.
@@ -198,7 +200,7 @@ impl ChatProvider for AnthropicProvider {
             AnthropicAuthSource::OAuth(_) => AnthropicAuthKind::OAuth,
             AnthropicAuthSource::ApiKey(_) => AnthropicAuthKind::ApiKey,
         };
-        let request = build_anthropic_request_for_auth(
+        let mut request = build_anthropic_request_for_auth(
             &self.model,
             &self.system_prompt,
             messages,
@@ -235,7 +237,23 @@ impl ChatProvider for AnthropicProvider {
                         }
                         AnthropicAuthSource::ApiKey(key) => Ok(AnthropicAuth::ApiKey(key.clone())),
                     },
-                    |auth| provider.send_once(auth, &request, sink, cancel),
+                    |auth| {
+                        let attempt = provider.send_once(auth, &request, sink, cancel);
+                        if let Attempt::Fatal(ref error) = attempt
+                            && error
+                                .downcast_ref::<ServerSideFallbackRejection>()
+                                .is_some()
+                            && remove_fallbacks(&mut request)
+                        {
+                            SERVER_SIDE_FALLBACK_UNSUPPORTED.store(true, Ordering::Relaxed);
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "server-side fallback rejected; retrying once without fallbacks and disabling fallback payloads for this process"
+                            );
+                            return provider.send_once(auth, &request, sink, cancel);
+                        }
+                        attempt
+                    },
                 )
             },
             cancel,
@@ -275,7 +293,10 @@ impl AnthropicProvider {
         // Request id comes off the response headers, before the body is read.
         let request_id = extract_request_id(response.headers());
         if status.is_success() {
-            let mut parser = AnthropicStreamParser::new(anthropic_origin(&self.model));
+            let mut parser = AnthropicStreamParser::new(
+                anthropic_origin(&self.model),
+                request_has_fallbacks(request),
+            );
             // Build a safe diagnostic tail from local state only -- never the
             // streamed body. `last_event_type` is whatever the parser last saw.
             let diag = |last_event_type: Option<String>| AnthropicDiagnostics {
@@ -344,7 +365,15 @@ impl AnthropicProvider {
             auth_kind,
             last_event_type: None,
         };
-        let error = anyhow!("Anthropic request failed [{diag}]");
+        let fallback_rejected = request_has_fallbacks(request)
+            && is_server_side_fallback_rejection(status.as_u16(), &body);
+        let error = if fallback_rejected {
+            anyhow::Error::new(ServerSideFallbackRejection {
+                diagnostics: diag.to_string(),
+            })
+        } else {
+            anyhow!("Anthropic request failed [{diag}]")
+        };
         match classify_http_status_retryable(status.as_u16()) {
             HttpClass::Reauth if auth.kind() == AnthropicAuthKind::OAuth => Attempt::Reauth(error),
             HttpClass::Reauth => Attempt::Fatal(
@@ -390,6 +419,23 @@ impl AnthropicProvider {
 /// argument, file path, command string, raw request/response body, or SSE
 /// frame. Adopted conceptually from minimalcc-pi's metadata-only stream
 /// diagnostics, trimmed to the fields Iris can produce cheaply.
+#[derive(Debug)]
+struct ServerSideFallbackRejection {
+    diagnostics: String,
+}
+
+impl std::fmt::Display for ServerSideFallbackRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Anthropic request rejected server-side fallback payload [{}]",
+            self.diagnostics
+        )
+    }
+}
+
+impl std::error::Error for ServerSideFallbackRejection {}
+
 struct AnthropicDiagnostics {
     status: u16,
     request_id: Option<String>,
@@ -668,6 +714,34 @@ fn anthropic_beta_for_auth(request: &Value, auth_kind: AnthropicAuthKind) -> Opt
     (!betas.is_empty()).then(|| betas.join(","))
 }
 
+fn request_has_fallbacks(request: &Value) -> bool {
+    request
+        .get("fallbacks")
+        .and_then(Value::as_array)
+        .is_some_and(|fallbacks| !fallbacks.is_empty())
+}
+
+fn remove_fallbacks(request: &mut Value) -> bool {
+    request
+        .as_object_mut()
+        .and_then(|object| object.remove("fallbacks"))
+        .is_some()
+}
+
+fn is_server_side_fallback_rejection(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.to_ascii_lowercase().contains("fallback"))
+}
+
 fn request_contains_context_management(request: &Value) -> bool {
     request
         .get("context_management")
@@ -781,7 +855,13 @@ fn build_anthropic_request_for_auth(
     // Fable 5 refusal fallback: ask the API to retry a safety-classifier decline
     // on the fallback model server-side (one round trip). The matching
     // `server-side-fallback` beta is added from this payload in `anthropic_beta`.
-    if let Some(fallback) = meta.and_then(|m| m.refusal_fallback) {
+    if let Some(fallback) = meta.and_then(|m| m.refusal_fallback)
+        && !SERVER_SIDE_FALLBACK_UNSUPPORTED.load(Ordering::Relaxed)
+    {
+        // Use Anthropic's server-side safety fallback. Do not implement a
+        // client-side Opus retry: the server-side path is the one Anthropic
+        // fallback-credit reprices/refunds when Fable's safety classifier
+        // declines and Opus 4.8 serves the turn.
         body["fallbacks"] = json!([{ "model": fallback }]);
     }
 
@@ -1034,6 +1114,7 @@ struct AnthropicStreamParser {
     tool_calls: Vec<ToolCall>,
     open_reasoning: HashMap<u64, ReasoningBlock>,
     reasoning: Vec<ReasoningBlock>,
+    fallback_block_indexes: HashSet<u64>,
     response_id: Option<String>,
     usage: ProviderUsage,
     raw_input_tokens: u64,
@@ -1044,6 +1125,12 @@ struct AnthropicStreamParser {
     /// buffered), so this gates whether a malformed stream can be retried
     /// without duplicating user-visible output.
     emitted_visible_text: bool,
+    /// Fable can switch to Opus mid-stream through a server-side fallback marker.
+    /// Until the marker arrives (or the turn ends without one), pre-boundary text
+    /// is buffered rather than streamed so a safety-refusal preface can be
+    /// discarded cleanly.
+    server_side_fallback_possible: bool,
+    fallback_boundary_seen: bool,
     /// Provider-neutral completion reason from `message_delta.delta.stop_reason`.
     completion_reason: Option<CompletionReason>,
     /// Type of the most recent SSE event seen, for safe failure diagnostics.
@@ -1058,7 +1145,7 @@ struct ToolBlock {
 }
 
 impl AnthropicStreamParser {
-    fn new(origin: ModelOrigin) -> Self {
+    fn new(origin: ModelOrigin, server_side_fallback_possible: bool) -> Self {
         let model = origin.model.clone();
         Self {
             origin,
@@ -1067,6 +1154,7 @@ impl AnthropicStreamParser {
             tool_calls: Vec::new(),
             open_reasoning: HashMap::new(),
             reasoning: Vec::new(),
+            fallback_block_indexes: HashSet::new(),
             response_id: None,
             usage: ProviderUsage {
                 provider: PROVIDER_ID.to_string(),
@@ -1083,6 +1171,8 @@ impl AnthropicStreamParser {
             usage_seen: false,
             message_stopped: false,
             emitted_visible_text: false,
+            server_side_fallback_possible,
+            fallback_boundary_seen: false,
             completion_reason: None,
             last_event_type: None,
         }
@@ -1109,6 +1199,15 @@ impl AnthropicStreamParser {
                     .and_then(|message| message.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                if let Some(model) = value
+                    .get("message")
+                    .and_then(|message| message.get("model"))
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.is_empty())
+                {
+                    self.origin.model = model.to_string();
+                    self.usage.model = model.to_string();
+                }
                 if let Some(usage) = value
                     .get("message")
                     .and_then(|message| message.get("usage"))
@@ -1155,6 +1254,24 @@ impl AnthropicStreamParser {
                                 },
                             );
                         }
+                        Some("fallback") => {
+                            self.fallback_block_indexes.insert(index);
+                            self.fallback_boundary_seen = true;
+                            if let Some(to_model) = block
+                                .get("to")
+                                .and_then(|to| to.get("model"))
+                                .and_then(Value::as_str)
+                                .filter(|model| !model.is_empty())
+                            {
+                                self.origin.model = to_model.to_string();
+                                self.usage.model = to_model.to_string();
+                            }
+                            self.text.clear();
+                            self.tool_calls.clear();
+                            self.open_tools.clear();
+                            self.reasoning.clear();
+                            self.open_reasoning.clear();
+                        }
                         _ => {}
                     }
                 }
@@ -1166,9 +1283,13 @@ impl AnthropicStreamParser {
                         Some("text_delta") => {
                             if let Some(text) = delta.get("text").and_then(Value::as_str) {
                                 self.text.push_str(text);
-                                sink.on_text_delta(text)?;
-                                if !text.is_empty() {
-                                    self.emitted_visible_text = true;
+                                if !self.server_side_fallback_possible
+                                    || self.fallback_boundary_seen
+                                {
+                                    sink.on_text_delta(text)?;
+                                    if !text.is_empty() {
+                                        self.emitted_visible_text = true;
+                                    }
                                 }
                             }
                         }
@@ -1205,6 +1326,9 @@ impl AnthropicStreamParser {
             }
             Some("content_block_stop") => {
                 let index = block_index(&value);
+                if self.fallback_block_indexes.remove(&index) {
+                    return Ok(());
+                }
                 if let Some(block) = self.open_tools.remove(&index) {
                     self.tool_calls.push(finalize_tool(block)?);
                 } else if let Some(block) = self.open_reasoning.remove(&index) {
@@ -1308,11 +1432,16 @@ impl AnthropicStreamParser {
         // Malformed status-200 streams (no terminal `message_stop`, or
         // `message_stop` with content blocks still open) are recoverable
         // protocol anomalies: return the typed error so the transport can retry.
-        if !self.message_stopped || !self.open_tools.is_empty() || !self.open_reasoning.is_empty() {
+        if !self.message_stopped
+            || !self.open_tools.is_empty()
+            || !self.open_reasoning.is_empty()
+            || !self.fallback_block_indexes.is_empty()
+        {
             let mut open_block_indexes: Vec<u64> = self
                 .open_tools
                 .keys()
                 .chain(self.open_reasoning.keys())
+                .chain(self.fallback_block_indexes.iter())
                 .copied()
                 .collect();
             open_block_indexes.sort_unstable();
@@ -1391,7 +1520,12 @@ fn parse_anthropic_sse_for_model(body: &str, model: &str) -> Result<AssistantTur
             Ok(())
         }
     }
-    let mut parser = AnthropicStreamParser::new(anthropic_origin(model));
+    let mut parser = AnthropicStreamParser::new(
+        anthropic_origin(model),
+        anthropic_models::find(model)
+            .and_then(|model| model.refusal_fallback)
+            .is_some(),
+    );
     let mut sink = NoopSink;
     for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
         parser.ingest_event(data, &mut sink)
@@ -1602,7 +1736,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     fn stream_error_event_surfaces_last_event_type_in_diagnostics() {
         // Drive a real error frame through the parser, then confirm the diagnostic
         // tail built from parser state names the error event and no payload.
-        let mut parser = AnthropicStreamParser::new(anthropic_origin("claude-opus-4-8"));
+        let mut parser = AnthropicStreamParser::new(anthropic_origin("claude-opus-4-8"), false);
         struct NoopSink;
         impl TurnSink for NoopSink {
             fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
@@ -2115,6 +2249,70 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn fallback_payload_helpers_detect_and_remove_fallbacks() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+        let mut request = build_anthropic_request(
+            "claude-fable-5",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
+            &ContextManagement::default(),
+        );
+        assert!(request_has_fallbacks(&request));
+        assert!(remove_fallbacks(&mut request));
+        assert!(!request_has_fallbacks(&request));
+    }
+
+    #[test]
+    fn fallback_rejection_detection_is_local_and_specific() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"fallbacks: Extra inputs are not permitted"}}"#;
+        assert!(is_server_side_fallback_rejection(400, body));
+        assert!(!is_server_side_fallback_rejection(
+            400,
+            r#"{"error":{"message":"other"}}"#
+        ));
+        assert!(!is_server_side_fallback_rejection(500, body));
+    }
+
+    #[test]
+    fn fallback_text_buffering_follows_actual_request_payload() {
+        struct RecordingSink {
+            deltas: Vec<String>,
+        }
+        impl TurnSink for RecordingSink {
+            fn on_text_delta(&mut self, delta: &str) -> Result<()> {
+                self.deltas.push(delta.to_string());
+                Ok(())
+            }
+        }
+        let mut parser = AnthropicStreamParser::new(anthropic_origin("claude-fable-5"), false);
+        let mut sink = RecordingSink { deltas: Vec::new() };
+        parser
+            .ingest_event(
+                r#"{"type":"message_start","message":{"id":"msg_1","model":"claude-fable-5"}}"#,
+                &mut sink,
+            )
+            .unwrap();
+        parser
+            .ingest_event(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                &mut sink,
+            )
+            .unwrap();
+        parser
+            .ingest_event(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"live"}}"#,
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.deltas, ["live"]);
+        assert!(parser.emitted_visible_text);
+    }
+
+    #[test]
     fn resolve_manual_thinking_enforces_the_invariant() {
         // Happy path: budget fits below the cap-bounded max_tokens.
         assert_eq!(
@@ -2207,6 +2405,57 @@ data: {\"type\":\"message_stop\"}
         );
         assert!(turn.reasoning[1].redacted);
         assert_eq!(turn.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn fallback_marker_drops_pre_boundary_text_reasoning_and_tool_calls() {
+        let body = "\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fallback\",\"model\":\"claude-fable-5\",\"usage\":{\"input_tokens\":1}}}\n\n
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"refusal preface\"}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"refused thought\"}}\n\n
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-fable\"}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_pre\",\"name\":\"read\",\"input\":{\"path\":\"secret.rs\"}}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":2}\n\n
+data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"claude-fable-5\"},\"to\":{\"model\":\"claude-opus-4-8\"}}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":3}\n\n
+data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n
+data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"fallback answer\"}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":4}\n\n
+data: {\"type\":\"message_stop\"}\n\n
+";
+        let turn = parse_anthropic_sse_for_model(body, "claude-fable-5")
+            .expect("fallback stream should parse");
+        assert_eq!(turn.text.as_deref(), Some("fallback answer"));
+        assert!(
+            turn.reasoning.is_empty(),
+            "pre-fallback reasoning must not replay"
+        );
+        assert!(
+            turn.tool_calls.is_empty(),
+            "pre-fallback tool calls must not execute"
+        );
+        assert_eq!(
+            turn.usage.map(|usage| usage.model),
+            Some("claude-opus-4-8".to_string())
+        );
+    }
+
+    #[test]
+    fn response_model_rekeys_reasoning_origin() {
+        let body = "\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-8\"}}\n\n
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"opus thought\"}}\n\n
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-opus\"}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n
+data: {\"type\":\"message_stop\"}\n\n
+";
+        let turn =
+            parse_anthropic_sse_for_model(body, "claude-fable-5").expect("stream should parse");
+        assert_eq!(turn.reasoning.len(), 1);
+        assert_eq!(turn.reasoning[0].origin.model, "claude-opus-4-8");
     }
 
     #[test]
@@ -2491,7 +2740,12 @@ data: {\"type\":\"message_stop\"}
                 Ok(())
             }
         }
-        let mut parser = AnthropicStreamParser::new(anthropic_origin(model));
+        let mut parser = AnthropicStreamParser::new(
+            anthropic_origin(model),
+            anthropic_models::find(model)
+                .and_then(|model| model.refusal_fallback)
+                .is_some(),
+        );
         let mut sink = NoopSink;
         for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
             parser.ingest_event(data, &mut sink)
