@@ -96,9 +96,11 @@ const MAX_STREAMING_MARKDOWN_BYTES: usize = 64 * 1024;
 /// The model still receives the full output; only the terminal preview is
 /// bounded, and the omitted logical-line count is reported.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
-const PANEL_BODY_SIDE_PADDING: usize = 1;
+const PANEL_BODY_LEFT_PADDING: usize = 4;
+const PANEL_BODY_RIGHT_PADDING: usize = 2;
 const PANEL_BODY_BORDER_WIDTH: usize = 2;
-const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_BORDER_WIDTH + PANEL_BODY_SIDE_PADDING * 2;
+const PANEL_BODY_CHROME_WIDTH: usize =
+    PANEL_BODY_BORDER_WIDTH + PANEL_BODY_LEFT_PADDING + PANEL_BODY_RIGHT_PADDING;
 
 // Color roles live in `crate::ui::palette` (the single source of truth). They
 // are imported here under their long-standing names so the whole `tui` module
@@ -334,7 +336,7 @@ impl Drop for TuiUi {
 
 #[cfg(test)]
 mod tests {
-    use super::panel::{panel_body_line, panel_header_line, panel_rule_line};
+    use super::panel::{inset_rule_line, panel_body_line, panel_header_line, panel_rule_line};
     use super::*;
     use crate::nexus::{ApprovalDecision, ToolCall};
     use crate::ui::UiEvent;
@@ -2155,6 +2157,14 @@ mod tests {
             rendered.contains("Grep   \"fn emit\" in src/context"),
             "{rendered}"
         );
+        assert!(
+            rendered.contains("│    Read   src/context/engine.rs"),
+            "EXPLORE body should use the framed-output inset: {rendered}"
+        );
+        assert!(
+            rendered.contains("│    Grep   \"fn emit\" in src/context"),
+            "EXPLORE body should use the framed-output inset: {rendered}"
+        );
         assert!(rendered.contains("3 matches · 2 files"), "{rendered}");
     }
 
@@ -2794,6 +2804,33 @@ mod tests {
     }
 
     #[test]
+    fn hidden_shell_output_moves_expand_hint_to_exit_row_when_finished() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        let content = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "seq" })),
+            content,
+            exit_code: Some(0),
+            duration: None,
+        });
+        let lines = screen.wrapped_lines(80);
+        let hidden = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("lines hidden")
+        }));
+        let exit = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+
+        assert!(!hidden.contains("ctrl+o"), "{hidden}");
+        assert!(exit.contains("ctrl+o to expand"), "{exit}");
+        assert!(display_width(&exit) <= 80, "{exit}");
+    }
+
+    #[test]
     fn tiny_panel_rows_are_width_safe_with_visible_border_glyphs() {
         for width in 1..=5 {
             let rows = vec![
@@ -3324,7 +3361,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("↑18.2k ↓846"))
             .expect("turn divider with telemetry");
-        assert!(divider.trim_start().starts_with("── "), "{divider}");
+        assert!(divider.trim_start().starts_with("────── "), "{divider}");
         assert!(divider.contains(" ┊ ↑18.2k ↓846 "), "{divider}");
         assert!(!divider.contains("Worked for"), "{divider}");
         assert!(!divider.contains("T+"), "{divider}");
@@ -3348,7 +3385,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.trim_start().starts_with("── ")),
+                .any(|line| line.trim_start().starts_with("────── ")),
             "runtime-error divider missing: {lines:?}"
         );
     }
@@ -3360,6 +3397,30 @@ mod tests {
         assert!(line.contains("── 16s ─"), "{line}");
         assert!(!line.contains('┊'), "{line}");
         assert_eq!(display_width(&line), 60);
+    }
+
+    #[test]
+    fn turn_divider_elapsed_aligns_with_working_indicator_elapsed() {
+        let divider = line_text(&inset_rule_line(
+            90,
+            &turn_divider_label(Some(Duration::from_secs(27)), None),
+        ));
+        let working = line_text(&working_indicator_line(
+            WORKING_FRAMES[1],
+            Duration::from_millis(700),
+            true,
+            None,
+            0,
+            90,
+        ));
+
+        let divider_at = divider
+            .find("27s")
+            .map(|idx| display_width(&divider[..idx]));
+        let working_at = working
+            .find("0.7s")
+            .map(|idx| display_width(&working[..idx]));
+        assert_eq!(divider_at, working_at);
     }
 
     #[test]
@@ -3547,6 +3608,8 @@ mod tests {
         });
 
         let rendered = rendered_text(&mut screen, 80, 12);
+        assert!(rendered.contains("│    $ cargo test"), "{rendered}");
+        assert!(rendered.contains("│    test result"), "{rendered}");
         assert!(rendered.contains("\u{25c6} EXIT 0"), "{rendered}");
     }
 
