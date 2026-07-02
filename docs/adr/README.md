@@ -26,6 +26,8 @@
 | [0023](0023-project-tool-declarations-per-provider-and-prefer-native-tools.md) | Project tool declarations per provider and prefer native tools | accepted | 2026-06-21 |
 | [0024](0024-introduce-tui-component-container-overlay-focus-abstraction.md) | Introduce a reusable TUI Component/Container/overlay/focus abstraction | accepted | 2026-06-26 |
 | [0025](0025-expose-stored-reasoning-as-a-display-event.md) | Expose stored reasoning as a display event | accepted | 2026-06-26 |
+| [0026](0026-make-system-prompt-fragments-fully-internal.md) | Make system-prompt fragments fully internal | proposed | 2026-07-02 |
+| [0027](0027-repurpose-trust-store-as-per-cwd-project-permission-policy.md) | Repurpose the trust store as a per-cwd project permission policy | proposed | 2026-07-02 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.

@@ -1,7 +1,7 @@
 # ADR-0015: Assign fragments to config-defined named slots instead of numeric slots
 
 **Date**: 2026-06-18
-**Status**: proposed
+**Status**: proposed (applies to internal fragments only after ADR-0026)
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context
