@@ -488,10 +488,9 @@ fn repl_reports_provider_errors_and_continues() -> Result<()> {
 
     assert!(String::from_utf8(errors)?.contains("provider error: boom"));
     assert!(String::from_utf8(output)?.contains("assistant> recovered"));
-    assert_eq!(harness.agent.messages.len(), 3);
-    assert_eq!(harness.agent.messages[0].content, "fail");
-    assert_eq!(harness.agent.messages[1].content, "again");
-    assert_eq!(harness.agent.messages[2].content, "recovered");
+    assert_eq!(harness.agent.messages.len(), 2);
+    assert_eq!(harness.agent.messages[0].content, "again");
+    assert_eq!(harness.agent.messages[1].content, "recovered");
     Ok(())
 }
 

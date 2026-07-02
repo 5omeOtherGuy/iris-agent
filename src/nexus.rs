@@ -738,6 +738,9 @@ impl<P: ChatProvider> Agent<P> {
                         turn_id: provider_turn_id.clone(),
                         message: format!("{error:#}"),
                     })?;
+                    if let Some(start) = unanswered_start {
+                        self.messages.truncate(start);
+                    }
                     return Err(error);
                 }
             };
