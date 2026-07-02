@@ -245,7 +245,7 @@ impl OpenAiCompatibleChatProvider {
 }
 
 /// A status-200 chat-completions stream that ended in a structurally invalid
-/// state: an unparseable SSE frame, or the socket closed before the terminal
+/// state: an unparsable SSE frame, or the socket closed before the terminal
 /// `[DONE]` sentinel / `finish_reason`. Recoverable: the transport may retry
 /// the whole turn when no visible text has streamed. Carries no streamed
 /// content -- only the anomaly kind.
