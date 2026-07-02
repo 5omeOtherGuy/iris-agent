@@ -69,7 +69,7 @@ pub(crate) fn overlay_box(
         .chain(footer.map(display_width))
         .max()
         .unwrap_or(0);
-    let inner = content_max.clamp(16, max_inner);
+    let inner = content_max.clamp(max_inner.min(16), max_inner);
     let rule = |left: char, right: char| {
         Line::from(Span::styled(
             format!("{left}{}{right}", "─".repeat(inner + 2)),
