@@ -12,12 +12,13 @@
 //! Anthropic runs a real OAuth PKCE browser login (with a manual paste
 //! fallback), the same shape as the other subscription providers.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use reqwest::blocking::Client;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::config;
 use crate::mimir::auth;
 use crate::mimir::auth::storage::{AuthStore, CredentialKind};
 use crate::mimir::model_catalog;
@@ -27,6 +28,7 @@ use crate::ui::modal::{
 };
 
 /// Either open a modal, or show status lines (e.g. nothing to do).
+#[derive(Debug)]
 pub(crate) enum LoginStep {
     Open(Modal),
     Lines(Vec<String>),
@@ -48,27 +50,87 @@ pub(crate) fn provider_select(method: LoginMethod, auth: &AuthStore) -> LoginSte
                 "No subscription providers available.",
             )))
         }
-        // Iris has no API-key-backed providers today.
-        LoginMethod::ApiKey => {
-            LoginStep::Lines(vec!["No API key providers available.".to_string()])
-        }
+        LoginMethod::ApiKey => LoginStep::Open(Modal::Providers(ProviderSelect::new(
+            ProviderPurpose::ApiKeyLogin,
+            api_key_providers(auth),
+            "No API key providers available.",
+        ))),
     }
 }
 
 /// OAuth/subscription providers with their no-secret status badge.
 fn subscription_providers(auth: &AuthStore) -> Vec<ProviderRow> {
-    let mut rows: Vec<ProviderRow> = ProviderId::ALL
-        .iter()
-        .map(|provider| ProviderRow {
-            id: provider.as_str().to_string(),
-            name: provider.display_name().to_string(),
-            badge: model_catalog::provider_status(auth, *provider)
-                .badge()
-                .to_string(),
-        })
-        .collect();
+    let mut rows: Vec<ProviderRow> = [
+        ProviderId::OpenAiCodex,
+        ProviderId::Anthropic,
+        ProviderId::Antigravity,
+    ]
+    .iter()
+    .map(|provider| ProviderRow {
+        id: provider.as_str().to_string(),
+        name: provider.display_name().to_string(),
+        badge: model_catalog::provider_status(auth, *provider)
+            .badge()
+            .to_string(),
+    })
+    .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
+}
+
+fn api_key_providers(auth: &AuthStore) -> Vec<ProviderRow> {
+    let mut rows: Vec<ProviderRow> = [
+        ProviderId::Anthropic,
+        ProviderId::OpenAi,
+        ProviderId::OpenAiCompatible,
+    ]
+    .iter()
+    .map(|provider| ProviderRow {
+        id: provider.as_str().to_string(),
+        name: provider.display_name().to_string(),
+        badge: model_catalog::provider_status(auth, *provider)
+            .badge()
+            .to_string(),
+    })
+    .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub(crate) fn open_api_key_dialog(provider_id: &str) -> Modal {
+    Modal::ApiKeyDialog(crate::ui::modal::ApiKeyDialog::new(
+        provider_id,
+        &provider_display_name(provider_id),
+    ))
+}
+
+pub(crate) fn apply_api_key_login(provider_id: &str, key: &str, auth: &AuthStore) -> Vec<String> {
+    match auth.set_api_key_credentials(provider_id, key) {
+        Ok(()) => {
+            if let Ok(provider) = ProviderId::parse(provider_id) {
+                save_default_after_api_key_login(provider);
+            }
+            vec![format!(
+                "Stored API key for {}. Environment variables are unchanged.",
+                provider_display_name(provider_id)
+            )]
+        }
+        Err(error) => vec![format!("API key login failed: {error:#}")],
+    }
+}
+
+fn save_default_after_api_key_login(provider: ProviderId) {
+    if !matches!(provider, ProviderId::OpenAi | ProviderId::Anthropic) {
+        return;
+    }
+    let already_default = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())
+        .and_then(|settings| settings.default_provider)
+        .is_some_and(|default| default.trim() == provider.as_str());
+    if !already_default {
+        let _ = config::save_default_model(provider.as_str(), provider.default_model());
+    }
 }
 
 /// Open the `/logout` selector over only providers with stored credentials.
@@ -236,6 +298,9 @@ impl LoginBackend for OAuthLoginBackend {
                 })?;
                 Ok(LoginOutcome::LoggedIn)
             }
+            ProviderId::OpenAi | ProviderId::OpenAiCompatible => {
+                bail!("{} uses API-key login", provider.display_name())
+            }
         }
     }
 }
@@ -362,14 +427,24 @@ mod tests {
     }
 
     #[test]
-    fn api_key_method_reports_no_providers() {
+    fn api_key_method_lists_api_key_providers_without_secrets() {
         let (auth, path) = temp_auth();
+        auth.set_api_key_credentials("openai", SECRET).unwrap();
         match provider_select(LoginMethod::ApiKey, &auth) {
-            LoginStep::Lines(lines) => {
-                assert_eq!(lines, vec!["No API key providers available.".to_string()])
-            }
-            _ => panic!("expected lines"),
+            LoginStep::Open(Modal::Providers(_)) => {}
+            other => panic!("expected provider picker, got {other:?}"),
         }
+        let rows = api_key_providers(&auth);
+        assert!(
+            rows.iter()
+                .any(|row| row.id == "openai" && row.badge == "✓ API key")
+        );
+        assert!(rows.iter().any(|row| row.id == "anthropic"));
+        assert!(rows.iter().any(|row| row.id == "openai-compatible"));
+        assert!(
+            rows.iter()
+                .all(|row| !row.name.contains(SECRET) && !row.badge.contains(SECRET))
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -440,7 +515,7 @@ mod tests {
         assert_eq!(updates.lock().unwrap().len(), 1);
         assert_eq!(
             login_complete_lines(ProviderId::OpenAiCodex, &outcome),
-            vec!["Logged in to OpenAI".to_string()]
+            vec!["Logged in to OpenAI Codex".to_string()]
         );
     }
 }

@@ -52,6 +52,30 @@ impl AuthStore {
             })
     }
 
+    pub(crate) fn api_key_credentials(&self, provider_id: &str) -> Result<ApiKeyCredentials> {
+        AuthFile::read_or_default(&self.path)?
+            .api_key_credentials(provider_id)
+            .with_context(|| {
+                format!(
+                    "failed to load {provider_id} API-key credentials from {}",
+                    self.path.display()
+                )
+            })
+    }
+
+    pub(crate) fn set_api_key_credentials(&self, provider_id: &str, key: &str) -> Result<()> {
+        let mut auth = AuthFile::read_or_default(&self.path)?;
+        auth.set_api_key_credentials(provider_id, key)?;
+        auth.write(&self.path)
+    }
+
+    pub(crate) fn credential_kind(&self, provider_id: &str) -> Result<Option<CredentialKind>> {
+        Ok(AuthFile::read_or_default(&self.path)?
+            .providers
+            .get(provider_id)
+            .map(CredentialKind::from_value))
+    }
+
     pub(crate) fn set_oauth_credentials(
         &self,
         provider_id: &str,
@@ -63,8 +87,8 @@ impl AuthStore {
     }
 
     /// Whether a credential of any kind is stored for `provider_id` in the auth
-    /// file. Used by the `/login` status badges and model-availability checks;
-    /// it reads only the presence of an entry, never the secret material.
+    /// file. Used by tests to assert removal semantics without reading secret material.
+    #[cfg(test)]
     pub(crate) fn has_credentials(&self, provider_id: &str) -> Result<bool> {
         Ok(AuthFile::read_or_default(&self.path)?
             .providers
@@ -129,13 +153,37 @@ impl CredentialKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OAuthCredentials {
     pub(crate) access: String,
     pub(crate) refresh: String,
     pub(crate) expires: u128,
     #[serde(flatten)]
     pub(crate) extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ApiKeyCredentials {
+    pub(crate) key: String,
+}
+
+impl std::fmt::Debug for OAuthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCredentials")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires", &self.expires)
+            .field("extra", &self.extra)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ApiKeyCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyCredentials")
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -179,6 +227,35 @@ impl AuthFile {
             .with_context(|| format!("malformed {provider_id} OAuth credentials"))
     }
 
+    fn api_key_credentials(&self, provider_id: &str) -> Result<ApiKeyCredentials> {
+        let value = self
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| anyhow!("missing {provider_id} credentials"))?
+            .clone();
+        if value.get("type").and_then(Value::as_str) != Some("api_key") {
+            bail!("{provider_id} credentials are not API-key credentials");
+        }
+        serde_json::from_value(value)
+            .with_context(|| format!("malformed {provider_id} API-key credentials"))
+    }
+
+    fn set_api_key_credentials(&mut self, provider_id: &str, key: &str) -> Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("API key is blank");
+        }
+        let mut value = serde_json::to_value(ApiKeyCredentials {
+            key: key.to_string(),
+        })
+        .context("failed to serialize API-key credentials")?;
+        if let Value::Object(object) = &mut value {
+            object.insert("type".to_string(), Value::String("api_key".to_string()));
+        }
+        self.providers.insert(provider_id.to_string(), value);
+        Ok(())
+    }
+
     fn set_oauth_credentials(
         &mut self,
         provider_id: &str,
@@ -211,7 +288,9 @@ fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
 }
 
 #[cfg(test)]
@@ -283,6 +362,52 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stores_reads_and_rejects_api_key_credentials() -> Result<()> {
+        let dir = unique_test_dir()?;
+        let path = dir.join("auth.json");
+        let store = AuthStore { path: path.clone() };
+
+        store.set_api_key_credentials("openai", "sk-live-secret")?;
+        assert_eq!(store.api_key_credentials("openai")?.key, "sk-live-secret");
+        assert_eq!(
+            store.credential_kind("openai")?,
+            Some(CredentialKind::ApiKey)
+        );
+
+        let written = fs::read_to_string(&path)?;
+        assert!(written.contains(r#""type": "api_key""#));
+        assert!(written.contains(r#""key": "sk-live-secret""#));
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+
+        let error = store
+            .set_api_key_credentials("openai", "   ")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("API key is blank"), "{error}");
+
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stored_oauth_credentials_are_not_api_key_credentials() -> Result<()> {
+        let mut auth = AuthFile::default();
+        auth.set_oauth_credentials(
+            "openai",
+            OAuthCredentials {
+                access: "access".to_string(),
+                refresh: "refresh".to_string(),
+                expires: 9,
+                extra: serde_json::Map::new(),
+            },
+        )?;
+        let error = auth.api_key_credentials("openai").unwrap_err().to_string();
+        assert!(error.contains("not API-key credentials"), "{error}");
         Ok(())
     }
 

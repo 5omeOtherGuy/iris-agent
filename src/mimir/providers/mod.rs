@@ -11,6 +11,7 @@
 pub(crate) mod anthropic_messages;
 pub(crate) mod antigravity;
 pub(crate) mod openai_codex_responses;
+pub(crate) mod openai_compatible_chat;
 mod transport;
 
 use std::collections::hash_map::DefaultHasher;

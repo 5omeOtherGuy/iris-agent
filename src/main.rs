@@ -1,10 +1,11 @@
 use std::env;
+use std::io::{IsTerminal, Write};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use nexus::{Agent, ChatProvider};
 use reqwest::blocking::Client;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +62,12 @@ fn dispatch() -> Result<()> {
         [command, provider] if command == "login" && provider == "openai-codex" => {
             login_openai_codex(LoginMethod::Browser)
         }
+        [command, provider] if command == "login" && provider == "openai" => {
+            login_api_key(mimir::selection::ProviderId::OpenAi)
+        }
+        [command, provider] if command == "login" && provider == "openai-compatible" => {
+            login_api_key(mimir::selection::ProviderId::OpenAiCompatible)
+        }
         [command, provider] if command == "login" && provider == "antigravity" => {
             login_antigravity()
         }
@@ -74,6 +81,21 @@ fn dispatch() -> Result<()> {
             if command == "login" && provider == "openai-codex" && flag == "--device-code" =>
         {
             login_openai_codex(LoginMethod::DeviceCode)
+        }
+        [command, provider, flag]
+            if command == "login" && provider == "anthropic" && flag == "--api-key" =>
+        {
+            login_api_key(mimir::selection::ProviderId::Anthropic)
+        }
+        [command, provider, flag]
+            if command == "login" && provider == "openai" && flag == "--api-key" =>
+        {
+            login_api_key(mimir::selection::ProviderId::OpenAi)
+        }
+        [command, provider, flag]
+            if command == "login" && provider == "openai-compatible" && flag == "--api-key" =>
+        {
+            login_api_key(mimir::selection::ProviderId::OpenAiCompatible)
         }
         [command] if command == "update" => update_agent(),
         [command] if command == "help" || command == "--help" || command == "-h" => {
@@ -304,6 +326,25 @@ fn build_provider(
                 selection.retry_policy,
             )?,
         ),
+        ProviderId::OpenAi => {
+            let auth = mimir::auth::storage::AuthStore::from_env()?;
+            let api_key = mimir::auth::api_key::api_key_for_provider(ProviderId::OpenAi, &auth)?;
+            Box::new(
+                mimir::providers::openai_compatible_chat::OpenAiCompatibleChatProvider::new(
+                    mimir::providers::openai_compatible_chat::OpenAiCompatibleChatConfig {
+                        provider: ProviderId::OpenAi,
+                        model,
+                        base_url,
+                        reasoning,
+                        system_prompt,
+                        api_key,
+                        supports_reasoning: true,
+                        api_key_required: true,
+                        retry_policy: selection.retry_policy,
+                    },
+                )?,
+            )
+        }
         ProviderId::Anthropic => Box::new(
             mimir::providers::anthropic_messages::AnthropicProvider::new(
                 model,
@@ -322,6 +363,26 @@ fn build_provider(
                 reasoning,
                 system_prompt,
             )?)
+        }
+        ProviderId::OpenAiCompatible => {
+            let auth = mimir::auth::storage::AuthStore::from_env()?;
+            let api_key =
+                mimir::auth::api_key::api_key_for_provider(ProviderId::OpenAiCompatible, &auth)?;
+            Box::new(
+                mimir::providers::openai_compatible_chat::OpenAiCompatibleChatProvider::new(
+                    mimir::providers::openai_compatible_chat::OpenAiCompatibleChatConfig {
+                        provider: ProviderId::OpenAiCompatible,
+                        model,
+                        base_url,
+                        reasoning,
+                        system_prompt,
+                        api_key,
+                        supports_reasoning: selection.open_ai_compatible.reasoning,
+                        api_key_required: selection.open_ai_compatible.api_key_required,
+                        retry_policy: selection.retry_policy,
+                    },
+                )?,
+            )
         }
     };
     Ok(provider)
@@ -394,6 +455,85 @@ fn login_antigravity() -> Result<()> {
     Ok(())
 }
 
+fn login_api_key(provider: mimir::selection::ProviderId) -> Result<()> {
+    let key = read_api_key(provider)?;
+    if key.is_empty() {
+        bail!("API key is blank");
+    }
+    let auth = mimir::auth::storage::AuthStore::from_env()?;
+    auth.set_api_key_credentials(provider.as_str(), &key)?;
+    save_default_after_api_key_login(provider);
+    println!("Stored API key for {}.", provider.display_name());
+    Ok(())
+}
+
+fn read_api_key(provider: mimir::selection::ProviderId) -> Result<String> {
+    print!("Enter API key for {}: ", provider.display_name());
+    std::io::stdout().flush()?;
+    if !std::io::stdin().is_terminal() {
+        let mut key = String::new();
+        std::io::stdin().read_line(&mut key)?;
+        return Ok(key.trim().to_string());
+    }
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        }
+    }
+
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    let guard = RawModeGuard;
+    let mut key = String::new();
+    let result: Result<()> = loop {
+        match ratatui::crossterm::event::read()? {
+            ratatui::crossterm::event::Event::Key(event)
+                if event.kind == ratatui::crossterm::event::KeyEventKind::Press =>
+            {
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Enter => break Ok(()),
+                    ratatui::crossterm::event::KeyCode::Backspace => {
+                        key.pop();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('c')
+                        if event
+                            .modifiers
+                            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        break Err(anyhow!("API key entry cancelled"));
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(ch) => key.push(ch),
+                    _ => {}
+                }
+            }
+            ratatui::crossterm::event::Event::Paste(text) => key.push_str(&text),
+            _ => {}
+        }
+    };
+    drop(guard);
+    println!();
+    result?;
+    Ok(key.trim().to_string())
+}
+
+fn save_default_after_api_key_login(provider: mimir::selection::ProviderId) {
+    if !matches!(
+        provider,
+        mimir::selection::ProviderId::OpenAi | mimir::selection::ProviderId::Anthropic
+    ) {
+        return;
+    }
+    let already_default = env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())
+        .and_then(|settings| settings.default_provider)
+        .is_some_and(|default| default.trim() == provider.as_str());
+    if !already_default {
+        let _ = config::save_default_model(provider.as_str(), provider.default_model());
+    }
+}
+
 fn login_anthropic() -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
@@ -429,8 +569,11 @@ fn print_help() {
     eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
     eprintln!("  iris login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
+    eprintln!("  iris login openai                 Store an OpenAI API key");
+    eprintln!("  iris login openai-compatible      Store an OpenAI-compatible API key");
     eprintln!("  iris login antigravity            Login with Google account OAuth");
     eprintln!("  iris login anthropic              Login with Anthropic OAuth (browser)");
+    eprintln!("  iris login anthropic --api-key    Store an Anthropic API key");
     eprintln!("  iris update                       Update Iris from GitHub");
     eprintln!();
     eprintln!("Accessibility (environment):");

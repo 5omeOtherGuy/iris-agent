@@ -11,7 +11,7 @@ use crate::config;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, CatalogModel, ExactMatch};
-use crate::mimir::selection::ReasoningEffort;
+use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
 use crate::ui::modal::{EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SettingsMenu};
 use crate::wayland::Harness;
@@ -60,8 +60,12 @@ pub(crate) fn resolve_scoped(
 /// Snapshot the authenticated catalog. A failure to read the auth store is
 /// treated as "no models" rather than panicking.
 fn available_now() -> Vec<CatalogModel> {
+    let settings = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())
+        .unwrap_or_default();
     match AuthStore::from_env() {
-        Ok(auth) => model_catalog::available_models(&auth),
+        Ok(auth) => model_catalog::available_models(&auth, &settings),
         Err(_) => Vec::new(),
     }
 }
@@ -151,6 +155,13 @@ pub(crate) fn open_settings<P>(switch: &ModelSwitch<'_, P>) -> Modal {
 /// Build the effort/thinking picker for the current model (settings submenu).
 fn effort_picker<P>(switch: &ModelSwitch<'_, P>) -> Modal {
     let selection = switch.selection();
+    if selection.provider == ProviderId::OpenAiCompatible && !selection.open_ai_compatible.reasoning
+    {
+        return Modal::Effort(EffortPicker::new(
+            vec![ReasoningEffort::Off],
+            ReasoningEffort::Off,
+        ));
+    }
     let levels =
         model_capabilities::supported_levels(selection.provider, &selection.model).to_vec();
     let current = model_capabilities::clamp(
@@ -279,7 +290,9 @@ pub(crate) fn cycle_effort<P: ChatProvider>(
     let selection = switch.selection();
     let provider = selection.provider;
     let model = selection.model.clone();
-    if !model_capabilities::supports_thinking(provider, &model) {
+    if !model_capabilities::supports_thinking(provider, &model)
+        || (provider == ProviderId::OpenAiCompatible && !selection.open_ai_compatible.reasoning)
+    {
         return vec!["Current model does not support thinking".to_string()];
     }
     let current = selection.reasoning.unwrap_or(ReasoningEffort::DEFAULT);
@@ -363,6 +376,7 @@ fn parse_qualified(id: &str) -> Option<CatalogModel> {
     Some(CatalogModel {
         provider,
         id: model.to_string(),
+        ctx_label: None,
     })
 }
 
@@ -375,6 +389,7 @@ mod tests {
         CatalogModel {
             provider,
             id: id.to_string(),
+            ctx_label: None,
         }
     }
 

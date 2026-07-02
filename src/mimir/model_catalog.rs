@@ -13,9 +13,11 @@
 //! record in `auth.json` (or, for Anthropic, an existing Claude Code login). It
 //! never reads, refreshes, or exposes the secret material.
 
+use crate::config::Settings;
 use crate::mimir::auth::anthropic;
-use crate::mimir::auth::storage::AuthStore;
-use crate::mimir::selection::ProviderId;
+use crate::mimir::auth::api_key;
+use crate::mimir::auth::storage::{AuthStore, CredentialKind};
+use crate::mimir::selection::{ModelSelection, OpenAiCompatibleConfig, ProviderId};
 
 /// UI id of the model hidden behind the [`FABLE_5_OPT_IN_ENV`] opt-in.
 const FABLE_5_MODEL_ID: &str = "claude-fable-5";
@@ -65,6 +67,10 @@ const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
         "GPT 5.3 Codex Spark",
         "300k",
     ),
+    (ProviderId::OpenAi, "gpt-4.1", "GPT 4.1", "1M"),
+    (ProviderId::OpenAi, "gpt-4.1-mini", "GPT 4.1 Mini", "1M"),
+    (ProviderId::OpenAi, "gpt-4o", "GPT 4o", "128k"),
+    (ProviderId::OpenAi, "gpt-4o-mini", "GPT 4o Mini", "128k"),
     (ProviderId::Anthropic, "claude-opus-4-8", "Opus 4.8", "1M"),
     (ProviderId::Anthropic, "claude-opus-4-7", "Opus 4.7", "1M"),
     (ProviderId::Anthropic, "claude-opus-4-6", "Opus 4.6", "1M"),
@@ -101,6 +107,7 @@ const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
 pub(crate) struct CatalogModel {
     pub(crate) provider: ProviderId,
     pub(crate) id: String,
+    pub(crate) ctx_label: Option<String>,
 }
 
 impl CatalogModel {
@@ -117,6 +124,10 @@ impl CatalogModel {
 pub(crate) enum AuthStatus {
     /// Stored OAuth credential in Iris's `auth.json`.
     StoredOAuth,
+    /// Stored API-key credential in Iris's `auth.json`.
+    StoredApiKey,
+    /// API-key credential supplied by the provider-specific environment var.
+    EnvApiKey,
     /// Anthropic only: bootstrapped from an existing Claude Code login.
     ClaudeCode,
     /// No credential Iris can use.
@@ -132,6 +143,8 @@ impl AuthStatus {
     pub(crate) fn badge(self) -> &'static str {
         match self {
             AuthStatus::StoredOAuth => "✓ configured",
+            AuthStatus::StoredApiKey => "✓ API key",
+            AuthStatus::EnvApiKey => "✓ env API key",
             AuthStatus::ClaudeCode => "✓ Claude Code login",
             AuthStatus::Unconfigured => "unconfigured",
         }
@@ -146,9 +159,10 @@ pub(crate) fn all() -> Vec<CatalogModel> {
     ENTRIES
         .iter()
         .filter(|(_, id, ..)| fable_enabled || *id != FABLE_5_MODEL_ID)
-        .map(|(provider, id, _name, _ctx)| CatalogModel {
+        .map(|(provider, id, _name, ctx)| CatalogModel {
             provider: *provider,
             id: (*id).to_string(),
+            ctx_label: Some((*ctx).to_string()),
         })
         .collect()
 }
@@ -160,6 +174,14 @@ pub(crate) fn ctx_label(qualified: &str) -> Option<&'static str> {
         .iter()
         .find(|(provider, id, _, _)| format!("{}/{}", provider.as_str(), id) == qualified)
         .map(|(_, _, _, ctx)| *ctx)
+}
+
+#[cfg(test)]
+pub(crate) fn ctx_label_for(model: &CatalogModel) -> Option<String> {
+    model
+        .ctx_label
+        .clone()
+        .or_else(|| ctx_label(&model.qualified()).map(str::to_string))
 }
 
 /// Human-friendly display name for a `provider/modelId`, shown in the `/model`
@@ -181,8 +203,17 @@ pub(crate) fn display_name(qualified: &str) -> String {
 
 /// Auth status for one provider, by credential presence only.
 pub(crate) fn provider_status(auth: &AuthStore, provider: ProviderId) -> AuthStatus {
-    if auth.has_credentials(provider.as_str()).unwrap_or(false) {
-        return AuthStatus::StoredOAuth;
+    match auth.credential_kind(provider.as_str()).ok().flatten() {
+        Some(CredentialKind::OAuth) => return AuthStatus::StoredOAuth,
+        Some(CredentialKind::ApiKey) => return AuthStatus::StoredApiKey,
+        Some(CredentialKind::Unknown) | None => {}
+    }
+    if api_key::api_key_for_provider(provider, auth)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return AuthStatus::EnvApiKey;
     }
     if provider == ProviderId::Anthropic && anthropic::claude_code_credentials_available() {
         return AuthStatus::ClaudeCode;
@@ -193,7 +224,7 @@ pub(crate) fn provider_status(auth: &AuthStore, provider: ProviderId) -> AuthSta
 /// Catalog models whose provider is authenticated, in registry order. This is
 /// the candidate set the `/model` picker shows and `/model <exact>` matches
 /// against when no scope is active.
-pub(crate) fn available_models(auth: &AuthStore) -> Vec<CatalogModel> {
+pub(crate) fn available_models(auth: &AuthStore, settings: &Settings) -> Vec<CatalogModel> {
     // Resolve auth once per provider (a handful) rather than re-reading auth.json
     // for every catalog entry.
     let configured: Vec<ProviderId> = ProviderId::ALL
@@ -201,10 +232,59 @@ pub(crate) fn available_models(auth: &AuthStore) -> Vec<CatalogModel> {
         .copied()
         .filter(|&provider| provider_status(auth, provider).is_configured())
         .collect();
-    all()
+    let mut models: Vec<CatalogModel> = all()
         .into_iter()
         .filter(|model| configured.contains(&model.provider))
-        .collect()
+        .collect();
+
+    if let Some(model) = openai_compatible_model(auth, settings)
+        && !models
+            .iter()
+            .any(|entry| entry.qualified() == model.qualified())
+    {
+        models.push(model);
+    }
+    models
+}
+
+fn openai_compatible_model(auth: &AuthStore, settings: &Settings) -> Option<CatalogModel> {
+    let configured_default = settings
+        .default_provider
+        .as_deref()
+        .and_then(|provider| ProviderId::parse(provider).ok())
+        == Some(ProviderId::OpenAiCompatible);
+    let has_key = provider_status(auth, ProviderId::OpenAiCompatible).is_configured();
+    if !configured_default && settings.open_ai_compatible.is_none() && !has_key {
+        return None;
+    }
+
+    let config = OpenAiCompatibleConfig::from_settings(settings.open_ai_compatible.as_ref());
+    if config.api_key_required && !has_key {
+        return None;
+    }
+    let id = if configured_default {
+        ModelSelection::resolve(settings)
+            .ok()
+            .map(|selection| selection.model)
+            .unwrap_or_else(|| ProviderId::OpenAiCompatible.default_model().to_string())
+    } else {
+        ProviderId::OpenAiCompatible.default_model().to_string()
+    };
+    Some(CatalogModel {
+        provider: ProviderId::OpenAiCompatible,
+        id,
+        ctx_label: config.context_window.map(context_window_label),
+    })
+}
+
+pub(crate) fn context_window_label(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1000 {
+        format!("{}k", tokens / 1000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// Result of resolving a `/model <search>` argument against a candidate set.
@@ -256,6 +336,31 @@ mod tests {
         CatalogModel {
             provider,
             id: id.to_string(),
+            ctx_label: None,
+        }
+    }
+
+    fn settings(
+        provider: Option<&str>,
+        model: Option<&str>,
+        base_url: Option<&str>,
+    ) -> crate::config::Settings {
+        crate::config::Settings {
+            default_provider: provider.map(str::to_string),
+            default_model: model.map(str::to_string),
+            base_url: base_url.map(str::to_string),
+            context_token_budget: None,
+            default_reasoning: None,
+            prompt_cache_retention: None,
+            anthropic_context_management: None,
+            enabled_models: None,
+            max_tool_roundtrips: None,
+            retry: None,
+            open_ai_compatible: Some(crate::config::OpenAiCompatibleSettings {
+                context_window: Some(131_072),
+                reasoning: Some(true),
+                api_key_required: Some(false),
+            }),
         }
     }
 
@@ -282,6 +387,7 @@ mod tests {
         assert_eq!(display_name("anthropic/claude-haiku-4-5"), "Haiku 4.5");
         // Not in the catalog -> show the bare model id.
         assert_eq!(display_name("openai-codex/gpt-9-mystery"), "gpt-9-mystery");
+        assert_eq!(display_name("openai-compatible/llama3.1"), "llama3.1");
         assert_eq!(display_name("no-slash"), "no-slash");
     }
 
@@ -299,10 +405,78 @@ mod tests {
         assert_eq!(ctx_label("anthropic/claude-haiku-4-5"), Some("200k"));
         assert_eq!(ctx_label("anthropic/claude-fable-5"), Some("1M"));
         assert_eq!(ctx_label("openai-codex/gpt-9-mystery"), None);
+        assert_eq!(ctx_label("openai-compatible/llama3.1"), None);
+    }
+
+    #[test]
+    fn api_key_status_and_available_models_use_stored_or_env_keys() {
+        let _env = crate::mimir::test_support::env_lock();
+        let dir = std::env::temp_dir().join(format!("iris-catalog-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let auth = AuthStore::from_path(dir.join("auth.json"));
+        auth.set_api_key_credentials("openai", "sk-openai").unwrap();
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-anthropic");
+            std::env::remove_var("OPENAI_COMPATIBLE_API_KEY");
+        }
+
+        assert_eq!(
+            provider_status(&auth, ProviderId::OpenAi),
+            AuthStatus::StoredApiKey
+        );
+        assert_eq!(
+            provider_status(&auth, ProviderId::Anthropic),
+            AuthStatus::EnvApiKey
+        );
+        assert_eq!(AuthStatus::StoredApiKey.badge(), "✓ API key");
+        assert_eq!(AuthStatus::EnvApiKey.badge(), "✓ env API key");
+
+        let models = available_models(&auth, &settings(None, None, None));
+        assert!(models.iter().any(|m| m.qualified() == "openai/gpt-4.1"));
+        assert!(
+            models
+                .iter()
+                .any(|m| m.qualified() == "anthropic/claude-sonnet-4-6")
+        );
+
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn openai_compatible_catalog_synthesizes_configured_model_without_key() {
+        let dir =
+            std::env::temp_dir().join(format!("iris-catalog-custom-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let auth = AuthStore::from_path(dir.join("auth.json"));
+        let models = available_models(
+            &auth,
+            &settings(
+                Some("openai-compatible"),
+                Some("llama3.1"),
+                Some("http://localhost:11434/v1"),
+            ),
+        );
+
+        let custom = models
+            .iter()
+            .find(|m| m.qualified() == "openai-compatible/llama3.1")
+            .expect("configured custom model");
+        assert_eq!(ctx_label_for(custom), Some("131k".to_string()));
+
+        let models = available_models(&auth, &settings(Some("openai"), Some("gpt-4.1"), None));
+        assert!(
+            models
+                .iter()
+                .any(|m| m.qualified() == "openai-compatible/llama3.1"),
+            "configured custom provider stays discoverable when another provider is active"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn fable_5_is_hidden_unless_the_opt_in_is_switched_on() {
+        let _env = crate::mimir::test_support::env_lock();
         // SAFETY: env mutation is process-global; this is the only test that reads
         // IRIS_ENABLE_FABLE_5, and it restores the var before returning.
         let has = |models: &[CatalogModel]| models.iter().any(|m| m.id == FABLE_5_MODEL_ID);
@@ -374,7 +548,11 @@ mod tests {
     fn unconfigured_status_is_not_configured_and_has_no_secret_badge() {
         assert!(!AuthStatus::Unconfigured.is_configured());
         assert!(AuthStatus::StoredOAuth.is_configured());
+        assert!(AuthStatus::StoredApiKey.is_configured());
+        assert!(AuthStatus::EnvApiKey.is_configured());
         assert_eq!(AuthStatus::Unconfigured.badge(), "unconfigured");
         assert_eq!(AuthStatus::StoredOAuth.badge(), "✓ configured");
+        assert_eq!(AuthStatus::StoredApiKey.badge(), "✓ API key");
+        assert_eq!(AuthStatus::EnvApiKey.badge(), "✓ env API key");
     }
 }

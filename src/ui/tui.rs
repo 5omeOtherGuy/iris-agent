@@ -3064,10 +3064,12 @@ mod tests {
                 CatalogModel {
                     provider: ProviderId::OpenAiCodex,
                     id: "gpt-5.5".to_string(),
+                    ctx_label: None,
                 },
                 CatalogModel {
                     provider: ProviderId::Anthropic,
                     id: "claude-sonnet-4-6".to_string(),
+                    ctx_label: None,
                 },
             ],
             "openai-codex/gpt-5.5",
@@ -3139,6 +3141,7 @@ mod tests {
                 vec![CatalogModel {
                     provider: ProviderId::OpenAiCodex,
                     id: "gpt-5.5".to_string(),
+                    ctx_label: None,
                 }],
                 "openai-codex/gpt-5.5",
                 "openai-codex/gpt-5.5",
@@ -3160,10 +3163,12 @@ mod tests {
             CatalogModel {
                 provider: ProviderId::OpenAiCodex,
                 id: "gpt-5.5".to_string(),
+                ctx_label: None,
             },
             CatalogModel {
                 provider: ProviderId::Anthropic,
                 id: "claude-sonnet-4-6".to_string(),
+                ctx_label: None,
             },
         ];
         screen.open_modal(Modal::Model(ModelPicker::new(

@@ -39,7 +39,9 @@ pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [R
     use ReasoningEffort::{High, Low, Medium, Minimal, Off, XHigh};
     match provider {
         // gpt-5.5 accepts the full effort range, including xhigh.
-        ProviderId::OpenAiCodex => &[Off, Minimal, Low, Medium, High, XHigh],
+        ProviderId::OpenAiCodex | ProviderId::OpenAi | ProviderId::OpenAiCompatible => {
+            &[Off, Minimal, Low, Medium, High, XHigh]
+        }
         // Anthropic depends on the model: the subscription matrix accepts xhigh;
         // unknown/older budget models top out at high.
         ProviderId::Anthropic => anthropic_supported_levels(model),
@@ -112,6 +114,16 @@ pub(crate) fn validate(selection: &ModelSelection) -> Result<()> {
     let Some(level) = selection.reasoning else {
         return Ok(());
     };
+    if selection.provider == ProviderId::OpenAiCompatible
+        && !selection.open_ai_compatible.reasoning
+        && level != ReasoningEffort::Off
+    {
+        return Err(UsageError::new(format!(
+            "reasoning level '{}' is not enabled for openai-compatible/{}; set openAiCompatible.reasoning to true or use 'off'",
+            level.as_str(), selection.model
+        ))
+        .into());
+    }
     let supported = supported_levels(selection.provider, &selection.model);
     if supported.contains(&level) {
         return Ok(());
@@ -164,6 +176,7 @@ mod tests {
             cache_retention: PromptCacheRetention::Short,
             context_management: ContextManagement::default(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
+            open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
         }
     }
 
@@ -219,6 +232,7 @@ mod tests {
                 cache_retention: PromptCacheRetention::Short,
                 context_management: ContextManagement::default(),
                 retry_policy: crate::mimir::retry::RetryPolicy::default(),
+                open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
             };
             assert!(validate(&sel).is_ok(), "{model} should accept xhigh");
             assert_eq!(
