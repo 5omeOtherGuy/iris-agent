@@ -55,6 +55,7 @@ pub(crate) trait Component {
 /// concatenated in order -- the borrowed-children counterpart to
 /// [`Container::render`]. Kept separate so hot paths (the transcript renders
 /// thousands of rows per frame) can composite `&dyn Component` without boxing.
+#[cfg(test)]
 pub(crate) fn composite<'a>(
     children: impl IntoIterator<Item = &'a dyn Component>,
     width: usize,

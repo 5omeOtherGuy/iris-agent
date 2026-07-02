@@ -151,9 +151,30 @@ impl<W: Write> TerminalSurface<W> {
         lines: &[Line<'static>],
         volatile_tail: usize,
     ) -> io::Result<RenderStats> {
+        self.render_with_hints(size, lines, volatile_tail, 0)
+    }
+
+    pub(crate) fn render_with_hints(
+        &mut self,
+        size: Size,
+        lines: &[Line<'static>],
+        volatile_tail: usize,
+        stable_prefix: usize,
+    ) -> io::Result<RenderStats> {
         let width = size.width.max(1);
         let height = size.height.max(1);
-        let (new_lines, cursor) = render_lines(lines, width, self.crash_log_dir.as_deref())?;
+        let reusable_prefix = if !self.state.first_render && self.state.previous_width == width {
+            stable_prefix.min(self.state.previous_lines.len())
+        } else {
+            0
+        };
+        let (new_lines, cursor) = render_lines(
+            lines,
+            width,
+            self.crash_log_dir.as_deref(),
+            &self.state.previous_lines,
+            reusable_prefix,
+        )?;
         let volatile_tail = volatile_tail.min(new_lines.len());
 
         let width_changed = self.state.previous_width != 0 && self.state.previous_width != width;
@@ -174,7 +195,7 @@ impl<W: Write> TerminalSurface<W> {
             self.write_resize_redraw(new_lines, width, height, volatile_tail)?;
             RenderKind::FullRedraw
         } else {
-            self.write_diff_or_replay(&new_lines, width, height, volatile_tail)?
+            self.write_diff_or_replay(new_lines, width, height, volatile_tail, reusable_prefix)?
         };
 
         // Position the hardware cursor for IME on every render, including
@@ -291,10 +312,11 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_diff_or_replay(
         &mut self,
-        lines: &[String],
+        lines: Vec<String>,
         width: u16,
         height: u16,
         volatile_tail: usize,
+        stable_prefix: usize,
     ) -> io::Result<RenderKind> {
         // A height-only change can reach here without a resize redraw (Termux).
         // Recompute the effective previous viewport top for the new height before
@@ -312,8 +334,14 @@ impl<W: Write> TerminalSurface<W> {
         let previous_volatile_tail = self.state.previous_volatile_tail.min(previous_len);
         let previous_stable_len = previous_len.saturating_sub(previous_volatile_tail);
         let new_stable_len = new_len.saturating_sub(volatile_tail.min(new_len));
+        let stable_prefix = stable_prefix
+            .min(previous_stable_len)
+            .min(new_stable_len)
+            .min(previous_len)
+            .min(new_len);
 
-        let Some((first_changed, last_changed)) = changed_range(&self.state.previous_lines, lines)
+        let Some((first_changed, last_changed)) =
+            changed_range_from(&self.state.previous_lines, &lines, stable_prefix)
         else {
             self.state.previous_width = width;
             self.state.previous_height = height;
@@ -322,8 +350,12 @@ impl<W: Write> TerminalSurface<W> {
             return Ok(RenderKind::Unchanged);
         };
 
-        let stable_append = new_stable_len > previous_stable_len
-            && self.state.previous_lines[..previous_stable_len] == lines[..previous_stable_len];
+        let stable_append = if new_stable_len > previous_stable_len {
+            previous_stable_len <= stable_prefix
+                || self.state.previous_lines[..previous_stable_len] == lines[..previous_stable_len]
+        } else {
+            false
+        };
         if stable_append && previous_volatile_tail > 0 {
             self.write_append_replacing_volatile(
                 lines,
@@ -338,13 +370,7 @@ impl<W: Write> TerminalSurface<W> {
         let append_only =
             new_len > previous_len && first_changed == previous_len && previous_len > 0;
         if append_only {
-            self.write_append(
-                &lines[previous_len..],
-                width,
-                height,
-                new_len,
-                volatile_tail,
-            )?;
+            self.write_append(lines, previous_len, width, height, volatile_tail)?;
             return Ok(RenderKind::Append);
         }
 
@@ -360,7 +386,7 @@ impl<W: Write> TerminalSurface<W> {
             if new_viewport_top > self.state.previous_viewport_top {
                 self.write_scrolling_replay(lines, width, height, new_viewport_top, volatile_tail)?;
             } else {
-                self.write_full(lines.to_vec(), width, height, true, volatile_tail)?;
+                self.write_full(lines, width, height, true, volatile_tail)?;
             }
             return Ok(RenderKind::FullRedraw);
         }
@@ -378,7 +404,7 @@ impl<W: Write> TerminalSurface<W> {
 
     fn write_scrolling_replay(
         &mut self,
-        lines: &[String],
+        lines: Vec<String>,
         width: u16,
         height: u16,
         new_viewport_top: usize,
@@ -405,20 +431,15 @@ impl<W: Write> TerminalSurface<W> {
         buffer.push_str(END_SYNC);
         write!(self.writer, "{buffer}")?;
         self.writer.flush()?;
-        self.remember(
-            lines.to_vec(),
-            width,
-            height,
-            lines.len().saturating_sub(1),
-            volatile_tail,
-        );
+        let hardware_cursor_row = lines.len().saturating_sub(1);
+        self.remember(lines, width, height, hardware_cursor_row, volatile_tail);
         self.state.previous_viewport_top = new_viewport_top;
         Ok(())
     }
 
     fn write_append_replacing_volatile(
         &mut self,
-        lines: &[String],
+        lines: Vec<String>,
         start: usize,
         width: u16,
         height: u16,
@@ -445,22 +466,17 @@ impl<W: Write> TerminalSurface<W> {
         buffer.push_str(END_SYNC);
         write!(self.writer, "{buffer}")?;
         self.writer.flush()?;
-        self.remember(
-            lines.to_vec(),
-            width,
-            height,
-            lines.len().saturating_sub(1),
-            volatile_tail,
-        );
+        let hardware_cursor_row = lines.len().saturating_sub(1);
+        self.remember(lines, width, height, hardware_cursor_row, volatile_tail);
         Ok(())
     }
 
     fn write_append(
         &mut self,
-        appended: &[String],
+        lines: Vec<String>,
+        previous_len: usize,
         width: u16,
         height: u16,
-        new_len: usize,
         volatile_tail: usize,
     ) -> io::Result<()> {
         let mut buffer = String::from(BEGIN_SYNC);
@@ -472,7 +488,7 @@ impl<W: Write> TerminalSurface<W> {
             self.state.previous_viewport_top,
             previous_last,
         );
-        for line in appended {
+        for line in &lines[previous_len..] {
             buffer.push_str("\r\n");
             buffer.push_str(line);
             self.state.hardware_cursor_row += 1;
@@ -482,15 +498,14 @@ impl<W: Write> TerminalSurface<W> {
         write!(self.writer, "{buffer}")?;
         self.writer.flush()?;
 
-        let hardware_cursor_row = new_len.saturating_sub(1);
-        self.state.previous_lines.extend(appended.iter().cloned());
-        self.remember_metadata(width, height, hardware_cursor_row, volatile_tail);
+        let hardware_cursor_row = lines.len().saturating_sub(1);
+        self.remember(lines, width, height, hardware_cursor_row, volatile_tail);
         Ok(())
     }
 
     fn write_visible_diff(
         &mut self,
-        lines: &[String],
+        lines: Vec<String>,
         width: u16,
         height: u16,
         first_changed: usize,
@@ -518,7 +533,7 @@ impl<W: Write> TerminalSurface<W> {
         buffer.push_str(END_SYNC);
         write!(self.writer, "{buffer}")?;
         self.writer.flush()?;
-        self.remember(lines.to_vec(), width, height, last_changed, volatile_tail);
+        self.remember(lines, width, height, last_changed, volatile_tail);
         Ok(())
     }
 
@@ -593,9 +608,13 @@ impl<W: Write> TerminalSurface<W> {
     }
 }
 
-fn changed_range(previous: &[String], next: &[String]) -> Option<(usize, usize)> {
+fn changed_range_from(
+    previous: &[String],
+    next: &[String],
+    start: usize,
+) -> Option<(usize, usize)> {
     let max_len = previous.len().max(next.len());
-    let first = (0..max_len).find(|&i| previous.get(i) != next.get(i))?;
+    let first = (start.min(max_len)..max_len).find(|&i| previous.get(i) != next.get(i))?;
     let last = (first..max_len)
         .rev()
         .find(|&i| previous.get(i) != next.get(i))
@@ -638,22 +657,23 @@ fn render_lines(
     lines: &[Line<'static>],
     width: u16,
     crash_log_dir: Option<&Path>,
+    previous_lines: &[String],
+    stable_prefix: usize,
 ) -> io::Result<(Vec<String>, Option<CursorPos>)> {
     let max = usize::from(width.max(1));
-    let mut out = Vec::with_capacity(lines.len());
+    let stable_prefix = stable_prefix.min(previous_lines.len());
+    let mut out = Vec::with_capacity(stable_prefix + lines.len());
+    out.extend(previous_lines[..stable_prefix].iter().cloned());
     let mut cursor: Option<(usize, usize)> = None;
-    let mut rendered_for_log: Vec<String> = Vec::with_capacity(lines.len());
-    for (row, line) in lines.iter().enumerate() {
+    for (offset, line) in lines.iter().enumerate() {
+        let row = stable_prefix + offset;
         let rendered = render_line(line, max);
-        rendered_for_log.push(rendered.text.clone());
         if let Some(col) = rendered.cursor_col {
             cursor = Some((row, col));
         }
         if rendered.width > max {
-            // Finish rendering the remaining lines for the diagnostic, then fail.
-            for tail in &lines[row + 1..] {
-                rendered_for_log.push(render_line(tail, max).text);
-            }
+            let rendered_for_log =
+                render_lines_for_log(&previous_lines[..stable_prefix], lines, max);
             write_overwidth_crash_log(crash_log_dir, max, &rendered_for_log, row, rendered.width);
             let log_hint = crash_log_dir
                 .map(|dir| {
@@ -673,6 +693,17 @@ fn render_lines(
         out.push(rendered.text);
     }
     Ok((out, cursor))
+}
+
+fn render_lines_for_log(
+    stable_prefix: &[String],
+    lines: &[Line<'static>],
+    max: usize,
+) -> Vec<String> {
+    let mut rendered = Vec::with_capacity(stable_prefix.len() + lines.len());
+    rendered.extend(stable_prefix.iter().cloned());
+    rendered.extend(lines.iter().map(|line| render_line(line, max).text));
+    rendered
 }
 
 struct RenderedLine {
