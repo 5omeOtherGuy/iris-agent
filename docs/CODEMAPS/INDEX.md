@@ -123,7 +123,7 @@ TTYs, and the text UI remains the fallback for pipes/CI or TUI startup failure.
 | Input | Default | Used by |
 |---|---|---|
 | `~/.iris/settings.json`, `<cwd>/.iris/settings.json` | absent (built-in defaults) | `config::Settings::load()` (project overrides `defaultModel`, `defaultReasoning`, and `contextTokenBudget`; global owns provider/base-url, `promptCacheRetention`, `anthropicContextManagement`, and `enabledModels`) |
-| `IRIS_TRUST_PATH` | `~/.iris/trust.json` | per-project permission policy store (`wayland::trust`, ADR-0027) |
+| `IRIS_TRUST_PATH` | `~/.iris/trust.json` | per-project permission policy store (`wayland::trust`, ADR-0027); overrides must be absolute and outside the project directory |
 | `IRIS_AUTH_PATH` | `~/.iris/auth.json` | Mimir token stores (`AuthStore::from_env()`) |
 | `IRIS_CONFIG_PATH` | `~/.iris/settings.json` | global settings path override (`config::Settings`) |
 | `IRIS_SESSION_DIR` | `~/.iris/sessions` | transcript root (`session::SessionLog`) |

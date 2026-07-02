@@ -326,7 +326,8 @@ fn bash_command_is_destructive(args: &Value) -> bool {
         .filter(|token| !token.is_empty())
         .any(|token| {
             let command = token.rsplit('/').next().unwrap_or(token);
-            DANGER_TOKENS.contains(&command) || command.starts_with("mkfs.")
+            let command = destructive_command_basename(command);
+            DANGER_TOKENS.contains(&command.as_str()) || command.starts_with("mkfs.")
         });
     if token_danger {
         return true;
@@ -345,4 +346,56 @@ fn bash_command_is_destructive(args: &Value) -> bool {
         "> /dev/sd",
     ];
     DANGER_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Normalize the command word enough for destructive-command classification:
+/// path-qualified basenames (`/bin/rm`), quoted command words (`'rm'`), and
+/// escaped spellings (`\rm`, `r\m`) all invoke the same shell command. This is
+/// intentionally conservative; false positives cost a prompt, false negatives
+/// could persist or auto-approve a destructive command.
+fn destructive_command_basename(token: &str) -> String {
+    token
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '\'' | '"'))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn bash_args(command: &str) -> Value {
+        json!({ "command": command })
+    }
+
+    #[test]
+    fn destructive_bash_detection_catches_path_qualified_variants() {
+        for command in [
+            "/bin/rm -rf target",
+            "/usr/bin/dd if=/dev/zero of=file",
+            "mkfs.ext4 /dev/sdz",
+        ] {
+            assert!(
+                bash_command_is_destructive(&bash_args(command)),
+                "{command} should be destructive"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_bash_detection_catches_quoted_and_escaped_commands() {
+        for command in [
+            "\\rm -rf target",
+            "r\\m -rf target",
+            "'rm' -rf target",
+            "\"rm\" -rf target",
+            "git status; /bin/r\\m -rf target",
+        ] {
+            assert!(
+                bash_command_is_destructive(&bash_args(command)),
+                "{command} should be destructive"
+            );
+        }
+    }
 }

@@ -211,11 +211,12 @@ tokens with `baseUrl`.
 
 ### Project permissions (`/trust`)
 
-The system prompt is assembled entirely from fragments built into the binary
-plus your `AGENTS.md`/`CLAUDE.md` project docs — no `.md` fragment files are
-read from `~/.iris/fragments` or a repo's `.iris/fragments`, so a cloned repo
-cannot inject system-prompt text (ADR-0026). Steer Iris through
-`AGENTS.md`/`CLAUDE.md`.
+The fragment portion of the system prompt is assembled entirely from fragments
+built into the binary. No `.md` fragment files are read from
+`~/.iris/fragments` or a repo's `.iris/fragments`, so a cloned repo cannot
+inject through the old fragment surface (ADR-0026). Project docs
+(`AGENTS.md`/`CLAUDE.md`) remain the intentional repo/user steering channel;
+review them like any other project instruction file.
 
 Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
 (symlink-resolved) working directory (ADR-0027):
@@ -228,7 +229,8 @@ Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
 - `/trust` opens the project-permissions editor: toggle `write`/`edit` grants
   and revoke stored `bash` command/prefix grants.
 - The store is HOME-owned; a repo-committed file can never grant permissions.
-  Override the store path with `IRIS_TRUST_PATH`.
+  `IRIS_TRUST_PATH` may override the store only with an absolute path outside
+  the project directory.
 
 ### Environment variables
 
@@ -236,7 +238,7 @@ Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
 - `IRIS_MODEL` — OpenAI Codex model override; defaults to `gpt-5.5`.
 - `IRIS_CODEX_BASE_URL` — OpenAI Codex base URL; defaults to `https://chatgpt.com/backend-api`.
 - `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
-- `IRIS_TRUST_PATH` — project-permission policy store path; defaults to `~/.iris/trust.json`.
+- `IRIS_TRUST_PATH` — project-permission policy store path; defaults to `~/.iris/trust.json`; overrides must be absolute and outside the project directory.
 - `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
 - `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
 - `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.

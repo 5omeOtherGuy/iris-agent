@@ -644,9 +644,9 @@ impl Screen {
         allow_project: bool,
     ) {
         let options = match (allow_always, allow_project) {
-            (true, true) => "[y] once  [a] always  [p] project  [N] deny",
+            (true, true) => "[y] once  [a] always  [p] always project  [N] deny",
             (true, false) => "[y] once  [a] always  [N] deny",
-            (false, true) => "[y] once  [p] project  [N] deny",
+            (false, true) => "[y] once  [p] always project  [N] deny",
             (false, false) => "[y] once  [N] deny",
         };
         let shell = call.name == "bash";

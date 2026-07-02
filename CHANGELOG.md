@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENTS.md`/`CLAUDE.md` project docs, cwd, and date. Iris no longer
   materializes defaults into `~/.iris/fragments` and no longer loads `.md`
   fragments from `~/.iris/fragments` or a repo's `<cwd>/.iris/fragments`,
-  removing the system-prompt-injection surface entirely. The per-project
+  removing the `.iris/fragments` system-prompt-injection surface. The per-project
   fragment-trust gate, its first-run prompt, and the fragment meaning of
   `/trust` are gone with it. Migration: previously materialized
   `~/.iris/fragments/*.md` files are left in place but are inert (never read);
@@ -31,9 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[p]` ("always for this project") approval option persists a grant, so
   granted tools/commands auto-approve across sessions in that directory;
   `/trust` becomes the project-permissions editor (toggle `write`/`edit`,
-  revoke bash grants). Precedence is session > project > global default.
-  Invariants: the store is never read from a repo-committed file (a clone
-  cannot pre-approve its own tools); destructive commands (`rm`, `dd`, ...)
+  revoke bash grants). `IRIS_TRUST_PATH` overrides must be absolute paths
+  outside the project directory. Precedence is session > project > global
+  default. Invariants: the store is never read from a repo-committed file (a
+  clone cannot pre-approve its own tools); destructive commands (`rm`, `dd`, ...)
   always re-prompt and can never be granted; policy loosens only through
   deliberate user action. Legacy tri-state `"trusted"`/`"untrusted"` entries in
   `trust.json` are ignored (fail closed) and overwritten on the next grant.
@@ -88,24 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It persists its session like a normal run. (The project-trust default
   mentioned here was removed by ADR-0026; persisted project permission grants,
   ADR-0027, apply headless too.)
-
-- Added a per-project trust gate for repo-provided Iris resources (issue #202):
-  system-prompt fragments under `<cwd>/.iris/fragments` now load only for a
-  trusted workspace. A first interactive run whose repo ships fragments prompts
-  once and persists the decision in `~/.iris/trust.json` (keyed by the canonical
-  directory, `IRIS_TRUST_PATH` override); non-interactive runs never prompt and
-  default to untrusted without recording a decision. Project docs
-  (`AGENTS.md`/`CLAUDE.md`) stay ungated. Added the `/trust` command to change
-  the decision mid-session (re-assembles the prompt and rebuilds the provider at
-  the turn boundary).
-  - Hardened the gate: repo `.iris/fragments` resolution now enforces workspace
-    containment unconditionally (independent of the tool-path security opt-in),
-    so the shipped default runtime rejects a `.iris/fragments` symlink escaping
-    the workspace instead of folding host files into the prompt.
-  - `/trust` now rebuilds the provider before committing: on a rebuild failure it
-    restores the prior prompt and reports the failure without a success notice
-    (untrust fails closed), instead of claiming the prompt changed while the old
-    prompt stays live.
 
 - Added root-level product and design-system briefs (`PRODUCT.md` and
   `DESIGN.md`) and linked them from the README documentation index.

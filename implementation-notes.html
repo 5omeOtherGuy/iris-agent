@@ -30,7 +30,7 @@ h2 { border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
 
 <h2>ADR-0027 — store shape</h2>
 <ul>
-<li><strong>File shape</strong>: same file (<code>~/.iris/trust.json</code>, <code>IRIS_TRUST_PATH</code> override), still a flat JSON object keyed by canonical (symlink-resolved) cwd. The value changes from the legacy string (<code>"trusted"</code>/<code>"untrusted"</code>) to a record:
+<li><strong>File shape</strong>: same file (<code>~/.iris/trust.json</code>, <code>IRIS_TRUST_PATH</code> override), still a flat JSON object keyed by canonical (symlink-resolved) cwd. <code>IRIS_TRUST_PATH</code> must be an absolute path outside the project directory; relative or project-local overrides fail closed so a repo-committed file cannot become the grant source. The value changes from the legacy string (<code>"trusted"</code>/<code>"untrusted"</code>) to a record:
 <pre>{ "/abs/canonical/cwd": {
     "allow_tools": ["write", "edit"],
     "allow_bash": ["cargo test"],
@@ -49,7 +49,7 @@ Legacy string entries fail the record parse and read as the empty policy (fail c
 <li><strong>bash is never grantable per-tool</strong>: <code>ProjectPolicy::allows</code> consults the tool-name set only for non-bash tools; bash goes exclusively through exact/prefix command matching, so a blanket bash allow is not expressible in the policy.</li>
 <li><strong>Prefix matching is token-boundary</strong>: <code>git</code>/<code>git&nbsp;</code> matches <code>git status</code> but not <code>gitevil</code> (<code>bash_prefix_matches</code>), so a stored prefix cannot widen to lexically adjacent commands.</li>
 <li><strong><code>[p]</code> offer and defense in depth</strong>: <code>ApprovalGate::review</code> gained an <code>allow_project</code> flag, passed as <code>!destructive</code>. Non-obvious invariant placement: even if a front-end returns <code>AllowProject</code> for a destructive call anyway, Nexus refuses to apply or persist the grant (runs the call once, notices) — invariant 2 is enforced at the decision handler, not just at the offer.</li>
-<li><strong>Destructive classifier hardening after review</strong>: <code>bash_command_is_destructive</code> now checks the basename of path-qualified command tokens (<code>/bin/rm</code>, <code>/usr/bin/dd</code>) and <code>mkfs.*</code> variants (<code>mkfs.ext4</code>). Nexus tests pin that a project prefix grant such as <code>git</code> still re-prompts for <code>git status; /bin/rm -rf sub</code>.</li>
+<li><strong>Destructive classifier hardening after review</strong>: <code>bash_command_is_destructive</code> now checks the normalized basename of command tokens: path-qualified commands (<code>/bin/rm</code>, <code>/usr/bin/dd</code>), quoted/escaped command words (<code>'rm'</code>, <code>\rm</code>, <code>r\m</code>), and <code>mkfs.*</code> variants (<code>mkfs.ext4</code>). Nexus tests pin that a project prefix grant such as <code>git</code> still re-prompts for <code>git status; /bin/rm -rf sub</code>.</li>
 <li>A bash call with a missing/empty <code>command</code> cannot mint a grant (allowed once with a notice).</li>
 <li>A failed sink persist degrades to session-lifetime scope with an honest notice; headless <code>--print</code> loads the policy (grants auto-approve headless too) but installs no sink (its gate cannot return <code>AllowProject</code>).</li>
 <li><code>reset_session</code> (/new, in-session /resume) clears <code>session_allowed</code> but keeps <code>project_policy</code> — it is keyed to the cwd, not the conversation.</li>
@@ -73,7 +73,7 @@ Legacy string entries fail the record parse and read as the empty policy (fail c
 
 <h2>Test coverage of the four ADR-0027 invariants</h2>
 <ul>
-<li>Invariant 1 (HOME-owned store, no repo grants): <code>wayland::trust::tests::invariant_1_a_repo_shipped_policy_file_grants_nothing</code> + <code>nexus::tests::invariant_1_only_the_injected_policy_grants_never_repo_files</code>.</li>
+<li>Invariant 1 (HOME-owned store, no repo grants): <code>wayland::trust::tests::invariant_1_a_repo_shipped_policy_file_grants_nothing</code> + <code>wayland::trust::tests::invariant_1_relative_iris_trust_path_fails_closed</code> + <code>wayland::trust::tests::invariant_1_project_local_iris_trust_path_fails_closed</code> + <code>nexus::tests::invariant_1_only_the_injected_policy_grants_never_repo_files</code>.</li>
 <li>Invariant 2 (destructive floor): <code>nexus::tests::invariant_2_destructive_bash_reprompts_despite_project_grants</code> + <code>nexus::tests::invariant_2_prefix_grant_does_not_auto_approve_destructive_compound_suffix</code> + <code>nexus::tests::invariant_2_allow_project_on_a_destructive_call_is_never_persisted</code>.</li>
 <li>Invariant 3 (sandbox never loosened automatically): <code>wayland::trust::tests::invariant_3_grant_writes_preserve_and_never_create_sandbox_posture</code>.</li>
 <li>Invariant 4 (nothing self-waives / grants stay narrow): <code>nexus::tests::invariants_3_and_4_grants_do_not_loosen_anything_ungranted</code>.</li>

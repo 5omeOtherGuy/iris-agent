@@ -4,7 +4,10 @@
 //! fragment-gating role): the same persistence substrate -- `~/.iris/trust.json`
 //! keyed by the **canonical** (symlink-resolved) directory, HOME-owned, atomic
 //! writes, fail-closed reads, `IRIS_TRUST_PATH` override -- now carries a
-//! per-project permission policy instead of a tri-state trust value:
+//! per-project permission policy instead of a tri-state trust value. The
+//! override must be an absolute path outside the project directory; a relative
+//! or project-local override fails closed so a repo-committed file cannot become
+//! the grant source.
 //!
 //! - `allow_tools`: non-bash tools (`write`/`edit`) whose calls auto-approve.
 //! - `allow_bash`: exact `bash` command strings that auto-approve.
@@ -30,7 +33,7 @@ use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -93,7 +96,7 @@ impl ProjectPolicyRecord {
 /// Fail-closed: an empty policy grants nothing. Only the HOME-owned store is
 /// ever consulted -- never any file under `dir` (invariant 1).
 pub(crate) fn policy_for(dir: &Path) -> ProjectPolicyRecord {
-    let Some(store) = store_path() else {
+    let Some(store) = store_path(dir) else {
         return ProjectPolicyRecord::default();
     };
     read_record(&store, dir)
@@ -103,7 +106,7 @@ pub(crate) fn policy_for(dir: &Path) -> ProjectPolicyRecord {
 /// prompt). Read-modify-write: other projects' entries and this project's
 /// sandbox posture are preserved untouched.
 pub(crate) fn apply_grant(dir: &Path, grant: &PolicyGrant) -> Result<()> {
-    let store = resolve_store()?;
+    let store = resolve_store(dir)?;
     let mut record = read_record(&store, dir);
     record.apply_grant(grant);
     write_record(&store, dir, &record)
@@ -112,7 +115,7 @@ pub(crate) fn apply_grant(dir: &Path, grant: &PolicyGrant) -> Result<()> {
 /// Replace the whole stored policy record for `dir` (the `/trust` editor's
 /// grant/revoke path). An empty record removes the entry.
 pub(crate) fn set_policy(dir: &Path, record: &ProjectPolicyRecord) -> Result<()> {
-    let store = resolve_store()?;
+    let store = resolve_store(dir)?;
     write_record(&store, dir, record)
 }
 
@@ -134,8 +137,9 @@ impl ProjectPolicySink for PolicyStoreSink {
     }
 }
 
-fn resolve_store() -> Result<PathBuf> {
-    store_path().context("cannot resolve the policy store path (set HOME or IRIS_TRUST_PATH)")
+fn resolve_store(dir: &Path) -> Result<PathBuf> {
+    store_path_for(dir)
+        .context("cannot resolve the policy store path (set HOME or IRIS_TRUST_PATH)")
 }
 
 /// Core reader, split out so tests supply an explicit store path. A missing
@@ -209,22 +213,96 @@ fn write_map_atomically(store: &Path, map: &Map<String, Value>) -> Result<()> {
 }
 
 /// Policy store path: `IRIS_TRUST_PATH` override, else `~/.iris/trust.json`.
-/// `None` when neither `IRIS_TRUST_PATH` nor `HOME` is set. NEVER derived from
-/// the workspace: a repo-committed file can never become the store.
-fn store_path() -> Option<PathBuf> {
+/// The override must be absolute and outside `dir`; invalid overrides fail
+/// closed. `None` when neither `IRIS_TRUST_PATH` nor `HOME` is set. NEVER
+/// derived from the workspace: a repo-committed file can never become the store.
+fn store_path(dir: &Path) -> Option<PathBuf> {
+    store_path_for(dir).ok()
+}
+
+fn store_path_for(dir: &Path) -> Result<PathBuf> {
     if let Ok(path) = env::var("IRIS_TRUST_PATH") {
-        return Some(PathBuf::from(path));
+        return override_store_path(dir, PathBuf::from(path));
     }
-    let home = env::var("HOME").ok().filter(|home| !home.is_empty())?;
-    Some(Path::new(&home).join(".iris/trust.json"))
+    let home = env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .context("HOME is not set")?;
+    Ok(Path::new(&home).join(".iris/trust.json"))
+}
+
+fn override_store_path(dir: &Path, path: PathBuf) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("IRIS_TRUST_PATH must be an absolute path");
+    }
+    reject_project_local_override(dir, &path)?;
+    Ok(path)
+}
+
+fn reject_project_local_override(dir: &Path, path: &Path) -> Result<()> {
+    let Ok(root) = std::fs::canonicalize(dir) else {
+        return Ok(());
+    };
+    // Lexical check catches an override that points inside the cwd before its
+    // parent exists. Canonical parent check catches symlink aliases that resolve
+    // inside the cwd. Either case would let a repo-controlled file become the
+    // policy store, violating ADR-0027 invariant 1.
+    if path.starts_with(&root) {
+        bail!("IRIS_TRUST_PATH must not point inside the project directory");
+    }
+    if let Some(parent) = path.parent()
+        && let Ok(parent) = std::fs::canonicalize(parent)
+        && parent.starts_with(&root)
+    {
+        bail!("IRIS_TRUST_PATH must not point inside the project directory");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        trust_path: Option<OsString>,
+        home: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            Self {
+                _lock: lock,
+                trust_path: env::var_os("IRIS_TRUST_PATH"),
+                home: env::var_os("HOME"),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: trust.rs env-sensitive tests run under ENV_LOCK and restore
+            // the process-global vars before releasing it.
+            unsafe {
+                match &self.trust_path {
+                    Some(value) => env::set_var("IRIS_TRUST_PATH", value),
+                    None => env::remove_var("IRIS_TRUST_PATH"),
+                }
+                match &self.home {
+                    Some(value) => env::set_var("HOME", value),
+                    None => env::remove_var("HOME"),
+                }
+            }
+        }
+    }
 
     struct TempDir {
         path: PathBuf,
@@ -403,6 +481,57 @@ mod tests {
             "a repo-shipped policy file must never grant: {record:?}"
         );
         assert!(record.to_policy().tools.is_empty());
+    }
+
+    #[test]
+    fn invariant_1_relative_iris_trust_path_fails_closed() {
+        let _env = EnvGuard::new();
+        let ws = temp_dir();
+        let key = canonical_key(&ws.path).unwrap();
+        let hostile = format!("{{ \"{key}\": {{ \"allow_tools\": [\"write\"] }} }}");
+        fs::create_dir_all(ws.path.join(".iris")).unwrap();
+        fs::write(ws.path.join(".iris/trust.json"), hostile).unwrap();
+        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        unsafe {
+            env::set_var("IRIS_TRUST_PATH", ".iris/trust.json");
+            env::remove_var("HOME");
+        }
+
+        let record = policy_for(&ws.path);
+        assert!(
+            record.is_empty(),
+            "a relative IRIS_TRUST_PATH must fail closed instead of reading repo files"
+        );
+        assert!(
+            apply_grant(&ws.path, &grant_write()).is_err(),
+            "writes through a relative IRIS_TRUST_PATH must be refused"
+        );
+    }
+
+    #[test]
+    fn invariant_1_project_local_iris_trust_path_fails_closed() {
+        let _env = EnvGuard::new();
+        let ws = temp_dir();
+        let store_file = ws.path.join(".iris/trust.json");
+        let key = canonical_key(&ws.path).unwrap();
+        let hostile = format!("{{ \"{key}\": {{ \"allow_tools\": [\"write\"] }} }}");
+        fs::create_dir_all(store_file.parent().unwrap()).unwrap();
+        fs::write(&store_file, hostile).unwrap();
+        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        unsafe {
+            env::set_var("IRIS_TRUST_PATH", &store_file);
+            env::remove_var("HOME");
+        }
+
+        let record = policy_for(&ws.path);
+        assert!(
+            record.is_empty(),
+            "an absolute IRIS_TRUST_PATH inside the project must fail closed"
+        );
+        assert!(
+            apply_grant(&ws.path, &grant_write()).is_err(),
+            "writes through a project-local IRIS_TRUST_PATH must be refused"
+        );
     }
 
     // ---- ADR-0027 invariant 3: grants never touch the sandbox posture ---------
