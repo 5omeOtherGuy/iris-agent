@@ -145,7 +145,9 @@ impl Tool for BashTool {
         })
     }
     fn requires_approval(&self) -> bool {
-        path::restrictions_enabled()
+        // Approval is independent of workspace/path confinement. Print mode
+        // denies this by default, and interactive mode asks before running it.
+        true
     }
     fn is_destructive(&self, args: &Value) -> bool {
         bash_command_is_destructive(args)
@@ -181,7 +183,9 @@ impl Tool for EditTool {
         })
     }
     fn requires_approval(&self) -> bool {
-        path::restrictions_enabled()
+        // Approval is independent of workspace/path confinement. Print mode
+        // denies this by default, and interactive mode asks before running it.
+        true
     }
     fn supports_allow_always(&self) -> bool {
         // A blanket "always" on edit would authorize arbitrary later edits to
@@ -218,7 +222,9 @@ impl Tool for WriteTool {
         })
     }
     fn requires_approval(&self) -> bool {
-        path::restrictions_enabled()
+        // Approval is independent of workspace/path confinement. Print mode
+        // denies this by default, and interactive mode asks before running it.
+        true
     }
     fn supports_allow_always(&self) -> bool {
         // A blanket "always" on write would authorize arbitrary later writes to

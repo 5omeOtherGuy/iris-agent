@@ -12,36 +12,12 @@ A fast coding agent for the terminal, built for token efficiency.
 
 ## Install
 
-No Rust toolchain required. The install script downloads the prebuilt binary
-for your platform (Linux and macOS, x86_64 and aarch64), verifies its SHA-256
-checksum, and installs it:
+Iris is still in pre-release. Until the first public GitHub release and crates.io
+publish are cut, install from Git with a Rust toolchain:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/iris-agent/main/install.sh | sh
+cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked
 ```
-
-Override the install directory with `IRIS_INSTALL_DIR` or pin a version with
-`IRIS_VERSION=vX.Y.Z`. To install manually, download the
-`iris-agent-<target>.tar.gz` archive and its `.sha256` sidecar from the
-[latest release](https://github.com/5omeOtherGuy/iris-agent/releases/latest),
-verify the checksum, extract, and move `iris` onto your `PATH`.
-
-With a Rust toolchain you can also install from crates.io or from source:
-
-```bash
-cargo install iris-agent --locked                                     # crates.io
-cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked  # git HEAD
-```
-
-Update an installed copy with:
-
-```bash
-iris update
-```
-
-Prebuilt binaries self-update: `iris update` downloads the latest release,
-verifies its checksum, and atomically replaces the running binary. A binary
-built from source instead re-runs `cargo install`.
 
 Or run from a source checkout:
 
@@ -50,6 +26,34 @@ git clone https://github.com/5omeOtherGuy/iris-agent.git
 cd iris-agent
 cargo run
 ```
+
+Prebuilt release plumbing is in place for Linux and macOS (x86_64 and aarch64),
+but it becomes usable only after release assets exist. At that point the install
+script will download `iris-agent-<target>.tar.gz`, verify its `.sha256` sidecar,
+and install `iris`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/iris-agent/main/install.sh | sh
+```
+
+Override the install directory with `IRIS_INSTALL_DIR` or pin a version with
+`IRIS_VERSION=vX.Y.Z`. Manual release installs use the same archive plus
+checksum from the [latest release](https://github.com/5omeOtherGuy/iris-agent/releases/latest).
+After the crates.io publish is live, this will also work:
+
+```bash
+cargo install iris-agent --locked
+```
+
+Update an installed copy with:
+
+```bash
+iris update
+```
+
+Prebuilt release binaries self-update: `iris update` downloads the latest
+release, verifies its checksum, and atomically replaces the running binary. A
+binary built from source instead re-runs `cargo install`.
 
 **Runtime dependencies: none beyond the binary.** The `grep` and `find` tools
 search in-process via the ripgrep library crates (`grep`, `ignore`, `globset`),
@@ -64,13 +68,13 @@ so no `rg` or `fd` binary needs to be on `PATH`.
 | Windows | Unsupported | — |
 
 macOS caveat: the `bash` sandbox is Linux-only. On macOS every shell command
-runs without kernel confinement. Approval prompts appear only when
-`IRIS_SECURITY_OPT_IN=1` enables them; a default run may auto-approve and show
-no prompt at all. When a `bash` approval prompt is shown on macOS, it states
-`unsandboxed` at the point you approve a command, so the posture is visible
-where you decide, not buried in a startup line. macOS Seatbelt confinement is a
-planned follow-up ([docs/ROADMAP.md](docs/ROADMAP.md)); until it lands, treat
-macOS shell commands as unsandboxed whether or not a prompt is shown.
+runs without kernel confinement. Iris still asks before running mutating tools,
+and when a `bash` approval prompt is shown on macOS, it states `unsandboxed` at
+the point you approve a command, so the posture is visible where you decide, not
+buried in a startup line. `IRIS_SECURITY_OPT_IN=1` controls workspace path and
+Landlock enforcement, not whether mutating tools require approval. macOS
+Seatbelt confinement is a planned follow-up ([docs/ROADMAP.md](docs/ROADMAP.md));
+until it lands, treat macOS shell commands as unsandboxed.
 
 ## Run
 
@@ -94,10 +98,10 @@ iris --print "apply the fix" --approve          # auto-approve gated tools
 ```
 
 Print mode is non-interactive: it exits 0 on success and nonzero on failure, and
-never prompts. Gated tools are denied by default; pass `--approve` to
-auto-approve them. When stdin is piped it is appended to the prompt after a
-blank line; on a TTY there is nothing to merge. Only the final assistant answer
-reaches stdout.
+never prompts. Mutating tools (`bash`, `edit`, `write`) are denied by default;
+pass `--approve` to auto-approve them. When stdin is piped it is appended to the
+prompt after a blank line; on a TTY there is nothing to merge. Only the final
+assistant answer reaches stdout.
 
 ### Terminal multiplexers (tmux)
 
