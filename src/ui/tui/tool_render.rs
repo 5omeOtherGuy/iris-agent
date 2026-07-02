@@ -335,9 +335,6 @@ impl ToolRenderer for ShellRenderer {
                 body.line("$ \u{2588}", panel_style());
             }
             ToolOutcome::Done { content, exit_code } => {
-                if exit_code.is_some() {
-                    body.defer_expand_hint_to_result();
-                }
                 body.output(content);
                 // `None` is not "an unknown but presumably fine" code: the bash
                 // tool only omits it for a cancelled run, a timeout, or a
@@ -346,14 +343,23 @@ impl ToolRenderer for ShellRenderer {
                 // would fabricate a status the run never reported, so the row
                 // is omitted rather than guessed.
                 if let Some(code) = exit_code {
-                    body.line("", panel_style());
-                    let expand_hint = body.take_deferred_expand_hint();
+                    // Per the design-system `ShellOutput`, the exit-status row
+                    // hides in a collapsed capped preview and reappears when
+                    // expanded -- but only once the OUTPUT itself has made the
+                    // panel foldable. On a short panel that shows in full, the
+                    // row must stay `Always`, otherwise a non-`Always` row would
+                    // itself force an always-expanded panel to fold.
+                    let fold = if body.is_foldable() {
+                        FoldVis::WhenExpanded
+                    } else {
+                        FoldVis::Always
+                    };
+                    body.line_folded("", panel_style(), fold);
                     body.push(shell_result_row(
                         *code,
                         summarize_output(call, content, Some(*code))
                             .map(|summary| summary.render()),
-                        expand_hint,
-                        body.fold_hint_width(),
+                        fold,
                     ));
                 }
             }
@@ -377,16 +383,10 @@ impl ToolRenderer for ShellRenderer {
 /// failed` on success, `■ EXIT <code>  ┊ <meta>` on failure — glyph + bold
 /// uppercase label sharing one color, then a muted `┊ meta` summary when the
 /// output yields an honest one (the design-system `ShellOutput` `ResultRow`).
-/// Always `FoldVis::Always`, by design: unlike the web reference (which hides
-/// its `ResultRow` while collapsed), the row stays visible even in a folded
-/// SHELL panel's capped preview, since exit status is exactly the kind of
-/// thing a glance at a collapsed panel should still answer.
-fn shell_result_row(
-    code: i32,
-    meta: Option<String>,
-    expand_hint: bool,
-    width: usize,
-) -> TranscriptRow {
+/// `fold` matches the `ShellOutput` reference: `WhenExpanded` (hidden in a
+/// collapsed capped preview, shown when expanded) for a foldable panel, and
+/// `Always` for a short panel whose output already shows in full.
+fn shell_result_row(code: i32, meta: Option<String>, fold: FoldVis) -> TranscriptRow {
     let failed = code != 0;
     let symbol = if failed {
         symbols::ERROR
@@ -405,25 +405,11 @@ fn shell_result_row(
         plain.push_str(&aside);
         spans.push(Span::styled(aside, dim_style()));
     }
-    let chrome = if expand_hint {
-        let hint = "ctrl+o to expand";
-        let text = right_align_hint(&plain, hint, width);
-        if !plain.is_empty() {
-            plain = text;
-        }
-        ChromeRow::BodyRight {
-            left: Line::from(spans),
-            right: hint.to_string(),
-            right_style: dim_style(),
-            bg: None,
-        }
-    } else {
-        ChromeRow::Body {
-            line: Line::from(spans),
-            bg: None,
-        }
+    let chrome = ChromeRow::Body {
+        line: Line::from(spans),
+        bg: None,
     };
-    TranscriptRow::chrome_with_text(chrome, plain, style)
+    TranscriptRow::chrome_with_text(chrome, plain, style).with_fold(fold)
 }
 
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
@@ -530,8 +516,6 @@ fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
 struct PanelBody {
     width: usize,
     indent: usize,
-    defer_expand_hint_to_result: bool,
-    deferred_expand_hint: bool,
     rows: Vec<TranscriptRow>,
 }
 
@@ -540,22 +524,12 @@ impl PanelBody {
         Self {
             width,
             indent: 0,
-            defer_expand_hint_to_result: false,
-            deferred_expand_hint: false,
             rows: Vec::new(),
         }
     }
 
     fn shell(width: usize) -> Self {
         Self::new(width)
-    }
-
-    fn defer_expand_hint_to_result(&mut self) {
-        self.defer_expand_hint_to_result = true;
-    }
-
-    fn take_deferred_expand_hint(&mut self) -> bool {
-        std::mem::take(&mut self.deferred_expand_hint)
     }
 
     fn into_rows(self) -> Vec<TranscriptRow> {
@@ -606,6 +580,15 @@ impl PanelBody {
     /// Push a pre-built row (e.g. the SHELL exit-status row) verbatim.
     fn push(&mut self, row: TranscriptRow) {
         self.rows.push(row);
+    }
+
+    /// Whether the body accumulated so far has made the panel foldable: true
+    /// once any row carries a non-`Always` fold (a capped-preview / expanded
+    /// pair). Mirrors the transcript's own foldability test so the SHELL result
+    /// row can track the panel's existing collapse state instead of creating
+    /// it.
+    fn is_foldable(&self) -> bool {
+        self.rows.iter().any(|row| row.fold != FoldVis::Always)
     }
 
     /// Render the structured command region: the `$` prompt row (carrying the
@@ -773,21 +756,14 @@ impl PanelBody {
     fn fold_expand_hint(&mut self, hidden: usize, earlier: bool) {
         let noun = if earlier { "earlier lines" } else { "lines" };
         let left = format!("\u{2026} {hidden} {noun} hidden");
-        let text = if self.defer_expand_hint_to_result {
-            self.deferred_expand_hint = true;
-            left
-        } else {
-            self.push_right_line(
-                Line::from(Span::styled(left.clone(), dim_style())),
-                left,
-                "ctrl+o to expand",
-                dim_style(),
-                dim_style(),
-                FoldVis::WhenCollapsed,
-            );
-            return;
-        };
-        self.line_folded(&text, dim_style(), FoldVis::WhenCollapsed);
+        self.push_right_line(
+            Line::from(Span::styled(left.clone(), dim_style())),
+            left,
+            "ctrl+o to expand",
+            dim_style(),
+            dim_style(),
+            FoldVis::WhenCollapsed,
+        );
     }
 
     /// Expanded-state fold affordance: right-aligned `ctrl+o to collapse`.
@@ -1478,11 +1454,11 @@ mod tests {
     }
 
     #[test]
-    fn shell_result_row_survives_output_folding_in_both_collapsed_and_expanded_sets() {
-        // The result row is `FoldVis::Always` by design (unlike the web
-        // reference's `ResultRow`, which hides while collapsed): exit status
-        // should stay visible even when a long command's output is folded to a
-        // capped preview.
+    fn shell_result_row_hides_when_collapsed_and_shows_when_expanded_for_folded_output() {
+        // Per the design-system `ShellOutput`, the exit-status row is hidden in
+        // a collapsed capped preview (`WhenExpanded`) and reappears when the
+        // panel is expanded -- so a folded panel's preview stays a clean
+        // head/tail slice.
         let content = (0..200)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1505,22 +1481,53 @@ mod tests {
             rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
         );
         assert!(
-            result_rows[0].fold == FoldVis::Always,
-            "{}",
+            result_rows[0].fold == FoldVis::WhenExpanded,
+            "folded panel's result row must hide while collapsed: {}",
             result_rows[0].text
         );
+        // Hidden from the collapsed-visible set (fold != WhenExpanded), present
+        // in the expanded-visible set (fold != WhenCollapsed).
         assert!(
             !rows
                 .iter()
-                .any(|r| r.fold == FoldVis::WhenCollapsed && r.text.contains("ctrl+o to expand")),
-            "hidden-lines affordance should not carry the expand hint: {:?}",
-            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+                .filter(|r| r.fold != FoldVis::WhenExpanded)
+                .any(|r| r.text.contains("EXIT 0")),
+            "result row must not appear in the collapsed preview"
         );
         assert!(
-            rows.last().unwrap().text.ends_with("ctrl+o to expand"),
-            "{}",
-            rows.last().unwrap().text
+            rows.iter()
+                .filter(|r| r.fold != FoldVis::WhenCollapsed)
+                .any(|r| r.text.contains("EXIT 0")),
+            "result row must appear in the expanded set"
         );
+        assert!(
+            rows.iter()
+                .any(|r| r.fold == FoldVis::WhenCollapsed && r.text.contains("ctrl+o to expand")),
+            "collapsed hidden-lines affordance should carry the expand hint: {:?}",
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shell_result_row_stays_always_visible_for_short_unfolded_output() {
+        // A short panel shows its output in full and is not foldable; the
+        // result row must stay `Always` so it never forces the panel to fold.
+        let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "echo hi" })),
+            &ToolOutcome::Done {
+                content: "hi",
+                exit_code: Some(0),
+            },
+        );
+        assert!(
+            rows.iter().all(|r| r.fold == FoldVis::Always),
+            "short shell panel must not become foldable: {:?}",
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(rows.last().unwrap().text, "\u{25c6} EXIT 0");
     }
 
     #[test]

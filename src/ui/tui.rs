@@ -3099,7 +3099,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_shell_output_moves_expand_hint_to_exit_row_when_finished() {
+    fn hidden_shell_output_keeps_expand_hint_on_hidden_affordance_when_finished() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         let content = (0..20)
@@ -3116,13 +3116,14 @@ mod tests {
         let hidden = line_text(line_matching(&lines, |line| {
             line_text(line).contains("lines hidden")
         }));
-        let exit = line_text(line_matching(&lines, |line| {
-            line_text(line).contains("EXIT 0")
-        }));
 
-        assert!(!hidden.contains("ctrl+o"), "{hidden}");
-        assert!(exit.contains("ctrl+o to expand"), "{exit}");
-        assert!(display_width(&exit) <= 80, "{exit}");
+        assert!(hidden.contains("ctrl+o to expand"), "{hidden}");
+        assert!(display_width(&hidden) <= 80, "{hidden}");
+        assert!(
+            !lines.iter().any(|line| line_text(line).contains("EXIT 0")),
+            "collapsed preview must hide the result row: {:?}",
+            lines.iter().map(line_text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
