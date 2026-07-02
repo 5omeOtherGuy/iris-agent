@@ -28,6 +28,15 @@ use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream};
 /// How long to wait for a TCP connect + TLS handshake before classifying the
 /// attempt as transient (the retry loop then backs off and retries).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total-request backstop. Generous enough that no legitimate turn hits it
+/// (the hardest single requests run ~15 minutes; provider SDKs default to a
+/// 10-minute total timeout), but finite so a provider that accepts the
+/// request and then stalls with a healthy TCP connection cannot pin the
+/// `spawn_blocking` thread and pooled connection forever -- a cancelled turn
+/// cannot wake a blocking socket read, and TCP keepalive only detects dead
+/// peers, not silent ones. Replaces the old 120s timeout, which killed
+/// legitimate long streams.
+const TOTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Keep pooled connections around across turns. Idle gaps between turns (the
 /// user reading/typing, long tool runs) routinely exceed reqwest's 90s default,
 /// which forced a fresh TCP+TLS handshake on the next turn's first token.
@@ -49,19 +58,19 @@ const TCP_KEEPALIVE_RETRIES: u32 = 3;
 /// Tuned for streaming SSE responsiveness: ALPN-negotiated HTTP/2 with an
 /// adaptive flow-control window (no stalls on fast token streams), TCP
 /// keepalive probes (warm, validated connection between turns), TCP_NODELAY
-/// (no Nagle delay on request writes), and NO total request timeout. Long
-/// turns (extended thinking, large outputs) legitimately stream for many
-/// minutes; the old per-provider 120s whole-request timeout killed any stream
-/// that outlived it. `.timeout(None)` is required explicitly -- the blocking
-/// client otherwise defaults to a 30s total timeout. Hang detection comes
-/// from the connect timeout and the TCP keepalive probes; a cancelled turn
-/// stops consuming the stream immediately either way.
+/// (no Nagle delay on request writes), and a total request timeout that is a
+/// backstop rather than a cap on legitimate turns. Long turns (extended
+/// thinking, large outputs) legitimately stream for many minutes; the old
+/// per-provider 120s whole-request timeout killed any stream that outlived
+/// it. Hang detection comes from the connect timeout, the TCP keepalive
+/// probes (dead peer), and [`TOTAL_REQUEST_TIMEOUT`] (silent-but-alive peer);
+/// a cancelled turn stops consuming the stream immediately either way.
 pub(crate) fn shared_client() -> Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             Client::builder()
-                .timeout(None)
+                .timeout(TOTAL_REQUEST_TIMEOUT)
                 .connect_timeout(CONNECT_TIMEOUT)
                 .pool_idle_timeout(POOL_IDLE_TIMEOUT)
                 .tcp_nodelay(true)
