@@ -12,16 +12,70 @@
 //! reauth.
 
 use std::io::{BufRead, Error as IoError};
+use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use futures::channel::mpsc;
+use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
 use crate::mimir::retry::RetryPolicy;
 use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream};
+
+/// How long to wait for a TCP connect + TLS handshake before classifying the
+/// attempt as transient (the retry loop then backs off and retries).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Keep pooled connections around across turns. Idle gaps between turns (the
+/// user reading/typing, long tool runs) routinely exceed reqwest's 90s default,
+/// which forced a fresh TCP+TLS handshake on the next turn's first token.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// TCP keepalive cadence: first probe after this idle period, then one probe
+/// per [`TCP_KEEPALIVE_INTERVAL`], giving up after [`TCP_KEEPALIVE_RETRIES`]
+/// unanswered probes. Keeps NATs/load-balancers from silently dropping the
+/// idle pooled connection between turns and detects a dead socket (~60s)
+/// instead of blocking a stream read indefinitely.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Process-wide HTTP client shared by every provider adapter (and their OAuth
+/// token refreshes). One client means one connection pool: switching models or
+/// providers mid-session reuses warm connections instead of re-handshaking,
+/// and a token refresh rides the same pool as the chat request.
+///
+/// Tuned for streaming SSE responsiveness: ALPN-negotiated HTTP/2 with an
+/// adaptive flow-control window (no stalls on fast token streams), TCP
+/// keepalive probes (warm, validated connection between turns), TCP_NODELAY
+/// (no Nagle delay on request writes), and NO total request timeout. Long
+/// turns (extended thinking, large outputs) legitimately stream for many
+/// minutes; the old per-provider 120s whole-request timeout killed any stream
+/// that outlived it. `.timeout(None)` is required explicitly -- the blocking
+/// client otherwise defaults to a 30s total timeout. Hang detection comes
+/// from the connect timeout and the TCP keepalive probes; a cancelled turn
+/// stops consuming the stream immediately either way.
+pub(crate) fn shared_client() -> Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(None)
+                .connect_timeout(CONNECT_TIMEOUT)
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .tcp_nodelay(true)
+                .tcp_keepalive(TCP_KEEPALIVE_IDLE)
+                .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+                .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+                .http2_adaptive_window(true)
+                .build()
+                // Static configuration over a compiled-in TLS backend: this
+                // cannot fail at runtime for environment-specific reasons.
+                .expect("failed to build shared HTTP client")
+        })
+        .clone()
+}
 
 /// Provider-internal seam for incremental assistant text. The streamed SSE
 /// parser pushes deltas here; the live provider forwards them onto the
@@ -325,28 +379,38 @@ impl std::error::Error for StreamReadError {}
 /// Iterate SSE events from a blocking reader. Events are separated by a blank
 /// line; for each event the joined `data:` payload is passed to `on_event`
 /// (terminal `[DONE]` and empty payloads are skipped by the caller). `cancel`
-/// is checked between events so a cancelled turn stops draining promptly (an
-/// idle socket read still blocks until the next byte or the client timeout --
-/// blocking reqwest cannot be force-aborted mid-read).
+/// is checked between lines so a cancelled turn stops draining promptly (an
+/// idle socket read still blocks until the next byte or the client read
+/// timeout -- blocking reqwest cannot be force-aborted mid-read). Reads into
+/// two reused buffers so a high-frequency token stream does not allocate a
+/// fresh `String` per line.
 pub(super) fn for_each_sse_event(
-    reader: impl BufRead,
+    mut reader: impl BufRead,
     cancel: &CancellationToken,
     mut on_event: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let mut event = String::new();
-    for line in reader.lines() {
+    let mut line = String::new();
+    loop {
         if cancel.is_cancelled() {
             bail!("provider stream cancelled");
         }
-        let line = line.map_err(|source| anyhow::Error::new(StreamReadError { source }))?;
-        if line.trim_end_matches('\r').is_empty() {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|source| anyhow::Error::new(StreamReadError { source }))?;
+        if read == 0 {
+            break;
+        }
+        let content = line.trim_end_matches(['\n', '\r']);
+        if content.is_empty() {
             let data = event_data(&event);
             if !data.is_empty() {
                 on_event(&data)?;
             }
             event.clear();
         } else {
-            event.push_str(&line);
+            event.push_str(content);
             event.push('\n');
         }
     }

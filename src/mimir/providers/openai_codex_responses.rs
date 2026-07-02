@@ -2,7 +2,6 @@
 use std::io::BufRead;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
@@ -63,9 +62,10 @@ impl OpenAiCodexResponsesProvider {
         retry_policy: crate::mimir::retry::RetryPolicy,
     ) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(120))
-                .build()?,
+            // Shared process-wide client: warm pooled connections (HTTP/2 +
+            // keep-alive) survive across turns and model switches, so a turn
+            // does not pay a fresh TLS handshake after an idle gap.
+            client: super::transport::shared_client(),
             model: model.to_string(),
             base_url: base_url.to_string(),
             reasoning,

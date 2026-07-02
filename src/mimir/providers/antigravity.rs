@@ -11,7 +11,7 @@
 
 use std::io::BufReader;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
@@ -51,9 +51,10 @@ impl AntigravityProvider {
         system_prompt: &str,
     ) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(120))
-                .build()?,
+            // Shared process-wide client: warm pooled connections (HTTP/2 +
+            // keep-alive) survive across turns and model switches, so a turn
+            // does not pay a fresh TLS handshake after an idle gap.
+            client: super::transport::shared_client(),
             model: model.to_string(),
             base_url: base_url.to_string(),
             reasoning,
