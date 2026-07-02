@@ -379,6 +379,12 @@ pub(crate) struct Screen {
     /// first un-padded frame must not reuse a stable prefix computed from
     /// transcript rows alone (see [`render_document_inner`]).
     padded_frame: bool,
+    /// Whether the terminal (pane) reports itself focused. Terminals without
+    /// focus reporting never send focus events, so this stays true. While
+    /// unfocused the spinner holds its frame and requests no tick redraws, so N
+    /// backgrounded Iris panes in a tmux session do not each animate at 10Hz;
+    /// event-driven redraws (streaming, tool output) continue as normal.
+    terminal_focused: bool,
 }
 
 impl Screen {
@@ -397,7 +403,17 @@ impl Screen {
             modal: None,
             queued: 0,
             padded_frame: false,
+            terminal_focused: true,
         }
+    }
+
+    /// Record the terminal's focus state (crossterm `FocusGained`/`FocusLost`).
+    /// Returns whether the state changed, so the loop redraws once on regain
+    /// (catching the animation up) and never redraws on repeated reports.
+    pub(crate) fn set_terminal_focused(&mut self, focused: bool) -> bool {
+        let changed = self.terminal_focused != focused;
+        self.terminal_focused = focused;
+        changed
     }
 
     /// Set the count of queued (not-yet-injected) steering/follow-up messages
@@ -615,8 +631,10 @@ impl Screen {
     /// loop only redraws on a tick while a turn is running). While an approval is
     /// shown the spinner is hidden behind the hint, so a tick changes nothing and
     /// requests no redraw -- the loop stays CPU-idle waiting on the decision.
+    /// An unfocused terminal likewise holds the frame: pure animation is not
+    /// worth per-tick redraws in a pane the user is not looking at.
     pub(crate) fn tick(&mut self) -> bool {
-        if self.approval_hint.is_some() {
+        if self.approval_hint.is_some() || !self.terminal_focused {
             return false;
         }
         self.spinner.tick()
@@ -1269,9 +1287,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApprovalHint, CONTEXT_METER_DOTS, Spinner, approval_status_line, approval_status_lines,
-        context_meter_filled, display_width, line_text, parse_context_window, truncate_cwd_middle,
-        working_lines,
+        ApprovalHint, CONTEXT_METER_DOTS, Screen, Spinner, approval_status_line,
+        approval_status_lines, context_meter_filled, display_width, line_text,
+        parse_context_window, truncate_cwd_middle, working_lines,
     };
     use crate::ui::tui::WORKING_FRAMES;
 
@@ -1299,6 +1317,27 @@ mod tests {
                 "reduced motion holds the indicator at frame 0"
             );
         }
+    }
+
+    #[test]
+    fn unfocused_terminal_holds_tick_redraws_until_refocus() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        assert!(screen.tick(), "a focused running turn animates");
+
+        // Losing focus (tmux pane switched away) pauses tick-driven redraws;
+        // the change itself is reported once so the loop can react.
+        assert!(screen.set_terminal_focused(false));
+        assert!(!screen.tick(), "no animation redraws while unfocused");
+        assert!(
+            !screen.set_terminal_focused(false),
+            "repeated focus reports are not a state change"
+        );
+
+        // Refocus reports the change (the loop redraws once to catch up) and
+        // the animation resumes.
+        assert!(screen.set_terminal_focused(true));
+        assert!(screen.tick(), "animation resumes when refocused");
     }
 
     #[test]

@@ -99,6 +99,30 @@ auto-approve them. When stdin is piped it is appended to the prompt after a
 blank line; on a TTY there is nothing to merge. Only the final assistant answer
 reaches stdout.
 
+### Terminal multiplexers (tmux)
+
+Iris renders inline -- no alternate screen, no mouse capture -- so the terminal
+keeps owning what a multiplexer user expects it to own: the transcript flows
+into native scrollback, wheel scroll / copy-mode / text selection work
+unmodified, and detach/reattach just works. Narrow panes are fine; the layout
+wraps to any width.
+
+Resize behavior: until the transcript has scrolled past the pane, resizes never
+touch the pane's scrollback, so whatever was there before Iris started (shell
+history, for example) survives every split and drag. Once the transcript has
+scrolled, a resize rebuilds the pane's scrollback from Iris state so history
+rewraps to the new width.
+
+Optional tmux settings that improve the experience:
+
+```tmux
+set -g focus-events on   # pause the working animation in unfocused panes
+```
+
+tmux >= 3.4 additionally passes synchronized-output through, making mid-turn
+updates flicker-free, and `extended-keys` enables the enhanced keyboard
+protocol Iris negotiates where available.
+
 ### Resuming sessions
 
 ```bash

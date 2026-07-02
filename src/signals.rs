@@ -27,11 +27,11 @@ static RESTORE_TERMINAL_ON_FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 static SAVED_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 
 // Async-signal-safe terminal cleanup for a TUI force-quit path: show cursor and
-// disable common mouse/bracketed-paste modes.
+// disable common mouse/focus-reporting/bracketed-paste modes.
 // This is deliberately raw ANSI bytes so the signal handler can use `write(2)`
 // instead of running crossterm/Drop code.
 const TUI_FORCE_QUIT_RESTORE: &[u8] =
-    b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<1u";
+    b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l\x1b[<1u";
 
 /// Install the SIGINT handler. Call once at startup.
 pub(crate) fn install() {

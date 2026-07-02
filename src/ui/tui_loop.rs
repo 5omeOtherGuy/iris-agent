@@ -59,10 +59,11 @@ const TICK: Duration = Duration::from_millis(100);
 /// agent events, and drawing on each one is wasteful and causes flicker.
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Trailing-edge debounce for width-changing idle resize redraws. A width
-/// change forces a scrollback-clearing full replay, so drag storms collapse to
-/// one redraw after the terminal settles. Height-only resizes remain immediate
-/// unless a width replay is already pending.
+/// Trailing-edge debounce for width-changing resize redraws, idle and
+/// mid-turn. A width change forces a full document replay, so drag storms
+/// (tmux pane drags resize continuously) collapse to one redraw after the
+/// terminal settles. Height-only resizes remain immediate unless a width
+/// replay is already pending.
 const RESIZE_REDRAW_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Footer git branch cache lifetime. The footer is presentation-only, so a
@@ -89,6 +90,10 @@ enum RenderAction {
 struct RenderScheduler {
     last_draw: Option<Instant>,
     pending: bool,
+    /// Trailing-edge hold: no draw before this instant. Set on width-changing
+    /// resizes so a tmux pane-drag storm collapses to one full replay after the
+    /// terminal settles instead of one per coalescing window.
+    hold: Option<Instant>,
 }
 
 impl RenderScheduler {
@@ -96,6 +101,7 @@ impl RenderScheduler {
         Self {
             last_draw: None,
             pending: false,
+            hold: None,
         }
     }
 
@@ -105,30 +111,40 @@ impl RenderScheduler {
         self.pending = true;
     }
 
+    /// Defer any pending or future draw to at least `until`. Repeated calls
+    /// extend the hold (trailing edge), never shorten it.
+    fn hold_until(&mut self, until: Instant) {
+        self.hold = Some(self.hold.map_or(until, |hold| hold.max(until)));
+    }
+
     /// Decide what to do for the current pending state at `now`.
     fn poll(&self, now: Instant) -> RenderAction {
         if !self.pending {
             return RenderAction::Idle;
         }
-        match self.last_draw {
-            // First draw after idle is immediate (startup/forced responsiveness).
-            None => RenderAction::DrawNow,
-            Some(last) => {
-                let next = last + MIN_RENDER_INTERVAL;
-                if now >= next {
-                    RenderAction::DrawNow
-                } else {
-                    RenderAction::Wait(next)
-                }
-            }
+        // First draw after idle is immediate (startup/forced responsiveness);
+        // afterwards pace to the coalescing window. An active hold defers both.
+        let mut next = match self.last_draw {
+            None => now,
+            Some(last) => last + MIN_RENDER_INTERVAL,
+        };
+        if let Some(hold) = self.hold {
+            next = next.max(hold);
+        }
+        if now >= next {
+            RenderAction::DrawNow
+        } else {
+            RenderAction::Wait(next)
         }
     }
 
     /// Record that a draw just happened at `now`, clearing the pending flag and
-    /// resetting the pacing window. Use for both coalesced and forced draws.
+    /// resetting the pacing window (and any hold the draw satisfied). Use for
+    /// both coalesced and forced draws.
     fn mark_drawn(&mut self, now: Instant) {
         self.pending = false;
         self.last_draw = Some(now);
+        self.hold = self.hold.filter(|hold| *hold > now);
     }
 }
 
@@ -704,6 +720,11 @@ async fn run_turn<P: ChatProvider>(
     // window as "just drawn" and let the first in-burst event defer to the flush.
     let mut sched = RenderScheduler::new();
     sched.mark_drawn(Instant::now());
+    // Width-changing resizes mid-turn (tmux pane drags) hold the scheduler so a
+    // storm settles into one full replay instead of one per coalescing window.
+    let mut last_resize_width = ratatui::crossterm::terminal::size()
+        .ok()
+        .map(|(width, _)| width);
 
     let result = {
         let mut turn = std::pin::pin!(harness.submit_turn(prompt, &bridge, &bridge, &token));
@@ -756,6 +777,12 @@ async fn run_turn<P: ChatProvider>(
                             // idempotent with the input thread's own cancel.
                             if is_ctrl_c(&event) {
                                 token.cancel();
+                            }
+                            if let Event::Resize(width, _) = &event
+                                && last_resize_width != Some(*width)
+                            {
+                                last_resize_width = Some(*width);
+                                sched.hold_until(Instant::now() + RESIZE_REDRAW_DEBOUNCE);
                             }
                             if handle_running_event(&mut tui.screen, event, &mut pending, steering)
                             {
@@ -830,6 +857,17 @@ async fn run_modal_phase<P: ChatProvider>(
                     tui.screen.close_modal();
                     break;
                 };
+                // Track focus even while a modal is open so a turn started
+                // later in an unfocused pane begins with the animation paused.
+                match &event {
+                    Event::FocusGained => {
+                        tui.screen.set_terminal_focused(true);
+                    }
+                    Event::FocusLost => {
+                        tui.screen.set_terminal_focused(false);
+                    }
+                    _ => {}
+                }
                 let outcome = if let Event::Paste(text) = &event {
                     match tui.screen.modal.as_mut() {
                         Some(modal) => modal.paste_text(text),
@@ -1213,6 +1251,19 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
         // Mouse capture is disabled so the terminal owns scroll/select/copy of
         // the native scrollback; no Mouse events arrive here.
         Event::Resize(..) => return IdleKey::Continue,
+        // Focus reports gate the spinner's tick redraws; a regain redraws once
+        // so a pane switched back to is visually current.
+        Event::FocusGained => {
+            return if screen.set_terminal_focused(true) {
+                IdleKey::Continue
+            } else {
+                IdleKey::Ignore
+            };
+        }
+        Event::FocusLost => {
+            screen.set_terminal_focused(false);
+            return IdleKey::Ignore;
+        }
         Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
             key
         }
@@ -1445,6 +1496,13 @@ fn handle_running_event(
         // Mouse capture is off; the terminal scrolls its own scrollback. Resize
         // still triggers a redraw of the terminal surface.
         Event::Resize(..) => true,
+        // Focus reports pause/resume the spinner's tick redraws; a regain
+        // redraws once to catch the frozen animation and elapsed time up.
+        Event::FocusGained => screen.set_terminal_focused(true),
+        Event::FocusLost => {
+            screen.set_terminal_focused(false);
+            false
+        }
         Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1603,6 +1661,42 @@ mod tests {
         sched.mark_drawn(t0);
         // No new request -> idle even long after the interval (no busy wakeups).
         assert_eq!(sched.poll(t0 + Duration::from_secs(1)), RenderAction::Idle);
+    }
+
+    #[test]
+    fn scheduler_hold_defers_draws_until_it_expires() {
+        let mut sched = RenderScheduler::new();
+        let t0 = Instant::now();
+        let hold = t0 + RESIZE_REDRAW_DEBOUNCE;
+        sched.hold_until(hold);
+        // Even a first-after-idle request (normally immediate) waits the hold out.
+        sched.request();
+        assert_eq!(sched.poll(t0), RenderAction::Wait(hold));
+        // Past the hold, the pending draw flushes.
+        assert_eq!(sched.poll(hold), RenderAction::DrawNow);
+        sched.mark_drawn(hold);
+        // The satisfied hold is cleared: the next request paces normally.
+        sched.request();
+        assert_eq!(
+            sched.poll(hold + MIN_RENDER_INTERVAL),
+            RenderAction::DrawNow
+        );
+    }
+
+    #[test]
+    fn scheduler_hold_extends_on_repeat_never_shortens() {
+        let mut sched = RenderScheduler::new();
+        let t0 = Instant::now();
+        let first = t0 + RESIZE_REDRAW_DEBOUNCE;
+        let later = first + RESIZE_REDRAW_DEBOUNCE;
+        sched.request();
+        // A resize storm keeps pushing the trailing edge out...
+        sched.hold_until(first);
+        sched.hold_until(later);
+        // ...and an out-of-order earlier deadline never pulls it back in.
+        sched.hold_until(first);
+        assert_eq!(sched.poll(first), RenderAction::Wait(later));
+        assert_eq!(sched.poll(later), RenderAction::DrawNow);
     }
 
     fn key(code: KeyCode) -> Event {
@@ -1854,6 +1948,52 @@ mod tests {
             key_mod(KeyCode::Char('-'), KeyModifiers::CONTROL),
         );
         assert_eq!(screen.editor_text(), "alpha ");
+    }
+
+    #[test]
+    fn focus_events_route_to_the_screen_in_idle_and_running_phases() {
+        // Running phase: losing focus needs no redraw, regaining focus redraws
+        // once (the frozen animation catches up), repeats are no-ops.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let steering = SteeringQueue::default();
+        let mut pending: Option<PendingApproval> = None;
+        assert!(!handle_running_event(
+            &mut screen,
+            Event::FocusLost,
+            &mut pending,
+            &steering,
+        ));
+        assert!(!screen.tick(), "unfocused pane stops animating");
+        assert!(handle_running_event(
+            &mut screen,
+            Event::FocusGained,
+            &mut pending,
+            &steering,
+        ));
+        assert!(!handle_running_event(
+            &mut screen,
+            Event::FocusGained,
+            &mut pending,
+            &steering,
+        ));
+        assert!(screen.tick(), "refocused pane animates again");
+
+        // Idle phase: focus reports never submit/exit, and only a focus regain
+        // that changed state asks for a redraw.
+        let mut screen = Screen::new();
+        assert!(matches!(
+            handle_idle_event(&mut screen, Event::FocusLost),
+            IdleKey::Ignore
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, Event::FocusGained),
+            IdleKey::Continue
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, Event::FocusGained),
+            IdleKey::Ignore
+        ));
     }
 
     #[test]
