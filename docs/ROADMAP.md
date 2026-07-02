@@ -205,9 +205,10 @@ Deferred (bounded, documented in code with `ponytail:` markers):
   Upgrade path: a non-blocking / single-owner terminal input event loop.
 - A cancelled provider stream's `spawn_blocking` HTTP request is preempted
   promptly while actively streaming (token check + dropped-consumer break), but
-  an *idle* socket read is not interrupted until the next byte or the 120s
-  reqwest timeout (blocking reqwest cannot be force-aborted mid-read); bounded at
-  process exit by `Runtime::shutdown_timeout`. Upgrade path: async reqwest.
+  an *idle* socket read is not interrupted until the next byte or a TCP
+  keepalive dead-peer reset (blocking reqwest cannot be force-aborted
+  mid-read); bounded at process exit by `Runtime::shutdown_timeout`. Upgrade
+  path: async reqwest.
 - A cancelled `grep`/`find`/`ls` is abandoned, not aborted: dropping the
   `spawn_blocking` handle lets the orphaned walk finish on the pool with its
   result discarded. Upgrade path: thread cancellation into the `ignore` walker.

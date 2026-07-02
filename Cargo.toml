@@ -60,7 +60,10 @@ unicode-width = "0.2"
 # canonical UAX#29 implementation and is already in the build graph transitively
 # via ratatui-core, so this is a direct-dep promotion, not a new crate.
 unicode-segmentation = "1"
-reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+# `http2` enables ALPN-negotiated HTTP/2 to api.anthropic.com / OpenAI: one
+# multiplexed connection per host, kept warm between turns by TCP keepalive,
+# so a turn does not pay a fresh TCP+TLS handshake after idle gaps.
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "http2"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"

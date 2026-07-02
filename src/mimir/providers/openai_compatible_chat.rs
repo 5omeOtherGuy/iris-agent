@@ -1,15 +1,16 @@
-use std::time::Duration;
+use std::io::BufReader;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::errors::AuthError;
 use crate::mimir::providers::transport::{
-    Attempt, classify_http_status_retryable, retry_after_hint, run_with_retry, spawn_stream,
+    Attempt, StreamReadError, TurnSink, classify_http_status_retryable, for_each_sse_event,
+    retry_after_hint, run_with_retry, spawn_stream,
 };
 use crate::mimir::retry::RetryPolicy;
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
@@ -17,6 +18,9 @@ use crate::nexus::{
     AssistantTurn, ChatProvider, CompletionReason, Message, ModelOrigin, ProviderStream,
     ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
 };
+
+/// API id recorded on reasoning-block origins for this adapter.
+const API_ID: &str = "chat-completions";
 
 #[derive(Clone)]
 pub(crate) struct OpenAiCompatibleChatConfig<'a> {
@@ -92,9 +96,10 @@ impl OpenAiCompatibleChatProvider {
             .into());
         }
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(120))
-                .build()?,
+            // Shared process-wide client: warm pooled connections (HTTP/2 +
+            // keep-alive) survive across turns and model switches, so a turn
+            // does not pay a fresh TLS handshake after an idle gap.
+            client: crate::mimir::providers::transport::shared_client(),
             provider: config.provider,
             model: config.model.to_string(),
             base_url: config.base_url.to_string(),
@@ -126,13 +131,13 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
         let provider = self.clone();
         let cancel = cancel.clone();
         Ok(spawn_stream(
-            move |_sink, cancel| {
+            move |sink, cancel| {
                 run_with_retry(
                     provider.provider.as_str(),
                     &provider.retry_policy,
                     cancel,
                     |_| Ok(()),
-                    |_| provider.send_once(url.clone(), &request, cancel),
+                    |_| provider.send_once(url.clone(), &request, sink, cancel),
                 )
             },
             cancel,
@@ -141,7 +146,13 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
 }
 
 impl OpenAiCompatibleChatProvider {
-    fn send_once(&self, url: Url, request: &Value, cancel: &CancellationToken) -> Attempt {
+    fn send_once(
+        &self,
+        url: Url,
+        request: &Value,
+        sink: &mut dyn TurnSink,
+        cancel: &CancellationToken,
+    ) -> Attempt {
         if cancel.is_cancelled() {
             return Attempt::Fatal(anyhow!("OpenAI-compatible request cancelled"));
         }
@@ -155,57 +166,309 @@ impl OpenAiCompatibleChatProvider {
                 if cancel.is_cancelled() {
                     return Attempt::Fatal(anyhow!("OpenAI-compatible request cancelled"));
                 }
+                // A pre-stream send failure (DNS/TLS/connect/timeout) emitted
+                // no output yet: retry with backoff.
                 return Attempt::Retry(
                     anyhow!("failed to send OpenAI-compatible request: {error}"),
                     None,
                 );
             }
         };
-        if cancel.is_cancelled() {
-            return Attempt::Fatal(anyhow!("OpenAI-compatible request cancelled"));
-        }
         let status = response.status();
-        if !status.is_success() {
-            let retry_after = retry_after_hint(response.headers());
-            let _ = response.text();
-            if matches!(status.as_u16(), 401 | 403) {
-                return Attempt::Fatal(
-                    AuthError::for_provider(
-                        self.provider.as_str(),
-                        format!(
-                            "{} key was rejected ({status})",
-                            self.provider.display_name()
-                        ),
-                    )
-                    .into(),
-                );
-            }
-            let error = anyhow!("OpenAI-compatible request failed ({status})");
-            return match classify_http_status_retryable(status.as_u16()) {
-                crate::mimir::providers::transport::HttpClass::Retry => {
-                    Attempt::Retry(error, retry_after)
+        if status.is_success() {
+            let mut parser = ChatStreamParser::new(self.provider.as_str(), &self.model);
+            if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                parser.ingest_event(data, sink)
+            }) {
+                // A mid-stream read failure is retryable only when this attempt
+                // streamed no visible text, so a retry cannot duplicate output
+                // the user already saw.
+                if !cancel.is_cancelled()
+                    && protocol_anomaly_retryable(&error, parser.emitted_visible_text)
+                {
+                    return Attempt::Retry(error, None);
                 }
-                _ => Attempt::Fatal(error),
+                return Attempt::Fatal(error);
+            }
+            let emitted_visible_text = parser.emitted_visible_text;
+            return match parser.finish() {
+                Ok(turn) => {
+                    if let Some(usage) = &turn.usage {
+                        self.record_usage(usage);
+                    }
+                    Attempt::Done(Box::new(turn))
+                }
+                Err(error) => {
+                    if protocol_anomaly_retryable(&error, emitted_visible_text) {
+                        Attempt::Retry(error, None)
+                    } else {
+                        Attempt::Fatal(error)
+                    }
+                }
             };
         }
-        let value: Value = match response.json() {
-            Ok(value) => value,
-            Err(error) => {
-                return Attempt::Fatal(anyhow!(
-                    "failed to parse OpenAI-compatible response: {error}"
-                ));
+        let retry_after = retry_after_hint(response.headers());
+        let _ = response.text();
+        if matches!(status.as_u16(), 401 | 403) {
+            return Attempt::Fatal(
+                AuthError::for_provider(
+                    self.provider.as_str(),
+                    format!(
+                        "{} key was rejected ({status})",
+                        self.provider.display_name()
+                    ),
+                )
+                .into(),
+            );
+        }
+        let error = anyhow!("OpenAI-compatible request failed ({status})");
+        match classify_http_status_retryable(status.as_u16()) {
+            crate::mimir::providers::transport::HttpClass::Retry => {
+                Attempt::Retry(error, retry_after)
             }
-        };
-        match parse_chat_response(&value, self.provider.as_str(), &self.model) {
-            Ok(turn) => Attempt::Done(Box::new(turn)),
-            Err(error) => Attempt::Fatal(error),
+            _ => Attempt::Fatal(error),
         }
     }
+
+    fn record_usage(&self, usage: &ProviderUsage) {
+        tracing::info!(
+            provider = %usage.provider,
+            model = %usage.model,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            cache_read_input_tokens = usage.cache_read_input_tokens,
+            reasoning_output_tokens = usage.reasoning_output_tokens,
+            total_tokens = usage.total_tokens,
+            "provider token usage"
+        );
+    }
+}
+
+/// A status-200 chat-completions stream that ended in a structurally invalid
+/// state: an unparsable SSE frame, or the socket closed before the terminal
+/// `[DONE]` sentinel / `finish_reason`. Recoverable: the transport may retry
+/// the whole turn when no visible text has streamed. Carries no streamed
+/// content -- only the anomaly kind.
+#[derive(Debug, Clone)]
+struct ChatStreamProtocolAnomaly {
+    kind: &'static str,
+}
+
+impl ChatStreamProtocolAnomaly {
+    fn invalid_json() -> Self {
+        Self {
+            kind: "invalid_json",
+        }
+    }
+
+    fn closed_before_done() -> Self {
+        Self {
+            kind: "closed_before_done",
+        }
+    }
+}
+
+impl std::fmt::Display for ChatStreamProtocolAnomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenAI-compatible stream protocol anomaly kind={}",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for ChatStreamProtocolAnomaly {}
+
+/// Whether a stream failure may be retried: only protocol anomalies and local
+/// read errors, and only when the attempt streamed no visible text (a retry
+/// must never duplicate already-shown output).
+fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_text: bool) -> bool {
+    !emitted_visible_text
+        && (error.downcast_ref::<ChatStreamProtocolAnomaly>().is_some()
+            || error.downcast_ref::<StreamReadError>().is_some())
+}
+
+/// Incremental Chat Completions SSE assembler. Text deltas are forwarded to
+/// the sink as they arrive (live rendering); reasoning and tool-call argument
+/// fragments are buffered and only surface on the terminal [`AssistantTurn`].
+struct ChatStreamParser {
+    provider: String,
+    model: String,
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<StreamingToolCall>,
+    response_id: Option<String>,
+    usage: Option<ProviderUsage>,
+    completion_reason: Option<CompletionReason>,
+    /// Whether a non-empty content delta was forwarded to the sink this
+    /// attempt; gates whether a malformed stream can be retried without
+    /// duplicating user-visible output.
+    emitted_visible_text: bool,
+    saw_done: bool,
+}
+
+#[derive(Default)]
+struct StreamingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ChatStreamParser {
+    fn new(provider: &str, model: &str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            response_id: None,
+            usage: None,
+            completion_reason: None,
+            emitted_visible_text: false,
+            saw_done: false,
+        }
+    }
+
+    fn ingest_event(&mut self, data: &str, sink: &mut dyn TurnSink) -> Result<()> {
+        if data == "[DONE]" {
+            self.saw_done = true;
+            return Ok(());
+        }
+        // Drop the serde error so no streamed bytes can reach logs through
+        // this path; the fixed anomaly kind is sufficient for diagnostics.
+        let value: Value = serde_json::from_str(data)
+            .map_err(|_| anyhow::Error::new(ChatStreamProtocolAnomaly::invalid_json()))?;
+        if self.response_id.is_none() {
+            self.response_id = value.get("id").and_then(Value::as_str).map(str::to_string);
+        }
+        // With `stream_options.include_usage` the final chunk carries usage
+        // (typically with an empty `choices` array).
+        if value.get("usage").is_some_and(|usage| !usage.is_null()) {
+            self.usage = parse_usage(&value, &self.provider, &self.model);
+        }
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return Ok(());
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta.get("content").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                self.text.push_str(text);
+                sink.on_text_delta(text)?;
+                self.emitted_visible_text = true;
+            }
+            if let Some(thinking) = delta.get("reasoning_content").and_then(Value::as_str) {
+                self.reasoning.push_str(thinking);
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    self.ingest_tool_call_delta(call);
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.completion_reason = Some(map_finish_reason(reason));
+        }
+        Ok(())
+    }
+
+    /// Accumulate one `delta.tool_calls[]` fragment. The stream identifies a
+    /// call by its `index`; `id`/`name` arrive on the first fragment and the
+    /// JSON `arguments` string streams across subsequent fragments.
+    fn ingest_tool_call_delta(&mut self, call: &Value) {
+        let index = call
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|index| index as usize)
+            .unwrap_or_else(|| self.tool_calls.len().saturating_sub(1));
+        while self.tool_calls.len() <= index {
+            self.tool_calls.push(StreamingToolCall::default());
+        }
+        let entry = &mut self.tool_calls[index];
+        if let Some(id) = call.get("id").and_then(Value::as_str)
+            && entry.id.is_empty()
+        {
+            entry.id.push_str(id);
+        }
+        if let Some(function) = call.get("function") {
+            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                entry.name.push_str(name);
+            }
+            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                entry.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    fn finish(self) -> Result<AssistantTurn> {
+        // A stream that ended without the `[DONE]` sentinel or a terminal
+        // finish_reason was cut off: return the typed anomaly so the transport
+        // can retry when nothing visible streamed.
+        if !self.saw_done && self.completion_reason.is_none() {
+            return Err(ChatStreamProtocolAnomaly::closed_before_done().into());
+        }
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(finalize_stream_tool_call)
+            .collect::<Result<Vec<_>>>()?;
+        let reasoning: Vec<ReasoningBlock> = (!self.reasoning.is_empty())
+            .then(|| {
+                ReasoningBlock::new(
+                    &self.reasoning,
+                    None,
+                    false,
+                    ModelOrigin::new(&self.provider, API_ID, &self.model),
+                )
+            })
+            .into_iter()
+            .collect();
+        if self.text.is_empty()
+            && tool_calls.is_empty()
+            && reasoning.is_empty()
+            && self.completion_reason.is_none()
+        {
+            bail!("OpenAI-compatible response did not include assistant text or tool calls");
+        }
+        Ok(AssistantTurn {
+            text: (!self.text.is_empty()).then_some(self.text),
+            reasoning,
+            tool_calls,
+            response_id: self.response_id,
+            usage: self.usage,
+            completion_reason: self.completion_reason,
+        })
+    }
+}
+
+fn finalize_stream_tool_call(call: StreamingToolCall) -> Result<ToolCall> {
+    let arguments = if call.arguments.trim().is_empty() {
+        json!({})
+    } else {
+        // Drop the serde error so a malformed buffer cannot surface any of the
+        // tool arguments; the fixed message is sufficient for diagnostics.
+        serde_json::from_str(&call.arguments).map_err(|_| {
+            anyhow!("OpenAI-compatible tool call arguments were incomplete or invalid JSON")
+        })?
+    };
+    Ok(ToolCall {
+        id: call.id,
+        name: call.name,
+        arguments,
+        thought_signature: None,
+    })
 }
 
 fn chat_headers(api_key: Option<&str>) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(USER_AGENT, HeaderValue::from_static("iris-agent"));
     if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
         headers.insert(
@@ -241,7 +504,12 @@ fn build_chat_request(
 ) -> Value {
     let mut body = json!({
         "model": model,
-        "stream": false,
+        // Stream tokens as they are generated so the UI renders text live
+        // instead of waiting for the whole completion. `include_usage` asks
+        // for a final usage chunk (supported by OpenAI and the mainstream
+        // OpenAI-compatible servers).
+        "stream": true,
+        "stream_options": { "include_usage": true },
         "messages": build_chat_messages(system_prompt, messages),
     });
     let declarations = tool_declarations(tools);
@@ -350,84 +618,6 @@ fn tool_declarations(tools: &Tools) -> Vec<Value> {
         .collect()
 }
 
-fn parse_chat_response(value: &Value, provider: &str, model: &str) -> Result<AssistantTurn> {
-    let choice = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .ok_or_else(|| anyhow!("OpenAI-compatible response missing choices"))?;
-    let message = choice
-        .get("message")
-        .ok_or_else(|| anyhow!("OpenAI-compatible response missing message"))?;
-    let text = message
-        .get("content")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string);
-    let reasoning = message
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(|text| {
-            ReasoningBlock::new(
-                text,
-                None,
-                false,
-                ModelOrigin::new(provider, "chat-completions", model),
-            )
-        })
-        .into_iter()
-        .collect();
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|calls| {
-            calls
-                .iter()
-                .map(parse_tool_call)
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    Ok(AssistantTurn {
-        text,
-        reasoning,
-        tool_calls,
-        response_id: value.get("id").and_then(Value::as_str).map(str::to_string),
-        usage: parse_usage(value, provider, model),
-        completion_reason: choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .map(map_finish_reason),
-    })
-}
-
-fn parse_tool_call(value: &Value) -> Result<ToolCall> {
-    let function = value.get("function").unwrap_or(&Value::Null);
-    let raw_arguments = function.get("arguments").unwrap_or(&Value::Null);
-    let arguments = match raw_arguments {
-        Value::String(text) if text.trim().is_empty() => json!({}),
-        Value::String(text) => serde_json::from_str(text)
-            .map_err(|_| anyhow!("OpenAI-compatible tool call arguments were invalid JSON"))?,
-        Value::Object(_) => raw_arguments.clone(),
-        _ => json!({}),
-    };
-    Ok(ToolCall {
-        id: value
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        name: function
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        arguments,
-        thought_signature: None,
-    })
-}
-
 fn parse_usage(value: &Value, provider: &str, model: &str) -> Option<ProviderUsage> {
     let usage = value.get("usage")?;
     let input_tokens = usage
@@ -531,7 +721,8 @@ mod tests {
         );
 
         assert_eq!(request["model"], json!("gpt-test"));
-        assert_eq!(request["stream"], json!(false));
+        assert_eq!(request["stream"], json!(true));
+        assert_eq!(request["stream_options"], json!({ "include_usage": true }));
         assert_eq!(request["reasoning_effort"], json!("high"));
         assert_eq!(
             request["messages"][0],
@@ -607,40 +798,75 @@ mod tests {
         Ok(())
     }
 
+    /// Recording sink so tests can assert what streamed live.
+    struct RecordingSink(Vec<String>);
+
+    impl TurnSink for RecordingSink {
+        fn on_text_delta(&mut self, delta: &str) -> Result<()> {
+            self.0.push(delta.to_string());
+            Ok(())
+        }
+    }
+
+    fn parse_stream(events: &[Value], done: bool) -> (Result<AssistantTurn>, Vec<String>) {
+        let mut parser = ChatStreamParser::new("openai", "gpt-test");
+        let mut sink = RecordingSink(Vec::new());
+        for event in events {
+            parser
+                .ingest_event(&event.to_string(), &mut sink)
+                .expect("event ingested");
+        }
+        if done {
+            parser.ingest_event("[DONE]", &mut sink).expect("[DONE]");
+        }
+        (parser.finish(), sink.0)
+    }
+
     #[test]
-    fn parses_text_tool_calls_usage_and_completion_reason() {
-        let response = json!({
-            "id": "chatcmpl_1",
-            "choices": [{
-                "finish_reason": "tool_calls",
-                "message": {
-                    "content": "",
-                    "reasoning_content": "thinking",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": { "name": "read", "arguments": "{\"path\":\"src/main.rs\"}" }
-                    }]
-                }
-            }],
-            "usage": {
+    fn streams_text_deltas_live_and_assembles_the_turn() {
+        let events = [
+            json!({ "id": "chatcmpl_1", "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "Hel" }, "finish_reason": null }] }),
+            json!({ "id": "chatcmpl_1", "choices": [{ "index": 0, "delta": { "content": "lo" }, "finish_reason": null }] }),
+            json!({ "id": "chatcmpl_1", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+        ];
+        let (turn, deltas) = parse_stream(&events, true);
+        let turn = turn.expect("stream parsed");
+        assert_eq!(deltas, vec!["Hel".to_string(), "lo".to_string()]);
+        assert_eq!(turn.text.as_deref(), Some("Hello"));
+        assert_eq!(turn.response_id.as_deref(), Some("chatcmpl_1"));
+        assert_eq!(
+            turn.completion_reason,
+            Some(crate::nexus::CompletionReason::EndTurn)
+        );
+    }
+
+    #[test]
+    fn assembles_tool_calls_reasoning_and_usage_from_stream_chunks() {
+        let events = [
+            json!({ "id": "chatcmpl_2", "choices": [{ "index": 0, "delta": { "reasoning_content": "thin" }, "finish_reason": null }] }),
+            json!({ "choices": [{ "index": 0, "delta": { "reasoning_content": "king" }, "finish_reason": null }] }),
+            json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "call_1", "type": "function", "function": { "name": "read", "arguments": "" } }] }, "finish_reason": null }] }),
+            json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{\"path\":" } }] }, "finish_reason": null }] }),
+            json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "\"src/main.rs\"}" } }] }, "finish_reason": null }] }),
+            json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+            json!({ "choices": [], "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "total_tokens": 15,
                 "prompt_tokens_details": { "cached_tokens": 3 },
                 "completion_tokens_details": { "reasoning_tokens": 2 }
-            }
-        });
-
-        let turn = parse_chat_response(&response, "openai", "gpt-test").unwrap();
-
-        assert_eq!(turn.response_id.as_deref(), Some("chatcmpl_1"));
+            } }),
+        ];
+        let (turn, deltas) = parse_stream(&events, true);
+        let turn = turn.expect("stream parsed");
+        assert!(deltas.is_empty(), "tool/reasoning deltas are not visible");
         assert!(turn.text.is_none());
         assert_eq!(turn.reasoning.len(), 1);
         assert_eq!(turn.reasoning[0].text, "thinking");
         assert_eq!(turn.reasoning[0].origin.provider, "openai");
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].id, "call_1");
+        assert_eq!(turn.tool_calls[0].name, "read");
         assert_eq!(
             turn.tool_calls[0].arguments,
             json!({ "path": "src/main.rs" })
@@ -649,7 +875,7 @@ mod tests {
             turn.completion_reason,
             Some(crate::nexus::CompletionReason::ToolUse)
         );
-        let usage = turn.usage.unwrap();
+        let usage = turn.usage.expect("usage from final chunk");
         assert_eq!(usage.provider, "openai");
         assert_eq!(usage.model, "gpt-test");
         assert_eq!(usage.input_tokens, 10);
@@ -657,5 +883,34 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 3);
         assert_eq!(usage.reasoning_output_tokens, 2);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn truncated_stream_is_a_retryable_protocol_anomaly() {
+        // No [DONE], no finish_reason: the socket died mid-stream.
+        let events = [
+            json!({ "id": "chatcmpl_3", "choices": [{ "index": 0, "delta": { "content": "par" }, "finish_reason": null }] }),
+        ];
+        let (turn, deltas) = parse_stream(&events, false);
+        let error = turn.expect_err("truncated stream must not produce a turn");
+        assert!(
+            error.downcast_ref::<ChatStreamProtocolAnomaly>().is_some(),
+            "typed anomaly so the transport can classify: {error}"
+        );
+        // Visible text streamed, so the transport must NOT retry this attempt.
+        assert!(!protocol_anomaly_retryable(&error, true));
+        assert!(protocol_anomaly_retryable(&error, false));
+        assert_eq!(deltas, vec!["par".to_string()]);
+    }
+
+    #[test]
+    fn empty_completion_with_finish_reason_is_a_valid_turn() {
+        let events = [
+            json!({ "id": "chatcmpl_4", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+        ];
+        let (turn, _) = parse_stream(&events, true);
+        let turn = turn.expect("empty completion with stop reason is legitimate");
+        assert!(turn.text.is_none());
+        assert!(turn.tool_calls.is_empty());
     }
 }
