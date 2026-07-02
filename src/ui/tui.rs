@@ -81,10 +81,6 @@ const MIN_EDITOR_H: u16 = 4;
 const EDITOR_VERTICAL_CHROME_ROWS: u16 = 3;
 /// Blank row below the input so the composer text does not sit on the screen edge.
 const EDITOR_BOTTOM_PADDING_ROWS: u16 = 1;
-/// Compact inline footprint for a short session. Once the transcript grows past
-/// this, Iris naturally scrolls with the terminal; before then it stays near the
-/// bottom instead of immediately occupying the whole terminal height.
-const MIN_INLINE_DOCUMENT_ROWS: u16 = 16;
 
 /// Safety valve for long-running sessions: keep rendering and retained
 /// transcript state bounded. The terminal's own scrollback already contains
@@ -1870,6 +1866,28 @@ mod tests {
     }
 
     #[test]
+    fn short_session_composer_chrome_pins_to_viewport_bottom() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextEnd("Short answer.".to_string()));
+
+        let height = 24;
+        let lines = rendered_lines(&mut screen, 100, height);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let input_idx = texts
+            .iter()
+            .position(|line| line.contains("Give Iris a task..."))
+            .expect("composer input");
+
+        assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+        assert_eq!(
+            input_idx + 2,
+            texts.len(),
+            "only the intentional one blank row should sit below composer input: {texts:?}"
+        );
+        assert_eq!(texts[input_idx + 1].trim(), "", "{texts:?}");
+    }
+
+    #[test]
     fn composer_statusline_shows_status_with_context_meter() {
         let mut screen = Screen::new();
         screen.set_footer(
@@ -2317,6 +2335,61 @@ mod tests {
         assert!(
             !next_user.trim_start().starts_with("› "),
             "user message must stay unmarked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn assistant_marker_skips_structural_markdown_block_starts() {
+        let markdown = "Intro paragraph.\n\n```rust\nlet answer = 42;\n```\n\n> quoted note\n\n| left | right |\n| --- | --- |\n| one | two |\n\nOutro paragraph.\n\n---";
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextEnd(markdown.to_string()));
+
+        let rendered = rendered_lines(&mut screen, 100, 32)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        let structural_needles = ["let answer = 42;", "> quoted note", "┌", "---"];
+        for needle in structural_needles {
+            let line = rendered
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing structural line {needle:?}: {rendered:?}"));
+            assert!(
+                !line.trim_start().starts_with("› "),
+                "structural markdown line must stay unmarked: {rendered:?}"
+            );
+        }
+
+        let outro = rendered
+            .iter()
+            .find(|line| line.contains("Outro paragraph."))
+            .expect("outro paragraph");
+        assert!(
+            outro.trim_start().starts_with("› "),
+            "prose after structural markdown still needs assistant marker: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_marker_allows_prose_containing_pipe() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextEnd(
+            "First paragraph.\n\nUse foo | bar when choosing a mode.".to_string(),
+        ));
+
+        let rendered = rendered_lines(&mut screen, 100, 24)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        let pipe_prose = rendered
+            .iter()
+            .find(|line| line.contains("Use foo | bar"))
+            .expect("pipe prose paragraph");
+
+        assert!(
+            pipe_prose.trim_start().starts_with("› "),
+            "ordinary prose with a pipe should still get the assistant marker: {rendered:?}"
         );
     }
 

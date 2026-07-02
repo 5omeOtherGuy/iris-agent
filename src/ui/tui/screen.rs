@@ -28,8 +28,8 @@ use super::wrap::{
 };
 use super::{
     BOX_X_PADDING_U16, EDITOR_BOTTOM_PADDING_ROWS, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS,
-    MAX_MENU_ROWS, MIN_EDITOR_H, MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, WORKING_FRAMES,
-    border_style, dim_style, format_elapsed_compact, panel_style, prompt_style,
+    MAX_MENU_ROWS, MIN_EDITOR_H, TEXT_COLUMN_X_PADDING, WORKING_FRAMES, border_style, dim_style,
+    format_elapsed_compact, panel_style, prompt_style,
 };
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -765,7 +765,7 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     let chrome = render_editor_chrome(screen, width, height);
     let chrome_len = chrome.len();
     let volatile_tail = chrome_len + working_block.len();
-    let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
+    let target_rows = height;
     let min_transcript_rows =
         usize::from(target_rows).saturating_sub(chrome.len() + working_block.len());
     let pad_frame = transcript.total_lines < min_transcript_rows;
