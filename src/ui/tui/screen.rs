@@ -1047,12 +1047,17 @@ struct ChromeHeights {
 /// `MIN_EDITOR_H` (hairline + statusline + spacer + one input row) before anything else
 /// is squeezed. The bottom padding is preferred, not protected, so overlays can
 /// reclaim it in tight viewports.
-fn chrome_heights(height: u16, menu_wanted: u16, editor_rows: u16) -> ChromeHeights {
+fn chrome_heights(
+    height: u16,
+    menu_wanted: u16,
+    editor_rows: u16,
+    bottom_padding_rows: u16,
+) -> ChromeHeights {
     let menu = menu_wanted.min(height.saturating_sub(MIN_EDITOR_H));
     let max_editor_h = height.saturating_sub(menu).max(1);
     let wanted_editor_h = editor_rows
         .saturating_add(EDITOR_VERTICAL_CHROME_ROWS)
-        .saturating_add(EDITOR_BOTTOM_PADDING_ROWS);
+        .saturating_add(bottom_padding_rows);
     let editor = if max_editor_h >= MIN_EDITOR_H {
         wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
     } else {
@@ -1117,7 +1122,15 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     // full hairline top edge, the statusline, a blank spacer, then the input
     // rows. No box, no hint row, no separate workspace label (the workspace
     // lives right-aligned in the statusline).
-    let heights = chrome_heights(area.height, menu_wanted, editor_rows);
+    // Keep one soft row under the normal composer, but do not spend an extra
+    // blank row while a docked overlay or approval prompt already occupies the
+    // lower viewport.
+    let bottom_padding_rows = if menu_wanted == 0 && screen.approval_hint.is_none() {
+        EDITOR_BOTTOM_PADDING_ROWS
+    } else {
+        0
+    };
+    let heights = chrome_heights(area.height, menu_wanted, editor_rows, bottom_padding_rows);
     let chrome_h = heights.menu.saturating_add(heights.editor);
     let chrome_area = Rect::new(0, 0, width, chrome_h.max(1));
     let chunks = Layout::vertical([
@@ -1154,7 +1167,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
-            .saturating_sub(EDITOR_BOTTOM_PADDING_ROWS)
+            .saturating_sub(bottom_padding_rows)
             .max(1),
     };
     // Cell of the editor's hardware-cursor (IME) marker, in buffer coordinates.
