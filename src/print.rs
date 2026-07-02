@@ -25,24 +25,34 @@ pub(crate) struct PrintInvocation {
 
 /// Parse a print-mode invocation from the raw arguments (already stripped of
 /// `argv[0]`). Returns `None` when this is not a `-p`/`--print` run so the
-/// caller falls through to the other command dispatch. A print run needs a
-/// prompt argument; `--approve` may appear before or after it. Extra positional
-/// arguments make it invalid (returns `None`, which surfaces as a usage error).
+/// caller falls through to the other command dispatch. A print run needs
+/// exactly one `-p`/`--print` flag and exactly one prompt argument; both it and
+/// `--approve` may appear in any position. Anything else (extra positionals,
+/// missing prompt, repeated flags) makes it invalid (returns `None`, which
+/// surfaces as a usage error when a print flag was present).
 pub(crate) fn parse_print_args(args: &[String]) -> Option<PrintInvocation> {
-    let (first, rest) = args.split_first()?;
-    if first != "-p" && first != "--print" {
-        return None;
-    }
+    let mut print = false;
     let mut approve = false;
     let mut prompt: Option<String> = None;
-    for arg in rest {
-        if arg == "--approve" {
+    for arg in args {
+        if arg == "-p" || arg == "--print" {
+            if print {
+                return None;
+            }
+            print = true;
+        } else if arg == "--approve" {
+            if approve {
+                return None;
+            }
             approve = true;
         } else if prompt.is_none() {
             prompt = Some(arg.clone());
         } else {
             return None;
         }
+    }
+    if !print {
+        return None;
     }
     prompt.map(|prompt| PrintInvocation { prompt, approve })
 }
@@ -170,6 +180,24 @@ mod tests {
         };
         assert_eq!(after, expected);
         assert_eq!(before, expected);
+    }
+
+    #[test]
+    fn parse_print_args_accepts_flags_in_any_position() {
+        let expected = PrintInvocation {
+            prompt: "hello".to_string(),
+            approve: true,
+        };
+        for order in [
+            ["--approve", "-p", "hello"],
+            ["--approve", "hello", "--print"],
+            ["hello", "--print", "--approve"],
+        ] {
+            assert_eq!(parse_print_args(&args(&order)).expect("parsed"), expected);
+        }
+        // Repeated flags are invalid.
+        assert!(parse_print_args(&args(&["-p", "--print", "hello"])).is_none());
+        assert!(parse_print_args(&args(&["-p", "--approve", "--approve", "x"])).is_none());
     }
 
     #[test]
