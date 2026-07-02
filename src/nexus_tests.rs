@@ -2124,6 +2124,126 @@ fn test_workspace() -> Result<TestWorkspace> {
 }
 
 #[test]
+fn provider_context_overflow_compacts_and_retries_once() -> Result<()> {
+    // A provider whose responses can be typed errors, so a test can drive the
+    // harness's overflow-recovery path (issue #211).
+    struct TypedErrorProvider {
+        responses: RefCell<Vec<Result<AssistantTurn, anyhow::Error>>>,
+        calls: std::cell::Cell<usize>,
+    }
+    impl ChatProvider for TypedErrorProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            self.calls.set(self.calls.get() + 1);
+            let item = self
+                .responses
+                .borrow_mut()
+                .pop()
+                .expect("unexpected provider call");
+            let event = item.map(ProviderEvent::Completed);
+            Ok(Box::pin(futures::stream::once(async move { event })))
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // Reverse order (popped): turn 1 bulks up the transcript, turn 2 is
+    // rejected as a context overflow once and then succeeds after compaction.
+    let filler = "filler ".repeat(400);
+    let provider = TypedErrorProvider {
+        responses: RefCell::new(vec![
+            Ok(AssistantTurn::text("recovered")),
+            Err(anyhow::Error::new(
+                crate::errors::ContextOverflowError::new("prompt too large"),
+            )),
+            Ok(AssistantTurn::text(&filler)),
+        ]),
+        calls: std::cell::Cell::new(0),
+    };
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("first", &frontend, &frontend, &CancellationToken::new()))?;
+    block_on(harness.submit_turn("second", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        harness.agent.provider.calls.get(),
+        3,
+        "overflow retries exactly once"
+    );
+    assert!(
+        harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("recovered")),
+        "retried turn completes after compaction"
+    );
+    // The covered bulk was compacted into a summary and the user was told.
+    assert!(
+        harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("auto-compacted summary")),
+        "compaction summary installed"
+    );
+    let events = frontend.events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.contains("compacted older context and retrying")
+        )),
+        "recovery notice emitted"
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_non_overflow_error_is_not_retried() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // One plain provider error; a retry would pop "unexpected call" instead.
+    let provider = FakeProvider::new(vec![Err("boom")]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    let error = block_on(harness.submit_turn(
+        "hi",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))
+    .unwrap_err();
+
+    assert!(error.to_string().contains("boom"), "{error:#}");
+    assert_eq!(
+        harness.agent.provider.seen.borrow().len(),
+        1,
+        "a non-overflow error must not trigger a retry"
+    );
+    Ok(())
+}
+
+#[test]
 fn turn_persists_transcript_when_log_attached() -> Result<()> {
     let workspace = test_workspace()?;
     let root = test_workspace()?; // separate temp dir as the session root

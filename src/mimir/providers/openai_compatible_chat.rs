@@ -208,7 +208,18 @@ impl OpenAiCompatibleChatProvider {
             };
         }
         let retry_after = retry_after_hint(response.headers());
-        let _ = response.text();
+        // The body is read only to classify a context-window overflow (issue
+        // #211); its text is never surfaced.
+        let body = response.text().unwrap_or_default();
+        if status.as_u16() == 400 && crate::errors::body_indicates_context_overflow(&body) {
+            return Attempt::Fatal(
+                crate::errors::ContextOverflowError::new(format!(
+                    "OpenAI-compatible request failed ({status}): conversation exceeds the \
+                     model's context window"
+                ))
+                .into(),
+            );
+        }
         if matches!(status.as_u16(), 401 | 403) {
             return Attempt::Fatal(
                 AuthError::for_provider(

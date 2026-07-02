@@ -144,9 +144,21 @@ impl AntigravityProvider {
         }
 
         let body = response.text().unwrap_or_default();
-        let error = match crate::telemetry::sanitize_external_body(&body) {
-            Some(detail) => anyhow!("Antigravity request failed ({status}): {detail}"),
-            None => anyhow!("Antigravity request failed ({status})"),
+        let error = if status.as_u16() == 400
+            && crate::errors::body_indicates_context_overflow(&body)
+        {
+            // Typed so the harness can compact-and-retry (issue #211); the raw
+            // body classification never surfaces its text.
+            crate::errors::ContextOverflowError::new(format!(
+                "Antigravity request failed ({status}): conversation exceeds the model's \
+                 context window"
+            ))
+            .into()
+        } else {
+            match crate::telemetry::sanitize_external_body(&body) {
+                Some(detail) => anyhow!("Antigravity request failed ({status}): {detail}"),
+                None => anyhow!("Antigravity request failed ({status})"),
+            }
         };
         match classify_http_status(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),

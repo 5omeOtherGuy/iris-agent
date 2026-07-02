@@ -220,7 +220,18 @@ impl OpenAiCodexResponsesProvider {
             endpoint: "/codex/responses",
             last_event_type: None,
         };
-        let error = anyhow!("Codex request failed [{diag}]");
+        let error = if status.as_u16() == 400
+            && (diag.error_code.as_deref() == Some("context_length_exceeded")
+                || crate::errors::body_indicates_context_overflow(&body))
+        {
+            // Typed so the harness can compact-and-retry (issue #211). Only the
+            // classification escapes; the raw body is still dropped.
+            anyhow::Error::new(crate::errors::ContextOverflowError::new(format!(
+                "Codex request failed [{diag}]: conversation exceeds the model's context window"
+            )))
+        } else {
+            anyhow!("Codex request failed [{diag}]")
+        };
         match classify_http_status_retryable(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
             HttpClass::Retry => Attempt::Retry(error, retry_after),

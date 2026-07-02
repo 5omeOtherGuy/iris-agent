@@ -144,7 +144,14 @@ impl Tool for BashTool {
         Box::pin(async move {
             let root = root(env)?;
             let mut state = state_mut(env)?;
-            bash::execute(&root, args, &mut state.bash, &cancel, env.output_sink)
+            bash::execute(
+                &root,
+                args,
+                &mut state.bash,
+                &cancel,
+                env.output_sink,
+                env.output_store,
+            )
         })
     }
     fn requires_approval(&self) -> bool {
