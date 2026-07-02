@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::io::IsTerminal;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -99,12 +101,48 @@ pub(crate) enum SessionSource {
     Resume(String),
 }
 
+/// Rollback guard for the shared session id that provider builders read. A
+/// session swap must point the provider builder at the target id before the
+/// rebuild, but if the rebuild fails the live session stays unchanged; dropping
+/// this guard before commit restores the previous id so later rebuilds cannot
+/// key a provider to the wrong session.
+pub(crate) struct SessionIdGuard {
+    cell: Rc<RefCell<String>>,
+    previous: String,
+    committed: bool,
+}
+
+impl SessionIdGuard {
+    pub(crate) fn swap(cell: Rc<RefCell<String>>, next: String) -> Self {
+        let previous = cell.replace(next);
+        Self {
+            cell,
+            previous,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionIdGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.cell.replace(self.previous.clone());
+        }
+    }
+}
+
 /// The pieces the harness needs to swap to a different session at the safe
-/// inter-turn boundary: the reopened/new transcript log, the provider-visible
-/// messages to seed, and how many of them are already persisted (0 for a fresh
-/// session, the loaded count for a resume). The provider is rebuilt separately
-/// via [`ModelSwitch::rebuild_provider`] so the new session's id keys it.
+/// inter-turn boundary: a transaction guard for the provider-builder session id,
+/// the reopened/new transcript log, the provider-visible messages to seed, and
+/// how many of them are already persisted (0 for a fresh session, the loaded
+/// count for a resume). The provider is rebuilt separately via
+/// [`ModelSwitch::rebuild_provider`] so the new session's id keys it.
 pub(crate) struct LoadedSource {
+    pub(crate) session_id: SessionIdGuard,
     pub(crate) session_log: Option<SessionLog>,
     pub(crate) messages: Vec<Message>,
     pub(crate) resumed: usize,
@@ -342,12 +380,19 @@ pub(crate) fn run_interactive<P: ChatProvider>(
         match TuiUi::new() {
             Ok(tui) => return run_tui(harness, tui, switch, swap, startup_modal),
             Err(error) => {
+                if startup_modal.is_some() {
+                    bail!(
+                        "could not open resume picker because the TUI is unavailable: {error:#}; run `iris resume --plain` to list sessions"
+                    );
+                }
                 tracing::warn!(error = %format!("{error:#}"), "TUI unavailable; using text UI");
             }
         }
     }
-    // The text/plain path has no modal surface: a startup resume picker is only
-    // meaningful in the interactive TUI, so it is dropped here.
+    // The text/plain path has no modal surface. Bare `iris resume` is routed to
+    // a list before this point whenever the plain renderer is requested or stdio
+    // is not a terminal; if TUI creation fails after requesting a startup modal,
+    // the branch above errors instead of silently starting a fresh session.
     let mut ui = crate::ui::text::TextUi::stdio();
     run_session(harness, &mut ui, switch)
 }
@@ -594,6 +639,22 @@ mod tests {
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
         }
+    }
+
+    #[test]
+    fn session_id_guard_restores_uncommitted_swap_and_keeps_committed_one() {
+        let cell = Rc::new(RefCell::new("old".to_string()));
+        {
+            let _guard = SessionIdGuard::swap(cell.clone(), "new".to_string());
+            assert_eq!(&*cell.borrow(), "new");
+        }
+        assert_eq!(&*cell.borrow(), "old");
+
+        {
+            let mut guard = SessionIdGuard::swap(cell.clone(), "committed".to_string());
+            guard.commit();
+        }
+        assert_eq!(&*cell.borrow(), "committed");
     }
 
     #[test]

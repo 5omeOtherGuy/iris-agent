@@ -213,7 +213,7 @@ fn print_session_list(sessions: &[session::ResumableSession], now_ms: u128) {
         println!(
             "  {}  {:>8}  {}",
             session.meta.id,
-            session::relative_age(now_ms, session.meta.created_ms),
+            session::relative_age(now_ms, session.meta.updated_ms),
             session.preview,
         );
     }
@@ -305,8 +305,8 @@ fn load_session_source(
                     None
                 }
             };
-            *cell.borrow_mut() = id;
             Ok(cli::LoadedSource {
+                session_id: cli::SessionIdGuard::swap(cell.clone(), id),
                 session_log,
                 messages: Vec::new(),
                 resumed: 0,
@@ -326,8 +326,8 @@ fn load_session_source(
                     None
                 }
             };
-            *cell.borrow_mut() = meta.id.clone();
             Ok(cli::LoadedSource {
+                session_id: cli::SessionIdGuard::swap(cell.clone(), meta.id.clone()),
                 session_log,
                 messages: stored.messages,
                 resumed,

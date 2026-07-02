@@ -322,7 +322,7 @@ impl SessionStore {
                 }
             }
         }
-        sessions.sort_by_key(|meta| std::cmp::Reverse(meta.created_ms));
+        sessions.sort_by_key(|meta| std::cmp::Reverse(meta.updated_ms));
         Ok(sessions)
     }
 
@@ -929,8 +929,8 @@ pub(crate) fn new_session_id() -> String {
 }
 
 /// Pick the newest session for `cwd` from a [`list`](SessionStore::list) result.
-/// `metas` is assumed newest-first (as `list` returns), so the first match for
-/// the directory is the most recent one. `None` when the directory has no
+/// `metas` is assumed newest-updated-first (as `list` returns), so the first
+/// match for the directory is the most recently active one. `None` when the directory has no
 /// persisted session. Pure so `iris --continue` selection is unit-tested without
 /// disk.
 pub(crate) fn newest_for_cwd<'a>(metas: &'a [SessionMeta], cwd: &str) -> Option<&'a SessionMeta> {
@@ -987,11 +987,11 @@ fn first_user_preview(path: &Path) -> Option<String> {
 }
 
 /// A short, human-relative age (`just now`, `5m ago`, `3h ago`, `2d ago`) for a
-/// session created at `created_ms`, measured against `now_ms`. Pure so the
-/// picker/list formatting is unit-tested without a clock. A future or malformed
-/// timestamp reads as `just now`.
-pub(crate) fn relative_age(now_ms: u128, created_ms: u128) -> String {
-    let delta = now_ms.saturating_sub(created_ms);
+/// session timestamp, measured against `now_ms`. Pure so the picker/list
+/// formatting is unit-tested without a clock. A future or malformed timestamp
+/// reads as `just now`.
+pub(crate) fn relative_age(now_ms: u128, timestamp_ms: u128) -> String {
+    let delta = now_ms.saturating_sub(timestamp_ms);
     let seconds = delta / 1000;
     if seconds < 60 {
         "just now".to_string()
@@ -1854,5 +1854,25 @@ mod tests {
         assert_eq!(resumable[0].meta.id, here_new.id(), "newest first");
         assert_eq!(resumable[0].preview, "new task");
         assert_eq!(resumable[1].preview, "old task");
+    }
+
+    #[test]
+    fn list_orders_by_recent_activity_not_creation_time() {
+        let dir = temp_dir();
+        let store = SessionStore::with_root(dir.path.clone());
+        let mut older = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        older.append(&Message::user("older created")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        older
+            .append(&Message::assistant("recent activity"))
+            .unwrap();
+
+        let sessions = store.list().unwrap();
+        assert_eq!(sessions[0].id, older.id());
+        assert_eq!(sessions[1].id, newer.id());
+        assert!(sessions[0].created_ms < sessions[1].created_ms);
+        assert!(sessions[0].updated_ms >= sessions[1].updated_ms);
     }
 }

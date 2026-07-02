@@ -172,7 +172,7 @@ pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<Se
         .map(|entry| SessionRow {
             id: entry.meta.id.clone(),
             preview: entry.preview.clone(),
-            age: session::relative_age(now_ms, entry.meta.created_ms),
+            age: session::relative_age(now_ms, entry.meta.updated_ms),
         })
         .collect()
 }

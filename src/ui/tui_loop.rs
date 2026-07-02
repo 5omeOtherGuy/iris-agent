@@ -222,20 +222,20 @@ async fn session_loop<P: ChatProvider>(
 
     tui.screen.apply(UiEvent::SessionStarted);
     refresh_footer(tui, switch);
+    // `iris resume` (no id) on a rich TTY opens the resume picker on start by
+    // handing a pre-built modal here. Open it before the first draw and before
+    // the blocking input reader starts, so the first key acts on a visible
+    // picker.
+    if let Some(modal) = startup_modal {
+        tui.screen.open_modal(modal);
+    }
     tui.draw()?;
-    // Draw once before starting the blocking input reader so the banner is
-    // visible immediately and the terminal surface has its initial dimensions.
+    // Draw once before starting the blocking input reader so the banner/picker
+    // is visible immediately and the terminal surface has its initial dimensions.
     spawn_input_thread(input_tx, current_turn.clone());
 
     // The production OAuth backend; `/login` drives it on a blocking task.
     let login_backend: Arc<dyn LoginBackend> = Arc::new(OAuthLoginBackend);
-
-    // `iris resume` (no id) on a rich TTY opens the resume picker on start by
-    // handing a pre-built modal here; the loop's top-of-iteration modal phase
-    // runs it before the first idle read.
-    if let Some(modal) = startup_modal {
-        tui.screen.open_modal(modal);
-    }
 
     loop {
         // Keep the status footer current: a model/effort change handled in the
@@ -347,7 +347,7 @@ fn perform_swap<P: ChatProvider>(
 ) -> Result<()> {
     // The loader updates the shared session-id cell and opens/creates the target
     // log before returning; the provider rebuild below then reads the new id.
-    let loaded: LoadedSource = match swap(source) {
+    let mut loaded: LoadedSource = match swap(source) {
         Ok(loaded) => loaded,
         Err(error) => {
             apply_notices(tui, vec![format!("could not switch session: {error:#}")]);
@@ -363,6 +363,7 @@ fn perform_swap<P: ChatProvider>(
             }
         }
     }
+    loaded.session_id.commit();
     let resumed = loaded.resumed;
     harness.swap_session(loaded.session_log, loaded.messages, resumed);
     tui.reset_screen();
