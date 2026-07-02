@@ -1,545 +1,136 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Iris implementation notes</title>
+<title>Release-ops validation — implementation notes (issue #252)</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 50rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+  code { background: #f2f2f2; padding: 0 .2em; border-radius: 3px; }
+  .k { color: #b00; font-weight: 600; }
+  li { margin: .35rem 0; }
+</style>
 </head>
 <body>
-<h1>Unified text engine (src/ui/textengine.rs) &mdash; implementation notes</h1>
-<p>Branch <code>feat/text-engine</code>. Records non-obvious decisions, parity risks, and
-reviewer context. Not a step log. This file previously held the merged Anthropic-stream
-notes; it is the per-task notes file and was overwritten for this task.</p>
+<h1>Release-ops validation notes</h1>
+<p>Decisions and discoveries not already explicit in the task spec. Tracking issue
+<strong>#252</strong>; refs PR #233 / issue #199. Concise, factual.</p>
 
-<h2>Base commit / detached-HEAD drift</h2>
-<p>The primary checkout was in <b>detached HEAD at <code>d1d9bce</code></b> = <code>origin/main</code>
-(<code>6b48611</code>) + 1 unmerged commit (<code>feat(tui): compact tool durations ...</code>).
-<code>git diff 6b48611 d1d9bce</code> touches only <code>tui.rs</code>, <code>tui/panel.rs</code>,
-<code>tui/transcript.rs</code> &mdash; none of the files this task consolidates. Per
-<code>AGENTS.md</code> I branched the worktree from a clean base:
-<code>git worktree add ../iris-text-engine -b feat/text-engine origin/main</code>
-(<b>built on <code>6b48611</code></b>). The unmerged commit is unaffected by this change and merges
-independently. The untracked <code>mydiff.txt</code> in the primary was left alone.</p>
-
-<h2>Unit 1 &mdash; the engine module</h2>
+<h2>Environment</h2>
 <ul>
-<li><b>Grapheme crate choice: <code>unicode-segmentation</code> (justified).</b> The Rust stdlib has
-no grapheme-cluster iterator. I empirically confirmed (throwaway test, since removed) that
-<code>unicode-width</code> 0.2.2's <code>UnicodeWidthStr::width</code> on a <em>whole grapheme
-cluster</em> already returns the correct terminal width for ZWJ families, flags, VS16, keycaps, and
-combining marks (e.g. <code>"\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"</code> &rarr; 2). So no
-custom emoji/east-asian table is needed; the only missing primitive is cluster segmentation. A thin
-wrapper over <code>unicode-width</code> alone is insufficient because the bug is that the old
-per-<em>char</em> wrap/truncate loops split clusters (losing the cluster-aware width and emitting
-broken half-emoji). <code>unicode-segmentation</code> is the canonical UAX#29 implementation and is
-<b>already in the build graph transitively via <code>ratatui-core</code></b> (also pulls
-<code>unicode-truncate</code>), so adding it as a direct dep downloads/builds <b>no new crate</b> &mdash;
-it is a direct-dep promotion. Rejected alternatives: <code>textwrap</code>/<code>ansi-width</code>
-(heavier, own width tables, would duplicate <code>unicode-width</code>); hand-rolling UAX#29
-segmentation (forbidden by the reuse ladder).</li>
-<li><b>Two strip variants, one parser.</b> The old code had two divergent <em>handcoded</em>
-strippers. The engine has one scanner (CSI <code>ESC [ &hellip; final</code>; OSC/DCS/PM/APC/SOS
-string controls terminated by BEL or ST; plus the 8-bit C1 forms) exposed through two output
-policies: <code>strip_ansi</code> (removes escape sequences, keeps other chars incl. TAB/CR) and
-<code>clean_text</code> (also drops remaining control chars). <code>clean_text</code> is
-byte-identical to the old <code>tui/text.rs::strip_ansi_for_text</code> (the <code>\r</code>-splitting /
-footer-cleaning path) and is re-exported under that name. <code>strip_ansi</code> matches the intent
-of the old <code>ui/text.rs::strip_ansi</code> for common content; it differs only on malformed /
-non-SGR sequences (e.g. bracketed-paste <code>ESC[200~</code>), where the proper CSI parser is more
-correct than the old "consume until first ASCII letter" loop (which ate the following letter).</li>
-<li><b>display_width is raw (does NOT strip ANSI); visible_width does.</b> The historic
-<code>wrap.rs::display_width</code> was raw <code>UnicodeWidthStr::width</code> and several call sites
-rely on that as a conservative over-estimate (e.g. the tool-output flood guard
-<code>wrapped_row_estimate</code>, which intentionally counts escapes as width). Keeping
-<code>display_width</code> raw preserves that behavior exactly. The new <code>visible_width</code>
-(strip then measure) is the correct measure for escape-bearing strings and is what fixed the
-<code>ui/text.rs</code> bug.</li>
-<li><b>SGR + OSC 8 carry across wrapped lines (Rust model).</b> <code>AnsiState</code> mirrors
-pi-mono's <code>AnsiCodeTracker</code>: each boolean SGR attribute plus fg/bg stored as raw code
-strings (e.g. <code>"38;5;240"</code>), and an <code>Option&lt;Hyperlink&gt;</code>. On each physical
-row break, <code>active_codes()</code> re-emits the open SGR + reopens the OSC 8 link, and
-<code>close_codes()</code> closes the link + resets SGR at row end. The OSC 8 terminator (BEL vs ST)
-is preserved per-link because some terminals only make BEL-terminated links clickable (OAuth URLs use
-BEL) &mdash; reopening with the wrong terminator would break clickability on wrapped rows.</li>
+  <li><span class="k">Network is reachable</span> here (api.github.com returned HTTP 200), unlike the
+      spec's "appeared offline" note. This let me install the pinned <code>dist</code> CLI.</li>
+  <li><code>dist</code> (cargo-dist) was <em>not</em> on PATH; installed <code>cargo install cargo-dist --locked --version 0.28.0</code>
+      (3m34s compile) &rarr; <code>dist 0.28.0</code>. So the tool-driven path (unit 2/3) was taken, not the offline fallback.</li>
+  <li>No git tags, <code>gh release list</code> empty, <code>Cargo.toml</code> version <code>0.1.0</code> &mdash; re-confirmed; no release ever cut.</li>
+  <li>Host target: <code>x86_64-unknown-linux-gnu</code>. aarch64 / darwin targets are not locally buildable here (no cross toolchains); deferred to CI matrix / operator.</li>
 </ul>
 
-<h2>Reserved <code>ansi_aware</code> subsystem (deferred feature, scoped allow)</h2>
-<p>The string-based ANSI-aware <code>wrap_ansi</code> / <code>truncate_ansi</code> /
-<code>slice_by_column</code> (and the tracker/parser they need) are <b>built and unit-tested but not
-wired into any render path</b>. The ratatui span pipeline already carries SGR via
-<code>Span.style</code>, and emitting clickable hyperlinks is explicitly deferred. They live in a
-<code>pub(crate) mod ansi_aware</code> with a single scoped <code>#![allow(dead_code)]</code> (rather
-than a whole-file allow, so genuinely dead production code is still caught). This is the foundation a
-future markdown/hyperlink renderer builds on; today it only <em>preserves</em> OSC 8 (cross-wrap and
-cross-truncate tests prove the link is reopened on every physical row).</p>
-
-<h2>Per-unit migration parity</h2>
+<h2>Unit 2 &mdash; release.yml: keep hand-written, do NOT regenerate</h2>
 <ul>
-<li><b>wrap.rs (unit 2/4):</b> width/truncate/plain-wrap now re-export from the engine; the local
-<code>display_width</code>/<code>char_width</code>/<code>truncate_*</code>/<code>wrap_to_width</code>
-bodies are gone. The char-by-char loops (<code>push_wrapped_line</code>) now iterate grapheme
-clusters via a new <code>push_span_str</code> helper, so for ASCII/CJK output is byte-identical and
-emoji clusters are no longer split. <code>styled_physical_row</code> stays char-based (it matches a
-plain wrapped string back to per-char styled cells; cluster-safe wrap output still yields the same
-chars in order).</li>
-<li><b>tui/text.rs (unit 3):</b> <code>strip_ansi_for_text</code> is now
-<code>textengine::clean_text</code> (byte-identical); the handcoded CSI/string-control consumers were
-removed. <code>ansi_spans</code> still uses <code>ansi-to-tui</code> for ratatui span parsing (kept,
-see below) but routes its strip through the engine.</li>
-<li><b>ui/text.rs (unit 3) &mdash; the documented width-bug fix:</b> <code>visible_width</code> used
-<code>strip_ansi(input).chars().count()</code>, counting a 2-column CJK/emoji glyph as 1. The frame
-in <code>write_frame</code> computes right-border padding from <code>visible_width</code>, so non-ASCII
-diff/title content produced a misaligned (overflowing) right border. Now
-<code>textengine::visible_width</code> (strip + grapheme display width). To avoid a half-fix (review
-finding), the <em>entire</em> <code>write_frame</code> path is now display-column-consistent: the
-fits-check (<code>visible_width</code>), the body hard-wrap (<code>wrap_plain</code> breaks by column
-width, not cluster count), the title truncation (<code>truncate_plain</code> &rarr;
-<code>truncate_to_width</code>), and the top-border fill (<code>visible_width</code> instead of
-<code>chars().count()</code>). <b>Behavioral effect:</b> ASCII output is byte-identical (one cluster ==
-one column); CJK/emoji content that previously overran or misaligned the fixed-width frame now wraps
-and pads to fit. <code>wrap_plain</code> still returns the original ANSI-colored line unchanged when it
-fits, so colored diff lines keep their color.</li>
-<li><b>terminal_surface.rs (unit 5) &mdash; the width-math seam:</b> after the terminal-hardening
-merge, the surface no longer clips lines at the final rendering boundary. It renders spans, strips the
-internal cursor marker, measures visible display width, and fails before writing if upstream layout
-hands it a line wider than the terminal. The old clip helper and clipping-specific test coverage were
-removed; wide-glyph overflow is now covered by a no-terminal-write error test. The diff/replay logic
-still receives sanitized rendered lines.</li>
+  <li><span class="k">Discovery:</span> <code>dist plan</code> refused to run &mdash; the committed <code>release.yml</code>
+      (114 lines, hand-written) diverges from <code>dist generate</code>'s canonical output (~291 lines).</li>
+  <li>The canonical output would <strong>regress three deliberate choices</strong>:
+    <ol>
+      <li>installs <code>dist</code> via <code>curl|sh</code> instead of the pinned <code>cargo install cargo-dist --locked --version</code>
+          (the committed header cites supply-chain posture: crates.io checksum + <code>--locked</code>);</li>
+      <li>drops <code>IRIS_DIST: "1"</code> on the build job &mdash; that env sets the <code>iris_dist</code> cfg marker that
+          <code>update_strategy()</code> requires, so regenerating would <em>silently break self-replace</em>;</li>
+      <li>pins <code>actions/checkout@v4</code> + <code>runs-on: ubuntu-20.04</code>, whereas the whole repo standardizes on
+          <code>checkout@v7</code> + <code>ubuntu-latest</code> (ubuntu-20.04 is retired).</li>
+    </ol></li>
+  <li><span class="k">Decision:</span> keep the hand-written workflow; add cargo-dist's sanctioned escape hatch
+      <code>allow-dirty = ["ci"]</code> to <code>[workspace.metadata.dist]</code>. Verified: with it, <code>dist plan</code> runs
+      cleanly (no <code>--allow-dirty</code> flag) and <code>dist generate --check</code> refuses to clobber the file.
+      Oracle concurred (8/10; main residual risk = future dist upgrades won't force a regen diff, mitigated by the version-sync guard + a runbook note).</li>
+  <li><span class="k">Naming invariant confirmed from cargo-dist itself:</span> <code>dist plan</code> emits
+      <code>iris-agent-&lt;target&gt;.tar.gz</code> + <code>.tar.gz.sha256</code> and installer <code>iris-agent-installer.sh</code>
+      &mdash; exactly what <code>selfupdate.rs::asset_name/checksum_name</code> and <code>install.sh</code> expect.</li>
 </ul>
 
-<h2>ansi-to-tui kept, not replaced</h2>
-<p><code>ansi_spans</code> still uses <code>ansi-to-tui</code> to turn raw ANSI into ratatui
-<code>Span</code>s with proper <code>Style</code>. Replacing it would mean hand-mapping every SGR code
-to a ratatui <code>Style</code> &mdash; out of scope and a regression risk. The task only requires that
-<em>stripping and width</em> go through the engine, which they now do; <code>ansi-to-tui</code> remains
-the span-construction path.</p>
-
-<h2>wayland/mod.rs NOT migrated (deliberate, architecture-driven)</h2>
-<p><code>wayland::truncate_chars</code> (summary <code>MAX_SUMMARY_CHARS</code>/<code>MAX_EXCERPT_CHARS</code>
-bounds) was left in place and is <b>not</b> routed through the engine. Two reasons: (1)
-<code>src/wayland</code> is Tier 2 and <code>docs/ARCHITECTURE.md</code> requires Tier 2 to depend on
-Tier 1 only; routing it to the Tier-3 <code>src/ui</code> engine would create a forbidden upward
-Tier&nbsp;2&rarr;Tier&nbsp;3 dependency. (2) Its semantics differ &mdash; it is a char-count bound on
-stored summary text with a <code>"..."</code> ellipsis, not terminal display-width truncation, so it is
-not the same operation as the engine's width helpers. The prompt's "wayland may consume it" is
-superseded by the tier rule (AGENTS.md: trust the architecture boundary). This is a justified
-deferral, not a skipped migration.</p>
-
-<h2>Test-only strip helpers left in place</h2>
-<p>Three <code>strip_ansi</code> copies remain under <code>#[cfg(test)]</code> (in
-<code>tui.rs</code>, <code>terminal_surface.rs</code>, and a <code>chars().count()</code> assertion in
-<code>modal.rs</code>). They are assertion utilities for rendered-output tests, not production
-parsers. Routing them through the engine risks the carefully-tuned terminal-surface tests for no
-production benefit, so they were left; the production duplicate parsers are gone.</p>
-
-<h2>Review-round fixes (wave 1)</h2>
+<h2>Test seams (needed to exercise real code paths without a public release)</h2>
 <ul>
-<li><b>O(n^2) tokenizer on malformed escapes (high):</b> <code>csi_len</code>/<code>string_control_len</code>
-now return <code>Some(rest.len())</code> for an unterminated sequence instead of <code>None</code>, so a
-dangling introducer is consumed as one zero-width token and the <code>ansi_aware</code> tokenizer stays
-linear on adversarial input. The production strip path (<code>transform</code>) was already single-pass
-linear; this hardens the deferred subsystem before it is wired. Test:
-<code>tokenize_is_linear_on_unterminated_escapes</code>.</li>
-<li><b>slice_by_column style leak (medium):</b> it now tracks an <code>AnsiState</code> and appends
-<code>close_codes()</code> before returning, so a slice ending mid-style does not leak SGR/OSC 8 into the
-next rendered content. Test: <code>slice_by_column_closes_style_and_does_not_leak</code>.</li>
-<li><b>C1 (8-bit) consistency (medium):</b> the tokenizer recognized 8-bit C1 CSI/OSC, but the tracker
-did not. <code>AnsiState::process</code> now also accepts the C1 CSI introducer and <code>parse_osc8</code>
-the C1 OSC introducer, so C1-encoded styles/links carry across wrapped rows.</li>
-<li><b>truncate_ansi ellipsis wider than field (low):</b> guarded so the result never exceeds
-<code>max_width</code> (clips the ellipsis itself).</li>
-<li><b>Dedup/cleanup:</b> <code>cluster_advance</code> is exported from the engine and reused by
-<code>wrap.rs</code> (was duplicated); removed a dead binding in <code>ansi_escape_len</code>.</li>
-<li><b>Added coverage:</b> RGB/256-color SGR carry across wrap, OSC 8 preservation through
-<code>truncate_ansi</code>, and a CJK frame-helper test in <code>ui/text.rs</code>.</li>
+  <li><code>install.sh</code>: added <code>IRIS_RELEASE_BASE_URL</code> override for the artifact base directory (default unchanged =
+      the GitHub releases download URL). Lets the installer hit a local HTTP server over the <em>real</em>
+      download &rarr; sha256-verify &rarr; extract &rarr; atomic-install path. Cleaner than <code>/etc/hosts</code> (no root, no TLS/SNI).</li>
+  <li><code>selfupdate.rs</code>: added a <strong>loopback-only</strong> <code>IRIS_UPDATE_RELEASES_API_URL</code> override for the
+      releases API endpoint. Guard rejects any non-loopback host, so the env var cannot redirect a real user's update to an
+      attacker server. The real <code>reqwest</code> download, <code>sha256_matches</code>, tar extract, and <code>self_replace</code>
+      still run unchanged. This is a narrow test seam, not a rewrite of the update logic.</li>
 </ul>
 
-<h2>Review-round fixes (wave 2)</h2>
+<h2>Unit 3 &mdash; local artifact defect: missing <code>[profile.dist]</code></h2>
 <ul>
-<li><b>C1 ST terminator (U+009C):</b> <code>consume_string_control</code> (production strip path) and
-<code>string_control_len</code>/<code>parse_osc8</code> (engine) now treat the 8-bit C1 String
-Terminator as a valid terminator, not just BEL / 7-bit ST. Previously a C1-ST-terminated OSC/DCS would
-swallow the following visible text. Test added in <code>strip_ansi_handles_osc_with_st_and_bel</code>.</li>
-<li><b>visible_width non-allocating fast path:</b> when the input has no ESC and no 0xC2 lead byte (so no
-escape/C1 sequence is possible) it now sums widths directly instead of allocating a stripped copy.
-Control chars contribute 0 to <code>UnicodeWidthStr</code> either way, so this is identical output with
-no allocation on the common plain-text path.</li>
-<li><b>slice_by_column overflow guard:</b> <code>start + len</code> is now <code>saturating_add</code>.</li>
-<li><b>SGR 21:</b> kept as bold-off to match the pi-mono reference tracker, though ECMA-48 defines 21 as
-double-underline; this is the deferred subsystem and matches prior art. Colon (T.416) SGR sub-parameter
-separators are likewise not parsed (semicolon only) &mdash; noted, out of scope.</li>
+  <li><span class="k">Defect found &amp; fixed:</span> <code>dist build --artifacts=local</code> failed with
+      <em>"profile `dist` is not defined"</em>. The hand-written <code>Cargo.toml</code> never had <code>dist init</code> run
+      against it, so the cargo-dist build profile was missing &mdash; <strong>the real CI release would have failed too.</strong>
+      Added the canonical <code>[profile.dist]</code> (<code>inherits = "release"</code>, <code>lto = "thin"</code>). Rebuild succeeded;
+      produced <code>iris-agent-x86_64-unknown-linux-gnu.tar.gz</code> (5.4 MB) + <code>.sha256</code>; recomputed SHA-256 matches the
+      sidecar; archive contains <code>iris</code> + CHANGELOG/README/LICENSE.</li>
+  <li><span class="k">Discovery:</span> <code>iris</code> has <strong>no <code>--version</code></strong> flag (only
+      <code>help</code>/<code>--help</code>/<code>-h</code> exit 0). The spec/README assume <code>iris --version</code>; the smoke test uses
+      <code>iris --help</code> instead. Adding <code>--version</code> is a reasonable follow-up but out of scope here.</li>
 </ul>
 
-<h2>Deliberately NOT migrated (reviewer findings judged out of scope / not bugs)</h2>
-<p><code>tool_display.rs::fold</code> (<code>MAX_DISPLAY_CHARS</code>) and <code>truncate_inline</code> use
-<code>chars().count()</code>/<code>take()</code>: these are char-count <em>content budgets</em> (how much
-text to show), not display-column layout, so char/grapheme count is the correct semantic &mdash; the same
-reasoning as <code>wayland::truncate_chars</code>. Converting them to display-width would wrongly halve a
-CJK-heavy preview. <code>markdown.rs</code>'s continuation-prefix padding uses <code>chars().count()</code>
-on markers that are ASCII in practice. <code>screen.rs::take_last_display</code> already measures via the
-engine's <code>display_width</code> (it is a reverse-truncate algorithm, not a duplicate width impl).
-<code>wrap.rs::styled_physical_row</code> keeps per-char cells (documented above). None of these are
-production width/ANSI duplicates; leaving them is the smallest-correct scope.</p>
-
-<h2>Performance notes (no production regression)</h2>
-<p>Reviewers flagged allocations in the <code>ansi_aware</code> subsystem (<code>tokenize</code> returning a
-<code>Vec</code>, <code>split(';').collect()</code> in <code>AnsiState::process</code>, per-row
-<code>active_codes</code>/<code>format!</code>, the double tokenize in <code>wrap_ansi</code>). All are in
-the deferred, not-yet-wired subsystem and fine for real SGR input; left for when that path is wired to a
-real feature. The production transcript paths (<code>display_width</code> raw, <code>wrap_to_width</code>
-fast-path, <code>push_wrapped_line</code> per-cluster append) match the prior cost profile &mdash; no
-regression.</p>
-
-<h2>Known minor divergence: TAB width</h2>
-<p>The old <code>ui/text.rs::visible_width</code> counted a literal TAB as 1 (char count); the engine's
-<code>visible_width</code> reports 0 for control chars (TAB included), matching <code>UnicodeWidthStr</code>.
-For tab-indented frame/diff content the right-border padding shifts slightly. Both behaviors are wrong
-without true tab-stop expansion (the terminal renders TAB as a variable-width stop); tab expansion was
-left out of scope. Noted so it reads as a deliberate, bounded delta, not an oversight.</p>
-
-<h2>Reviewer-facing regression risks</h2>
+<h2>Unit 4 &mdash; install.sh defect: global-variable clobber</h2>
 <ul>
-<li><b>Terminal wrap drift:</b> the main risk is any divergence in wrap/truncate output for existing
-content. Mitigated by keeping <code>display_width</code> raw, preserving each migrated function's
-algorithm, and grapheme==char width equality for ASCII/CJK/single-emoji/combining (verified). Only
-ZWJ/flag/multi-RI sequences and the documented <code>ui/text.rs</code> CJK frame-overflow fix change
-output, all toward correctness.</li>
-<li><b>let-chains:</b> three <code>collapsible_if</code> sites in the engine use
-<code>if A &amp;&amp; let &hellip;</code> let-chains (already used elsewhere in the tree); the tokenizer
-escape-introducer OR-group is bound to a local first to keep <code>&amp;&amp;</code>/<code>||</code>
-precedence correct.</li>
-</ul>
-<hr>
-<h2>Built-in ToolRenderer registry — implementation notes</h2>
-<p>Non-obvious decisions and discoveries only. Organized by unit. Not a step log.</p>
-
-<h2>Base / working state</h2>
-<ul>
-  <li>Primary checkout was in <b>detached HEAD at <code>d1d9bce</code></b> (origin/main
-      <code>6b48611</code> +1 unmerged commit "compact tool durations, expand hint, intra-line diff
-      highlights" touching <code>panel.rs</code>/<code>transcript.rs</code>/<code>tui.rs</code>).
-      <code>git fetch</code> succeeded; <code>origin/main</code> = <code>6b48611</code>.</li>
-  <li>Built the worktree from <b><code>origin/main</code></b> per AGENTS.md:
-      <code>git worktree add ../iris-tool-renderers -b feat/tool-renderer-registry origin/main</code>.
-      So <code>panel.rs</code> in this worktree is the clean origin/main variant (336 lines, the
-      <code>tool_panel_title</code>/<code>tool_panel_meta</code>/<code>explore_*</code> taxonomy the
-      prompt cites), NOT the unmerged compact-diff variant. Line numbers in the prompt were from the
-      detached variant and drifted; worked from observed code.</li>
-  <li>Both <code>~/vendor/pi-mono</code> reference paths exist and were read.</li>
-  <li><b>Mid-task base shift &mdash; rebased onto the now-merged #170.</b> After the work was first
-      written and reviewed, <code>origin/main</code> advanced <code>6b48611 -&gt; a77c97f</code>: the
-      formerly-unmerged compact-diff commit landed as <b>#170</b> ("compact durations, ctrl+o output
-      reveal, intra-line diff highlights") plus #171. #170 rewrote the exact functions this refactor
-      touches. The two feature commits were squashed and <b>rebased onto current
-      <code>origin/main</code></b>; <code>panel.rs</code>/<code>tui.rs</code> auto-merged,
-      <code>transcript.rs</code> was reset to #170 and the registry wiring re-applied on top.</li>
-  <li><b>FoldVis integration.</b> #170 added a <code>FoldVis</code> row-tag system (<code>Always</code>
-      /<code>WhenCollapsed</code>/<code>WhenExpanded</code>): capped tool output emits a collapsed
-      preview <i>and</i> the full output so <code>ctrl+o</code> toggles between them, and the panel
-      header is marked a collapsed preview via <code>mark_panel_preview</code>. <code>PanelBody</code>
-      was made fold-aware (ports #170's <code>push_tool_output</code>/<code>_tail</code> + fold hints +
-      <code>right_align_hint</code>); <code>append_tool_panel</code> detects a foldable body (any row
-      with <code>fold != Always</code>) and calls <code>mark_panel_preview</code>, reproducing #170's
-      behavior under the registry. Durations are now compact (<code>format_elapsed_compact</code>) and
-      the hint reads <code>ctrl+o to expand</code>/<code>to collapse</code> &mdash; all inherited from
-      #170, not changed here. Byte-identity target is now #170's output, verified by its snapshot
-      tests which pass unchanged.</li>
+  <li><span class="k">Defect found &amp; fixed:</span> POSIX <code>sh</code> functions have no local scope, so
+      <code>verify_checksum()</code> assigned to a bare <code>archive</code> (= the full workdir path), <strong>clobbering
+      <code>main()</code>'s <code>archive</code></strong>. The later <code>tar -xzf "$workdir/$archive"</code> then got a doubled path
+      (<code>/tmp/x//tmp/x/iris-agent-...tar.gz</code>) and every real install failed. PR #233 only ran <code>shellcheck</code> (clean)
+      and never executed the installer &mdash; exactly the gap this validation closes. Fixed by giving the function
+      underscore-prefixed names (<code>_vc_archive</code> etc.).</li>
+  <li>Validated against the real unit-3 artifact over a local HTTP server (<code>IRIS_RELEASE_BASE_URL</code> override):
+      happy path installs + <code>iris --help</code> exits 0; a corrupted <code>.sha256</code> hard-fails with no install; the
+      off-PATH note is emitted.</li>
 </ul>
 
-<h2>Unit 1 — ToolRenderer trait + module (src/ui/tui/tool_render.rs)</h2>
+<h2>Unit 5 &mdash; iris update self-replace (real code path)</h2>
 <ul>
-  <li><b>Returns panel primitives, not a Component.</b> Iris has no Component/Container abstraction
-      (separate deferred task), so the trait returns Iris's existing render units:
-      <code>title -&gt; &amp;'static str</code>, <code>header_meta/plain_meta -&gt; String</code>, and
-      <code>body -&gt; Vec&lt;TranscriptRow&gt;</code> (the rows between the separator and the bottom
-      border). This mirrors pi-mono's renderCall (title/meta) + renderResult (body) split without
-      adopting its Component return type.</li>
-  <li><b>renderShell default|self.</b> Modeled as <code>ToolPanelKind { Explore, Shell, Generic }</code>.
-      Shell is the "self-framing" case (emits its own <code>$ target</code> command row + cursor);
-      Explore/Generic/Edit use the standard panel body. <code>kind()</code> drives the stateful
-      dispatch path in transcript.rs (replacing <code>is_exploration_tool</code> and
-      <code>call.name == "bash"</code> branches).</li>
-  <li><b>No rendererState object.</b> pi-mono keeps a long-lived <code>rendererState</code> per tool
-      row; Iris keeps cross-frame state (expansion, live output buffer, exploration grouping) in
-      retained transcript rows. Renderers are pure functions over
-      <code>(ctx, call, outcome)</code>. Divergence noted and intentional.</li>
-  <li><b>tool_display reused, not duplicated.</b> Renderers call
-      <code>summarize</code>/<code>run_target</code>/<code>exploration_summary</code>/<code>display_path</code>
-      from <code>src/tool_display.rs</code>. The name&rarr;renderer map in <code>resolve()</code> is the
-      single source for the TUI surface.</li>
+  <li>Used the real dist-built binary (v0.1.0, <code>IRIS_DIST=1</code> + <code>self-update</code>) as the running exe, a local
+      mock of <code>releases/latest</code> (<code>IRIS_UPDATE_RELEASES_API_URL</code>, loopback-only), and a replacement archive whose
+      <code>iris</code> is the same binary + a trailing sentinel (ELF ignores it) so a successful swap is observable by a changed
+      SHA-256. The real <code>reqwest</code> download, <code>sha256_matches</code> over real bytes, tar extract, and <code>self_replace</code>
+      all run.</li>
+  <li>Proven: (A) newer tag &rarr; downloads, verifies, self-replaces (hash changes S&rarr;S'); (B) tag == running version &rarr;
+      "Already on the latest", binary untouched; (C) corrupted <code>.sha256</code> &rarr; "refusing to install", binary unchanged.
+      Also: the binary takes the SelfReplace strategy (not the cargo fallback), and the loopback guard rejects
+      <code>https://evil.example.com</code>.</li>
+  <li>Source-build fallback (<code>update_strategy() == CargoInstall</code> when the marker/feature are off) is unchanged &mdash;
+      covered by the existing <code>select_strategy_*</code> unit tests, untouched.</li>
 </ul>
 
-<h2>Unit 2 — Built-in renderers</h2>
+<h2>Deferrals (operator-gated / externally visible / environment-limited)</h2>
 <ul>
-  <li><b>EXPLORE is a single-row adapter, not a normal body.</b> Per oracle review: the grouped
-      EXPLORE panel stores one body-row index and replaces it in place, so EXPLORE's
-      <code>body()</code> returns exactly one TranscriptRow. The grouping/aggregate-header machinery
-      stays in transcript.rs; only meta + the summary line come from the renderer.</li>
-  <li><b>Shell Running body depends on whether output exists.</b> <code>begin_exec</code> (empty
-      stream) emits <code>$ target</code> + cursor with NO <code>(no output)</code>; the relayout path
-      (non-empty stream) emits <code>$ target</code> + output-tail + cursor. Encoded as: skip the
-      output-tail when <code>streamed.is_empty()</code>. This is the one easy place to break
-      byte-identical output.</li>
-  <li><b>One intentional micro-divergence (reviewer-facing regression risk).</b> The old code had two
-      empty-output behaviors: <code>begin_exec</code> never emitted <code>(no output)</code>, but
-      <code>relayout_active_running</code> used <code>push_tool_output_tail</code> which emits
-      <code>(no output)</code> for an empty buffer. <code>relayout</code> only runs after a chunk is
-      appended, so its buffer is non-empty in every reachable state; the unified Shell Running body is
-      therefore byte-identical for all reachable states and matches <code>begin_exec</code> exactly.
-      The only divergence is a degenerate, untested path (provider sends an <i>empty</i> first
-      <code>ToolOutputDelta</code> chunk): old code would show <code>(no output)</code> above the live
-      cursor, new code shows none. Judged better; not worth a distinguishing flag. No snapshot covers
-      it.</li>
-  <li><b>Hidden-affordance literal.</b> Kept <code>"ctrl+o toggles panel"</code> to stay
-      byte-identical with the origin/main base; the sibling detached-<code>d1d9bce</code> worktree's
-      <code>"ctrl+o to expand"</code> belongs to that unmerged commit, not this base.</li>
-  <li>Generic/Edit share one body; they differ only in title (EDIT vs TOOL). Generic Cancelled has
-      no body rows; Shell Cancelled keeps only <code>$ target</code> (+ streamed tail if any).</li>
+  <li><span class="k">Public <code>v*</code> tag + GitHub release</span> &mdash; externally visible, irreversible; runbook step.</li>
+  <li><span class="k"><code>CARGO_REGISTRY_TOKEN</code> + crates.io publish</span> &mdash; repo-admin secret; runbook step.</li>
+  <li><span class="k">aarch64 / macOS artifacts</span> &mdash; no cross toolchains locally; built by the CI matrix. Only the
+      x86_64-linux host target was built here. Naming for all four targets is confirmed from <code>dist plan</code>.</li>
+  <li><span class="k">Live <code>curl | sh</code> on a clean OS image</span> &mdash; no clean image reachable in-session; runbook step.</li>
 </ul>
 
-<h2>Unit 3 — Registry + dispatch / PanelBody</h2>
+<h2>Review hardening</h2>
 <ul>
-  <li><b>PanelBody builder.</b> The body helpers (<code>push_panel_body</code>,
-      <code>push_tool_output</code>, <code>push_tool_output_tail</code>, hidden-affordance, output-line
-      gutter) were moved into a short-lived <code>PanelBody { width, rows }</code> builder so both
-      renderers and the thin transcript wrappers use one implementation (no duplicated flood-cap
-      logic). transcript.rs methods now delegate to PanelBody.</li>
+  <li>Independent review flagged that the loopback override guarded only the <em>metadata</em> request, not the asset
+      download URLs from the response. Tightened: when <code>IRIS_UPDATE_RELEASES_API_URL</code> is active, the archive and
+      checksum URLs are also loopback-checked before download, so the override can't pull artifacts from a remote host.
+      The default (unset) path still trusts GitHub's real download URLs.</li>
+  <li><code>install.sh</code>'s <code>IRIS_RELEASE_BASE_URL</code> fetches archive <em>and</em> checksum from the same base, so it is a
+      trust override by nature; documented as such (validation, not untrusted mirrors) rather than loopback-restricted,
+      since setting it is equivalent to editing the script the user already runs.</li>
+  <li><code>scripts/validate-dist.sh</code> now uses a <code>sha256sum</code>/<code>shasum -a 256</code> fallback so the reproducer runs on
+      macOS (a supported target), matching <code>install.sh</code>'s own fallback.</li>
 </ul>
 
-<h2>Unit 4 — Failure isolation</h2>
+<h2>Follow-up risks</h2>
 <ul>
-  <li><b>catch_unwind at the body boundary.</b> <code>render_body</code> wraps
-      <code>renderer.body()</code> in <code>std::panic::catch_unwind(AssertUnwindSafe(..))</code> and
-      falls back to <code>GenericRenderer</code> on panic. Renderers return a freshly-built Vec, so a
-      panic discards a partial body cleanly and never corrupts <code>Transcript::rows</code> (nothing
-      shared is mutated inside the caught closure). Used <code>Result</code>-free panic catching
-      rather than a fallible trait because built-in renderers do not return errors; the seam exists
-      for the deferred extension phase where third-party renderers may panic.</li>
-  <li><b>Stderr tradeoff.</b> The default panic hook still prints a backtrace to stderr on a caught
-      panic; tests silence it with <code>set_hook</code>/<code>take_hook</code>. Did not swap the hook
-      per-render in production (racy/global); accepted as a rare-path cosmetic concern.</li>
-  <li><b>EXPLORE fallback note.</b> EXPLORE also routes through <code>render_body</code>; if its
-      renderer ever panicked the generic fallback could yield a non-single-row body, but built-in
-      EXPLORE never panics, so this only matters for the deferred extension phase.</li>
+  <li>Future <code>cargo-dist</code> upgrades won't force a regenerated-CI diff (because of <code>allow-dirty</code>); the version-sync
+      test catches the pinned-version half, but the operator must re-diff <code>dist generate</code> when bumping
+      <code>cargo-dist-version</code>. Documented in the runbook.</li>
+  <li>Cross-filesystem replace: <code>self_replace</code> + install.sh both stage beside the target for a same-FS rename; a
+      genuinely cross-FS install dir still relies on <code>self_replace</code>'s handling. Not exercised here.</li>
+  <li><code>iris</code> has no <code>--version</code>; users can't confirm the installed version from the CLI. Suggested follow-up.</li>
 </ul>
 
-<h2>Deferrals (named in report)</h2>
-<ul>
-  <li>Extension/custom third-party renderers + public registration API — explicit "later" phase.</li>
-  <li>General Component/Container abstraction — separate task; trait returns existing primitives.</li>
-  <li>Text fallback surface (<code>src/ui/text.rs</code>) — different surface; keeps its own
-      <code>is_exploration_tool</code>/<code>run_target</code> path. <code>is_exploration_tool</code>
-      remains in tool_display only for text.rs; the TUI no longer uses it.</li>
-  <li>Long-lived per-renderer mutable state object — not needed; state lives in transcript rows.</li>
-</ul>
-<hr>
-<h2>Markdown enrichment + reasoning/thinking blocks</h2>
-
-<h2>Base / working state</h2>
-<ul>
-  <li>Primary checkout was in <strong>detached HEAD at <code>d1d9bce</code></strong> =
-      <code>origin/main</code> (<code>6b48611</code>) + 1 unmerged commit
-      (<em>feat(tui): compact tool durations, expand hint, intra-line diff highlights</em>,
-      touching <code>src/ui/tui.rs</code>, <code>src/ui/tui/panel.rs</code>,
-      <code>src/ui/tui/transcript.rs</code>). <code>git fetch</code> succeeded; no new remote commits.</li>
-  <li>Per <code>AGENTS.md</code> I branched from a clean base:
-      <code>git worktree add ../iris-md-reasoning -b feat/markdown-reasoning origin/main</code>
-      (base <strong><code>6b48611</code></strong>). I did NOT build on the unmerged
-      <code>d1d9bce</code>; its transcript.rs deltas are unrelated to this task and would be
-      re-derived/merged separately.</li>
-  <li>All cited <read_first> files matched the prompt's snapshot at <code>6b48611</code>
-      (line numbers verified against the live files).</li>
-  <li>Both <code>~/vendor/pi-mono</code> reference paths exist and were read.</li>
-  <li>Untracked <code>mydiff.txt</code> in the primary checkout is not part of this task; left untouched.</li>
-</ul>
-
-<h2>Part A — markdown</h2>
-<ul>
-  <li><strong>Theme as patch-composed Styles (not pi-mono's style functions).</strong>
-      <code>MarkdownTheme</code> holds ratatui <code>Style</code> fields plus a <code>base</code>
-      style that is <code>patch</code>-merged under every emitted span (the Rust analogue of
-      pi-mono's <code>defaultTextStyle</code>). Emphasis stacks by patching (heading/bold/italic/
-      strikethrough/quote). <code>MarkdownTheme::default()</code> is constructed so the patched
-      result equals the previous hardcoded <code>dim()</code>/<code>fg(Cyan)</code> output exactly,
-      keeping every existing snapshot byte-identical. Verified by the full pre-existing test set
-      plus <code>default_theme_matches_legacy_inline_code_color</code>.</li>
-  <li><strong>Highlight hook</strong> is <code>Option&lt;Rc&lt;dyn Fn(&amp;str, Option&lt;&amp;str&gt;)
-      -&gt; Vec&lt;Line&gt;&gt;&gt;</code> (no bundled highlighter). To call it I had to buffer the
-      fenced block (capture lang at <code>Start(CodeBlock)</code>, accumulate text, render at
-      <code>End</code>) instead of the old per-<code>Text</code>-event emission. Default (no hook)
-      path preserved; one behavioral nicety: internal blank lines inside code are now kept
-      (the old per-chunk logic dropped them); only the trailing-newline empty segment is dropped.
-      No existing test covered internal blanks.</li>
-  <li><strong>Link styling seam.</strong> <code>theme.link</code> is patched onto link-label spans;
-      default is a no-op <code>Style</code> so output is unchanged, and the seam is proven by
-      <code>link_theme_seam_styles_label</code>. The visible destination is still appended.
-      Raw OSC-8 emission is deferred (see below).</li>
-  <li><strong>Tables need a width but the renderer is width-agnostic by design.</strong> Iris stores
-      pre-rendered rows and re-wraps them per frame; markdown runs once at append time. Tables are the
-      one block that cannot be re-wrapped line-by-line without corrupting the box, so I threaded a
-      table-layout <code>width</code> into <code>render_markdown_themed</code>. <code>pane.rs</code>
-      passes <code>content_width - ASSISTANT_TEXT_PREFIX</code> so a full-width table line plus the
-      <code>"\u25cf "</code>/<code>"  "</code> marker prefix still fits the frame and the downstream
-      word-wrapper is a no-op on table lines. <code>transcript.rs</code> uses <code>last_width</code>
-      (fallback <code>DEFAULT_RENDER_WIDTH=80</code> before the first frame).</li>
-  <li><strong>Table layout.</strong> Column widths = natural cell widths when they fit
-      <code>width - (3*cols+1)</code> border overhead, else proportional shrink with a floor of 1 and
-      rounding-drift fixup (<code>fit_columns</code>). Cells wrap (<code>wrap_plain</code>, word-wrap +
-      hard-break of over-long words) so every physical line fits; row height = tallest cell. Alignment
-      from <code>pulldown_cmark::Alignment</code>. If <code>width</code> is too narrow for a stable box,
-      it falls back to pipe-joined plain rows (<code>narrow_table_falls_back_to_plain_rows</code>).
-      Cells collect <em>plain</em> text (inline emphasis inside cells not preserved) to keep width math
-      and wrapping simple — a deliberate scope cut.</li>
-  <li><strong>Known limitation (documented, not fixed):</strong> because table layout is computed once
-      at append time, a table does not reflow on terminal resize; narrowing can let the generic wrapper
-      break a previously-fitting box. This matches the existing retained-panel behavior. Non-table
-      markdown reflows normally (it is word-wrapped at render time).</li>
-  <li><code>render_markdown(text)</code> (default theme + default width) is now used only by tests, so
-      it is <code>#[cfg(test)]</code> to keep <code>clippy -D warnings</code> clean; production callers
-      use <code>render_markdown_themed</code>.</li>
-</ul>
-
-<h2>Part B — reasoning / thinking blocks</h2>
-<ul>
-  <li><strong>New event is a DISPLAY event, block-level.</strong> <code>AgentEvent::AssistantReasoning
-      { text, redacted }</code> sits with <code>AssistantText</code> (which already carries model text),
-      not the ADR-0020 observability family — so carrying reasoning text is consistent. It is block-level
-      (emitted once per <code>ReasoningBlock</code>) because reasoning is assembled into whole blocks at
-      turn completion; the provider stream exposes no reasoning deltas on this path. See ADR-0025.</li>
-  <li><strong>Storage stays intact (ADR-0016).</strong> Emission was added <em>before</em> the unchanged
-      <code>Message::assistant_reasoning_block(block)</code> push at nexus.rs; the row, its
-      <code>continuity</code>, <code>redacted</code> flag, and <code>ModelOrigin</code> are written
-      exactly as before. Test <code>completed_turn_records_reasoning_and_all_tool_calls_before_results</code>
-      (pre-existing) still passes; new tests assert the row content is preserved alongside emission.</li>
-  <li><strong>Redacted handling.</strong> A redacted block is emitted with empty <code>text</code> +
-      <code>redacted: true</code> — the opaque content is still stored for replay but never leaves Nexus
-      as text and is never rendered (<code>redacted_reasoning_emits_event_without_leaking_text</code>,
-      <code>redacted_reasoning_never_renders_trace_text</code>). The TUI shows a
-      "[reasoning withheld by provider]" placeholder.</li>
-  <li><strong>Thinking block reuses the existing panel + ctrl+o toggle.</strong> Rendered as a panel
-      titled <code>THINKING</code> with a <code>Thinking...</code> right-label, <code>expanded:false</code>
-      by default. The existing collapse render-loop hides the body until the existing
-      <code>toggle_latest_panel</code> (ctrl+o) expands it — no new affordance. Default-collapsed mirrors
-      pi-mono's <code>hideThinkingBlock</code> default and keeps thinking quiet by default. The trace is
-      markdown-rendered with <code>MarkdownTheme::thinking()</code> (dim+italic base). Reasoning events are
-      emitted before the assistant-text event, so the block renders above the answer
-      (<code>reasoning_renders_before_assistant_text</code>).</li>
-  <li><strong>Stop reasons (B8) were already implemented and are preserved, not re-built.</strong> The
-      requested surfacing — reuse <code>completion_reason_notice</code> — already exists at nexus.rs:
-      MaxOutputTokens / ContextWindowExceeded / content-less Refusal emit a <code>Notice</code> after the
-      assistant content (tested), aborted via the interrupt notice, error via the turn-error path. My
-      changes keep this ordering (reasoning -&gt; text -&gt; completion notice). Adding a redundant
-      stop-reason channel would be over-engineering, so none was added.</li>
-  <li><strong>Text fallback (<code>ui/text.rs</code>) ignores reasoning</strong> by design (different
-      surface, out of scope); the arm is explicit so the exhaustive match compiles and the fallback's
-      output is unchanged.</li>
-</ul>
-
-<h2>Deferrals (named) and what unblocks them</h2>
-<ul>
-  <li><strong>Raw OSC-8 hyperlink emission</strong> — deferred. Iris's terminal surface strips control
-      sequences and has no OSC-8 passthrough; that is the text-engine task. This change provides link
-      styling + the <code>theme.link</code> seam only. Unblocked when the text engine adds OSC-8
-      passthrough.</li>
-  <li><strong>Bundled syntax highlighting</strong> — deferred (a dependency decision). The
-      <code>highlight_code</code> hook ships with no built-in implementation; default fenced blocks stay
-      dimmed. Unblocked by a decision to add a highlighter crate that wires a closure into the theme.</li>
-  <li><strong>Images / terminal graphics; the Component / theme object model; markdown in the text
-      fallback</strong> — out of scope (separate tasks/surfaces).</li>
-  <li><strong>Streaming reasoning deltas</strong> — not applicable here; reasoning arrives block-level.
-      Unblocked if a provider/stream surfaces incremental reasoning.</li>
-  <li><strong>Table reflow on resize</strong> — see Part A limitation; unblocked by re-running markdown on
-      resize or storing table source for re-layout.</li>
-</ul>
-
-<h2>Wave-1 review fixes (commit 2)</h2>
-<ul>
-  <li><strong>Streaming + reasoning ordering/duplication (real bug, fixed).</strong> The reasoning
-      apply-arm called <code>finish_stream()</code> (and <code>push_thinking_block</code> used
-      <code>begin_block</code>), which committed the live-streamed answer <em>before</em> the thinking
-      block and then double-committed it when <code>AssistantTextEnd</code> re-committed the same text.
-      Fix: the reasoning arm no longer finishes the stream; <code>push_thinking_block</code> uses
-      <code>push_blank</code> so the panel is inserted above the still-pending stream, which commits
-      once afterwards. Test: <code>reasoning_renders_above_streamed_answer_without_duplication</code>.</li>
-  <li><strong>Streaming table width (real bug, fixed).</strong> <code>render_streaming_assistant</code>
-      is handed the full frame width but passed it straight to table layout; committed rows get the
-      already-inset content width. Fix: streaming reduces by <code>2*TEXT_COLUMN_X_PADDING</code> first
-      so both paths lay out tables at <code>full-10</code>. Test:
-      <code>assistant_table_never_exceeds_frame_width</code> (widths 40/60/80, both paths).</li>
-  <li><strong>Verified false positives (no change):</strong> several reviewers flagged the committed
-      assistant table width and the thinking-block panel width as too wide. Checked the constants:
-      <code>last_width = full - 2*TEXT_COLUMN_X_PADDING = full-8</code> and panel body width =
-      <code>panel_width(full) - PANEL_BODY_CHROME_WIDTH = (full-4) - 4 = full-8</code> are equal, so
-      both already match. No change made (avoided an incorrect double-subtraction).</li>
-  <li><strong>Hardening:</strong> table cell lines are clamped with a width-aware
-      <code>truncate_to_width</code> so an unsplittable wide glyph in a 1-column slot can't push the
-      border out; <code>HardBreak</code> inside a cell becomes a space; table overhead/column-sum use
-      saturating arithmetic.</li>
-</ul>
-
-<h2>Wave-2 review fixes (commit 3)</h2>
-<ul>
-  <li><strong>Nested-table prefix (real bug, fixed).</strong> A GFM table inside a blockquote or
-      list rendered at column 0, dropping the <code>&gt; </code> markers / list indent (confirmed
-      empirically). <code>render_table</code> now computes the block prefix (quote markers +
-      list-continuation spaces), reduces the table layout width by the prefix width, and prepends the
-      styled prefix to every emitted table line. Top-level tables (prefix empty) are unchanged. Tests:
-      <code>blockquoted_table_keeps_quote_prefix</code>, <code>nested_list_table_keeps_indent_and_fits_width</code>.</li>
-  <li><strong>Narrow-table fallback now wraps (fixed).</strong> The pipe-joined fallback previously
-      ignored width; it now wraps each fallback row to the available width so even the fallback never
-      overflows.</li>
-  <li><strong>Verified false positive (no change): thinking-block panel width.</strong> Two reviewers
-      claimed the panel body is <code>W-12</code> vs the <code>W-8</code> used. Checked the code:
-      <code>panel_body_lines</code> uses <code>panel_width(W) - PANEL_BODY_CHROME_WIDTH = (W-4) - 4 =
-      W-8</code>, exactly equal to <code>markdown_content_width()</code> (<code>last_width = W-8</code>).
-      They match; tables in thinking blocks fit. No change.</li>
-  <li><strong>Pre-existing / out of scope (not changed):</strong> <code>panel_end_from</code>
-      terminate-on-missing-Bottom (my panels are always well-formed with a Bottom in one synchronous
-      push, so it cannot loop), the render-loop <code>collapsed</code>-reset for hypothetical nested
-      panels (correct for today's linear panels), <code>ProviderTurnError</code> being display-ignored
-      (unchanged from before), and the streaming markdown re-parse per frame (already per-frame before
-      this work). Inline code ignoring surrounding emphasis and the list-marker-on-first-line behavior
-      are unchanged from the original renderer (the latter is handled by <code>continuation_prefix</code>).</li>
-  <li><strong>Micro-optimizations declined</strong> (per the smallest-correct-change rule): per-row
-      <code>String</code> allocations in table wrap/truncate, <code>MarkdownTheme::default()</code>
-      construction cost, and the single per-code-block <code>Rc</code> clone are negligible relative to
-      the bounded, truncated streaming preview; caching streamed markdown lines is a larger pre-existing
-      optimization left for separate work.</li>
-</ul>
-
-<h2>Reviewer-facing regression risks</h2>
-<ul>
-  <li>Default markdown output parity rests on <code>MarkdownTheme::default()</code> matching the old
-      hardcoded styles and on the code-block buffering change; covered by the full original snapshot set.</li>
-  <li>Width threading: a miscomputed table width could let the wrapper break a box. Guarded by
-      <code>table_lines_fit_render_width</code>.</li>
-  <li>Enabling <code>ENABLE_TABLES</code>/<code>STRIKETHROUGH</code> changes how stray <code>|</code> /
-      <code>~</code> parse; existing prose tests have none and still pass.</li>
-  <li>The new exhaustive <code>UiEvent</code> arm had to be added in <code>ui/mod.rs</code> mapping and
-      <code>ui/text.rs</code>; both done.</li>
-</ul>
-
-<h2>Terminal hardening (pi-mono parity)</h2>
-<ul>
-  <li><strong>Resize redraws:</strong> true terminal resizes now clear the screen and native scrollback,
-      then rebuild the whole Iris document from retained state. First render and normal append/diff updates
-      still preserve scrollback. Termux gets a height-only exception so soft-keyboard height changes do not
-      churn scrollback; width changes still force a full rebuild.</li>
-  <li><strong>Render coalescing:</strong> active-turn redraws are paced to a 16ms minimum interval. The
-      first render after idle remains immediate, but event bursts collapse into one scheduled flush.</li>
-  <li><strong>Over-width safety:</strong> the terminal surface no longer silently clips lines. If upstream
-      layout hands it a line wider than the terminal, rendering fails before writing corrupt output and writes
-      a best-effort diagnostic to <code>tui-crash.log</code> under the Iris crash/data directory (or
-      <code>IRIS_CRASH_LOG_DIR</code> in tests).</li>
-  <li><strong>IME cursor support:</strong> focused composer rendering inserts an internal zero-width cursor
-      marker, which the terminal surface strips before output and uses to position the hardware cursor for
-      IME candidate windows. The visible cursor stays hidden by default because Iris draws its own block
-      cursor.</li>
-  <li><strong>Keyboard protocol lifecycle:</strong> Iris now probes terminal support before pushing Kitty
-      keyboard-enhancement flags, requests disambiguation/event/alternate-key reporting when supported, and
-      pops the protocol only when it was actually negotiated.</li>
-  <li><strong>Integration decision:</strong> stale branch-era diff/transcript rendering was not restored.
-      The merge preserves main's newer panel renderer, folding behavior, diff gutter, and tool-renderer
-      registry while layering the terminal hardening onto the current TUI surface.</li>
-</ul>
 </body>
 </html>

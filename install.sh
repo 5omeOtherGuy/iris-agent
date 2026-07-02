@@ -5,8 +5,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/iris-agent/main/install.sh | sh
 #
 # Environment overrides:
-#   IRIS_INSTALL_DIR   install directory (default: $CARGO_HOME/bin or ~/.local/bin)
-#   IRIS_VERSION       release tag to install (default: latest)
+#   IRIS_INSTALL_DIR       install directory (default: $CARGO_HOME/bin or ~/.local/bin)
+#   IRIS_VERSION           release tag to install (default: latest)
+#   IRIS_RELEASE_BASE_URL  artifact base URL (default: the GitHub release download
+#                          URL for the resolved tag). Trust override: the archive
+#                          AND its checksum are fetched from this base, so it
+#                          delegates install authenticity to that host. Intended
+#                          for local validation, not untrusted remote mirrors.
 #
 # POSIX sh; no bashisms. Artifact names match the cargo-dist config in
 # Cargo.toml, which names archives after the cargo package (`iris-agent`), not
@@ -84,19 +89,23 @@ resolve_version() {
 	printf '%s' "$tag"
 }
 
+# POSIX sh functions have no local scope, so this uses underscore-prefixed
+# variable names that do not collide with main()'s `archive`/`base`/etc.
+# (assigning a bare `archive` here would clobber main's and corrupt the later
+# `tar -xzf "$workdir/$archive"`).
 verify_checksum() {
-	archive="$1"
-	sum_file="$2"
-	expected=$(awk '{print $1; exit}' "$sum_file")
-	[ -n "$expected" ] || err "empty checksum file"
+	_vc_archive="$1"
+	_vc_sum_file="$2"
+	_vc_expected=$(awk '{print $1; exit}' "$_vc_sum_file")
+	[ -n "$_vc_expected" ] || err "empty checksum file"
 	if command -v sha256sum >/dev/null 2>&1; then
-		actual=$(sha256sum "$archive" | awk '{print $1}')
+		_vc_actual=$(sha256sum "$_vc_archive" | awk '{print $1}')
 	elif command -v shasum >/dev/null 2>&1; then
-		actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+		_vc_actual=$(shasum -a 256 "$_vc_archive" | awk '{print $1}')
 	else
 		err "need sha256sum or shasum to verify the download"
 	fi
-	[ "$actual" = "$expected" ] || err "checksum mismatch (expected $expected, got $actual)"
+	[ "$_vc_actual" = "$_vc_expected" ] || err "checksum mismatch (expected $_vc_expected, got $_vc_actual)"
 }
 
 main() {
@@ -108,7 +117,11 @@ main() {
 	version=$(resolve_version)
 	dir=$(install_dir)
 	archive="$PKG-$target.tar.gz"
-	base="https://github.com/$REPO/releases/download/$version"
+	# Base directory that holds the archive + checksum. Defaults to the GitHub
+	# release download URL; an override points at a local server (trailing slash
+	# trimmed so "$base/$archive" is well-formed either way).
+	base="${IRIS_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download/$version}"
+	base="${base%/}"
 
 	say "installing $BIN $version ($target) to $dir"
 

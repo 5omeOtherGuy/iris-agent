@@ -46,6 +46,58 @@ fn select_strategy(dist_build: bool, self_update_feature: bool) -> UpdateStrateg
 #[allow(dead_code)]
 pub const TARGET: &str = env!("IRIS_TARGET");
 
+/// GitHub "latest release" endpoint queried by the self-replace path.
+const RELEASES_API: &str = "https://api.github.com/repos/5omeOtherGuy/iris-agent/releases/latest";
+
+/// Env var that redirects the releases-API query to a local mock server for
+/// validation. Intentionally *loopback-only* (see [`ensure_loopback_url`]): it
+/// exists so the real download/verify/replace path can be exercised against a
+/// local server without cutting a public release, and must never let a stray
+/// env var redirect a real user's update to an attacker-controlled host.
+const RELEASES_API_ENV: &str = "IRIS_UPDATE_RELEASES_API_URL";
+
+/// Resolve the releases-API URL: the pinned GitHub endpoint by default, or a
+/// loopback override from [`RELEASES_API_ENV`] when set. A non-loopback or
+/// malformed override is a hard error rather than a silent fallback, so the
+/// override cannot be abused to point updates at a remote host.
+#[allow(dead_code)]
+pub fn releases_api_url() -> anyhow::Result<String> {
+    match std::env::var(RELEASES_API_ENV) {
+        Ok(url) if !url.is_empty() => {
+            ensure_loopback_url(&url)?;
+            Ok(url)
+        }
+        _ => Ok(RELEASES_API.to_owned()),
+    }
+}
+
+/// Accept only `http`/`https` URLs whose host is loopback (`localhost` or a
+/// loopback IP). Used to constrain [`RELEASES_API_ENV`].
+#[allow(dead_code)]
+fn ensure_loopback_url(url: &str) -> anyhow::Result<()> {
+    use anyhow::{bail, ensure};
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid {RELEASES_API_ENV}: {e}"))?;
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "{RELEASES_API_ENV} must be http(s)"
+    );
+    // Strip the brackets around an IPv6 literal (`[::1]`) so it parses as an IP.
+    let host = parsed.host_str().unwrap_or_default();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !is_loopback {
+        bail!("{RELEASES_API_ENV} must point to localhost/loopback, got {host:?}");
+    }
+    Ok(())
+}
+
 /// Release archive name for a target triple. cargo-dist names archives after
 /// the cargo package (`iris-agent`), not the binary (`iris`), so this matches
 /// its `unix-archive = ".tar.gz"` output (`iris-agent-<target>.tar.gz`).
@@ -95,10 +147,10 @@ mod imp {
     use reqwest::blocking::Client;
     use serde::Deserialize;
 
-    use super::{TARGET, asset_name, checksum_name, parse_expected_sha256, sha256_matches};
+    use super::{
+        TARGET, asset_name, checksum_name, parse_expected_sha256, releases_api_url, sha256_matches,
+    };
 
-    const RELEASES_API: &str =
-        "https://api.github.com/repos/5omeOtherGuy/iris-agent/releases/latest";
     const USER_AGENT: &str = concat!("iris-agent/", env!("CARGO_PKG_VERSION"));
 
     #[derive(Deserialize)]
@@ -125,8 +177,16 @@ mod imp {
             .timeout(Duration::from_secs(120))
             .build()?;
 
+        let releases_api = releases_api_url()?;
+        // When the releases API is redirected to a loopback mock (validation
+        // only), constrain the asset download URLs to loopback too, so the
+        // override cannot be used to pull the archive/checksum from a remote
+        // host. The default (unset) path trusts GitHub's real download URLs.
+        let override_active = std::env::var(super::RELEASES_API_ENV)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
         let release: Release = client
-            .get(RELEASES_API)
+            .get(&releases_api)
             .header("Accept", "application/vnd.github+json")
             .send()?
             .error_for_status()
@@ -144,6 +204,10 @@ mod imp {
             .with_context(|| format!("release {} has no asset {archive}", release.tag_name))?;
         let checksum_url = asset_url(&release.assets, &checksum)
             .with_context(|| format!("release {} has no asset {checksum}", release.tag_name))?;
+        if override_active {
+            super::ensure_loopback_url(archive_url)?;
+            super::ensure_loopback_url(checksum_url)?;
+        }
 
         println!("Downloading {} ...", release.tag_name);
         let archive_bytes = download(&client, archive_url)?;
@@ -305,4 +369,112 @@ mod tests {
         assert!(sha256_matches(b"", &empty.to_ascii_uppercase()));
         assert!(!sha256_matches(b"tampered", empty));
     }
+
+    #[test]
+    fn releases_api_url_defaults_to_github_when_unset() {
+        // Serialize env access across tests that mutate IRIS_UPDATE_RELEASES_API_URL.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded under ENV_LOCK; restored by the test.
+        unsafe {
+            std::env::remove_var(RELEASES_API_ENV);
+        }
+        assert_eq!(releases_api_url().unwrap(), RELEASES_API);
+    }
+
+    #[test]
+    fn releases_api_url_accepts_loopback_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for url in [
+            "http://127.0.0.1:8080/latest",
+            "http://localhost:9000/x",
+            "http://[::1]:7000/y",
+        ] {
+            // SAFETY: single-threaded under ENV_LOCK.
+            unsafe {
+                std::env::set_var(RELEASES_API_ENV, url);
+            }
+            assert_eq!(releases_api_url().unwrap(), url, "loopback URL must pass");
+        }
+        unsafe {
+            std::env::remove_var(RELEASES_API_ENV);
+        }
+    }
+
+    #[test]
+    fn releases_api_url_rejects_non_loopback_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for url in [
+            "https://evil.example.com/releases/latest",
+            "http://169.254.169.254/latest", // link-local, not loopback
+            "ftp://127.0.0.1/latest",        // wrong scheme
+            "not-a-url",
+        ] {
+            // SAFETY: single-threaded under ENV_LOCK.
+            unsafe {
+                std::env::set_var(RELEASES_API_ENV, url);
+            }
+            assert!(
+                releases_api_url().is_err(),
+                "non-loopback override must be rejected: {url}"
+            );
+        }
+        unsafe {
+            std::env::remove_var(RELEASES_API_ENV);
+        }
+    }
+
+    /// The release pipeline builds prebuilt binaries with the pinned `dist`
+    /// version from `.github/workflows/release.yml` (`DIST_VERSION`), while the
+    /// dist config lives in `Cargo.toml` (`cargo-dist-version`). If they drift,
+    /// CI installs a different dist than the config targets and the generated
+    /// artifacts can diverge from what `install.sh` / this module expect. Lock
+    /// them together so the divergence fails the local gate, not a release.
+    #[test]
+    fn dist_version_matches_cargo_dist_version() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let cargo_toml = std::fs::read_to_string(format!("{root}/Cargo.toml")).unwrap();
+        let release_yml =
+            std::fs::read_to_string(format!("{root}/.github/workflows/release.yml")).unwrap();
+
+        let cargo_dist_version = cargo_toml
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("cargo-dist-version = "))
+            .map(|v| v.trim().trim_matches('"'))
+            .expect("cargo-dist-version in [workspace.metadata.dist]");
+        let dist_version = release_yml
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("DIST_VERSION: "))
+            .map(|v| v.trim().trim_matches('"'))
+            .expect("DIST_VERSION in release.yml env");
+
+        assert_eq!(
+            dist_version, cargo_dist_version,
+            "release.yml DIST_VERSION ({dist_version}) must equal Cargo.toml cargo-dist-version ({cargo_dist_version})"
+        );
+    }
+
+    /// `install.sh` downloads `$PKG-$target.tar.gz` with `PKG=iris-agent`; this
+    /// module downloads `asset_name(target)`. Both must equal cargo-dist's
+    /// package-named archive, or a release built by dist would be un-installable
+    /// by one of the two paths. Guard the shared `iris-agent-` prefix + suffix.
+    #[test]
+    fn install_sh_and_asset_name_agree_on_archive_scheme() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let install_sh = std::fs::read_to_string(format!("{root}/install.sh")).unwrap();
+        assert!(
+            install_sh.contains("PKG=\"iris-agent\""),
+            "install.sh must name archives after package iris-agent"
+        );
+        assert!(
+            install_sh.contains("archive=\"$PKG-$target.tar.gz\""),
+            "install.sh archive name must be $PKG-$target.tar.gz"
+        );
+        let asset = asset_name("x86_64-unknown-linux-gnu");
+        assert_eq!(asset, "iris-agent-x86_64-unknown-linux-gnu.tar.gz");
+        assert_eq!(checksum_name(&asset), format!("{asset}.sha256"));
+    }
+
+    use std::sync::Mutex;
+    /// Serializes tests that mutate the process-wide `IRIS_UPDATE_RELEASES_API_URL`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 }

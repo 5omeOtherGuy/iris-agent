@@ -130,3 +130,14 @@ install-path = "CARGO_HOME"
 # Let release-plz own tag creation and version bumps; dist only builds/uploads.
 publish-jobs = []
 pr-run-mode = "plan"
+# CI is hand-maintained (see .github/workflows/release.yml header); tell dist not
+# to treat the divergence from `dist generate` as an error.
+allow-dirty = ["ci"]
+
+# Build profile cargo-dist (dist) uses for release artifacts. cargo-dist builds
+# with `--profile dist`; without this section `dist build` fails with
+# "profile `dist` is not defined". Inherits the release profile and enables thin
+# LTO, matching cargo-dist's `dist init` default.
+[profile.dist]
+inherits = "release"
+lto = "thin"

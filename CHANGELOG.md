@@ -13,12 +13,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crates.io installs, and prebuilt self-update become usable only after the
   first public release/publish; the current pre-release install path is
   `cargo install --git ... --locked` or a source checkout.
+- `install.sh` no longer corrupts the archive path during install. POSIX `sh`
+  has no local scope, so `verify_checksum` assigned a bare `archive` that
+  clobbered the caller's, and the extract step then received a doubled path so
+  every prebuilt install failed. Found running the installer end-to-end for the
+  first time (issue #252).
+- Added the `[profile.dist]` build profile that cargo-dist requires. Without it
+  `dist build` and the release workflow failed with "profile `dist` is not
+  defined" (issue #252).
 - Mutating built-in tools (`bash`, `edit`, `write`) now require approval by
   default, independent of the workspace path/sandbox opt-in. In print mode this
   means they are denied unless `--approve` is passed, so headless runs cannot
   execute them silently.
 
 ### Added
+
+- Validated the prebuilt-binary release path without cutting a public release
+  (issue #252, follows #199/#233): `scripts/validate-dist.sh` builds a real host
+  archive + SHA-256 and exercises the real `install.sh` (download, checksum
+  verify, atomic install) and `iris update` self-replace (download, verify,
+  self-replace, already-latest, checksum-mismatch refusal) against a local
+  server and a mock release response. Regression tests lock the asset/checksum
+  names and the `DIST_VERSION`/`cargo-dist-version` sync; `docs/RELEASING.md` is
+  the operator runbook for the remaining externally-visible steps (public
+  release, crates.io token). `install.sh` gains an `IRIS_RELEASE_BASE_URL`
+  override and `iris update` a loopback-only `IRIS_UPDATE_RELEASES_API_URL`
+  override for local validation. Prebuilt/crates.io installs still become usable
+  only after the operator cuts the first public release.
 
 - Added session shortcuts and pickers (issue #201): `iris -c`/`--continue`
   resumes the newest session for the current directory, `iris resume` opens the
