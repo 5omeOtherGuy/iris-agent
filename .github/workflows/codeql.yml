@@ -6,13 +6,13 @@
 
 name: CodeQL
 
+# Not a PR gate: scans run on pushes to main and weekly, keeping PR merges
+# fast while every landed commit is still analyzed.
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
-    # Weekly Monday scan. Pull requests and pushes are scanned separately.
+    # Weekly Monday scan in addition to per-push scans of main.
     - cron: "24 5 * * 1"
   workflow_dispatch:
 
