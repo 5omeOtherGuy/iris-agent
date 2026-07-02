@@ -88,13 +88,15 @@
 - **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
   settings; supported provider ids are `openai-codex`, `anthropic`, and
   `antigravity`. Project-local settings may override only `defaultModel`,
-  `defaultReasoning`, and `contextTokenBudget`; global settings own provider,
-  base-url, and model-cycle scope so a cloned repo cannot redirect bearer tokens
-  or silently change which provider a session cycles to.
+  `defaultReasoning`, `contextTokenBudget`, and `compactionSummarizer`; global
+  settings own provider, base-url, and model-cycle scope so a cloned repo
+  cannot redirect bearer tokens or silently change which provider a session
+  cycles to.
   OpenAI Codex additionally supports `IRIS_MODEL` and `IRIS_CODEX_BASE_URL` env
   overrides. `contextTokenBudget` configures the auto-compaction threshold,
-  `defaultReasoning` sets startup thinking/effort, and `enabledModels` scopes
-  Ctrl+P model cycling from global/user config only.
+  `compactionSummarizer` picks who writes compaction summaries
+  (`provider`/`excerpts`), `defaultReasoning` sets startup thinking/effort, and
+  `enabledModels` scopes Ctrl+P model cycling from global/user config only.
   [Partial]
 - **Provider-native prompt cache controls** — global-only `promptCacheRetention`
   supports `none`, `short` (default), and `long`. OpenAI receives
@@ -110,6 +112,11 @@
   provider/model/effort pickers, Ctrl+P/Shift+Ctrl+P model cycling,
   Shift+Tab effort cycling, `/settings`, `/scoped-models`, and session-local or
   persisted defaults at safe turn boundaries. [Implemented]
+- **Token-efficient switching** — switches classify as reasoning-only (prefix
+  unchanged, silent), model change, or provider change; a model/provider switch
+  carrying a large context (over a quarter of the budget) advises `/compact`
+  before the new model re-reads it uncached, and foreign-origin reasoning rows
+  are never replayed to any provider after a switch. (ADR-0026) [Implemented]
 - **TUI auth selectors** — `/login` and `/logout` modals show no-secret provider
   status and drive existing OAuth/subscription flows where available. [Implemented]
 - **Session utility commands** — `/session` (transcript file, id, message counts,
@@ -233,10 +240,20 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 - **Durable compaction entries** — JSONL `compaction` entries replace covered
   message-id ranges with summary messages during read/resume rebuild. [Implemented]
 - **Auto-compaction** — when context estimates exceed `contextTokenBudget`, the
-  Wayland harness compacts at safe turn boundaries with a deterministic bounded
-  excerpt summary, retaining recent context and preserving tool-call/result
-  pairs. Provider-quality summaries, manual `/compact`, and branch-aware
-  compaction are planned later. [Implemented]
+  Wayland harness compacts at safe turn boundaries, retaining recent context and
+  preserving tool-call/result pairs. Branch-aware compaction is planned later.
+  [Implemented]
+- **Provider-backed summaries** — the default `compactionSummarizer: provider`
+  asks the active model for a structured handoff summary (goal, state, key
+  facts, next steps), reusing the cached context prefix and normal tool
+  declarations; failures, empty answers, or non-shrinking summaries fall back
+  to the deterministic bounded excerpts (`compactionSummarizer: excerpts` keeps
+  the deterministic stand-in only). Cancellation skips compaction for the turn.
+  (ADR-0026) [Implemented]
+- **Manual `/compact`** — compacts on demand at the inter-turn boundary in the
+  TUI (turn-style spinner, Ctrl-C cancel) and the text path, keeping a small
+  recent tail and reporting the token shrink; works without a budget.
+  [Implemented]
 - **Hierarchical compaction** — layered raw turns, compacted older turns, task
   facts, file-change facts, decisions/blockers, and project memory. [Research]
 - **Freshness rules** — mark summaries stale when underlying files change.

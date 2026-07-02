@@ -940,8 +940,13 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    handle-backed large tool outputs ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)),
    and turn-boundary auto-compaction ([#55](https://github.com/5omeOtherGuy/iris-agent/issues/55)).
    Next: prove the token-efficiency thesis with benchmark evidence, then add the
-   missing consumer slices: selective handle dereferencing, richer micro-summary
-   schema, and provider-quality compaction summaries.
+   missing consumer slices: selective handle dereferencing and a richer
+   micro-summary schema. Done (2026-07-02, ADR-0026): provider-quality
+   compaction summaries (default `compactionSummarizer: provider`, deterministic
+   excerpts as the fallback/floor), a manual `/compact` command in both
+   front-ends, switch-time context-cost advisories on `/model`/picker/cycle
+   switches, and dropping foreign-origin reasoning from every provider request
+   after a model change.
 
 ## Implementation notes backlog
 

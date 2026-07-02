@@ -540,7 +540,11 @@ fn build_chat_messages(system_prompt: &str, messages: &[Message]) -> Vec<Value> 
         match message.role {
             Role::User => out.push(json!({ "role": "user", "content": message.content })),
             Role::Assistant => push_assistant_content(&mut out, &message.content),
-            Role::AssistantReasoning => push_assistant_content(&mut out, &message.content),
+            // Chat Completions has no reasoning replay channel; re-sending
+            // reasoning as assistant content would re-bill the chain-of-thought
+            // as input on every request (ADR-0026), so reasoning rows are
+            // display/persistence-only on this lane.
+            Role::AssistantReasoning => {}
             Role::AssistantToolCall => push_assistant_tool_call(&mut out, message),
             Role::Tool => out.push(json!({
                 "role": "tool",
@@ -748,6 +752,33 @@ mod tests {
         );
         assert_eq!(request["tools"][0]["type"], json!("function"));
         assert_eq!(request["tools"][0]["function"]["name"], json!("read"));
+    }
+
+    #[test]
+    fn reasoning_rows_are_omitted_from_chat_messages() {
+        // Reasoning rows (own or foreign) never re-enter the request: Chat
+        // Completions has no replay channel, so re-sending them as assistant
+        // content would re-bill the chain-of-thought every turn (ADR-0026).
+        let origin = crate::nexus::ModelOrigin::new("openai", API_ID, "gpt-test");
+        let messages = vec![
+            Message::user("go"),
+            Message::assistant_reasoning_block(crate::nexus::ReasoningBlock::new(
+                "internal deliberation",
+                None,
+                false,
+                origin,
+            )),
+            Message::assistant("answer"),
+        ];
+        let out = build_chat_messages("P", &messages);
+        assert_eq!(out.len(), 3, "system + user + one assistant message");
+        assert_eq!(out[2]["role"], json!("assistant"));
+        assert_eq!(out[2]["content"], json!("answer"));
+        assert!(
+            !out.iter()
+                .any(|m| m.to_string().contains("internal deliberation")),
+            "reasoning text must not appear anywhere in the request: {out:?}"
+        );
     }
 
     #[test]

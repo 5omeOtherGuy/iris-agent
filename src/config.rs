@@ -72,6 +72,13 @@ pub(crate) struct Settings {
     /// providers a session talks to, so it is global-only: a cloned repo cannot
     /// silently change the cycle scope.
     pub(crate) enabled_models: Option<Vec<String>>,
+    /// How compaction produces its summary text: `provider` (default) asks the
+    /// active model for a structured handoff summary, falling back to the
+    /// deterministic excerpts on failure; `excerpts` keeps the deterministic
+    /// stand-in only. A cost/quality knob like
+    /// [`Settings::context_token_budget`] (it can only choose who writes the
+    /// summary, never where requests go), so a project file may tune it.
+    pub(crate) compaction_summarizer: Option<String>,
     /// Optional graceful soft cap on tool round-trips per turn. Absent (the
     /// default) leaves the agent loop unbounded: it runs while the model emits
     /// tool calls and stops naturally, with cancellation as the runaway guard.
@@ -162,6 +169,9 @@ impl Settings {
             // Reasoning effort is likewise not a security redirect, so a project
             // may override it; fall back to global.
             default_reasoning: project.default_reasoning.or(self.default_reasoning),
+            // Summarizer choice is a cost/quality knob like the budget (it can
+            // only pick who writes the summary text), so a project may tune it.
+            compaction_summarizer: project.compaction_summarizer.or(self.compaction_summarizer),
             // Prompt cache retention can affect privacy/cost, so keep it
             // global-only like provider/base-url and scoped model sets.
             prompt_cache_retention: self.prompt_cache_retention,
@@ -206,6 +216,23 @@ impl Settings {
     pub(crate) fn context_token_budget(&self) -> u64 {
         self.context_token_budget
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
+    }
+
+    /// Configured compaction summarizer, defaulting to the provider-backed one
+    /// (ADR-0026). An unknown value falls back to the default rather than
+    /// erroring, matching how other tuning knobs degrade.
+    pub(crate) fn compaction_summarizer(&self) -> crate::wayland::SummarizerKind {
+        match self.compaction_summarizer.as_deref() {
+            Some("excerpts") => crate::wayland::SummarizerKind::Excerpts,
+            Some("provider") | None => crate::wayland::SummarizerKind::Provider,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unknown compactionSummarizer; using 'provider'"
+                );
+                crate::wayland::SummarizerKind::Provider
+            }
+        }
     }
 }
 
