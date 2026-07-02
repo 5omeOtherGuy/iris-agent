@@ -637,11 +637,17 @@ impl Screen {
 
     /// Show a gated tool's approval prompt in the status row. The transcript
     /// records the final approval/denial outcome, not the transient prompt.
-    pub(crate) fn show_approval(&mut self, call: &ToolCall, allow_always: bool) {
-        let options = if allow_always {
-            "[y] once  [a] always  [N] deny"
-        } else {
-            "[y] once  [N] deny"
+    pub(crate) fn show_approval(
+        &mut self,
+        call: &ToolCall,
+        allow_always: bool,
+        allow_project: bool,
+    ) {
+        let options = match (allow_always, allow_project) {
+            (true, true) => "[y] once  [a] always  [p] always project  [N] deny",
+            (true, false) => "[y] once  [a] always  [N] deny",
+            (false, true) => "[y] once  [p] always project  [N] deny",
+            (false, false) => "[y] once  [N] deny",
         };
         let shell = call.name == "bash";
         self.approval_hint = Some(ApprovalHint {

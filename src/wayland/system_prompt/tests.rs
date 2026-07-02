@@ -1,15 +1,51 @@
 //! Behavior tests for the fragment/slot system-prompt assembler. Each test
-//! pins one rule from the spec: a regression in parsing, ordering, anchoring,
-//! the empty-body skip, generated blocks, project-doc discovery, or dynamic
-//! context fails exactly here.
+//! pins one rule from the spec: a regression in ordering, anchoring, the
+//! empty-body skip, generated blocks, project-doc discovery, dynamic context,
+//! or the ADR-0026 internal-only guarantee fails exactly here.
 
 use super::*;
+use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::tools::built_in_tools;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    home: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn with_home(home: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let guard = Self {
+            _lock: lock,
+            home: env::var_os("HOME"),
+        };
+        // SAFETY: system_prompt env-sensitive tests run under ENV_LOCK and
+        // restore HOME before releasing it.
+        unsafe { env::set_var("HOME", home) };
+        guard
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        unsafe {
+            match &self.home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+    }
+}
 
 struct TempDir {
     path: PathBuf,
@@ -33,11 +69,10 @@ fn temp_dir() -> TempDir {
     TempDir { path }
 }
 
-fn frag(name: &str, slot: Option<u32>, source: Source, body: &str) -> Fragment {
+fn frag(name: &str, slot: Option<u32>, body: &str) -> Fragment {
     Fragment {
         name: name.to_string(),
         slot,
-        source,
         body: body.to_string(),
     }
 }
@@ -49,176 +84,6 @@ fn at(prompt: &str, tag: &str) -> usize {
         .unwrap_or_else(|| panic!("missing <{tag}> block in:\n{prompt}"))
 }
 
-// ---- Unit 1: frontmatter parse + body extraction --------------------------
-
-#[test]
-fn parses_name_and_slot_from_frontmatter() {
-    let f = parse_fragment(
-        "file",
-        Source::Repo,
-        "---\nname: greeting\nslot: 3\n---\nHello body",
-    );
-    assert_eq!(f.name, "greeting");
-    assert_eq!(f.slot, Some(3));
-    assert_eq!(f.body, "Hello body");
-}
-
-#[test]
-fn unknown_frontmatter_keys_are_ignored() {
-    // Forward-compat: future model/mode/thinking_level keys must not break parse.
-    let raw = "---\nname: x\nslot: 2\nmodel: gpt-5\nthinking_level: high\n---\nbody";
-    let f = parse_fragment("file", Source::Global, raw);
-    assert_eq!(f.name, "x");
-    assert_eq!(f.slot, Some(2));
-    assert_eq!(f.body, "body");
-}
-
-#[test]
-fn missing_name_defaults_to_file_stem() {
-    let f = parse_fragment("my_fragment", Source::Repo, "---\nslot: 1\n---\nb");
-    assert_eq!(f.name, "my_fragment");
-    assert_eq!(f.slot, Some(1));
-}
-
-#[test]
-fn no_frontmatter_uses_whole_file_as_body() {
-    let f = parse_fragment("stem", Source::Repo, "just body text\nsecond line");
-    assert_eq!(f.name, "stem");
-    assert_eq!(f.slot, None);
-    assert_eq!(f.body, "just body text\nsecond line");
-}
-
-#[test]
-fn bom_prefixed_fragment_still_parses_frontmatter() {
-    // A UTF-8 BOM from an editor must not push the frontmatter fence out of
-    // alignment and dump the whole file into the body.
-    let f = parse_fragment(
-        "stem",
-        Source::Repo,
-        "\u{feff}---\nname: x\nslot: 2\n---\nbody",
-    );
-    assert_eq!(f.name, "x");
-    assert_eq!(f.slot, Some(2));
-    assert_eq!(f.body, "body");
-}
-
-#[test]
-fn unparsable_slot_is_treated_as_unslotted() {
-    let f = parse_fragment("stem", Source::Repo, "---\nname: x\nslot: high\n---\nb");
-    assert_eq!(f.slot, None);
-}
-
-#[test]
-fn slot_zero_parses_as_some_zero() {
-    // The off switch is a real slot value, not a parse failure.
-    let f = parse_fragment("stem", Source::Repo, "---\nname: x\nslot: 0\n---\nb");
-    assert_eq!(f.slot, Some(0));
-}
-
-#[test]
-fn description_frontmatter_is_ignored_and_kept_out_of_the_body() {
-    // A description line is metadata: it must not bleed into the rendered body.
-    let raw = "---\nname: custom\nslot: 1\ndescription: why this exists\n---\nactual body";
-    let f = parse_fragment("file", Source::Repo, raw);
-    assert_eq!(f.body, "actual body");
-    assert_eq!(f.name, "custom");
-}
-
-#[test]
-fn body_preserves_internal_blank_lines() {
-    let f = parse_fragment(
-        "stem",
-        Source::Repo,
-        "---\nname: x\n---\npara one\n\npara two\n",
-    );
-    assert_eq!(f.body, "para one\n\npara two");
-}
-
-// ---- Unit 3: ordering rules -----------------------------------------------
-
-#[test]
-fn slotted_fragments_emit_in_ascending_slot_order() {
-    let frags = vec![
-        frag("c", Some(3), Source::Repo, "C"),
-        frag("a", Some(1), Source::Repo, "A"),
-        frag("b", Some(2), Source::Repo, "B"),
-    ];
-    let names: Vec<String> = order_middles(frags).into_iter().map(|f| f.name).collect();
-    assert_eq!(names, vec!["a", "b", "c"]);
-}
-
-#[test]
-fn same_slot_orders_global_before_repo_then_alphabetical() {
-    let frags = vec![
-        frag("zeta", Some(1), Source::Global, ""),
-        frag("beta", Some(1), Source::Repo, ""),
-        frag("alpha", Some(1), Source::Repo, ""),
-        frag("gamma", Some(1), Source::Global, ""),
-    ];
-    let names: Vec<String> = order_middles(frags).into_iter().map(|f| f.name).collect();
-    // Global first (gamma, zeta), then repo (alpha, beta); each group alphabetical.
-    assert_eq!(names, vec!["gamma", "zeta", "alpha", "beta"]);
-}
-
-#[test]
-fn unslotted_fragments_follow_all_slotted_alphabetically() {
-    let frags = vec![
-        frag("zzz", Some(9), Source::Repo, ""),
-        frag("banana", None, Source::Repo, ""),
-        frag("apple", None, Source::Global, ""),
-    ];
-    let names: Vec<String> = order_middles(frags).into_iter().map(|f| f.name).collect();
-    assert_eq!(names, vec!["zzz", "apple", "banana"]);
-}
-
-#[test]
-fn slot_is_a_sort_key_not_a_uniqueness_constraint() {
-    // Two fragments sharing a slot both survive ordering (no dedup).
-    let frags = vec![
-        frag("one", Some(5), Source::Global, "one"),
-        frag("two", Some(5), Source::Global, "two"),
-    ];
-    assert_eq!(order_middles(frags).len(), 2);
-}
-
-#[test]
-fn repo_fragment_overrides_same_name_global() {
-    // A repo .iris/fragments/pragmatism_and_scope.md overrides the materialized
-    // global default of the same name: one block, repo body wins.
-    let frags = vec![
-        frag(
-            "pragmatism_and_scope",
-            Some(2),
-            Source::Global,
-            "global body",
-        ),
-        frag("pragmatism_and_scope", Some(2), Source::Repo, "repo body"),
-    ];
-    let kept = order_middles(frags);
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].body, "repo body");
-
-    // End to end: exactly one rendered block carries the tag, with the repo body.
-    let prompt = build_with(
-        vec![
-            frag("identity", None, Source::Global, "I am iris."),
-            frag(
-                "pragmatism_and_scope",
-                Some(2),
-                Source::Global,
-                "global body",
-            ),
-            frag("pragmatism_and_scope", Some(2), Source::Repo, "repo body"),
-        ],
-        &[],
-    );
-    assert_eq!(prompt.matches("<pragmatism_and_scope>").count(), 1);
-    assert!(prompt.contains("repo body"));
-    assert!(!prompt.contains("global body"));
-}
-
-// ---- Unit 4 + 5: anchoring and empty-body skip ----------------------------
-
 fn build_with(frags: Vec<Fragment>, docs: &[(String, String)]) -> String {
     build_prompt(
         frags,
@@ -229,12 +94,56 @@ fn build_with(frags: Vec<Fragment>, docs: &[(String, String)]) -> String {
     )
 }
 
+// ---- ordering rules ---------------------------------------------------------
+
+#[test]
+fn slotted_fragments_emit_in_ascending_slot_order() {
+    let frags = vec![
+        frag("c", Some(3), "C"),
+        frag("a", Some(1), "A"),
+        frag("b", Some(2), "B"),
+    ];
+    let names: Vec<String> = order_middles(frags).into_iter().map(|f| f.name).collect();
+    assert_eq!(names, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn same_slot_orders_alphabetically() {
+    let frags = vec![
+        frag("zeta", Some(1), ""),
+        frag("beta", Some(1), ""),
+        frag("alpha", Some(1), ""),
+    ];
+    let names: Vec<String> = order_middles(frags).into_iter().map(|f| f.name).collect();
+    assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+}
+
+#[test]
+fn unslotted_fragments_follow_all_slotted_alphabetically() {
+    let frags = vec![
+        frag("zzz", Some(9), ""),
+        frag("banana", None, ""),
+        frag("apple", None, ""),
+    ];
+    let names: Vec<String> = order_middles(frags).into_iter().map(|f| f.name).collect();
+    assert_eq!(names, vec!["zzz", "apple", "banana"]);
+}
+
+#[test]
+fn slot_is_a_sort_key_not_a_uniqueness_constraint() {
+    // Two fragments sharing a slot both survive ordering (no dedup).
+    let frags = vec![frag("one", Some(5), "one"), frag("two", Some(5), "two")];
+    assert_eq!(order_middles(frags).len(), 2);
+}
+
+// ---- anchoring and empty-body skip ------------------------------------------
+
 #[test]
 fn identity_is_first_and_tool_tail_order_is_fixed() {
     let frags = vec![
-        frag("identity", None, Source::Global, "I am iris."),
-        frag("middle", Some(1), Source::Global, "a middle block"),
-        frag("tool_use", None, Source::Global, "tool guidance"),
+        frag("identity", None, "I am iris."),
+        frag("middle", Some(1), "a middle block"),
+        frag("tool_use", None, "tool guidance"),
     ];
     let prompt = build_with(frags, &[]);
     assert!(at(&prompt, "identity") < at(&prompt, "middle"));
@@ -249,9 +158,9 @@ fn anchors_cannot_be_repositioned_by_a_slot() {
     // both, keeping identity first and tool_use in the tail. (slot 1 not 0:
     // slot 0 would disable the fragment entirely -- see slot_zero tests.)
     let frags = vec![
-        frag("tool_use", Some(1), Source::Global, "tail prose"),
-        frag("identity", Some(99), Source::Global, "head"),
-        frag("middle", Some(50), Source::Global, "mid"),
+        frag("tool_use", Some(1), "tail prose"),
+        frag("identity", Some(99), "head"),
+        frag("middle", Some(50), "mid"),
     ];
     let prompt = build_with(frags, &[]);
     assert!(at(&prompt, "identity") < at(&prompt, "middle"));
@@ -261,9 +170,9 @@ fn anchors_cannot_be_repositioned_by_a_slot() {
 #[test]
 fn slot_zero_disables_a_middle_fragment() {
     let frags = vec![
-        frag("identity", None, Source::Global, "id"),
-        frag("off", Some(0), Source::Global, "SHOULD NOT APPEAR"),
-        frag("on", Some(1), Source::Global, "present"),
+        frag("identity", None, "id"),
+        frag("off", Some(0), "SHOULD NOT APPEAR"),
+        frag("on", Some(1), "present"),
     ];
     let prompt = build_with(frags, &[]);
     assert!(
@@ -278,9 +187,9 @@ fn slot_zero_disables_a_middle_fragment() {
 fn slot_zero_disables_even_an_anchor() {
     // "Not active at all" applies uniformly: a disabled anchor emits nothing.
     let frags = vec![
-        frag("identity", Some(0), Source::Global, "DISABLED IDENTITY"),
-        frag("tool_use", Some(0), Source::Global, "DISABLED TAIL"),
-        frag("kept", Some(1), Source::Global, "kept body"),
+        frag("identity", Some(0), "DISABLED IDENTITY"),
+        frag("tool_use", Some(0), "DISABLED TAIL"),
+        frag("kept", Some(1), "kept body"),
     ];
     let prompt = build_with(frags, &[]);
     assert!(!prompt.contains("<identity>"));
@@ -293,26 +202,11 @@ fn slot_zero_disables_even_an_anchor() {
 }
 
 #[test]
-fn description_is_never_rendered_into_the_prompt() {
-    let f = parse_fragment(
-        "file",
-        Source::Repo,
-        "---\nname: custom\nslot: 1\ndescription: SECRET INTENT NOTE\n---\nvisible body",
-    );
-    let prompt = build_with(vec![frag("identity", None, Source::Global, "id"), f], &[]);
-    assert!(prompt.contains("visible body"));
-    assert!(
-        !prompt.contains("SECRET INTENT NOTE"),
-        "description is metadata and must not leak into the prompt"
-    );
-}
-
-#[test]
 fn empty_body_fragment_emits_no_block() {
     let frags = vec![
-        frag("identity", None, Source::Global, "id"),
-        frag("blank", Some(1), Source::Global, "   \n\t  "),
-        frag("kept", Some(2), Source::Global, "present"),
+        frag("identity", None, "id"),
+        frag("blank", Some(1), "   \n\t  "),
+        frag("kept", Some(2), "present"),
     ];
     let prompt = build_with(frags, &[]);
     assert!(!prompt.contains("<blank>"), "empty body must emit nothing");
@@ -321,10 +215,7 @@ fn empty_body_fragment_emits_no_block() {
 
 #[test]
 fn empty_identity_or_tool_use_anchor_emits_nothing() {
-    let frags = vec![
-        frag("identity", None, Source::Global, "  "),
-        frag("tool_use", None, Source::Global, ""),
-    ];
+    let frags = vec![frag("identity", None, "  "), frag("tool_use", None, "")];
     let prompt = build_with(frags, &[]);
     assert!(!prompt.contains("<identity>"));
     assert!(!prompt.contains("<tool_use>"));
@@ -333,30 +224,25 @@ fn empty_identity_or_tool_use_anchor_emits_nothing() {
 }
 
 #[test]
-fn user_authored_generated_block_is_dropped_in_favor_of_the_generated_one() {
-    let frags = vec![frag(
-        "available_tools",
-        Some(1),
-        Source::Repo,
-        "FAKE TOOL LIST",
-    )];
+fn stray_fragment_named_like_a_generated_block_is_dropped() {
+    let frags = vec![frag("available_tools", Some(1), "FAKE TOOL LIST")];
     let prompt = build_with(frags, &[]);
     assert!(!prompt.contains("FAKE TOOL LIST"));
     assert!(prompt.contains("Available tools:"));
 }
 
 #[test]
-fn repo_anchor_overrides_global_anchor() {
+fn take_anchor_consumes_every_match_and_last_one_wins() {
     let mut frags = vec![
-        frag("identity", None, Source::Global, "global identity"),
-        frag("identity", None, Source::Repo, "repo identity"),
+        frag("identity", None, "first identity"),
+        frag("identity", None, "last identity"),
     ];
     let body = take_anchor(&mut frags, "identity");
-    assert_eq!(body.as_deref(), Some("repo identity"));
+    assert_eq!(body.as_deref(), Some("last identity"));
     assert!(frags.is_empty(), "all identity fragments removed");
 }
 
-// ---- Unit 6: generated tool blocks reflect the registry -------------------
+// ---- generated tool blocks reflect the registry ------------------------------
 
 #[test]
 fn available_tools_lists_every_registered_tool_with_the_guardrail() {
@@ -389,7 +275,7 @@ fn tool_guidelines_have_conditional_and_always_bullets() {
     assert!(body.contains("Show file paths clearly when working with files"));
 }
 
-// ---- Unit 7: dynamic context (project docs + date/cwd) --------------------
+// ---- dynamic context (project docs + date/cwd) --------------------------------
 
 #[test]
 fn project_docs_render_in_a_project_context_block_root_to_leaf() {
@@ -414,7 +300,7 @@ fn no_docs_yields_no_project_context_block() {
 #[test]
 fn date_and_cwd_lines_precede_the_tool_tail_with_backslash_normalization() {
     let prompt = build_prompt(
-        vec![frag("identity", None, Source::Global, "id")],
+        vec![frag("identity", None, "id")],
         &built_in_tools(),
         Path::new("C:\\Users\\dev\\proj"),
         &[],
@@ -433,10 +319,7 @@ fn date_and_cwd_lines_precede_the_tool_tail_with_backslash_normalization() {
 fn project_context_appears_between_middles_and_runtime_context() {
     let docs = vec![("/ws/AGENTS.md".to_string(), "be terse".to_string())];
     let prompt = build_prompt(
-        vec![
-            frag("identity", None, Source::Global, "id"),
-            frag("mid", Some(1), Source::Global, "m"),
-        ],
+        vec![frag("identity", None, "id"), frag("mid", Some(1), "m")],
         &built_in_tools(),
         Path::new("/ws"),
         &docs,
@@ -511,183 +394,96 @@ fn discover_rejects_a_symlinked_project_doc() {
     );
 }
 
-// ---- loader + materialization + fallback ----------------------------------
+// ---- ADR-0026: fragments are internal-only ---------------------------------
 
 #[test]
-fn load_dir_missing_is_empty_not_an_error() {
-    let dir = temp_dir();
-    let frags = load_dir(&dir.path.join("does-not-exist"), Source::Repo);
-    assert!(frags.is_empty());
-}
-
-#[cfg(unix)]
-#[test]
-fn load_dir_rejects_a_symlinked_fragments_dir() {
-    use std::os::unix::fs::symlink;
-    // A directory of real .md files that a dir-symlink must not expose.
-    let secrets = temp_dir();
+fn assemble_ignores_repo_fragments_entirely() {
+    // ADR-0026: a repo `.iris/fragments/*.md` is never folded into the prompt.
+    // There is no trust decision to make -- even a workspace that was "trusted"
+    // under the old gate assembles from the internal defaults only.
+    let ws = temp_dir();
+    fs::create_dir_all(ws.path.join(".iris/fragments")).unwrap();
     fs::write(
-        secrets.path.join("leak.md"),
-        "---\nname: leak\n---\nHOST SECRET",
+        ws.path.join(".iris/fragments/injected.md"),
+        "---\nname: injected\nslot: 5\n---\nHOSTILE FRAGMENT",
     )
     .unwrap();
+    fs::write(ws.path.join("AGENTS.md"), "PROJECT DOC CONTENT").unwrap();
 
-    let parent = temp_dir();
-    let link = parent.path.join("fragments");
-    symlink(&secrets.path, &link).unwrap();
-    let frags = load_dir(&link, Source::Repo);
+    let prompt = assemble(&ws.path, &built_in_tools());
     assert!(
-        frags.is_empty(),
-        "a symlinked fragments dir must not be enumerated"
+        !prompt.contains("HOSTILE FRAGMENT"),
+        "repo fragments must never load"
     );
+    assert!(!prompt.contains("<injected>"));
+    assert!(
+        prompt.contains("PROJECT DOC CONTENT"),
+        "project docs still fold in"
+    );
+    // The full internal prompt is present.
+    assert!(prompt.contains("<identity>"));
+    assert!(prompt.contains("<available_tools>"));
 }
 
-#[cfg(unix)]
 #[test]
-fn assemble_rejects_a_repo_fragments_dir_escaping_the_workspace() {
-    use std::os::unix::fs::symlink;
-    let secrets = temp_dir();
+fn assemble_builds_from_internal_defaults() {
+    let ws = temp_dir();
+    let prompt = assemble(&ws.path, &built_in_tools());
+    assert!(prompt.contains("<identity>"));
+    assert!(prompt.contains("You are iris, a coding assistant"));
+    assert!(prompt.contains("<available_tools>"));
+    assert!(prompt.contains("<tool_use>"));
+}
+
+#[test]
+fn assemble_ignores_global_home_fragments_and_writes_nothing_to_home() {
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let global = home.path.join(".iris/fragments");
+    fs::create_dir_all(&global).unwrap();
     fs::write(
-        secrets.path.join("leak.md"),
-        "---\nname: leak\n---\nHOST SECRET",
+        global.join("identity.md"),
+        "---\nname: identity\n---\nGLOBAL HOSTILE IDENTITY",
     )
     .unwrap();
+    let before = fs::read_to_string(global.join("identity.md")).unwrap();
 
     let ws = temp_dir();
-    fs::create_dir_all(ws.path.join(".iris")).unwrap();
-    // .iris/fragments -> a directory outside the workspace.
-    symlink(&secrets.path, ws.path.join(".iris/fragments")).unwrap();
+    let prompt = assemble(&ws.path, &built_in_tools());
 
-    // Even a trusted workspace must not follow an escaping symlink.
-    let prompt = assemble(&ws.path, &built_in_tools(), true);
     assert!(
-        !prompt.contains("HOST SECRET"),
-        "an escaping repo fragments dir must not be read into the prompt"
+        !prompt.contains("GLOBAL HOSTILE IDENTITY"),
+        "global ~/.iris/fragments must not be read"
     );
-    // Still a complete prompt (shipped defaults / global), never a leak.
-    assert!(prompt.contains("<identity>"));
-}
-
-#[cfg(unix)]
-#[test]
-fn load_dir_rejects_a_symlinked_fragment_file() {
-    use std::os::unix::fs::symlink;
-    let outside = temp_dir();
-    let secret = outside.path.join("secret.md");
-    fs::write(&secret, "---\nname: leaked\n---\nTOP SECRET").unwrap();
-
-    let dir = temp_dir();
-    // A workspace-controlled .iris/fragments/*.md that symlinks to a host file
-    // must not be loaded into the prompt.
-    symlink(&secret, dir.path.join("evil.md")).unwrap();
-    let frags = load_dir(&dir.path, Source::Repo);
-    assert!(frags.iter().all(|f| !f.body.contains("TOP SECRET")));
-}
-
-#[test]
-fn template_fragment_ships_disabled_and_is_never_rendered() {
-    // The template materializes into ~/.iris/fragments for discoverability but
-    // carries slot 0, so it must stay out of the assembled prompt.
-    assert!(
-        DEFAULTS
-            .iter()
-            .any(|d| d.name == "template" && d.slot == Some(0))
-    );
-    let prompt = build_prompt(
-        default_fragments(),
-        &built_in_tools(),
-        Path::new("/tmp/iris"),
-        &[],
-        "2026-06-18",
-    );
-    assert!(!prompt.contains("<template>"));
-    assert!(!prompt.contains("This file is a copy-ready template"));
-}
-
-#[test]
-fn template_is_materialized_to_disk_with_slot_zero() {
-    let dir = temp_dir();
-    let frag_dir = dir.path.join("fragments");
-    materialize_defaults(&frag_dir).unwrap();
-    let contents = fs::read_to_string(frag_dir.join("template.md")).unwrap();
-    assert!(contents.contains("name: template"));
-    assert!(contents.contains("slot: 0"));
-    // Re-parsing it yields a disabled fragment (Some(0)).
-    let loaded = load_dir(&frag_dir, Source::Global);
-    assert!(
-        loaded
-            .iter()
-            .any(|f| f.name == "template" && f.slot == Some(0))
-    );
-}
-
-#[test]
-fn every_shipped_default_has_a_description() {
-    assert!(
-        DEFAULTS.iter().all(|d| !d.description.trim().is_empty()),
-        "each shipped default must document its intent"
-    );
-}
-
-#[test]
-fn materialized_default_files_carry_a_description_kept_out_of_the_body() {
-    let dir = temp_dir();
-    let frag_dir = dir.path.join("fragments");
-    materialize_defaults(&frag_dir).unwrap();
-
-    let identity = fs::read_to_string(frag_dir.join("identity.md")).unwrap();
-    assert!(
-        identity.contains("description: Who iris is"),
-        "materialized frontmatter carries the description"
-    );
-    // Reloading keeps the description (metadata) out of the rendered body.
-    let loaded = load_dir(&frag_dir, Source::Global);
-    let id = loaded.iter().find(|f| f.name == "identity").unwrap();
-    assert!(!id.body.contains("description:"));
-}
-
-#[test]
-fn load_dir_reads_only_md_files() {
-    let dir = temp_dir();
-    fs::write(dir.path.join("a.md"), "---\nname: a\n---\nbody a").unwrap();
-    fs::write(dir.path.join("b.txt"), "ignored").unwrap();
-    let frags = load_dir(&dir.path, Source::Repo);
-    assert_eq!(frags.len(), 1);
-    assert_eq!(frags[0].name, "a");
-}
-
-#[test]
-fn materialize_writes_defaults_then_does_not_overwrite() {
-    let dir = temp_dir();
-    let frag_dir = dir.path.join("fragments");
-    materialize_defaults(&frag_dir).unwrap();
-    // Every shipped default lands as a file and re-parses to its name/slot.
-    let loaded = load_dir(&frag_dir, Source::Global);
-    assert_eq!(loaded.len(), DEFAULTS.len());
-    assert!(
-        loaded
-            .iter()
-            .any(|f| f.name == "identity" && f.slot.is_none())
-    );
-    assert!(
-        loaded
-            .iter()
-            .any(|f| f.name == "mission" && f.slot == Some(1))
-    );
-    assert!(
-        loaded
-            .iter()
-            .any(|f| f.name == "response_style" && f.slot == Some(2))
-    );
-
-    // A user edit survives a second materialize (no overwrite).
-    let edited = frag_dir.join("response_style.md");
-    fs::write(&edited, "---\nname: response_style\nslot: 1\n---\nMY EDIT").unwrap();
-    materialize_defaults(&frag_dir).unwrap();
     assert_eq!(
-        fs::read_to_string(&edited).unwrap(),
-        "---\nname: response_style\nslot: 1\n---\nMY EDIT"
+        fs::read_to_string(global.join("identity.md")).unwrap(),
+        before,
+        "assemble must not materialize or rewrite HOME fragments"
     );
+    assert!(
+        !home.path.join(".iris/fragments/tool_use.md").exists(),
+        "assemble must not materialize shipped fragments into HOME"
+    );
+}
+
+#[test]
+fn assemble_writes_nothing_to_the_workspace() {
+    // assemble is read-only: no materialization side effect anywhere. (Startup
+    // materialization into ~/.iris/fragments was removed with ADR-0026; the
+    // function no longer exists, so HOME is never written either.)
+    let ws = temp_dir();
+    let before: Vec<PathBuf> = fs::read_dir(&ws.path)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    let _ = assemble(&ws.path, &built_in_tools());
+    let after: Vec<PathBuf> = fs::read_dir(&ws.path)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(before, after, "assemble must not create files");
 }
 
 #[test]
@@ -718,94 +514,6 @@ fn shipped_identity_is_one_sentence_and_mission_follows_it() {
 }
 
 #[test]
-fn assemble_falls_back_to_shipped_defaults_when_dirs_are_empty() {
-    // A workspace with no .iris/fragments dir and (typically) no global dir
-    // must still produce the full default prompt. Use a temp workspace so the
-    // repo dir is absent; the global dir may or may not exist on the dev host,
-    // so assert the defaults' content is present either way.
-    let ws = temp_dir();
-    let prompt = assemble(&ws.path, &built_in_tools(), true);
-    assert!(prompt.contains("<identity>"));
-    assert!(prompt.contains("You are iris, a coding assistant"));
-    assert!(prompt.contains("<available_tools>"));
-    assert!(prompt.contains("<tool_use>"));
-}
-
-#[test]
-fn untrusted_workspace_skips_repo_fragments_but_keeps_project_docs() {
-    // A repo drops a system-prompt fragment AND a project doc. Untrusted: the
-    // fragment is gated out, but the project doc still loads (docs are not
-    // gated -- only system-prompt-level fragments are).
-    let ws = temp_dir();
-    fs::create_dir_all(ws.path.join(".iris/fragments")).unwrap();
-    fs::write(
-        ws.path.join(".iris/fragments/injected.md"),
-        "---\nname: injected\nslot: 5\n---\nHOSTILE FRAGMENT",
-    )
-    .unwrap();
-    fs::write(ws.path.join("AGENTS.md"), "PROJECT DOC CONTENT").unwrap();
-
-    // The repo does provide fragments, so the gate is meaningful here.
-    assert!(repo_provides_fragments(&ws.path));
-
-    let untrusted = assemble(&ws.path, &built_in_tools(), false);
-    assert!(
-        !untrusted.contains("HOSTILE FRAGMENT"),
-        "untrusted repo fragments must be skipped"
-    );
-    assert!(
-        untrusted.contains("PROJECT DOC CONTENT"),
-        "project docs load regardless of trust"
-    );
-
-    // Trusted: the repo fragment is folded in.
-    let trusted = assemble(&ws.path, &built_in_tools(), true);
-    assert!(
-        trusted.contains("HOSTILE FRAGMENT"),
-        "a trusted workspace loads its repo fragments"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn repo_fragment_containment_rejects_out_of_root_symlink_in_production() {
-    use std::os::unix::fs::symlink;
-    // Production defense: repo-fragment containment must hold in the shipped
-    // default runtime, where `crate::tools::path::resolve_existing` does NOT
-    // confine paths (it only confines under `IRIS_SECURITY_OPT_IN`/`cfg(test)`).
-    // Test the containment predicate directly with a resolved dir outside the
-    // workspace root, so it stays meaningful even though cfg(test) enables the
-    // tool-path sandbox globally and would mask the gap in `assemble`.
-    let outside = temp_dir();
-    let root = temp_dir();
-    let escape = root.path.join("escape");
-    symlink(&outside.path, &escape).unwrap();
-    // Canonicalize as the loader does; the resolved dir points outside root.
-    let resolved = escape.canonicalize().unwrap();
-    let canonical_root = root.path.canonicalize().unwrap();
-    assert!(
-        contain_in_workspace(resolved, &canonical_root).is_none(),
-        "a resolved dir escaping the workspace root must be rejected unconditionally"
-    );
-    // An in-root dir is accepted (the normal case still works).
-    let inside = root.path.join("inside");
-    fs::create_dir_all(&inside).unwrap();
-    let resolved_inside = inside.canonicalize().unwrap();
-    assert_eq!(
-        contain_in_workspace(resolved_inside.clone(), &canonical_root),
-        Some(resolved_inside)
-    );
-}
-
-#[test]
-fn repo_provides_fragments_is_false_without_the_dir() {
-    let ws = temp_dir();
-    assert!(!repo_provides_fragments(&ws.path));
-    fs::create_dir_all(ws.path.join(".iris/fragments")).unwrap();
-    assert!(repo_provides_fragments(&ws.path));
-}
-
-#[test]
 fn assemble_with_only_defaults_is_equivalent_to_today_prompt_content() {
     // Definition of done: identity + tool list from the registry + the
     // no-other-tools guardrail + guidelines + cwd, all present.
@@ -826,29 +534,10 @@ fn assemble_with_only_defaults_is_equivalent_to_today_prompt_content() {
 }
 
 #[test]
-fn dropping_a_repo_fragment_changes_the_prompt_at_its_slot_position() {
-    // New behavior: a user-dropped slot:N fragment lands at the expected spot.
-    let mut frags = default_fragments();
-    frags.push(frag(
-        "custom_rule",
-        Some(3),
-        Source::Repo,
-        "always run the linter",
-    ));
-    let prompt = build_with(frags, &[]);
-    assert!(prompt.contains("<custom_rule>"));
-    assert!(prompt.contains("always run the linter"));
-    // slot 3 sits after response_style (slot 2) and before default_to_action
-    // (slot 4); same-slot rule does not apply since slots differ.
-    assert!(at(&prompt, "response_style") < at(&prompt, "custom_rule"));
-    assert!(at(&prompt, "custom_rule") < at(&prompt, "default_to_action"));
-}
-
-#[test]
 fn rendering_wraps_each_block_in_its_tag_separated_by_blank_lines() {
     let frags = vec![
-        frag("identity", None, Source::Global, "id body"),
-        frag("alpha", Some(1), Source::Global, "alpha body"),
+        frag("identity", None, "id body"),
+        frag("alpha", Some(1), "alpha body"),
     ];
     let prompt = build_with(frags, &[]);
     assert!(prompt.contains("<identity>\nid body\n</identity>"));

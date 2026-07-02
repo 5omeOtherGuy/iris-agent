@@ -159,6 +159,26 @@ impl<P: ChatProvider> Harness<P> {
         self.steering = Some(steering);
     }
 
+    /// Snapshot this cwd's persisted project permission policy for the `/trust`
+    /// editor. Tier 3 renders the data but never reads the store directly.
+    pub(crate) fn project_policy_record(&self) -> trust::ProjectPolicyRecord {
+        trust::policy_for(&self.workspace)
+    }
+
+    /// Apply one project-permission edit from `/trust`: Wayland owns the
+    /// read-modify-write store operation and refreshes Nexus's in-memory
+    /// enforcement policy only after the store write succeeds (fail closed).
+    pub(crate) fn apply_project_policy_edit(
+        &mut self,
+        edit: &trust::ProjectPolicyEdit,
+    ) -> anyhow::Result<String> {
+        let mut record = trust::policy_for(&self.workspace);
+        let notice = record.apply_edit(edit);
+        trust::set_policy(&self.workspace, &record)?;
+        self.agent.set_project_policy(record.to_policy());
+        Ok(notice)
+    }
+
     /// Swap the active provider at a safe turn boundary, delegating to the bare
     /// agent (which re-plans the model-visible tool surface). Tier 3 owns the
     /// active selection, system prompt, and provider construction; the harness

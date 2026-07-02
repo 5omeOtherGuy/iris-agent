@@ -124,18 +124,22 @@ Implemented today:
 - Harness-owned fragment/slot system-prompt / project-instruction assembly
   ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56),
   [#74](https://github.com/5omeOtherGuy/iris-agent/pull/74)): the Tier-2
-  Wayland `system_prompt::assemble` builds shipped/user/repo fragments +
+  Wayland `system_prompt::assemble` builds in-binary shipped fragments +
   generated live-tool blocks + dynamic project docs (`AGENTS.md`/`CLAUDE.md`) +
   runtime context in one place; fresh and resumed sessions feed the same
   assembled string through the provider request path. Skills/templates remain
   deferred (issue #57); named slots and selector-driven assembly remain open
-  (#76/#73). Repo-provided fragments are gated behind a per-project trust
-  decision ([#202](https://github.com/5omeOtherGuy/iris-agent/issues/202)): a
-  Tier-2 trust store (`wayland::trust`, `~/.iris/trust.json`, keyed by canonical
-  dir) records trusted/untrusted/undecided; `assemble` skips repo fragments
-  unless trusted; a first-run interactive prompt (never in non-interactive
-  contexts) and the `/trust` command set the decision. Project docs stay
-  ungated.
+  (#76/#73). ADR-0026 made fragments fully internal (superseding the #202
+  user/repo `.md` loading and its per-project trust gate: no
+  `~/.iris/fragments` materialization, no repo `.iris/fragments` loading, no
+  fragment-trust prompt); project docs keep loading. ADR-0027 repurposed the
+  per-cwd store (`wayland::trust`, `~/.iris/trust.json`, canonical-dir keyed)
+  as a persistent project permission policy
+  ([#209](https://github.com/5omeOtherGuy/iris-agent/issues/209)): per-tool
+  `write`/`edit` grants and per-command `bash` allows (exact/prefix), granted
+  via `[p]` at the approval prompt and edited via `/trust` (`/permissions` alias); destructive
+  commands always re-prompt and are never grantable; per-project sandbox
+  posture is stored but not yet enforced.
 - Milestone 2 foundations: structured metadata, typed tool-result contracts,
   token estimates, handle-backed large tool outputs, session-scoped
   content-addressed sidecars, turn-boundary auto-compaction, formal

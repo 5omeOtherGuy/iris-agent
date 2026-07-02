@@ -2,135 +2,81 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Release-ops validation — implementation notes (issue #252)</title>
+<title>Implementation notes: ADR-0026 + ADR-0027</title>
 <style>
-  body { font: 15px/1.5 system-ui, sans-serif; max-width: 50rem; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
-  code { background: #f2f2f2; padding: 0 .2em; border-radius: 3px; }
-  .k { color: #b00; font-weight: 600; }
-  li { margin: .35rem 0; }
+body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; line-height: 1.5; }
+code { background: #f2f2f2; padding: 0 0.2em; }
+h2 { border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
 </style>
 </head>
 <body>
-<h1>Release-ops validation notes</h1>
-<p>Decisions and discoveries not already explicit in the task spec. Tracking issue
-<strong>#252</strong>; refs PR #233 / issue #199. Concise, factual.</p>
+<h1>Implementation notes: ADR-0026 (internal fragments) + ADR-0027 (project permission policy)</h1>
+<p>Decisions not explicit in the ADRs. Branch: <code>feat/adr-0026-0027-internal-fragments-project-policy</code>.</p>
 
-<h2>Environment</h2>
+<h2>Unit 0 — ADR files</h2>
 <ul>
-  <li><span class="k">Network is reachable</span> here (api.github.com returned HTTP 200), unlike the
-      spec's "appeared offline" note. This let me install the pinned <code>dist</code> CLI.</li>
-  <li><code>dist</code> (cargo-dist) was <em>not</em> on PATH; installed <code>cargo install cargo-dist --locked --version 0.28.0</code>
-      (3m34s compile) &rarr; <code>dist 0.28.0</code>. So the tool-driven path (unit 2/3) was taken, not the offline fallback.</li>
-  <li>No git tags, <code>gh release list</code> empty, <code>Cargo.toml</code> version <code>0.1.0</code> &mdash; re-confirmed; no release ever cut.</li>
-  <li>Host target: <code>x86_64-unknown-linux-gnu</code>. aarch64 / darwin targets are not locally buildable here (no cross toolchains); deferred to CI matrix / operator.</li>
+<li>Both ADR files were <strong>already present on <code>origin/main</code></strong> (merged via PR #257), including the <code>docs/adr/README.md</code> rows. Unit 0 was skipped per the task spec; the on-disk ADRs are authoritative and match the embedded spec.</li>
 </ul>
 
-<h2>Unit 2 &mdash; release.yml: keep hand-written, do NOT regenerate</h2>
+<h2>ADR-0026 — assembler</h2>
 <ul>
-  <li><span class="k">Discovery:</span> <code>dist plan</code> refused to run &mdash; the committed <code>release.yml</code>
-      (114 lines, hand-written) diverges from <code>dist generate</code>'s canonical output (~291 lines).</li>
-  <li>The canonical output would <strong>regress three deliberate choices</strong>:
-    <ol>
-      <li>installs <code>dist</code> via <code>curl|sh</code> instead of the pinned <code>cargo install cargo-dist --locked --version</code>
-          (the committed header cites supply-chain posture: crates.io checksum + <code>--locked</code>);</li>
-      <li>drops <code>IRIS_DIST: "1"</code> on the build job &mdash; that env sets the <code>iris_dist</code> cfg marker that
-          <code>update_strategy()</code> requires, so regenerating would <em>silently break self-replace</em>;</li>
-      <li>pins <code>actions/checkout@v4</code> + <code>runs-on: ubuntu-20.04</code>, whereas the whole repo standardizes on
-          <code>checkout@v7</code> + <code>ubuntu-latest</code> (ubuntu-20.04 is retired).</li>
-    </ol></li>
-  <li><span class="k">Decision:</span> keep the hand-written workflow; add cargo-dist's sanctioned escape hatch
-      <code>allow-dirty = ["ci"]</code> to <code>[workspace.metadata.dist]</code>. Verified: with it, <code>dist plan</code> runs
-      cleanly (no <code>--allow-dirty</code> flag) and <code>dist generate --check</code> refuses to clobber the file.
-      Oracle concurred (8/10; main residual risk = future dist upgrades won't force a regen diff, mitigated by the version-sync guard + a runbook note).</li>
-  <li><span class="k">Naming invariant confirmed from cargo-dist itself:</span> <code>dist plan</code> emits
-      <code>iris-agent-&lt;target&gt;.tar.gz</code> + <code>.tar.gz.sha256</code> and installer <code>iris-agent-installer.sh</code>
-      &mdash; exactly what <code>selfupdate.rs::asset_name/checksum_name</code> and <code>install.sh</code> expect.</li>
+<li><strong>Deleted</strong> from <code>system_prompt/mod.rs</code>: <code>Source</code>/<code>source_rank</code> (fragments are now sourceless), <code>load_repo_fragments</code>, <code>repo_fragments_dir</code>, <code>contain_in_workspace</code>, <code>repo_provides_fragments</code>, <code>ensure_default_fragments</code>, <code>materialize_defaults</code>, <code>default_file_contents</code>, <code>global_fragments_dir</code>, <code>load_dir</code>, <code>parse_fragment</code>, <code>strip_frontmatter_open</code>, <code>split_at_closing_fence</code>, <code>dedup_by_name</code>, <code>MAX_FRAGMENT_BYTES</code>. Frontmatter parsing went with file loading: internal fragments are structured data, not text to parse.</li>
+<li><strong>Kept</strong>: <code>build_prompt</code> (pure core), <code>take_anchor</code> (simplified to "last occurrence wins"), <code>order_middles</code> (slot then name; source tie-break removed), <code>push_block</code>, generated tool blocks, <code>discover_project_docs</code>/<code>read_doc_in_dir</code>/<code>read_regular_bounded</code>/<code>open_no_follow</code> (the AGENTS.md path-safety reader), date helpers.</li>
+<li><code>assemble_defaults</code> kept as the single <code>#[cfg(test)]</code> seam (used by provider request-shaping tests); it is not a second runtime path — <code>assemble</code> is the only runtime entry and differs only by doing real project-doc discovery.</li>
+<li><code>defaults.rs</code>: dropped the <code>description</code> field (it existed only for materialized frontmatter; keeping it would be dead code under <code>-D warnings</code>) and the <code>template</code> fragment + <code>TEMPLATE</code> const (a copy-ready template for a file format that no longer exists; it was slot-0-disabled, so the rendered prompt is unchanged).</li>
+<li><code>cli.rs</code>: removed <code>ModelSwitch::{system_prompt, set_system_prompt}</code> — their only caller was the old <code>/trust</code> prompt-reassembly path.</li>
+<li>"No writes to <code>~/.iris/fragments</code> at startup" is guaranteed structurally (the materialization function no longer exists; the module does no writes at all) plus tests that <code>assemble</code> creates no workspace files and ignores a temp <code>HOME/.iris/fragments/identity.md</code> without materializing or rewriting HOME fragments. The HOME test is serialized under an env lock.</li>
 </ul>
 
-<h2>Test seams (needed to exercise real code paths without a public release)</h2>
+<h2>ADR-0027 — store shape</h2>
 <ul>
-  <li><code>install.sh</code>: added <code>IRIS_RELEASE_BASE_URL</code> override for the artifact base directory (default unchanged =
-      the GitHub releases download URL). Lets the installer hit a local HTTP server over the <em>real</em>
-      download &rarr; sha256-verify &rarr; extract &rarr; atomic-install path. Cleaner than <code>/etc/hosts</code> (no root, no TLS/SNI).</li>
-  <li><code>selfupdate.rs</code>: added a <strong>loopback-only</strong> <code>IRIS_UPDATE_RELEASES_API_URL</code> override for the
-      releases API endpoint. Guard rejects any non-loopback host, so the env var cannot redirect a real user's update to an
-      attacker server. The real <code>reqwest</code> download, <code>sha256_matches</code>, tar extract, and <code>self_replace</code>
-      still run unchanged. This is a narrow test seam, not a rewrite of the update logic.</li>
+<li><strong>File shape</strong>: same file (<code>~/.iris/trust.json</code>, <code>IRIS_TRUST_PATH</code> override), still a flat JSON object keyed by canonical (symlink-resolved) cwd. <code>IRIS_TRUST_PATH</code> must be an absolute path outside the project directory; relative or project-local overrides fail closed so a repo-committed file cannot become the grant source. The value changes from the legacy string (<code>"trusted"</code>/<code>"untrusted"</code>) to a record:
+<pre>{ "/abs/canonical/cwd": {
+    "allow_tools": ["write", "edit"],
+    "allow_bash": ["cargo test"],
+    "allow_bash_prefix": ["git "],
+    "sandbox": "restricted"        // optional; stored, not enforced
+} }</pre>
+Legacy string entries fail the record parse and read as the empty policy (fail closed, pinned by test); they are overwritten on the next grant. No version field: the flat map plus fail-closed per-entry parsing covers the one migration that exists.</li>
+<li>An emptied record (all grants revoked, no sandbox) removes the project's entry entirely instead of storing an empty object.</li>
+<li><code>serde</code> derive (already a workspace dep with <code>derive</code>) is used for the record; no new dependencies.</li>
 </ul>
 
-<h2>Unit 3 &mdash; local artifact defect: missing <code>[profile.dist]</code></h2>
+<h2>ADR-0027 — enforcement wiring</h2>
 <ul>
-  <li><span class="k">Defect found &amp; fixed:</span> <code>dist build --artifacts=local</code> failed with
-      <em>"profile `dist` is not defined"</em>. The hand-written <code>Cargo.toml</code> never had <code>dist init</code> run
-      against it, so the cargo-dist build profile was missing &mdash; <strong>the real CI release would have failed too.</strong>
-      Added the canonical <code>[profile.dist]</code> (<code>inherits = "release"</code>, <code>lto = "thin"</code>). Rebuild succeeded;
-      produced <code>iris-agent-x86_64-unknown-linux-gnu.tar.gz</code> (5.4 MB) + <code>.sha256</code>; recomputed SHA-256 matches the
-      sidecar; archive contains <code>iris</code> + CHANGELOG/README/LICENSE.</li>
-  <li><span class="k">Discovery:</span> <code>iris</code> has <strong>no <code>--version</code></strong> flag (only
-      <code>help</code>/<code>--help</code>/<code>-h</code> exit 0). The spec/README assume <code>iris --version</code>; the smoke test uses
-      <code>iris --help</code> instead. Adding <code>--version</code> is a reasonable follow-up but out of scope here.</li>
+<li><strong>Tier split</strong>: <code>nexus::ProjectPolicy</code> (data: tool set, bash exact set, bash prefix set) is the enforcement-layer shape; <code>wayland::trust::ProjectPolicyRecord</code> is the persistence shape. Nexus never touches disk: the host (<code>main.rs</code>) loads the policy via <code>wayland::trust::policy_for(cwd).to_policy()</code> and injects it with <code>Agent::with_project_policy(policy, sink)</code>. New grants persist through the injected <code>ProjectPolicySink</code> trait (<code>wayland::trust::PolicyStoreSink</code>). The <code>/trust</code>/<code>/permissions</code> editor now calls <code>wayland::Harness::{project_policy_record,apply_project_policy_edit}</code>, so Tier 3 no longer reads/writes the store directly; enforcement stays in Nexus and IO/edit application stays in Wayland (ADR-0005 direction preserved).</li>
+<li><strong>Precedence computation</strong>: in <code>run_gated_single</code>, <code>auto_approved = !destructive &amp;&amp; (session_allowed || project_allowed)</code>. All three layers are allow-only (there are no deny grants), so "most-specific wins" degenerates to a union of the allow layers over the prompting global default; the destructive floor is applied <em>before</em> any layer.</li>
+<li><strong>bash is never grantable per-tool</strong>: <code>ProjectPolicy::allows</code> consults the tool-name set only for non-bash tools; bash goes exclusively through exact/prefix command matching, so a blanket bash allow is not expressible in the policy.</li>
+<li><strong>Prefix matching is token-boundary</strong>: <code>git</code>/<code>git&nbsp;</code> matches <code>git status</code> but not <code>gitevil</code> (<code>bash_prefix_matches</code>), so a stored prefix cannot widen to lexically adjacent commands.</li>
+<li><strong><code>[p]</code> offer and defense in depth</strong>: <code>ApprovalGate::review</code> gained an <code>allow_project</code> flag, passed as <code>!destructive</code>. Non-obvious invariant placement: even if a front-end returns <code>AllowProject</code> for a destructive call anyway, Nexus refuses to apply or persist the grant (runs the call once, notices) — invariant 2 is enforced at the decision handler, not just at the offer.</li>
+<li><strong>Destructive classifier hardening after review</strong>: <code>bash_command_is_destructive</code> now checks the normalized basename of command tokens: path-qualified commands (<code>/bin/rm</code>, <code>/usr/bin/dd</code>), quoted/escaped command words (<code>'rm'</code>, <code>\rm</code>, <code>r\m</code>), and <code>mkfs.*</code> variants (<code>mkfs.ext4</code>). Nexus tests pin that a project prefix grant such as <code>git</code> still re-prompts for <code>git status; /bin/rm -rf sub</code>.</li>
+<li>A bash call with a missing/empty <code>command</code> cannot mint a grant (allowed once with a notice).</li>
+<li>A failed sink persist degrades to session-lifetime scope with an honest notice; headless <code>--print</code> loads the policy (grants auto-approve headless too) but installs no sink (its gate cannot return <code>AllowProject</code>).</li>
+<li><code>reset_session</code> (/new, in-session /resume) clears <code>session_allowed</code> but keeps <code>project_policy</code> — it is keyed to the cwd, not the conversation.</li>
+<li><code>/trust</code>/<code>/permissions</code> editor (<code>Harness::apply_project_policy_edit</code>) fails closed: if the store write fails, the in-memory policy is <em>not</em> updated either, so the live session never runs looser than what is persisted. Edits refresh the live agent via <code>agent.set_project_policy</code>; no provider rebuild is needed anymore (the prompt no longer depends on trust).</li>
 </ul>
 
-<h2>Unit 4 &mdash; install.sh defect: global-variable clobber</h2>
+<h2>Deferrals</h2>
 <ul>
-  <li><span class="k">Defect found &amp; fixed:</span> POSIX <code>sh</code> functions have no local scope, so
-      <code>verify_checksum()</code> assigned to a bare <code>archive</code> (= the full workdir path), <strong>clobbering
-      <code>main()</code>'s <code>archive</code></strong>. The later <code>tar -xzf "$workdir/$archive"</code> then got a doubled path
-      (<code>/tmp/x//tmp/x/iris-agent-...tar.gz</code>) and every real install failed. PR #233 only ran <code>shellcheck</code> (clean)
-      and never executed the installer &mdash; exactly the gap this validation closes. Fixed by giving the function
-      underscore-prefixed names (<code>_vc_archive</code> etc.).</li>
-  <li>Validated against the real unit-3 artifact over a local HTTP server (<code>IRIS_RELEASE_BASE_URL</code> override):
-      happy path installs + <code>iris --help</code> exits 0; a corrupted <code>.sha256</code> hard-fails with no install; the
-      off-PATH note is emitted.</li>
+<li><strong>Sandbox-posture enforcement</strong>: the <code>sandbox</code> field is stored, round-tripped, shown read-only in the <code>/trust</code> modal, and covered by the invariant-3 test (grant writes never create or alter it). Wiring it into <code>src/tools/bash/sandbox.rs</code> is deferred — it touches the Landlock layer and would balloon the diff; nothing currently writes the field, so there is no way to loosen it.</li>
+<li><strong>Full <code>/settings</code> review-and-revoke surface</strong>: deferred; the <code>/trust</code>/<code>/permissions</code> modal covers list/grant(write/edit)/revoke.</li>
+<li><strong>Text/non-TTY <code>/trust</code> editor</strong>: deferred (TUI-only, matching the prior precedent); the text UI approval prompt does offer <code>[p]</code>, so grants can still be minted in the text fallback.</li>
 </ul>
 
-<h2>Unit 5 &mdash; iris update self-replace (real code path)</h2>
+<h2>Drift found vs. the task prompt</h2>
 <ul>
-  <li>Used the real dist-built binary (v0.1.0, <code>IRIS_DIST=1</code> + <code>self-update</code>) as the running exe, a local
-      mock of <code>releases/latest</code> (<code>IRIS_UPDATE_RELEASES_API_URL</code>, loopback-only), and a replacement archive whose
-      <code>iris</code> is the same binary + a trailing sentinel (ELF ignores it) so a successful swap is observable by a changed
-      SHA-256. The real <code>reqwest</code> download, <code>sha256_matches</code> over real bytes, tar extract, and <code>self_replace</code>
-      all run.</li>
-  <li>Proven: (A) newer tag &rarr; downloads, verifies, self-replaces (hash changes S&rarr;S'); (B) tag == running version &rarr;
-      "Already on the latest", binary untouched; (C) corrupted <code>.sha256</code> &rarr; "refusing to install", binary unchanged.
-      Also: the binary takes the SelfReplace strategy (not the cargo fallback), and the loopback guard rejects
-      <code>https://evil.example.com</code>.</li>
-  <li>Source-build fallback (<code>update_strategy() == CargoInstall</code> when the marker/feature are off) is unchanged &mdash;
-      covered by the existing <code>select_strategy_*</code> unit tests, untouched.</li>
+<li>The ADR files (and <code>docs/adr/README.md</code> rows) were already merged to <code>origin/main</code>, so remote ADR verification <em>was</em> possible; the "uncommitted local worktree" caveat in the prompt was stale.</li>
+<li>The prompt claimed <code>bash</code> has <code>supports_allow_always=true</code>; the code (and a pinned test) opts <em>all three</em> mutating tools (<code>bash</code>/<code>write</code>/<code>edit</code>) out of session allow-always. The project layer is independent of that flag, so the design is unaffected — it makes ADR-0027 the only persistence path for all three, which is exactly #209's point.</li>
+<li>The prompt referenced <code>clear_session_policy</code> (~L645); the actual mechanism is <code>Agent::reset_session</code> clearing <code>session_allowed</code>.</li>
 </ul>
 
-<h2>Deferrals (operator-gated / externally visible / environment-limited)</h2>
+<h2>Test coverage of the four ADR-0027 invariants</h2>
 <ul>
-  <li><span class="k">Public <code>v*</code> tag + GitHub release</span> &mdash; externally visible, irreversible; runbook step.</li>
-  <li><span class="k"><code>CARGO_REGISTRY_TOKEN</code> + crates.io publish</span> &mdash; repo-admin secret; runbook step.</li>
-  <li><span class="k">aarch64 / macOS artifacts</span> &mdash; no cross toolchains locally; built by the CI matrix. Only the
-      x86_64-linux host target was built here. Naming for all four targets is confirmed from <code>dist plan</code>.</li>
-  <li><span class="k">Live <code>curl | sh</code> on a clean OS image</span> &mdash; no clean image reachable in-session; runbook step.</li>
+<li>Invariant 1 (HOME-owned store, no repo grants): <code>wayland::trust::tests::invariant_1_a_repo_shipped_policy_file_grants_nothing</code> + <code>wayland::trust::tests::invariant_1_relative_iris_trust_path_fails_closed</code> + <code>wayland::trust::tests::invariant_1_project_local_iris_trust_path_fails_closed</code> + <code>nexus::tests::invariant_1_only_the_injected_policy_grants_never_repo_files</code>.</li>
+<li>Invariant 2 (destructive floor): <code>nexus::tests::invariant_2_destructive_bash_reprompts_despite_project_grants</code> + <code>nexus::tests::invariant_2_prefix_grant_does_not_auto_approve_destructive_compound_suffix</code> + <code>nexus::tests::invariant_2_allow_project_on_a_destructive_call_is_never_persisted</code>.</li>
+<li>Invariant 3 (sandbox never loosened automatically): <code>wayland::trust::tests::invariant_3_grant_writes_preserve_and_never_create_sandbox_posture</code>.</li>
+<li>Invariant 4 (nothing self-waives / grants stay narrow): <code>nexus::tests::invariants_3_and_4_grants_do_not_loosen_anything_ungranted</code>.</li>
+<li>Precedence: <code>nexus::tests::precedence_session_project_then_global_prompt</code>; cross-session persistence: <code>wayland::trust::tests::grants_round_trip_and_persist_across_reads</code> + <code>nexus::tests::project_grant_for_write_auto_approves_without_prompting</code> + <code>nexus::tests::allow_project_persists_to_disk_and_fresh_agent_auto_approves</code>.</li>
 </ul>
-
-<h2>Review hardening</h2>
-<ul>
-  <li>Independent review flagged that the loopback override guarded only the <em>metadata</em> request, not the asset
-      download URLs from the response. Tightened: when <code>IRIS_UPDATE_RELEASES_API_URL</code> is active, the archive and
-      checksum URLs are also loopback-checked before download, so the override can't pull artifacts from a remote host.
-      The default (unset) path still trusts GitHub's real download URLs.</li>
-  <li><code>install.sh</code>'s <code>IRIS_RELEASE_BASE_URL</code> fetches archive <em>and</em> checksum from the same base, so it is a
-      trust override by nature; documented as such (validation, not untrusted mirrors) rather than loopback-restricted,
-      since setting it is equivalent to editing the script the user already runs.</li>
-  <li><code>scripts/validate-dist.sh</code> now uses a <code>sha256sum</code>/<code>shasum -a 256</code> fallback so the reproducer runs on
-      macOS (a supported target), matching <code>install.sh</code>'s own fallback.</li>
-</ul>
-
-<h2>Follow-up risks</h2>
-<ul>
-  <li>Future <code>cargo-dist</code> upgrades won't force a regenerated-CI diff (because of <code>allow-dirty</code>); the version-sync
-      test catches the pinned-version half, but the operator must re-diff <code>dist generate</code> when bumping
-      <code>cargo-dist-version</code>. Documented in the runbook.</li>
-  <li>Cross-filesystem replace: <code>self_replace</code> + install.sh both stage beside the target for a same-FS rename; a
-      genuinely cross-FS install dir still relies on <code>self_replace</code>'s handling. Not exercised here.</li>
-  <li><code>iris</code> has no <code>--version</code>; users can't confirm the installed version from the CLI. Suggested follow-up.</li>
-</ul>
-
 </body>
 </html>

@@ -92,7 +92,12 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/trust",
-        description: "Trust or untrust this project's Iris resources",
+        description: "View or edit this project's permission policy",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/permissions",
+        description: "Alias for /trust project permissions",
         action: SlashAction::Submit,
     },
     SlashCommand {

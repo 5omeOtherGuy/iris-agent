@@ -5,9 +5,11 @@ use crate::ui::text::TextUi;
 use crate::wayland::Harness;
 use anyhow::anyhow;
 use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
@@ -127,7 +129,12 @@ impl AgentObserver for RecordingFrontend {
 }
 
 impl ApprovalGate for RecordingFrontend {
-    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+    ) -> ApprovalFuture<'a> {
         let mut snapshot = self.events_at_review.borrow_mut();
         if snapshot.is_none() {
             *snapshot = Some(self.events.borrow().clone());
@@ -1391,7 +1398,12 @@ fn observer_error_on_tool_result_still_records_paired_transcript() -> Result<()>
         }
     }
     impl ApprovalGate for FailOnToolResult {
-        fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+        fn review<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+            _allow_always: bool,
+            _allow_project: bool,
+        ) -> ApprovalFuture<'a> {
             Box::pin(async move { Ok(ApprovalDecision::Allow) })
         }
     }
@@ -2091,6 +2103,614 @@ fn always_allow_does_not_auto_approve_bash() -> Result<()> {
     Ok(())
 }
 
+// ---- ADR-0027: per-project permission policy -------------------------------
+
+/// Like [`test_harness`], with a persistent project policy and grant sink
+/// installed on the agent (the ADR-0027 "project" precedence layer).
+fn test_harness_with_policy<P: ChatProvider>(
+    provider: P,
+    workspace: &Path,
+    tools: Tools,
+    policy: ProjectPolicy,
+    sink: Option<Box<dyn ProjectPolicySink>>,
+) -> Harness<P> {
+    Harness::new(
+        Agent::new(provider, tools).with_project_policy(policy, sink),
+        workspace.to_path_buf(),
+        ToolState::new(),
+        None,
+        None,
+    )
+}
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    trust_path: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn with_trust_path(path: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let guard = Self {
+            _lock: lock,
+            trust_path: std::env::var_os("IRIS_TRUST_PATH"),
+        };
+        // SAFETY: nexus env-sensitive tests run under ENV_LOCK and restore the
+        // process-global var before releasing it.
+        unsafe { std::env::set_var("IRIS_TRUST_PATH", path) };
+        guard
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        unsafe {
+            match &self.trust_path {
+                Some(value) => std::env::set_var("IRIS_TRUST_PATH", value),
+                None => std::env::remove_var("IRIS_TRUST_PATH"),
+            }
+        }
+    }
+}
+
+/// Records every grant Nexus asks to persist, standing in for the Tier-2 store.
+struct RecordingSink {
+    grants: std::rc::Rc<RefCell<Vec<PolicyGrant>>>,
+}
+
+impl ProjectPolicySink for RecordingSink {
+    fn persist(&self, grant: &PolicyGrant) -> Result<()> {
+        self.grants.borrow_mut().push(grant.clone());
+        Ok(())
+    }
+}
+
+fn policy(tools: &[&str], bash_exact: &[&str], bash_prefix: &[&str]) -> ProjectPolicy {
+    ProjectPolicy {
+        tools: tools.iter().map(|t| t.to_string()).collect(),
+        bash_exact: bash_exact.iter().map(|c| c.to_string()).collect(),
+        bash_prefix: bash_prefix.iter().map(|p| p.to_string()).collect(),
+    }
+}
+
+#[test]
+fn invariant_1_only_the_injected_policy_grants_never_repo_files() -> Result<()> {
+    // A cloned repo ships a policy file pre-approving `write`. Nexus consults
+    // only the injected `ProjectPolicy` (loaded by the host from the HOME-owned
+    // store; see wayland::trust::invariant_1_a_repo_shipped_policy_file_grants_nothing
+    // for the store side). With an empty injected policy, the repo-shipped file
+    // changes nothing: the gate is consulted and a Deny denies.
+    let workspace = test_workspace()?;
+    fs::create_dir_all(workspace.path.join(".iris"))?;
+    fs::write(
+        workspace.path.join(".iris/trust.json"),
+        r#"{ "*": { "allow_tools": ["write", "edit"] } }"#,
+    )?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "pwned.txt", "content": "x" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        ProjectPolicy::default(),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("write it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "the gate must be consulted: a repo-shipped policy file grants nothing"
+    );
+    assert!(
+        !workspace.path.join("pwned.txt").exists(),
+        "the denied write must not run"
+    );
+    Ok(())
+}
+
+#[test]
+fn invariant_2_destructive_bash_reprompts_despite_project_grants() -> Result<()> {
+    // Both an exact grant for the destructive command AND a covering prefix
+    // grant are stored; the destructive floor still forces the prompt.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "/bin/rm -rf sub" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        policy(&[], &["/bin/rm -rf sub"], &["/bin/rm"]),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("clean up", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "a destructive command must re-prompt even when granted"
+    );
+    let events = frontend.events.borrow();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::ToolAutoApproved(_))),
+        "a destructive command must never auto-approve"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(message) if message.contains("destructive command")
+        )),
+        "the forced re-prompt is explained"
+    );
+    Ok(())
+}
+
+#[test]
+fn invariant_2_prefix_grant_does_not_auto_approve_destructive_compound_suffix() -> Result<()> {
+    // A safe-looking granted prefix must not auto-approve a compound command
+    // whose suffix is path-qualified destructive bash (`/bin/rm`).
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "git status; /bin/rm -rf sub" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        policy(&[], &[], &["git"]),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("status", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "a destructive suffix under a granted prefix must still prompt"
+    );
+    assert!(
+        frontend
+            .events
+            .borrow()
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::ToolAutoApproved(_))),
+        "a granted prefix cannot bypass the destructive floor"
+    );
+    Ok(())
+}
+
+#[test]
+fn invariant_2_allow_project_on_a_destructive_call_is_never_persisted() -> Result<()> {
+    // Defense in depth: even if a front-end answers AllowProject for a
+    // destructive call (the option is not offered), the call runs once and no
+    // grant is applied or persisted.
+    let workspace = test_workspace()?;
+    fs::create_dir_all(workspace.path.join("sub"))?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "mkfs.ext4 /dev/sdz" }),
+        )),
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "mkfs.ext4 /dev/sdz" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let grants = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let sink = RecordingSink {
+        grants: grants.clone(),
+    };
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        ProjectPolicy::default(),
+        Some(Box::new(sink)),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::AllowProject);
+
+    block_on(harness.submit_turn("clean up", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        grants.borrow().is_empty(),
+        "a destructive allow must never be persisted: {:?}",
+        grants.borrow()
+    );
+    let events = frontend.events.borrow();
+    // The second identical call must not auto-approve: nothing stuck in-memory
+    // either.
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::ToolAutoApproved(_))),
+        "no auto-approval may follow a refused destructive grant"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(message) if message.contains("cannot be granted")
+        )),
+        "the refused grant is explained"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_grant_for_write_auto_approves_without_prompting() -> Result<()> {
+    // The #209 core: a persisted per-project `write` grant auto-approves
+    // without consulting the gate -- even though `write` opts out of the
+    // session allow-always layer. (Cross-session persistence of the grant
+    // itself is pinned in wayland::trust::grants_round_trip_and_persist_across_reads.)
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "note.txt", "content": "hello" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        policy(&["write"], &[], &[]),
+        None,
+    );
+    // If the gate were consulted it would deny; the grant must bypass it.
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("write it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "a granted tool must not prompt"
+    );
+    let events = frontend.events.borrow();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolAutoApproved(_))),
+        "the auto-approval is surfaced as an event"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("note.txt"))?,
+        "hello",
+        "the granted write ran"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_bash_grants_match_exact_and_token_boundary_prefix() -> Result<()> {
+    // An exact command grant and a prefix grant both auto-approve; the prefix
+    // matches only at a token boundary.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("bash", json!({ "command": "echo hi" }))),
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "printf 'granted by prefix'" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        policy(&[], &["echo hi"], &["printf"]),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("run", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "granted commands must not prompt"
+    );
+    let auto = frontend
+        .events
+        .borrow()
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolAutoApproved(_)))
+        .count();
+    assert_eq!(auto, 2, "both granted commands auto-approve");
+    Ok(())
+}
+
+#[test]
+fn invariants_3_and_4_grants_do_not_loosen_anything_ungranted() -> Result<()> {
+    // A project policy loosens exactly what the user granted, nothing else
+    // (ADR-0014: nothing self-waives). With `write` granted and `echo hi`
+    // granted: `edit` still prompts, a lexically-adjacent bash command
+    // (`echo hijack` does NOT match the `echo hi` exact grant, `printfx` does
+    // NOT match a `printf` prefix grant) still prompts.
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "hello")?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "edit",
+            json!({ "path": "note.txt", "oldText": "hello", "newText": "bye" }),
+        )),
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "echo hijack" }),
+        )),
+        Ok(single_call_turn("bash", json!({ "command": "printfx" }))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        policy(&["write"], &["echo hi"], &["printf"]),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::ToolAutoApproved(_))),
+        "nothing ungranted may auto-approve"
+    );
+    let denied = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolDenied(_)))
+        .count();
+    assert_eq!(denied, 3, "every ungranted call prompts and is denied");
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("note.txt"))?,
+        "hello",
+        "the denied edit must not run"
+    );
+    Ok(())
+}
+
+#[test]
+fn allow_project_persists_the_grant_and_covers_later_calls() -> Result<()> {
+    // `[p]` at the prompt: the grant is persisted through the sink AND applied
+    // in-memory, so the next identical call auto-approves without prompting.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "a.txt", "content": "1" }),
+        )),
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "b.txt", "content": "2" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let grants = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let sink = RecordingSink {
+        grants: grants.clone(),
+    };
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        ProjectPolicy::default(),
+        Some(Box::new(sink)),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::AllowProject);
+
+    block_on(harness.submit_turn(
+        "write twice",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    assert_eq!(
+        grants.borrow().as_slice(),
+        &[PolicyGrant::Tool("write".to_string())],
+        "exactly one grant is persisted"
+    );
+    let events = frontend.events.borrow();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolAutoApproved(_))),
+        "the second write auto-approves from the fresh grant"
+    );
+    assert!(workspace.path.join("a.txt").exists());
+    assert!(workspace.path.join("b.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn allow_project_persists_to_disk_and_fresh_agent_auto_approves() -> Result<()> {
+    // End-to-end ADR-0027 #209 path: a text approval prompt's `p` answer writes
+    // the HOME-owned policy store through PolicyStoreSink; a fresh Agent loads
+    // policy_for(cwd) and auto-approves a later write without consulting its
+    // denial gate.
+    let workspace = test_workspace()?;
+    let store = test_workspace()?;
+    let store_file = store.path.join("trust.json");
+    let _env = EnvGuard::with_trust_path(&store_file);
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "a.txt", "content": "one" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        ProjectPolicy::default(),
+        Some(Box::new(crate::wayland::trust::PolicyStoreSink::new(
+            workspace.path.clone(),
+        ))),
+    );
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    run_text_session(
+        &mut harness,
+        "go\np\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+    assert!(workspace.path.join("a.txt").exists());
+    assert!(
+        String::from_utf8(output)?.contains("for this project"),
+        "text prompt used the project-grant path"
+    );
+
+    let fresh_policy = crate::wayland::trust::policy_for(&workspace.path).to_policy();
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "b.txt", "content": "two" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+        fresh_policy,
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    block_on(harness.submit_turn(
+        "fresh write",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "fresh agent should auto-approve from persisted project policy"
+    );
+    assert_eq!(fs::read_to_string(workspace.path.join("b.txt"))?, "two");
+    Ok(())
+}
+
+#[test]
+fn precedence_session_project_then_global_prompt() -> Result<()> {
+    // The three layers resolve independently and most-specific-first: an
+    // allow-always-capable tool rides the session layer, a project-granted
+    // tool rides the persistent project layer, and an ungranted gated tool
+    // falls through to the global default (prompt).
+    struct GatedNamed(&'static str);
+    impl Tool for GatedNamed {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "gated test tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: &'a Value,
+            _env: &'a ToolEnv<'_>,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'a> {
+            let name = self.0;
+            Box::pin(async move { Ok(ToolOutput::text(format!("{name}-ran"))) })
+        }
+        fn requires_approval(&self) -> bool {
+            true
+        }
+        // alpha supports allow-always; the others use the default (true) too --
+        // the layer split under test comes from the session/project state, not
+        // the capability flag.
+    }
+
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("alpha", json!({}))),
+        Ok(single_call_turn("alpha", json!({}))),
+        Ok(single_call_turn("granted", json!({}))),
+        Ok(single_call_turn("beta", json!({}))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness_with_policy(
+        provider,
+        &workspace.path,
+        Tools::new(vec![
+            Box::new(GatedNamed("alpha")),
+            Box::new(GatedNamed("granted")),
+            Box::new(GatedNamed("beta")),
+        ]),
+        policy(&["granted"], &[], &[]),
+        None,
+    );
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    // alpha #1 -> always (session layer sticks); alpha #2 auto-approves;
+    // `granted` auto-approves (project layer, consumes no prompt answer);
+    // beta prompts (global default) -> denied.
+    run_text_session(
+        &mut harness,
+        "go\na\nn\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    let rendered = String::from_utf8(output)?;
+    assert!(
+        rendered.contains("You approved iris to run alpha"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("approve granted"),
+        "the project-granted tool must not prompt: {rendered}"
+    );
+    let seen = harness.agent.provider.seen.borrow();
+    // The project-granted tool ran (its result reached provider context)...
+    assert!(
+        seen[3].iter().any(|m| m.content.contains("granted-ran")),
+        "project-granted tool ran"
+    );
+    // ...and beta's tool result is a denial (global default prompted, user n).
+    assert!(
+        seen.last()
+            .unwrap()
+            .last()
+            .unwrap()
+            .content
+            .contains("\"denied\":true"),
+        "the ungranted tool falls through to the global default and is denied"
+    );
+    Ok(())
+}
+
 struct TestWorkspace {
     path: PathBuf,
 }
@@ -2710,7 +3330,12 @@ impl AgentObserver for BlockingApprovalGate {
     }
 }
 impl ApprovalGate for BlockingApprovalGate {
-    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+    ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             futures::future::pending::<()>().await;
             Ok(ApprovalDecision::Allow)
