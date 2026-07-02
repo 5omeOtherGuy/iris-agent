@@ -33,6 +33,7 @@ use crate::nexus::ToolCall;
 use crate::tool_display::{
     bash_timeout_secs, command_display, display_path, exploration_summary, run_target, summarize,
 };
+use crate::tool_summary::summarize_output;
 use crate::ui::palette;
 use crate::ui::symbols;
 
@@ -229,8 +230,9 @@ fn explore_op_row(width: usize, call: &ToolCall, outcome: &ToolOutcome) -> Trans
         }
     }
     // Right-aligned count, only when the op finished and the count is real.
-    if let ToolOutcome::Done { content, .. } = outcome
-        && let Some(meta) = explore_result_meta(call, content)
+    if let ToolOutcome::Done { content, exit_code } = outcome
+        && let Some(meta) =
+            summarize_output(call, content, *exit_code).map(|summary| summary.render())
     {
         let left_w = display_width(&plain);
         let meta_w = display_width(&meta);
@@ -261,69 +263,6 @@ fn explore_verb(call: &ToolCall) -> &'static str {
         "find" => "Find",
         _ => "Read",
     }
-}
-
-/// Honest right-aligned counts for a finished EXPLORE op, derived from the
-/// tool's own rendered output. Returns `None` when no real count is available
-/// (counts are real or omitted — never guessed).
-fn explore_result_meta(call: &ToolCall, content: &str) -> Option<String> {
-    match call.name.as_str() {
-        "read" => {
-            let lines = content
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim_start();
-                    trimmed.split_once('\u{2192}').is_some_and(|(num, _)| {
-                        !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())
-                    })
-                })
-                .count();
-            (lines > 0).then(|| format!("{lines} lines"))
-        }
-        "grep" => grep_result_meta(content),
-        "ls" | "find" => {
-            let entries = content
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
-            Some(format!(
-                "{entries} {}",
-                if entries == 1 { "entry" } else { "entries" }
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// Parse the grep tool's own summary header (`"3 matches in 2 files"` /
-/// `"Found 4 files"` / a no-matches note) into the compact `┊`-free meta
-/// (`3 matches · 2 files`).
-fn grep_result_meta(content: &str) -> Option<String> {
-    let first = content.lines().next()?.trim();
-    if let Some(rest) = first.strip_prefix("Found ") {
-        let mut words = rest.split_whitespace();
-        let count: usize = words.next()?.parse().ok()?;
-        return Some(format!(
-            "{count} {}",
-            if count == 1 { "file" } else { "files" }
-        ));
-    }
-    if first.starts_with("No matches") {
-        return Some("0 matches".to_string());
-    }
-    // "{N} match(es) in {M} file(s)"
-    let mut words = first.split_whitespace();
-    let matches: usize = words.next()?.parse().ok()?;
-    let match_word = words.next()?;
-    if !match_word.starts_with("match") || words.next()? != "in" {
-        return None;
-    }
-    let files: usize = words.next()?.parse().ok()?;
-    Some(format!(
-        "{matches} {} · {files} {}",
-        if matches == 1 { "match" } else { "matches" },
-        if files == 1 { "file" } else { "files" }
-    ))
 }
 
 /// Build a single-row, single-style panel body line carrying both the styled
@@ -398,7 +337,8 @@ impl ToolRenderer for ShellRenderer {
                     let expand_hint = body.take_deferred_expand_hint();
                     body.push(shell_result_row(
                         *code,
-                        shell_result_meta(content, *code),
+                        summarize_output(call, content, Some(*code))
+                            .map(|summary| summary.render()),
                         expand_hint,
                         body.fold_hint_width(),
                     ));
@@ -472,60 +412,6 @@ fn shell_result_row(
         plain,
         style,
     )
-}
-
-/// A muted, honest one-line summary of a finished command's output for the
-/// exit row: test totals (`142 passed · 0 failed`) or an error count
-/// (`3 errors`). Derived only from what the output actually says; `None` when
-/// nothing summarizable is present (never asserts what the run didn't report).
-fn shell_result_meta(content: &str, code: i32) -> Option<String> {
-    let mut passed = 0u64;
-    let mut failed = 0u64;
-    let mut saw_test_result = false;
-    for line in content.lines() {
-        // cargo test / libtest: "test result: ok. 142 passed; 0 failed; ..."
-        if let Some(rest) = line.trim_start().strip_prefix("test result:") {
-            for part in rest.split(&[';', '.'][..]) {
-                let mut words = part.split_whitespace();
-                let (Some(count), Some(noun)) = (words.next(), words.next()) else {
-                    continue;
-                };
-                let Ok(count) = count.parse::<u64>() else {
-                    continue;
-                };
-                match noun {
-                    "passed" => {
-                        passed += count;
-                        saw_test_result = true;
-                    }
-                    "failed" => {
-                        failed += count;
-                        saw_test_result = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    if saw_test_result {
-        return Some(format!("{passed} passed · {failed} failed"));
-    }
-    if code != 0 {
-        let errors = content
-            .lines()
-            .filter(|line| {
-                let t = line.trim_start();
-                t.starts_with("error:") || t.starts_with("error[")
-            })
-            .count();
-        if errors > 0 {
-            return Some(format!(
-                "{errors} {}",
-                if errors == 1 { "error" } else { "errors" }
-            ));
-        }
-    }
-    None
 }
 
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
