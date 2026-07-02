@@ -14,8 +14,9 @@
 //! - `edit` follows Claude Code's exact-string contract
 //!   (`file_path`/`old_string`/`new_string`/`replace_all`).
 //!
-//! Workspace-path enforcement is opt-in via `IRIS_SECURITY_OPT_IN=1`. By default
-//! tools resolve requested paths but do not refuse workspace escapes. See [`path`].
+//! Mutating tools require approval by default. Workspace-path enforcement is a
+//! separate opt-in via `IRIS_SECURITY_OPT_IN=1`: by default tools resolve
+//! requested paths but do not refuse workspace escapes. See [`path`].
 //!
 //! Module layout:
 //! - [`path`], [`text`]: shared path-resolution and text/I/O-size helpers.

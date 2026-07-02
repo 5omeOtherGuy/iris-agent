@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected install documentation to state that prebuilt binaries, `install.sh`,
+  crates.io installs, and prebuilt self-update become usable only after the
+  first public release/publish; the current pre-release install path is
+  `cargo install --git ... --locked` or a source checkout.
+- Mutating built-in tools (`bash`, `edit`, `write`) now require approval by
+  default, independent of the workspace path/sandbox opt-in. In print mode this
+  means they are denied unless `--approve` is passed, so headless runs cannot
+  execute them silently.
+
 ### Added
 
 - Added session shortcuts and pickers (issue #201): `iris -c`/`--continue`
