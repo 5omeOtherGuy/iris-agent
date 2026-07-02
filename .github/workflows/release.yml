@@ -1,18 +1,22 @@
 # Prebuilt-binary release pipeline, driven by cargo-dist (dist).
 #
-# On a version tag push (release-plz creates the tag and GitHub release), dist
-# builds the per-target archives + SHA-256 checksums and the `curl | sh`
-# installer, then uploads them to the release. Configuration lives in
-# `[workspace.metadata.dist]` in Cargo.toml.
+# On a version tag push, dist builds the per-target archives + SHA-256 checksums
+# and the shell installer, and the host job creates the GitHub release for the
+# tag and attaches them. The tag is pushed by an operator (see
+# docs/RELEASING.md); a tag pushed by release-plz's default GITHUB_TOKEN would
+# not trigger this workflow. release-plz does not own the release object
+# (git_release_enable = false) and no crates.io token is required. Configuration
+# lives in `[workspace.metadata.dist]` in Cargo.toml.
 #
-# This file delegates every step to the pinned `dist` CLI rather than
+# This file delegates artifact building to the pinned `dist` CLI rather than
 # hand-rolling a build matrix. `dist` is installed with `cargo install
 # cargo-dist --locked --version ${DIST_VERSION}` rather than an unpinned
 # `curl | sh`: cargo pins the exact version and verifies the crate against the
 # immutable crates.io registry checksum, and `--locked` reproduces its
 # dependency tree. Keep `DIST_VERSION` in sync with `cargo-dist-version` in
-# Cargo.toml. Regenerate the canonical version with `dist init` + `dist
-# generate` once the dist CLI is available in CI.
+# Cargo.toml (a unit test enforces this). The workflow is hand-maintained
+# (`allow-dirty = ["ci"]` in Cargo.toml); re-diff `dist generate` when bumping
+# the version.
 name: release
 
 on:
@@ -85,11 +89,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: artifacts-build-${{ matrix.target }}
+          # The shell installer is a cargo-dist "global" artifact; it is built in
+          # the host job, not here, so only per-target archives + checksums are
+          # uploaded from this matrix leg.
           path: |
             target/distrib/*.tar.gz
             target/distrib/*.tar.gz.sha256
-            target/distrib/*-installer.sh
 
+  # Build the shell installer (a cargo-dist "global" artifact) and publish the
+  # GitHub release for the pushed tag with every per-target archive, its SHA-256
+  # sidecar, and the installer attached. Creating the release here with `gh`
+  # makes a manually pushed tag self-sufficient: release-plz does not own the
+  # release (git_release_enable = false) and no crates.io token is required.
   host:
     needs: [plan, build-local-artifacts]
     runs-on: ubuntu-latest
@@ -102,13 +113,37 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install dist
         run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
-      - name: Download artifacts
+      - name: Download per-target artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: artifacts-*
+          pattern: artifacts-build-*
           path: target/distrib
           merge-multiple: true
-      - name: Upload to GitHub release
+      - name: Build installer (global artifact)
+        run: dist build --artifacts=global --output-format=json > dist-manifest.json
+      - name: Publish GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: dist host --steps=upload --steps=release --output-format=json > dist-manifest.json
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd target/distrib
+          # Require the full asset set so a partial build never publishes a
+          # half-populated release. Four targets x (archive + checksum) + installer.
+          assets=""
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                   x86_64-apple-darwin aarch64-apple-darwin; do
+            for f in "iris-agent-$t.tar.gz" "iris-agent-$t.tar.gz.sha256"; do
+              [ -f "$f" ] || { echo "missing release asset: $f" >&2; exit 1; }
+              assets="$assets $f"
+            done
+          done
+          [ -f iris-agent-installer.sh ] || { echo "missing installer" >&2; exit 1; }
+          assets="$assets iris-agent-installer.sh"
+          # Idempotent so the job can be re-run: create the release only if it is
+          # absent, then upload assets with --clobber to replace any partial ones.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Iris $TAG" --generate-notes
+          fi
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" --clobber $assets

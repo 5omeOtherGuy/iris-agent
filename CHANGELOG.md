@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made the prebuilt-binary release self-sufficient from a manually pushed tag.
+  `release.yml` now builds the shell installer (a cargo-dist global artifact the
+  build matrix never produced) and creates the GitHub release with all archives,
+  checksums, and the installer via `gh release create`. `release-plz.toml` sets
+  `publish = false` and `git_release_enable = false` so release-plz only opens
+  the version/CHANGELOG PR and does not race to create the release or publish to
+  crates.io. crates.io is now an explicit later opt-in documented in
+  `docs/RELEASING.md`. Previously a release depended on the token-gated
+  release-plz job creating the release, and a tag it pushed with the default
+  `GITHUB_TOKEN` would not have triggered the binary build at all.
+
 - Corrected install documentation to state that prebuilt binaries, `install.sh`,
   crates.io installs, and prebuilt self-update become usable only after the
   first public release/publish; the current pre-release install path is

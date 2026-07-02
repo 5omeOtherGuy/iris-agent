@@ -1,13 +1,20 @@
 # Releasing Iris
 
-How an operator cuts a public Iris release. Two systems cooperate:
+How an operator cuts a public Iris release. The current path ships prebuilt binaries only;
+crates.io is an explicit later opt-in. Two systems cooperate:
 
 - **release-plz** (`release-plz.toml`, `.github/workflows/release-plz.yml`) — opens a
-  release PR that bumps the version and updates `CHANGELOG.md`; on merge it tags the
-  version, creates the GitHub release, and (when a token exists) publishes to crates.io.
+  release PR that bumps the version and updates `CHANGELOG.md`. It does **not** create the
+  git tag, the GitHub release, or a crates.io publish (`git_release_enable = false`,
+  `publish = false`).
 - **cargo-dist** (`[workspace.metadata.dist]` in `Cargo.toml`,
-  `.github/workflows/release.yml`) — on the version tag, builds the four prebuilt archives
-  + SHA-256 checksums + the shell installer and uploads them to that release.
+  `.github/workflows/release.yml`) — triggered by the version tag an operator pushes. It
+  builds the four prebuilt archives + SHA-256 checksums + the shell installer, then creates
+  the GitHub release and attaches them.
+
+The operator pushes the tag by hand on purpose: a tag pushed by release-plz's default
+`GITHUB_TOKEN` would not trigger `release.yml`
+([release-plz docs](https://release-plz.dev/docs/github/token)).
 
 ## Status
 
@@ -23,9 +30,9 @@ visible or need repo-admin rights; do not automate them from an agent session.
 
 ## Prerequisites
 
-- Push access to `main` and permission to create releases.
-- For crates.io: a crates.io API token with publish rights for `iris-agent`.
+- Push access to `main` and permission to push tags / create releases.
 - Green `main`: `bash scripts/gate.sh` plus the Lint workflow (actionlint, typos).
+- crates.io is not required for a prebuilt release (see the optional section below).
 
 ## Pre-release check (reproducible, no public action)
 
@@ -44,32 +51,27 @@ download/verify/self-replace path, including checksum-mismatch refusal. Expect
 The asset/checksum names and the `DIST_VERSION` = `cargo-dist-version` sync are locked by
 unit tests in `src/selfupdate.rs`, so drift fails `cargo test`, not a release.
 
-## Step 1 — enable crates.io publish **[operator, one-time]**
+## Step 1 — cut the prebuilt release **[operator]**
 
-The `release-plz-release` job is skipped until the token exists, so nothing publishes early.
-
-1. Create a crates.io API token scoped to publish `iris-agent`.
-2. Add it as the repository secret `CARGO_REGISTRY_TOKEN`
-   (Settings -> Secrets and variables -> Actions).
-
-Until this secret is set, releases still produce prebuilt binaries and a GitHub release;
-only the `cargo install iris-agent` path is unavailable.
-
-## Step 2 — cut the release **[operator]**
-
-1. Merge the open **release-plz** PR (title `chore: release ...`). This bumps the version,
-   finalizes `CHANGELOG.md`, tags `vX.Y.Z`, and creates the GitHub release.
-2. The tag push triggers `.github/workflows/release.yml` (cargo-dist). Watch it build the
-   four targets and upload assets. Confirm the release has:
+1. Merge the open **release-plz** PR (title `chore: release ...`). This bumps the version
+   and finalizes `CHANGELOG.md` on `main`. No tag or release is created yet.
+2. Push the version tag from the merged commit. It must equal `v` + the `Cargo.toml`
+   version (e.g. `v0.1.0`) so `iris update` matches it:
+   ```
+   git switch main && git pull
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+3. The tag triggers `.github/workflows/release.yml`. It builds the four targets, builds the
+   installer, and creates the GitHub release with the assets attached. Confirm the release
+   has all nine files:
    - `iris-agent-x86_64-unknown-linux-gnu.tar.gz` + `.sha256`
    - `iris-agent-aarch64-unknown-linux-gnu.tar.gz` + `.sha256`
    - `iris-agent-x86_64-apple-darwin.tar.gz` + `.sha256`
    - `iris-agent-aarch64-apple-darwin.tar.gz` + `.sha256`
    - `iris-agent-installer.sh`
-3. If `CARGO_REGISTRY_TOKEN` is set, `release-plz-release` publishes to crates.io. Confirm
-   the new version on crates.io.
 
-## Step 3 — post-release live acceptance **[operator]**
+## Step 2 — post-release live acceptance **[operator]**
 
 Run on a clean machine per platform (no prior Iris, no Rust toolchain needed):
 
@@ -82,8 +84,21 @@ Then confirm self-update from a prior build: install `vX.Y.Z-1`, run `iris updat
 check it downloads, verifies the checksum, and self-replaces to `vX.Y.Z`. Both paths verify
 SHA-256 before installing; a mismatch must abort.
 
-After acceptance, update `README.md` to state that prebuilt install and `cargo install
-iris-agent` work, and mark the distribution item done in `docs/ROADMAP.md`.
+After acceptance, update `README.md` to state that prebuilt install works, and mark the
+distribution item done in `docs/ROADMAP.md`.
+
+## Optional — enable crates.io later **[operator, one-time]**
+
+Prebuilt binaries do not need this. To also offer `cargo install iris-agent`:
+
+1. Set `publish = true` in `release-plz.toml`.
+2. Add a crates.io API token (publish rights for `iris-agent`) as the repository secret
+   `CARGO_REGISTRY_TOKEN` (Settings -> Secrets and variables -> Actions). The
+   `release-plz-release` job stays skipped until this secret exists.
+3. Decide who owns the git release object. `release.yml` already creates it; leave
+   `git_release_enable = false` unless you move release-object creation to release-plz.
+
+The crates.io publish then runs from `release-plz-release` when the release PR merges.
 
 ## Maintaining the cargo-dist pipeline
 
