@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added a per-project trust gate for repo-provided Iris resources (issue #202):
+  system-prompt fragments under `<cwd>/.iris/fragments` now load only for a
+  trusted workspace. A first interactive run whose repo ships fragments prompts
+  once and persists the decision in `~/.iris/trust.json` (keyed by the canonical
+  directory, `IRIS_TRUST_PATH` override); non-interactive runs never prompt and
+  default to untrusted without recording a decision. Project docs
+  (`AGENTS.md`/`CLAUDE.md`) stay ungated. Added the `/trust` command to change
+  the decision mid-session (re-assembles the prompt and rebuilds the provider at
+  the turn boundary).
+
 - Added root-level product and design-system briefs (`PRODUCT.md` and
   `DESIGN.md`) and linked them from the README documentation index.
 - Documented the PR #170-#175 TUI/harness batch: compact tool durations,

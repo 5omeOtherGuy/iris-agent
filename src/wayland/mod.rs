@@ -8,6 +8,7 @@
 //! filesystem-free.
 
 pub(crate) mod system_prompt;
+pub(crate) mod trust;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

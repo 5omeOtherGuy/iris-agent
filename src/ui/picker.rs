@@ -13,8 +13,11 @@ use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, CatalogModel, ExactMatch};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
-use crate::ui::modal::{EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SettingsMenu};
+use crate::ui::modal::{
+    EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SettingsMenu, TrustMenu,
+};
 use crate::wayland::Harness;
+use crate::wayland::trust::{self, TrustDecision};
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -143,6 +146,53 @@ pub(crate) fn open_scoped<P>(switch: &ModelSwitch<'_, P>) -> ModelCommand {
     ModelCommand::Open(Modal::Scoped(ScopedModels::new(available, enabled)))
 }
 
+/// Build the `/trust` modal from the current recorded decision for the cwd. An
+/// undecided project shows the untrusted row as current (the effective state).
+pub(crate) fn open_trust() -> Modal {
+    let trusted = std::env::current_dir()
+        .ok()
+        .map(|cwd| trust::decision_for(&cwd) == TrustDecision::Trusted)
+        .unwrap_or(false);
+    Modal::Trust(TrustMenu::new(trusted))
+}
+
+/// Apply a `/trust` decision: persist it (keyed by canonical cwd), re-assemble
+/// the system prompt under the new trust, and rebuild the provider at the safe
+/// inter-turn boundary so the change takes effect this session. Best-effort:
+/// a persistence failure is reported and nothing is rebuilt.
+fn apply_trust<P: ChatProvider>(
+    trusted: bool,
+    harness: &mut Harness<P>,
+    switch: &mut ModelSwitch<'_, P>,
+) -> Vec<String> {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => return vec![format!("could not resolve working directory: {error:#}")],
+    };
+    if let Err(error) = trust::set_decision(&cwd, trusted) {
+        return vec![format!("could not save trust decision: {error:#}")];
+    }
+    // Re-assemble the prompt under the new trust and rebuild the provider with
+    // it. Repo fragments now load (trust) or drop (untrust) from this turn on.
+    let tools = crate::tools::built_in_tools();
+    let prompt = crate::wayland::system_prompt::assemble(&cwd, &tools, trusted);
+    switch.set_system_prompt(prompt);
+    let candidate = switch.selection().clone();
+    let mut lines = vec![if trusted {
+        "Project trusted; repo fragments now load.".to_string()
+    } else {
+        "Project not trusted; repo fragments are skipped.".to_string()
+    }];
+    // Rebuild with the re-assembled prompt; surface only failures (the generic
+    // "switched to <model>" confirmation would be misleading for a trust change).
+    lines.extend(
+        cli::apply_selection(candidate, harness, switch)
+            .into_iter()
+            .filter(|line| line.contains("could not")),
+    );
+    lines
+}
+
 /// Build the `/settings` modal (effort picker entry).
 pub(crate) fn open_settings<P>(switch: &ModelSwitch<'_, P>) -> Modal {
     let current = switch
@@ -210,6 +260,9 @@ pub(crate) fn apply_action<P: ChatProvider>(
                 lines.push("Model selection saved to settings".to_string());
             }
             ActionResult::Keep(lines)
+        }
+        ModalAction::SetTrust(trusted) => {
+            ActionResult::Close(apply_trust(trusted, harness, switch))
         }
         ModalAction::SetEffort(level) => ActionResult::Close(apply_effort(level, harness, switch)),
         ModalAction::OpenEffortPicker => {

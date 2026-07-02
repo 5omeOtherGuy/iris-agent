@@ -129,7 +129,13 @@ Implemented today:
   runtime context in one place; fresh and resumed sessions feed the same
   assembled string through the provider request path. Skills/templates remain
   deferred (issue #57); named slots and selector-driven assembly remain open
-  (#76/#73).
+  (#76/#73). Repo-provided fragments are gated behind a per-project trust
+  decision ([#202](https://github.com/5omeOtherGuy/iris-agent/issues/202)): a
+  Tier-2 trust store (`wayland::trust`, `~/.iris/trust.json`, keyed by canonical
+  dir) records trusted/untrusted/undecided; `assemble` skips repo fragments
+  unless trusted; a first-run interactive prompt (never in non-interactive
+  contexts) and the `/trust` command set the decision. Project docs stay
+  ungated.
 - Milestone 2 foundations: structured metadata, typed tool-result contracts,
   token estimates, handle-backed large tool outputs, session-scoped
   content-addressed sidecars, turn-boundary auto-compaction, formal

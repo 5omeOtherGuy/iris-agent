@@ -558,7 +558,8 @@ fn assemble_rejects_a_repo_fragments_dir_escaping_the_workspace() {
     // .iris/fragments -> a directory outside the workspace.
     symlink(&secrets.path, ws.path.join(".iris/fragments")).unwrap();
 
-    let prompt = assemble(&ws.path, &built_in_tools());
+    // Even a trusted workspace must not follow an escaping symlink.
+    let prompt = assemble(&ws.path, &built_in_tools(), true);
     assert!(
         !prompt.contains("HOST SECRET"),
         "an escaping repo fragments dir must not be read into the prompt"
@@ -723,11 +724,54 @@ fn assemble_falls_back_to_shipped_defaults_when_dirs_are_empty() {
     // repo dir is absent; the global dir may or may not exist on the dev host,
     // so assert the defaults' content is present either way.
     let ws = temp_dir();
-    let prompt = assemble(&ws.path, &built_in_tools());
+    let prompt = assemble(&ws.path, &built_in_tools(), true);
     assert!(prompt.contains("<identity>"));
     assert!(prompt.contains("You are iris, a coding assistant"));
     assert!(prompt.contains("<available_tools>"));
     assert!(prompt.contains("<tool_use>"));
+}
+
+#[test]
+fn untrusted_workspace_skips_repo_fragments_but_keeps_project_docs() {
+    // A repo drops a system-prompt fragment AND a project doc. Untrusted: the
+    // fragment is gated out, but the project doc still loads (docs are not
+    // gated -- only system-prompt-level fragments are).
+    let ws = temp_dir();
+    fs::create_dir_all(ws.path.join(".iris/fragments")).unwrap();
+    fs::write(
+        ws.path.join(".iris/fragments/injected.md"),
+        "---\nname: injected\nslot: 5\n---\nHOSTILE FRAGMENT",
+    )
+    .unwrap();
+    fs::write(ws.path.join("AGENTS.md"), "PROJECT DOC CONTENT").unwrap();
+
+    // The repo does provide fragments, so the gate is meaningful here.
+    assert!(repo_provides_fragments(&ws.path));
+
+    let untrusted = assemble(&ws.path, &built_in_tools(), false);
+    assert!(
+        !untrusted.contains("HOSTILE FRAGMENT"),
+        "untrusted repo fragments must be skipped"
+    );
+    assert!(
+        untrusted.contains("PROJECT DOC CONTENT"),
+        "project docs load regardless of trust"
+    );
+
+    // Trusted: the repo fragment is folded in.
+    let trusted = assemble(&ws.path, &built_in_tools(), true);
+    assert!(
+        trusted.contains("HOSTILE FRAGMENT"),
+        "a trusted workspace loads its repo fragments"
+    );
+}
+
+#[test]
+fn repo_provides_fragments_is_false_without_the_dir() {
+    let ws = temp_dir();
+    assert!(!repo_provides_fragments(&ws.path));
+    fs::create_dir_all(ws.path.join(".iris/fragments")).unwrap();
+    assert!(repo_provides_fragments(&ws.path));
 }
 
 #[test]

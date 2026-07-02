@@ -420,6 +420,15 @@ fn route_command<P: ChatProvider>(
             tui.screen.open_modal(picker::open_settings(sw));
             Ok(true)
         }
+        "/trust" if rest.is_empty() => {
+            // Needs a switch to rebuild the provider with the re-assembled prompt.
+            if switch.as_ref().is_none() {
+                return Ok(false);
+            }
+            tui.screen.commit_user(prompt);
+            tui.screen.open_modal(picker::open_trust());
+            Ok(true)
+        }
         "/login" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             tui.screen.open_modal(login::open_login());
