@@ -19,25 +19,6 @@ use crate::mimir::auth::api_key;
 use crate::mimir::auth::storage::{AuthStore, CredentialKind};
 use crate::mimir::selection::{ModelSelection, OpenAiCompatibleConfig, ProviderId};
 
-/// UI id of the model hidden behind the [`FABLE_5_OPT_IN_ENV`] opt-in.
-const FABLE_5_MODEL_ID: &str = "claude-fable-5";
-
-/// Hidden opt-in for Claude Fable 5. The model stays fully defined in the
-/// subscription matrix (so a deliberate selection still builds a correct
-/// request), but it is omitted from the `/model` candidate set unless this env
-/// var is set to `1`. It is an undocumented 0->1 switch: Fable 5 is gated by
-/// Anthropic (`404 not_found` on accounts without access), so it stays off by
-/// default and is only surfaced for accounts that opt in.
-const FABLE_5_OPT_IN_ENV: &str = "IRIS_ENABLE_FABLE_5";
-
-/// Whether the Fable 5 opt-in is switched on (`IRIS_ENABLE_FABLE_5=1`). Unset,
-/// `0`, or any other value keeps it hidden.
-fn fable_5_enabled() -> bool {
-    std::env::var(FABLE_5_OPT_IN_ENV)
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false)
-}
-
 /// The hand-maintained set of (provider, model id, display name, context-window
 /// label) tuples Iris supports. New models are added here in one place; the list
 /// intentionally stays small.
@@ -151,14 +132,10 @@ impl AuthStatus {
     }
 }
 
-/// The full catalog, in registry order. Fable 5 is filtered out unless its
-/// hidden opt-in ([`FABLE_5_OPT_IN_ENV`]) is switched on, so it never appears in
-/// the `/model` picker or exact-match candidate set by default.
+/// The full catalog, in registry order.
 pub(crate) fn all() -> Vec<CatalogModel> {
-    let fable_enabled = fable_5_enabled();
     ENTRIES
         .iter()
-        .filter(|(_, id, ..)| fable_enabled || *id != FABLE_5_MODEL_ID)
         .map(|(provider, id, _name, ctx)| CatalogModel {
             provider: *provider,
             id: (*id).to_string(),
@@ -475,20 +452,9 @@ mod tests {
     }
 
     #[test]
-    fn fable_5_is_hidden_unless_the_opt_in_is_switched_on() {
-        let _env = crate::mimir::test_support::env_lock();
-        // SAFETY: env mutation is process-global; this is the only test that reads
-        // IRIS_ENABLE_FABLE_5, and it restores the var before returning.
-        let has = |models: &[CatalogModel]| models.iter().any(|m| m.id == FABLE_5_MODEL_ID);
-        unsafe { std::env::remove_var(FABLE_5_OPT_IN_ENV) };
-        assert!(!has(&all()), "hidden by default (unset)");
-        unsafe { std::env::set_var(FABLE_5_OPT_IN_ENV, "0") };
-        assert!(!has(&all()), "0 keeps it hidden");
-        unsafe { std::env::set_var(FABLE_5_OPT_IN_ENV, "1") };
-        assert!(has(&all()), "1 surfaces it");
-        // Other Anthropic models are unaffected by the toggle.
+    fn fable_5_is_in_the_catalog() {
+        assert!(all().iter().any(|m| m.id == "claude-fable-5"));
         assert!(all().iter().any(|m| m.id == "claude-opus-4-8"));
-        unsafe { std::env::remove_var(FABLE_5_OPT_IN_ENV) };
     }
 
     #[test]
