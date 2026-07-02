@@ -857,7 +857,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.starts_with("      Second paragraph")),
+                .any(|line| line.starts_with("    › Second paragraph")),
             "paragraph start lost assistant text-column alignment: {rendered:?}"
         );
         assert!(
@@ -2097,6 +2097,38 @@ mod tests {
         assert!(
             prompt_idx < injected_idx,
             "injected row must follow: {rendered}"
+        );
+    }
+
+    #[test]
+    fn assistant_paragraphs_keep_marker_before_following_user_message() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextEnd(
+            "First assistant paragraph.\n\nSecond assistant paragraph.".to_string(),
+        ));
+        screen.apply(UiEvent::UserMessage("Next user message.".to_string()));
+
+        let lines = rendered_lines(&mut screen, 100, 24);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        let second_assistant = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("Second assistant paragraph."))
+            .expect("second assistant paragraph");
+        assert!(
+            second_assistant.trim_start().starts_with("› "),
+            "assistant paragraphs need the visible marker before user text: {rendered}"
+        );
+
+        let next_user = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("Next user message."))
+            .expect("next user message");
+        assert!(
+            !next_user.trim_start().starts_with("› "),
+            "user message must stay unmarked: {rendered}"
         );
     }
 
