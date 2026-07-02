@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
-use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider, Message};
+use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider, Message, Role};
 use crate::session::SessionLog;
 use crate::ui::tui::TuiUi;
 use crate::ui::{Ui, UiBridge, UiEvent, slash};
@@ -329,10 +329,11 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     vec![confirm]
 }
 
-/// Picker-only slash commands that require the interactive TUI. In the non-TTY
-/// text path these are reported as unavailable instead of being sent to the
-/// model; `/model` and `/reasoning` keep working as text commands.
-fn picker_only_command(prompt: &str) -> Option<&'static str> {
+/// Slash commands that require the interactive TUI (pickers/modals, or --
+/// `/debug` -- the rendered screen itself). In the non-TTY text path these are
+/// reported as unavailable instead of being sent to the model; `/model`,
+/// `/reasoning`, `/copy`, and `/session` keep working as text commands.
+fn tui_only_command(prompt: &str) -> Option<&'static str> {
     match prompt.split_whitespace().next().unwrap_or("") {
         "/scoped-models" => Some("/scoped-models"),
         "/settings" => Some("/settings"),
@@ -341,8 +342,88 @@ fn picker_only_command(prompt: &str) -> Option<&'static str> {
         "/new" => Some("/new"),
         "/login" => Some("/login"),
         "/logout" => Some("/logout"),
+        // pi-mono spells it `/debug`; `/dbug` is accepted as an unlisted alias.
+        "/debug" | "/dbug" => Some("/debug"),
         _ => None,
     }
+}
+
+/// The most recent assistant text reply in the provider-visible context, for
+/// `/copy`. Skips reasoning/tool rows so what lands in the clipboard is the
+/// reply the user just read, mirroring pi-mono's `getLastAssistantText`.
+fn last_assistant_text(messages: &[Message]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
+        .map(|message| message.content.as_str())
+}
+
+/// `/copy`: put the last assistant reply on the system clipboard and report
+/// what happened. Shared by the TUI and text front-ends.
+pub(crate) fn copy_command_lines<P: ChatProvider>(harness: &Harness<P>) -> Vec<String> {
+    let Some(text) = last_assistant_text(harness.messages()) else {
+        return vec!["no assistant reply to copy yet.".to_string()];
+    };
+    match crate::ui::clipboard::copy(text) {
+        Ok(crate::ui::clipboard::CopyMethod::NativeTool) => {
+            vec!["copied last assistant reply to the clipboard.".to_string()]
+        }
+        Ok(crate::ui::clipboard::CopyMethod::Osc52) => vec![
+            "sent last assistant reply to the clipboard via OSC 52 (requires terminal support)."
+                .to_string(),
+        ],
+        Err(error) => vec![format!("could not copy: {error:#}")],
+    }
+}
+
+/// `/session`: read-only session facts (transcript file, id, message counts,
+/// context-token estimate, active model). Mirrors pi-mono's `/session` info at
+/// the level Iris actually tracks -- estimates, not provider-billed totals.
+pub(crate) fn session_info_lines<P: ChatProvider>(
+    harness: &Harness<P>,
+    switch: &Option<ModelSwitch<'_, P>>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match (harness.session_id(), harness.session_path()) {
+        (Some(id), Some(path)) => {
+            lines.push(format!("session: {id}"));
+            lines.push(format!("file: {}", path.display()));
+        }
+        _ => lines.push("session: in-memory (not persisted)".to_string()),
+    }
+    let messages = harness.messages();
+    let count = |role: Role| messages.iter().filter(|m| m.role == role).count();
+    lines.push(format!(
+        "messages: {} ({} user, {} assistant, {} reasoning, {} tool calls, {} tool results)",
+        messages.len(),
+        count(Role::User),
+        count(Role::Assistant),
+        count(Role::AssistantReasoning),
+        count(Role::AssistantToolCall),
+        count(Role::Tool),
+    ));
+    let budget = match harness.context_budget() {
+        Some(budget) => format!("{budget} budget"),
+        None => "no budget".to_string(),
+    };
+    lines.push(format!(
+        "context: ~{} tokens estimated ({budget})",
+        harness.context_token_estimate(),
+    ));
+    if let Some(sw) = switch.as_ref() {
+        let selection = sw.selection();
+        lines.push(format!(
+            "model: {}/{} (reasoning: {})",
+            selection.provider.as_str(),
+            selection.model,
+            selection
+                .reasoning
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("none"),
+        ));
+    }
+    lines
 }
 
 /// Read-only `/model` view: current provider/model/reasoning + supported levels.
@@ -499,10 +580,24 @@ fn run_session_inner<P: ChatProvider>(
         if slash::is_exit(prompt) {
             break;
         }
-        // Picker-only commands need the interactive TUI; in the non-TTY text path
-        // they are a no-op status rather than being sent to the model. `/model`
-        // and `/reasoning` keep their existing text behavior below.
-        if let Some(name) = picker_only_command(prompt) {
+        // Read-only session commands work the same here as in the TUI and never
+        // start a turn.
+        if prompt == "/copy" {
+            for line in copy_command_lines(harness) {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
+        if prompt == "/session" {
+            for line in session_info_lines(harness, switch) {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
+        // TUI-only commands (pickers/modals, `/debug`) are a no-op status in the
+        // non-TTY text path rather than being sent to the model. `/model` and
+        // `/reasoning` keep their existing text behavior below.
+        if let Some(name) = tui_only_command(prompt) {
             ui.emit(UiEvent::Notice(format!(
                 "{name} is only available in the interactive TUI"
             )))?;
@@ -655,6 +750,86 @@ mod tests {
             guard.commit();
         }
         assert_eq!(&*cell.borrow(), "committed");
+    }
+
+    #[test]
+    fn last_assistant_text_prefers_latest_nonempty_text_reply() {
+        assert_eq!(last_assistant_text(&[]), None);
+        assert_eq!(last_assistant_text(&[Message::user("question")]), None);
+        let messages = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            // Trailing non-text rows (reasoning, blank text) are skipped.
+            Message::assistant("   "),
+        ];
+        assert_eq!(last_assistant_text(&messages), Some("a2"));
+    }
+
+    #[test]
+    fn copy_command_reports_missing_assistant_reply() {
+        let (harness, _dir) = fake_harness();
+        assert_eq!(
+            copy_command_lines(&harness),
+            vec!["no assistant reply to copy yet.".to_string()]
+        );
+    }
+
+    #[test]
+    fn session_info_lines_report_in_memory_session_counts_and_model() {
+        let dir = crate::tools::test_support::temp_dir();
+        let messages = vec![Message::user("hi"), Message::assistant("hello")];
+        let agent = Agent::resumed(
+            FakeProvider::new(vec![]),
+            crate::tools::built_in_tools(),
+            messages,
+        );
+        let harness = Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            None,
+            Some(1000),
+        );
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let switch = Some(ModelSwitch::new(
+            selection(ProviderId::OpenAiCodex, "gpt-5.5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        let lines = session_info_lines(&harness, &switch);
+        assert_eq!(lines[0], "session: in-memory (not persisted)");
+        assert!(
+            lines[1].starts_with("messages: 2 (1 user, 1 assistant"),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("1000 budget"), "{lines:?}");
+        assert!(
+            lines[3].contains("openai-codex/gpt-5.5 (reasoning: none)"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn session_info_lines_report_persisted_file_and_id() {
+        let dir = crate::tools::test_support::temp_dir();
+        let log = SessionLog::create_in(&dir.path, &dir.path).expect("session log");
+        let id = log.id().to_string();
+        let path = log.path().to_path_buf();
+        let agent = Agent::new(FakeProvider::new(vec![]), crate::tools::built_in_tools());
+        let harness = Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            Some(log),
+            None,
+        );
+        let lines = session_info_lines(&harness, &None);
+        assert_eq!(lines[0], format!("session: {id}"));
+        assert_eq!(lines[1], format!("file: {}", path.display()));
+        assert!(lines[3].contains("no budget"), "{lines:?}");
     }
 
     #[test]
@@ -830,6 +1005,44 @@ mod tests {
         // No switch state -> never handled (the tests' in-memory loops pass None).
         let mut none: Option<ModelSwitch<FakeProvider>> = None;
         assert!(handle_model_command("/model", &mut harness, &mut none).is_none());
+    }
+
+    #[test]
+    fn text_path_handles_session_and_copy_and_reports_tui_only_commands() -> Result<()> {
+        let (mut harness, _dir) = fake_harness();
+        // `/quit` exits through the registry, so no turn ever reaches the
+        // provider (the fake provider would error on an unexpected call).
+        let mut ui = TextUi::new(
+            "/session\n/copy\n/debug\n/dbug\n/settings\n/quit\n".as_bytes(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut switch = None;
+        run_session(&mut harness, &mut ui, &mut switch)?;
+
+        let (_, out, _) = ui.into_parts();
+        let out = String::from_utf8(out)?;
+        assert!(
+            out.contains("note: session: in-memory (not persisted)"),
+            "{out}"
+        );
+        assert!(out.contains("note: messages: 0 (0 user"), "{out}");
+        assert!(
+            out.contains("note: no assistant reply to copy yet."),
+            "{out}"
+        );
+        // Both spellings of the debug command report the same TUI-only notice.
+        assert_eq!(
+            out.matches("note: /debug is only available in the interactive TUI")
+                .count(),
+            2,
+            "{out}"
+        );
+        assert!(
+            out.contains("note: /settings is only available in the interactive TUI"),
+            "{out}"
+        );
+        Ok(())
     }
 
     #[test]

@@ -415,7 +415,11 @@ pub(crate) struct StoredSession {
 /// foundation persists so a resumed session can report a stable context total
 /// without replaying the model. Messages produced by a provider/model round
 /// trip may also carry Nexus's optional `providerTurnId` correlation field.
-fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value {
+/// The persisted `message` body for one conversation message (role, content,
+/// tool linkage, reasoning continuity/origin). Split from [`message_entry`] so
+/// the `/debug` snapshot can dump the in-memory context in the exact JSONL
+/// message shape the transcript uses, without fabricating entry ids.
+pub(crate) fn message_body(message: &Message) -> Value {
     let mut inner = json!({
         "role": message.role.as_str(),
         "content": message.content,
@@ -448,6 +452,11 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
             });
         }
     }
+    inner
+}
+
+fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value {
+    let inner = message_body(message);
     let mut entry = json!({
         "type": "message",
         "id": id,

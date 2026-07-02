@@ -310,6 +310,32 @@ impl TuiUi {
         Ok(())
     }
 
+    /// Snapshot the rendered document for `/debug`: the current terminal size
+    /// plus every rendered line as `[idx] (w=NN) "escaped text"`, mirroring
+    /// pi-mono's debug dump of all rendered lines with visible widths. The
+    /// zero-width hardware-cursor marker is stripped so widths reflect what the
+    /// terminal shows.
+    pub(crate) fn debug_render_lines(&mut self) -> Result<(Size, Vec<String>)> {
+        let (width, height) = terminal_size()?;
+        let size = Size::new(width.max(1), height.max(1));
+        let document = render_document_with_hints(&mut self.screen, size);
+        let lines = document
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .filter(|content| *content != crate::ui::terminal_surface::CURSOR_MARKER)
+                    .collect();
+                format!("[{idx}] (w={}) {text:?}", wrap::display_width(&text))
+            })
+            .collect();
+        Ok((size, lines))
+    }
+
     fn restore(&mut self) {
         if self.active {
             // Replace the interactive chrome with transcript-only content so

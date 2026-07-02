@@ -191,6 +191,34 @@ impl<P: ChatProvider> Harness<P> {
         self.agent.reset_session(messages);
     }
 
+    /// Id of the attached transcript log, or `None` for an in-memory session.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.session.as_ref().map(SessionLog::id)
+    }
+
+    /// On-disk path of the attached transcript log, or `None` for an in-memory
+    /// session.
+    pub(crate) fn session_path(&self) -> Option<&std::path::Path> {
+        self.session.as_ref().map(SessionLog::path)
+    }
+
+    /// The provider-visible conversation context, for read-only inspection
+    /// (`/copy`, `/session`, `/debug`). Same view the persistence cursor walks.
+    pub(crate) fn messages(&self) -> &[Message] {
+        self.agent.messages()
+    }
+
+    /// Estimated tokens of the current provider-visible context, using the same
+    /// per-message convention as persistence and auto-compaction.
+    pub(crate) fn context_token_estimate(&self) -> u64 {
+        context_tokens(self.agent.messages())
+    }
+
+    /// The configured auto-compaction context budget, when enabled.
+    pub(crate) fn context_budget(&self) -> Option<u64> {
+        self.budget
+    }
+
     /// Record a runtime mode switch as a first-class `modelSelection` entry in
     /// the transcript log. Best-effort (no-op without an attached log), mirroring
     /// message persistence: a switch is still applied even if it cannot be

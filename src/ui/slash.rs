@@ -3,10 +3,13 @@
 //! A small data-driven registry replaces the former two-string `is_exit_command`
 //! match: the TUI palette filters this list as the user types `/`, and the
 //! non-TTY text path consults [`is_exit`] for the same commands. Commands are
-//! registered here ONLY when a real backing action exists; `/exit` ends the
-//! session, `/model` and `/reasoning` route to the shared model-switch
-//! handler (`crate::cli::handle_model_command`). Adding a command with no action
-//! would lie to the user, so the list stays honest and short.
+//! registered here ONLY when a real backing action exists; `/exit` and `/quit`
+//! end the session, and every `Submit` command routes to a real handler --
+//! `/model`/`/reasoning` to the shared model-switch handler
+//! (`crate::cli::handle_model_command`), `/copy`/`/session` to the shared line
+//! builders in `crate::cli`, and the rest to their TUI pickers/handlers in
+//! `crate::ui::tui_loop::route_command`. Adding a command with no action would
+//! lie to the user, so the list stays honest and short.
 
 /// What accepting a slash command does. The loop owns dispatch; this enum is the
 /// neutral contract so the registry never reaches into the event loop.
@@ -38,6 +41,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Exit,
     },
     SlashCommand {
+        name: "/quit",
+        description: "End the session (alias of /exit)",
+        action: SlashAction::Exit,
+    },
+    SlashCommand {
         name: "/model",
         description: "Show or switch provider/model",
         action: SlashAction::Submit,
@@ -55,6 +63,21 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/new",
         description: "Start a fresh session",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/session",
+        description: "Show session info (file, id, messages, tokens)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/copy",
+        description: "Copy the last assistant reply to the clipboard",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/debug",
+        description: "Write a debug snapshot (screen + transcript) to a file",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -185,13 +208,20 @@ mod tests {
 
     #[test]
     fn matches_filters_by_prefix_case_insensitively() {
-        assert_eq!(matches("/").len(), 10);
+        assert_eq!(matches("/").len(), COMMANDS.len());
         let ex = matches("/EX");
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name, "/exit");
-        assert!(matches("/q").is_empty());
+        assert_eq!(matches("/q")[0].name, "/quit");
         assert_eq!(matches("/m")[0].name, "/model");
-        assert_eq!(matches("/r")[0].name, "/reasoning");
+        assert_eq!(matches("/rea")[0].name, "/reasoning");
+        assert_eq!(matches("/c")[0].name, "/copy");
+        assert_eq!(matches("/d")[0].name, "/debug");
+        // `/se` narrows to the session/settings pair, prefix order preserved.
+        let se = matches("/se");
+        assert_eq!(se.len(), 2);
+        assert_eq!(se[0].name, "/session");
+        assert_eq!(se[1].name, "/settings");
         assert!(matches("/zzz").is_empty());
         assert!(matches("hello").is_empty());
     }
@@ -201,7 +231,8 @@ mod tests {
         assert!(is_exit("/exit"));
         // Case-insensitive so a /EXIT typed past the palette still exits.
         assert!(is_exit("/EXIT"));
-        assert!(!is_exit("/quit"));
+        // pi-mono parity: /quit is a registered exit alias.
+        assert!(is_exit("/quit"));
         assert!(!is_exit("/export"));
         assert!(!is_exit("exit"));
     }
@@ -214,10 +245,10 @@ mod tests {
         assert_eq!(p.selected(), 0);
         // Registry order ends with /logout. Down walks to the last
         // row, then clamps there.
-        for _ in 0..20 {
+        for _ in 0..COMMANDS.len() + 6 {
             p.down("/");
         }
-        assert_eq!(p.selected(), 9);
+        assert_eq!(p.selected(), COMMANDS.len() - 1);
         assert_eq!(p.accept("/").unwrap().name, "/logout");
         // Up returns toward the top.
         p.up();
