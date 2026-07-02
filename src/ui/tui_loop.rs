@@ -899,9 +899,7 @@ async fn run_login(
                 match maybe {
                     Some(event) if is_modal_cancel(&event) => break LoginResolution::Cancelled,
                     Some(event) => {
-                        if dialog.accepts_manual_input()
-                            && apply_manual_key(&mut dialog, &event, &manual_tx)
-                        {
+                        if handle_login_input_event(&mut dialog, &event, &manual_tx) {
                             tui.screen.open_modal(Modal::LoginDialog(dialog.clone()));
                             tui.draw()?;
                         }
@@ -935,6 +933,17 @@ async fn run_login(
     tui.screen.close_modal();
     tui.draw()?;
     Ok(())
+}
+
+fn handle_login_input_event(
+    dialog: &mut LoginDialog,
+    event: &Event,
+    manual_tx: &std::sync::mpsc::Sender<String>,
+) -> bool {
+    if dialog.accepts_manual_input() {
+        let _ = apply_manual_key(dialog, event, manual_tx);
+    }
+    true
 }
 
 /// Apply a keystroke to the manual-paste buffer of an Anthropic login dialog.
@@ -2010,6 +2019,18 @@ mod tests {
             to_modal_key(&key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             None
         );
+    }
+
+    #[test]
+    fn login_input_resize_requests_redraw_without_manual_edit() {
+        let (manual_tx, _manual_rx) = std::sync::mpsc::channel::<String>();
+        let mut dialog = LoginDialog::new("openai-codex", false);
+
+        assert!(handle_login_input_event(
+            &mut dialog,
+            &Event::Resize(90, 30),
+            &manual_tx,
+        ));
     }
 
     #[test]
