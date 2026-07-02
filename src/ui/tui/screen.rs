@@ -373,6 +373,12 @@ pub(crate) struct Screen {
     /// user sees their queued input register before it is injected. Reset at
     /// each turn boundary.
     queued: usize,
+    /// Whether the last rendered document padded blank rows above a short
+    /// transcript (`MIN_INLINE_DOCUMENT_ROWS`). While that padding is on the
+    /// surface, its retained lines do not start with transcript content, so the
+    /// first un-padded frame must not reuse a stable prefix computed from
+    /// transcript rows alone (see [`render_document_inner`]).
+    padded_frame: bool,
 }
 
 impl Screen {
@@ -390,6 +396,7 @@ impl Screen {
             footer: None,
             modal: None,
             queued: 0,
+            padded_frame: false,
         }
     }
 
@@ -743,7 +750,8 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     let target_rows = height.min(MIN_INLINE_DOCUMENT_ROWS);
     let min_transcript_rows =
         usize::from(target_rows).saturating_sub(chrome.len() + working_block.len());
-    if transcript.total_lines < min_transcript_rows {
+    let pad_frame = transcript.total_lines < min_transcript_rows;
+    if pad_frame {
         transcript = screen.wrapped_lines(width);
         let mut padded = Vec::with_capacity(min_transcript_rows + chrome.len());
         padded.extend(
@@ -753,7 +761,16 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
         padded.extend(transcript.lines);
         transcript.lines = padded;
         transcript.stable_prefix = 0;
+    } else if screen.padded_frame && transcript.stable_prefix > 0 {
+        // The previous frame padded blank rows above the transcript, so the
+        // surface's retained document does not start with transcript content
+        // and the stable-prefix hint would splice padding into this frame.
+        // Re-render the whole transcript once without the hint; the next frame
+        // resumes incremental rendering against the clean surface state.
+        transcript = screen.wrapped_lines(width);
+        transcript.stable_prefix = 0;
     }
+    screen.padded_frame = pad_frame;
     // The transcript is the scrolling base, moved into the document and never
     // cloned. The bottom-pinned tail -- working indicator then composer chrome
     // (which carries the docked overlays) -- is composited through the root

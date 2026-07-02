@@ -105,10 +105,26 @@ struct ActiveEdit {
     started: Option<Instant>,
 }
 
+/// Cached layout for one logical row: the physical-line range it wraps to plus
+/// its fold visibility, resolved once at wrap time. Fold state is part of the
+/// cache because every fold mutation (`toggle_latest_panel`, panel rebuilds)
+/// already dirties the affected rows, so per-frame rendering can skip the
+/// whole-transcript visibility scan and touch only dirty rows.
+struct RowLayout {
+    lines: Range<usize>,
+    /// Whether this row is visible under the panel fold state at wrap time.
+    visible: bool,
+    /// Cumulative visible physical lines through this row (inclusive), so the
+    /// stable-prefix line count for any dirty boundary is an O(1) lookup.
+    visible_cum: usize,
+    /// Panel `expanded` state carried into the next row's visibility scan.
+    expanded_after: bool,
+}
+
 #[derive(Default)]
 struct WrappedTranscriptCache {
     width: usize,
-    rows: Vec<Range<usize>>,
+    rows: Vec<RowLayout>,
     lines: Vec<Line<'static>>,
     dirty_from: usize,
 }
@@ -124,6 +140,17 @@ impl WrappedTranscriptCache {
     fn mark_dirty(&mut self, row: usize) {
         self.dirty_from = self.dirty_from.min(row);
     }
+}
+
+/// Memoized render of the in-flight streaming preview. The stream buffer only
+/// ever grows for a given stream and the memo is dropped on every stream
+/// start/end transition, so `(len, width)` uniquely identifies the rendered
+/// output. This keeps spinner ticks and typing-while-streaming frames from
+/// re-parsing the whole markdown preview when the stream did not change.
+struct StreamingRender {
+    len: usize,
+    width: usize,
+    lines: Vec<Line<'static>>,
 }
 
 #[derive(Debug)]
@@ -170,6 +197,9 @@ pub(super) struct Transcript {
     /// uses a realistic column count. Zero until the first render.
     last_width: usize,
     wrapped_cache: WrappedTranscriptCache,
+    /// Memoized wrapped lines for the current streaming preview; see
+    /// [`StreamingRender`].
+    streaming_render: Option<StreamingRender>,
 }
 
 impl Transcript {
@@ -378,6 +408,7 @@ impl Transcript {
 
     /// Commit any in-flight streamed assistant text into the transcript.
     fn finish_stream(&mut self) {
+        self.streaming_render = None;
         if let Some(text) = self.streaming.take()
             && !text.is_empty()
         {
@@ -1431,6 +1462,9 @@ impl Transcript {
             | UiEvent::OutputHandleStored { .. } => {}
             UiEvent::AssistantTextDelta(delta) => {
                 if self.streaming.is_none() {
+                    // A fresh stream starts here: drop any memoized render of a
+                    // prior stream so its `(len, width)` key can never collide.
+                    self.streaming_render = None;
                     self.push_blank();
                 }
                 self.streaming
@@ -1441,6 +1475,7 @@ impl Transcript {
                 // A non-empty end event is authoritative. Some providers only
                 // send deltas and finish with an empty end marker; in that case
                 // commit the accumulated stream instead of dropping it.
+                self.streaming_render = None;
                 let text = if text.is_empty() {
                     self.streaming.take().unwrap_or_default()
                 } else {
@@ -1745,16 +1780,54 @@ impl Transcript {
             .min(self.rows.len())
             .min(self.wrapped_cache.rows.len());
         if dirty_from < self.wrapped_cache.rows.len() {
-            let line_start = self.wrapped_cache.rows[dirty_from].start;
+            let line_start = self.wrapped_cache.rows[dirty_from].lines.start;
             self.wrapped_cache.rows.truncate(dirty_from);
             self.wrapped_cache.lines.truncate(line_start);
         }
 
+        // Resume the fold-visibility scan from the last cached row instead of
+        // rescanning the whole transcript: `expanded` and the cumulative
+        // visible-line count carry forward, so re-wrapping and visibility are
+        // both proportional to the dirty tail.
+        let (mut expanded, mut visible_cum) =
+            self.wrapped_cache.rows.last().map_or((true, 0), |layout| {
+                (layout.expanded_after, layout.visible_cum)
+            });
         for row in &self.rows[self.wrapped_cache.rows.len()..] {
+            match row.chrome.as_ref() {
+                // A panel opens fully shown until its header sets the state;
+                // resetting at Top guards against a missing Bottom leaking a
+                // prior panel's collapsed state into the next one.
+                Some(ChromeRow::Top) => expanded = true,
+                Some(
+                    ChromeRow::Header { expanded: e, .. }
+                    | ChromeRow::RailHeader { expanded: e, .. },
+                ) => expanded = *e,
+                _ => {}
+            }
+            let visible = match row.fold {
+                FoldVis::Always => true,
+                FoldVis::WhenCollapsed => !expanded,
+                FoldVis::WhenExpanded => expanded,
+            };
             let start = self.wrapped_cache.lines.len();
             row.render_rows(width, &mut self.wrapped_cache.lines);
             let end = self.wrapped_cache.lines.len();
-            self.wrapped_cache.rows.push(start..end);
+            if visible {
+                visible_cum += end - start;
+            }
+            if matches!(
+                row.chrome.as_ref(),
+                Some(ChromeRow::Bottom | ChromeRow::RailEnd)
+            ) {
+                expanded = true;
+            }
+            self.wrapped_cache.rows.push(RowLayout {
+                lines: start..end,
+                visible,
+                visible_cum,
+                expanded_after: expanded,
+            });
         }
 
         self.wrapped_cache.dirty_from = self.rows.len();
@@ -1784,61 +1857,57 @@ impl Transcript {
         };
         self.ensure_wrapped_cache(width);
 
-        // Select the visible fold-tagged rows, then append the cached physical
-        // lines for each visible logical row. The fold pass remains a cheap
-        // no-allocation scan over retained rows, while width-aware wrapping and
-        // panel chrome composition only rerun for dirty rows. Production uses
-        // `suffix_only` so the stable prefix is counted, not cloned into the
-        // frame; tests use full output for direct render assertions.
-        let mut out = Vec::with_capacity(self.wrapped_cache.lines.len());
-        let mut stable_prefix = 0usize;
-        let mut expanded = true;
-        for (index, row) in self.rows.iter().enumerate() {
-            match row.chrome.as_ref() {
-                // A panel opens fully shown until its header sets the state;
-                // resetting at Top guards against a missing Bottom leaking a
-                // prior panel's collapsed state into the next one.
-                Some(ChromeRow::Top) => expanded = true,
-                Some(
-                    ChromeRow::Header { expanded: e, .. }
-                    | ChromeRow::RailHeader { expanded: e, .. },
-                ) => expanded = *e,
-                _ => {}
+        // Emit the cached physical lines of visible rows. Fold visibility and
+        // the cumulative visible-line counts were resolved at wrap time, so a
+        // frame touches only the dirty suffix: the stable prefix is an O(1)
+        // lookup, never a whole-transcript scan. Production uses `suffix_only`
+        // so the stable prefix is counted, not cloned into the frame; tests use
+        // full output for direct render assertions.
+        let start_row = if suffix_only { dirty_from } else { 0 };
+        let stable_prefix = if suffix_only && start_row > 0 {
+            self.wrapped_cache.rows[start_row - 1].visible_cum
+        } else {
+            0
+        };
+        let suffix_lines: usize = self.wrapped_cache.rows[start_row..]
+            .iter()
+            .filter(|layout| layout.visible)
+            .map(|layout| layout.lines.len())
+            .sum();
+        let mut out = Vec::with_capacity(suffix_lines);
+        for layout in &self.wrapped_cache.rows[start_row..] {
+            if layout.visible {
+                out.extend(
+                    self.wrapped_cache.lines[layout.lines.clone()]
+                        .iter()
+                        .cloned(),
+                );
             }
-            let skip = match row.fold {
-                FoldVis::Always => false,
-                FoldVis::WhenCollapsed => expanded,
-                FoldVis::WhenExpanded => !expanded,
-            };
-            if !skip {
-                let range = self.wrapped_cache.rows[index].clone();
-                let line_count = range.end.saturating_sub(range.start);
-                if suffix_only && index < dirty_from {
-                    stable_prefix += line_count;
-                } else {
-                    out.extend(self.wrapped_cache.lines[range].iter().cloned());
-                }
-            }
-            if matches!(
-                row.chrome.as_ref(),
-                Some(ChromeRow::Bottom | ChromeRow::RailEnd)
-            ) {
-                expanded = true;
-            }
-        }
-        if !suffix_only {
-            stable_prefix = stable_prefix.min(out.len());
         }
         // The in-flight stream renders as transient rows appended after history;
         // keep it out of the committed cache so spinner/streaming frames never
-        // mutate retained row ranges.
-        let streaming_rows = self
-            .streaming
-            .as_ref()
-            .map(|text| pane::streaming_assistant_rows(text, width))
-            .unwrap_or_default();
-        for row in &streaming_rows {
-            row.render_rows(width, &mut out);
+        // mutate retained row ranges. Its wrapped lines are memoized on
+        // `(len, width)` so only frames where the stream actually grew pay the
+        // markdown re-parse.
+        if let Some(text) = self.streaming.as_ref() {
+            let fresh = self
+                .streaming_render
+                .as_ref()
+                .is_some_and(|memo| memo.len == text.len() && memo.width == width);
+            if !fresh {
+                let mut lines = Vec::new();
+                for row in &pane::streaming_assistant_rows(text, width) {
+                    row.render_rows(width, &mut lines);
+                }
+                self.streaming_render = Some(StreamingRender {
+                    len: text.len(),
+                    width,
+                    lines,
+                });
+            }
+            if let Some(memo) = self.streaming_render.as_ref() {
+                out.extend(memo.lines.iter().cloned());
+            }
         }
         let total_lines = stable_prefix + out.len();
         TranscriptRender {

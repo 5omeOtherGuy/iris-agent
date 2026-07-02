@@ -60,7 +60,8 @@ pub(crate) use screen::Screen;
 use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
 use screen::{
-    composer_statusline, editor_visual_rows, fresh_editor, render_document, working_indicator_line,
+    composer_statusline, editor_visual_rows, fresh_editor, render_document,
+    render_document_with_chrome_tail, working_indicator_line,
 };
 #[cfg(test)]
 use transcript::Transcript;
@@ -559,6 +560,33 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "timer benchmark; run explicitly with --ignored --nocapture"]
+    fn streaming_render_benchmark() -> std::io::Result<()> {
+        let size = Size::new(120, 40);
+        let mut screen = Screen::new();
+        let mut surface = TerminalSurface::new(Vec::new());
+        screen.start_turn();
+        let chunk =
+            "Streaming markdown with `code`, **emphasis**, and prose that wraps across rows. ";
+
+        // ~50KB streamed in 600 deltas. Each delta renders one frame, followed
+        // by three no-delta frames (spinner ticks / typing while streaming), the
+        // realistic frame mix during a streamed answer.
+        let start = Instant::now();
+        for _ in 0..600 {
+            screen.apply(UiEvent::AssistantTextDelta(chunk.to_string()));
+            render_perf_cycle(&mut screen, &mut surface, size)?;
+            for _ in 0..3 {
+                let _ = screen.tick();
+                render_perf_cycle(&mut screen, &mut surface, size)?;
+            }
+        }
+        let streamed = start.elapsed();
+        eprintln!("streaming_perf deltas=600 frames=2400 elapsed={streamed:?}");
+        Ok(())
+    }
+
     #[derive(Clone, Debug)]
     enum CachedRenderOp {
         User(usize),
@@ -820,6 +848,123 @@ mod tests {
             assert!(!lines.is_empty(), "partial markdown vanished: {markdown:?}");
             assert!(screen.transcript.rows.is_empty());
         }
+    }
+
+    #[test]
+    fn streaming_render_memo_is_dropped_across_stream_boundaries() {
+        // Two consecutive streams of identical byte length at the same width:
+        // the second stream must never reuse the first stream's memoized
+        // render (the `(len, width)` memo key is only sound because the memo
+        // is dropped on every stream start/end transition).
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextDelta("alpha".to_string()));
+        let live_a = screen.wrapped_lines(80);
+        assert!(live_a.iter().any(|l| line_text(l).contains("alpha")));
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+
+        screen.apply(UiEvent::AssistantTextDelta("gamma".to_string()));
+        let live_b = screen.wrapped_lines(80);
+        assert!(
+            live_b.iter().any(|l| line_text(l).contains("gamma")),
+            "second stream reused a stale memoized render"
+        );
+        let alpha_rows = live_b
+            .iter()
+            .filter(|l| line_text(l).contains("alpha"))
+            .count();
+        assert_eq!(alpha_rows, 1, "committed text duplicated by stale memo");
+    }
+
+    #[test]
+    fn streaming_render_memo_tracks_growth_and_width() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantTextDelta("one two three".to_string()));
+        // Unchanged stream renders identically across repeated frames (the
+        // memo-hit path must be byte-stable with the fresh render).
+        let first = screen.wrapped_lines(80);
+        let second = screen.wrapped_lines(80);
+        assert_eq!(line_signature(&first), line_signature(&second));
+
+        // A delta grows the buffer: the next frame must show the new tail.
+        screen.apply(UiEvent::AssistantTextDelta(" four".to_string()));
+        let grown = screen.wrapped_lines(80);
+        assert!(grown.iter().any(|l| line_text(l).contains("four")));
+
+        // A width change must re-wrap the memoized stream, not reuse it.
+        let narrow = screen.wrapped_lines(12);
+        assert!(
+            narrow.iter().all(|l| display_width(&line_text(l)) <= 12),
+            "memoized streaming lines not re-wrapped for the narrower width"
+        );
+    }
+
+    /// Incremental rendering (wrapped-row cache + fold-visibility cache +
+    /// stable-prefix hints + surface prefix reuse) must leave the terminal
+    /// surface byte-identical to a fresh full replay of the same screen after
+    /// every kind of mutation, including fold toggles that dirty mid-transcript
+    /// rows and streaming frames that append transient rows.
+    #[test]
+    fn incremental_surface_matches_full_replay_after_each_mutation() {
+        let size = Size::new(60, 18);
+        let mut screen = Screen::new();
+        let mut incremental = TerminalSurface::new(Vec::new());
+
+        let mut step = 0usize;
+        let mut check = |screen: &mut Screen, incremental: &mut TerminalSurface<Vec<u8>>| {
+            step += 1;
+            render_perf_cycle(screen, incremental, size).expect("incremental render");
+            let (lines, chrome_tail) = render_document_with_chrome_tail(screen, size);
+            let mut fresh = TerminalSurface::new(Vec::new());
+            fresh
+                .render_with_volatile_tail(size, &lines, chrome_tail)
+                .expect("fresh render");
+            assert_eq!(
+                incremental.state().previous_lines,
+                fresh.state().previous_lines,
+                "incremental surface diverged from full replay at step {step}"
+            );
+        };
+
+        screen.apply(UiEvent::AssistantText(
+            "## Session start\n\nplain prose with `code` and a list\n\n- one\n- two".to_string(),
+        ));
+        check(&mut screen, &mut incremental);
+
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "seq 20" })),
+            content: (0..20)
+                .map(|n| format!("output row {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(12)),
+        });
+        check(&mut screen, &mut incremental);
+
+        // Fold toggle dirties rows in the middle of the transcript.
+        assert!(screen.toggle_latest_panel());
+        check(&mut screen, &mut incremental);
+        assert!(screen.toggle_latest_panel());
+        check(&mut screen, &mut incremental);
+
+        screen.commit_user("a user prompt that wraps across the narrow test width");
+        check(&mut screen, &mut incremental);
+
+        // Streaming frames: transient rows after committed history.
+        screen.apply(UiEvent::AssistantTextDelta(
+            "streaming **tail** ".to_string(),
+        ));
+        check(&mut screen, &mut incremental);
+        screen.apply(UiEvent::AssistantTextDelta("grows".to_string()));
+        check(&mut screen, &mut incremental);
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+        check(&mut screen, &mut incremental);
+
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "first paragraph.\n\nhidden second paragraph.".to_string(),
+            redacted: false,
+        });
+        check(&mut screen, &mut incremental);
     }
 
     #[test]
