@@ -19,9 +19,9 @@
 //! transcript stays valid without any per-session counter state.
 //!
 //! Deliberately out of scope (issue #61): cloud/blob storage, a database,
-//! search/indexing, binary artifacts, and a model-facing dereference tool or TUI
-//! browser. This is durable local storage plus stable handles -- the foundation
-//! a later selective-dereference slice reads, not the consumer itself.
+//! search/indexing, binary artifacts, and a TUI browser. This is durable local
+//! storage plus stable handles; the model-facing `read_output` tool (issue
+//! #205) dereferences them via [`ToolOutputStore::get`].
 
 use std::fmt::Write as _;
 use std::fs;
@@ -59,30 +59,6 @@ impl HandleStore {
     pub(crate) fn with_dir(dir: PathBuf) -> Self {
         Self { dir }
     }
-
-    /// Read a stored output back by handle id, returning `None` when no such
-    /// handle exists. This is the retrieval half of "the full output stays
-    /// retrievable by handle"; the model-facing dereference tool / UI that would
-    /// call it is a later slice (issue #61 defers it), so it is currently only
-    /// exercised by tests.
-    ///
-    /// The id is validated as hex-only before use: although handles are minted
-    /// by [`handle_id`], a resumed transcript's reference is untrusted input, so
-    /// a forged id containing path separators or `..` must never escape `dir`.
-    #[allow(dead_code)]
-    pub(crate) fn get(&self, id: &str) -> Result<Option<String>> {
-        if !is_handle_id(id) {
-            return Ok(None);
-        }
-        let path = self.dir.join(format!("{id}.txt"));
-        match fs::read_to_string(&path) {
-            Ok(content) => Ok(Some(content)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => {
-                Err(error).with_context(|| format!("failed to read handle {}", path.display()))
-            }
-        }
-    }
 }
 
 impl ToolOutputStore for HandleStore {
@@ -108,6 +84,28 @@ impl ToolOutputStore for HandleStore {
         fs::rename(&temp, &path)
             .with_context(|| format!("failed to finalize handle {}", path.display()))?;
         Ok(id)
+    }
+
+    /// Read a stored output back by handle id, returning `None` when no such
+    /// handle exists. This is the retrieval half of "the full output stays
+    /// retrievable by handle"; the model-facing `read_output` tool dereferences
+    /// offloaded outputs through it (issue #205).
+    ///
+    /// The id is validated as hex-only before use: although handles are minted
+    /// by [`handle_id`], a resumed transcript's reference is untrusted input, so
+    /// a forged id containing path separators or `..` must never escape `dir`.
+    fn get(&self, id: &str) -> Result<Option<String>> {
+        if !is_handle_id(id) {
+            return Ok(None);
+        }
+        let path = self.dir.join(format!("{id}.txt"));
+        match fs::read_to_string(&path) {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to read handle {}", path.display()))
+            }
+        }
     }
 }
 

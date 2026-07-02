@@ -237,6 +237,13 @@ pub(crate) trait ToolOutputStore {
     /// be stable for identical content so a resumed transcript keeps pointing at
     /// the same stored output (the harness impl is content-addressed).
     fn put(&self, content: &str) -> Result<String>;
+
+    /// Read a stored output back by handle id, `None` when no such handle
+    /// exists. The retrieval half of "the full output stays retrievable by
+    /// handle": the model-facing `read_output` tool dereferences offloaded
+    /// outputs through this (issue #205). Implementations must treat the id as
+    /// untrusted input (a resumed transcript can carry a forged reference).
+    fn get(&self, id: &str) -> Result<Option<String>>;
 }
 
 /// Display-only live-output sink for a running tool (issue #90 sub-item 1). A
@@ -1905,7 +1912,8 @@ fn compact_preview(
     let omitted = total_bytes.saturating_sub(head.len() + tail.len());
     let notice = format!(
         "\n... [iris stored the full {total_bytes}-byte ({total_lines}-line) tool output out of \
-         context; {omitted} bytes omitted here. retrieve via output handle {handle_id}] ...\n"
+         context; {omitted} bytes omitted here. retrieve via the read_output tool with \
+         handle_id {handle_id}] ...\n"
     );
     format!("{head}{notice}{tail}")
 }

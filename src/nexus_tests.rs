@@ -2509,6 +2509,9 @@ fn offload_falls_back_to_inline_when_the_store_errors() {
         fn put(&self, _content: &str) -> Result<String> {
             Err(anyhow!("disk full"))
         }
+        fn get(&self, _id: &str) -> Result<Option<String>> {
+            Err(anyhow!("disk full"))
+        }
     }
 
     let body = "Z".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 100);
@@ -3901,7 +3904,16 @@ impl ChatProvider for SurfaceProbe {
     }
 }
 
-const FULL_SURFACE: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const FULL_SURFACE: [&str; 8] = [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "read_output",
+];
 
 #[test]
 fn surface_plan_defaults_to_full_built_in_surface() {
@@ -3919,7 +3931,10 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
     tools.plan_surface(&ProviderCapabilities { native_edit: true });
 
     let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-    assert_eq!(visible, ["read", "bash", "write", "grep", "find", "ls"]);
+    assert_eq!(
+        visible,
+        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
+    );
     assert!(
         !visible.contains(&"edit"),
         "edit must be hidden from the model"
@@ -3995,7 +4010,7 @@ fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
     let advertised = harness.agent.provider.advertised.borrow();
     assert_eq!(
         advertised[0],
-        ["read", "bash", "write", "grep", "find", "ls"]
+        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
     );
     assert!(!advertised[0].iter().any(|name| name == "edit"));
     Ok(())
