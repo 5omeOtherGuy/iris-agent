@@ -294,6 +294,54 @@ fn settings_base_url_for_switch(provider: ProviderId) -> Option<String> {
         .flatten()
 }
 
+/// What a candidate selection changes relative to the active one, ordered by
+/// context-cost impact (ADR-0026). Reasoning-only changes keep the request
+/// prefix byte-identical; a model change resets the provider's model-keyed
+/// prompt cache; a provider change additionally re-ingests the whole carried
+/// context on an endpoint that has never seen it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchScope {
+    ReasoningOnly,
+    Model,
+    Provider,
+}
+
+fn switch_scope(current: &ModelSelection, candidate: &ModelSelection) -> SwitchScope {
+    if current.provider != candidate.provider {
+        SwitchScope::Provider
+    } else if current.model != candidate.model {
+        SwitchScope::Model
+    } else {
+        SwitchScope::ReasoningOnly
+    }
+}
+
+/// Carried-context size above which a model/provider switch appends the
+/// `/compact` advisory: a quarter of the auto-compaction budget, or a fixed
+/// floor when no budget is configured. Below it the re-read is cheap enough
+/// that advice would be noise.
+fn switch_hint_threshold(budget: Option<u64>) -> u64 {
+    budget.map_or(32_000, |budget| budget / 4)
+}
+
+/// The advisory line for a switch that will re-read a large carried context
+/// uncached, or `None` when the switch is reasoning-only (prefix unchanged) or
+/// the context is small enough not to matter (ADR-0026).
+fn switch_context_advisory(
+    scope: SwitchScope,
+    context_tokens: u64,
+    budget: Option<u64>,
+    model: &str,
+) -> Option<String> {
+    if scope == SwitchScope::ReasoningOnly || context_tokens < switch_hint_threshold(budget) {
+        return None;
+    }
+    Some(format!(
+        "carrying ~{context_tokens} tokens of context to {model}; its prompt cache starts cold, \
+so the next request re-reads all of it -- /compact first to hand over a short summary instead.",
+    ))
+}
+
 /// Validate, rebuild the provider, install it at the safe boundary, and record
 /// the audit event. Any failure (unsupported reasoning, build/auth error) leaves
 /// the active selection and provider untouched.
@@ -309,6 +357,7 @@ pub(crate) fn apply_selection<P: ChatProvider>(
         Ok(provider) => provider,
         Err(error) => return vec![format!("could not switch: {error:#}")],
     };
+    let scope = switch_scope(&switch.selection, &candidate);
     harness.replace_provider(provider);
     let reasoning = candidate.reasoning.map(ReasoningEffort::as_str);
     if let Err(error) =
@@ -325,14 +374,23 @@ pub(crate) fn apply_selection<P: ChatProvider>(
             .map(ReasoningEffort::as_str)
             .unwrap_or("none"),
     );
+    let advisory = switch_context_advisory(
+        scope,
+        harness.context_token_estimate(),
+        harness.context_budget(),
+        &candidate.model,
+    );
     switch.selection = candidate;
-    vec![confirm]
+    let mut lines = vec![confirm];
+    lines.extend(advisory);
+    lines
 }
 
 /// Slash commands that require the interactive TUI (pickers/modals, or --
 /// `/debug` -- the rendered screen itself). In the non-TTY text path these are
 /// reported as unavailable instead of being sent to the model; `/model`,
-/// `/reasoning`, `/copy`, and `/session` keep working as text commands.
+/// `/reasoning`, `/copy`, `/session`, and `/compact` keep working as text
+/// commands.
 fn tui_only_command(prompt: &str) -> Option<&'static str> {
     match prompt.split_whitespace().next().unwrap_or("") {
         "/scoped-models" => Some("/scoped-models"),
@@ -591,6 +649,29 @@ fn run_session_inner<P: ChatProvider>(
         if prompt == "/session" {
             for line in session_info_lines(harness, switch) {
                 ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
+        // On-demand compaction at this safe inter-turn boundary. Driven like a
+        // turn (runtime + Ctrl-C watcher) because the provider-backed
+        // summarizer awaits a cancellable model request.
+        if prompt == "/compact" {
+            crate::signals::reset();
+            let token = CancellationToken::new();
+            let done = Arc::new(AtomicBool::new(false));
+            let watcher = std::thread::spawn({
+                let token = token.clone();
+                let done = Arc::clone(&done);
+                move || watch_for_interrupt(&token, &done)
+            });
+            let result = {
+                let bridge = UiBridge::new(ui);
+                runtime.block_on(harness.compact_now(&bridge, &token))
+            };
+            done.store(true, Ordering::Relaxed);
+            let _ = watcher.join();
+            if let Err(error) = result {
+                ui.emit(UiEvent::Notice(format!("could not compact: {error:#}")))?;
             }
             continue;
         }
@@ -906,6 +987,118 @@ mod tests {
             switch.as_ref().unwrap().selection.model,
             "some-future-model"
         );
+    }
+
+    /// A harness carrying a large context (seeded via a resumed agent) with an
+    /// optional auto-compaction budget, for the switch-advisory tests.
+    fn seeded_harness(
+        content_chars: usize,
+        budget: Option<u64>,
+    ) -> (Harness<FakeProvider>, crate::tools::test_support::TestDir) {
+        let dir = crate::tools::test_support::temp_dir();
+        let messages = vec![
+            Message::user("start"),
+            Message::assistant(&"R".repeat(content_chars)),
+        ];
+        let agent = Agent::resumed(
+            FakeProvider::new(vec![]),
+            crate::tools::built_in_tools(),
+            messages,
+        );
+        let harness = Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            None,
+            budget,
+        );
+        (harness, dir)
+    }
+
+    #[test]
+    fn model_switch_with_large_context_advises_compaction() {
+        // ~50k estimated tokens, over the no-budget 32k advisory floor.
+        let (mut harness, _dir) = seeded_harness(200_000, None);
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut switch = Some(ModelSwitch::new(
+            selection(ProviderId::OpenAiCodex, "gpt-5.5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        let lines = handle_model_command(
+            "/model anthropic/claude-sonnet-4-6",
+            &mut harness,
+            &mut switch,
+        )
+        .expect("handled");
+        assert!(
+            lines.iter().any(|l| l.starts_with("switched to")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("carrying ~") && l.contains("/compact")),
+            "a cross-provider switch over the threshold must advise /compact: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_only_switch_stays_silent_about_context() {
+        let (mut harness, _dir) = seeded_harness(200_000, None);
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut switch = Some(ModelSwitch::new(
+            selection(ProviderId::OpenAiCodex, "gpt-5.5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        let lines =
+            handle_model_command("/reasoning high", &mut harness, &mut switch).expect("handled");
+        assert!(
+            !lines.iter().any(|l| l.contains("/compact")),
+            "a reasoning-only change keeps the prefix; no advisory: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn model_switch_with_small_context_stays_silent() {
+        // ~5k estimated tokens with the default-ish 128k budget: under the
+        // budget/4 threshold, so the advisory would be noise.
+        let (mut harness, _dir) = seeded_harness(20_000, Some(128_000));
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut switch = Some(ModelSwitch::new(
+            selection(ProviderId::OpenAiCodex, "gpt-5.5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        let lines = handle_model_command(
+            "/model anthropic/claude-sonnet-4-6",
+            &mut harness,
+            &mut switch,
+        )
+        .expect("handled");
+        assert!(
+            !lines.iter().any(|l| l.contains("/compact")),
+            "a small carried context needs no advisory: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn text_path_compact_on_in_memory_session_reports_why() -> Result<()> {
+        let (mut harness, _dir) = fake_harness();
+        let mut ui = TextUi::new("/compact\n/quit\n".as_bytes(), Vec::new(), Vec::new());
+        let mut switch = None;
+        run_session(&mut harness, &mut ui, &mut switch)?;
+        let (_, out, _) = ui.into_parts();
+        let out = String::from_utf8(out)?;
+        assert!(
+            out.contains("in-memory"),
+            "text-path /compact must explain the in-memory no-op: {out}"
+        );
+        Ok(())
     }
 
     #[test]

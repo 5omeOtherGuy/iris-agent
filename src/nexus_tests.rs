@@ -3850,6 +3850,211 @@ fn resume_after_auto_compaction_rebuilds_through_the_summary() -> Result<()> {
     Ok(())
 }
 
+/// Provider-backed summarizer (ADR-0026): when installed, auto-compaction asks
+/// the provider for the summary. The summarization request replays the context
+/// prefix plus the summary instruction, and the compacted context opens with
+/// the framed provider summary instead of the deterministic excerpts.
+#[test]
+fn provider_backed_summarizer_writes_model_summary() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+    // Scripted in request order: turn 1, then the summarization request fired
+    // at turn 2's boundary, then turn 2 itself.
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text("session handoff summary")),
+        Ok(AssistantTurn::text("b")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+    harness.set_summarizer(crate::wayland::SummarizerKind::Provider);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        &"P".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    block_on(harness.submit_turn(
+        &"Q".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 3, "turn, summarization request, turn");
+    // The summarization request ends with the summary instruction appended
+    // after the carried context (so the cached prefix is reused).
+    let summary_request = &seen[1];
+    assert!(
+        summary_request
+            .last()
+            .expect("summary request has messages")
+            .content
+            .starts_with("Summarize this coding session"),
+        "summarization request must end with the summary instruction"
+    );
+    assert!(
+        summary_request.len() > 1,
+        "summarization request must carry the covered context prefix"
+    );
+    // The second turn's request opens with the framed provider summary.
+    assert!(
+        seen[2][0].content.starts_with("[compacted summary of"),
+        "compacted context must open with the framed provider summary, got: {}",
+        seen[2][0].content
+    );
+    assert!(seen[2][0].content.contains("session handoff summary"));
+    // The durable compaction entry stores the provider summary text.
+    let on_disk = fs::read_to_string(&log_path)?;
+    assert!(
+        on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")
+                && line.contains("session handoff summary")),
+        "the compaction entry must persist the provider summary"
+    );
+    Ok(())
+}
+
+/// A failing provider summary falls back to the deterministic excerpts rather
+/// than aborting the turn or skipping compaction.
+#[test]
+fn provider_summarizer_falls_back_to_excerpts_on_error() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Err("summarizer boom"),
+        Ok(AssistantTurn::text("b")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+    harness.set_summarizer(crate::wayland::SummarizerKind::Provider);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        &"P".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    block_on(harness.submit_turn(
+        &"Q".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 3, "turn, failed summarization request, turn");
+    assert!(
+        seen[2][0].content.starts_with("[auto-compacted summary"),
+        "fallback must use the deterministic excerpt summary, got: {}",
+        seen[2][0].content
+    );
+    Ok(())
+}
+
+/// `/compact` compacts on demand without any budget: older turns collapse into
+/// the summary, a small recent tail stays verbatim, and the notice reports the
+/// shrink. An in-memory session refuses with a notice instead.
+#[test]
+fn manual_compact_covers_older_turns_and_keeps_recent_tail() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(4_000); // ~1k tokens per assistant reply
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text("tail answer")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let log_path = log.path().to_path_buf();
+    // No budget: manual compaction must work with auto-compaction disabled.
+    let mut harness = Harness::new(agent, dir.path.clone(), ToolState::new(), Some(log), None);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    for prompt in ["first", "second", "third"] {
+        block_on(harness.submit_turn(prompt, &frontend, &frontend, &CancellationToken::new()))?;
+    }
+    let before = harness.context_token_estimate();
+    block_on(harness.compact_now(&frontend, &CancellationToken::new()))?;
+    let after = harness.context_token_estimate();
+
+    assert!(after < before, "manual compaction must shrink the context");
+    let messages = harness.messages();
+    assert!(
+        messages[0].content.starts_with("[auto-compacted summary"),
+        "context must open with the summary, got: {}",
+        messages[0].content
+    );
+    assert!(
+        messages.iter().any(|m| m.content == "tail answer"),
+        "the recent tail must stay verbatim"
+    );
+    let on_disk = fs::read_to_string(&log_path)?;
+    assert!(
+        on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")),
+        "manual compaction must persist a compaction entry"
+    );
+    let events = frontend.events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(notice) if notice.contains("compacted") && notice.contains("summary")
+        )),
+        "manual compaction must report the shrink"
+    );
+    Ok(())
+}
+
+#[test]
+fn manual_compact_on_in_memory_session_reports_why() -> Result<()> {
+    let dir = crate::tools::test_support::temp_dir();
+    let provider = FakeProvider::new(vec![]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let mut harness = Harness::new(agent, dir.path.clone(), ToolState::new(), None, None);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.compact_now(&frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(notice) if notice.contains("in-memory")
+        )),
+        "an in-memory session must explain why /compact did nothing"
+    );
+    Ok(())
+}
+
 // --- Provider-specific tool surface planner (issue #60) ---------------------
 
 /// Provider that reports configurable [`ProviderCapabilities`] and records the

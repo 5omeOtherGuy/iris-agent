@@ -1090,6 +1090,16 @@ fn reasoning_block(message: &Message, current_origin: &ModelOrigin) -> Option<Va
             "signature": signature,
         }));
     }
+    // Foreign-origin reasoning is dropped, not downgraded to text: replaying
+    // another model's chain-of-thought would re-bill it as input on every
+    // later request while its answer/tool calls already carry the outcome
+    // (ADR-0026). The row stays persisted and display-visible.
+    if !same_origin {
+        return None;
+    }
+    // Same-origin but signature-less visible reasoning cannot be replayed as a
+    // `thinking` block (Anthropic requires the signature), so it degrades to
+    // text to preserve same-model continuity.
     (!message.content.is_empty()).then(|| json!({ "type": "text", "text": message.content }))
 }
 
@@ -2495,14 +2505,38 @@ data: {\"type\":\"message_stop\"}\n\n
         );
         assert_eq!(
             blocks[1],
-            json!({ "type": "text", "text": " foreign  thinking " })
-        );
-        assert_eq!(
-            blocks[2],
             json!({ "type": "redacted_thinking", "data": "opaque-same" })
         );
-        assert_eq!(blocks[3], json!({ "type": "text", "text": "answer" }));
-        assert_eq!(blocks.len(), 4, "foreign redacted thinking is dropped");
+        assert_eq!(blocks[2], json!({ "type": "text", "text": "answer" }));
+        assert_eq!(
+            blocks.len(),
+            3,
+            "foreign visible and redacted thinking are both dropped (ADR-0026)"
+        );
+    }
+
+    #[test]
+    fn same_origin_signatureless_reasoning_degrades_to_text() {
+        // A same-origin visible row without a signature cannot replay as a
+        // `thinking` block, so it degrades to text; a foreign row never does.
+        let same = ModelOrigin::new("anthropic", "anthropic-messages", "claude-sonnet-4-6");
+        let messages = vec![
+            Message::user("go"),
+            Message::assistant_reasoning_block(crate::nexus::ReasoningBlock::new(
+                "kept same-origin thought",
+                None,
+                false,
+                same,
+            )),
+            Message::assistant("answer"),
+        ];
+        let msgs = build_messages(&messages, &anthropic_origin("claude-sonnet-4-6"));
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0],
+            json!({ "type": "text", "text": "kept same-origin thought" })
+        );
+        assert_eq!(blocks[1], json!({ "type": "text", "text": "answer" }));
     }
 
     #[test]

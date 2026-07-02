@@ -630,6 +630,14 @@ impl<P: ChatProvider> Agent<P> {
         &self.messages
     }
 
+    /// Read access to the injected tool set so the harness can issue auxiliary
+    /// provider requests (compaction summaries) that advertise the same
+    /// model-visible declarations as a normal turn, keeping the provider's
+    /// cached prompt prefix (tools + system + history) intact.
+    pub(crate) fn tools(&self) -> &Tools {
+        &self.tools
+    }
+
     /// Replace the in-memory provider-visible context. The Tier-2 harness uses
     /// this to install a compacted context (summary + retained tail) before the
     /// next turn; the bare agent stays oblivious to compaction policy and

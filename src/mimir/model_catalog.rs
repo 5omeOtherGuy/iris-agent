@@ -328,6 +328,7 @@ mod tests {
             base_url: base_url.map(str::to_string),
             context_token_budget: None,
             default_reasoning: None,
+            compaction_summarizer: None,
             prompt_cache_retention: None,
             anthropic_context_management: None,
             enabled_models: None,
