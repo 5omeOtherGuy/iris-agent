@@ -314,9 +314,9 @@ fn right_aligned_line(
         ]);
     }
     let mut spans = left.spans;
-    spans.push(Span::raw(
-        " ".repeat(width.saturating_sub(left_w).saturating_sub(right_w).max(1)),
-    ));
+    spans.push(Span::raw(" ".repeat(
+        width.saturating_sub(left_w).saturating_sub(right_w).max(1),
+    )));
     spans.push(Span::styled(right.to_string(), right_style));
     Line::from(spans)
 }

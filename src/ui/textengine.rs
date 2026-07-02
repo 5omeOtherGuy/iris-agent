@@ -178,9 +178,7 @@ fn ansi_string_control_len(rest: &str) -> Option<usize> {
         if ch == '\u{7}' || ch == '\u{009c}' {
             return Some(i + ch.len_utf8());
         }
-        if ch == '\x1b'
-            && matches!(chars.peek(), Some((_, '\\')))
-        {
+        if ch == '\x1b' && matches!(chars.peek(), Some((_, '\\'))) {
             let (j, st) = chars.next()?;
             return Some(j + st.len_utf8());
         }

@@ -1028,7 +1028,10 @@ mod tests {
             "wrote more rows than the viewport and would scroll: {plain:?}"
         );
         assert_eq!(surface.state().previous_viewport_top, 5);
-        assert_eq!(surface.state().hardware_cursor_row, next.len().saturating_sub(1));
+        assert_eq!(
+            surface.state().hardware_cursor_row,
+            next.len().saturating_sub(1)
+        );
         Ok(())
     }
 

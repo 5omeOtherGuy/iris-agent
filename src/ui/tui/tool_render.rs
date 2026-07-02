@@ -483,11 +483,7 @@ fn shell_result_row(
             bg: None,
         }
     };
-    TranscriptRow::chrome_with_text(
-        chrome,
-        plain,
-        style,
-    )
+    TranscriptRow::chrome_with_text(chrome, plain, style)
 }
 
 /// A muted, honest one-line summary of a finished command's output for the
@@ -1286,7 +1282,11 @@ mod tests {
         output.render_rows(ctx.width, &mut rendered);
         let mut rendered_has_expanded_content = false;
         for line in rendered {
-            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
             rendered_has_expanded_content |= text.contains("a       bclobbersafe");
             assert!(!text.contains("owned"), "{text:?}");
             for forbidden in ['\t', '\r', '\x1b', '\x07'] {
@@ -1390,7 +1390,12 @@ mod tests {
             row.render_rows(width, &mut rendered);
             rendered
                 .into_iter()
-                .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
                 .collect()
         }
 
@@ -1399,15 +1404,15 @@ mod tests {
             assert_eq!(rendered.len(), 1, "width {width}: {rendered:?}");
             assert_eq!(display_width(&rendered[0]), width, "{:?}", rendered[0]);
             assert!(
-                rendered[0]
-                    .trim_end()
-                    .ends_with(&format!("{right}  │")),
+                rendered[0].trim_end().ends_with(&format!("{right}  │")),
                 "width {width}: {:?}",
                 rendered[0]
             );
         }
 
-        let mut command = String::from("printf 'this command is long enough to wrap at narrow widths' && python3 - <<'PY'\n");
+        let mut command = String::from(
+            "printf 'this command is long enough to wrap at narrow widths' && python3 - <<'PY'\n",
+        );
         for i in 0..40 {
             command.push_str(&format!("line {i}\n"));
         }
@@ -1453,7 +1458,9 @@ mod tests {
             "narrow resize must preserve command text: {narrow_timeout:?}"
         );
         assert!(
-            narrow_timeout.iter().any(|row| row.contains("timeout 120s")),
+            narrow_timeout
+                .iter()
+                .any(|row| row.contains("timeout 120s")),
             "narrow resize must still show timeout metadata: {narrow_timeout:?}"
         );
     }
