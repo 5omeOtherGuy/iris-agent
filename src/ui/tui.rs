@@ -418,6 +418,127 @@ mod tests {
             .join("\n")
     }
 
+    fn synthetic_render_perf_screen() -> Screen {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "openai-codex/gpt-5.5".to_string(),
+            Some("xhigh".to_string()),
+            "~/iris-agent (main)".to_string(),
+        );
+
+        let mut i = 0usize;
+        while screen.transcript.rows.len() < MAX_TRANSCRIPT_ROWS.saturating_sub(96) {
+            match i % 6 {
+                0 => screen.commit_user(&format!(
+                    "inspect render hot path batch {i} with enough prose to wrap across several \
+                     words and preserve user transcript rhythm"
+                )),
+                1 => screen.apply(UiEvent::AssistantText(format!(
+                    "## Render batch {i}\n\nThe renderer keeps markdown prose, `inline_code`, \
+                     links, and lists byte-stable while the terminal surface diffs only the \
+                     rows that changed.\n\n- fold visibility remains semantic\n- rules stay muted\n\n---"
+                ))),
+                2 => {
+                    let call = call_args(
+                        "bash",
+                        json!({ "command": format!("printf 'line %04d\\n' {i}") }),
+                    );
+                    let content = (0..18)
+                        .map(|n| format!("shell output batch {i} row {n}: a moderately long line"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    screen.apply(UiEvent::ToolResult {
+                        call,
+                        content,
+                        exit_code: Some(0),
+                        duration: Some(Duration::from_millis((i % 97) as u64)),
+                    });
+                    let _ = screen.toggle_latest_panel();
+                }
+                3 => {
+                    let call = call_args("edit", json!({ "path": format!("src/file_{i}.rs") }));
+                    screen.apply(UiEvent::DiffPreview {
+                        call: call.clone(),
+                        diff: format!(
+                            "--- a/src/file_{i}.rs\n+++ b/src/file_{i}.rs\n@@ -1,3 +1,3 @@\n fn sample() {{\n-old_{i}();\n+new_{i}();\n }}\n"
+                        ),
+                    });
+                    screen.apply(UiEvent::ToolResult {
+                        call,
+                        content: "applied".to_string(),
+                        exit_code: Some(0),
+                        duration: Some(Duration::from_millis(3)),
+                    });
+                }
+                4 => screen.apply(UiEvent::AssistantReasoning {
+                    text: format!(
+                        "Candidate {i}: keep cached row wraps unless a fold toggle, trim, or \
+                         panel rewrite invalidates the row range.\n\nSecond paragraph is hidden behind \
+                         progressive disclosure for long traces."
+                    ),
+                    redacted: false,
+                }),
+                _ => screen.apply(UiEvent::Notice(format!(
+                    "synthetic notice {i}: resize replay and append diff remain stable"
+                ))),
+            }
+            i += 1;
+        }
+
+        screen.transcript.trim_history();
+        screen
+    }
+
+    fn render_perf_cycle(
+        screen: &mut Screen,
+        surface: &mut TerminalSurface<Vec<u8>>,
+        size: Size,
+    ) -> std::io::Result<RenderKind> {
+        let (document, chrome_tail) = render_document_with_chrome_tail(screen, size);
+        surface
+            .render_with_volatile_tail(size, &document, chrome_tail)
+            .map(|stats| stats.kind)
+    }
+
+    #[test]
+    #[ignore = "timer benchmark; run explicitly with --ignored --nocapture"]
+    fn render_pipeline_near_retention_cap_benchmark() -> std::io::Result<()> {
+        let size = Size::new(120, 40);
+        let mut screen = synthetic_render_perf_screen();
+        eprintln!(
+            "render_perf rows={} width={} height={}",
+            screen.transcript.rows.len(),
+            size.width,
+            size.height
+        );
+
+        let mut surface = TerminalSurface::new(Vec::new());
+        let full_start = Instant::now();
+        let full_kind = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let full = full_start.elapsed();
+
+        screen.start_turn();
+        let spinner_start = Instant::now();
+        for _ in 0..100 {
+            let _ = screen.tick();
+            render_perf_cycle(&mut screen, &mut surface, size)?;
+        }
+        let spinner = spinner_start.elapsed();
+
+        screen.apply(UiEvent::Notice(
+            "synthetic append after spinner churn".to_string(),
+        ));
+        let append_start = Instant::now();
+        let append_kind = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let append = append_start.elapsed();
+
+        eprintln!(
+            "render_perf full={full:?} kind={full_kind:?}; spinner_100={spinner:?}; \
+             append={append:?} kind={append_kind:?}"
+        );
+        Ok(())
+    }
+
     fn strip_ansi(input: &str) -> String {
         let mut out = String::new();
         let mut chars = input.chars().peekable();
