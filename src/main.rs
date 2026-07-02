@@ -23,6 +23,7 @@ mod session;
 mod signals;
 mod telemetry;
 mod tool_display;
+mod tool_summary;
 mod tools;
 mod ui;
 mod wayland;
