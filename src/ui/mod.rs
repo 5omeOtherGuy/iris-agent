@@ -22,8 +22,8 @@ pub(crate) mod textengine;
 /// True when `lines[i]` begins a unified-diff file header: a `--- ` line
 /// immediately followed by a `+++ ` line and a `@@` hunk. The `@@` guard keeps
 /// a removed content line that happens to start with `-- ` from being mistaken
-/// for a header. Shared by the TUI (`tui::diff_rows`) and text
-/// (`text::diff_body`) diff colorizers so both drop EVERY file-header pair in a
+/// for a header. Shared by the TUI panel and text (`text::diff_body`) diff
+/// colorizers so both drop EVERY file-header pair in a
 /// multi-file diff, not just the first.
 pub(crate) fn is_diff_file_header(lines: &[&str], i: usize) -> bool {
     lines[i].starts_with("--- ")
