@@ -289,8 +289,17 @@ pub(crate) trait SteeringSource {
 pub(crate) trait ApprovalGate {
     /// `allow_always` mirrors the tool's [`Tool::supports_allow_always`] so the
     /// front-end only offers an "always allow" choice the loop will honor (shell
-    /// tools opt out, so their prompt is y/N only).
-    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a>;
+    /// tools opt out, so their prompt is y/N only). `destructive` is Nexus's
+    /// [`Tool::is_destructive`] classification for this call: a gate that
+    /// consults a persistent grant store (issue #209) must never auto-allow or
+    /// offer to persist a destructive call -- the unconditional re-prompt is the
+    /// safety floor, and Nexus tells the gate where it applies.
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        allow_always: bool,
+        destructive: bool,
+    ) -> ApprovalFuture<'a>;
 }
 
 /// Structured result of a successful tool call: the model-facing text plus
@@ -1142,7 +1151,7 @@ impl<P: ChatProvider> Agent<P> {
                     let decision = tokio::select! {
                         biased;
                         _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
-                        decision = gate.review(call, tool.supports_allow_always()) => decision?,
+                        decision = gate.review(call, tool.supports_allow_always(), destructive) => decision?,
                     };
                     // A blocking front-end prompt (real terminal) cannot observe
                     // the token mid-read, so it may still return a decision after a

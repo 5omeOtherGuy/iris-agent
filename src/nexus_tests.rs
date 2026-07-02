@@ -127,7 +127,12 @@ impl AgentObserver for RecordingFrontend {
 }
 
 impl ApprovalGate for RecordingFrontend {
-    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _destructive: bool,
+    ) -> ApprovalFuture<'a> {
         let mut snapshot = self.events_at_review.borrow_mut();
         if snapshot.is_none() {
             *snapshot = Some(self.events.borrow().clone());
@@ -1391,7 +1396,12 @@ fn observer_error_on_tool_result_still_records_paired_transcript() -> Result<()>
         }
     }
     impl ApprovalGate for FailOnToolResult {
-        fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+        fn review<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+            _allow_always: bool,
+            _destructive: bool,
+        ) -> ApprovalFuture<'a> {
             Box::pin(async move { Ok(ApprovalDecision::Allow) })
         }
     }
@@ -2907,7 +2917,12 @@ impl AgentObserver for BlockingApprovalGate {
     }
 }
 impl ApprovalGate for BlockingApprovalGate {
-    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _destructive: bool,
+    ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             futures::future::pending::<()>().await;
             Ok(ApprovalDecision::Allow)

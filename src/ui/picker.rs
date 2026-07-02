@@ -19,6 +19,7 @@ use crate::ui::modal::{
     SettingsMenu, TrustMenu,
 };
 use crate::wayland::Harness;
+use crate::wayland::approvals;
 use crate::wayland::trust::{self, TrustDecision};
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
@@ -251,13 +252,23 @@ fn finalize_trust(trusted: bool, rebuild: Vec<String>) -> (bool, Vec<String>) {
     (true, vec![notice])
 }
 
-/// Build the `/settings` modal (effort picker entry).
-pub(crate) fn open_settings<P>(switch: &ModelSwitch<'_, P>) -> Modal {
+/// Build the `/settings` modal (effort picker + project approvals entries).
+pub(crate) fn open_settings<P>(switch: &ModelSwitch<'_, P>, workspace: &std::path::Path) -> Modal {
     let current = switch
         .selection()
         .reasoning
         .unwrap_or(ReasoningEffort::DEFAULT);
-    Modal::Settings(SettingsMenu::new(current))
+    let grants = approvals::grants_for(workspace).len();
+    Modal::Settings(SettingsMenu::new(current, grants))
+}
+
+/// Build the project-approvals review/revoke submenu from the stored grants.
+fn approvals_menu<P: ChatProvider>(harness: &Harness<P>) -> Modal {
+    let grants = approvals::grants_for(harness.workspace())
+        .iter()
+        .map(|grant| (grant.key(), grant.label()))
+        .collect();
+    Modal::Approvals(crate::ui::modal::ApprovalsMenu::new(grants))
 }
 
 /// Build the effort/thinking picker for the current model (settings submenu).
@@ -325,6 +336,20 @@ pub(crate) fn apply_action<P: ChatProvider>(
         ModalAction::SetEffort(level) => ActionResult::Close(apply_effort(level, harness, switch)),
         ModalAction::OpenEffortPicker => {
             ActionResult::Replace(Box::new(effort_picker(switch)), Vec::new())
+        }
+        ModalAction::OpenApprovals => {
+            ActionResult::Replace(Box::new(approvals_menu(harness)), Vec::new())
+        }
+        ModalAction::RevokeApproval(key) => {
+            let line = match approvals::Grant::parse(&key) {
+                Some(grant) => match approvals::revoke_grant(harness.workspace(), &grant) {
+                    Ok(()) => format!("revoked project approval: {}", grant.label()),
+                    Err(error) => format!("could not revoke project approval: {error:#}"),
+                },
+                None => format!("unknown approval entry: {key}"),
+            };
+            // Rebuild the submenu so the list reflects the revocation.
+            ActionResult::Replace(Box::new(approvals_menu(harness)), vec![line])
         }
         // Login navigation/side effects are not picker concerns.
         other => ActionResult::Close(vec![format!("unhandled action: {other:?}")]),

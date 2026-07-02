@@ -7,6 +7,7 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+pub(crate) mod approvals;
 pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
@@ -209,6 +210,12 @@ impl<P: ChatProvider> Harness<P> {
         self.persisted = resumed;
         self.entry_ids = vec![None; resumed];
         self.agent.reset_session(messages);
+    }
+
+    /// Workspace root this harness executes against (the key for
+    /// project-scoped state such as persistent approvals).
+    pub(crate) fn workspace(&self) -> &std::path::Path {
+        &self.workspace
     }
 
     /// Id of the attached transcript log, or `None` for an in-memory session.

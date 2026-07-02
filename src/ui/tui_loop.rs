@@ -48,6 +48,7 @@ use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::steering::SteeringQueue;
 use crate::ui::tui::{FocusTarget, Screen, TuiUi};
 use crate::wayland::Harness;
+use crate::wayland::approvals;
 
 /// Spinner cadence. Input redraws are immediate (channel-driven), so this paces
 /// only the spinner animation, not input latency; a 100ms beat is a smooth,
@@ -202,18 +203,32 @@ enum IdleKey {
 }
 
 /// A gated tool waiting for the user's decision: the reply channel back into the
-/// turn future plus whether "always" is on offer.
+/// turn future plus whether "always" and the project-persistent grant are on
+/// offer.
 struct PendingApproval {
     call: ToolCall,
-    reply: oneshot::Sender<ApprovalDecision>,
+    reply: oneshot::Sender<ReviewReply>,
     allow_always: bool,
+    persistable: bool,
 }
 
-/// A review request crossing from the turn future into the loop.
+/// A review request crossing from the turn future into the loop. `persistable`
+/// is false for destructive calls, whose approval never persists (issue #209).
 struct ApprovalRequest {
     call: ToolCall,
     allow_always: bool,
-    reply: oneshot::Sender<ApprovalDecision>,
+    persistable: bool,
+    reply: oneshot::Sender<ReviewReply>,
+}
+
+/// The loop's answer to a review request. `AllowProject` is the `[p]` choice:
+/// allow this call AND store a project-scoped persistent grant; the bridge
+/// (which owns the workspace key) performs the store write, keeping the
+/// keypress handler free of filesystem work.
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewReply {
+    Decision(ApprovalDecision),
+    AllowProject,
 }
 
 async fn session_loop<P: ChatProvider>(
@@ -559,7 +574,8 @@ fn route_command<P: ChatProvider>(
                 return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(picker::open_settings(sw));
+            tui.screen
+                .open_modal(picker::open_settings(sw, harness.workspace()));
             Ok(RouteOutcome::Consumed)
         }
         "/trust" if rest.is_empty() => {
@@ -781,7 +797,11 @@ async fn run_turn<P: ChatProvider>(
 ) -> Result<()> {
     let (event_tx, mut event_rx) = unbounded_channel::<UiEvent>();
     let (appr_tx, mut appr_rx) = unbounded_channel::<ApprovalRequest>();
-    let bridge = LoopBridge { event_tx, appr_tx };
+    let bridge = LoopBridge {
+        event_tx,
+        appr_tx,
+        workspace: harness.workspace().to_path_buf(),
+    };
 
     // Clear any stale interrupt before arming, then publish the token so the
     // input thread can cancel this turn on Ctrl-C.
@@ -834,11 +854,12 @@ async fn run_turn<P: ChatProvider>(
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
-                    tui.screen.show_approval(&request.call, request.allow_always);
+                    tui.screen.show_approval(&request.call, request.allow_always, request.persistable);
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,
                         allow_always: request.allow_always,
+                        persistable: request.persistable,
                     });
                     request_render(&mut sched, tui)?;
                 }
@@ -1548,7 +1569,7 @@ fn resolve_input_eof(
 ) {
     token.cancel();
     if let Some(p) = pending.take() {
-        let _ = p.reply.send(ApprovalDecision::Deny);
+        let _ = p.reply.send(ReviewReply::Decision(ApprovalDecision::Deny));
         screen.clear_approval();
     }
 }
@@ -1596,7 +1617,7 @@ fn handle_running_event(
                 // approval as Deny so Nexus observes the cancellation and aborts.
                 steering.clear();
                 if let Some(p) = pending.take() {
-                    let _ = p.reply.send(ApprovalDecision::Deny);
+                    let _ = p.reply.send(ReviewReply::Decision(ApprovalDecision::Deny));
                     screen.clear_approval();
                 }
                 return true;
@@ -1604,20 +1625,31 @@ fn handle_running_event(
             // While a tool is awaiting approval, the composer is frozen: only the
             // approval keys act, and any other key is ignored (never typed).
             if let Some(p) = pending.as_ref() {
-                let decision = match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::Allow),
+                let reply = match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        Some(ReviewReply::Decision(ApprovalDecision::Allow))
+                    }
                     KeyCode::Char('a') | KeyCode::Char('A') if p.allow_always => {
-                        Some(ApprovalDecision::AllowAlways)
+                        Some(ReviewReply::Decision(ApprovalDecision::AllowAlways))
+                    }
+                    // Persist a project-scoped grant (issue #209); never offered
+                    // for destructive calls (persistable is false there).
+                    KeyCode::Char('p') | KeyCode::Char('P') if p.persistable => {
+                        Some(ReviewReply::AllowProject)
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter | KeyCode::Esc => {
-                        Some(ApprovalDecision::Deny)
+                        Some(ReviewReply::Decision(ApprovalDecision::Deny))
                     }
                     _ => None,
                 };
-                if let Some(decision) = decision {
+                if let Some(reply) = reply {
                     let p = pending.take().expect("pending approval present");
-                    screen.record_approval(&p.call, decision);
-                    let _ = p.reply.send(decision);
+                    let shown = match &reply {
+                        ReviewReply::Decision(decision) => *decision,
+                        ReviewReply::AllowProject => ApprovalDecision::Allow,
+                    };
+                    screen.record_approval(&p.call, shown);
+                    let _ = p.reply.send(reply);
                     screen.clear_approval();
                     return true;
                 }
@@ -1659,6 +1691,8 @@ fn handle_running_event(
 struct LoopBridge {
     event_tx: UnboundedSender<UiEvent>,
     appr_tx: UnboundedSender<ApprovalRequest>,
+    // Workspace root, the key for project-scoped persistent approvals (#209).
+    workspace: std::path::PathBuf,
 }
 
 impl AgentObserver for LoopBridge {
@@ -1671,15 +1705,34 @@ impl AgentObserver for LoopBridge {
 }
 
 impl ApprovalGate for LoopBridge {
-    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        allow_always: bool,
+        destructive: bool,
+    ) -> ApprovalFuture<'a> {
         let appr_tx = self.appr_tx.clone();
+        let event_tx = self.event_tx.clone();
+        let workspace = self.workspace.clone();
         let call = call.clone();
         Box::pin(async move {
+            // Project-scoped persistent grants (issue #209). Never consulted
+            // for destructive calls: Nexus's unconditional re-prompt floor
+            // holds even when the tool/command was granted for this project.
+            if !destructive && approvals::is_granted(&workspace, &call.name, bash_command_of(&call))
+            {
+                let _ = event_tx.send(UiEvent::Notice(format!(
+                    "{}: allowed by stored project approval",
+                    approval_grant_for(&call).label()
+                )));
+                return Ok(ApprovalDecision::Allow);
+            }
             let (reply, rx) = oneshot::channel();
             if appr_tx
                 .send(ApprovalRequest {
-                    call,
+                    call: call.clone(),
                     allow_always,
+                    persistable: !destructive,
                     reply,
                 })
                 .is_err()
@@ -1687,8 +1740,51 @@ impl ApprovalGate for LoopBridge {
                 return Ok(ApprovalDecision::Deny);
             }
             // Safe-by-default: if the loop drops the reply, deny.
-            Ok(rx.await.unwrap_or(ApprovalDecision::Deny))
+            match rx
+                .await
+                .unwrap_or(ReviewReply::Decision(ApprovalDecision::Deny))
+            {
+                ReviewReply::Decision(decision) => Ok(decision),
+                ReviewReply::AllowProject => {
+                    let grant = approval_grant_for(&call);
+                    match approvals::add_grant(&workspace, &grant) {
+                        Ok(()) => {
+                            let _ = event_tx.send(UiEvent::Notice(format!(
+                                "stored project approval: {} (revoke via /settings)",
+                                grant.label()
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(UiEvent::Notice(format!(
+                                "could not store project approval: {error:#}"
+                            )));
+                        }
+                    }
+                    Ok(ApprovalDecision::Allow)
+                }
+            }
         })
+    }
+}
+
+/// The bash command string of a call, when it is a shell `run` (the grant key
+/// for bash approvals). `None` for non-bash tools and shell management actions.
+fn bash_command_of(call: &ToolCall) -> Option<&str> {
+    if call.name != "bash" {
+        return None;
+    }
+    call.arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+}
+
+/// The grant a `[p]` decision stores for this call: the exact command for a
+/// bash run, the whole tool otherwise (write/edit).
+fn approval_grant_for(call: &ToolCall) -> approvals::Grant {
+    match bash_command_of(call) {
+        Some(command) => approvals::Grant::Bash(command.to_string()),
+        None => approvals::Grant::Tool(call.name.clone()),
     }
 }
 
@@ -2108,6 +2204,7 @@ mod tests {
         // Allow.
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            persistable: true,
             call: call(),
             reply: tx,
             allow_always: true,
@@ -2119,11 +2216,15 @@ mod tests {
             &steering,
         ));
         assert!(pending.is_none());
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Allow);
+        assert_eq!(
+            rx.blocking_recv().unwrap(),
+            ReviewReply::Decision(ApprovalDecision::Allow)
+        );
 
         // Deny via 'n'.
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            persistable: true,
             call: call(),
             reply: tx,
             allow_always: false,
@@ -2134,12 +2235,16 @@ mod tests {
             &mut pending,
             &steering,
         );
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
+        assert_eq!(
+            rx.blocking_recv().unwrap(),
+            ReviewReply::Decision(ApprovalDecision::Deny)
+        );
 
         // 'a' is ignored when always is not on offer (and not typed: the composer
         // is frozen while an approval is pending).
         let (tx, mut rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            persistable: true,
             call: call(),
             reply: tx,
             allow_always: false,
@@ -2163,6 +2268,7 @@ mod tests {
         steering.enqueue_steering("queued".to_string());
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            persistable: true,
             call: call(),
             reply: tx,
             allow_always: true,
@@ -2174,7 +2280,10 @@ mod tests {
             &steering,
         ));
         assert!(pending.is_none());
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
+        assert_eq!(
+            rx.blocking_recv().unwrap(),
+            ReviewReply::Decision(ApprovalDecision::Deny)
+        );
         // Aborting also discards what the user had queued.
         assert_eq!(steering.len(), 0);
     }
@@ -2237,6 +2346,7 @@ mod tests {
         let steering = SteeringQueue::default();
         let (tx, _rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            persistable: true,
             call: call(),
             reply: tx,
             allow_always: true,
@@ -2257,6 +2367,7 @@ mod tests {
         let token = CancellationToken::new();
         let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
+            persistable: true,
             call: call(),
             reply: tx,
             allow_always: true,
@@ -2266,7 +2377,7 @@ mod tests {
         assert!(pending.is_none(), "EOF takes the pending approval");
         assert_eq!(
             rx.blocking_recv().unwrap(),
-            ApprovalDecision::Deny,
+            ReviewReply::Decision(ApprovalDecision::Deny),
             "EOF resolves the pending approval as Deny"
         );
     }

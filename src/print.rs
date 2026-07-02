@@ -141,7 +141,12 @@ impl PrintApprovalGate {
 }
 
 impl ApprovalGate for PrintApprovalGate {
-    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _destructive: bool,
+    ) -> ApprovalFuture<'a> {
         let decision = self.decision();
         Box::pin(async move { Ok(decision) })
     }
@@ -268,14 +273,15 @@ mod tests {
     #[test]
     fn approval_gate_denies_by_default() {
         let gate = PrintApprovalGate::new(false);
-        let decision = futures::executor::block_on(gate.review(&tool_call(), false)).unwrap();
+        let decision =
+            futures::executor::block_on(gate.review(&tool_call(), false, false)).unwrap();
         assert_eq!(decision, ApprovalDecision::Deny);
     }
 
     #[test]
     fn approval_gate_allows_with_approve_flag() {
         let gate = PrintApprovalGate::new(true);
-        let decision = futures::executor::block_on(gate.review(&tool_call(), true)).unwrap();
+        let decision = futures::executor::block_on(gate.review(&tool_call(), true, false)).unwrap();
         assert_eq!(decision, ApprovalDecision::Allow);
     }
 }
