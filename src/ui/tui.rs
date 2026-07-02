@@ -3162,19 +3162,21 @@ mod tests {
         use crate::mimir::selection::ProviderId;
         use crate::ui::modal::{Modal, ModelPicker};
 
-        for height in [2u16, 3, 4] {
-            let mut screen = Screen::new();
-            screen.open_modal(Modal::Model(ModelPicker::new(
-                vec![CatalogModel {
-                    provider: ProviderId::OpenAiCodex,
-                    id: "gpt-5.5".to_string(),
-                    ctx_label: None,
-                }],
-                "openai-codex/gpt-5.5",
-                "openai-codex/gpt-5.5",
-                crate::mimir::selection::ReasoningEffort::Medium,
-            )));
-            let _ = rendered_lines(&mut screen, 40, height);
+        for width in [10u16, 16, 24, 40] {
+            for height in [2u16, 3, 4] {
+                let mut screen = Screen::new();
+                screen.open_modal(Modal::Model(ModelPicker::new(
+                    vec![CatalogModel {
+                        provider: ProviderId::OpenAiCodex,
+                        id: "gpt-5.5".to_string(),
+                        ctx_label: None,
+                    }],
+                    "openai-codex/gpt-5.5",
+                    "openai-codex/gpt-5.5",
+                    crate::mimir::selection::ReasoningEffort::Medium,
+                )));
+                let _ = rendered_lines(&mut screen, width, height);
+            }
         }
     }
 
