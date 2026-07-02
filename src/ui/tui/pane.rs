@@ -90,7 +90,17 @@ fn push_assistant_markdown_lines(rows: &mut Vec<TranscriptRow>, lines: Vec<Line<
 fn assistant_marker_target(line: &Line<'static>) -> bool {
     let text = line_text(line);
     let trimmed = text.trim_start();
-    !trimmed.is_empty() && !is_list_row(trimmed) && !trimmed.starts_with(crate::ui::symbols::SEP)
+    !trimmed.is_empty()
+        && !text.chars().next().is_some_and(char::is_whitespace)
+        && !is_list_row(trimmed)
+        && !is_structural_markdown_row(trimmed)
+}
+
+fn is_structural_markdown_row(trimmed: &str) -> bool {
+    trimmed.starts_with(crate::ui::symbols::SEP)
+        || trimmed.starts_with('>')
+        || trimmed == "---"
+        || matches!(trimmed.chars().next(), Some('┌' | '│' | '├' | '└'))
 }
 
 fn is_list_row(trimmed: &str) -> bool {
