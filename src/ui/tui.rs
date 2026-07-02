@@ -1195,12 +1195,11 @@ mod tests {
             .position(|line| line.contains("Give Iris a task..."))
             .expect("placeholder line");
 
-        assert!(
-            lines
-                .get(placeholder + 1)
-                .is_some_and(|line| line.trim().is_empty()),
-            "{lines:?}"
-        );
+        let blank_rows_after_placeholder = lines[placeholder + 1..]
+            .iter()
+            .take_while(|line| line.trim().is_empty())
+            .count();
+        assert_eq!(blank_rows_after_placeholder, 1, "{lines:?}");
     }
 
     #[test]
@@ -3620,6 +3619,35 @@ mod tests {
         assert!(rendered.contains("effort (xhigh)"), "{rendered}");
         assert!(rendered.contains("SELECT MODEL"), "{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    #[test]
+    fn open_modal_reclaims_composer_bottom_padding() {
+        use crate::mimir::model_catalog;
+        use crate::ui::modal::{Modal, ModelPicker};
+
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Model(ModelPicker::new(
+            model_catalog::all(),
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-opus-4-8",
+            crate::mimir::selection::ReasoningEffort::XHigh,
+        )));
+
+        let lines = rendered_lines(&mut screen, 80, 17)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>();
+        let placeholder = lines
+            .iter()
+            .position(|line| line.contains("Give Iris a task..."))
+            .expect("placeholder line");
+        let blank_rows_after_placeholder = lines[placeholder + 1..]
+            .iter()
+            .take_while(|line| line.trim().is_empty())
+            .count();
+
+        assert_eq!(blank_rows_after_placeholder, 0, "{lines:?}");
     }
 
     #[test]
