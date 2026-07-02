@@ -57,7 +57,7 @@ use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
 pub(crate) use screen::Screen;
-use screen::{compact_count, render_document_with_chrome_tail};
+use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
 use screen::{
     composer_statusline, editor_visual_rows, fresh_editor, render_document, working_indicator_line,
@@ -293,9 +293,13 @@ impl TuiUi {
     pub(crate) fn draw(&mut self) -> Result<()> {
         let (width, height) = terminal_size()?;
         let size = Size::new(width.max(1), height.max(1));
-        let (document, chrome_tail) = render_document_with_chrome_tail(&mut self.screen, size);
-        self.surface
-            .render_with_volatile_tail(size, &document, chrome_tail)?;
+        let document = render_document_with_hints(&mut self.screen, size);
+        self.surface.render_with_hints(
+            size,
+            &document.lines,
+            document.chrome_tail,
+            document.stable_prefix,
+        )?;
         Ok(())
     }
 
@@ -307,7 +311,7 @@ impl TuiUi {
             if let Ok((width, height)) = terminal_size() {
                 let size = Size::new(width.max(1), height.max(1));
                 let transcript = self.screen.wrapped_lines(size.width);
-                let _ = self.surface.render(size, &transcript);
+                let _ = self.surface.render(size, &transcript.lines);
             }
             let _ = self.surface.finish();
             // Restore the keyboard protocol first (pop only if pushed), then the
@@ -416,6 +420,270 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn synthetic_render_perf_screen() -> Screen {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "openai-codex/gpt-5.5".to_string(),
+            Some("xhigh".to_string()),
+            "~/iris-agent (main)".to_string(),
+        );
+
+        let mut i = 0usize;
+        while screen.transcript.rows.len() < MAX_TRANSCRIPT_ROWS.saturating_sub(96) {
+            match i % 6 {
+                0 => screen.commit_user(&format!(
+                    "inspect render hot path batch {i} with enough prose to wrap across several \
+                     words and preserve user transcript rhythm"
+                )),
+                1 => screen.apply(UiEvent::AssistantText(format!(
+                    "## Render batch {i}\n\nThe renderer keeps markdown prose, `inline_code`, \
+                     links, and lists byte-stable while the terminal surface diffs only the \
+                     rows that changed.\n\n- fold visibility remains semantic\n- rules stay muted\n\n---"
+                ))),
+                2 => {
+                    let call = call_args(
+                        "bash",
+                        json!({ "command": format!("printf 'line %04d\\n' {i}") }),
+                    );
+                    let content = (0..18)
+                        .map(|n| format!("shell output batch {i} row {n}: a moderately long line"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    screen.apply(UiEvent::ToolResult {
+                        call,
+                        content,
+                        exit_code: Some(0),
+                        duration: Some(Duration::from_millis((i % 97) as u64)),
+                    });
+                    let _ = screen.toggle_latest_panel();
+                }
+                3 => {
+                    let call = call_args("edit", json!({ "path": format!("src/file_{i}.rs") }));
+                    screen.apply(UiEvent::DiffPreview {
+                        call: call.clone(),
+                        diff: format!(
+                            "--- a/src/file_{i}.rs\n+++ b/src/file_{i}.rs\n@@ -1,3 +1,3 @@\n fn sample() {{\n-old_{i}();\n+new_{i}();\n }}\n"
+                        ),
+                    });
+                    screen.apply(UiEvent::ToolResult {
+                        call,
+                        content: "applied".to_string(),
+                        exit_code: Some(0),
+                        duration: Some(Duration::from_millis(3)),
+                    });
+                }
+                4 => screen.apply(UiEvent::AssistantReasoning {
+                    text: format!(
+                        "Candidate {i}: keep cached row wraps unless a fold toggle, trim, or \
+                         panel rewrite invalidates the row range.\n\nSecond paragraph is hidden behind \
+                         progressive disclosure for long traces."
+                    ),
+                    redacted: false,
+                }),
+                _ => screen.apply(UiEvent::Notice(format!(
+                    "synthetic notice {i}: resize replay and append diff remain stable"
+                ))),
+            }
+            i += 1;
+        }
+
+        screen.transcript.trim_history();
+        screen
+    }
+
+    fn render_perf_cycle(
+        screen: &mut Screen,
+        surface: &mut TerminalSurface<Vec<u8>>,
+        size: Size,
+    ) -> std::io::Result<RenderKind> {
+        let document = render_document_with_hints(screen, size);
+        surface
+            .render_with_hints(
+                size,
+                &document.lines,
+                document.chrome_tail,
+                document.stable_prefix,
+            )
+            .map(|stats| stats.kind)
+    }
+
+    #[test]
+    #[ignore = "timer benchmark; run explicitly with --ignored --nocapture"]
+    fn render_pipeline_near_retention_cap_benchmark() -> std::io::Result<()> {
+        let size = Size::new(120, 40);
+        let mut screen = synthetic_render_perf_screen();
+        eprintln!(
+            "render_perf rows={} width={} height={}",
+            screen.transcript.rows.len(),
+            size.width,
+            size.height
+        );
+
+        let mut surface = TerminalSurface::new(Vec::new());
+        let full_start = Instant::now();
+        let full_kind = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let full = full_start.elapsed();
+
+        screen.start_turn();
+        let spinner_start = Instant::now();
+        for _ in 0..100 {
+            let _ = screen.tick();
+            render_perf_cycle(&mut screen, &mut surface, size)?;
+        }
+        let spinner = spinner_start.elapsed();
+
+        screen.apply(UiEvent::Notice(
+            "synthetic append after spinner churn".to_string(),
+        ));
+        let append_start = Instant::now();
+        let append_kind = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let append = append_start.elapsed();
+
+        eprintln!(
+            "render_perf full={full:?} kind={full_kind:?}; spinner_100={spinner:?}; \
+             append={append:?} kind={append_kind:?}"
+        );
+        Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    enum CachedRenderOp {
+        User(usize),
+        Assistant(usize),
+        Shell(usize),
+        Diff(usize),
+        Reasoning(usize),
+        ToggleLatest,
+        Width(u16),
+        TrimBurst(usize),
+    }
+
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn pick(&mut self, count: usize) -> usize {
+            (self.next() as usize) % count
+        }
+    }
+
+    fn apply_cached_render_op(screen: &mut Screen, op: &CachedRenderOp) {
+        match *op {
+            CachedRenderOp::User(i) => screen.commit_user(&format!(
+                "cached render user prompt {i} with enough text to wrap on narrow widths"
+            )),
+            CachedRenderOp::Assistant(i) => screen.apply(UiEvent::AssistantText(format!(
+                "Assistant batch {i}\n\n- preserves markdown wrapping\n- keeps `code` styled\n\n---"
+            ))),
+            CachedRenderOp::Shell(i) => screen.apply(UiEvent::ToolResult {
+                call: call_args("bash", json!({ "command": format!("seq {i}") })),
+                content: (0..14)
+                    .map(|n| format!("foldable shell output {i}.{n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                exit_code: Some(0),
+                duration: Some(Duration::from_millis((i % 13) as u64)),
+            }),
+            CachedRenderOp::Diff(i) => {
+                let call = call_args("edit", json!({ "path": format!("src/cache_{i}.rs") }));
+                screen.apply(UiEvent::DiffPreview {
+                    call: call.clone(),
+                    diff: format!(
+                        "--- a/src/cache_{i}.rs\n+++ b/src/cache_{i}.rs\n@@ -1 +1 @@\n-old_{i}\n+new_{i}\n"
+                    ),
+                });
+                screen.apply(UiEvent::ToolResult {
+                    call,
+                    content: "applied".to_string(),
+                    exit_code: Some(0),
+                    duration: Some(Duration::from_millis(1)),
+                });
+            }
+            CachedRenderOp::Reasoning(i) => screen.apply(UiEvent::AssistantReasoning {
+                text: format!(
+                    "Reasoning preview {i}.\n\nHidden paragraph {i} exercises fold visibility."
+                ),
+                redacted: false,
+            }),
+            CachedRenderOp::ToggleLatest => {
+                let _ = screen.toggle_latest_panel();
+            }
+            CachedRenderOp::Width(_) => {}
+            CachedRenderOp::TrimBurst(i) => {
+                for n in 0..(MAX_TRANSCRIPT_ROWS + 24) {
+                    screen.transcript.rows.push(TranscriptRow::new(
+                        format!("trim burst {i} row {n}"),
+                        dim_style(),
+                    ));
+                }
+                screen.transcript.trim_history();
+            }
+        }
+    }
+
+    fn cached_render_signature(
+        screen: &mut Screen,
+        width: u16,
+    ) -> Vec<Vec<(String, Option<Color>, Modifier)>> {
+        let lines = screen.wrapped_lines(width);
+        line_signature(&lines)
+    }
+
+    #[test]
+    fn cached_transcript_render_matches_fresh_replay_after_mutations() {
+        let mut rng = TestRng(0x5eed_1ced_5eed_1ced);
+        let mut ops = Vec::new();
+        for i in 0..36 {
+            let op = match rng.pick(7) {
+                0 => CachedRenderOp::User(i),
+                1 => CachedRenderOp::Assistant(i),
+                2 => CachedRenderOp::Shell(i),
+                3 => CachedRenderOp::Diff(i),
+                4 => CachedRenderOp::Reasoning(i),
+                5 => CachedRenderOp::ToggleLatest,
+                _ => CachedRenderOp::Width([44, 72, 100, 132][rng.pick(4)]),
+            };
+            ops.push(op);
+        }
+        ops.push(CachedRenderOp::TrimBurst(99));
+        ops.push(CachedRenderOp::Width(88));
+        ops.push(CachedRenderOp::ToggleLatest);
+
+        let mut cached = Screen::new();
+        let mut applied = Vec::new();
+        let mut width = 80u16;
+        for (step, op) in ops.into_iter().enumerate() {
+            if let CachedRenderOp::Width(next) = &op {
+                width = *next;
+            }
+            apply_cached_render_op(&mut cached, &op);
+            applied.push(op.clone());
+
+            let cached_sig = cached_render_signature(&mut cached, width);
+            let mut fresh = Screen::new();
+            let mut fresh_width = 80u16;
+            let mut fresh_sig = Vec::new();
+            for prior in &applied {
+                if let CachedRenderOp::Width(next) = prior {
+                    fresh_width = *next;
+                }
+                apply_cached_render_op(&mut fresh, prior);
+                fresh_sig = cached_render_signature(&mut fresh, fresh_width);
+            }
+            assert_eq!(fresh_width, width);
+            assert_eq!(
+                cached_sig, fresh_sig,
+                "cached render diverged after step {step}: {op:?}"
+            );
+        }
     }
 
     fn strip_ansi(input: &str) -> String {
