@@ -74,6 +74,7 @@ pub(super) fn execute(
     state: &mut BashState,
     cancel: &CancellationToken,
     sink: Option<&dyn crate::nexus::ToolOutputSink>,
+    store: Option<&dyn crate::nexus::ToolOutputStore>,
 ) -> Result<super::ToolOutput> {
     let parsed: BashArgs =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
@@ -95,13 +96,13 @@ pub(super) fn execute(
         "run" => match session {
             Some(id) => {
                 let (text, code, duration) =
-                    run_session(root, &id, command, timeout, state, cancel)?;
+                    run_session(root, &id, command, timeout, state, cancel, store)?;
                 exec = Some((code, duration));
                 text
             }
             None => {
                 let command = command.context("bash tool arguments must include command")?;
-                let run = bash(root, &BashInput { command, timeout }, cancel, sink)?;
+                let run = bash(root, &BashInput { command, timeout }, cancel, sink, store)?;
                 exec = Some((run.exit_code, run.duration));
                 run.text
             }
@@ -127,14 +128,14 @@ pub(super) fn execute(
         }
         "poll" => {
             let id = job.as_deref().context("bash poll requires 'job'")?;
-            render_job(id, state.jobs.poll(id)?)
+            render_job(id, state.jobs.poll(id)?, store)
         }
         "finalize" => {
             let id = job.as_deref().context("bash finalize requires 'job'")?;
             // No default wait: unset (or 0) blocks until the job completes
             // (cancellation-aware); a positive value bounds the wait.
             let wait = timeout.filter(|&secs| secs > 0).map(Duration::from_secs);
-            render_job(id, state.jobs.finalize(id, wait, cancel)?)
+            render_job(id, state.jobs.finalize(id, wait, cancel)?, store)
         }
         "cancel" => {
             let id = job.as_deref().context("bash cancel requires 'job'")?;
@@ -165,6 +166,7 @@ fn run_session(
     timeout: Option<u64>,
     state: &mut BashState,
     cancel: &CancellationToken,
+    store: Option<&dyn crate::nexus::ToolOutputStore>,
 ) -> Result<(String, Option<i32>, Duration)> {
     let command = command
         .filter(|c| !c.trim().is_empty())
@@ -184,11 +186,19 @@ fn run_session(
     let outcome = state.sessions.run(root, id, &command, timeout, cancel)?;
     let duration = start.elapsed();
     let exit_code = outcome.exit_code;
-    Ok((render_session(outcome, timeout_secs), exit_code, duration))
+    Ok((
+        render_session(outcome, timeout_secs, store),
+        exit_code,
+        duration,
+    ))
 }
 
 /// Format a background-job update: bounded output, drop/sandbox notices, status.
-fn render_job(id: &str, update: jobs::JobUpdate) -> String {
+fn render_job(
+    id: &str,
+    update: jobs::JobUpdate,
+    store: Option<&dyn crate::nexus::ToolOutputStore>,
+) -> String {
     let mut out = if update.output.is_empty() {
         if update.finished {
             "(no output)".to_string()
@@ -196,7 +206,7 @@ fn render_job(id: &str, update: jobs::JobUpdate) -> String {
             "(no new output)".to_string()
         }
     } else {
-        render_output(&update.output)
+        render_output(&update.output, store)
     };
     if update.dropped > 0 {
         out = format!(
@@ -247,8 +257,12 @@ fn render_job_list(jobs: Vec<jobs::JobInfo>) -> String {
 
 /// Format a session command result the same way the one-shot path does: bounded
 /// body, sandbox notice, then a timeout/exit-status footer.
-fn render_session(outcome: session::RunOutcome, timeout_secs: u64) -> String {
-    let mut out = render_output(&outcome.output);
+fn render_session(
+    outcome: session::RunOutcome,
+    timeout_secs: u64,
+    store: Option<&dyn crate::nexus::ToolOutputStore>,
+) -> String {
+    let mut out = render_output(&outcome.output, store);
     if outcome.output_dropped > 0 {
         out = format!(
             "[output truncated: {} byte(s) dropped]\n{out}",
@@ -317,6 +331,7 @@ fn bash(
     input: &BashInput,
     cancel: &CancellationToken,
     sink: Option<&dyn crate::nexus::ToolOutputSink>,
+    store: Option<&dyn crate::nexus::ToolOutputStore>,
 ) -> Result<BashRun> {
     if input.command.trim().is_empty() {
         bail!("bash command must not be empty");
@@ -449,7 +464,7 @@ fn bash(
         combined.push_str(&stderr_text);
     }
 
-    let mut out = render_output(&combined);
+    let mut out = render_output(&combined, store);
 
     if capture_truncated {
         out = format!(
@@ -486,20 +501,45 @@ fn bash(
     })
 }
 
-/// Apply the shared output policy: keep the bounded tail, mark `(no output)`
-/// when empty, and report truncation without writing a temp-file spill.
-fn render_output(combined: &str) -> String {
+/// Apply the shared output policy: keep the bounded tail (last 2000 lines/50KB,
+/// so errors and final results survive), mark `(no output)` when empty, and
+/// report exactly what a truncation dropped. When a handle store is available
+/// the full captured stream is spilled to it and the notice names the
+/// `read_output` handle, so nothing is lost -- no temp-file spill needed.
+fn render_output(combined: &str, store: Option<&dyn crate::nexus::ToolOutputStore>) -> String {
     let (body, truncated, dropped_lines) =
         truncate_tail(combined, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-    let mut out = if body.trim().is_empty() {
+    if !truncated {
+        return if body.trim().is_empty() {
+            "(no output)".to_string()
+        } else {
+            body
+        };
+    }
+    let kept = body.len();
+    let total = combined.len();
+    let retrieval = match store.map(|store| store.put(combined)) {
+        Some(Ok(handle_id)) => {
+            format!("; full output retrievable via the read_output tool with handle_id {handle_id}")
+        }
+        Some(Err(error)) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to store full bash output behind a handle; tail only"
+            );
+            String::new()
+        }
+        None => String::new(),
+    };
+    let body = if body.trim().is_empty() {
         "(no output)".to_string()
     } else {
         body
     };
-    if truncated {
-        out = format!("[output truncated, dropped {dropped_lines} earlier line(s)]\n{out}");
-    }
-    out
+    format!(
+        "[output truncated: showing the last {kept} of {total} bytes, {dropped_lines} earlier \
+         line(s) dropped{retrieval}]\n{body}"
+    )
 }
 
 /// Resolve the shell used to run commands.
@@ -617,6 +657,7 @@ mod tests {
             },
             &CancellationToken::new(),
             Some(&sink),
+            None,
         )
         .unwrap();
         // The sink saw the live chunks as they arrived.
@@ -638,6 +679,7 @@ mod tests {
             },
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         assert!(run.text.contains("hi"));
@@ -655,6 +697,7 @@ mod tests {
             &json!({ "command": "exit 3" }),
             &mut state,
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap();
@@ -684,6 +727,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(out.metadata.get("exitCode"), Some(&json!(5)));
@@ -701,11 +745,70 @@ mod tests {
     fn bash_truncation_does_not_spill_full_output_to_temp_file() {
         let combined = format!("old\n{}", "x\n".repeat(DEFAULT_MAX_LINES + 1));
 
-        let out = render_output(&combined);
+        let out = render_output(&combined, None);
 
         assert!(out.contains("output truncated"), "{out}");
         assert!(!out.contains("full output saved to"), "{out}");
         assert!(!out.contains("iris-bash-output-"), "{out}");
+    }
+
+    #[test]
+    fn bash_truncation_keeps_the_tail_and_reports_what_was_dropped() {
+        // The head must be dropped and the LAST lines survive (errors and final
+        // results live at the end of shell output), with a notice saying
+        // exactly how many bytes/lines were cut.
+        let combined = format!(
+            "FIRST-LINE\n{}LAST-LINE\n",
+            "filler\n".repeat(DEFAULT_MAX_LINES + 10)
+        );
+
+        let out = render_output(&combined, None);
+
+        assert!(out.contains("LAST-LINE"), "tail must survive");
+        assert!(!out.contains("FIRST-LINE"), "head must be dropped");
+        assert!(
+            out.contains("output truncated: showing the last"),
+            "{}",
+            &out[..200]
+        );
+        assert!(out.contains("earlier line(s) dropped"), "{}", &out[..200]);
+    }
+
+    #[test]
+    fn bash_truncation_spills_full_output_behind_a_handle_when_store_present() {
+        use std::cell::RefCell;
+        struct MemStore {
+            content: RefCell<Option<String>>,
+        }
+        impl crate::nexus::ToolOutputStore for MemStore {
+            fn put(&self, content: &str) -> Result<String> {
+                *self.content.borrow_mut() = Some(content.to_string());
+                Ok("cafe1234".to_string())
+            }
+            fn get(&self, _id: &str) -> Result<Option<String>> {
+                Ok(self.content.borrow().clone())
+            }
+        }
+
+        let combined = format!("HEAD\n{}TAIL\n", "filler\n".repeat(DEFAULT_MAX_LINES + 10));
+        let store = MemStore {
+            content: RefCell::new(None),
+        };
+
+        let out = render_output(&combined, Some(&store));
+
+        assert!(
+            out.contains("read_output tool with handle_id cafe1234"),
+            "{}",
+            &out[..250]
+        );
+        // The store holds the FULL stream, head included.
+        let stored = store.content.borrow().clone().unwrap();
+        assert!(stored.contains("HEAD") && stored.contains("TAIL"));
+
+        // An untruncated output is never spilled.
+        let short = render_output("hello\n", Some(&store));
+        assert!(!short.contains("read_output"), "{short}");
     }
 
     #[test]
@@ -719,6 +822,7 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap()
@@ -741,6 +845,7 @@ mod tests {
             },
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         assert!(run.text.contains("ok"), "out: {}", run.text);
@@ -760,6 +865,7 @@ mod tests {
                 timeout: Some(1),
             },
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap()
@@ -788,6 +894,7 @@ mod tests {
             },
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap()
         .text;
@@ -814,6 +921,7 @@ mod tests {
             },
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap()
         .text;
@@ -838,6 +946,7 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap()
@@ -881,6 +990,7 @@ mod tests {
             },
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap()
         .text;
@@ -903,6 +1013,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         let pwd = execute(
@@ -910,6 +1021,7 @@ mod tests {
             &json!({ "command": "pwd", "session": "s1" }),
             &mut state,
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap();
@@ -926,6 +1038,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         assert!(!other.content.trim_end().ends_with("/sub"));
@@ -937,6 +1050,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         assert!(closed.content.contains("closed"));
@@ -945,6 +1059,7 @@ mod tests {
             &json!({ "command": "pwd", "session": "s1" }),
             &mut state,
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap();
@@ -971,6 +1086,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
 
@@ -990,6 +1106,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         // The id is echoed as job-0 for the first job.
@@ -1005,6 +1122,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         assert!(listed.content.contains("job-0"));
@@ -1014,6 +1132,7 @@ mod tests {
             &json!({ "action": "finalize", "job": "job-0", "timeout": 5 }),
             &mut state,
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap();
@@ -1035,6 +1154,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            None,
         )
         .unwrap();
         assert!(after.content.contains("no background jobs"));
@@ -1054,6 +1174,7 @@ mod tests {
                 timeout: Some(30),
             },
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap()
@@ -1090,6 +1211,7 @@ mod tests {
                 timeout: None,
             },
             &CancellationToken::new(),
+            None,
             None,
         )
         .unwrap()

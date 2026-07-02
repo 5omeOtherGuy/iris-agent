@@ -83,6 +83,115 @@ const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
     ),
 ];
 
+/// Published API list prices for one model, in dollars per million tokens
+/// (issue #206). `cache_write` is the cache-creation surcharge rate;
+/// providers without a cache-write price (OpenAI) use 0.
+///
+/// Hand-maintained like [`ENTRIES`], and deliberately sparse: a model without a
+/// verified published price has NO entry here, and every consumer must then
+/// show tokens only -- an absent price is never guessed or approximated.
+/// Subscription (OAuth) lanes have no marginal dollar price regardless of this
+/// table; the display layer gates on the credential kind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ModelPricing {
+    pub(crate) input: f64,
+    pub(crate) output: f64,
+    pub(crate) cache_read: f64,
+    pub(crate) cache_write: f64,
+}
+
+/// `provider/model` -> $/Mtoken price rows for the API-metered models with
+/// verified published prices. Kept beside [`ENTRIES`] so adding a model
+/// prompts the question "is its price known?" -- and absent stays absent.
+const PRICES: &[(&str, ModelPricing)] = &[
+    (
+        "openai/gpt-4.1",
+        ModelPricing {
+            input: 2.00,
+            output: 8.00,
+            cache_read: 0.50,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "openai/gpt-4.1-mini",
+        ModelPricing {
+            input: 0.40,
+            output: 1.60,
+            cache_read: 0.10,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "openai/gpt-4o",
+        ModelPricing {
+            input: 2.50,
+            output: 10.00,
+            cache_read: 1.25,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "openai/gpt-4o-mini",
+        ModelPricing {
+            input: 0.15,
+            output: 0.60,
+            cache_read: 0.075,
+            cache_write: 0.0,
+        },
+    ),
+    (
+        "anthropic/claude-haiku-4-5",
+        ModelPricing {
+            input: 1.00,
+            output: 5.00,
+            cache_read: 0.10,
+            cache_write: 1.25,
+        },
+    ),
+];
+
+/// Published price row for a `provider/modelId`, or `None` when Iris has no
+/// verified price (consumers must then show tokens only, never a guess).
+pub(crate) fn pricing(qualified: &str) -> Option<ModelPricing> {
+    PRICES
+        .iter()
+        .find(|(id, _)| *id == qualified)
+        .map(|(_, price)| *price)
+}
+
+impl ModelPricing {
+    /// Dollar cost of one usage report under these prices. Cache reads/writes
+    /// are already included in `input_tokens`, so they are separated back out
+    /// and billed at their own rates; output is billed flat (reasoning tokens
+    /// are part of `output_tokens` where providers report them).
+    pub(crate) fn cost(&self, usage: &crate::nexus::ProviderUsage) -> f64 {
+        let cached = usage
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_write_input_tokens);
+        let uncached_input = usage.input_tokens.saturating_sub(cached) as f64;
+        (uncached_input * self.input
+            + usage.cache_read_input_tokens as f64 * self.cache_read
+            + usage.cache_write_input_tokens as f64 * self.cache_write
+            + usage.output_tokens as f64 * self.output)
+            / 1_000_000.0
+    }
+
+    /// Dollar cost of a cumulative session ledger under these prices (same
+    /// bucket math as [`cost`](Self::cost)).
+    pub(crate) fn cost_of_totals(&self, totals: &crate::session::UsageTotals) -> f64 {
+        let cached = totals
+            .cache_read_input_tokens
+            .saturating_add(totals.cache_write_input_tokens);
+        let uncached_input = totals.input_tokens.saturating_sub(cached) as f64;
+        (uncached_input * self.input
+            + totals.cache_read_input_tokens as f64 * self.cache_read
+            + totals.cache_write_input_tokens as f64 * self.cache_write
+            + totals.output_tokens as f64 * self.output)
+            / 1_000_000.0
+    }
+}
+
 /// One known model: its provider and id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogModel {
@@ -449,6 +558,51 @@ mod tests {
             "configured custom provider stays discoverable when another provider is active"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pricing_is_absent_for_unpriced_models_and_costs_by_bucket() {
+        // Subscription-lane and post-cutoff models have NO price row: absent
+        // means "show tokens only", never a guess.
+        assert!(pricing("openai-codex/gpt-5.5").is_none());
+        assert!(pricing("anthropic/claude-fable-5").is_none());
+        assert!(pricing("antigravity/gemini-3.1-pro").is_none());
+
+        let price = pricing("openai/gpt-4.1").expect("gpt-4.1 is priced");
+        let usage = crate::nexus::ProviderUsage {
+            provider: "openai".into(),
+            model: "gpt-4.1".into(),
+            // 1M input of which 500k cache reads; 100k output.
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cache_read_input_tokens: 500_000,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_100_000,
+            cache_creation: None,
+        };
+        // 500k uncached * $2/M + 500k cached * $0.50/M + 100k out * $8/M
+        let cost = price.cost(&usage);
+        assert!((cost - (1.0 + 0.25 + 0.8)).abs() < 1e-9, "cost = {cost}");
+    }
+
+    #[test]
+    fn cache_write_priced_models_separate_the_write_bucket() {
+        let price = pricing("anthropic/claude-haiku-4-5").expect("haiku is priced");
+        let usage = crate::nexus::ProviderUsage {
+            provider: "anthropic".into(),
+            model: "claude-haiku-4-5".into(),
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_input_tokens: 400_000,
+            cache_write_input_tokens: 600_000,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_000_000,
+            cache_creation: None,
+        };
+        // 0 uncached; 400k * $0.10/M + 600k * $1.25/M
+        let cost = price.cost(&usage);
+        assert!((cost - (0.04 + 0.75)).abs() < 1e-9, "cost = {cost}");
     }
 
     #[test]

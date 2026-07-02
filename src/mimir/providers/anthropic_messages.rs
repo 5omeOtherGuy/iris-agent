@@ -371,6 +371,12 @@ impl AnthropicProvider {
             anyhow::Error::new(ServerSideFallbackRejection {
                 diagnostics: diag.to_string(),
             })
+        } else if status.as_u16() == 400 && crate::errors::body_indicates_context_overflow(&body) {
+            // Typed so the harness can compact-and-retry (issue #211). Only the
+            // classification escapes; the raw body is still dropped.
+            anyhow::Error::new(crate::errors::ContextOverflowError::new(format!(
+                "Anthropic request failed [{diag}]: conversation exceeds the model's context window"
+            )))
         } else {
             anyhow!("Anthropic request failed [{diag}]")
         };

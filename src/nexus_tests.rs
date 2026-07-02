@@ -127,7 +127,12 @@ impl AgentObserver for RecordingFrontend {
 }
 
 impl ApprovalGate for RecordingFrontend {
-    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _destructive: bool,
+    ) -> ApprovalFuture<'a> {
         let mut snapshot = self.events_at_review.borrow_mut();
         if snapshot.is_none() {
             *snapshot = Some(self.events.borrow().clone());
@@ -1391,7 +1396,12 @@ fn observer_error_on_tool_result_still_records_paired_transcript() -> Result<()>
         }
     }
     impl ApprovalGate for FailOnToolResult {
-        fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+        fn review<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+            _allow_always: bool,
+            _destructive: bool,
+        ) -> ApprovalFuture<'a> {
             Box::pin(async move { Ok(ApprovalDecision::Allow) })
         }
     }
@@ -2124,6 +2134,200 @@ fn test_workspace() -> Result<TestWorkspace> {
 }
 
 #[test]
+fn provider_context_overflow_compacts_and_retries_once() -> Result<()> {
+    // A provider whose responses can be typed errors, so a test can drive the
+    // harness's overflow-recovery path (issue #211).
+    struct TypedErrorProvider {
+        responses: RefCell<Vec<Result<AssistantTurn, anyhow::Error>>>,
+        calls: std::cell::Cell<usize>,
+    }
+    impl ChatProvider for TypedErrorProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            self.calls.set(self.calls.get() + 1);
+            let item = self
+                .responses
+                .borrow_mut()
+                .pop()
+                .expect("unexpected provider call");
+            let event = item.map(ProviderEvent::Completed);
+            Ok(Box::pin(futures::stream::once(async move { event })))
+        }
+    }
+
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // Reverse order (popped): turn 1 bulks up the transcript, turn 2 is
+    // rejected as a context overflow once and then succeeds after compaction.
+    let filler = "filler ".repeat(400);
+    let provider = TypedErrorProvider {
+        responses: RefCell::new(vec![
+            Ok(AssistantTurn::text("recovered")),
+            Err(anyhow::Error::new(
+                crate::errors::ContextOverflowError::new("prompt too large"),
+            )),
+            Ok(AssistantTurn::text(&filler)),
+        ]),
+        calls: std::cell::Cell::new(0),
+    };
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("first", &frontend, &frontend, &CancellationToken::new()))?;
+    block_on(harness.submit_turn("second", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        harness.agent.provider.calls.get(),
+        3,
+        "overflow retries exactly once"
+    );
+    assert!(
+        harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("recovered")),
+        "retried turn completes after compaction"
+    );
+    // The covered bulk was compacted into a summary and the user was told.
+    assert!(
+        harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("auto-compacted summary")),
+        "compaction summary installed"
+    );
+    let events = frontend.events.borrow();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.contains("compacted older context and retrying")
+        )),
+        "recovery notice emitted"
+    );
+    Ok(())
+}
+
+#[test]
+fn harness_accumulates_and_persists_the_usage_ledger_across_resume() -> Result<()> {
+    fn usage(input: u64, output: u64, cache_read: u64) -> crate::nexus::ProviderUsage {
+        crate::nexus::ProviderUsage {
+            provider: "fake".into(),
+            model: "fake-1".into(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cache_read,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: input + output,
+            cache_creation: None,
+        }
+    }
+    let turn_with_usage = |text: &str, u: crate::nexus::ProviderUsage| AssistantTurn {
+        usage: Some(u),
+        ..AssistantTurn::text(text)
+    };
+
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(turn_with_usage("one", usage(1000, 50, 200))),
+        Ok(turn_with_usage("two", usage(2000, 100, 1500))),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("a", &frontend, &frontend, &CancellationToken::new()))?;
+    block_on(harness.submit_turn("b", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let totals = harness.usage_totals();
+    assert_eq!(totals.turns, 2);
+    assert_eq!(totals.input_tokens, 3000);
+    assert_eq!(totals.output_tokens, 150);
+    assert_eq!(totals.cache_read_input_tokens, 1700);
+    assert_eq!(harness.last_usage().unwrap().input_tokens, 2000);
+    drop(harness);
+
+    // The ledger is persisted: a resumed harness over the same log continues
+    // the cumulative totals instead of starting from zero.
+    let resumed_provider = FakeProvider::new(vec![]);
+    let resumed_agent = Agent::new(resumed_provider, crate::tools::built_in_tools());
+    let resumed_log = crate::session::SessionLog::resume(&log_path)?;
+    let resumed = Harness::resumed(
+        resumed_agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(resumed_log),
+        0,
+        None,
+    );
+    let totals = resumed.usage_totals();
+    assert_eq!(totals.turns, 2, "resumed ledger continues");
+    assert_eq!(totals.input_tokens, 3000);
+    assert!(
+        resumed.last_usage().is_none(),
+        "last-turn usage is per-process"
+    );
+
+    // The on-disk ledger alone reproduces the totals (what a resume reads).
+    let from_disk = crate::session::read_usage_totals(&log_path);
+    assert_eq!(from_disk.turns, 2);
+    assert_eq!(from_disk.input_tokens, 3000);
+    assert_eq!(from_disk.output_tokens, 150);
+    Ok(())
+}
+
+#[test]
+fn provider_non_overflow_error_is_not_retried() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    // One plain provider error; a retry would pop "unexpected call" instead.
+    let provider = FakeProvider::new(vec![Err("boom")]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    let error =
+        block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))
+            .unwrap_err();
+
+    assert!(error.to_string().contains("boom"), "{error:#}");
+    assert_eq!(
+        harness.agent.provider.seen.borrow().len(),
+        1,
+        "a non-overflow error must not trigger a retry"
+    );
+    Ok(())
+}
+
+#[test]
 fn turn_persists_transcript_when_log_attached() -> Result<()> {
     let workspace = test_workspace()?;
     let root = test_workspace()?; // separate temp dir as the session root
@@ -2509,6 +2713,9 @@ fn offload_falls_back_to_inline_when_the_store_errors() {
         fn put(&self, _content: &str) -> Result<String> {
             Err(anyhow!("disk full"))
         }
+        fn get(&self, _id: &str) -> Result<Option<String>> {
+            Err(anyhow!("disk full"))
+        }
     }
 
     let body = "Z".repeat(MAX_INLINE_TOOL_OUTPUT_BYTES + 100);
@@ -2710,7 +2917,12 @@ impl AgentObserver for BlockingApprovalGate {
     }
 }
 impl ApprovalGate for BlockingApprovalGate {
-    fn review<'a>(&'a self, _call: &'a ToolCall, _allow_always: bool) -> ApprovalFuture<'a> {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _destructive: bool,
+    ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             futures::future::pending::<()>().await;
             Ok(ApprovalDecision::Allow)
@@ -3901,7 +4113,16 @@ impl ChatProvider for SurfaceProbe {
     }
 }
 
-const FULL_SURFACE: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const FULL_SURFACE: [&str; 8] = [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "read_output",
+];
 
 #[test]
 fn surface_plan_defaults_to_full_built_in_surface() {
@@ -3919,7 +4140,10 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
     tools.plan_surface(&ProviderCapabilities { native_edit: true });
 
     let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-    assert_eq!(visible, ["read", "bash", "write", "grep", "find", "ls"]);
+    assert_eq!(
+        visible,
+        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
+    );
     assert!(
         !visible.contains(&"edit"),
         "edit must be hidden from the model"
@@ -3995,7 +4219,7 @@ fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
     let advertised = harness.agent.provider.advertised.borrow();
     assert_eq!(
         advertised[0],
-        ["read", "bash", "write", "grep", "find", "ls"]
+        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
     );
     assert!(!advertised[0].iter().any(|name| name == "edit"));
     Ok(())

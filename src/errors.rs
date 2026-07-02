@@ -44,6 +44,61 @@ impl AuthError {
     }
 }
 
+/// The provider rejected a request because the conversation exceeded the
+/// model's context window (issue #211).
+///
+/// Providers attach this after classifying their own native error signal (an
+/// HTTP 400 body naming a token/context limit), so the harness can recover by
+/// compacting and retrying without ever parsing provider error strings itself.
+/// The wrapped message is the provider's already-sanitized diagnostics line,
+/// never the raw response body.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ContextOverflowError {
+    message: String,
+}
+
+impl ContextOverflowError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Whether an error (anywhere in its chain) is a provider context-window
+/// overflow, so the harness can compact and retry instead of surfacing it.
+pub(crate) fn is_context_overflow(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ContextOverflowError>().is_some()
+}
+
+/// Whether a provider error body names a context-window/token-limit overflow.
+///
+/// Called by provider adapters on the RAW (unsanitized) error body -- only the
+/// boolean ever escapes, so no body text is surfaced. The patterns cover the
+/// providers Iris routes to today: Anthropic ("prompt is too long", "input
+/// length and `max_tokens` exceed context limit"), OpenAI ("context_length_exceeded",
+/// "maximum context length", "exceeds the context window"), and Gemini ("input
+/// token count ... exceeds the maximum"). Deliberately a handful of patterns,
+/// not pi's 24: unknown phrasings fail open to the ordinary error path.
+pub(crate) fn body_indicates_context_overflow(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "prompt is too long",
+        "exceed context limit",
+        "context_length_exceeded",
+        "maximum context length",
+        "exceeds the context window",
+        "context window exceeded",
+        "exceeds the maximum number of tokens",
+    ];
+    if PATTERNS.iter().any(|pattern| lower.contains(pattern)) {
+        return true;
+    }
+    // Gemini phrases the limit as "the input token count (N) exceeds ...".
+    lower.contains("input token count") && lower.contains("exceeds")
+}
+
 /// The command line was malformed (unknown command or bad arguments).
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -108,5 +163,48 @@ mod tests {
         assert_eq!(exit_code(&auth), 3);
         let usage = anyhow::Error::new(UsageError::new("bad")).context("parsing args");
         assert_eq!(exit_code(&usage), 2);
+    }
+
+    #[test]
+    fn context_overflow_is_detected_through_context_wrapping() {
+        let error =
+            anyhow::Error::new(ContextOverflowError::new("prompt too long")).context("turn");
+        assert!(is_context_overflow(&error));
+        assert!(!is_context_overflow(&anyhow!("disk full")));
+        assert!(!is_context_overflow(&anyhow::Error::new(AuthError::new(
+            "401"
+        ))));
+    }
+
+    #[test]
+    fn overflow_body_patterns_cover_the_supported_providers() {
+        // Anthropic
+        assert!(body_indicates_context_overflow(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#
+        ));
+        assert!(body_indicates_context_overflow(
+            "input length and `max_tokens` exceed context limit"
+        ));
+        // OpenAI
+        assert!(body_indicates_context_overflow(
+            r#"{"error":{"code":"context_length_exceeded","message":"..."}}"#
+        ));
+        assert!(body_indicates_context_overflow(
+            "This model's maximum context length is 128000 tokens."
+        ));
+        assert!(body_indicates_context_overflow(
+            "Your input exceeds the context window of this model."
+        ));
+        // Gemini
+        assert!(body_indicates_context_overflow(
+            "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+        ));
+
+        // Ordinary errors fail open to the normal error path.
+        assert!(!body_indicates_context_overflow("rate limit exceeded"));
+        assert!(!body_indicates_context_overflow(
+            r#"{"error":{"type":"invalid_request_error","message":"missing field"}}"#
+        ));
+        assert!(!body_indicates_context_overflow(""));
     }
 }

@@ -7,6 +7,7 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+pub(crate) mod approvals;
 pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
@@ -20,10 +21,12 @@ use tracing::Instrument;
 
 use crate::handles::HandleStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, SteeringSource,
-    ToolEnv,
+    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderUsage, Role,
+    SteeringSource, ToolEnv,
 };
-use crate::session::{SessionLog, estimate_tokens, message_token_estimate};
+use crate::session::{
+    SessionLog, UsageTotals, estimate_tokens, message_token_estimate, read_usage_totals,
+};
 use crate::tools::ToolState;
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
@@ -65,6 +68,12 @@ pub(crate) struct Harness<P> {
     // typed while the turn ran; the bare agent drains it at safe injection
     // points. Forwarded per-turn as a borrow; never owned by the bare agent.
     steering: Option<Rc<dyn SteeringSource>>,
+    // Cumulative provider-reported token ledger for this session (issue #206).
+    // Seeded from the log's persisted `usage` entries (so a resumed session's
+    // ledger continues) and extended after every provider turn.
+    usage_totals: UsageTotals,
+    // The most recent provider turn's usage, for the on-demand per-turn readout.
+    last_usage: Option<ProviderUsage>,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -138,6 +147,11 @@ impl<P: ChatProvider> Harness<P> {
         let output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
+        // Continue the persisted cumulative usage ledger (zero for a new file).
+        let usage_totals = session
+            .as_ref()
+            .map(|log| read_usage_totals(log.path()))
+            .unwrap_or_default();
         Self {
             agent,
             workspace,
@@ -148,6 +162,8 @@ impl<P: ChatProvider> Harness<P> {
             budget,
             output_store,
             steering: None,
+            usage_totals,
+            last_usage: None,
         }
     }
 
@@ -185,10 +201,21 @@ impl<P: ChatProvider> Harness<P> {
         self.output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
+        self.usage_totals = session
+            .as_ref()
+            .map(|log| read_usage_totals(log.path()))
+            .unwrap_or_default();
+        self.last_usage = None;
         self.session = session;
         self.persisted = resumed;
         self.entry_ids = vec![None; resumed];
         self.agent.reset_session(messages);
+    }
+
+    /// Workspace root this harness executes against (the key for
+    /// project-scoped state such as persistent approvals).
+    pub(crate) fn workspace(&self) -> &std::path::Path {
+        &self.workspace
     }
 
     /// Id of the attached transcript log, or `None` for an in-memory session.
@@ -256,6 +283,40 @@ impl<P: ChatProvider> Harness<P> {
         // transcript is complete here (every tool call answered), so the
         // covered range never splits a pending tool-call/result pair.
         self.maybe_auto_compact(obs)?;
+        let result = self.run_turn(prompt, obs, gate, token).await;
+        let Err(error) = result else {
+            return Ok(());
+        };
+        // Context-overflow recovery (issue #211): the provider rejected the
+        // request as exceeding the model's context window -- token estimates
+        // drift, so proactive compaction can undershoot. Compact now and retry
+        // once; the failed turn already truncated its unanswered prompt, so
+        // resubmitting the same prompt keeps the transcript valid. Anything
+        // else (including a second overflow) surfaces honestly.
+        if token.is_cancelled()
+            || !crate::errors::is_context_overflow(&error)
+            || !self.compact_for_overflow(obs)?
+        {
+            return Err(error);
+        }
+        obs.on_event(AgentEvent::Notice(
+            "the provider rejected the request as exceeding the model's context window; \
+             compacted older context and retrying."
+                .to_string(),
+        ))?;
+        self.run_turn(prompt, obs, gate, token).await
+    }
+
+    /// One provider turn against the owned execution env, persisting whatever
+    /// it produced (even on error, so the transcript records the user prompt
+    /// and any tool work; persistence is best-effort and never fatal).
+    async fn run_turn(
+        &mut self,
+        prompt: &str,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+        token: &CancellationToken,
+    ) -> Result<()> {
         let env = ToolEnv {
             workspace: &self.workspace,
             state: &self.state,
@@ -267,18 +328,55 @@ impl<P: ChatProvider> Harness<P> {
             // exclusive path. The harness env carries none.
             output_sink: None,
         };
+        // Capture provider-reported usage as the turn's events stream through,
+        // so the harness owns the session ledger without any front-end wiring.
+        let capture = UsageCapture {
+            inner: obs,
+            seen: RefCell::new(Vec::new()),
+        };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
         let result = self
             .agent
-            .submit_turn(prompt, obs, gate, &env, token, self.steering.as_deref())
+            .submit_turn(
+                prompt,
+                &capture,
+                gate,
+                &env,
+                token,
+                self.steering.as_deref(),
+            )
             .instrument(tracing::info_span!("turn"))
             .await;
-        // Persist whatever the turn produced even when it ended in an error, so
-        // the transcript records the user prompt and any tool work. Best-effort:
-        // a write failure is logged, never fatal to the session.
         self.persist_new_messages();
+        self.record_usage(capture.seen.into_inner());
         result
+    }
+
+    /// Fold one turn's provider usage reports into the cumulative ledger and
+    /// persist each as a `usage` entry. Best-effort like message persistence:
+    /// a write failure is logged, never fatal to the session.
+    fn record_usage(&mut self, reports: Vec<ProviderUsage>) {
+        for usage in reports {
+            self.usage_totals.add(&usage);
+            if let Some(log) = self.session.as_mut()
+                && let Err(error) = log.append_usage(&usage)
+            {
+                tracing::warn!(error = %format!("{error:#}"), "failed to persist usage entry");
+            }
+            self.last_usage = Some(usage);
+        }
+    }
+
+    /// Cumulative provider-reported token totals for this session, including
+    /// turns persisted before a resume.
+    pub(crate) fn usage_totals(&self) -> UsageTotals {
+        self.usage_totals
+    }
+
+    /// The most recent provider turn's reported usage, when any turn has run.
+    pub(crate) fn last_usage(&self) -> Option<&ProviderUsage> {
+        self.last_usage.as_ref()
     }
 
     /// Append messages not yet written to the transcript log, advancing the
@@ -314,17 +412,40 @@ impl<P: ChatProvider> Harness<P> {
         let Some(budget) = self.budget else {
             return Ok(());
         };
-        // Compaction is a durable read-time view; without a log there is no
-        // place to record it, so skip rather than mutate history in memory.
-        if self.session.is_none() {
-            return Ok(());
-        }
-
         // Current provider-visible context total, using the same per-message
         // convention the store persists and rebuilds with.
         let total = context_tokens(self.agent.messages());
         if total <= budget {
             return Ok(());
+        }
+        self.compact_to(budget, obs)?;
+        Ok(())
+    }
+
+    /// Forced compaction after a provider context-window rejection (issue
+    /// #211): the estimates said the context fit, the provider disagreed, so
+    /// shrink relative to what is actually there rather than the configured
+    /// budget. Targets half the current estimated total (bounded by the
+    /// configured budget when one is set). Returns whether anything was
+    /// compacted -- `false` (nothing coverable) means the caller must surface
+    /// the original error instead of retrying.
+    fn compact_for_overflow(&mut self, obs: &dyn AgentObserver) -> Result<bool> {
+        let total = context_tokens(self.agent.messages());
+        let target = self.budget.unwrap_or(total).min(total) / 2;
+        if target == 0 {
+            return Ok(false);
+        }
+        self.compact_to(target, obs)
+    }
+
+    /// Compact the coverable prefix so the retained tail fits within `budget`,
+    /// appending a durable `compaction` entry and installing the rebuilt
+    /// context. Returns whether a compaction was applied.
+    fn compact_to(&mut self, budget: u64, obs: &dyn AgentObserver) -> Result<bool> {
+        // Compaction is a durable read-time view; without a log there is no
+        // place to record it, so skip rather than mutate history in memory.
+        if self.session.is_none() {
+            return Ok(false);
         }
 
         let messages = self.agent.messages().to_vec();
@@ -332,7 +453,7 @@ impl<P: ChatProvider> Harness<P> {
             // Nothing coverable (e.g. resumed id-less history or a single
             // oversized message at a tool boundary): a no-op, never history
             // destruction or a faked token count.
-            return Ok(());
+            return Ok(false);
         };
 
         let covered = plan.end - plan.start;
@@ -403,7 +524,8 @@ impl<P: ChatProvider> Harness<P> {
         })?;
         obs.on_event(AgentEvent::Notice(format!(
             "compacted {covered} earlier message(s) to stay within the {budget}-token context budget."
-        )))
+        )))?;
+        Ok(true)
     }
 
     /// Choose the message range to compact. Keeps the largest recent tail whose
@@ -469,6 +591,26 @@ impl<P: ChatProvider> Harness<P> {
             from_id: self.entry_ids[start].clone()?,
             to_id: self.entry_ids[end - 1].clone()?,
         })
+    }
+}
+
+/// Pass-through observer that also captures each provider turn's reported
+/// usage, so the harness can extend its session ledger after the turn without
+/// requiring any front-end to forward events back (issue #206).
+struct UsageCapture<'a> {
+    inner: &'a dyn AgentObserver,
+    seen: RefCell<Vec<ProviderUsage>>,
+}
+
+impl AgentObserver for UsageCapture<'_> {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if let AgentEvent::ProviderTurnCompleted {
+            usage: Some(usage), ..
+        } = &event
+        {
+            self.seen.borrow_mut().push(usage.clone());
+        }
+        self.inner.on_event(event)
     }
 }
 

@@ -44,44 +44,30 @@ struct ReadInput {
     limit: Option<i64>,
 }
 
-fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<super::ToolOutput> {
-    if matches!(input.limit, Some(limit) if limit <= 0) {
+/// A line-numbered window over text content: the rendered output plus the
+/// metadata the read-style tools report. Shared by `read` (files) and
+/// `read_output` (offloaded tool outputs) so both page with the same contract.
+pub(super) struct Window {
+    pub(super) text: String,
+    pub(super) lines: usize,
+    pub(super) total_lines: usize,
+    pub(super) truncated: bool,
+}
+
+/// Render the `offset`/`limit` line window of `content` with line numbers,
+/// capped at [`DEFAULT_MAX_LINES`] lines / [`DEFAULT_MAX_BYTES`] bytes, with
+/// continuation notices telling the model how to page further.
+pub(super) fn window_content(
+    content: &str,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Window> {
+    if matches!(limit, Some(limit) if limit <= 0) {
         bail!("`limit` must be greater than 0");
     }
-    if matches!(input.offset, Some(offset) if offset < 0) {
+    if matches!(offset, Some(offset) if offset < 0) {
         bail!("`offset` must be non-negative");
     }
-
-    let resolved = resolve_existing(root, &input.path)?;
-    let metadata =
-        fs::metadata(&resolved).with_context(|| format!("failed to stat {}", input.path))?;
-    if !metadata.is_file() {
-        bail!("path {} is not a regular file", input.path);
-    }
-    if metadata.len() > READ_TOOL_MAX_BYTES {
-        bail!(
-            "file is too large ({} bytes). Max allowed is {READ_TOOL_MAX_BYTES} bytes.",
-            metadata.len()
-        );
-    }
-
-    let bytes = fs::read(&resolved).with_context(|| format!("failed to read {}", input.path))?;
-    if bytes.contains(&0) {
-        bail!(
-            "file appears to be binary and cannot be safely read as text: {}",
-            input.path
-        );
-    }
-    let content = std::str::from_utf8(&bytes).with_context(|| {
-        format!(
-            "file is not valid UTF-8 and cannot be safely read as text: {}",
-            input.path
-        )
-    })?;
-    // The agent now knows this file's current bytes; record it so a later
-    // edit/write can detect changes made behind its back. `read` always loads
-    // the full file even when offset/limit windows the output.
-    observed.observe(&resolved, &bytes);
 
     let mut lines: Vec<&str> = content.split('\n').collect();
     // A trailing newline produces a final empty element that is not a real line.
@@ -89,21 +75,21 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
         lines.pop();
     }
     let total_lines = lines.len();
-    let file_bytes = bytes.len();
     if total_lines == 0 {
-        return Ok(super::ToolOutput::text(String::new())
-            .with("bytes", json!(file_bytes))
-            .with("lines", json!(0))
-            .with("total_lines", json!(0))
-            .with("truncated", json!(false)));
+        return Ok(Window {
+            text: String::new(),
+            lines: 0,
+            total_lines: 0,
+            truncated: false,
+        });
     }
 
-    let offset = input.offset.unwrap_or(1).max(1) as usize;
+    let offset = offset.unwrap_or(1).max(1) as usize;
     let start = offset - 1;
     if start >= total_lines {
         bail!("offset {offset} is beyond end of file ({total_lines} lines total)");
     }
-    let limit = input.limit.map_or(DEFAULT_MAX_LINES, |l| l as usize).max(1);
+    let limit = limit.map_or(DEFAULT_MAX_LINES, |l| l as usize).max(1);
     let mut end = (start + limit).min(total_lines);
 
     let width = end.to_string().len().max(1);
@@ -149,11 +135,60 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
             ));
         }
     }
-    Ok(super::ToolOutput::text(out)
+    Ok(Window {
+        text: out,
+        lines: lines_shown,
+        total_lines,
+        truncated,
+    })
+}
+
+fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<super::ToolOutput> {
+    if matches!(input.limit, Some(limit) if limit <= 0) {
+        bail!("`limit` must be greater than 0");
+    }
+    if matches!(input.offset, Some(offset) if offset < 0) {
+        bail!("`offset` must be non-negative");
+    }
+
+    let resolved = resolve_existing(root, &input.path)?;
+    let metadata =
+        fs::metadata(&resolved).with_context(|| format!("failed to stat {}", input.path))?;
+    if !metadata.is_file() {
+        bail!("path {} is not a regular file", input.path);
+    }
+    if metadata.len() > READ_TOOL_MAX_BYTES {
+        bail!(
+            "file is too large ({} bytes). Max allowed is {READ_TOOL_MAX_BYTES} bytes.",
+            metadata.len()
+        );
+    }
+
+    let bytes = fs::read(&resolved).with_context(|| format!("failed to read {}", input.path))?;
+    if bytes.contains(&0) {
+        bail!(
+            "file appears to be binary and cannot be safely read as text: {}",
+            input.path
+        );
+    }
+    let content = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "file is not valid UTF-8 and cannot be safely read as text: {}",
+            input.path
+        )
+    })?;
+    // The agent now knows this file's current bytes; record it so a later
+    // edit/write can detect changes made behind its back. `read` always loads
+    // the full file even when offset/limit windows the output.
+    observed.observe(&resolved, &bytes);
+
+    let file_bytes = bytes.len();
+    let window = window_content(content, input.offset, input.limit)?;
+    Ok(super::ToolOutput::text(window.text)
         .with("bytes", json!(file_bytes))
-        .with("lines", json!(lines_shown))
-        .with("total_lines", json!(total_lines))
-        .with("truncated", json!(truncated)))
+        .with("lines", json!(window.lines))
+        .with("total_lines", json!(window.total_lines))
+        .with("truncated", json!(window.truncated)))
 }
 
 fn clamp_line_to_byte_cap(line: &str) -> (String, bool) {

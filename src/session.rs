@@ -220,6 +220,33 @@ impl SessionLog {
         Ok(id)
     }
 
+    /// Append a `usage` ledger entry recording one provider turn's token
+    /// accounting (issue #206). Deliberately id-less: it is an audit/ledger
+    /// record, not part of the transcript chain, so the entry-id chain flows
+    /// around it and every read path (including older builds) skips it as an
+    /// unknown type. The cumulative session ledger is the sum of these entries
+    /// ([`read_usage_totals`]), so a resumed session's ledger continues.
+    pub(crate) fn append_usage(&mut self, usage: &crate::nexus::ProviderUsage) -> Result<()> {
+        let entry = json!({
+            "type": "usage",
+            "timestamp": now_ms(),
+            "provider": usage.provider,
+            "model": usage.model,
+            "inputTokens": usage.input_tokens,
+            "outputTokens": usage.output_tokens,
+            "cacheReadInputTokens": usage.cache_read_input_tokens,
+            "cacheWriteInputTokens": usage.cache_write_input_tokens,
+            "reasoningOutputTokens": usage.reasoning_output_tokens,
+            "totalTokens": usage.total_tokens,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append usage entry to session {}",
+                self.path.display()
+            )
+        })
+    }
+
     /// Reopen an existing transcript file for append, so a resumed session
     /// continues the same log instead of starting a new one. Reads the header
     /// id and the existing entries to restore the leaf link (`parentId` of the
@@ -483,6 +510,72 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: &Message) -> Value 
 // purpose -- this foundation only needs a stable, deterministic number. Upgrade
 // path = record real provider usage per turn in `tokenEstimate` and prefer it
 // (the read path already does).
+/// Cumulative provider-reported token accounting for one session: the sum of
+/// its persisted `usage` entries (issue #206). Real provider numbers, distinct
+/// from the chars/4 `tokenEstimate` heuristic; all sums saturate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UsageTotals {
+    pub(crate) turns: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) cache_write_input_tokens: u64,
+    pub(crate) reasoning_output_tokens: u64,
+    pub(crate) total_tokens: u64,
+}
+
+impl UsageTotals {
+    pub(crate) fn add(&mut self, usage: &crate::nexus::ProviderUsage) {
+        self.turns = self.turns.saturating_add(1);
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(usage.cache_write_input_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(usage.reasoning_output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+    }
+}
+
+/// Sum a session file's persisted `usage` entries so a resumed session's
+/// cumulative ledger continues where it left off. Best-effort (display-only
+/// state): an unreadable file or malformed entries yield what could be read.
+pub(crate) fn read_usage_totals(path: &Path) -> UsageTotals {
+    let mut totals = UsageTotals::default();
+    let Ok(file) = File::open(path) else {
+        return totals;
+    };
+    for line in BufReader::new(file).lines() {
+        let Ok(text) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("usage") {
+            continue;
+        }
+        let field = |name: &str| value.get(name).and_then(Value::as_u64).unwrap_or(0);
+        totals.turns = totals.turns.saturating_add(1);
+        totals.input_tokens = totals.input_tokens.saturating_add(field("inputTokens"));
+        totals.output_tokens = totals.output_tokens.saturating_add(field("outputTokens"));
+        totals.cache_read_input_tokens = totals
+            .cache_read_input_tokens
+            .saturating_add(field("cacheReadInputTokens"));
+        totals.cache_write_input_tokens = totals
+            .cache_write_input_tokens
+            .saturating_add(field("cacheWriteInputTokens"));
+        totals.reasoning_output_tokens = totals
+            .reasoning_output_tokens
+            .saturating_add(field("reasoningOutputTokens"));
+        totals.total_tokens = totals.total_tokens.saturating_add(field("totalTokens"));
+    }
+    totals
+}
+
 pub(crate) fn estimate_tokens(content: &str) -> u64 {
     (content.chars().count() as u64).div_ceil(4)
 }

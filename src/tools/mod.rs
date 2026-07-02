@@ -21,7 +21,7 @@
 //! Module layout:
 //! - [`path`], [`text`]: shared path-resolution and text/I/O-size helpers.
 //! - One module per tool: [`read`], [`bash`], [`edit`], [`write`],
-//!   [`grep`], [`find`], [`ls`].
+//!   [`grep`], [`find`], [`ls`], [`read_output`].
 
 mod bash;
 mod edit;
@@ -31,6 +31,7 @@ mod ls;
 mod observe;
 pub(crate) mod path;
 mod read;
+mod read_output;
 mod registry;
 mod text;
 mod write;
@@ -157,7 +158,7 @@ mod tests {
                 "{name} should be gated"
             );
         }
-        for name in ["read", "grep", "find", "ls"] {
+        for name in ["read", "grep", "find", "ls", "read_output"] {
             assert!(
                 !tools.by_name(name).unwrap().requires_approval(),
                 "{name} should not be gated"
@@ -209,12 +210,21 @@ mod tests {
     }
 
     #[test]
-    fn built_in_tools_cover_all_seven_in_order() {
+    fn built_in_tools_cover_all_eight_in_order() {
         let tools = built_in_tools();
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
         assert_eq!(
             names,
-            vec!["read", "bash", "edit", "write", "grep", "find", "ls"]
+            vec![
+                "read",
+                "bash",
+                "edit",
+                "write",
+                "grep",
+                "find",
+                "ls",
+                "read_output"
+            ]
         );
     }
 

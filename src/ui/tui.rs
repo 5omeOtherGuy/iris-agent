@@ -1329,7 +1329,11 @@ mod tests {
     #[test]
     fn approval_hint_names_tool_target() {
         let mut screen = Screen::new();
-        screen.show_approval(&call_args("bash", json!({ "command": "echo hi" })), false);
+        screen.show_approval(
+            &call_args("bash", json!({ "command": "echo hi" })),
+            false,
+            true,
+        );
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("REVIEW"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
@@ -1349,6 +1353,7 @@ mod tests {
                 }),
             ),
             false,
+            true,
         );
         let lines = rendered_lines(&mut screen, 48, 12);
         assert!(

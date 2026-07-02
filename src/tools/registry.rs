@@ -27,11 +27,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
-use super::{Preview, ToolState, bash, edit, find, grep, ls, path, read, render_preview, write};
+use super::{
+    Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, render_preview, write,
+};
 
-/// Construct the seven workspace tools the CLI injects into the agent. The
+/// Construct the eight workspace tools the CLI injects into the agent. The
 /// order is the provider-declaration order (`read, bash, edit, write, grep,
-/// find, ls`).
+/// find, ls, read_output`).
 pub(crate) fn built_in_tools() -> Tools {
     Tools::new(vec![
         Box::new(ReadTool),
@@ -41,6 +43,7 @@ pub(crate) fn built_in_tools() -> Tools {
         Box::new(GrepTool),
         Box::new(FindTool),
         Box::new(LsTool),
+        Box::new(ReadOutputTool),
     ])
 }
 
@@ -141,7 +144,14 @@ impl Tool for BashTool {
         Box::pin(async move {
             let root = root(env)?;
             let mut state = state_mut(env)?;
-            bash::execute(&root, args, &mut state.bash, &cancel, env.output_sink)
+            bash::execute(
+                &root,
+                args,
+                &mut state.bash,
+                &cancel,
+                env.output_sink,
+                env.output_store,
+            )
         })
     }
     fn requires_approval(&self) -> bool {
@@ -304,6 +314,34 @@ impl Tool for LsTool {
     ) -> ToolFuture<'a> {
         run_off_thread(root(env), args.clone(), "ls", ls::execute)
     }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+}
+
+struct ReadOutputTool;
+impl Tool for ReadOutputTool {
+    fn name(&self) -> &str {
+        "read_output"
+    }
+    fn description(&self) -> &str {
+        read_output::DESCRIPTION
+    }
+    fn parameters(&self) -> Value {
+        read_output::parameters()
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move { read_output::execute(env.output_store, args) })
+    }
+    // Read-only over the session's handle store: touches no `ToolState`, so it
+    // can join a parallel batch (the store read is a plain file read). No
+    // approval gate -- dereferencing an already-produced output has no effect
+    // beyond context cost.
     fn is_concurrency_safe(&self) -> bool {
         true
     }

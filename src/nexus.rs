@@ -237,6 +237,13 @@ pub(crate) trait ToolOutputStore {
     /// be stable for identical content so a resumed transcript keeps pointing at
     /// the same stored output (the harness impl is content-addressed).
     fn put(&self, content: &str) -> Result<String>;
+
+    /// Read a stored output back by handle id, `None` when no such handle
+    /// exists. The retrieval half of "the full output stays retrievable by
+    /// handle": the model-facing `read_output` tool dereferences offloaded
+    /// outputs through this (issue #205). Implementations must treat the id as
+    /// untrusted input (a resumed transcript can carry a forged reference).
+    fn get(&self, id: &str) -> Result<Option<String>>;
 }
 
 /// Display-only live-output sink for a running tool (issue #90 sub-item 1). A
@@ -282,8 +289,17 @@ pub(crate) trait SteeringSource {
 pub(crate) trait ApprovalGate {
     /// `allow_always` mirrors the tool's [`Tool::supports_allow_always`] so the
     /// front-end only offers an "always allow" choice the loop will honor (shell
-    /// tools opt out, so their prompt is y/N only).
-    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a>;
+    /// tools opt out, so their prompt is y/N only). `destructive` is Nexus's
+    /// [`Tool::is_destructive`] classification for this call: a gate that
+    /// consults a persistent grant store (issue #209) must never auto-allow or
+    /// offer to persist a destructive call -- the unconditional re-prompt is the
+    /// safety floor, and Nexus tells the gate where it applies.
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        allow_always: bool,
+        destructive: bool,
+    ) -> ApprovalFuture<'a>;
 }
 
 /// Structured result of a successful tool call: the model-facing text plus
@@ -1135,7 +1151,7 @@ impl<P: ChatProvider> Agent<P> {
                     let decision = tokio::select! {
                         biased;
                         _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
-                        decision = gate.review(call, tool.supports_allow_always()) => decision?,
+                        decision = gate.review(call, tool.supports_allow_always(), destructive) => decision?,
                     };
                     // A blocking front-end prompt (real terminal) cannot observe
                     // the token mid-read, so it may still return a decision after a
@@ -1905,7 +1921,8 @@ fn compact_preview(
     let omitted = total_bytes.saturating_sub(head.len() + tail.len());
     let notice = format!(
         "\n... [iris stored the full {total_bytes}-byte ({total_lines}-line) tool output out of \
-         context; {omitted} bytes omitted here. retrieve via output handle {handle_id}] ...\n"
+         context; {omitted} bytes omitted here. retrieve via the read_output tool with \
+         handle_id {handle_id}] ...\n"
     );
     format!("{head}{notice}{tail}")
 }

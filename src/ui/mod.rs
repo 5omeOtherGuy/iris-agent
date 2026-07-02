@@ -293,7 +293,14 @@ impl AgentObserver for UiBridge<'_> {
 }
 
 impl ApprovalGate for UiBridge<'_> {
-    fn review<'a>(&'a self, call: &'a ToolCall, allow_always: bool) -> ApprovalFuture<'a> {
+    // The non-interactive text fallback does not consult or write the
+    // project-approvals store; `destructive` is therefore unused here.
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        allow_always: bool,
+        _destructive: bool,
+    ) -> ApprovalFuture<'a> {
         Box::pin(async move { self.ui.borrow_mut().request_approval(call, allow_always) })
         // The interactive production front-end is the raw-mode TUI
         // (`ui::tui::TuiUi`): it reads Ctrl-C at an approval as a key event,

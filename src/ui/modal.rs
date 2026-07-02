@@ -85,6 +85,11 @@ pub(crate) enum ModalAction {
     SetEffort(ReasoningEffort),
     /// Settings menu -> open the thinking-level submenu.
     OpenEffortPicker,
+    /// Settings menu -> open the project-approvals review/revoke submenu.
+    OpenApprovals,
+    /// Revoke one stored project approval grant (key = `Grant::key()`), then
+    /// rebuild the approvals submenu.
+    RevokeApproval(String),
     /// Set this project's trust decision (`true` = trust repo Iris resources).
     /// Re-assembles the system prompt and rebuilds the provider at the boundary.
     SetTrust(bool),
@@ -126,6 +131,7 @@ pub(crate) enum Modal {
     Scoped(ScopedModels),
     Effort(EffortPicker),
     Settings(SettingsMenu),
+    Approvals(ApprovalsMenu),
     Trust(TrustMenu),
     Session(SessionPicker),
     LoginMethod(MethodSelect),
@@ -141,6 +147,7 @@ impl Modal {
             Modal::Scoped(picker) => picker.handle_key(key),
             Modal::Effort(picker) => picker.handle_key(key),
             Modal::Settings(menu) => menu.handle_key(key),
+            Modal::Approvals(menu) => menu.handle_key(key),
             Modal::Trust(menu) => menu.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
             Modal::LoginMethod(menu) => menu.handle_key(key),
@@ -170,6 +177,7 @@ impl Modal {
             Modal::Scoped(picker) => picker.render(width),
             Modal::Effort(picker) => picker.render(width),
             Modal::Settings(menu) => menu.render(width),
+            Modal::Approvals(menu) => menu.render(width),
             Modal::Trust(menu) => menu.render(width),
             Modal::Session(picker) => picker.render(width),
             Modal::LoginMethod(menu) => menu.render(width),
@@ -808,11 +816,15 @@ pub(crate) struct SettingsMenu {
 }
 
 impl SettingsMenu {
-    pub(crate) fn new(current_effort: ReasoningEffort) -> Self {
-        let item = SelectorItem::new("thinking", "Thinking level")
+    pub(crate) fn new(current_effort: ReasoningEffort, approval_grants: usize) -> Self {
+        let thinking = SelectorItem::new("thinking", "Thinking level")
             .detail(format!("current: {}", current_effort.as_str()));
+        let plural = if approval_grants == 1 { "" } else { "s" };
+        let approvals = SelectorItem::new("approvals", "Project approvals").detail(format!(
+            "{approval_grants} stored grant{plural} · review/revoke"
+        ));
         SettingsMenu {
-            selector: Selector::new(vec![item], false, false, 8),
+            selector: Selector::new(vec![thinking, approvals], false, false, 8),
         }
     }
 
@@ -828,6 +840,7 @@ impl SettingsMenu {
             }
             ModalKey::Enter => match self.selector.selected_id() {
                 Some("thinking") => ModalOutcome::Emit(ModalAction::OpenEffortPicker),
+                Some("approvals") => ModalOutcome::Emit(ModalAction::OpenApprovals),
                 _ => ModalOutcome::Ignore,
             },
             ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
@@ -841,6 +854,60 @@ impl SettingsMenu {
             Some("Settings"),
             rows,
             Some("↑↓ move · ↵ select · esc cancel"),
+            usize::from(width),
+        )
+    }
+}
+
+// --- project approvals menu (issue #209) ---
+
+/// Review and revoke this project's stored persistent approval grants
+/// (`/settings` -> Project approvals). Each row is one grant; Enter revokes it
+/// (the loop rebuilds the menu so the list stays live). Read-only otherwise:
+/// grants are only ever ADDED from the approval prompt's `[p]` choice.
+#[derive(Debug, Clone)]
+pub(crate) struct ApprovalsMenu {
+    selector: Selector,
+}
+
+impl ApprovalsMenu {
+    /// `grants` are `(key, label)` pairs from the approvals store, in display
+    /// order.
+    pub(crate) fn new(grants: Vec<(String, String)>) -> Self {
+        let items = grants
+            .into_iter()
+            .map(|(key, label)| SelectorItem::new(key, label).detail("↵ revoke"))
+            .collect();
+        ApprovalsMenu {
+            selector: Selector::new(items, false, false, 8),
+        }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some(key) => ModalOutcome::Emit(ModalAction::RevokeApproval(key.to_string())),
+                None => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let rows = selector_rows(&self.selector, "No stored approvals for this project");
+        crate::ui::tui::overlay_box(
+            Some("Project approvals"),
+            rows,
+            Some("↑↓ move · ↵ revoke · esc close"),
             usize::from(width),
         )
     }
@@ -1726,7 +1793,7 @@ mod tests {
 
     #[test]
     fn settings_menu_opens_effort_picker() {
-        let mut menu = SettingsMenu::new(ReasoningEffort::Medium);
+        let mut menu = SettingsMenu::new(ReasoningEffort::Medium, 0);
         assert_eq!(
             menu.handle_key(ModalKey::Enter),
             ModalOutcome::Emit(ModalAction::OpenEffortPicker)
