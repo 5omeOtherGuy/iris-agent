@@ -142,6 +142,7 @@ impl Deref for TranscriptRender {
 }
 
 /// Transcript state and width-aware rendering, separate from editor/spinner UI.
+#[derive(Default)]
 pub(super) struct Transcript {
     pub(super) rows: Vec<TranscriptRow>,
     /// Live assistant text being streamed; rendered after committed rows and
@@ -169,25 +170,6 @@ pub(super) struct Transcript {
     /// uses a realistic column count. Zero until the first render.
     last_width: usize,
     wrapped_cache: WrappedTranscriptCache,
-}
-
-impl Default for Transcript {
-    fn default() -> Self {
-        Self {
-            rows: Vec::new(),
-            streaming: None,
-            active_exec: None,
-            active_explorations: Vec::new(),
-            active_tool: None,
-            active_edit: None,
-            exploring_open: false,
-            provider_turn_started: None,
-            thinking_header_row: None,
-            thinking_elapsed: None,
-            last_width: 0,
-            wrapped_cache: WrappedTranscriptCache::default(),
-        }
-    }
 }
 
 impl Transcript {
