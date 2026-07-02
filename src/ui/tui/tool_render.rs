@@ -45,6 +45,11 @@ use super::{
     err_style, ok_style, panel_style,
 };
 
+// Stored EXPLORE rows are shaped inside the transcript text column. Align the
+// final unit word (`entries`/`files`/`lines`) to the panel-header state label
+// column (`DONE`/`ERROR`/`REVIEW`), while leaving the count text to extend left.
+const EXPLORE_META_UNIT_RIGHT_OFFSET: usize = 16;
+
 /// The panel family a tool renders as. Selects the stateful dispatch path in
 /// [`super::transcript`] (grouped EXPLORE, streaming SHELL exec cell, or a
 /// standard GENERIC/EDIT panel). Mirrors pi-mono's renderShell `self`/`default`.
@@ -234,8 +239,11 @@ fn explore_op_row(width: usize, call: &ToolCall, outcome: &ToolOutcome) -> Trans
     {
         let left_w = display_width(&plain);
         let meta_w = display_width(&meta);
-        if left_w + 2 + meta_w <= width {
-            let gap = width - left_w - meta_w;
+        let unit_w = explore_meta_unit_offset(&meta);
+        let unit_col = width.saturating_sub(EXPLORE_META_UNIT_RIGHT_OFFSET);
+        let meta_start = unit_col.saturating_sub(unit_w);
+        if meta_start >= left_w + 2 && meta_start + meta_w <= width {
+            let gap = meta_start - left_w;
             spans.push(Span::raw(" ".repeat(gap)));
             spans.push(Span::styled(meta.clone(), dim_style()));
             plain.push_str(&" ".repeat(gap));
@@ -261,6 +269,11 @@ fn explore_verb(call: &ToolCall) -> &'static str {
         "find" => "Find",
         _ => "Read",
     }
+}
+
+fn explore_meta_unit_offset(meta: &str) -> usize {
+    meta.rsplit_once(' ')
+        .map_or(0, |(prefix, _)| display_width(prefix) + 1)
 }
 
 /// Honest right-aligned counts for a finished EXPLORE op, derived from the
@@ -1113,7 +1126,15 @@ mod tests {
         );
         assert_eq!(listed.len(), 1);
         assert!(listed[0].text.ends_with("3 entries"), "{}", listed[0].text);
-        assert!(display_width(&listed[0].text) <= panel_body_width(ctx.width));
+        let unit_col = listed[0]
+            .text
+            .find("entries")
+            .map(|idx| display_width(&listed[0].text[..idx]))
+            .expect("entries unit");
+        assert_eq!(
+            unit_col,
+            panel_body_width(ctx.width) - EXPLORE_META_UNIT_RIGHT_OFFSET
+        );
     }
 
     #[test]
