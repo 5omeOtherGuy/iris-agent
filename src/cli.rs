@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
+use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
@@ -164,11 +165,17 @@ pub(crate) fn candidate_for(
     let base_url = if provider == current.provider {
         current.base_url.clone()
     } else {
-        selection::base_url_for(provider, None)
+        let settings_base_url = settings_base_url_for_switch(provider);
+        selection::base_url_for(provider, settings_base_url.as_deref())
     };
-    let reasoning = current
-        .reasoning
-        .map(|level| model_capabilities::clamp(provider, model, level));
+    let reasoning =
+        if provider == ProviderId::OpenAiCompatible && !current.open_ai_compatible.reasoning {
+            None
+        } else {
+            current
+                .reasoning
+                .map(|level| model_capabilities::clamp(provider, model, level))
+        };
     ModelSelection {
         provider,
         model: model.to_string(),
@@ -176,9 +183,24 @@ pub(crate) fn candidate_for(
         reasoning,
         cache_retention: current.cache_retention,
         context_management: current.context_management.clone(),
-        // A runtime model switch keeps the configured retry policy.
+        // A runtime model switch keeps the configured retry policy and custom
+        // endpoint metadata.
         retry_policy: current.retry_policy,
+        open_ai_compatible: current.open_ai_compatible,
     }
+}
+
+fn settings_base_url_for_switch(provider: ProviderId) -> Option<String> {
+    let settings = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())?;
+    let configured_provider = settings
+        .default_provider
+        .as_deref()
+        .and_then(|value| ProviderId::parse(value).ok());
+    (configured_provider == Some(provider))
+        .then_some(settings.base_url)
+        .flatten()
 }
 
 /// Validate, rebuild the provider, install it at the safe boundary, and record
@@ -470,6 +492,7 @@ mod tests {
             cache_retention: selection::PromptCacheRetention::Short,
             context_management: selection::ContextManagement::default(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
+            open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
         }
     }
 

@@ -320,7 +320,14 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
         .reasoning
         .map(|effort| effort.as_str().to_string());
     let qualified_model = format!("{}/{}", selection.provider.as_str(), selection.model);
-    let context = model_catalog::ctx_label(&qualified_model).map(str::to_string);
+    let context = if selection.provider == crate::mimir::selection::ProviderId::OpenAiCompatible {
+        selection
+            .open_ai_compatible
+            .context_window
+            .map(model_catalog::context_window_label)
+    } else {
+        model_catalog::ctx_label(&qualified_model).map(str::to_string)
+    };
     tui.screen
         .set_footer_with_context(selection.model.clone(), effort, context, footer_cwd());
 }
@@ -624,23 +631,28 @@ async fn run_modal_phase<P: ChatProvider>(
                     tui.screen.close_modal();
                     break;
                 };
-                match to_modal_key(&event) {
-                    Some(key) => {
-                        let outcome = match tui.screen.modal.as_mut() {
+                let outcome = if let Event::Paste(text) = &event {
+                    match tui.screen.modal.as_mut() {
+                        Some(modal) => modal.paste_text(text),
+                        None => break,
+                    }
+                } else {
+                    match to_modal_key(&event) {
+                        Some(key) => match tui.screen.modal.as_mut() {
                             Some(modal) => modal.handle_key(key),
                             None => break,
-                        };
-                        apply_modal_outcome(
-                            outcome, harness, tui, input_rx, tick, switch, login_backend,
-                        )
-                        .await?;
-                        // The picker may have switched model/effort; refresh the
-                        // footer before drawing so it never shows a stale model.
-                        refresh_footer(tui, switch);
-                        tui.draw()?;
+                        },
+                        None => ModalOutcome::Ignore,
                     }
-                    None => tui.draw()?,
-                }
+                };
+                apply_modal_outcome(
+                    outcome, harness, tui, input_rx, tick, switch, login_backend,
+                )
+                .await?;
+                // The picker may have switched model/effort; refresh the
+                // footer before drawing so it never shows a stale model.
+                refresh_footer(tui, switch);
+                tui.draw()?;
             }
             _ = tick.tick() => {}
         }
@@ -696,6 +708,22 @@ async fn dispatch_action<P: ChatProvider>(
         ModalAction::BackToLoginMethod => tui.screen.open_modal(login::open_login()),
         ModalAction::BeginLogin(provider) => {
             run_login(provider, tui, input_rx, tick, login_backend).await?;
+        }
+        ModalAction::OpenApiKeyDialog(provider_id) => {
+            tui.screen
+                .open_modal(login::open_api_key_dialog(&provider_id));
+        }
+        ModalAction::SaveApiKey(provider_id) => {
+            let key = match tui.screen.modal.as_mut() {
+                Some(Modal::ApiKeyDialog(dialog)) => dialog.take_input(),
+                _ => String::new(),
+            };
+            let lines = match AuthStore::from_env() {
+                Ok(auth) => login::apply_api_key_login(&provider_id, &key, &auth),
+                Err(error) => vec![format!("auth unavailable: {error:#}")],
+            };
+            apply_notices(tui, lines);
+            tui.screen.close_modal();
         }
         ModalAction::Logout(id) => {
             let lines = match AuthStore::from_env() {

@@ -19,7 +19,7 @@ use std::env;
 
 use anyhow::Result;
 
-use crate::config::Settings;
+use crate::config::{OpenAiCompatibleSettings, Settings};
 use crate::errors::UsageError;
 
 /// The providers Iris supports today. Parsing keeps the "unsupported provider"
@@ -28,8 +28,10 @@ use crate::errors::UsageError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderId {
     OpenAiCodex,
+    OpenAi,
     Anthropic,
     Antigravity,
+    OpenAiCompatible,
 }
 
 impl ProviderId {
@@ -40,10 +42,12 @@ impl ProviderId {
     /// Every supported provider, in display/registry order. Used by the model
     /// catalog and the `/login` provider list so a new provider is added in one
     /// place.
-    pub(crate) const ALL: [ProviderId; 3] = [
+    pub(crate) const ALL: [ProviderId; 5] = [
         ProviderId::OpenAiCodex,
+        ProviderId::OpenAi,
         ProviderId::Anthropic,
         ProviderId::Antigravity,
+        ProviderId::OpenAiCompatible,
     ];
 
     /// Human-facing provider name for selectors and status lines. Today this is
@@ -51,9 +55,11 @@ impl ProviderId {
     /// be added without touching call sites.
     pub(crate) fn display_name(self) -> &'static str {
         match self {
-            ProviderId::OpenAiCodex => "OpenAI",
+            ProviderId::OpenAiCodex => "OpenAI Codex",
+            ProviderId::OpenAi => "OpenAI API",
             ProviderId::Anthropic => "Anthropic",
             ProviderId::Antigravity => "Antigravity",
+            ProviderId::OpenAiCompatible => "OpenAI-compatible",
         }
     }
 
@@ -63,10 +69,12 @@ impl ProviderId {
     pub(crate) fn parse(value: &str) -> Result<ProviderId> {
         match value.trim() {
             "openai-codex" => Ok(ProviderId::OpenAiCodex),
+            "openai" => Ok(ProviderId::OpenAi),
             "anthropic" => Ok(ProviderId::Anthropic),
             "antigravity" => Ok(ProviderId::Antigravity),
+            "openai-compatible" => Ok(ProviderId::OpenAiCompatible),
             other => Err(UsageError::new(format!(
-                "unsupported provider '{other}'; supported: openai-codex, anthropic, antigravity"
+                "unsupported provider '{other}'; supported: openai-codex, openai, anthropic, antigravity, openai-compatible"
             ))
             .into()),
         }
@@ -76,8 +84,10 @@ impl ProviderId {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ProviderId::OpenAiCodex => "openai-codex",
+            ProviderId::OpenAi => "openai",
             ProviderId::Anthropic => "anthropic",
             ProviderId::Antigravity => "antigravity",
+            ProviderId::OpenAiCompatible => "openai-compatible",
         }
     }
 
@@ -87,8 +97,10 @@ impl ProviderId {
     pub(crate) fn default_model(self) -> &'static str {
         match self {
             ProviderId::OpenAiCodex => "gpt-5.5",
+            ProviderId::OpenAi => "gpt-4.1",
             ProviderId::Anthropic => "claude-sonnet-4-6",
             ProviderId::Antigravity => "gemini-3.5-flash",
+            ProviderId::OpenAiCompatible => "llama3.1",
         }
     }
 
@@ -96,8 +108,10 @@ impl ProviderId {
     fn default_base_url(self) -> &'static str {
         match self {
             ProviderId::OpenAiCodex => "https://chatgpt.com/backend-api",
+            ProviderId::OpenAi => "https://api.openai.com/v1",
             ProviderId::Anthropic => "https://api.anthropic.com",
             ProviderId::Antigravity => "https://daily-cloudcode-pa.googleapis.com",
+            ProviderId::OpenAiCompatible => "http://localhost:11434/v1",
         }
     }
 
@@ -106,7 +120,10 @@ impl ProviderId {
     fn base_url_env(self) -> Option<&'static str> {
         match self {
             ProviderId::OpenAiCodex => Some("IRIS_CODEX_BASE_URL"),
-            ProviderId::Anthropic | ProviderId::Antigravity => None,
+            ProviderId::OpenAi
+            | ProviderId::Anthropic
+            | ProviderId::Antigravity
+            | ProviderId::OpenAiCompatible => None,
         }
     }
 }
@@ -301,6 +318,26 @@ impl ContextManagement {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OpenAiCompatibleConfig {
+    pub(crate) context_window: Option<u64>,
+    pub(crate) reasoning: bool,
+    pub(crate) api_key_required: bool,
+}
+
+impl OpenAiCompatibleConfig {
+    pub(crate) fn from_settings(settings: Option<&OpenAiCompatibleSettings>) -> Self {
+        let Some(settings) = settings else {
+            return Self::default();
+        };
+        Self {
+            context_window: settings.context_window,
+            reasoning: settings.reasoning.unwrap_or(false),
+            api_key_required: settings.api_key_required.unwrap_or(false),
+        }
+    }
+}
+
 /// The resolved user choice: provider + model + base URL + optional reasoning.
 /// `reasoning: None` means no preference, so adapters omit every reasoning field
 /// and emit byte-identical requests to today's behavior.
@@ -318,6 +355,8 @@ pub(crate) struct ModelSelection {
     /// pi-mono-aligned defaults. Every provider adapter uses this single
     /// definition instead of its own retry constants.
     pub(crate) retry_policy: crate::mimir::retry::RetryPolicy,
+    /// Generic OpenAI-compatible endpoint capability/display metadata.
+    pub(crate) open_ai_compatible: OpenAiCompatibleConfig,
 }
 
 impl ModelSelection {
@@ -336,7 +375,7 @@ impl ModelSelection {
     pub(crate) fn resolve(settings: &Settings) -> Result<ModelSelection> {
         let provider = match trimmed_non_empty(settings.default_provider.as_deref()) {
             Some(value) => ProviderId::parse(value)?,
-            None => ProviderId::DEFAULT,
+            None => default_provider_from_env(),
         };
         let model = non_empty_env("IRIS_MODEL")
             .or_else(|| trimmed_non_empty(settings.default_model.as_deref()).map(str::to_string))
@@ -363,6 +402,8 @@ impl ModelSelection {
         context_management.validate_supported()?;
         let retry_policy =
             crate::mimir::retry::RetryPolicy::from_settings(&settings.retry_settings());
+        let open_ai_compatible =
+            OpenAiCompatibleConfig::from_settings(settings.open_ai_compatible.as_ref());
         Ok(ModelSelection {
             provider,
             model,
@@ -371,8 +412,24 @@ impl ModelSelection {
             cache_retention,
             context_management,
             retry_policy,
+            open_ai_compatible,
         })
     }
+}
+
+fn default_provider_from_env() -> ProviderId {
+    if non_empty_env("OPENAI_API_KEY").is_some() {
+        return ProviderId::OpenAi;
+    }
+    if non_empty_env("ANTHROPIC_API_KEY").is_some() {
+        return ProviderId::Anthropic;
+    }
+    if non_empty_env("OPENAI_COMPATIBLE_API_KEY").is_some()
+        || non_empty_env("IRIS_OPENAI_COMPATIBLE_API_KEY").is_some()
+    {
+        return ProviderId::OpenAiCompatible;
+    }
+    ProviderId::DEFAULT
 }
 
 /// Resolve a base URL for a provider with precedence `env > settings > default`.
@@ -383,8 +440,17 @@ pub(crate) fn base_url_for(provider: ProviderId, settings_base_url: Option<&str>
     provider
         .base_url_env()
         .and_then(non_empty_env)
-        .or_else(|| trimmed_non_empty(settings_base_url).map(str::to_string))
+        .or_else(|| settings_base_url_for(provider, settings_base_url))
         .unwrap_or_else(|| provider.default_base_url().to_string())
+}
+
+fn settings_base_url_for(provider: ProviderId, settings_base_url: Option<&str>) -> Option<String> {
+    matches!(
+        provider,
+        ProviderId::OpenAiCodex | ProviderId::OpenAi | ProviderId::OpenAiCompatible
+    )
+    .then(|| trimmed_non_empty(settings_base_url).map(str::to_string))
+    .flatten()
 }
 
 /// Trim a settings value and drop it when blank, so an empty `""` falls back to
@@ -424,6 +490,7 @@ mod tests {
             enabled_models: None,
             max_tool_roundtrips: None,
             retry: None,
+            open_ai_compatible: None,
         }
     }
 
@@ -431,10 +498,15 @@ mod tests {
     /// test so concurrent test threads never observe each other's `IRIS_MODEL`.
     #[test]
     fn resolve_precedence_env_over_settings_over_default() {
+        let _env = crate::mimir::test_support::env_lock();
         // Clean slate: no env overrides -> settings, then defaults.
         unsafe {
             env::remove_var("IRIS_MODEL");
             env::remove_var("IRIS_CODEX_BASE_URL");
+            env::remove_var("OPENAI_API_KEY");
+            env::remove_var("ANTHROPIC_API_KEY");
+            env::remove_var("OPENAI_COMPATIBLE_API_KEY");
+            env::remove_var("IRIS_OPENAI_COMPATIBLE_API_KEY");
         }
 
         // Defaults when nothing is set.
@@ -476,6 +548,10 @@ mod tests {
         unsafe {
             env::remove_var("IRIS_MODEL");
             env::remove_var("IRIS_CODEX_BASE_URL");
+            env::remove_var("OPENAI_API_KEY");
+            env::remove_var("ANTHROPIC_API_KEY");
+            env::remove_var("OPENAI_COMPATIBLE_API_KEY");
+            env::remove_var("IRIS_OPENAI_COMPATIBLE_API_KEY");
         }
     }
 
@@ -603,8 +679,10 @@ mod tests {
     fn provider_reasoning_and_cache_retention_parse_round_trip() {
         for provider in [
             ProviderId::OpenAiCodex,
+            ProviderId::OpenAi,
             ProviderId::Anthropic,
             ProviderId::Antigravity,
+            ProviderId::OpenAiCompatible,
         ] {
             assert_eq!(ProviderId::parse(provider.as_str()).unwrap(), provider);
         }
@@ -625,6 +703,65 @@ mod tests {
     }
 
     #[test]
+    fn resolve_defaults_to_api_key_provider_when_only_api_key_env_is_available() {
+        let _env = crate::mimir::test_support::env_lock();
+        unsafe {
+            env::remove_var("IRIS_MODEL");
+            env::remove_var("IRIS_CODEX_BASE_URL");
+            env::set_var("OPENAI_API_KEY", "sk-env");
+            env::remove_var("ANTHROPIC_API_KEY");
+            env::remove_var("OPENAI_COMPATIBLE_API_KEY");
+            env::remove_var("IRIS_OPENAI_COMPATIBLE_API_KEY");
+        }
+        let resolved = ModelSelection::resolve(&settings(None, None, None, None)).unwrap();
+        assert_eq!(resolved.provider, ProviderId::OpenAi);
+        assert_eq!(resolved.model, "gpt-4.1");
+        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+
+        unsafe {
+            env::remove_var("OPENAI_API_KEY");
+            env::set_var("ANTHROPIC_API_KEY", "sk-env");
+        }
+        let resolved = ModelSelection::resolve(&settings(None, None, None, None)).unwrap();
+        assert_eq!(resolved.provider, ProviderId::Anthropic);
+        assert_eq!(resolved.model, "claude-sonnet-4-6");
+
+        unsafe {
+            env::remove_var("ANTHROPIC_API_KEY");
+            env::set_var("OPENAI_COMPATIBLE_API_KEY", "sk-compatible-env");
+        }
+        let resolved = ModelSelection::resolve(&settings(None, None, None, None)).unwrap();
+        assert_eq!(resolved.provider, ProviderId::OpenAiCompatible);
+        assert_eq!(resolved.model, "llama3.1");
+
+        unsafe { env::remove_var("OPENAI_COMPATIBLE_API_KEY") };
+    }
+
+    #[test]
+    fn openai_compatible_resolves_configured_model_base_url_and_flags() {
+        let mut s = settings(
+            Some("openai-compatible"),
+            Some("llama3.1"),
+            Some("http://localhost:11434/v1"),
+            Some("high"),
+        );
+        s.open_ai_compatible = Some(OpenAiCompatibleSettings {
+            context_window: Some(131_072),
+            reasoning: Some(true),
+            api_key_required: Some(false),
+        });
+
+        let resolved = ModelSelection::resolve(&s).unwrap();
+
+        assert_eq!(resolved.provider, ProviderId::OpenAiCompatible);
+        assert_eq!(resolved.model, "llama3.1");
+        assert_eq!(resolved.base_url, "http://localhost:11434/v1");
+        assert_eq!(resolved.open_ai_compatible.context_window, Some(131_072));
+        assert!(resolved.open_ai_compatible.reasoning);
+        assert!(!resolved.open_ai_compatible.api_key_required);
+    }
+
+    #[test]
     fn base_url_for_ignores_settings_on_provider_switch() {
         // Anthropic/Antigravity expose no base-url env, so these cases are
         // env-independent (no IRIS_CODEX_BASE_URL interaction). With
@@ -636,8 +773,16 @@ mod tests {
         );
         assert_eq!(
             base_url_for(ProviderId::Antigravity, Some("https://stale.example")),
-            "https://stale.example",
-            "explicit settings url is honored when provided"
+            "https://daily-cloudcode-pa.googleapis.com",
+            "settings base URL must not redirect Google OAuth traffic"
+        );
+        assert_eq!(
+            base_url_for(
+                ProviderId::OpenAiCompatible,
+                Some("http://localhost:11434/v1")
+            ),
+            "http://localhost:11434/v1",
+            "custom OpenAI-compatible endpoints still use the configured base URL"
         );
     }
 }

@@ -109,15 +109,18 @@ Implemented today:
 - Anthropic-only server-side context-management clear edits, with provider-side
   compact rejected until Iris can persist and replay provider compaction blocks.
 - Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
-  subscription OAuth reuse, and Antigravity Google OAuth.
+  subscription OAuth reuse, Antigravity Google OAuth, Anthropic/OpenAI API keys,
+  and dedicated keys for configured OpenAI-compatible endpoints.
 - OpenAI Codex browser and device-code login flows; Antigravity browser PKCE
-  login; Anthropic browser PKCE login plus Claude Code credential reuse; shared
+  login; Anthropic browser PKCE login plus Claude Code credential reuse; API-key
+  login for Anthropic, OpenAI, and OpenAI-compatible providers; shared
   cancellable loopback OAuth callback plumbing with manual-paste fallback.
-- OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini Code Assist
-  request/response handling, including tool schemas, streamed-response parsing,
-  and normalized reasoning/thinking controls where supported; Anthropic preserves
-  same-origin reasoning continuity in flattened transcripts, and Antigravity
-  round-trips Gemini tool-call `thoughtSignature` continuity.
+- OpenAI Codex Responses, Anthropic Messages, OpenAI Chat Completions,
+  OpenAI-compatible Chat Completions, and Antigravity/Gemini Code Assist
+  request/response handling, including tool schemas, streamed-response parsing
+  where supported, and normalized reasoning/thinking controls where supported;
+  Anthropic preserves same-origin reasoning continuity in flattened transcripts,
+  and Antigravity round-trips Gemini tool-call `thoughtSignature` continuity.
 - Harness-owned fragment/slot system-prompt / project-instruction assembly
   ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56),
   [#74](https://github.com/5omeOtherGuy/iris-agent/pull/74)): the Tier-2

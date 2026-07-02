@@ -59,6 +59,7 @@ pub(crate) enum LoginMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderPurpose {
     Login,
+    ApiKeyLogin,
     Logout,
 }
 
@@ -88,6 +89,10 @@ pub(crate) enum ModalAction {
     ChooseLoginMethod(LoginMethod),
     /// Begin an OAuth/subscription login for this provider.
     BeginLogin(ProviderId),
+    /// Open an API-key entry dialog for this provider id.
+    OpenApiKeyDialog(String),
+    /// Store the API key currently buffered in the active API-key dialog.
+    SaveApiKey(String),
     /// Remove the stored credential for this provider id.
     Logout(String),
     /// Provider-select cancel during `/login` returns to the method selector.
@@ -117,6 +122,7 @@ pub(crate) enum Modal {
     LoginMethod(MethodSelect),
     Providers(ProviderSelect),
     LoginDialog(LoginDialog),
+    ApiKeyDialog(ApiKeyDialog),
 }
 
 impl Modal {
@@ -129,6 +135,21 @@ impl Modal {
             Modal::LoginMethod(menu) => menu.handle_key(key),
             Modal::Providers(picker) => picker.handle_key(key),
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
+            Modal::ApiKeyDialog(dialog) => dialog.handle_key(key),
+        }
+    }
+
+    pub(crate) fn paste_text(&mut self, text: &str) -> ModalOutcome {
+        match self {
+            Modal::LoginDialog(dialog) if dialog.accepts_manual_input() => {
+                dialog.push_str(text);
+                ModalOutcome::Redraw
+            }
+            Modal::ApiKeyDialog(dialog) => {
+                dialog.push_str(text);
+                ModalOutcome::Redraw
+            }
+            _ => ModalOutcome::Ignore,
         }
     }
 
@@ -141,6 +162,7 @@ impl Modal {
             Modal::LoginMethod(menu) => menu.render(width),
             Modal::Providers(picker) => picker.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
+            Modal::ApiKeyDialog(dialog) => dialog.render(width),
         }
     }
 }
@@ -922,6 +944,9 @@ impl ProviderSelect {
                         Ok(provider) => ModalOutcome::Emit(ModalAction::BeginLogin(provider)),
                         Err(_) => ModalOutcome::Ignore,
                     },
+                    ProviderPurpose::ApiKeyLogin => {
+                        ModalOutcome::Emit(ModalAction::OpenApiKeyDialog(id))
+                    }
                     ProviderPurpose::Logout => ModalOutcome::Emit(ModalAction::Logout(id)),
                 },
                 None => ModalOutcome::Ignore,
@@ -948,7 +973,9 @@ impl ProviderSelect {
     /// Login cancel returns to the method selector; logout cancel closes.
     fn cancel(&self) -> ModalOutcome {
         match self.purpose {
-            ProviderPurpose::Login => ModalOutcome::Emit(ModalAction::BackToLoginMethod),
+            ProviderPurpose::Login | ProviderPurpose::ApiKeyLogin => {
+                ModalOutcome::Emit(ModalAction::BackToLoginMethod)
+            }
             ProviderPurpose::Logout => ModalOutcome::Close,
         }
     }
@@ -957,6 +984,7 @@ impl ProviderSelect {
         let rows = selector_rows(&self.selector, &self.empty);
         let title = match self.purpose {
             ProviderPurpose::Login => "Select provider",
+            ProviderPurpose::ApiKeyLogin => "Store API key",
             ProviderPurpose::Logout => "Logout",
         };
         crate::ui::tui::overlay_box(
@@ -1013,6 +1041,13 @@ impl LoginDialog {
         }
     }
 
+    /// Append bracketed paste text to the manual-paste buffer.
+    pub(crate) fn push_str(&mut self, text: &str) {
+        if self.manual {
+            self.input.push_str(text.trim_end_matches(['\r', '\n']));
+        }
+    }
+
     /// Delete the last character of the manual-paste buffer.
     pub(crate) fn backspace(&mut self) {
         self.input.pop();
@@ -1059,6 +1094,77 @@ impl LoginDialog {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ApiKeyDialog {
+    provider_id: String,
+    provider_name: String,
+    input: String,
+}
+
+impl std::fmt::Debug for ApiKeyDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyDialog")
+            .field("provider_id", &self.provider_id)
+            .field("provider_name", &self.provider_name)
+            .field("input", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ApiKeyDialog {
+    pub(crate) fn new(provider_id: &str, provider_name: &str) -> Self {
+        Self {
+            provider_id: provider_id.to_string(),
+            provider_name: provider_name.to_string(),
+            input: String::new(),
+        }
+    }
+
+    pub(crate) fn take_input(&mut self) -> String {
+        std::mem::take(&mut self.input)
+    }
+
+    pub(crate) fn push_str(&mut self, text: &str) {
+        self.input.push_str(text.trim_end_matches(['\r', '\n']));
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Enter => {
+                ModalOutcome::Emit(ModalAction::SaveApiKey(self.provider_id.clone()))
+            }
+            ModalKey::Backspace => {
+                self.input.pop();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Char(ch) => {
+                self.input.push(ch);
+                ModalOutcome::Redraw
+            }
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let masked = "•".repeat(self.input.chars().count());
+        let rows = vec![
+            (
+                Line::from(Span::styled("Paste the API key, then press Enter.", dim())),
+                false,
+            ),
+            (Line::from(Span::raw(format!("> {masked}"))), false),
+        ];
+        let title = format!("API key — {}", self.provider_name);
+        crate::ui::tui::overlay_box(
+            Some(&title),
+            rows,
+            Some("↵ save · esc cancel"),
+            usize::from(width),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,6 +1173,7 @@ mod tests {
         CatalogModel {
             provider,
             id: id.to_string(),
+            ctx_label: None,
         }
     }
 
@@ -1488,6 +1595,35 @@ mod tests {
         let mut dialog = LoginDialog::new("openai-codex", false);
         dialog.set_lines(vec!["Open: https://example".to_string()]);
         assert_eq!(dialog.handle_key(ModalKey::CtrlC), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn api_key_dialog_masks_secret_and_emits_save_without_secret() {
+        let mut dialog = ApiKeyDialog::new("openai", "OpenAI API");
+        for ch in "sk-secret".chars() {
+            dialog.handle_key(ModalKey::Char(ch));
+        }
+        let rendered = dialog
+            .render(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("sk-secret"), "{rendered}");
+        assert!(rendered.contains("•••••••••"), "{rendered}");
+        match dialog.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::SaveApiKey(provider_id)) => {
+                assert_eq!(provider_id, "openai");
+            }
+            other => panic!("expected SaveApiKey, got {other:?}"),
+        }
+        assert_eq!(dialog.take_input(), "sk-secret");
+        assert!(!format!("{dialog:?}").contains("sk-secret"));
     }
 
     #[test]
