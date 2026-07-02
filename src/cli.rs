@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
-use crate::nexus::ChatProvider;
+use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider};
 use crate::ui::tui::TuiUi;
 use crate::ui::{Ui, UiBridge, UiEvent, slash};
 use crate::wayland::Harness;
@@ -331,6 +331,36 @@ fn run_tui<P: ChatProvider>(
 ) -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let result = crate::ui::tui_loop::run(harness, &runtime, tui, switch);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+/// Drive one headless `--print` turn-sequence. Owns the same Tier-3 runtime and
+/// Ctrl-C watcher as the interactive driver, but runs a single `submit_turn`
+/// with the caller's observer and approval gate instead of a prompt loop, so a
+/// non-interactive run still races the provider stream and tools against
+/// cancellation and cannot hang on exit.
+pub(crate) fn run_print_turn<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    prompt: &str,
+    obs: &dyn AgentObserver,
+    gate: &dyn ApprovalGate,
+) -> Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    // Clear any stale interrupt before arming the watcher so a Ctrl-C from before
+    // this run cannot cancel the turn immediately.
+    crate::signals::reset();
+    let token = CancellationToken::new();
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = std::thread::spawn({
+        let token = token.clone();
+        let done = Arc::clone(&done);
+        move || watch_for_interrupt(&token, &done)
+    });
+    let result = runtime.block_on(harness.submit_turn(prompt, obs, gate, &token));
+    done.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+    // Bound shutdown so an orphaned blocking provider request cannot hang exit.
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
 }

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added a headless `--print` mode (issue #200): `iris -p "prompt"` (or
+  `iris --print "prompt"`) runs one agent turn-sequence, prints the final
+  assistant answer to stdout, and exits 0 on success / nonzero on failure.
+  Piped stdin is merged into the prompt after a blank-line delimiter
+  (`cat log | iris -p "explain this failure"`); on a TTY there is nothing to
+  merge. Print mode is non-interactive and never prompts: gated tools are denied
+  by default, or auto-approved with `--approve`, so a pipe/CI run cannot hang.
+  It does not prompt for project trust (defaults untrusted per issue #202) and
+  persists its session like a normal run.
+
 - Added a per-project trust gate for repo-provided Iris resources (issue #202):
   system-prompt fragments under `<cwd>/.iris/fragments` now load only for a
   trusted workspace. A first interactive run whose repo ships fragments prompts

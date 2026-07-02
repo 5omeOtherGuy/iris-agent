@@ -83,6 +83,22 @@ iris                      # /exit or /quit to leave
 
 From a source checkout, replace `iris` with `cargo run --`.
 
+### Headless print mode
+
+Run one turn without the REPL and print just the final answer to stdout:
+
+```bash
+iris -p "summarize the build failure"          # --print is the long form
+cat build.log | iris -p "explain this failure"  # piped stdin merges into the prompt
+iris --print "apply the fix" --approve          # auto-approve gated tools
+```
+
+Print mode is non-interactive: it exits 0 on success and nonzero on failure, and
+never prompts. Gated tools are denied by default; pass `--approve` to
+auto-approve them. When stdin is piped it is appended to the prompt after a
+blank line; on a TTY there is nothing to merge. Only the final assistant answer
+reaches stdout.
+
 At the prompt, `/model` views or switches provider/model and
 `/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
 turn boundary. `/settings`, `/scoped-models`, `/trust`, `/login`, and `/logout`
