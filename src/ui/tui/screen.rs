@@ -373,12 +373,6 @@ pub(crate) struct Screen {
     /// user sees their queued input register before it is injected. Reset at
     /// each turn boundary.
     queued: usize,
-    /// Whether the last rendered document padded blank rows above a short
-    /// transcript (`MIN_INLINE_DOCUMENT_ROWS`). While that padding is on the
-    /// surface, its retained lines do not start with transcript content, so the
-    /// first un-padded frame must not reuse a stable prefix computed from
-    /// transcript rows alone (see [`render_document_inner`]).
-    padded_frame: bool,
     /// Whether the terminal (pane) reports itself focused. Terminals without
     /// focus reporting never send focus events, so this stays true. While
     /// unfocused the spinner holds its frame and requests no tick redraws, so N
@@ -402,7 +396,6 @@ impl Screen {
             footer: None,
             modal: None,
             queued: 0,
-            padded_frame: false,
             terminal_focused: true,
         }
     }
@@ -747,7 +740,7 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     }
     let width = size.width.max(1);
     let height = size.height.max(1);
-    let mut transcript = if incremental {
+    let transcript = if incremental {
         screen.wrapped_lines_incremental(width)
     } else {
         screen.wrapped_lines(width)
@@ -763,39 +756,33 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
         block
     };
     let chrome = render_editor_chrome(screen, width, height);
-    let chrome_len = chrome.len();
-    let volatile_tail = chrome_len + working_block.len();
-    let target_rows = height;
-    let min_transcript_rows =
-        usize::from(target_rows).saturating_sub(chrome.len() + working_block.len());
-    let pad_frame = transcript.total_lines < min_transcript_rows;
-    if pad_frame {
-        transcript = screen.wrapped_lines(width);
-        let mut padded = Vec::with_capacity(min_transcript_rows + chrome.len());
-        padded.extend(
-            std::iter::repeat_with(Line::default)
-                .take(min_transcript_rows - transcript.lines.len()),
-        );
-        padded.extend(transcript.lines);
-        transcript.lines = padded;
-        transcript.stable_prefix = 0;
-    } else if screen.padded_frame && transcript.stable_prefix > 0 {
-        // The previous frame padded blank rows above the transcript, so the
-        // surface's retained document does not start with transcript content
-        // and the stable-prefix hint would splice padding into this frame.
-        // Re-render the whole transcript once without the hint; the next frame
-        // resumes incremental rendering against the clean surface state.
-        transcript = screen.wrapped_lines(width);
-        transcript.stable_prefix = 0;
-    }
-    screen.padded_frame = pad_frame;
+    // Full-pane takeover: while the transcript is shorter than the pane, blank
+    // filler rows sit BETWEEN the transcript and the bottom-pinned tail, so the
+    // conversation reads top-down from the first pane row while the working
+    // indicator and composer always occupy the bottom rows (Claude Code-style).
+    // The filler lives in the volatile tail: it shrinks as the transcript
+    // grows, the document holds exactly the viewport height until content
+    // overflows, and no blank row ever scrolls into native scrollback. Because
+    // the transcript keeps document row 0, the stable-prefix hint stays valid
+    // across padded and unpadded frames alike.
+    let tail_rows = chrome.len() + working_block.len();
+    let filler_rows = usize::from(height)
+        .saturating_sub(tail_rows)
+        .saturating_sub(transcript.total_lines);
+    let volatile_tail = tail_rows + filler_rows;
     // The transcript is the scrolling base, moved into the document and never
-    // cloned. The bottom-pinned tail -- working indicator then composer chrome
-    // (which carries the docked overlays) -- is composited through the root
-    // Container, mirroring pi-mono's `TUI extends Container` (`tui.ts#L265`).
-    // Both tail sections are bounded by the viewport height, not the transcript
-    // length, so the container's only per-frame copy is small and constant.
+    // cloned. The bottom-pinned tail -- viewport filler, working indicator,
+    // then composer chrome (which carries the docked overlays) -- is composited
+    // through the root Container, mirroring pi-mono's `TUI extends Container`
+    // (`tui.ts#L265`). Every tail section is bounded by the viewport height,
+    // not the transcript length, so the container's only per-frame copy is
+    // small and constant.
     let mut tail = Container::new();
+    tail.add_child(Box::new(LinesSection(
+        std::iter::repeat_with(Line::default)
+            .take(filler_rows)
+            .collect(),
+    )));
     tail.add_child(Box::new(LinesSection(working_block)));
     tail.add_child(Box::new(LinesSection(chrome)));
     let stable_prefix = transcript.stable_prefix;
