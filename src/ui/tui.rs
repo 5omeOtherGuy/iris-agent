@@ -70,7 +70,7 @@ pub(crate) use wrap::wrap_to_width;
 
 /// Editor box grows with content up to this many text rows, then scrolls
 /// internally (keeps the transcript from being squeezed by a huge paste).
-const MAX_EDITOR_ROWS: u16 = 10;
+const MAX_EDITOR_ROWS: u16 = 5;
 
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
@@ -78,6 +78,8 @@ const MAX_MENU_ROWS: u16 = 16;
 const MIN_EDITOR_H: u16 = 4;
 /// Composer chrome above the input rows: the hairline top edge, statusline, and spacer.
 const EDITOR_VERTICAL_CHROME_ROWS: u16 = 3;
+/// Blank row below the input so the composer text does not sit on the screen edge.
+const EDITOR_BOTTOM_PADDING_ROWS: u16 = 1;
 /// Compact inline footprint for a short session. Once the transcript grows past
 /// this, Iris naturally scrolls with the terminal; before then it stays near the
 /// bottom instead of immediately occupying the whole terminal height.
@@ -1182,11 +1184,39 @@ mod tests {
     }
 
     #[test]
+    fn empty_composer_keeps_blank_line_below_placeholder() {
+        let mut screen = Screen::new();
+        let lines = rendered_lines(&mut screen, 80, 8)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>();
+        let placeholder = lines
+            .iter()
+            .position(|line| line.contains("Give Iris a task..."))
+            .expect("placeholder line");
+
+        assert!(
+            lines
+                .get(placeholder + 1)
+                .is_some_and(|line| line.trim().is_empty()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn editor_visual_rows_use_actual_inner_text_width() {
         let mut editor = fresh_editor();
-        editor.insert_str("abcdefghijklmnopqrst");
+        editor.insert_str("abcdefghijkl");
 
         assert_eq!(editor_visual_rows(&editor, 18), 2);
+    }
+
+    #[test]
+    fn editor_visual_rows_cap_at_five_lines() {
+        let mut editor = fresh_editor();
+        editor.insert_str("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+
+        assert_eq!(editor_visual_rows(&editor, 18), 5);
     }
 
     #[test]

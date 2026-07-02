@@ -27,9 +27,9 @@ use super::wrap::{
     truncate_to_width, wrap_to_width,
 };
 use super::{
-    BOX_X_PADDING_U16, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS, MAX_MENU_ROWS, MIN_EDITOR_H,
-    MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, WORKING_FRAMES, border_style, dim_style,
-    format_elapsed_compact, panel_style, prompt_style,
+    BOX_X_PADDING_U16, EDITOR_BOTTOM_PADDING_ROWS, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS,
+    MAX_MENU_ROWS, MIN_EDITOR_H, MIN_INLINE_DOCUMENT_ROWS, TEXT_COLUMN_X_PADDING, WORKING_FRAMES,
+    border_style, dim_style, format_elapsed_compact, panel_style, prompt_style,
 };
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -332,9 +332,12 @@ pub(super) fn fresh_editor() -> TextArea<'static> {
 }
 
 pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
+    let box_width = width
+        .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
+        .max(1);
     let inner_width = usize::from(
-        width
-            .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
+        box_width
+            .saturating_sub(composer_text_x_offset(box_width))
             .max(1),
     );
     editor
@@ -1042,11 +1045,14 @@ struct ChromeHeights {
 
 /// Allocate chrome rows. The composer is protected first: the menu yields to
 /// `MIN_EDITOR_H` (hairline + statusline + spacer + one input row) before anything else
-/// is squeezed.
+/// is squeezed. The bottom padding is preferred, not protected, so overlays can
+/// reclaim it in tight viewports.
 fn chrome_heights(height: u16, menu_wanted: u16, editor_rows: u16) -> ChromeHeights {
     let menu = menu_wanted.min(height.saturating_sub(MIN_EDITOR_H));
     let max_editor_h = height.saturating_sub(menu).max(1);
-    let wanted_editor_h = editor_rows.saturating_add(EDITOR_VERTICAL_CHROME_ROWS);
+    let wanted_editor_h = editor_rows
+        .saturating_add(EDITOR_VERTICAL_CHROME_ROWS)
+        .saturating_add(EDITOR_BOTTOM_PADDING_ROWS);
     let editor = if max_editor_h >= MIN_EDITOR_H {
         wanted_editor_h.clamp(MIN_EDITOR_H, max_editor_h)
     } else {
@@ -1148,6 +1154,7 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
+            .saturating_sub(EDITOR_BOTTOM_PADDING_ROWS)
             .max(1),
     };
     // Cell of the editor's hardware-cursor (IME) marker, in buffer coordinates.
