@@ -52,6 +52,10 @@ struct ApprovalHint {
     /// Whether the gated action is a shell command, so the action reads with a
     /// `$ ` prompt (per the `ApprovalOutput` design-system component).
     shell: bool,
+    /// Whether the shell will run unconfined because this platform has no kernel
+    /// sandbox. Surfaces an honest `unsandboxed` posture at the decision point
+    /// on non-Linux, rather than only a startup notice that scrolls away.
+    unsandboxed: bool,
 }
 
 #[derive(Default)]
@@ -269,6 +273,12 @@ fn approval_lead_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
         spans.push(Span::styled("$ ", dim_style()));
     }
     spans.extend(ansi_spans(&hint.target, Style::default()));
+    if hint.unsandboxed {
+        spans.push(Span::styled(
+            format!("  {} unsandboxed", crate::ui::symbols::SEP),
+            dim_style(),
+        ));
+    }
     spans
 }
 
@@ -603,10 +613,12 @@ impl Screen {
         } else {
             "[y] once  [N] deny"
         };
+        let shell = call.name == "bash";
         self.approval_hint = Some(ApprovalHint {
             target: run_target(call),
             options,
-            shell: call.name == "bash",
+            shell,
+            unsandboxed: shell && !crate::tools::platform_can_sandbox(),
         });
     }
 
@@ -1282,6 +1294,7 @@ mod tests {
             target: "run an extremely long command".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
+            unsandboxed: true,
         };
         for width in 1..=4 {
             for line in approval_status_lines(&hint, width) {
@@ -1313,11 +1326,13 @@ mod tests {
             target: "echo hi".to_string(),
             options: "[y] once  [N] deny",
             shell: true,
+            unsandboxed: false,
         };
         let non_shell = ApprovalHint {
             target: "Write src/x.rs".to_string(),
             options: "[y] once  [N] deny",
             shell: false,
+            unsandboxed: false,
         };
         let shell_text = line_text(&approval_status_line(&shell));
         let non_shell_text = line_text(&approval_status_line(&non_shell));
@@ -1332,5 +1347,36 @@ mod tests {
             "{non_shell_text}"
         );
         assert!(!non_shell_text.contains("$ "), "{non_shell_text}");
+    }
+
+    #[test]
+    fn approval_review_line_marks_unsandboxed_shell() {
+        // On a platform without a kernel sandbox the shell runs unconfined; the
+        // approval prompt states that posture at the decision point, in the
+        // calm dim aside, rather than only in a startup notice.
+        let unsandboxed = ApprovalHint {
+            target: "echo hi".to_string(),
+            options: "[y] once  [N] deny",
+            shell: true,
+            unsandboxed: true,
+        };
+        let sandboxed = ApprovalHint {
+            target: "echo hi".to_string(),
+            options: "[y] once  [N] deny",
+            shell: true,
+            unsandboxed: false,
+        };
+        let unsandboxed_text = line_text(&approval_status_line(&unsandboxed));
+        let sandboxed_text = line_text(&approval_status_line(&sandboxed));
+        assert!(
+            unsandboxed_text.contains("unsandboxed"),
+            "{unsandboxed_text}"
+        );
+        assert!(
+            unsandboxed_text.contains(crate::ui::symbols::SEP),
+            "{unsandboxed_text}"
+        );
+        // The posture aside is shell-only and never claims confinement.
+        assert!(!sandboxed_text.contains("unsandboxed"), "{sandboxed_text}");
     }
 }

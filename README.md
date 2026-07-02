@@ -36,6 +36,21 @@ cargo run
 search in-process via the ripgrep library crates (`grep`, `ignore`, `globset`),
 so no `rg` or `fd` binary needs to be on `PATH`.
 
+## Platforms
+
+| Platform | Status | `bash` sandbox |
+| --- | --- | --- |
+| Linux | Supported | Kernel-enforced (Landlock LSM), opt-in via `IRIS_SECURITY_OPT_IN=1` |
+| macOS | Supported | None yet — the shell runs **unconfined** |
+| Windows | Unsupported | — |
+
+macOS caveat: the `bash` sandbox is Linux-only. On macOS every shell command
+runs without kernel confinement. Iris does not hide this: the `bash` approval
+prompt states `unsandboxed` at the point you approve a command, so the posture
+is visible where you decide, not buried in a startup line. macOS Seatbelt
+confinement is a planned follow-up ([docs/ROADMAP.md](docs/ROADMAP.md)); until it
+lands, treat macOS shell commands as unsandboxed.
+
 ## Run
 
 Create credentials for the provider you want, then start the REPL:
