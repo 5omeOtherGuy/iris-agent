@@ -2131,6 +2131,7 @@ mod tests {
     #[test]
     fn explore_rows_carry_verb_column_and_honest_counts() {
         let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
         screen.apply(UiEvent::ToolResult {
             call: call_args("read", json!({ "path": "src/context/engine.rs" })),
             content: "  1→fn a() {}\n  2→fn b() {}\n  3→fn c() {}".to_string(),
@@ -2166,6 +2167,32 @@ mod tests {
             "EXPLORE body should use the framed-output inset: {rendered}"
         );
         assert!(rendered.contains("3 matches · 2 files"), "{rendered}");
+
+        let lines = screen.wrapped_lines(100);
+        let header_line = line_text(line_matching(&lines, |line| {
+            let text = line_text(line);
+            text.contains("EXPLORE") && text.contains("DONE")
+        }));
+        let done_col = header_line
+            .find("DONE")
+            .map(|idx| display_width(&header_line[..idx]))
+            .expect("DONE header label");
+        let read_line = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("Read   src/context/engine.rs")
+        }));
+        let grep_line = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("Grep   \"fn emit\" in src/context")
+        }));
+        let lines_col = read_line
+            .find("lines")
+            .map(|idx| display_width(&read_line[..idx]))
+            .expect("lines unit");
+        let files_col = grep_line
+            .find("files")
+            .map(|idx| display_width(&grep_line[..idx]))
+            .expect("files unit");
+        assert_eq!(lines_col, done_col, "{read_line:?} vs {header_line:?}");
+        assert_eq!(files_col, done_col, "{grep_line:?} vs {header_line:?}");
     }
 
     #[test]
