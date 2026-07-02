@@ -1,7 +1,7 @@
 # ADR-0013: Shared selector schema for dynamic system-prompt and tool-surface assembly
 
 **Date**: 2026-06-18
-**Status**: proposed
+**Status**: proposed (fragment provenance narrowed to internal-only by ADR-0026; selectors still apply)
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context
