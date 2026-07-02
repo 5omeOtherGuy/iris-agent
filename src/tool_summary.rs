@@ -318,7 +318,7 @@ fn rg_content(content: &str) -> Option<ResultSummary> {
 /// Split a bash command string into candidate argv token lists, one per
 /// segment. Segments are cut on newlines and the shell control operators
 /// `&&`, `||`, `|`, `;`, `&`. Quote-awareness is intentionally omitted: this
-/// only locates a leading program name, and a mis-split segment simply fails
+/// only locates a leading program name, and a bad split segment simply fails
 /// its matcher's shape check.
 fn command_segments(command: &str) -> Vec<Vec<String>> {
     let mut segments = Vec::new();
