@@ -81,10 +81,28 @@ fn push_assistant_markdown_lines(rows: &mut Vec<TranscriptRow>, lines: Vec<Line<
     let mut at_block_start = true;
     for line in lines {
         let is_blank = line_text(&line).trim().is_empty();
-        let show_marker = at_block_start && !is_blank;
+        let show_marker = at_block_start && assistant_marker_target(&line);
         rows.push(assistant_row(line, show_marker));
         at_block_start = is_blank;
     }
+}
+
+fn assistant_marker_target(line: &Line<'static>) -> bool {
+    let text = line_text(line);
+    let trimmed = text.trim_start();
+    !trimmed.is_empty() && !is_list_row(trimmed) && !trimmed.starts_with(crate::ui::symbols::SEP)
+}
+
+fn is_list_row(trimmed: &str) -> bool {
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    let Some((marker, _)) = trimmed.split_once(' ') else {
+        return false;
+    };
+    marker
+        .strip_suffix('.')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn assistant_row(mut line: Line<'static>, show_marker: bool) -> TranscriptRow {

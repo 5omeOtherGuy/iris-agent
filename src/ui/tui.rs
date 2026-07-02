@@ -857,7 +857,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.starts_with("      Second paragraph")),
+                .any(|line| line.starts_with("    › Second paragraph")),
             "paragraph start lost assistant text-column alignment: {rendered:?}"
         );
         assert!(
