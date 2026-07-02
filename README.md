@@ -27,10 +27,12 @@ cd iris-agent
 cargo run
 ```
 
-Prebuilt release plumbing is in place for Linux and macOS (x86_64 and aarch64),
-but it becomes usable only after release assets exist. At that point the install
-script will download `iris-agent-<target>.tar.gz`, verify its `.sha256` sidecar,
-and install `iris`:
+Prebuilt release plumbing is in place for Linux and macOS (x86_64 and aarch64)
+and validated locally against real archives (installer, checksum verification,
+and `iris update` self-replace); it becomes usable only after release assets
+exist. Operators cut the first release with [docs/RELEASING.md](docs/RELEASING.md).
+At that point the install script will download `iris-agent-<target>.tar.gz`,
+verify its `.sha256` sidecar, and install `iris`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/iris-agent/main/install.sh | sh
@@ -275,6 +277,7 @@ cargo test
 
 - [Naming convention](docs/NAMING.md) — how the Iris/Wayland/Nexus/Mimir tiers are named.
 - [Roadmap](docs/ROADMAP.md) — milestone sequencing and acceptance gates.
+- [Releasing](docs/RELEASING.md) — operator runbook for cutting a public release.
 - [Feature list](docs/FEATURES.md) — implemented/planned capability inventory.
 - [Product brief](PRODUCT.md) — target users, product purpose, voice, and product principles.
 - [Design system summary](DESIGN.md) — concise visual-system summary for the Iris TUI.

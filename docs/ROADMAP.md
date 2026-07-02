@@ -942,6 +942,15 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    Next: prove the token-efficiency thesis with benchmark evidence, then add the
    missing consumer slices: selective handle dereferencing, richer micro-summary
    schema, and provider-quality compaction summaries.
+7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
+   [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
+   validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):
+   the cargo-dist pipeline builds a real host archive, and `install.sh` plus
+   `iris update` self-replace are proven against real archives + checksums and a
+   mock release response (`scripts/validate-dist.sh`). Gate: the first public
+   release is operator-gated and not yet cut. Next (operator): add
+   `CARGO_REGISTRY_TOKEN`, cut `v0.1.0`, and run post-release live acceptance per
+   [`RELEASING.md`](RELEASING.md).
 
 ## Implementation notes backlog
 
