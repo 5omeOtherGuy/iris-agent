@@ -110,9 +110,11 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
     let mut rendered: Vec<String> = Vec::new();
     let mut byte_count = 0usize;
     let mut byte_capped = false;
+    let mut line_capped = false;
     for (offset_in_window, idx) in (start..end).enumerate() {
         let line = lines[idx].strip_suffix('\r').unwrap_or(lines[idx]);
         let formatted = format!("{:>width$}\u{2192}{line}", idx + 1);
+        let (formatted, capped_line) = clamp_line_to_byte_cap(&formatted);
         byte_count += formatted.len() + 1;
         if byte_count > DEFAULT_MAX_BYTES && offset_in_window > 0 {
             end = idx;
@@ -120,12 +122,19 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
             break;
         }
         rendered.push(formatted);
+        if capped_line {
+            end = idx + 1;
+            line_capped = true;
+            break;
+        }
     }
 
     let lines_shown = end - start;
-    let truncated = end < total_lines;
+    let truncated = line_capped || end < total_lines;
     let mut out = rendered.join("\n");
-    if end < total_lines {
+    if line_capped {
+        out.push_str("\n\n[Line truncated at 50KB limit.]");
+    } else if end < total_lines {
         let next_offset = end + 1;
         if byte_capped {
             out.push_str(&format!(
@@ -145,6 +154,17 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
         .with("lines", json!(lines_shown))
         .with("total_lines", json!(total_lines))
         .with("truncated", json!(truncated)))
+}
+
+fn clamp_line_to_byte_cap(line: &str) -> (String, bool) {
+    if line.len() <= DEFAULT_MAX_BYTES {
+        return (line.to_string(), false);
+    }
+    let mut cut = DEFAULT_MAX_BYTES.saturating_sub(3);
+    while cut > 0 && !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (format!("{}...", &line[..cut]), true)
 }
 
 /// Convenience entry used by integration tests: read with default options.
@@ -221,6 +241,26 @@ mod tests {
         assert!(out.contains("4\u{2192}line4"));
         assert!(!out.contains("line5"));
         assert!(out.contains("more lines in file"));
+    }
+
+    #[test]
+    fn read_truncates_single_line_over_default_byte_cap() {
+        let dir = temp_dir();
+        fs::write(
+            dir.path.join("long.txt"),
+            "x".repeat(DEFAULT_MAX_BYTES + 1024),
+        )
+        .unwrap();
+
+        let out = read_file(&dir.path, "long.txt").unwrap();
+
+        assert!(
+            out.len() < DEFAULT_MAX_BYTES + 256,
+            "len={} out tail={:?}",
+            out.len(),
+            &out[out.len().saturating_sub(128)..]
+        );
+        assert!(out.contains("50KB limit"), "{out}");
     }
 
     #[test]
