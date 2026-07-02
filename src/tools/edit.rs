@@ -15,7 +15,7 @@ use super::text::{
 };
 use super::{ObservedFiles, Preview};
 
-pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default old_string must match a unique region; set replace_all=true to replace every occurrence. Matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
+pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default old_string must match a unique region; set replace_all=true to replace every occurrence. To make several related changes in one call, pass edits: an array of {old_string, new_string} pairs applied together against the file's current content; each must match a unique, non-overlapping region and the batch applies all-or-nothing. Matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -24,9 +24,22 @@ pub(super) fn parameters() -> Value {
             "file_path": { "type": "string", "description": "The absolute path to the file to modify" },
             "old_string": { "type": "string", "description": "The text to replace" },
             "new_string": { "type": "string", "description": "The text to replace it with (must be different from old_string)" },
-            "replace_all": { "type": "boolean", "description": "Replace all occurrences of old_string (default false)" }
+            "replace_all": { "type": "boolean", "description": "Replace all occurrences of old_string (default false)" },
+            "edits": {
+                "type": "array",
+                "description": "Multiple disjoint replacements applied together against the file's current content. Each old_string must match exactly one location and must not overlap another edit; if any edit fails, none are applied. Cannot be combined with the top-level old_string/new_string or replace_all.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_string": { "type": "string", "description": "The text to replace (must match a unique region)" },
+                        "new_string": { "type": "string", "description": "The text to replace it with" }
+                    },
+                    "required": ["old_string", "new_string"],
+                    "additionalProperties": false
+                }
+            }
         },
-        "required": ["file_path", "old_string", "new_string"],
+        "required": ["file_path"],
         "additionalProperties": false
     })
 }
@@ -37,7 +50,7 @@ pub(super) fn execute(
     observed: &mut ObservedFiles,
 ) -> Result<super::ToolOutput> {
     let input: EditInput = serde_json::from_value(args.clone())
-        .context("edit tool arguments must include file_path, old_string, new_string")?;
+        .context("edit tool arguments must include file_path plus old_string/new_string or edits")?;
     edit(root, &input, observed)
 }
 
@@ -62,10 +75,21 @@ pub(super) fn preview(root: &Path, args: &Value) -> Preview {
 #[derive(Debug, Deserialize)]
 struct EditInput {
     file_path: String,
-    old_string: String,
-    new_string: String,
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
     #[serde(default)]
     replace_all: bool,
+    #[serde(default)]
+    edits: Vec<EditPair>,
+}
+
+/// One replacement in the batch `edits[]` form.
+#[derive(Debug, Deserialize)]
+struct EditPair {
+    old_string: String,
+    new_string: String,
 }
 
 fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<super::ToolOutput> {
@@ -81,10 +105,17 @@ fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<
 
     let occurrences = plan.replaced;
     let plural = if occurrences == 1 { "" } else { "s" };
-    let message = format!(
-        "Successfully replaced {occurrences} occurrence{plural} in {}.",
-        input.file_path
-    );
+    let message = if input.edits.is_empty() {
+        format!(
+            "Successfully replaced {occurrences} occurrence{plural} in {}.",
+            input.file_path
+        )
+    } else {
+        format!(
+            "Successfully applied {occurrences} edit{plural} to {}.",
+            input.file_path
+        )
+    };
     Ok(super::ToolOutput::text(message).with("occurrences", json!(occurrences)))
 }
 
@@ -96,9 +127,6 @@ struct EditPlan {
 }
 
 fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
-    if input.new_string.len() > WRITE_TOOL_MAX_BYTES {
-        bail!("new_string exceeds maximum allowed size");
-    }
     let resolved = resolve_existing(root, &input.file_path)?;
     let metadata =
         fs::metadata(&resolved).with_context(|| format!("file not found: {}", input.file_path))?;
@@ -116,29 +144,61 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
     let (content_no_bom, had_bom) = strip_bom(&raw_content);
     let original_ending = detect_line_ending(content_no_bom);
     let normalized_content = normalize_to_lf(content_no_bom);
-    let normalized_old = normalize_to_lf(&input.old_string);
 
-    if normalized_old.is_empty() {
-        bail!("old_string cannot be empty");
-    }
-
-    let ranges = locate_matches(
-        &normalized_content,
-        &normalized_old,
-        input.replace_all,
-        &input.file_path,
-    )?;
+    // Resolve both input forms into one list of replacements against the
+    // ORIGINAL (normalized) content: `(start, len, replacement)` triples,
+    // non-overlapping and ascending. Any failed match rejects the whole call
+    // before anything is written (all-or-nothing).
+    let replacements = if input.edits.is_empty() {
+        let (Some(old_string), Some(new_string)) = (&input.old_string, &input.new_string) else {
+            bail!("edit requires old_string and new_string (or an edits array)");
+        };
+        if new_string.len() > WRITE_TOOL_MAX_BYTES {
+            bail!("new_string exceeds maximum allowed size");
+        }
+        let normalized_old = normalize_to_lf(old_string);
+        if normalized_old.is_empty() {
+            bail!("old_string cannot be empty");
+        }
+        let ranges = locate_matches(
+            &normalized_content,
+            &normalized_old,
+            input.replace_all,
+            &input.file_path,
+        )?;
+        let normalized_new = normalize_to_lf(new_string);
+        ranges
+            .into_iter()
+            .map(|(start, len)| (start, len, normalized_new.clone()))
+            .collect()
+    } else {
+        if input.old_string.is_some() || input.new_string.is_some() {
+            bail!("pass either old_string/new_string or edits, not both");
+        }
+        if input.replace_all {
+            bail!(
+                "replace_all is not supported with edits; make each edit's old_string unique \
+                 instead"
+            );
+        }
+        batch_replacements(&normalized_content, &input.edits, &input.file_path)?
+    };
 
     // Build the replacement against the LF-normalized content, then restore the
     // file's original line ending on write. Ranges are non-overlapping and
     // ascending, so one left-to-right pass applies every replacement.
-    let normalized_new = normalize_to_lf(&input.new_string);
-    let mut new_content =
-        String::with_capacity(normalized_content.len() + ranges.len() * normalized_new.len());
+    let replaced = replacements.len();
+    let mut new_content = String::with_capacity(
+        normalized_content.len()
+            + replacements
+                .iter()
+                .map(|(_, _, new)| new.len())
+                .sum::<usize>(),
+    );
     let mut cursor = 0;
-    for &(start, len) in &ranges {
-        new_content.push_str(&normalized_content[cursor..start]);
-        new_content.push_str(&normalized_new);
+    for (start, len, new) in &replacements {
+        new_content.push_str(&normalized_content[cursor..*start]);
+        new_content.push_str(new);
         cursor = start + len;
     }
     new_content.push_str(&normalized_content[cursor..]);
@@ -161,8 +221,53 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
         resolved,
         old_content: raw_content,
         new_content: final_content,
-        replaced: ranges.len(),
+        replaced,
     })
+}
+
+/// Resolve a batch of `edits[]` into replacement triples against the original
+/// normalized content. Each edit must match a unique region (with the same
+/// fuzzy fallback as the single-edit form), the matched regions must not
+/// overlap, and any failure rejects the whole batch with an error naming the
+/// offending edit -- nothing is partially applied.
+fn batch_replacements(
+    normalized_content: &str,
+    edits: &[EditPair],
+    path: &str,
+) -> Result<Vec<(usize, usize, String)>> {
+    let mut replacements: Vec<(usize, usize, String, usize)> = Vec::with_capacity(edits.len());
+    for (index, pair) in edits.iter().enumerate() {
+        let number = index + 1;
+        if pair.new_string.len() > WRITE_TOOL_MAX_BYTES {
+            bail!("edit {number}: new_string exceeds maximum allowed size");
+        }
+        let normalized_old = normalize_to_lf(&pair.old_string);
+        if normalized_old.is_empty() {
+            bail!("edit {number}: old_string cannot be empty");
+        }
+        let ranges = locate_matches(normalized_content, &normalized_old, false, path)
+            .map_err(|error| error.context(format!("edit {number} of {}", edits.len())))?;
+        let (start, len) = ranges[0];
+        replacements.push((start, len, normalize_to_lf(&pair.new_string), number));
+    }
+    // Matches are located independently against the original content, so two
+    // edits may claim overlapping regions; sort by position and reject any
+    // overlap (or exact duplicate) with both edit numbers named.
+    replacements.sort_by_key(|&(start, len, _, _)| (start, len));
+    for pair in replacements.windows(2) {
+        let (start_a, len_a, _, number_a) = &pair[0];
+        let (start_b, _, _, number_b) = &pair[1];
+        if start_a + len_a > *start_b {
+            bail!(
+                "edits {number_a} and {number_b} overlap in {path}; each edit must match a \
+                 distinct, non-overlapping region"
+            );
+        }
+    }
+    Ok(replacements
+        .into_iter()
+        .map(|(start, len, new, _)| (start, len, new))
+        .collect())
 }
 
 /// Locate the byte ranges in `haystack` to replace. Prefers exact matches; with
@@ -334,24 +439,44 @@ mod tests {
     use super::*;
     use crate::tools::test_support::{root_of, temp_dir};
 
-    fn run(root: &Path, path: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
+    fn single(path: &str, old: &str, new: &str, replace_all: bool) -> EditInput {
+        EditInput {
+            file_path: path.into(),
+            old_string: Some(old.into()),
+            new_string: Some(new.into()),
+            replace_all,
+            edits: Vec::new(),
+        }
+    }
+
+    fn batch(path: &str, pairs: &[(&str, &str)]) -> EditInput {
+        EditInput {
+            file_path: path.into(),
+            old_string: None,
+            new_string: None,
+            replace_all: false,
+            edits: pairs
+                .iter()
+                .map(|(old, new)| EditPair {
+                    old_string: (*old).to_string(),
+                    new_string: (*new).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn run_input(root: &Path, input: &EditInput) -> Result<String> {
         // The mechanics tests below exercise matching/replacement, not the
         // stale-file guard, so simulate a prior read of the existing file.
         let mut observed = ObservedFiles::new();
-        if let Ok(bytes) = fs::read(root.join(path)) {
-            observed.observe(&root.join(path), &bytes);
+        if let Ok(bytes) = fs::read(root.join(&input.file_path)) {
+            observed.observe(&root.join(&input.file_path), &bytes);
         }
-        edit(
-            root,
-            &EditInput {
-                file_path: path.into(),
-                old_string: old.into(),
-                new_string: new.into(),
-                replace_all,
-            },
-            &mut observed,
-        )
-        .map(|output| output.content)
+        edit(root, input, &mut observed).map(|output| output.content)
+    }
+
+    fn run(root: &Path, path: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
+        run_input(root, &single(path, old, new, replace_all))
     }
 
     #[test]
@@ -360,18 +485,9 @@ mod tests {
         let root = root_of(&dir);
         fs::write(dir.path.join("d.txt"), "one\ntwo\n").unwrap();
         let mut observed = ObservedFiles::new();
-        let err = edit(
-            &root,
-            &EditInput {
-                file_path: "d.txt".into(),
-                old_string: "two".into(),
-                new_string: "TWO".into(),
-                replace_all: false,
-            },
-            &mut observed,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = edit(&root, &single("d.txt", "two", "TWO", false), &mut observed)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("has not been read this session"), "{err}");
         // File is untouched.
         assert_eq!(
@@ -390,18 +506,9 @@ mod tests {
         observed.observe(&path, b"one\ntwo\n");
         // The file changes on disk behind the agent's back.
         fs::write(&path, "one\ntwo\nthree\n").unwrap();
-        let err = edit(
-            &root,
-            &EditInput {
-                file_path: "d.txt".into(),
-                old_string: "two".into(),
-                new_string: "TWO".into(),
-                replace_all: false,
-            },
-            &mut observed,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = edit(&root, &single("d.txt", "two", "TWO", false), &mut observed)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("changed since it was last read"), "{err}");
     }
 
@@ -466,5 +573,137 @@ mod tests {
             .to_string();
         assert!(err.contains("could not find the text"), "{err}");
         assert!(err.contains("Re-read the file"), "{err}");
+    }
+
+    #[test]
+    fn batch_edits_apply_together_in_one_write() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("m.txt"), "one\ntwo\nthree\n").unwrap();
+        let msg = run_input(
+            &root,
+            &batch("m.txt", &[("one", "ONE"), ("three", "THREE")]),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path.join("m.txt")).unwrap(),
+            "ONE\ntwo\nTHREE\n"
+        );
+        assert!(msg.contains("2 edits"), "{msg}");
+    }
+
+    #[test]
+    fn batch_edits_locate_against_original_content() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // The first edit grows its line; the second edit's match positions are
+        // still those of the ORIGINAL content, not the shifted intermediate.
+        fs::write(dir.path.join("o.txt"), "aa\nbb\n").unwrap();
+        run_input(
+            &root,
+            &batch("o.txt", &[("aa", "aaaaaaaa"), ("bb", "BB")]),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path.join("o.txt")).unwrap(),
+            "aaaaaaaa\nBB\n"
+        );
+    }
+
+    #[test]
+    fn batch_edit_failure_applies_nothing() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("n.txt"), "one\ntwo\n").unwrap();
+        let err = format!(
+            "{:#}",
+            run_input(&root, &batch("n.txt", &[("one", "ONE"), ("missing", "x")])).unwrap_err()
+        );
+        assert!(err.contains("edit 2 of 2"), "{err}");
+        assert!(err.contains("could not find the text"), "{err}");
+        // All-or-nothing: the first (matching) edit was not applied.
+        assert_eq!(
+            fs::read_to_string(dir.path.join("n.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn batch_edit_ambiguous_match_names_the_edit() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("p.txt"), "dup\ndup\n").unwrap();
+        let err = format!(
+            "{:#}",
+            run_input(&root, &batch("p.txt", &[("dup", "x")])).unwrap_err()
+        );
+        assert!(err.contains("edit 1 of 1"), "{err}");
+        assert!(err.contains("found 2 occurrences"), "{err}");
+    }
+
+    #[test]
+    fn batch_edits_reject_overlapping_regions() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("q.txt"), "alpha beta gamma\n").unwrap();
+        let err = run_input(
+            &root,
+            &batch("q.txt", &[("alpha beta", "x"), ("beta gamma", "y")]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("overlap"), "{err}");
+        assert!(err.contains("edits 1 and 2"), "{err}");
+        assert_eq!(
+            fs::read_to_string(dir.path.join("q.txt")).unwrap(),
+            "alpha beta gamma\n"
+        );
+    }
+
+    #[test]
+    fn batch_edits_reject_replace_all_and_mixed_forms() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("r.txt"), "one\n").unwrap();
+
+        let mut mixed = batch("r.txt", &[("one", "ONE")]);
+        mixed.old_string = Some("one".into());
+        mixed.new_string = Some("ONE".into());
+        let err = run_input(&root, &mixed).unwrap_err().to_string();
+        assert!(err.contains("not both"), "{err}");
+
+        let mut all = batch("r.txt", &[("one", "ONE")]);
+        all.replace_all = true;
+        let err = run_input(&root, &all).unwrap_err().to_string();
+        assert!(err.contains("replace_all is not supported with edits"), "{err}");
+    }
+
+    #[test]
+    fn edit_requires_some_form() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("s.txt"), "one\n").unwrap();
+        let err = run_input(&root, &batch("s.txt", &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires old_string and new_string (or an edits array)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn batch_edit_fuzzy_fallback_matches_single_edit_behavior() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // File uses a Unicode dash; the edit's old_string uses ASCII. The
+        // single-edit fuzzy fallback normalizes these, and the batch form must
+        // behave identically.
+        fs::write(dir.path.join("t.txt"), "a \u{2014} b\nc\n").unwrap();
+        run_input(&root, &batch("t.txt", &[("a - b", "AB"), ("c", "C")])).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path.join("t.txt")).unwrap(),
+            "AB\nC\n"
+        );
     }
 }
