@@ -5833,6 +5833,10 @@ fn acceptance_git_workspace() -> Result<TestWorkspace> {
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "test@example.com"]);
     git(&["config", "user.name", "Test"]);
+    // Neutralize any global ignore patterns for the harness's own git calls
+    // (which do not scrub the env like this helper): the untracked user file
+    // must actually be untracked-and-visible, not globally ignored.
+    git(&["config", "core.excludesFile", "/dev/null"]);
     fs::write(workspace.path.join("alpha.txt"), "alpha base\n")?;
     fs::write(workspace.path.join("beta.txt"), "beta base\n")?;
     git(&["add", "alpha.txt", "beta.txt"]);
@@ -5952,6 +5956,14 @@ fn epic_261_acceptance_end_to_end() -> Result<()> {
     assert!(
         beta.unified.contains("+iris edit"),
         "beta.txt renders the edit"
+    );
+
+    // The git-backed checkpoint chain must actually have been exercised (not
+    // the non-git fallback): refs exist under refs/iris/ before settlement.
+    assert!(
+        iris_refs(root).contains("refs/iris/checkpoints/"),
+        "checkpoint chain refs exist pre-settlement: {:?}",
+        iris_refs(root)
     );
 
     // (c) Rollback restores Iris's paths to their pre-task state byte-identically
