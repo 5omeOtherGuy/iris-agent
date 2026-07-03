@@ -460,6 +460,12 @@ impl TuiUi {
     /// keyboard flags stay as-is; only the in-app conversation view is reset, so
     /// the next draw starts the swapped session with an empty transcript. The
     /// caller re-applies the banner and refreshes the footer afterward.
+    /// Whether the kitty keyboard protocol was negotiated at startup (the
+    /// `/terminal-setup` doctor reports the live state, never a re-probe).
+    pub(crate) fn keyboard_enhanced(&self) -> bool {
+        self.keyboard_enhanced
+    }
+
     pub(crate) fn reset_screen(&mut self) {
         let pager_active = self.screen.pager_active;
         self.screen = Screen::new();
