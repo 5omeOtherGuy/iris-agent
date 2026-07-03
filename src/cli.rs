@@ -544,13 +544,23 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &mut Option<ModelSwitch<'_, P>>,
     force_plain: bool,
+    alt_screen: Option<&str>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<crate::ui::modal::Modal>,
     start_page: bool,
 ) -> Result<()> {
     if !prefers_text_ui(force_plain) {
-        match TuiUi::new() {
-            Ok(tui) => return run_tui(harness, tui, switch, swap, startup_modal, start_page),
+        // Screen-mode policy (ADR-0029): pager vs inline, resolved once per
+        // startup. Degradation/config notices land in the transcript as
+        // ordinary notices so honesty costs no new UI surface.
+        let resolution = crate::ui::screen_mode::resolve_for_startup(alt_screen);
+        match TuiUi::new(resolution.mode) {
+            Ok(mut tui) => {
+                for notice in resolution.notices {
+                    tui.screen.apply(crate::ui::UiEvent::Notice(notice));
+                }
+                return run_tui(harness, tui, switch, swap, startup_modal, start_page);
+            }
             Err(error) => {
                 if startup_modal.is_some() {
                     bail!(

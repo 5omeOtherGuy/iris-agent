@@ -72,6 +72,7 @@ pub(crate) mod markdown;
 pub(crate) mod modal;
 pub(crate) mod palette;
 pub(crate) mod picker;
+pub(crate) mod screen_mode;
 pub(crate) mod selector;
 pub(crate) mod slash;
 pub(crate) mod steering;

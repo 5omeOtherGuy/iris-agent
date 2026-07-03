@@ -57,7 +57,15 @@ fn main() -> ExitCode {
 }
 
 fn dispatch() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    // `--no-alt-screen` (ADR-0029) is positional-agnostic: strip it before the
+    // command table so every entry point honors it, and record it for the
+    // screen-mode resolver.
+    let before = args.len();
+    args.retain(|arg| arg != "--no-alt-screen");
+    if args.len() != before {
+        ui::screen_mode::set_no_alt_screen_cli();
+    }
     // Headless `--print` mode is detected before the command table so `-p`/
     // `--print` (with an optional `--approve` in any position) dispatches to the
     // one-shot runner; a malformed print invocation falls through to the usage
@@ -291,6 +299,7 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
         &mut harness,
         &mut switch,
         force_plain,
+        settings.alt_screen_value(),
         &swap,
         startup_modal,
         start_page,
@@ -482,7 +491,15 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     let swap_cwd = cwd.clone();
     let swap =
         move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
-    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, None, false)
+    cli::run_interactive(
+        &mut harness,
+        &mut switch,
+        force_plain,
+        settings.alt_screen_value(),
+        &swap,
+        None,
+        false,
+    )
 }
 
 /// Log the most recent prior session for `cwd` (if any) via the read side of
@@ -812,6 +829,7 @@ fn print_help() {
     eprintln!("Usage:");
     eprintln!("  iris                              Start interactive agent");
     eprintln!("  iris --plain                      Start in the plain, ANSI-free text UI");
+    eprintln!("  iris --no-alt-screen              Run inline instead of the alternate screen");
     eprintln!(
         "  iris -p \"prompt\"                  Print mode: run one turn, print the answer, exit"
     );
@@ -837,6 +855,7 @@ fn print_help() {
     );
     eprintln!("  NO_COLOR                          Disable color; routes to the plain text UI");
     eprintln!("  IRIS_REDUCED_MOTION=1             Freeze the working-indicator animation");
+    eprintln!("  IRIS_NO_ALT_SCREEN=1              Run inline (like --no-alt-screen)");
 }
 
 #[cfg(test)]

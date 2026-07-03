@@ -102,6 +102,19 @@ pub(crate) struct Settings {
     /// presence of this block engages the feature; an absent block leaves the
     /// feature off (no post-change checks, no reporting).
     pub(crate) verify: Option<VerifySettings>,
+    /// Terminal-UI behavior (ADR-0029 screen-mode policy). Display-only
+    /// preferences: no security-sensitive capability lives here.
+    pub(crate) tui: Option<TuiSettings>,
+}
+
+/// Terminal-UI settings block (`"tui": { ... }` in settings.json).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TuiSettings {
+    /// Alt-screen pager policy: `"auto" | "always" | "never"` (ADR-0029).
+    /// Parsed by `ui::screen_mode`; an invalid value is reported and the
+    /// built-in default applies.
+    pub(crate) alt_screen: Option<String>,
 }
 
 /// Raw per-project verification config (issue #265). Both fields optional: a
@@ -228,7 +241,17 @@ impl Settings {
             // so a cloned project may set it like the model or round-trip cap;
             // project value wins, else global.
             verify: project.verify.or(self.verify),
+            // Screen-mode policy is a display preference, not a security
+            // redirect, so a project may set it; project value wins, else
+            // global.
+            tui: project.tui.or(self.tui),
         }
+    }
+
+    /// Raw `tui.altScreen` value, if configured. Parsed (and validated loudly)
+    /// by `ui::screen_mode::resolve_for_startup`.
+    pub(crate) fn alt_screen_value(&self) -> Option<&str> {
+        self.tui.as_ref()?.alt_screen.as_deref()
     }
 
     /// Resolved verification config, or `None` when no `verify` block is present
@@ -475,6 +498,22 @@ mod tests {
         let path = env::temp_dir().join(format!("iris-config-test-{nanos}-{seq}"));
         fs::create_dir(&path).unwrap();
         TempDir { path }
+    }
+
+    #[test]
+    fn tui_alt_screen_parses_and_project_value_wins() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "tui": { "altScreen": "never" } }"#).unwrap();
+        fs::write(&project, r#"{ "tui": { "altScreen": "auto" } }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(settings.alt_screen_value(), Some("auto"));
+
+        // Global-only config still surfaces, and an absent block yields None.
+        let only_global = Settings::load_from(Some(&global), &dir.path.join("nope.json")).unwrap();
+        assert_eq!(only_global.alt_screen_value(), Some("never"));
+        assert_eq!(Settings::default().alt_screen_value(), None);
     }
 
     #[test]

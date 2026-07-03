@@ -492,6 +492,7 @@ mod tests {
             retry: None,
             open_ai_compatible: None,
             verify: None,
+            tui: None,
         }
     }
 

@@ -339,6 +339,7 @@ mod tests {
                 api_key_required: Some(false),
             }),
             verify: None,
+            tui: None,
         }
     }
 
