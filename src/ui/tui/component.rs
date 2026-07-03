@@ -115,13 +115,24 @@ pub(crate) const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 /// composition root calling this is a no-op strip until a marker-emitting
 /// (e.g. hardware-cursor) component lands.
 pub(crate) fn take_cursor_position(lines: &mut [Line<'static>]) -> Option<(usize, usize)> {
+    take_marker_position(lines, CURSOR_MARKER)
+}
+
+/// [`take_cursor_position`] generalized over the marker string, so the pager
+/// can locate/strip the terminal surface's hardware-cursor marker
+/// (`ui::terminal_surface::CURSOR_MARKER`) with the same find-strip-measure
+/// logic.
+pub(crate) fn take_marker_position(
+    lines: &mut [Line<'static>],
+    marker: &str,
+) -> Option<(usize, usize)> {
     for (row, line) in lines.iter_mut().enumerate() {
         // Locate the marker (span index + byte offset) in one pass.
         let Some((span_idx, marker_at)) = line
             .spans
             .iter()
             .enumerate()
-            .find_map(|(i, span)| span.content.find(CURSOR_MARKER).map(|at| (i, at)))
+            .find_map(|(i, span)| span.content.find(marker).map(|at| (i, at)))
         else {
             continue;
         };
@@ -132,7 +143,7 @@ pub(crate) fn take_cursor_position(lines: &mut [Line<'static>]) -> Option<(usize
         let span = &line.spans[span_idx];
         let content = span.content.as_ref();
         let before = &content[..marker_at];
-        let after = &content[marker_at + CURSOR_MARKER.len()..];
+        let after = &content[marker_at + marker.len()..];
         let column = prefix_width + display_width(before);
         let style = span.style;
         let mut replacement: Vec<Span<'static>> = Vec::new();

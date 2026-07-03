@@ -258,7 +258,7 @@ pub(crate) struct TuiUi {
     surface: TerminalSurface<Stdout>,
     /// Alt-screen pager lifecycle guard (ADR-0029). `Some` only in pager mode;
     /// inline mode never touches the alternate screen.
-    pager: Option<PagerSurface<Stdout>>,
+    pager: Option<PagerSurface>,
     pub(crate) screen: Screen,
     active: bool,
     /// Whether keyboard-enhancement flags were successfully pushed, so they are
@@ -310,7 +310,7 @@ impl TuiUi {
             ScreenMode::Inline => None,
             ScreenMode::Pager => {
                 pager::install_panic_hook();
-                match PagerSurface::enter(io::stdout()) {
+                match PagerSurface::enter() {
                     Ok(pager) => Some(pager),
                     Err(error) => {
                         let _ = disable_keyboard_enhancement(&mut stdout, keyboard_enhanced);
@@ -335,6 +335,13 @@ impl TuiUi {
     pub(crate) fn draw(&mut self) -> Result<()> {
         let (width, height) = terminal_size()?;
         let size = Size::new(width.max(1), height.max(1));
+        // Pager mode: full frame from the same logical state, stock ratatui
+        // diffing. Inline mode: the Iris-owned scrollback-append surface.
+        if let Some(pager) = self.pager.as_mut() {
+            let screen = &mut self.screen;
+            pager.render_with(|frame_size| pager::compose_frame(screen, frame_size))?;
+            return Ok(());
+        }
         let document = render_document_with_hints(&mut self.screen, size);
         self.surface.render_with_hints(
             size,
