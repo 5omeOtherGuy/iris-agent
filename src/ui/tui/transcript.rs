@@ -1843,6 +1843,43 @@ impl Transcript {
         }
     }
 
+    /// Case-insensitive substring search over the VISIBLE physical lines of
+    /// the wrap cache (folded-away content is not searched: a match the
+    /// pager cannot scroll to would be a dead jump). The cache is refreshed
+    /// at its current width first, so appends and fold changes since the last
+    /// frame are searched and stale lines are not. Returns ascending
+    /// visible-line indices. O(total visible lines) per invocation -- run per
+    /// `/find`/`n`/`N` keypress, never per frame.
+    pub(super) fn search_visible_lines(&mut self, query: &str) -> Vec<usize> {
+        let needle = query.to_lowercase();
+        let width = self.wrapped_cache.width;
+        if needle.is_empty() || width == 0 {
+            return Vec::new();
+        }
+        // Same cache-warming path rendering uses: dirty rows re-wrap, fold
+        // visibility re-resolves.
+        self.ensure_wrapped_cache(width);
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        for layout in &self.wrapped_cache.rows {
+            if !layout.visible {
+                continue;
+            }
+            for line in &self.wrapped_cache.lines[layout.lines.clone()] {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                if text.to_lowercase().contains(&needle) {
+                    out.push(pos);
+                }
+                pos += 1;
+            }
+        }
+        out
+    }
+
     /// Visible physical line index of logical `row` under the WARM wrap cache
     /// (callers refresh via [`Self::visible_total`] first). `None` when the
     /// row is folded away or the cache does not cover it yet.

@@ -376,6 +376,11 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     if let Some(line) = selected_line {
         screen.scroll.reveal(line);
     }
+    // One-shot reveal queued by a search jump (`/find`, n/N): scroll the
+    // match into view without pinning the view there afterwards.
+    if let Some(line) = screen.reveal_line.take() {
+        screen.scroll.reveal(line.min(total.saturating_sub(1)));
+    }
     let top = screen.scroll.top();
 
     let mut body = screen.transcript_window(width, top, view_rows);
@@ -394,12 +399,26 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
             span.style = span.style.bg(crate::ui::palette::SURFACE);
         }
     }
-    // Disengaged follow: overlay a dim indicator on the last transcript row
-    // (symbol + label, per the design language) showing how much is below.
-    if !screen.scroll.is_following() && view_rows > 0 {
-        let below = screen.scroll.lines_below();
-        if below > 0 {
-            body[view_rows - 1] = follow_indicator_line(below, width);
+    // Current search match: surface fill on the whole match line.
+    if let Some(line) = screen.search.as_ref().and_then(|state| state.line)
+        && line >= top
+        && line - top < body.len()
+    {
+        for span in &mut body[line - top].spans {
+            span.style = span.style.bg(crate::ui::palette::SURFACE);
+        }
+    }
+    // Bottom overlay row: an active search shows its position indicator;
+    // otherwise disengaged follow shows how much is below. Search wins (it is
+    // the mode the user just entered).
+    if view_rows > 0 {
+        if let Some(state) = screen.search.as_ref() {
+            body[view_rows - 1] = search_indicator_line(state, width);
+        } else if !screen.scroll.is_following() {
+            let below = screen.scroll.lines_below();
+            if below > 0 {
+                body[view_rows - 1] = follow_indicator_line(below, width);
+            }
         }
     }
 
@@ -420,6 +439,29 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         lines: frame,
         cursor,
     }
+}
+
+/// Dim centered search indicator: `find "query" k/N ; n older ; N newer`
+/// (or `no matches`).
+fn search_indicator_line(state: &super::screen::SearchState, width: u16) -> Line<'static> {
+    let label = if state.total == 0 {
+        format!("find {:?} ─ no matches", state.query)
+    } else {
+        format!(
+            "find {:?} ─ {}/{} {} n older {} N newer",
+            state.query,
+            state.position,
+            state.total,
+            crate::ui::symbols::SEP,
+            crate::ui::symbols::SEP
+        )
+    };
+    let width = usize::from(width);
+    let pad = width.saturating_sub(super::wrap::display_width(&label)) / 2;
+    Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+    ])
 }
 
 /// Dim centered `▾ N lines below` indicator shown while follow is
@@ -798,6 +840,74 @@ mod tests {
         // Selection already visible: no movement.
         scroll.reveal(85);
         assert!(scroll.is_following());
+    }
+
+    #[test]
+    fn find_jumps_to_newest_match_and_n_walks_older() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        for i in 0..100 {
+            screen.apply(UiEvent::Notice(format!("row {i}")));
+            if i % 10 == 0 {
+                screen.apply(UiEvent::Notice(format!("needle {i}")));
+            }
+        }
+        // Warm the wrap cache (search runs over it).
+        let _ = compose_frame(&mut screen, Size::new(80, 24));
+
+        let total = screen.start_search("NEEDLE").expect("search active");
+        assert_eq!(total, 10, "case-insensitive matches");
+        assert!(screen.scrollback_focus, "/find focuses the scrollback");
+        let state = screen.search.as_ref().expect("state");
+        assert_eq!(state.position, 10, "starts at the newest match");
+        let newest = state.line.expect("line");
+
+        // n walks older, clamping at the first match.
+        assert!(screen.search_step(-1));
+        assert!(screen.search.as_ref().unwrap().line.unwrap() < newest);
+        for _ in 0..20 {
+            let _ = screen.search_step(-1);
+        }
+        assert_eq!(screen.search.as_ref().unwrap().position, 1);
+        // N walks newer, clamping at the newest.
+        for _ in 0..20 {
+            let _ = screen.search_step(1);
+        }
+        assert_eq!(screen.search.as_ref().unwrap().position, 10);
+
+        // The compose shows the indicator and reveals + highlights the match.
+        screen.search_step(0);
+        let composed = compose_frame(&mut screen, Size::new(80, 24));
+        let rows = frame_rows(&composed.lines, 80, 24);
+        let body = rows[2..].join("\n");
+        assert!(body.contains("10/10"), "indicator shows position: {body}");
+        assert!(
+            composed.lines.iter().any(|line| line
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))),
+            "current match carries the surface fill"
+        );
+
+        // Empty query clears the search and the indicator.
+        assert!(screen.start_search("  ").is_none());
+        assert!(screen.search.is_none());
+        let composed = compose_frame(&mut screen, Size::new(80, 24));
+        let all = frame_rows(&composed.lines, 80, 24).join("\n");
+        assert!(!all.contains("find"), "indicator cleared: {all}");
+    }
+
+    #[test]
+    fn search_with_no_matches_reports_zero_and_jumps_nowhere() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.apply(UiEvent::Notice("hello".to_string()));
+        let _ = compose_frame(&mut screen, Size::new(80, 24));
+        assert_eq!(screen.start_search("absent"), Some(0));
+        let state = screen.search.as_ref().expect("state");
+        assert_eq!(state.total, 0);
+        assert!(state.line.is_none());
+        assert!(!screen.search_step(-1));
     }
 
     #[test]
