@@ -949,6 +949,52 @@ requirements must be specified before auto-commit, worktree, GitHub, or CI featu
 are implemented. [Satisfied for the #261 slice by ADR-0028 (2026-07-03); still
 binding for auto-commit, worktree, GitHub, and CI slices.]
 
+## Milestone 6 — Alt-Screen Pager TUI
+
+**Goal:** make the rich TUI a full-frame alternate-screen pager — a
+viewport-pinned session bar, an Iris-owned scrollback pane with follow mode
+and in-app scrolling, and mouse/clipboard behavior that degrades honestly —
+while keeping the inline renderer as an automatic fallback.
+
+**Design is specified and accepted — do not re-derive it.**
+[ADR-0029](adr/0029-adopt-alt-screen-pager-tui.md) settles the screen-mode
+policy (`alt_screen = auto|always|never` + `--no-alt-screen`, multiplexer
+auto-degrade), the render backend (stock ratatui `Terminal` full frames from
+the existing `Screen` state), the fixed-region layout (session bar /
+scrollback pane / working indicator / composer), the focus model (Tab toggles
+panes; typing returns to the prompt; Esc is never nav), the mouse-capture
+runtime toggle, and the clipboard ladder (native → OSC 52 → tmux buffer).
+Binary-verified reference behavior: `.iris-reference/grok-pager-dossier.md`.
+
+Slices, in order (each lands green through the gate):
+
+- **Backend seam + screen-mode policy** — a `RenderMode` seam over the
+  existing `TuiUi`/`TerminalSurface`; alt-screen enter/leave lifecycle with
+  panic-safe restore; `alt_screen` config + `--no-alt-screen`; multiplexer
+  detection and degradation notices. Inline mode is bit-for-bit unchanged.
+- **Full-frame pager render** — render the logical document (session bar
+  pinned, transcript slice, working indicator, composer) into ratatui frames;
+  synchronized output; resize as re-render. Golden-frame tests on a
+  `TestBackend`.
+- **Scroll state + follow mode** — Iris-owned scroll offset; PageUp/PageDown,
+  line scroll, ends; follow-by-overscroll re-engage; follow indicator;
+  per-row layout cache with visible-range-only rendering (perf gate: 10k-row
+  transcript renders O(viewport)).
+- **Mouse + clipboard** — wheel scrolling under mouse capture; the runtime
+  mouse-reporting toggle (key + slash command) restoring native select/copy;
+  OSC 52 copy with tmux fallbacks; `/copy` unchanged.
+- **Capability doctor + key fallbacks** — a `/terminal-setup`-style check
+  (multiplexer, OSC 52, kitty keyboard protocol, Shift+Enter) with exact fix
+  lines and per-terminal keybinding fallbacks.
+- **Pager-only affordances (follow-ups, each optional)** — scrollback focus +
+  keyboard entry selection/folding, transcript search, sticky user-prompt
+  headers, block fullscreen viewer, in-app text selection.
+
+Gate: the pager must never lose transcript content that inline mode would
+have kept (the retained `Screen` state is the source of truth); every slice
+keeps `--plain` and inline fallback working; no pane-rendering change ships
+without `TestBackend` frame assertions.
+
 ## Architecture work — Tier-Boundary Enforcement
 
 **Goal:** make the code match the three-tier ownership split in
