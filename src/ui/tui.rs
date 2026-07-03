@@ -338,8 +338,8 @@ impl TuiUi {
         // Pager mode: full frame from the same logical state, stock ratatui
         // diffing. Inline mode: the Iris-owned scrollback-append surface.
         if let Some(pager) = self.pager.as_mut() {
-            let frame = pager::compose_frame(&mut self.screen, size);
-            pager.render(&frame)?;
+            let screen = &mut self.screen;
+            pager.render_with(|frame_size| pager::compose_frame(screen, frame_size))?;
             return Ok(());
         }
         let document = render_document_with_hints(&mut self.screen, size);

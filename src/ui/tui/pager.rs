@@ -147,18 +147,37 @@ impl PagerSurface {
     }
 
     /// Draw one full frame inside a `?2026` synchronized-update block. The
-    /// fullscreen viewport autoresizes on each draw, so a terminal resize is
-    /// just the next render.
-    pub(crate) fn render(&mut self, lines: &[Line<'static>]) -> io::Result<()> {
+    /// frame is composed INSIDE the draw closure from the autoresized
+    /// `frame.area()`, so slicing and rendering always agree on the viewport
+    /// (a resize between a size query and the draw cannot unpin the composer).
+    pub(crate) fn render_with(
+        &mut self,
+        compose: impl FnOnce(Size) -> ComposedFrame,
+    ) -> io::Result<()> {
         execute!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let mut cursor = None;
         let drawn = self
             .terminal
-            .draw(|frame| render_frame(frame, lines))
+            .draw(|frame| {
+                let area = frame.area();
+                let composed = compose(Size::new(area.width, area.height));
+                render_frame(frame, &composed.lines);
+                cursor = composed.cursor;
+            })
             .map(|_| ());
+        // Position (never show) the hardware cursor at the composer's marker
+        // for IME candidate-window placement, mirroring the inline surface's
+        // `position_hardware_cursor` (the cursor stays hidden; Iris draws its
+        // own reversed block cursor).
+        let positioned = match cursor {
+            Some((column, row)) => queue!(self.terminal.backend_mut(), MoveTo(column, row))
+                .and_then(|()| self.terminal.backend_mut().flush()),
+            None => Ok(()),
+        };
         // Always close the sync block, even when the draw failed, so an error
         // can never leave the terminal buffering forever.
         let ended = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
-        drawn.and(ended)
+        drawn.and(positioned).and(ended)
     }
 
     /// Leave the alternate screen (idempotent; also covered by `Drop`).
@@ -167,12 +186,20 @@ impl PagerSurface {
     }
 }
 
+/// One composed pager frame: the viewport lines plus the hardware-cursor
+/// position (column, row) extracted from the composer's zero-width marker,
+/// when the composer is focused.
+pub(super) struct ComposedFrame {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) cursor: Option<(u16, u16)>,
+}
+
 /// Compose the pager frame for `size` from the same logical document the
 /// inline surface renders: session bar pinned at the top, bottom-anchored
 /// transcript tail (follow view), working indicator + composer pinned at the
 /// bottom. Slicing the shared document -- rather than re-composing regions --
 /// guarantees both modes render identical logical state (ADR-0029).
-pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> Vec<Line<'static>> {
+pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     let document = render_document_with_hints(screen, size);
     let height = usize::from(size.height);
     let mut frame = if document.lines.len() <= height {
@@ -188,20 +215,18 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> Vec<Line<'static
         frame.extend_from_slice(&document.lines[start..]);
         frame
     };
-    // The zero-width hardware-cursor marker is stripped by the inline
-    // surface's line renderer; the pager writes cells directly, so strip it
-    // here (bounded scan: at most one viewport of lines).
-    for line in &mut frame {
-        if line
-            .spans
-            .iter()
-            .any(|span| span.content.as_ref() == crate::ui::terminal_surface::CURSOR_MARKER)
-        {
-            line.spans
-                .retain(|span| span.content.as_ref() != crate::ui::terminal_surface::CURSOR_MARKER);
-        }
+    // The zero-width hardware-cursor marker is located and stripped here (the
+    // inline surface does this in its line renderer); its position drives IME
+    // candidate-window placement. Bounded scan: at most one viewport of lines.
+    let marker = crate::ui::terminal_surface::CURSOR_MARKER;
+    let cursor = super::component::take_marker_position(&mut frame, marker)
+        .map(|(row, column)| (column.min(usize::from(u16::MAX)) as u16, row as u16));
+    // Defensive: strip any further markers so none can reach the cells.
+    while super::component::take_marker_position(&mut frame, marker).is_some() {}
+    ComposedFrame {
+        lines: frame,
+        cursor,
     }
-    frame
 }
 
 /// Place composed lines into the frame buffer, top-aligned, truncated to the
@@ -263,7 +288,7 @@ mod tests {
             screen.apply(UiEvent::Notice(format!("row {i}")));
         }
         let size = Size::new(80, 24);
-        let frame = compose_frame(&mut screen, size);
+        let frame = compose_frame(&mut screen, size).lines;
         assert_eq!(frame.len(), 24, "frame is exactly the viewport height");
         let rows = frame_rows(&frame, 80, 24);
         assert!(
@@ -281,8 +306,18 @@ mod tests {
     fn composer_chrome_is_pinned_at_the_frame_bottom() {
         let mut screen = footer_screen();
         screen.apply(UiEvent::Notice("hello".to_string()));
-        let frame = compose_frame(&mut screen, Size::new(60, 20));
+        let composed = compose_frame(&mut screen, Size::new(60, 20));
+        // The focused composer emits the hardware-cursor marker: it must be
+        // stripped from the cells and surfaced as a cursor position on the
+        // editor input row.
+        let cursor = composed.cursor.expect("focused composer yields a cursor");
+        assert_eq!(cursor.1, 16, "cursor row is the editor input row");
+        let frame = composed.lines;
         let rows = frame_rows(&frame, 60, 20);
+        assert!(
+            !rows.iter().any(|row| row.contains("iris:c")),
+            "cursor marker never reaches the cells"
+        );
         // Bottom padding row is blank; the statusline sits right above it and
         // carries the approval-policy segment.
         assert_eq!(rows[19].trim(), "");
@@ -297,7 +332,7 @@ mod tests {
     fn start_page_renders_inside_the_pager_frame() {
         let mut screen = footer_screen();
         screen.show_start_page();
-        let frame = compose_frame(&mut screen, Size::new(80, 30));
+        let frame = compose_frame(&mut screen, Size::new(80, 30)).lines;
         assert_eq!(frame.len(), 30);
         let rows = frame_rows(&frame, 80, 30);
         let all = rows.join("\n");
@@ -315,7 +350,7 @@ mod tests {
                 for i in 0..50 {
                     screen.apply(UiEvent::Notice(format!("line {i}")));
                 }
-                let frame = compose_frame(&mut screen, Size::new(width, height));
+                let frame = compose_frame(&mut screen, Size::new(width, height)).lines;
                 assert!(
                     frame.len() <= usize::from(height),
                     "{width}x{height}: frame must fit the viewport"
