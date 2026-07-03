@@ -98,6 +98,12 @@ logical `Screen` state; the design language is identical in both.
 | **Pager** (rich default once stable) | Alternate screen, full-frame ratatui `Terminal`, synchronized updates | Literally viewport-pinned (rows 0–1) | Iris-owned scroll offset; native scrollback unused |
 | **Inline** (automatic fallback) | Scrollback-append terminal surface (ADR-0006) | Top of the rendered document; scrolls with history | Native terminal scrollback |
 
+In pager mode the mouse is captured by default (wheel scrolls the Iris-owned
+scrollback); Ctrl+T or `/mouse` toggles capture off to restore
+terminal-native select/copy, and the composer statusline shows a dim
+`○ mouse off` hint while off. Copy paths: native clipboard tools, then
+OSC 52 (`/copy`).
+
 Mode policy: `tui.altScreen = "auto" | "always" | "never"` in settings,
 `--no-alt-screen`, `IRIS_NO_ALT_SCREEN=1`. `auto` selects the pager on plain
 terminals and normal tmux; tmux control mode, Zellij, `TERM=dumb`, and

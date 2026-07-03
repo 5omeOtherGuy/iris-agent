@@ -115,6 +115,9 @@ pub(crate) struct TuiSettings {
     /// Parsed by `ui::screen_mode`; an invalid value is reported and the
     /// built-in default applies.
     pub(crate) alt_screen: Option<String>,
+    /// Mouse-wheel scroll step in lines for the pager (default 3, clamped to
+    /// `[1, 100]`).
+    pub(crate) scroll_speed: Option<u16>,
 }
 
 /// Raw per-project verification config (issue #265). Both fields optional: a
@@ -248,10 +251,9 @@ impl Settings {
         }
     }
 
-    /// Raw `tui.altScreen` value, if configured. Parsed (and validated loudly)
-    /// by `ui::screen_mode::resolve_for_startup`.
-    pub(crate) fn alt_screen_value(&self) -> Option<&str> {
-        self.tui.as_ref()?.alt_screen.as_deref()
+    /// The `tui` settings block, if configured.
+    pub(crate) fn tui_settings(&self) -> Option<&TuiSettings> {
+        self.tui.as_ref()
     }
 
     /// Resolved verification config, or `None` when no `verify` block is present
@@ -508,12 +510,22 @@ mod tests {
         fs::write(&global, r#"{ "tui": { "altScreen": "never" } }"#).unwrap();
         fs::write(&project, r#"{ "tui": { "altScreen": "auto" } }"#).unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
-        assert_eq!(settings.alt_screen_value(), Some("auto"));
+        assert_eq!(
+            settings
+                .tui_settings()
+                .and_then(|t| t.alt_screen.as_deref()),
+            Some("auto")
+        );
 
         // Global-only config still surfaces, and an absent block yields None.
         let only_global = Settings::load_from(Some(&global), &dir.path.join("nope.json")).unwrap();
-        assert_eq!(only_global.alt_screen_value(), Some("never"));
-        assert_eq!(Settings::default().alt_screen_value(), None);
+        assert_eq!(
+            only_global
+                .tui_settings()
+                .and_then(|t| t.alt_screen.as_deref()),
+            Some("never")
+        );
+        assert!(Settings::default().tui_settings().is_none());
     }
 
     #[test]

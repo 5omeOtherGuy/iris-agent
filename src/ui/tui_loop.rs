@@ -690,6 +690,20 @@ fn route_command<P: ChatProvider>(
             }
             Ok(RouteOutcome::Consumed)
         }
+        "/mouse" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            let notice = if tui.screen.pager_active {
+                if tui.screen.toggle_mouse() {
+                    "mouse reporting on \u{2014} wheel scrolls the transcript (Ctrl+T toggles)"
+                } else {
+                    "mouse reporting off \u{2014} terminal-native select/copy active (Ctrl+T re-enables)"
+                }
+            } else {
+                "mouse capture is a pager-mode feature; the inline renderer never captures the mouse"
+            };
+            apply_notices(tui, vec![notice.to_string()]);
+            Ok(RouteOutcome::Consumed)
+        }
         "/diff" if rest.is_empty() => {
             // The final task diff (issue #264): render the net diff on demand
             // through the diff colorizer at this safe boundary.
@@ -1404,8 +1418,16 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             screen.sync_palette();
             return IdleKey::Continue;
         }
-        // Mouse capture is disabled so the terminal owns scroll/select/copy of
-        // the native scrollback; no Mouse events arrive here.
+        // Pager mode captures the mouse: the wheel scrolls the Iris-owned
+        // scrollback. Inline mode never enables capture, so no Mouse events
+        // arrive there and the terminal owns scroll/select/copy natively.
+        Event::Mouse(mouse) => {
+            return if pager_wheel(screen, &mouse) {
+                IdleKey::Continue
+            } else {
+                IdleKey::Ignore
+            };
+        }
         Event::Resize(..) => return IdleKey::Continue,
         // Focus reports gate the spinner's tick redraws; a regain redraws once
         // so a pane switched back to is visually current.
@@ -1509,6 +1531,10 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             }
             KeyCode::Char('p') | KeyCode::Char('P') if ctrl => {
                 return IdleKey::CycleModel(!shift);
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') if ctrl && screen.pager_active => {
+                screen.toggle_mouse();
+                return IdleKey::Continue;
             }
             KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
                 screen.toggle_latest_panel();
@@ -1699,6 +1725,27 @@ fn resolve_input_eof(
 /// While a tool is awaiting approval the composer is frozen and only the
 /// approval keys (plus Ctrl-C/-O) act, so a `y`/`n` can't be both an answer and
 /// typed text. Returns whether a redraw is needed.
+/// Pager-mode wheel scrolling: ±`scroll_speed` lines per wheel tick. Only the
+/// wheel is consumed; clicks/drags are ignored (in-app selection is a later
+/// slice -- the Ctrl+T toggle restores terminal-native selection until then).
+fn pager_wheel(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
+    if !screen.pager_active {
+        return false;
+    }
+    let step = usize::from(screen.scroll_speed.max(1));
+    match mouse.kind {
+        ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+            screen.scroll.scroll_up(step);
+            true
+        }
+        ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+            screen.scroll.scroll_down(step);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Pager-mode scrollback navigation (ADR-0029). Consumes the key when it
 /// scrolled: PageUp/PageDown page, Alt+Up/Alt+Down scroll one line (Ctrl+J/K
 /// stay editor kill-ring keys), and Home/End jump to the ends -- but only
@@ -1733,8 +1780,10 @@ fn handle_running_event(
             insert_paste(screen, &text);
             true
         }
-        // Mouse capture is off; the terminal scrolls its own scrollback. Resize
-        // still triggers a redraw of the terminal surface.
+        // Pager mode: wheel scrolls the Iris-owned scrollback while a turn
+        // runs (follow mode disengages/re-engages as with the keys).
+        Event::Mouse(mouse) => pager_wheel(screen, &mouse),
+        // Resize still triggers a redraw of the terminal surface.
         Event::Resize(..) => true,
         // Focus reports pause/resume the spinner's tick redraws; a regain
         // redraws once to catch the frozen animation and elapsed time up.
@@ -1749,6 +1798,13 @@ fn handle_running_event(
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
                 screen.toggle_latest_panel();
+                return true;
+            }
+            if ctrl
+                && screen.pager_active
+                && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+            {
+                screen.toggle_mouse();
                 return true;
             }
             if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
@@ -1985,6 +2041,61 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn pager_wheel_scrolls_by_scroll_speed_and_gates_on_pager_mode() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        fn wheel(kind: MouseEventKind) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+        let mut screen = Screen::new();
+        // Inline mode never consumes mouse events.
+        assert!(!pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
+
+        screen.pager_active = true;
+        screen.scroll.sync(100, 20);
+        assert!(pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
+        assert!(!screen.scroll.is_following());
+        // Default step is 3 lines per tick (max_top 80 -> 77).
+        screen.scroll_speed = 5;
+        assert!(pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
+        // Clicks/drags are ignored until in-app selection lands.
+        assert!(!pager_wheel(
+            &mut screen,
+            &wheel(MouseEventKind::Down(MouseButton::Left))
+        ));
+        // Wheel-down past the bottom re-engages follow.
+        for _ in 0..100 {
+            let _ = pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollDown));
+        }
+        assert!(screen.scroll.is_following());
+    }
+
+    #[test]
+    fn ctrl_t_toggles_mouse_capture_only_in_pager_mode() {
+        let mut screen = Screen::new();
+        assert!(screen.mouse_capture);
+        // Inline mode: Ctrl+T falls through (not consumed as a toggle).
+        let outcome = handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(outcome, IdleKey::Ignore | IdleKey::Continue));
+        assert!(screen.mouse_capture, "inline mode never toggles capture");
+
+        screen.pager_active = true;
+        let outcome = handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(outcome, IdleKey::Continue));
+        assert!(!screen.mouse_capture);
     }
 
     #[test]

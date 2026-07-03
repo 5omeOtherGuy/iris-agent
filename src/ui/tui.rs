@@ -265,6 +265,10 @@ pub(crate) struct TuiUi {
     /// popped exactly once on shutdown/error and never on terminals that did not
     /// negotiate the protocol.
     keyboard_enhanced: bool,
+    /// Mouse-capture state actually applied to the terminal (pager mode only).
+    /// `draw` syncs it to `Screen::mouse_capture` so the Ctrl+T / `/mouse`
+    /// toggle takes effect on the next frame.
+    mouse_applied: bool,
 }
 
 impl TuiUi {
@@ -325,12 +329,19 @@ impl TuiUi {
         crate::telemetry::set_tui_active(true);
         let mut screen = Screen::new();
         screen.pager_active = pager.is_some();
+        // Mouse capture is on by default in pager mode (wheel scrolls the
+        // Iris-owned scrollback); best-effort -- a failure leaves it off and
+        // the statusline shows the state. Inline mode never captures.
+        let mouse_applied =
+            pager.is_some() && pager::set_mouse_capture(&mut io::stdout(), true).is_ok();
+        screen.mouse_capture = mouse_applied;
         Ok(Self {
             surface: TerminalSurface::new(stdout),
             pager,
             screen,
             active: true,
             keyboard_enhanced,
+            mouse_applied,
         })
     }
 
@@ -340,6 +351,14 @@ impl TuiUi {
         // Pager mode: full frame from the same logical state, stock ratatui
         // diffing. Inline mode: the Iris-owned scrollback-append surface.
         if let Some(pager) = self.pager.as_mut() {
+            // Sync the terminal's mouse capture to the toggled desired state
+            // before the frame, so `/mouse` / Ctrl+T take effect immediately.
+            if self.screen.mouse_capture != self.mouse_applied
+                && pager::set_mouse_capture(self.surface.writer_mut(), self.screen.mouse_capture)
+                    .is_ok()
+            {
+                self.mouse_applied = self.screen.mouse_capture;
+            }
             let screen = &mut self.screen;
             pager.render_with(|frame_size| pager::compose_frame(screen, frame_size))?;
             return Ok(());
@@ -384,6 +403,12 @@ impl TuiUi {
         if self.active {
             match self.pager.take() {
                 Some(mut pager) => {
+                    // Drop mouse capture before leaving the alt screen so the
+                    // shell never receives mouse escapes.
+                    if self.mouse_applied {
+                        let _ = pager::set_mouse_capture(self.surface.writer_mut(), false);
+                        self.mouse_applied = false;
+                    }
                     // Pager mode: reset render-toggled terminal modes (autowrap,
                     // synchronized output -- they are terminal-global, not
                     // per-screen) while still inside the alt screen, then leave;
