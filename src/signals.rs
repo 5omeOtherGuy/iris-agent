@@ -168,6 +168,17 @@ pub(crate) fn alt_screen_active() -> bool {
     ALT_SCREEN_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Serialize (and reset) the process-global alt-screen flag for tests. Every
+/// test in any module that toggles the flag must hold this guard; the flag is
+/// cleared on acquisition so a panicked predecessor cannot leak state.
+#[cfg(test)]
+pub(crate) fn alt_screen_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    ALT_SCREEN_ACTIVE.store(false, Ordering::Relaxed);
+    guard
+}
+
 /// Atomically claim the pending alt-screen leave: returns `true` exactly once
 /// per enter, so racing restore paths (Drop, panic hook, signal) emit exactly
 /// one leave sequence.

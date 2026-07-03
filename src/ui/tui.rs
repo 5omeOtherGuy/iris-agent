@@ -278,6 +278,11 @@ impl TuiUi {
         // handler can restore the tty even though Drop will not run then.
         crate::signals::save_termios_for_force_quit();
         enable_raw_mode()?;
+        // Arm the force-quit emergency restore BEFORE any terminal-owned state
+        // beyond raw mode is entered, so a repeat Ctrl-C in the setup window
+        // (paste/focus flags, keyboard protocol, alt screen) still restores the
+        // tty. Every error unwind below disarms it again.
+        crate::signals::enable_terminal_restore_on_force_quit();
         let mut stdout = io::stdout();
         // Probe Kitty keyboard-protocol support before negotiating so the push is
         // gated and the matching pop is conditional. A probe error is treated as
@@ -290,6 +295,7 @@ impl TuiUi {
         if let Err(error) = execute!(stdout, EnableBracketedPaste, EnableFocusChange, Hide) {
             let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
             let _ = disable_raw_mode();
+            crate::signals::disable_terminal_restore_on_force_quit();
             return Err(error.into());
         }
         // Best-effort: a failure to negotiate the protocol must not abort startup.
@@ -310,12 +316,12 @@ impl TuiUi {
                         let _ = disable_keyboard_enhancement(&mut stdout, keyboard_enhanced);
                         let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
                         let _ = disable_raw_mode();
+                        crate::signals::disable_terminal_restore_on_force_quit();
                         return Err(error.into());
                     }
                 }
             }
         };
-        crate::signals::enable_terminal_restore_on_force_quit();
         crate::telemetry::set_tui_active(true);
         Ok(Self {
             surface: TerminalSurface::new(stdout),
@@ -369,9 +375,13 @@ impl TuiUi {
         if self.active {
             match self.pager.take() {
                 Some(mut pager) => {
-                    // Pager mode: leaving the alt screen restores the user's
-                    // pre-session normal screen; there is no transcript replay
-                    // (the alt screen owns no scrollback to hand back).
+                    // Pager mode: reset render-toggled terminal modes (autowrap,
+                    // synchronized output -- they are terminal-global, not
+                    // per-screen) while still inside the alt screen, then leave;
+                    // the terminal restores the pre-session normal screen, so
+                    // there is no transcript replay (the alt screen owns no
+                    // scrollback to hand back).
+                    let _ = self.surface.cleanup_modes();
                     let _ = pager.leave();
                 }
                 None => {

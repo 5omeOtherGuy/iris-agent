@@ -34,14 +34,24 @@ impl<W: Write> PagerSurface<W> {
     /// active flag is set so the panic hook and the force-quit signal path
     /// know a leave is owed.
     pub(crate) fn enter(mut writer: W) -> io::Result<Self> {
-        queue!(
+        // Mark active BEFORE writing: a partial write/flush failure may still
+        // have delivered `?1049h`, so a leave is owed from the first byte. On
+        // failure, best-effort leave immediately and clear the pending flag.
+        crate::signals::set_alt_screen_active(true);
+        let entered = queue!(
             writer,
             EnterAlternateScreen,
             Clear(ClearType::All),
             MoveTo(0, 0)
-        )?;
-        writer.flush()?;
-        crate::signals::set_alt_screen_active(true);
+        )
+        .and_then(|()| writer.flush());
+        if let Err(error) = entered {
+            if crate::signals::take_alt_screen_active() {
+                let _ = queue!(writer, LeaveAlternateScreen);
+                let _ = writer.flush();
+            }
+            return Err(error);
+        }
         Ok(Self {
             writer,
             active: true,
@@ -102,16 +112,12 @@ fn emergency_restore<W: Write>(writer: &mut W) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// The alt-screen active flag is process-global; serialize the tests that
-    /// toggle it so parallel test threads cannot interleave.
-    static FLAG_LOCK: Mutex<()> = Mutex::new(());
-
+    /// The alt-screen active flag is process-global; the shared guard in
+    /// `signals` serializes every test (in any module) that toggles it and
+    /// resets the flag to inactive on acquisition.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        FLAG_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::signals::alt_screen_test_guard()
     }
 
     #[test]

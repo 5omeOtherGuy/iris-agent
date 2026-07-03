@@ -247,6 +247,16 @@ impl<W: Write> TerminalSurface<W> {
         Ok(RenderStats { kind })
     }
 
+    /// Defensive reset of the terminal modes rendering toggles (autowrap,
+    /// synchronized output) without the finish-path cursor repositioning.
+    /// Pager mode calls this before leaving the alternate screen so an
+    /// interrupted render can never leak those global modes onto the restored
+    /// normal screen.
+    pub(crate) fn cleanup_modes(&mut self) -> io::Result<()> {
+        write!(self.writer, "{ENABLE_AUTOWRAP}{END_SYNC}")?;
+        self.writer.flush()
+    }
+
     pub(crate) fn finish(&mut self) -> io::Result<()> {
         // Defensive cleanup for an interrupted prior render: make sure terminal
         // modes Iris toggles during drawing are restored even on the normal
