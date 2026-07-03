@@ -882,16 +882,24 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
 
 - Dirty-tree detection and unrelated-change safety
   ([#262](https://github.com/5omeOtherGuy/iris-agent/issues/262)) — gates the rest. Done.
+  Baseline + attribution ledger + choke-point gate: edit/write route a
+  pre-existing dirty target through per-file, per-task approval; bash is
+  detect-and-restore around a protected-set snapshot; non-git/`.jj` degrade with
+  an honest notice.
 - Task-scoped checkpoint/rollback
-  ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — in review. Op-log-shaped
+  ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — Done. Op-log-shaped
   git checkpoint chain under `refs/iris/checkpoints/<task-id>/` (plumbing only,
   temporary index), auto-checkpoint over the unsettled diff, rollback of ledger
   paths + user index, settlement GC (keep last N), crash-recovery reconciliation,
   30-day expiry, non-git content-snapshot fallback, and `/rollback`/`/accept`/
-  `/checkpoint` slash commands. Seam left for #264: net-diff over the chain with a
-  source-tree parameter.
+  `/checkpoint` slash commands.
 - Final diff summary as the task deliverable
-  ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)).
+  ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)) — Done.
+  Ledger-scoped net diff (one hunk set per file, pre-task baseline → current,
+  scoped to Iris-authored paths so user changes never appear), surfaced by the
+  `/diff` command and the accept-flow summary; fails closed on an unreadable
+  checkpoint rather than showing an empty diff; keeps a source-tree parameter for
+  a later worktree-apply review (#267/#271).
 - Verification loop (moved from Milestone 1): run the project's test/lint/build
   command, feed failures back, retry bounded; external-signal driven, not an
   LLM self-critique pass
@@ -905,7 +913,9 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   verification never settles the task, so a failed loop stays rollbackable
   (ADR-0028).
 - Worktree isolation slice — design ADR only
-  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267)). Settled
+  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267)). ADR-0029
+  proposed (PR [#274](https://github.com/5omeOtherGuy/iris-agent/pull/274)); the
+  implementation (#271) stays gated on its acceptance. Settled
   framing: worktree isolation is Tier 0 of the ADR-0028 guarantee model; apply
   is a settlement event that mutates the parent workspace through the #262
   choke point; the final diff engine (#264) doubles as the apply review
@@ -928,7 +938,11 @@ Later slices (not in #261):
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user
-changes.
+changes. Proven end to end by `epic_261_acceptance_end_to_end` (fake-provider
+task over a scratch repo: a clean-file edit + a create leave a dirty tracked file
+and an untracked file byte-identical, the net diff is scoped to Iris's paths,
+rollback restores Iris's paths byte-identically, and `refs/iris/` is empty after
+settlement).
 
 Gate before Git automation: dirty-tree behavior, rollback semantics, and approval
 requirements must be specified before auto-commit, worktree, GitHub, or CI features
