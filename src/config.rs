@@ -92,6 +92,38 @@ pub(crate) struct Settings {
     /// still resolved through the existing top-level defaults; this object holds
     /// capability/display flags for the configured custom endpoint.
     pub(crate) open_ai_compatible: Option<OpenAiCompatibleSettings>,
+    /// Post-change verification command config (issue #265). Project-safe (a
+    /// project may set it) because a verification command is model-independent,
+    /// user-authored, and still runs as a NORMAL shell execution under the
+    /// unchanged approval gate: bash opts out of persistent allow-always
+    /// (ADR-0010), so it re-prompts each run. A cloned repo therefore cannot use
+    /// it to widen permissions or redirect anything -- unlike provider/base-url,
+    /// it grants no new capability, so project override is safe here. The mere
+    /// presence of this block engages the feature; an absent block leaves the
+    /// feature off (no post-change checks, no reporting).
+    pub(crate) verify: Option<VerifySettings>,
+}
+
+/// Raw per-project verification config (issue #265). Both fields optional: a
+/// `verify` block with no `command` engages the feature but reports
+/// skipped-unconfigured, and an absent `maxAttempts` falls back to the built-in
+/// default. Resolved into a [`VerificationConfig`] by [`Settings::verification`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VerifySettings {
+    /// Shell command run after a task's changes to check the project.
+    pub(crate) command: Option<String>,
+    /// Maximum verification runs before giving up (clamped to a sane cap).
+    pub(crate) max_attempts: Option<u32>,
+}
+
+/// Resolved verification config the harness runs against (issue #265). `command`
+/// is `None` when the `verify` block is present but sets no (non-empty) command,
+/// which the loop reports as skipped-unconfigured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerificationConfig {
+    pub(crate) command: Option<String>,
+    pub(crate) max_attempts: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -127,6 +159,14 @@ pub(crate) struct RetrySettings {
 /// that fits common model context windows; it is only surfaced through
 /// [`Settings::context_token_budget`] and triggers nothing yet.
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u64 = 128_000;
+
+/// Default verification attempts when a `verify` block sets no `maxAttempts`.
+/// One initial run plus a couple of fix-and-retry rounds is enough to catch and
+/// correct a straightforward failure without a long retry chain.
+const DEFAULT_VERIFY_MAX_ATTEMPTS: u32 = 3;
+/// Hard ceiling on verification attempts, so a project file cannot request an
+/// unbounded retry chain of effectful shell runs.
+const MAX_VERIFY_MAX_ATTEMPTS: u32 = 10;
 
 impl Settings {
     /// Load and merge the global and project settings files for `cwd`.
@@ -183,7 +223,32 @@ impl Settings {
             // base URL, so a cloned project cannot change how a secret-bearing
             // endpoint is called.
             open_ai_compatible: self.open_ai_compatible,
+            // A verification command grants no new capability (it runs under the
+            // unchanged approval gate; bash re-prompts every run per ADR-0010),
+            // so a cloned project may set it like the model or round-trip cap;
+            // project value wins, else global.
+            verify: project.verify.or(self.verify),
         }
+    }
+
+    /// Resolved verification config, or `None` when no `verify` block is present
+    /// (feature off). A present block engages the feature even with no command
+    /// (reported as skipped-unconfigured). `max_attempts` is clamped to
+    /// `[1, MAX_VERIFY_MAX_ATTEMPTS]` so a project file cannot request an
+    /// unbounded or zero-run chain.
+    pub(crate) fn verification(&self) -> Option<VerificationConfig> {
+        self.verify.as_ref().map(|verify| VerificationConfig {
+            command: verify
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(str::to_owned),
+            max_attempts: verify
+                .max_attempts
+                .unwrap_or(DEFAULT_VERIFY_MAX_ATTEMPTS)
+                .clamp(1, MAX_VERIFY_MAX_ATTEMPTS),
+        })
     }
 
     /// Configured tool round-trip soft cap, or `None` (unbounded) when unset.
@@ -553,6 +618,63 @@ mod tests {
         assert_eq!(retry.max_retries, Some(5));
         assert_eq!(retry.base_delay_ms, Some(1000));
         assert_eq!(retry.max_delay_ms, Some(30000));
+    }
+
+    #[test]
+    fn verification_absent_block_is_feature_off() {
+        let dir = temp_dir();
+        let settings = Settings::load_from(
+            Some(&dir.path.join("none.json")),
+            &dir.path.join("none.json"),
+        )
+        .unwrap();
+        assert_eq!(settings.verification(), None);
+    }
+
+    #[test]
+    fn verification_present_block_engages_and_clamps() {
+        let dir = temp_dir();
+        // A project may set the verify command (it grants no new capability).
+        let project = dir.path.join("project.json");
+        fs::write(
+            &project,
+            r#"{ "verify": { "command": "  cargo test  ", "maxAttempts": 99 } }"#,
+        )
+        .unwrap();
+        let configured = Settings::load_from(None, &project).unwrap().verification();
+        assert_eq!(
+            configured,
+            Some(VerificationConfig {
+                command: Some("cargo test".to_string()),
+                max_attempts: MAX_VERIFY_MAX_ATTEMPTS,
+            })
+        );
+
+        // Present block, empty command -> engaged but no command (skipped path);
+        // absent maxAttempts -> the built-in default.
+        let empty = dir.path.join("empty.json");
+        fs::write(&empty, r#"{ "verify": { "command": "   " } }"#).unwrap();
+        assert_eq!(
+            Settings::load_from(None, &empty).unwrap().verification(),
+            Some(VerificationConfig {
+                command: None,
+                max_attempts: DEFAULT_VERIFY_MAX_ATTEMPTS,
+            })
+        );
+    }
+
+    #[test]
+    fn verification_project_overrides_global() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "verify": { "command": "global-check" } }"#).unwrap();
+        fs::write(&project, r#"{ "verify": { "command": "project-check" } }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(
+            settings.verification().unwrap().command.as_deref(),
+            Some("project-check")
+        );
     }
 
     #[test]

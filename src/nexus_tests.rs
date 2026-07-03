@@ -5461,3 +5461,345 @@ fn swap_session_switches_log_resets_context_and_cursor() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Post-change verification loop (issue #265): after a turn that changed files,
+// run a configured command as a NORMAL gated shell execution and iterate on
+// failure. Fake-provider loop tests over a real Harness + scratch git repo.
+// ---------------------------------------------------------------------------
+
+use crate::config::VerificationConfig;
+
+/// Init a scratch git repo (so the dirty-tree guard runs in git mode and a
+/// failed verification leaves rollback points), returning the workspace.
+fn verify_git_workspace() -> Result<TestWorkspace> {
+    let workspace = test_workspace()?;
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    fs::write(workspace.path.join("committed.txt"), "base\n")?;
+    git(&["add", "committed.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    Ok(workspace)
+}
+
+fn verify_harness(
+    provider: FakeProvider,
+    workspace: &Path,
+    command: Option<&str>,
+    max_attempts: u32,
+) -> Harness<FakeProvider> {
+    let mut harness = test_harness(provider, workspace, crate::tools::built_in_tools());
+    harness.set_verification(Some(VerificationConfig {
+        command: command.map(str::to_string),
+        max_attempts,
+    }));
+    harness
+}
+
+/// The verification outcomes emitted, in order.
+fn verification_outcomes(frontend: &RecordingFrontend) -> Vec<VerificationOutcome> {
+    frontend
+        .events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Verification(outcome) => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A write turn (mutates) followed by a text turn (ends the model turn). Two
+/// provider responses = one `submit_turn`.
+fn write_then_done(path: &str, content: &str) -> Vec<Result<AssistantTurn, &'static str>> {
+    vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": path, "content": content }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]
+}
+
+#[test]
+fn verification_passes_on_first_try_without_retry() -> Result<()> {
+    let workspace = verify_git_workspace()?;
+    let provider = FakeProvider::new(write_then_done("start.txt", "hi\n"));
+    // `true` exits 0; the counter file records that it ran exactly once.
+    let mut harness = verify_harness(
+        provider,
+        &workspace.path,
+        Some("printf x >> runs.log; true"),
+        3,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("do it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        verification_outcomes(&frontend),
+        vec![VerificationOutcome::Passed { attempts: 1 }]
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("runs.log")).unwrap_or_default(),
+        "x",
+        "the verification command ran exactly once"
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_fails_then_model_fixes_and_passes() -> Result<()> {
+    let workspace = verify_git_workspace()?;
+    // Turn 1 writes start.txt (mutates). The retry writes ok.flag, which the
+    // verify command tests for. Four responses = two `submit_turn`s.
+    let mut responses = write_then_done("start.txt", "hi\n");
+    responses.extend(write_then_done("ok.flag", "ok\n"));
+    let provider = FakeProvider::new(responses);
+    let mut harness = verify_harness(
+        provider,
+        &workspace.path,
+        Some("printf x >> runs.log; test -f ok.flag"),
+        3,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("do it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        verification_outcomes(&frontend),
+        vec![VerificationOutcome::Passed { attempts: 2 }],
+        "failure fed back, model edited, re-run passed; attempts reported"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("runs.log")).unwrap_or_default(),
+        "xx",
+        "verification ran twice (initial fail + post-fix pass)"
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_fails_after_exhausting_attempts_and_stays_rollbackable() -> Result<()> {
+    let workspace = verify_git_workspace()?;
+    let mut responses = write_then_done("a.txt", "a\n");
+    responses.extend(write_then_done("b.txt", "b\n"));
+    let provider = FakeProvider::new(responses);
+    // Always fails, emitting a marker so the last output is preserved.
+    let mut harness = verify_harness(
+        provider,
+        &workspace.path,
+        Some("printf x >> runs.log; echo FAILMARKER; false"),
+        2,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("do it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let outcomes = verification_outcomes(&frontend);
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0] {
+        VerificationOutcome::Failed {
+            attempts,
+            exit_code,
+            last_output,
+        } => {
+            assert_eq!(*attempts, 2, "reported fail-after-N with N == cap");
+            assert_eq!(*exit_code, Some(1));
+            assert!(
+                last_output.contains("FAILMARKER"),
+                "last output preserved: {last_output:?}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("runs.log")).unwrap_or_default(),
+        "xx",
+        "verification ran exactly twice (the cap)"
+    );
+    // Verification did not settle the task: the model's edits remain
+    // rollbackable (ADR-0028).
+    assert!(
+        !harness.checkpoint_restore_points().is_empty(),
+        "a failed loop leaves the task unsettled and rollbackable"
+    );
+    Ok(())
+}
+
+/// Gate that denies one tool name and allows everything else, so the model's
+/// mutation is approved but the verification shell command is denied.
+struct DenyToolGate {
+    deny: &'static str,
+    events: RefCell<Vec<AgentEvent>>,
+}
+
+impl AgentObserver for DenyToolGate {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        self.events.borrow_mut().push(event);
+        Ok(())
+    }
+}
+
+impl ApprovalGate for DenyToolGate {
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+    ) -> ApprovalFuture<'a> {
+        let decision = if call.name == self.deny {
+            ApprovalDecision::Deny
+        } else {
+            ApprovalDecision::Allow
+        };
+        Box::pin(async move { Ok(decision) })
+    }
+}
+
+#[test]
+fn verification_command_denial_reports_skipped_by_denial() -> Result<()> {
+    let workspace = verify_git_workspace()?;
+    let provider = FakeProvider::new(write_then_done("start.txt", "hi\n"));
+    let mut harness = verify_harness(
+        provider,
+        &workspace.path,
+        Some("printf x >> runs.log; true"),
+        3,
+    );
+    // Allow the model's `write`, deny the verification `bash`: same approval
+    // gate as any shell command, no exemption.
+    let gate = DenyToolGate {
+        deny: "bash",
+        events: RefCell::new(Vec::new()),
+    };
+
+    block_on(harness.submit_turn("do it", &gate, &gate, &CancellationToken::new()))?;
+
+    let outcomes: Vec<VerificationOutcome> = gate
+        .events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Verification(outcome) => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![VerificationOutcome::SkippedApprovalDenied],
+        "denied verification is reported as skipped-by-denial, not dropped or passed"
+    );
+    assert!(
+        !workspace.path.join("runs.log").exists(),
+        "the denied command never executed"
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_unconfigured_reports_skipped_but_off_is_silent() -> Result<()> {
+    // Engaged with no command -> skipped-unconfigured after a mutating turn.
+    let workspace = verify_git_workspace()?;
+    let provider = FakeProvider::new(write_then_done("start.txt", "hi\n"));
+    let mut harness = verify_harness(provider, &workspace.path, None, 3);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    block_on(harness.submit_turn("do it", &frontend, &frontend, &CancellationToken::new()))?;
+    assert_eq!(
+        verification_outcomes(&frontend),
+        vec![VerificationOutcome::SkippedUnconfigured]
+    );
+
+    // Feature off (no verify block wired) -> no verification event at all,
+    // preserving pre-#265 behavior.
+    let workspace2 = verify_git_workspace()?;
+    let provider2 = FakeProvider::new(write_then_done("start.txt", "hi\n"));
+    let mut off = test_harness(provider2, &workspace2.path, crate::tools::built_in_tools());
+    let frontend2 = RecordingFrontend::new(ApprovalDecision::Allow);
+    block_on(off.submit_turn("do it", &frontend2, &frontend2, &CancellationToken::new()))?;
+    assert!(
+        verification_outcomes(&frontend2).is_empty(),
+        "an unwired feature emits nothing"
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_never_executes_beyond_max_attempts() -> Result<()> {
+    let workspace = verify_git_workspace()?;
+    // The model keeps changing files each retry, but verification always fails;
+    // the loop must still stop exactly at the cap.
+    let mut responses = write_then_done("a.txt", "a\n");
+    responses.extend(write_then_done("b.txt", "b\n"));
+    responses.extend(write_then_done("c.txt", "c\n"));
+    // A 4th change is scripted but must never be reached (cap == 3).
+    responses.extend(write_then_done("d.txt", "d\n"));
+    let provider = FakeProvider::new(responses);
+    let mut harness = verify_harness(
+        provider,
+        &workspace.path,
+        Some("printf x >> runs.log; false"),
+        3,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("do it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    match verification_outcomes(&frontend).as_slice() {
+        [
+            VerificationOutcome::Failed {
+                attempts: 3,
+                exit_code: Some(1),
+                ..
+            },
+        ] => {}
+        other => panic!("expected a single fail after 3 attempts, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("runs.log")).unwrap_or_default(),
+        "xxx",
+        "verification ran exactly max_attempts (3) times, never more"
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_stops_when_model_makes_no_further_changes() -> Result<()> {
+    let workspace = verify_git_workspace()?;
+    // Turn 1 mutates; the retry turn produces only text (no further changes), so
+    // the loop must stop instead of re-running verification (no retry storm).
+    let mut responses = write_then_done("start.txt", "hi\n");
+    responses.push(Ok(AssistantTurn::text("I cannot fix this")));
+    let provider = FakeProvider::new(responses);
+    let mut harness = verify_harness(
+        provider,
+        &workspace.path,
+        Some("printf x >> runs.log; false"),
+        5,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("do it", &frontend, &frontend, &CancellationToken::new()))?;
+
+    match verification_outcomes(&frontend).as_slice() {
+        [VerificationOutcome::Failed { attempts: 1, .. }] => {}
+        other => panic!("expected a single fail after 1 attempt, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("runs.log")).unwrap_or_default(),
+        "x",
+        "verification ran once; no retry without a further change"
+    );
+    Ok(())
+}

@@ -320,9 +320,15 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
 - **Final diff summary** — net task diff (Iris-authored paths only) as the
   deliverable, TUI + plain-text. Issue
   [#264](https://github.com/5omeOtherGuy/iris-agent/issues/264). [Planned · MVP]
-- **Verification loop** — run the project's test/lint/build after changes, feed
-  failures back, bounded retries; same shell approval policy. Issue
-  [#265](https://github.com/5omeOtherGuy/iris-agent/issues/265). [Planned · MVP]
+- **Verification loop** — explicit per-project `verify.command` (+
+  `verify.maxAttempts`, default 3, capped 10; no auto-detection) run after a turn
+  that changed files, as a normal gated shell execution under the unchanged
+  approval policy (no persistent allow-always per ADR-0010; any build artifacts
+  go through the #262 dirty-tree guard). Failure output is fed back to the model
+  for a bounded retry — each retry only after the model makes further changes,
+  stopping at the cap. Honest pass / fail-after-N / skipped events; a failed loop
+  never settles the task, so it stays rollbackable. Issue
+  [#265](https://github.com/5omeOtherGuy/iris-agent/issues/265). [Implemented]
 - **Diff view** — present changes as git diffs. [Planned]
 - **Auto-commit** — commit changes with generated messages after explicit
   approval. Gated on ADR-0028's still-binding pre-automation gate. Issue

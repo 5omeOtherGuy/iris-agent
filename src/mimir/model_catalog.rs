@@ -338,6 +338,7 @@ mod tests {
                 reasoning: Some(true),
                 api_key_required: Some(false),
             }),
+            verify: None,
         }
     }
 
