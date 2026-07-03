@@ -323,16 +323,19 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
   [#265](https://github.com/5omeOtherGuy/iris-agent/issues/265). [Planned · MVP]
 - **Diff view** — present changes as git diffs. [Planned]
 - **Auto-commit** — commit changes with generated messages after explicit
-  approval. Gated on ADR-0028's still-binding pre-automation gate. [Planned]
+  approval. Gated on ADR-0028's still-binding pre-automation gate. Issue
+  [#270](https://github.com/5omeOtherGuy/iris-agent/issues/270). [Planned]
 - **Per-hunk staging** — stage and commit logically separate changes separately.
-  [Planned]
+  Issue [#269](https://github.com/5omeOtherGuy/iris-agent/issues/269). [Planned]
 - **Pre-commit self-review** — agent reviews its own diff before committing.
   [Planned]
 - **Worktree integration** — isolated worktree plus branch per task/run; also a
   subagent isolation primitive. Design ADR tracked in
   [#267](https://github.com/5omeOtherGuy/iris-agent/issues/267) (apply =
   settlement through the dirty-tree choke point; linked worktrees only first;
-  registry + lifecycle/GC). Reference:
+  registry + lifecycle/GC); implementation tracked in
+  [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271), blocked on the
+  #267 ADR. Reference:
   [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md).
   [Planned]
 
