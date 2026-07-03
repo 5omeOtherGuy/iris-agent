@@ -1461,23 +1461,27 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // Pager scroll keys act before editor routing (scrollback has implicit
-    // focus for the nav keys); typing/other keys fall through to the composer.
-    if pager_scroll_key(screen, key.code, ctrl, alt) {
-        return IdleKey::Continue;
-    }
-    // Tab focus toggle + focused-scrollback entry navigation (ADR-0029).
-    // Never on the start page (no transcript to focus).
-    if !screen.start_page_active() && scrollback_focus_key(screen, key.code, ctrl, alt) {
-        return IdleKey::Continue;
-    }
-
     let input = screen.editor_text();
 
     // Explicit focus routing (Editor < Palette < Modal). Modals run in their own
     // phase, so idle focus is only ever Editor or Palette here. Reuse the input
     // snapshot already computed above instead of re-joining the editor buffer.
     let focus = screen.focus_for(&input);
+
+    // Pager scroll keys act before editor routing (scrollback has implicit
+    // focus for the nav keys); typing/other keys fall through to the composer.
+    if pager_scroll_key(screen, key.code, ctrl, alt) {
+        return IdleKey::Continue;
+    }
+    // Tab focus toggle + focused-scrollback entry navigation (ADR-0029).
+    // Never on the start page (no transcript to focus) and never while the
+    // slash palette is open (Tab/arrows stay palette keys there).
+    if !screen.start_page_active()
+        && focus != FocusTarget::Palette
+        && scrollback_focus_key(screen, key.code, ctrl, alt)
+    {
+        return IdleKey::Continue;
+    }
 
     // Start-page launcher routing: the listed ctrl-chords activate directly,
     // and while the composer is empty ↑/↓/↵ drive the launcher selection. The

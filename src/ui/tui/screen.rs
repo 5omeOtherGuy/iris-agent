@@ -666,9 +666,29 @@ impl Screen {
         self.selected_entry = Some(headers[next]);
     }
 
+    /// Validate the selected entry against the CURRENT panel headers, snapping
+    /// a stale index (history trim, panel rebuild) to the nearest header (or
+    /// clearing it when none exist). The single normalization path used by
+    /// every reveal/highlight/fold action.
+    pub(crate) fn normalized_selection(&mut self) -> Option<usize> {
+        let row = self.selected_entry?;
+        if self.transcript.panel_expanded_at(row).is_some() {
+            return Some(row);
+        }
+        let headers = self.transcript.panel_header_rows();
+        let snapped = headers
+            .iter()
+            .rev()
+            .find(|&&header| header <= row)
+            .or_else(|| headers.first())
+            .copied();
+        self.selected_entry = snapped;
+        snapped
+    }
+
     /// Fold (`false`) or reveal (`true`) the selected entry's panel.
     pub(crate) fn set_selected_expanded(&mut self, expand: bool) -> bool {
-        let Some(row) = self.selected_entry else {
+        let Some(row) = self.normalized_selection() else {
             return false;
         };
         self.transcript.set_panel_expanded_at(row, expand)
@@ -676,7 +696,7 @@ impl Screen {
 
     /// Toggle the selected entry's fold (Enter while scrollback-focused).
     pub(crate) fn toggle_selected_entry(&mut self) -> bool {
-        let Some(row) = self.selected_entry else {
+        let Some(row) = self.normalized_selection() else {
             return false;
         };
         match self.transcript.panel_expanded_at(row) {

@@ -368,7 +368,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     // after `transcript_visible_total`, so the line lookup is O(1)).
     let selected_line = if screen.scrollback_focus {
         screen
-            .selected_entry
+            .normalized_selection()
             .and_then(|row| screen.transcript_line_of_row(row))
     } else {
         None
