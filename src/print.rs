@@ -12,7 +12,8 @@ use std::io::{self, IsTerminal, Read};
 use anyhow::Result;
 
 use crate::nexus::{
-    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ToolCall,
+    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ReviewContext,
+    ToolCall,
 };
 
 /// A parsed `-p`/`--print` invocation: the prompt argument plus whether gated
@@ -146,6 +147,7 @@ impl ApprovalGate for PrintApprovalGate {
         _call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        _ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         let decision = self.decision();
         Box::pin(async move { Ok(decision) })
@@ -273,15 +275,26 @@ mod tests {
     #[test]
     fn approval_gate_denies_by_default() {
         let gate = PrintApprovalGate::new(false);
-        let decision =
-            futures::executor::block_on(gate.review(&tool_call(), false, false)).unwrap();
+        let decision = futures::executor::block_on(gate.review(
+            &tool_call(),
+            false,
+            false,
+            ReviewContext::default(),
+        ))
+        .unwrap();
         assert_eq!(decision, ApprovalDecision::Deny);
     }
 
     #[test]
     fn approval_gate_allows_with_approve_flag() {
         let gate = PrintApprovalGate::new(true);
-        let decision = futures::executor::block_on(gate.review(&tool_call(), true, true)).unwrap();
+        let decision = futures::executor::block_on(gate.review(
+            &tool_call(),
+            true,
+            true,
+            ReviewContext::default(),
+        ))
+        .unwrap();
         assert_eq!(decision, ApprovalDecision::Allow);
     }
 }

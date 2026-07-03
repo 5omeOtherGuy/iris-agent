@@ -413,6 +413,25 @@ pub(crate) trait SteeringSource {
     fn take_follow_up(&self) -> Vec<String>;
 }
 
+/// Structured review facts Nexus derives at the gate and threads to the
+/// front-end (issue #262/ADR-0010, ADR-0028). Facts only, never UI copy: Nexus
+/// owns the contract and computes `destructive`/`dirty_paths` at the call site;
+/// Tier 3 turns them into the explanatory reason line at the decision point
+/// (docs/ARCHITECTURE.md tier rules). Cheap to clone (a bool plus a short list
+/// of already-computed display paths), so it crosses the seam by value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReviewContext {
+    /// The call performs a destructive, data-losing operation (the ADR-0010
+    /// floor fired): even an allowed tool re-prompts. Drives a danger-toned
+    /// note in the reason line.
+    pub(crate) destructive: bool,
+    /// Workspace-relative display paths of pre-existing uncommitted changes the
+    /// call would touch (ADR-0028 dirty-tree gate). Non-empty means the dirty
+    /// gate fired, so "always" here means "all dirty files this task" and no
+    /// per-project grant is offered.
+    pub(crate) dirty_paths: Vec<String>,
+}
+
 /// Request/response approval gate. Async so the loop can race a pending approval
 /// against cancellation (`tokio::select!`); the loop branches on the returned
 /// decision to control execution. Mirrors pi's `beforeToolCall` config hook,
@@ -423,12 +442,15 @@ pub(crate) trait ApprovalGate {
     /// front-end only offers an "always allow" choice the loop will honor (shell
     /// tools opt out, so their prompt is y/N only). `allow_project` is true when
     /// a persistent per-project grant (ADR-0027) is on offer -- never for a
-    /// destructive call (ADR-0010 floor).
+    /// destructive call (ADR-0010 floor). `ctx` carries the structured review
+    /// facts (destructive floor, dirty-tree paths) the front-end renders into
+    /// its reason line -- facts, never copy.
     fn review<'a>(
         &'a self,
         call: &'a ToolCall,
         allow_always: bool,
         allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a>;
 }
 
@@ -1493,6 +1515,18 @@ impl<P: ChatProvider> Agent<P> {
             Vec::new()
         };
         let dirty_gate = !dirty_protected.is_empty();
+        // Workspace-relative display paths for the dirty-tree gate, computed
+        // once: reused by the Notice (transcript record) and threaded to the
+        // front-end via `ReviewContext` for the decision-point reason line.
+        let dirty_display: Vec<String> = dirty_protected
+            .iter()
+            .map(|path| {
+                path.strip_prefix(env.workspace)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
         if let Some(tool) = self.tools.by_name(&call.name) {
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
                 obs.on_event(AgentEvent::DiffPreview {
@@ -1536,20 +1570,18 @@ impl<P: ChatProvider> Agent<P> {
                         obs.on_event(AgentEvent::Notice(message.to_string()))?;
                     }
                     if dirty_gate {
-                        let list = dirty_protected
-                            .iter()
-                            .map(|path| {
-                                path.strip_prefix(env.workspace)
-                                    .unwrap_or(path)
-                                    .display()
-                                    .to_string()
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let list = dirty_display.join(", ");
                         obs.on_event(AgentEvent::Notice(format!(
                             "uncommitted changes in {list}: approval required before Iris modifies it"
                         )))?;
                     }
+                    // Facts, not copy: the destructive floor and the dirty-tree
+                    // paths cross to the front-end so it can render the reason
+                    // line at the decision point (docs/ARCHITECTURE.md).
+                    let review_ctx = ReviewContext {
+                        destructive,
+                        dirty_paths: dirty_display.clone(),
+                    };
                     // Race the approval against cancellation so a pending prompt
                     // does not pin the turn open after a Ctrl-C. Cancellation is
                     // recorded as a cancelled call (not a denial) so the transcript
@@ -1573,6 +1605,7 @@ impl<P: ChatProvider> Agent<P> {
                             call,
                             tool.supports_allow_always() || dirty_gate,
                             !destructive && !dirty_gate,
+                            review_ctx,
                         ) => decision?,
                     };
                     // A blocking front-end prompt (real terminal) cannot observe

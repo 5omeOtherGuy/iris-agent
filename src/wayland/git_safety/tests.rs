@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 use super::GitSafety;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
-    AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream, Tool,
-    ToolCall, ToolEnv, ToolFuture, ToolOutput, Tools,
+    AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream,
+    ReviewContext, Tool, ToolCall, ToolEnv, ToolFuture, ToolOutput, Tools,
 };
 use crate::tools::ToolState;
 use crate::wayland::Harness;
@@ -485,6 +485,9 @@ struct CountingFrontend {
     decision: Cell<ApprovalDecision>,
     reviews: Cell<usize>,
     events: RefCell<Vec<AgentEvent>>,
+    /// The review facts the last gated call carried, so a dirty-tree test can
+    /// assert Nexus threads the workspace-relative `dirty_paths` to the gate.
+    last_ctx: RefCell<Option<ReviewContext>>,
 }
 
 impl CountingFrontend {
@@ -493,6 +496,7 @@ impl CountingFrontend {
             decision: Cell::new(decision),
             reviews: Cell::new(0),
             events: RefCell::new(Vec::new()),
+            last_ctx: RefCell::new(None),
         }
     }
 }
@@ -510,8 +514,10 @@ impl ApprovalGate for CountingFrontend {
         _call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         self.reviews.set(self.reviews.get() + 1);
+        *self.last_ctx.borrow_mut() = Some(ctx);
         let decision = self.decision.get();
         Box::pin(async move { Ok(decision) })
     }
@@ -571,6 +577,22 @@ fn dirty_write_prompts_despite_project_grant() -> Result<()> {
         frontend.reviews.get(),
         1,
         "a dirty-file write must prompt despite the project grant"
+    );
+    // The gate receives the dirty-tree facts (workspace-relative paths), not UI
+    // copy: Nexus threads them through `ReviewContext` (issue #262/ADR-0028).
+    let ctx = frontend
+        .last_ctx
+        .borrow()
+        .clone()
+        .expect("the gate received a review context");
+    assert_eq!(
+        ctx.dirty_paths,
+        vec!["committed.txt".to_string()],
+        "the dirty path is threaded to the gate"
+    );
+    assert!(
+        !ctx.destructive,
+        "a plain dirty-file write is not the destructive floor"
     );
     Ok(())
 }

@@ -38,7 +38,8 @@ use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource};
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
 use crate::nexus::{
-    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ToolCall,
+    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ReviewContext,
+    ToolCall,
 };
 use crate::ui::UiEvent;
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
@@ -215,6 +216,9 @@ struct ApprovalRequest {
     call: ToolCall,
     allow_always: bool,
     allow_project: bool,
+    /// Structured review facts (destructive floor, dirty-tree paths) the screen
+    /// renders into the docked approval surface's reason line.
+    ctx: ReviewContext,
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -858,7 +862,7 @@ async fn run_turn<P: ChatProvider>(
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
-                    tui.screen.show_approval(&request.call, request.allow_always, request.allow_project);
+                    tui.screen.show_approval(&request.call, request.allow_always, request.allow_project, &request.ctx);
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,
@@ -1704,6 +1708,7 @@ impl ApprovalGate for LoopBridge {
         call: &'a ToolCall,
         allow_always: bool,
         allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         let appr_tx = self.appr_tx.clone();
         let call = call.clone();
@@ -1714,6 +1719,7 @@ impl ApprovalGate for LoopBridge {
                     call,
                     allow_always,
                     allow_project,
+                    ctx,
                     reply,
                 })
                 .is_err()
