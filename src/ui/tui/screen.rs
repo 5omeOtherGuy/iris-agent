@@ -599,6 +599,24 @@ pub(crate) struct Screen {
     /// Selected scrollback entry (a panel-header transcript row index) while
     /// the scrollback pane is focused.
     pub(crate) selected_entry: Option<usize>,
+    /// Active transcript search (`/find`), pager mode only.
+    pub(crate) search: Option<SearchState>,
+    /// One-shot scroll target consumed by the next pager compose (search
+    /// jumps): reveal without pinning the view.
+    pub(crate) reveal_line: Option<usize>,
+}
+
+/// `/find` state: the query plus the current match position. Match lines are
+/// recomputed on every jump (the transcript moves under the search), so only
+/// the current position is retained.
+#[derive(Debug)]
+pub(crate) struct SearchState {
+    pub(crate) query: String,
+    /// 1-based position of the current match, for the `k/N` indicator.
+    pub(crate) position: usize,
+    pub(crate) total: usize,
+    /// Visible-line index of the current match at the last jump.
+    pub(crate) line: Option<usize>,
 }
 
 impl Screen {
@@ -626,7 +644,59 @@ impl Screen {
             scroll_speed: 3,
             scrollback_focus: false,
             selected_entry: None,
+            search: None,
+            reveal_line: None,
         }
+    }
+
+    /// Start (or clear, with an empty query) a transcript search. Jumps to the
+    /// newest match and focuses the scrollback so `n`/`N` navigate. Returns
+    /// the match count, or `None` when the search was cleared.
+    pub(crate) fn start_search(&mut self, query: &str) -> Option<usize> {
+        let query = query.trim();
+        if query.is_empty() {
+            self.search = None;
+            return None;
+        }
+        self.search = Some(SearchState {
+            query: query.to_string(),
+            position: 0,
+            total: 0,
+            line: None,
+        });
+        self.scrollback_focus = true;
+        self.search_step(0);
+        Some(self.search.as_ref().map_or(0, |state| state.total))
+    }
+
+    /// Move the search cursor: `-1` = older (up), `+1` = newer (down), `0` =
+    /// (re)select the newest match. Matches are recomputed against the current
+    /// transcript; the jump target is queued for the next pager compose.
+    pub(crate) fn search_step(&mut self, direction: isize) -> bool {
+        let Some(state) = self.search.as_mut() else {
+            return false;
+        };
+        let matches = self.transcript.search_visible_lines(&state.query);
+        state.total = matches.len();
+        if matches.is_empty() {
+            state.position = 0;
+            state.line = None;
+            return false;
+        }
+        // Re-anchor on the previous line where possible, else the newest match.
+        let anchor = state
+            .line
+            .and_then(|line| matches.iter().position(|&m| m >= line))
+            .unwrap_or(matches.len() - 1);
+        let index = match direction {
+            0 => matches.len() - 1,
+            d if d < 0 => anchor.saturating_sub(1),
+            _ => (anchor + 1).min(matches.len() - 1),
+        };
+        state.position = index + 1;
+        state.line = Some(matches[index]);
+        self.reveal_line = state.line;
+        true
     }
 
     /// Tab: toggle prompt <-> scrollback focus (pager only). Entering the

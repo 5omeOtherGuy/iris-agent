@@ -699,6 +699,22 @@ fn route_command<P: ChatProvider>(
             apply_notices(tui, crate::ui::terminal_doctor::report(&env));
             Ok(RouteOutcome::Consumed)
         }
+        "/find" => {
+            tui.screen.commit_user(prompt);
+            if !tui.screen.pager_active {
+                apply_notices(
+                    tui,
+                    vec!["transcript search is a pager-mode feature".to_string()],
+                );
+                return Ok(RouteOutcome::Consumed);
+            }
+            match tui.screen.start_search(rest) {
+                None => apply_notices(tui, vec!["search cleared".to_string()]),
+                Some(0) => apply_notices(tui, vec![format!("no matches for {rest:?}")]),
+                Some(_) => {}
+            }
+            Ok(RouteOutcome::Consumed)
+        }
         "/mouse" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             let notice = if tui.screen.pager_active {
@@ -1776,6 +1792,17 @@ fn scrollback_focus_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: boo
         }
         KeyCode::Enter => {
             screen.toggle_selected_entry();
+            true
+        }
+        // Search navigation while a `/find` is active: n = older, N = newer.
+        // Checked before the type-through fallthrough so the two letters
+        // navigate instead of stealing focus back to the prompt.
+        KeyCode::Char('n') if screen.search.is_some() => {
+            screen.search_step(-1);
+            true
+        }
+        KeyCode::Char('N') if screen.search.is_some() => {
+            screen.search_step(1);
             true
         }
         // Typing always returns to the prompt; the key falls through and is
