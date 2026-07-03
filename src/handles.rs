@@ -59,18 +59,18 @@ impl HandleStore {
     pub(crate) fn with_dir(dir: PathBuf) -> Self {
         Self { dir }
     }
+}
 
+impl ToolOutputStore for HandleStore {
     /// Read a stored output back by handle id, returning `None` when no such
     /// handle exists. This is the retrieval half of "the full output stays
-    /// retrievable by handle"; the model-facing dereference tool / UI that would
-    /// call it is a later slice (issue #61 defers it), so it is currently only
-    /// exercised by tests.
+    /// retrievable by handle"; the model-facing `read_output` dereference tool
+    /// (issue #205) calls it through the [`ToolOutputStore`] contract.
     ///
     /// The id is validated as hex-only before use: although handles are minted
     /// by [`handle_id`], a resumed transcript's reference is untrusted input, so
     /// a forged id containing path separators or `..` must never escape `dir`.
-    #[allow(dead_code)]
-    pub(crate) fn get(&self, id: &str) -> Result<Option<String>> {
+    fn get(&self, id: &str) -> Result<Option<String>> {
         if !is_handle_id(id) {
             return Ok(None);
         }
@@ -83,9 +83,7 @@ impl HandleStore {
             }
         }
     }
-}
 
-impl ToolOutputStore for HandleStore {
     /// Persist the full output and return its content-addressed handle id.
     /// Identical content yields the same id and is stored once (idempotent), so
     /// a resumed session that re-derives the same output reuses the same file.

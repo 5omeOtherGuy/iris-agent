@@ -249,7 +249,16 @@ fn available_tools_lists_every_registered_tool_with_the_guardrail() {
     let tools = built_in_tools();
     let body = available_tools_body(&tools);
     assert!(body.starts_with("Available tools:"));
-    for name in ["read", "bash", "edit", "write", "grep", "find", "ls"] {
+    for name in [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "read_output",
+    ] {
         assert!(body.contains(&format!("- {name}:")), "missing tool {name}");
     }
     assert!(body.contains("No other tools are available"));

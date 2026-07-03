@@ -323,6 +323,15 @@ pub(crate) trait ToolOutputStore {
     /// be stable for identical content so a resumed transcript keeps pointing at
     /// the same stored output (the harness impl is content-addressed).
     fn put(&self, content: &str) -> Result<String>;
+
+    /// Retrieve a stored output by handle id, or `None` when no such handle
+    /// exists (unknown or expired). The id comes from an (untrusted) transcript
+    /// reference, so the impl validates it and returns `None` -- never an error
+    /// or a filesystem escape -- for a malformed id. This is the retrieval half
+    /// of the offload contract the model-facing `read_output` tool calls through
+    /// [`ToolEnv::output_store`] (issue #205); keeping it on the contract, not
+    /// the concrete store, holds the tier boundary that `put` already draws.
+    fn get(&self, id: &str) -> Result<Option<String>>;
 }
 
 /// Display-only live-output sink for a running tool (issue #90 sub-item 1). A
