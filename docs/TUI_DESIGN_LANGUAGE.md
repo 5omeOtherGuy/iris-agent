@@ -1,0 +1,621 @@
+# Iris TUI — Design Language (canonical)
+
+> **This document is ground truth.** It is the exhaustive specification of the
+> Iris terminal-agent interface: every surface, every block, every symbol, every
+> spacing rule, and the invariants a build must not violate. Where any other
+> file in this system disagrees with this one, **this one wins**. `readme.md` is
+> the guide and index; the per-component `.prompt.md` files are quick reference;
+> this is the law.
+>
+> **Register:** product. **Three words:** precise · mechanical · honest.
+> **Built for:** terminal-native expert developers reaching for an instrument,
+> not a collaborator.
+
+---
+
+## 0 · Reading this document
+
+Iris is not a web app wearing a terminal costume; it is a **monospace
+character-cell interface** that we translate faithfully to the web. Every rule
+below is stated in terminal terms first (cells, rows, glyphs) and then in its
+CSS translation. When a rule and its translation seem to conflict, honour the
+terminal intent.
+
+The unit of measure is **one cell** — one monospace character width (`1ch`) and
+one line of the terminal grid. "Two cells of indent" means `2ch`, not "about
+16px". Vertical rhythm is measured in **blank lines**, not pixels.
+
+---
+
+## 1 · The pane — global anatomy
+
+Iris is a **single vertically scrolling transcript column** framed by a quiet
+**session bar pinned at the top** and a **fixed multiline composer pinned at
+the bottom**. That is the entire chrome. There is:
+
+- **no sidebar** — no file tree, no history rail, no agent avatar;
+- **no top tab bar** — the session bar is one quiet row (location + context),
+  not a toolbar;
+- **no separate bottom status bar** — the runtime statusline lives *inside*
+  the composer, below the input, so status and input are one object;
+- **no floating toolbars, no FABs, no cards, no panels-beside-panels.**
+
+The statusline is **split** across the two ends of the pane, and the two
+halves are never merged onto one line again:
+
+- **Session bar (pane top — "where am I / how full am I"):** `cwd ┊ git
+  branch` left, the right-aligned context readout `CTX <used>/<cap>` + 10-dot
+  meter right, over a soft (dim) hairline.
+- **Composer statusline (pane bottom — "what am I running"):** mode · model ·
+  effort · approval policy, below the input rows.
+
+```
+┌───────────────────────────── pane (one column) ─────────────────────────────┐
+│  ~/iris-agent ┊ git main                      CTX 94k/300k ●●●○○○○○○○        │
+│  ────────────────────────────────────────────  (session bar + soft hairline) │
+│  <transcript — scrolls>                                                      │
+│    user text                                                                 │
+│    › assistant text                                                          │
+│    THINKING ▸ …                                                              │
+│    ┌ EXPLORE  src              ◆ DONE   0.0s ┐   (tool panel — bordered)      │
+│    │ …                                        │                              │
+│    └──────────────────────────────────────────┘                             │
+│    ●··· 0:13 ┊ ESC ┊ ↑177k ↓5.7k             (working indicator, inline)     │
+│    ── 7.6s ┊ ↑18.2k ↓846 ───────────────────  (turn divider)                │
+│                                                                              │
+│  ────────────────────────────────────────────  (composer top edge — frame)  │
+│  Give Iris a task...                                                         │
+│  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  (internal rule — lighter)     │
+│  ◉ CODE ─ GPT-5.5 XHIGH ─ ◆ always-approve                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Shared measure.** Tool panels and the composer indent **2 cells** from the
+pane edge and share **one width**. Transcript text (user + assistant) aligns to
+a single **text column** (see §7). Nothing is centred; nothing is full-bleed
+except a genuine overlay's scrim.
+
+**Max width (web).** In a browser recreation the column caps at `--pane-max`
+(900px) and centres in the viewport on the flat `bg`. In a real terminal it is
+the terminal width.
+
+**Vertical rhythm.** Exactly **one blank line** (`--block-rhythm`, 1.5rem)
+separates every top-level block: user turn, assistant message, thinking block,
+plan, notice, each tool panel, the working indicator, and the turn divider. The
+calm of the interface comes from **varying nothing else.** Never 0.5-line,
+never 2-line gaps; never a gap that depends on block type.
+
+---
+
+## 2 · Color
+
+**Terminal-relative.** Every role binds to an ANSI named slot so Iris inherits
+the user's own light/dark terminal theme. The hexes below are the **dark-mode
+reference approximations** (from `src/ui/tui.rs`); `tokens/colors.css` is the
+source of truth for the values and ships a light theme under
+`:root[data-theme="light"]`.
+
+### 2.1 Foundation (grey does the structural work)
+
+| Role | Token | Dark hex | ANSI | Job |
+|---|---|---|---|---|
+| Background | `--iris-bg` | `#1a1a1f` | Reset bg | The entire canvas. Flat. |
+| Surface | `--iris-surface` | `#323238` | `Rgb(50,50,56)` | Selection / active-row fill **only**. |
+| Ink | `--iris-ink` | `#e6e6e6` | Reset fg | Default body text. |
+| Border | `--iris-border` | `#808080` | Gray | Panel & composer frames. |
+| Muted | `--iris-muted` | `#6b6b6b` | DarkGray | Metadata, hints, markers, elisions. |
+| Stdout | `--iris-stdout` | `#b7b7bd` | — | SHELL program output (below the command). |
+
+Grey carries the whole layout. If you can express a distinction with
+weight/case/dim instead of a hue, do.
+
+### 2.2 Signal (sparse, role-assigned)
+
+| Role | Token | Dark hex | ANSI | Used for |
+|---|---|---|---|---|
+| Accent | `--iris-accent` | `#d78700` | orange | Active mode `◉`, running `●`, meter edge dot, warning `▲`. |
+| Interactive | `--iris-interactive` | `#00afaf` | Cyan | Selection focus, inline code. |
+| Link | `--iris-link` | `#5f87ff` | Blue | Links only. |
+| Success | `--iris-success` | `#5faf5f` | Green | `◆` DONE/APPROVED, diff additions. |
+| Danger | `--iris-danger` | `#d75f5f` | Red | `■` ERROR/DENIED, diff removals, stderr. |
+
+### 2.3 Two laws of color
+
+1. **Never color a whole panel or region.** Color is a point signal (a glyph, a
+   word, one diff row's faint tone), never a fill behind content. The single
+   permitted tonal fill is `--iris-surface` for a selected/active row.
+2. **Never rely on color alone.** Every stateful thing pairs a **symbol + label**
+   with its color, and the UI must be fully legible in monochrome. A red word
+   with no `■` and no "ERROR" is a bug.
+
+### 2.4 Diff tone
+
+Additions/removals get a **whisper** of background — `color-mix` of the
+success/danger role at ~10% into the pane bg — plus tinted text and a `+`/`−`
+marker. The marker and text carry the signal; the tone only groups the hunk.
+Never a saturated block.
+
+---
+
+## 3 · Type
+
+**One family:** the user's terminal monospace. Web substitute: **JetBrains
+Mono** (complete box-drawing coverage, even cell widths), loaded from Google
+Fonts; swap the stack in `tokens/typography.css` for a house font or offline
+build.
+
+**There is no size axis.** The terminal has one cell size (`--fs-base`, 14px on
+the web). Hierarchy is built from five levers, in this order of preference:
+
+1. **Weight** — `400` body · `500` actor lines / active items · `700` labels & headings.
+2. **Dim / bright** — muted grey recedes; ink advances; stdout sits between.
+3. **Color** — only per §2 (sparse, always symbol-paired).
+4. **Case** — UPPERCASE for structural labels only (see §11).
+5. **The marker/symbol column** — a leading glyph is itself a level of hierarchy.
+
+The `--fs-*` steps exist **only** so web chrome (specimen cards, README) has a
+sane base. **Never introduce a larger font size to make something important in
+the pane** — reach for weight, then case, then a marker.
+
+**Line rhythm:** `--leading-base` 1.5 for prose/panels; `--leading-tight` 1.35
+where density matters. Uppercase labels get `--tracking-label` (0.06em).
+
+**Wrapping is semantic.** Break at spaces, `/`, `&&`, and token boundaries.
+**Never** break an identifier, a path, or a decimal; **never** let a line
+overflow a border. Continuation lines align under the content column, not the
+marker (see §7, §8).
+
+---
+
+## 4 · Spacing & rhythm (exact)
+
+| Token | Value | Meaning |
+|---|---|---|
+| `--cell` | `1ch` | One character width — the grid unit. |
+| `--pane-indent` | `2ch` | Tool panels & composer indent from the pane edge. |
+| `--marker-gap` | `2ch` | Assistant `›` marker → its text. |
+| `--panel-pad` | `4ch` | Tool-panel **body** left padding. |
+| `--panel-pad-y` | `0.5rem` | Compact vertical padding inside panels. |
+| `--block-rhythm` | `1.5rem` | The one blank line between top-level blocks. |
+| `--line` | `1.5em` | One line of vertical rhythm. |
+
+**Header/label rows** (panel headers, statusline) use `1.25ch`–`1.5ch`
+horizontal padding — tighter than the 4-cell body indent so the label column
+and the disclosure glyph sit close to the frame edge.
+
+**Golden rule:** inside a tool panel every row is exactly **one** of
+{ top border · header · separator · body · bottom border } and **all rows share
+one width**. Never merge two roles into one row; never let a body row be wider
+than the header.
+
+---
+
+## 5 · The symbol vocabulary (complete)
+
+Iris has **no icon font, no SVG icon set, no emoji — ever.** Its entire "icon
+system" is this closed set of Unicode glyphs rendered in the cell grid. Each
+glyph has **exactly one job.** Do not introduce new glyphs; do not reuse one for
+a second meaning.
+
+```
+STATE / ACTIVITY
+  ◉  active / selected mode (orange)        ●  running · live LED (orange)
+  ◆  done / approved (green)                ◇  preview / pending (muted)
+  ■  error / denied (red)                   ▲  warning / review (orange)
+  □  skipped / cancelled (muted)            ○  queued / empty meter slot (muted)
+
+TRANSCRIPT
+  ›  assistant message marker (muted)       ▋  live caret (orange, thinking)
+  ▾  expanded disclosure                    ▸  collapsed disclosure
+  •  markdown list bullet (muted)           1. ordered list marker (muted)
+
+DIFF / TELEMETRY
+  +  addition (green)                       −  removal (red — UNICODE minus, not ASCII -)
+  ↑  input tokens                           ↓  output / generated tokens
+  ┊  soft metadata separator (NOT ASCII |)  ─  rule / frame line / statusline separator
+
+METER
+  ●●●○○○○○○○  context meter — 10-dot LED strip (filled muted · edge orange · empty dim)
+
+FRAME (box-drawing, square corners ONLY)
+  ┌ ┐ └ ┘   corners        │  vertical        ─  horizontal        ├ ┤  tees
+```
+
+**Punctuation law:** use the ellipsis `…` (never `...`); use the Unicode minus
+`−` for removals (never ASCII `-`); use `┊` as the soft separator (never ASCII
+`|`). A glyph is added only when it carries meaning — do not decorate.
+
+The only raster/vector brand asset is the hero banner (`assets/hero-*.svg`),
+itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
+
+---
+
+## 6 · Elevation, borders, motion, transparency
+
+- **Flat by construction.** No z-layers in the transcript; `--radius: 0`
+  everywhere (square corners are intrinsic to box-drawing). No decorative
+  shadows, no faux-3D, no gradients, no textures, no images (except the hero).
+- **Depth is structural.** A bordered box-drawing panel sits "above" plain
+  unboxed transcript text, which recedes. The **1px frame in the `border` role
+  is the only elevation cue** in the transcript.
+- **The one permitted shadow** is a faint cast under a genuine overlay
+  (`--overlay-shadow`), which is the real top layer. Overlays sit on a
+  low-opacity black scrim; the pane is otherwise fully opaque. No blur, no glass.
+- **Motion is almost nil.** Only two live motions exist: the **LED-chase
+  working indicator** (`●··· → ·●·· → ··●· → ···●`) and the **edge-dot pulse**
+  on the context meter / running symbol at high usage. No braille spinners, no
+  rainbow meters, no easing-heavy transitions. Both degrade to a **static
+  readout** under `prefers-reduced-motion: reduce`.
+- **Interaction states are quiet.** Hover/selected rows in overlays use the
+  `surface` fill — never a colored left-border accent. Focus is the cyan
+  interactive role. State changes are reported by the symbol vocabulary, not by
+  shrink/scale/bounce.
+
+---
+
+## 7 · Transcript grammar — conversation
+
+Natural-language conversation is **unboxed and light.** Chrome (frames) is
+reserved for mechanical tool events (§8). The transcript text column is defined
+by the assistant marker: marker width (`1ch`) + `--marker-gap` (`2ch`).
+
+### 7.1 User message
+Plain transcript text on the text column. **No `›` marker, no USER label, no
+border, no role card, no bubble, no avatar.** One blank line separates turns.
+
+### 7.2 Assistant message
+The muted `›` marker sits one column left of its text; **wrapped lines align
+under the text, not the marker.** Never boxed; never an "AGENT" label. Content
+is rendered through the **markdown grammar** (§7.3).
+
+Voice inside: terse, factual, present-tense reports of *what happened* — "Done;
+emit() now budgets before sending. The diff is above." Never "I think", "I'll go
+ahead and", "Let me". No enthusiasm performance, no emoji.
+
+### 7.3 Markdown grammar (assistant rich text)
+Iris speaks prose but carries structure. GFM is rendered in the terminal idiom —
+hierarchy from weight/case/color/marker, **never a size jump**:
+
+| Construct | Rendering |
+|---|---|
+| Heading `#`–`####` | Bold ink, no size change. `#` (h1) gets uppercase + label tracking. |
+| **Bold** | `--fw-bold` ink. |
+| *Italic* | Slanted (JetBrains Mono italic). |
+| `Inline code` | Cyan interactive, monospace (already monospace — color is the cue). |
+| `[link](url)` | Link blue, **dotted** underline, 2px offset. |
+| Fenced ```` ``` ```` | `CodeBlock`: quiet **left rail**, muted `lang · file` caption, ink body, horizontal scroll. **Never boxed** (a box = tool panel). |
+| List `-`/`*`/`+` | Muted `•` marker column, hanging indent. |
+| List `1.` | Muted right-aligned `1.` marker column. |
+| Blockquote `>` | Muted **left rail**, muted text. |
+| Rule `---` | A single muted `─` line (50% opacity). |
+| Table | Aligned monospace columns, **bold header**, one `─` separator row, ink body. No vertical rules. |
+
+### 7.4 Thinking block
+The agent's raw reasoning. Reasoning is internal, secondary, verbose, and **not
+a mechanical event**, so it gets **no chrome.** It is the most recessive thing in
+the pane: a muted `THINKING` label, dim-grey body behind a quiet **left rail**
+(a rule, never a box), and generated-token telemetry. Folds by default
+(progressive disclosure); `ctrl+o` / header toggles `▾`⇄`▸`. Live reasoning
+pulses (`●` in the label, `▋` caret at the tail); finished reasoning may collapse
+to a line + token count. Short reasoning is shown whole and is not foldable.
+
+### 7.5 Plan list
+The agent's task checklist. **Unboxed** (narration, not a tool event): a muted
+`PLAN` label with a `done/total` count, then one row per step carrying its state
+as a glyph — `◆` done (recedes, muted text) · `●` active (orange, pulses,
+bright+bold) · `○` pending (muted) · `□` skipped (muted). Never color alone; a
+step may carry a muted trailing note.
+
+### 7.6 Notice (system message)
+A runtime event that is neither a tool call nor the assistant: context
+compaction, interrupt, undo, connection retry, rate-limit, model switch.
+Unboxed and quiet. State is a glyph + optional label: `┊` info (muted text) ·
+`◆` success · `▲` warning · `■` error · `□` cancelled. Prefer one line; use a
+muted `meta` for counts and a caption `hint` for a keybind (e.g. `ctrl+r to
+undo`).
+
+### 7.7 Working indicator
+An **inline** LED-chase readout shown while the agent runs. Never framed, never
+a braille spinner, one line:
+
+```
+●···  1:27 ┊ ESC ┊ ↑177k ↓5.7k
+```
+
+The lit cell bounces across a 4-cell strip. One blank line above/below when
+adjacent to other blocks. Telemetry (`↑`/`↓`) and the `ESC` hint are optional.
+
+### 7.8 Turn divider
+A quiet unboxed rule rendered **after a tool-backed agent turn** (not after
+purely conversational turns). Compact elapsed + optional token telemetry with
+`┊` separators; **never** `T+`. One blank line above and below.
+
+```
+── 7.6s ┊ ↑18.2k ↓846 ───────────────────────────────────
+```
+
+---
+
+## 8 · Tool-panel grammar — the four families
+
+The **tool panel** is Iris's primary structured-output primitive and — with the
+composer — the **only** thing that gets hard chrome: a single box-drawing frame
+(1px square border, `border` role) with a header row, an optional separator, and
+a body. There are **exactly four families.** Never invent a fifth; never render
+standalone `READ` / `GREP` / `LS` / `DIFF` panels.
+
+### 8.1 Shared header grammar
+```
+▾  TOOL  meta                                        SYMBOL STATE   ELAPSED
+```
+- **Disclosure glyph** `▾`/`▸` (muted) — present when the panel is foldable.
+- **TOOL** — the family name, bold uppercase (`EXPLORE`/`SHELL`/`EDIT`/`APPROVAL`).
+- **meta** — muted context (`bash ┊ ~/iris-agent`, a path, `src`), truncates
+  with `…` before it can overflow.
+- **State** — a `StateSymbol` (glyph + label) from §5; `running` pulses.
+- **Elapsed** — right-aligned compact duration (`4.1s`, `0:13`); omitted for a
+  pending `preview`.
+
+Header click (or `onToggle`) flips `expanded`. `ctrl+o` toggles the **latest**
+foldable panel. Collapsed = a capped preview + an elided-lines affordance
+(`… N lines hidden   ctrl+o to expand`).
+
+### 8.2 EXPLORE — read / grep / list / find
+The **single container** for every read-side op. Each op is **one row**:
+```
+VERB   target [code][after]                                   meta(count)
+```
+- `verb` (fixed 5-cell column, medium weight): `Read` · `Grep` · `List` · `Find`.
+- `target` ink path; `code` cyan (a grep pattern); `after` muted (` in src/…`).
+- `meta` muted right-aligned count (`142 lines`, `3 matches · 2 files`).
+
+Never break a read op into its own panel — batch them here.
+
+### 8.3 SHELL — command execution
+Body line types, in the recessive order below (the command is brightest, output
+recedes):
+
+| `type` | Rendering |
+|---|---|
+| `cmd` | Bright ink, medium weight, quiet muted `$ ` prompt (non-selectable). |
+| `out` | Recessive **stdout** grey, below the command. |
+| `err` | **Danger** red (stderr). |
+| `note` | Muted aside. |
+
+A live command shows the inline **working indicator** in the body and **no
+result row yet**. A finished command ends with a hairline-ruled **exit row**:
+```
+◆ EXIT 0   ┊ 142 passed · 0 failed        (done — green ◆)
+■ EXIT 101 ┊ 1 error · compile failed      (error — red ■)
+```
+The exit row is symbol + `EXIT <code>` label + muted meta. Long output folds to
+a capped preview (§8.1).
+
+### 8.4 EDIT — mutation & diff preview
+**One canonical body:** the wrapped **block diff** (`DiffBlock`) for every file
+type (code, prose, config, markdown), plus an optional quiet `+add −del ┊ note`
+footer. Use `state="preview"` (`◇`, **no elapsed**) for a pending apply;
+`state="done"` (`◆`) once applied.
+
+### 8.5 APPROVAL — authorization review
+Compact. The **header carries the decision** (`▲ REVIEW` · `◆ APPROVED` · `■
+DENIED`). The body carries:
+1. the **action** (a `$ command` if `shell`, else prose), optionally with
+   `+add/−del` on the right;
+2. optionally the **diff** being authorized (`DiffBlock`, under a hairline);
+3. a **reason** — muted, or danger-toned when the action is denied/destructive;
+4. when `review`, a hairline-ruled **decision affordance** of `┊`-separated
+   key hints (`y approve ┊ n deny ┊ e edit ┊ a always`).
+
+### 8.6 Diff rendering (`DiffBlock`) — shared by EDIT & APPROVAL
+Columns: **line number** (right-aligned, muted, non-selectable) · **marker**
+(1 cell) · **content** (wraps; continuations align under content). Markers:
+`+` addition (green + faint add-tone bg), `−` removal (red + faint del-tone bg,
+**Unicode minus**), `±` modified (accent), ` ` context (plain ink). Tone + text
++ marker together — never color alone.
+
+---
+
+## 9 · Session chrome — the session bar & the composer
+
+The statusline is split across the pane: the **session bar** (top) answers
+"where am I / how full am I"; the **composer statusline** (bottom) answers
+"what am I running". The two halves are never merged onto one line again.
+
+### 9.1 Session bar (pane top)
+
+A quiet, always-visible row pinned above the transcript (the transcript
+scrolls beneath it), with one soft hairline under it (dim `─` repeat — NOT the
+full border weight; visibly lighter than the composer's top edge). No
+background fill, no color bar.
+
+```
+~/iris-agent ┊ git main                      CTX 94k/300k ●●●○○○○○○○
+────────────────────────────────────────────────────────────────────
+```
+
+- **Left:** `<cwd> ┊ git <branch>` — cwd in body ink, `┊` and `git <branch>`
+  dim. Paths middle-ellipsize (never break; the project name survives). In a
+  worktree, the worktree path is the cwd.
+- **Right, right-aligned:** `CTX <used>/<cap>` + the 10-dot LED meter. `CTX`
+  and `/<cap>` dim; `<used>` body ink. Unknown context window: `CTX <used>`
+  with no meter.
+- **Narrow widths, drop in order:** meter → `/<cap>` → branch →
+  middle-truncate the cwd harder. Minimum form: cwd alone.
+
+### 9.2 The composer
+
+**Always present at the bottom. Never hidden, revealed, or collapsed** — there
+is no show/hide mechanic anywhere. Row order, top → bottom:
+
+```
+────────────────────────────────────────────  ← top edge: full border-frame hairline
+Give Iris a task...                           ← input rows (1 → 8)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  ← internal rule: lighter hairline
+◉ CODE ─ GPT-5.5 XHIGH ─ ◆ always-approve     ← bottom statusline
+```
+
+Exactly this **two-weight rule**: the top edge (separating composer from
+transcript) is the full `border-frame` hairline; the rule between the input
+and the statusline is a lighter internal hairline (the same soft weight panels
+use internally). There is no other chrome option.
+
+### 9.3 Bottom statusline (the composer's last row)
+`◉ MODE ─ MODEL EFFORT ─ <policy-symbol> <policy>`. The `◉` is orange; `MODE`
+bold uppercase; ` ─ ` dim separators; model name is an **underlined button**
+(opens the model `Picker`); effort is muted. The approval-policy segment is
+state symbol + label, never color alone:
+
+| Posture | Segment |
+|---|---|
+| always-approve | `◆` green + dim label |
+| on-request | `▲` orange + dim label |
+| read-only | `■` red + dim label |
+| off (approvals disabled) | `○` dim + dim label |
+
+**Narrow widths, drop in order:** policy → effort → minimum `◉ CODE ─ MODEL`.
+cwd/branch/context NEVER appear here — they live on the session bar.
+
+### 9.4 Input row
+A single editable row directly beneath the top edge, growing **1 → 8 rows** as
+the user types. Caret is the orange accent. Placeholder uses exact product
+casing: `Give Iris a task...`. Submit on `↵`; `shift+↵` for newline.
+
+### 9.5 Command palette (`/`)
+Typing a leading `/` opens the `SlashMenu` **above** the input: an overlay list
+of `command  —  one-line description`; `↑`/`↓` navigate, `↵`/`Tab` accept,
+`esc` dismisses. The highlighted row uses the `surface` fill (no accent border).
+Canonical commands: `/model` · `/diff` · `/undo` · `/compact` · `/clear` ·
+`/copy`.
+
+### 9.6 File reference (`@`)
+`@` references a workspace file (a path completion). Same overlay idiom.
+
+---
+
+## 10 · Overlays
+
+Overlays are the **genuine top layer** — the only place a shadow appears. All
+share: `frame-overlay` border, `surface-overlay` fill, `--overlay-shadow` cast,
+an optional uppercase title row, and rows whose highlight is the `surface` fill.
+
+- **SlashMenu** — command palette (§9.3).
+- **Picker** — model switcher, settings, scoped-models, login provider list.
+  Rows: `[◉ if active] label … meta hint`. `◉` marks the current selection.
+- **HelpOverlay** — the `?` cheatsheet: grouped key→action rows (keys in ink,
+  actions muted, quiet uppercase group headings). No color, no icons.
+
+---
+
+## 11 · Casing & content
+
+- **Sentence case** for all prose.
+- **UPPERCASE** is reserved for structural labels: tool families
+  (`SHELL`/`EXPLORE`/`EDIT`/`APPROVAL`), states (`DONE`/`RUNNING`/`ERROR`/…),
+  mode (`CODE`), section labels (`PLAN`/`THINKING`), and `EXIT`. **Never**
+  uppercase for emphasis in prose.
+- **Numbers are honest.** Token telemetry (`↑177k ↓5.7k`), durations (`7.6s`,
+  `1:27`), counts — shown compactly and only when real. Never assert savings the
+  runtime hasn't measured.
+- **Brevity.** Hints are short and inline (`↵ to send • shift+↵ for new line • /
+  for commands`). Placeholders use exact product casing.
+- **Emoji: none, ever.** State is carried by the glyph vocabulary.
+- **Progressive disclosure.** Minimal at a glance; complete and structured on
+  demand (`ctrl+o`). Nothing important is hidden; nothing trivial is shouted.
+
+---
+
+## 12 · Accessibility & the monochrome test
+
+- **The monochrome test is a hard gate.** Desaturate the whole pane: every state
+  must still be unambiguous from symbol + label + position. If a state is only
+  distinguishable by hue, it is broken.
+- Live regions: the working indicator is `role="status"`; the context meter is
+  `role="meter"` with `aria-valuenow`; decorative glyphs are `aria-hidden`.
+- All motion respects `prefers-reduced-motion`.
+- Contrast: ink on bg and muted on bg both clear the terminal-legibility bar in
+  both themes; stdout grey is deliberately recessive but still readable.
+
+---
+
+## 12.5 · The start page
+
+Shown when Iris launches interactively with no task and no resume target —
+before any transcript exists. Same pane chrome (session bar on top, composer
+on bottom, both live), with the launcher centered in the empty transcript
+area. Entering a session replaces the launcher with the normal transcript;
+nothing else changes — that is the point of the shared chrome. On the start
+page the session bar shows the launch cwd/branch and an empty meter
+(`CTX 0/<cap>`, all `○`).
+
+```
+~/demo ┊ git main                                     CTX 0/300k ○○○○○○○○○○
+
+                        ○ ○ ○ ● ○ ○ ○ ○ ○ ○ ○ ○        ← IrisMark (animated)
+
+                        ◉ New session ················ ctrl-n
+                          Resume session ·············· ctrl-r
+                          Settings ····················· ctrl-,
+                          Quit ························· ctrl-q
+
+──────────────────────────────────────────────────────────────────────
+Give Iris a task...
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+◉ CODE ─ GPT-5.5 XHIGH ─ ◆ always-approve
+```
+
+**IrisMark.** The logo IS an LED strip — no ASCII art, no figlet wordmark, no
+pictorial glyph. One row of 12 dots (`●`/`○` cells, single-spaced), centered. A
+single lit orange head sweeps back and forth (ping-pong: reverses at the ends,
+never wrapping), advancing one dot per ~130ms tick, with a 2-dot comet trail
+behind the travel direction (trail-1 non-bold orange, trail-2 dimmest; head
+bright orange). All other dots are dim `○`. It reuses the working indicator's
+tick machinery: it stops when the terminal is unfocused, and under
+`IRIS_REDUCED_MOTION` it holds a single static lit dot at the center.
+
+**Launcher.** A keyboard-navigable list (~44 columns, centered, one blank row
+below the mark) in the house picker idiom — NO hairline dividers between rows:
+a 1-col `◉` orange marker on the selected row, the action label (bold when
+selected), a dim dotted leader, and the right-aligned dim key hint. The
+selected row gets the `surface` fill across the menu width. `↑`/`↓` move the
+selection (wrapping), `↵` activates, and the listed `ctrl-` chords activate
+directly. The composer input stays live: typing a task and pressing `↵`
+starts the session with it.
+
+---
+
+## 13 · Invariants (golden tests — a build MUST satisfy)
+
+1. **One column.** No sidebar, no tabs, no separate status bar (the split
+   statusline lives on the session bar and inside the composer).
+2. **One blank line** between every top-level block. No other gap value.
+3. **Shared measure.** Panels + composer share one width and a 2-cell indent;
+   transcript text shares one column.
+4. **Panel rows** are each exactly one of {top·header·separator·body·bottom} and
+   all share one width; no row overflows the frame.
+5. **Four tool families only.** No standalone READ/GREP/LS/DIFF panels.
+6. **Chrome is for tools.** Conversation, thinking, plans, and notices are never
+   boxed. Boxes are never used for prose.
+7. **Square corners always** (`--radius: 0`).
+8. **State = symbol + label + color**, never color alone; the pane passes the
+   monochrome test.
+9. **One type size.** Hierarchy never uses a larger font in the pane.
+10. **Closed symbol set.** No glyph outside §5; `…`/`−`/`┊` (not `...`/`-`/`|`);
+    no emoji.
+11. **Composer is unconditional.** No show/hide/reveal/collapse mechanic.
+12. **Motion** is only the LED chase (working indicator + IrisMark) + edge
+    pulse, all reduced-motion safe.
+
+---
+
+## 14 · Anti-patterns (do NOT)
+
+- ✗ A role card / bubble / avatar for user or assistant messages.
+- ✗ A colored left-border accent on active rows (use the `surface` fill).
+- ✗ Boxing a code block, a plan, or a notice (that reads as a tool panel).
+- ✗ A braille spinner, a rainbow/percentage meter, or an animated progress bar.
+- ✗ A larger font, all-caps prose, or bold-for-emphasis to signal importance.
+- ✗ Emoji, gradients, rounded corners, drop shadows in the transcript, glass/blur.
+- ✗ ASCII `|` separators, ASCII `-` removals, or `...` ellipses.
+- ✗ Asserting efficiency/savings the runtime has not measured.
+- ✗ A fifth tool family, or a standalone READ/GREP/LS/DIFF panel.

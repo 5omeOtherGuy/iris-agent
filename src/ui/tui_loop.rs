@@ -47,7 +47,7 @@ use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
 use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::steering::SteeringQueue;
-use crate::ui::tui::{FocusTarget, Screen, TuiUi};
+use crate::ui::tui::{ApprovalPolicy, FocusTarget, Screen, StartAction, TuiUi};
 use crate::wayland::Harness;
 
 /// Spinner cadence. Input redraws are immediate (channel-driven), so this paces
@@ -162,8 +162,16 @@ pub(crate) fn run<P: ChatProvider>(
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<Modal>,
+    start_page: bool,
 ) -> Result<()> {
-    let result = runtime.block_on(session_loop(harness, &mut tui, switch, swap, startup_modal));
+    let result = runtime.block_on(session_loop(
+        harness,
+        &mut tui,
+        switch,
+        swap,
+        startup_modal,
+        start_page,
+    ));
     tui.shutdown();
     result
 }
@@ -187,6 +195,10 @@ enum IdleOutcome {
     CycleModel(bool),
     /// Shift+Tab: cycle the thinking/effort level.
     CycleEffort,
+    /// Start-page launcher: open the resume-session picker.
+    OpenResumePicker,
+    /// Start-page launcher: open the settings picker.
+    OpenSettings,
 }
 
 /// Per-key outcome inside the idle phase.
@@ -200,6 +212,8 @@ enum IdleKey {
     OpenModelPicker,
     CycleModel(bool),
     CycleEffort,
+    OpenResumePicker,
+    OpenSettings,
 }
 
 /// A gated tool waiting for the user's decision: the reply channel back into the
@@ -228,6 +242,7 @@ async fn session_loop<P: ChatProvider>(
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<Modal>,
+    start_page: bool,
 ) -> Result<()> {
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
@@ -243,6 +258,14 @@ async fn session_loop<P: ChatProvider>(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     tui.screen.apply(UiEvent::SessionStarted);
+    // The interactive loop gates every non-allowlisted tool through the
+    // approval prompt: the effective policy posture is `on-request`.
+    tui.screen.set_approval_policy(ApprovalPolicy::OnRequest);
+    // The start page (IrisMark + launcher) shows only for an interactive launch
+    // with no task and no resume target; a startup resume picker supersedes it.
+    if start_page && startup_modal.is_none() {
+        tui.screen.show_start_page();
+    }
     refresh_footer(tui, switch);
     // On startup, reconcile any crashed/unsettled Iris task in this repo and
     // expire stale ones (issue #263, ADR-0028), surfacing the recovery notice.
@@ -309,6 +332,21 @@ async fn session_loop<P: ChatProvider>(
                 if let Some(sw) = switch.as_mut() {
                     let lines = picker::cycle_effort(harness, sw);
                     apply_notices(tui, lines);
+                }
+            }
+            IdleOutcome::OpenResumePicker => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                match picker::open_resume(&cwd) {
+                    Some(modal) => tui.screen.open_modal(modal),
+                    None => apply_notices(
+                        tui,
+                        vec!["No prior sessions to resume for this directory.".to_string()],
+                    ),
+                }
+            }
+            IdleOutcome::OpenSettings => {
+                if let Some(sw) = switch.as_mut() {
+                    tui.screen.open_modal(picker::open_settings(sw));
                 }
             }
             IdleOutcome::Submit(prompt) => {
@@ -778,6 +816,8 @@ async fn idle_phase(
                         IdleKey::OpenModelPicker => return Ok(IdleOutcome::OpenModelPicker),
                         IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
                         IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
+                        IdleKey::OpenResumePicker => return Ok(IdleOutcome::OpenResumePicker),
+                        IdleKey::OpenSettings => return Ok(IdleOutcome::OpenSettings),
                     }
                 }
                 if draw_now {
@@ -791,7 +831,15 @@ async fn idle_phase(
                 pending_width_resize = None;
                 tui.draw()?;
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                // Idle animation: the start page's IrisMark sweep. `tick`
+                // reports false while no start page is shown (the spinner is
+                // idle here), under reduced motion, and while unfocused, so a
+                // plain idle session stays redraw-free.
+                if tui.screen.tick() {
+                    tui.draw()?;
+                }
+            }
         }
     }
 }
@@ -1388,6 +1436,62 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     // snapshot already computed above instead of re-joining the editor buffer.
     let focus = screen.focus_for(&input);
 
+    // Start-page launcher routing: the listed ctrl-chords activate directly,
+    // and while the composer is empty ↑/↓/↵ drive the launcher selection. The
+    // composer stays live throughout — typing a task and submitting it starts
+    // the session (the palette keeps priority for `/` input).
+    if screen.start_page_active() && focus != FocusTarget::Palette {
+        if ctrl {
+            match key.code {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    screen.leave_start_page();
+                    return IdleKey::Continue;
+                }
+                // Only while the composer is empty: once the user is typing a
+                // task, ctrl-r stays the editor's redo.
+                KeyCode::Char('r') | KeyCode::Char('R') if screen.editor_is_empty() => {
+                    return IdleKey::OpenResumePicker;
+                }
+                KeyCode::Char(',') => return IdleKey::OpenSettings,
+                KeyCode::Char('q') | KeyCode::Char('Q') => return IdleKey::Exit,
+                _ => {}
+            }
+        }
+        if screen.editor_is_empty() && !ctrl && !alt {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(page) = screen.start_page.as_mut() {
+                        page.up();
+                    }
+                    return IdleKey::Continue;
+                }
+                KeyCode::Down => {
+                    if let Some(page) = screen.start_page.as_mut() {
+                        page.down();
+                    }
+                    return IdleKey::Continue;
+                }
+                KeyCode::Enter => {
+                    let action = screen
+                        .start_page
+                        .as_ref()
+                        .map(|page| page.selected_action());
+                    return match action {
+                        Some(StartAction::NewSession) => {
+                            screen.leave_start_page();
+                            IdleKey::Continue
+                        }
+                        Some(StartAction::ResumeSession) => IdleKey::OpenResumePicker,
+                        Some(StartAction::Settings) => IdleKey::OpenSettings,
+                        Some(StartAction::Quit) => IdleKey::Exit,
+                        None => IdleKey::Continue,
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Global picker chords work regardless of editor contents (but not while the
     // slash palette is steering Up/Down/Enter): Ctrl+L opens the model picker,
     // Ctrl+P / Shift+Ctrl+P cycle models, Shift+Tab cycles effort.
@@ -1859,6 +1963,115 @@ mod tests {
             name: "bash".to_string(),
             arguments: serde_json::json!({ "command": "echo hi" }),
         }
+    }
+
+    #[test]
+    fn start_page_launcher_navigates_wraps_and_activates() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+
+        // ↓ moves to Resume session; ↵ activates it (opens the resume picker).
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Down)),
+            IdleKey::Continue
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::OpenResumePicker
+        ));
+
+        // ↑ wraps from the top row to Quit; ↵ exits.
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::Exit
+        ));
+    }
+
+    #[test]
+    fn start_page_ctrl_chords_activate_directly() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::OpenResumePicker
+        ));
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char(','), KeyModifiers::CONTROL)
+            ),
+            IdleKey::OpenSettings
+        ));
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Exit
+        ));
+        // ctrl-n enters the (already fresh) session: launcher dismissed.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+        assert!(!screen.start_page_active());
+        // Off the start page, ctrl-r is the editor's redo again.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+    }
+
+    #[test]
+    fn start_page_ctrl_r_stays_redo_once_the_composer_has_text() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+        handle_idle_event(&mut screen, key(KeyCode::Char('x')));
+        // A non-empty composer keeps ctrl-r as the editor's redo binding.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+        assert!(screen.start_page_active(), "launcher stays visible");
+    }
+
+    #[test]
+    fn start_page_composer_stays_live_and_submit_starts_the_session() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+        // Typing goes to the composer, not the launcher.
+        for c in "fix the bug".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        assert_eq!(screen.editor_text(), "fix the bug");
+        // With a non-empty composer, ↑/↓/↵ belong to the editor/submit path.
+        match handle_idle_event(&mut screen, key(KeyCode::Enter)) {
+            IdleKey::Submit(text) => assert_eq!(text, "fix the bug"),
+            _ => panic!("expected submit"),
+        }
+        // Entering the session (turn start) replaces the launcher.
+        screen.start_turn();
+        assert!(!screen.start_page_active());
     }
 
     #[test]

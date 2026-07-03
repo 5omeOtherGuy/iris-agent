@@ -283,7 +283,18 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
     let swap_cwd = cwd.clone();
     let swap =
         move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
-    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, startup_modal)
+    // The start page (IrisMark + launcher) shows only when Iris launches
+    // interactively with no task and no resume target; a bare `iris resume`
+    // opens the resume picker instead.
+    let start_page = startup_modal.is_none();
+    cli::run_interactive(
+        &mut harness,
+        &mut switch,
+        force_plain,
+        &swap,
+        startup_modal,
+        start_page,
+    )
 }
 
 /// Load the transcript state for an in-session `/resume` `/new` swap and point
@@ -471,7 +482,7 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     let swap_cwd = cwd.clone();
     let swap =
         move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
-    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, None)
+    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, None, false)
 }
 
 /// Log the most recent prior session for `cwd` (if any) via the read side of
