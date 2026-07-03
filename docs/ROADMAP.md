@@ -14,9 +14,12 @@
 > Nexus runs a tokio async loop with turn-level cancellation: the provider is an
 > async stream raced against cancellation, tools are async with child tokens,
 > concurrency-safe tools run in parallel while everything else stays exclusive,
-> and the transcript stays valid on abort. The active Milestone 2 gate is proof:
-> benchmark that the token/handle/compaction path reduces prompt tokens without
-> reducing task success. This roadmap defines build order and acceptance
+> and the transcript stays valid on abort. The active gate (2026-07-03) is the
+> first Git-Centered Workflow slice (epic
+> [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), ADR-0028) —
+> sequenced ahead of the Milestone 2 benchmark proof. The benchmark gate
+> (prove the token/handle/compaction path reduces prompt tokens without
+> reducing task success) follows it. This roadmap defines build order and acceptance
 > criteria. `FEATURES.md` remains the capability inventory; this document says
 > what to build first.
 
