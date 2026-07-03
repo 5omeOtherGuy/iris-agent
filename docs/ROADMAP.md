@@ -874,12 +874,22 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   command, feed failures back, retry bounded; external-signal driven, not an
   LLM self-critique pass
   ([#265](https://github.com/5omeOtherGuy/iris-agent/issues/265)).
+- Worktree isolation slice — design ADR only
+  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267)). Settled
+  framing: worktree isolation is Tier 0 of the ADR-0028 guarantee model; apply
+  is a settlement event that mutates the parent workspace through the #262
+  choke point; the final diff engine (#264) doubles as the apply review
+  artifact. Reference:
+  [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md)
+  (reverse-engineered Grok Build subsystem — reference, not a decision).
+  Reserves the task-tool `isolation` schema seam in Milestone 4
+  ([#216](https://github.com/5omeOtherGuy/iris-agent/issues/216)).
 
 Later slices (not in #261):
 
 - Per-hunk staging.
 - Optional auto-commit behind explicit approval.
-- Worktree support.
+- Worktree support implementation (design: #267; own gate).
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user
