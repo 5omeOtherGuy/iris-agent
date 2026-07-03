@@ -1762,6 +1762,13 @@ fn handle_running_event(
                 }
                 return true;
             }
+            // Pager scroll keys stay live while a turn runs -- including while
+            // an approval is pending (scrolling history is exactly what a
+            // reviewer needs before deciding); they never collide with the
+            // y/a/p/n approval keys and never edit or steer.
+            if pager_scroll_key(screen, key.code, ctrl, alt) {
+                return true;
+            }
             // While a tool is awaiting approval, the composer is frozen: only the
             // approval keys act, and any other key is ignored (never typed).
             if let Some(p) = pending.as_ref() {
@@ -1786,11 +1793,6 @@ fn handle_running_event(
                     return true;
                 }
                 return false;
-            }
-            // Pager scroll keys stay live while a turn runs (that is the
-            // point of follow mode); they never edit or steer.
-            if pager_scroll_key(screen, key.code, ctrl, alt) {
-                return true;
             }
             // No approval pending: the composer is live for steering. Enter
             // queues a steering message (injected before the next provider
