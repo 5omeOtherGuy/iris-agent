@@ -257,6 +257,26 @@ impl UiEvent {
             AgentEvent::ToolCancelled(call) => UiEvent::ToolCancelled(call),
             AgentEvent::UserMessage(text) => UiEvent::UserMessage(text),
             AgentEvent::Notice(message) => UiEvent::Notice(message),
+            // Dirty-tree safety (issue #262) surfaces through the existing
+            // notice channel: the baseline summary and any violation are
+            // rendered as advisory notices, no new UI surface.
+            AgentEvent::DirtyBaseline(summary) => UiEvent::Notice(summary),
+            AgentEvent::MutationViolation {
+                call,
+                paths,
+                restored,
+            } => {
+                let recovery = if restored {
+                    "restored from snapshot"
+                } else {
+                    "snapshot restore failed"
+                };
+                UiEvent::Notice(format!(
+                    "`{}` modified protected uncommitted file(s): {} ({recovery})",
+                    call.name,
+                    paths.join(", ")
+                ))
+            }
             AgentEvent::TurnComplete => UiEvent::TurnComplete,
         }
     }
