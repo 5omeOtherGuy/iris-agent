@@ -22,14 +22,16 @@
 - **Alt-screen pager TUI** — full-frame alternate-screen renderer
   ([ADR-0029](adr/0029-adopt-alt-screen-pager-tui.md)): viewport-pinned
   session bar, Iris-owned scrollback with follow mode
-  (PageUp/PageDown, Alt+Up/Down line scroll, Home/End, re-engage by
-  overscroll, dim `▾ N lines below` indicator), O(viewport) windowed
-  rendering over the wrap cache, panic-safe alt-screen restore. Policy:
-  `tui.altScreen = auto|always|never` (default `never` until mouse/clipboard
-  land), `--no-alt-screen`, `IRIS_NO_ALT_SCREEN`; tmux control mode, Zellij,
-  dumb terminals, and non-TTY stdio degrade to the inline renderer with a
-  notice. Mouse wheel + clipboard ladder and the capability doctor are next.
-  [Partial]
+  (PageUp/PageDown, Alt+Up/Down line scroll, Home/End, mouse wheel at
+  `tui.scrollSpeed` lines/tick, re-engage by overscroll, dim `▾ N lines
+  below` indicator), O(viewport) windowed rendering over the wrap cache,
+  panic-safe alt-screen restore, mouse capture with a runtime toggle (Ctrl+T
+  / `/mouse`; off restores terminal-native select/copy, statusline shows
+  `○ mouse off`), clipboard ladder (native tools → OSC 52) behind `/copy`.
+  Policy: `tui.altScreen = auto|always|never` (default `auto`),
+  `--no-alt-screen`, `IRIS_NO_ALT_SCREEN`; tmux control mode, Zellij, dumb
+  terminals, and non-TTY stdio degrade to the inline renderer with a notice.
+  The `/terminal-setup` capability doctor is next. [Partial]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process, plus linear session resume from persisted transcripts.
   [Partial]

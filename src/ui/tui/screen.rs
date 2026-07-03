@@ -586,6 +586,12 @@ pub(crate) struct Screen {
     /// Whether the alt-screen pager renders this screen. Gates the pager-only
     /// scroll keys so inline-mode input routing is untouched.
     pub(crate) pager_active: bool,
+    /// Desired mouse-capture state in pager mode (Ctrl+T / `/mouse` toggle it;
+    /// `TuiUi::draw` syncs the terminal to it). Off restores terminal-native
+    /// select/copy; the composer statusline shows `○ mouse off` while off.
+    pub(crate) mouse_capture: bool,
+    /// Wheel scroll step in lines (pager mode; `tui.scrollSpeed`, default 3).
+    pub(crate) scroll_speed: u16,
 }
 
 impl Screen {
@@ -609,7 +615,15 @@ impl Screen {
             last_session_bar: None,
             scroll: super::pager::ScrollState::default(),
             pager_active: false,
+            mouse_capture: true,
+            scroll_speed: 3,
         }
+    }
+
+    /// Flip the desired pager mouse-capture state; returns the new state.
+    pub(crate) fn toggle_mouse(&mut self) -> bool {
+        self.mouse_capture = !self.mouse_capture;
+        self.mouse_capture
     }
 
     /// Show the start page (IrisMark + launcher) until the session begins.
@@ -1220,15 +1234,33 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
             Span::styled(policy.label().to_string(), dim_style()),
         ]
     };
+    // Pager-only state hint while mouse reporting is toggled off (Ctrl+T):
+    // terminal-native selection is active. Symbol + label, never color alone.
+    let mouse_off = screen.pager_active && !screen.mouse_capture;
+    let mouse_seg = || {
+        vec![
+            Span::styled(format!("{} ", crate::ui::symbols::EMPTY), dim_style()),
+            Span::styled("mouse off".to_string(), dim_style()),
+        ]
+    };
 
     // Candidates from fullest to minimum. The drop order is monotonic and
-    // matches the spec: drop the policy segment, then effort, leaving the
-    // minimum `◉ CODE ─ MODEL`.
-    let candidates: Vec<Vec<Vec<Span<'static>>>> = vec![
+    // matches the spec: drop the mouse hint, then the policy segment, then
+    // effort, leaving the minimum `◉ CODE ─ MODEL`.
+    let mut candidates: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
+    if mouse_off {
+        candidates.push(vec![
+            mode_seg(),
+            model_with_effort(),
+            policy_seg(),
+            mouse_seg(),
+        ]);
+    }
+    candidates.extend([
         vec![mode_seg(), model_with_effort(), policy_seg()],
         vec![mode_seg(), model_with_effort()],
         vec![mode_seg(), model_only()],
-    ];
+    ]);
 
     let spans = candidates
         .into_iter()
@@ -1829,6 +1861,32 @@ mod tests {
             assert!(!status.contains("~/repo"), "{status:?}");
             assert!(!status.contains("CTX"), "{status:?}");
         }
+    }
+
+    #[test]
+    fn bottom_statusline_shows_mouse_off_hint_only_in_pager_mode() {
+        let mut screen = footer_screen("~/repo");
+        screen.set_approval_policy(ApprovalPolicy::OnRequest);
+        // Inline mode, capture on/off: never a hint.
+        screen.mouse_capture = false;
+        let status = composer_statusline(&screen, 80)
+            .map(|l| line_text(&l))
+            .expect("statusline");
+        assert!(!status.contains("mouse off"), "{status:?}");
+
+        // Pager mode with capture off: dim `○ mouse off` segment appears.
+        screen.pager_active = true;
+        let status = composer_statusline(&screen, 80)
+            .map(|l| line_text(&l))
+            .expect("statusline");
+        assert!(status.contains("\u{25cb} mouse off"), "{status:?}");
+
+        // Capture back on: hint disappears.
+        assert!(screen.toggle_mouse());
+        let status = composer_statusline(&screen, 80)
+            .map(|l| line_text(&l))
+            .expect("statusline");
+        assert!(!status.contains("mouse off"), "{status:?}");
     }
 
     #[test]

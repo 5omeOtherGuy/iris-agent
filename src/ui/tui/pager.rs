@@ -28,6 +28,7 @@ use std::sync::Once;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{MoveTo, Show};
+use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
     LeaveAlternateScreen, disable_raw_mode,
@@ -230,7 +231,20 @@ fn emergency_restore<W: Write>(writer: &mut W) -> io::Result<()> {
         return Ok(());
     }
     let _ = disable_raw_mode();
-    queue!(writer, LeaveAlternateScreen, Show)?;
+    // Mouse capture is on by default in pager mode; drop it before leaving so
+    // a panic never strands the terminal reporting mouse escapes at the shell.
+    queue!(writer, DisableMouseCapture, LeaveAlternateScreen, Show)?;
+    writer.flush()
+}
+
+/// Emit the mouse-capture enable/disable sequence (SGR + motion modes via
+/// crossterm). Pager mode only; the inline surface never captures the mouse.
+pub(super) fn set_mouse_capture<W: Write>(writer: &mut W, on: bool) -> io::Result<()> {
+    if on {
+        queue!(writer, EnableMouseCapture)?;
+    } else {
+        queue!(writer, DisableMouseCapture)?;
+    }
     writer.flush()
 }
 
@@ -410,6 +424,33 @@ mod tests {
     /// resets the flag to inactive on acquisition.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         crate::signals::alt_screen_test_guard()
+    }
+
+    /// Expected emergency-restore byte sequence, built from the same
+    /// crossterm commands so the golden tracks crossterm's encoding.
+    fn emergency_restore_bytes() -> Vec<u8> {
+        let mut expected = Vec::new();
+        queue!(expected, DisableMouseCapture, LeaveAlternateScreen, Show).expect("queue");
+        expected
+    }
+
+    #[test]
+    fn mouse_capture_toggle_emits_enable_and_disable_sequences() {
+        let mut on = Vec::new();
+        set_mouse_capture(&mut on, true).expect("enable");
+        let mut expected_on = Vec::new();
+        queue!(expected_on, EnableMouseCapture).expect("queue");
+        assert_eq!(on, expected_on);
+        assert!(
+            String::from_utf8_lossy(&on).contains("\x1b[?1006h"),
+            "SGR encoding mode is part of the enable sequence"
+        );
+
+        let mut off = Vec::new();
+        set_mouse_capture(&mut off, false).expect("disable");
+        let mut expected_off = Vec::new();
+        queue!(expected_off, DisableMouseCapture).expect("queue");
+        assert_eq!(off, expected_off);
     }
 
     fn footer_screen() -> Screen {
@@ -694,7 +735,7 @@ mod tests {
         crate::signals::set_alt_screen_active(true);
         let mut out = Vec::new();
         emergency_restore(&mut out).expect("restore");
-        assert_eq!(out, b"\x1b[?1049l\x1b[?25h");
+        assert_eq!(out, emergency_restore_bytes());
         assert!(!crate::signals::alt_screen_active());
 
         // A second emergency restore (hook then Drop racing) is a no-op.
@@ -710,7 +751,7 @@ mod tests {
         // Simulate the panic hook having already restored the screen.
         let mut hook_out = Vec::new();
         emergency_restore(&mut hook_out).expect("restore");
-        assert_eq!(hook_out, b"\x1b[?1049l\x1b[?25h");
+        assert_eq!(hook_out, emergency_restore_bytes());
         surface.writer.clear();
         surface.leave().expect("leave");
         assert!(

@@ -25,9 +25,10 @@ pub(crate) enum AltScreenConfig {
     Never,
 }
 
-/// Built-in default until the pager is feature-complete (flips to `Auto` once
-/// mouse + clipboard land -- Milestone 6 S4).
-pub(crate) const DEFAULT_ALT_SCREEN: AltScreenConfig = AltScreenConfig::Never;
+/// Built-in default: the pager on capable terminals, inline on multiplexer/
+/// dumb-terminal degrades (ADR-0029). Flipped from `Never` once mouse +
+/// clipboard landed (Milestone 6 S4).
+pub(crate) const DEFAULT_ALT_SCREEN: AltScreenConfig = AltScreenConfig::Auto;
 
 impl AltScreenConfig {
     /// Parse a settings value. `None` for anything but the three documented
@@ -278,6 +279,15 @@ mod tests {
                 resolution.notices
             );
         }
+    }
+
+    #[test]
+    fn default_config_selects_the_pager_on_a_plain_terminal() {
+        assert_eq!(DEFAULT_ALT_SCREEN, AltScreenConfig::Auto);
+        assert_eq!(
+            resolve(DEFAULT_ALT_SCREEN, false, &plain_tty()).mode,
+            ScreenMode::Pager
+        );
     }
 
     #[test]
