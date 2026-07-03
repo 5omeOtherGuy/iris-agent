@@ -700,7 +700,9 @@ fn route_command<P: ChatProvider>(
             Ok(RouteOutcome::Consumed)
         }
         "/find" => {
-            tui.screen.commit_user(prompt);
+            // Deliberately NOT committed to the transcript: the command row
+            // would otherwise always match its own query. The indicator row
+            // carries the query while the search is active.
             if !tui.screen.pager_active {
                 apply_notices(
                     tui,
