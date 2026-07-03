@@ -1876,6 +1876,114 @@ impl Transcript {
         self.render_cached(width, false)
     }
 
+    /// Refresh the streaming-preview memo for `width` (no-op when the stream
+    /// did not grow). Shared by the full render and the pager's windowed
+    /// render so both see the same transient stream rows.
+    fn refresh_streaming_memo(&mut self, width: usize) {
+        let Some(text) = self.streaming.as_ref() else {
+            return;
+        };
+        let fresh = self
+            .streaming_render
+            .as_ref()
+            .is_some_and(|memo| memo.len == text.len() && memo.width == width);
+        if !fresh {
+            let mut lines = Vec::new();
+            for row in &pane::streaming_assistant_rows(text, width) {
+                row.render_rows(width, &mut lines);
+            }
+            self.streaming_render = Some(StreamingRender {
+                len: text.len(),
+                width,
+                lines,
+            });
+        }
+    }
+
+    /// Number of transient streaming-preview lines at `width` (0 when idle).
+    fn streaming_lines(&self) -> usize {
+        if self.streaming.is_some() {
+            self.streaming_render
+                .as_ref()
+                .map_or(0, |memo| memo.lines.len())
+        } else {
+            0
+        }
+    }
+
+    /// Total visible physical lines (committed rows + streaming preview) at
+    /// `width`, refreshing the wrap cache. O(dirty suffix), O(1) once warm --
+    /// the pager calls this every frame regardless of transcript length.
+    pub(super) fn visible_total(&mut self, width: u16) -> usize {
+        let width = usize::from(width);
+        self.last_width = width
+            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+            .max(1);
+        self.ensure_wrapped_cache(width);
+        self.refresh_streaming_memo(width);
+        let committed = self
+            .wrapped_cache
+            .rows
+            .last()
+            .map_or(0, |layout| layout.visible_cum);
+        committed + self.streaming_lines()
+    }
+
+    /// Clone exactly the visible physical lines `[top .. top+rows)` out of the
+    /// wrap cache (plus the streaming preview when the window reaches it).
+    /// Callers must have the window clamped against [`Self::visible_total`]
+    /// for the same width. Cost: O(rows + log transcript), never O(transcript)
+    /// -- this is the pager's visible-range-only render (ADR-0029).
+    pub(super) fn render_window(
+        &mut self,
+        width: u16,
+        top: usize,
+        rows: usize,
+    ) -> Vec<Line<'static>> {
+        let total = self.visible_total(width);
+        let committed = total - self.streaming_lines();
+        let end = (top + rows).min(total);
+        if top >= end {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(end - top);
+        if top < committed {
+            // First cached row whose cumulative visible count exceeds `top`.
+            let mut idx = self
+                .wrapped_cache
+                .rows
+                .partition_point(|layout| layout.visible_cum <= top);
+            let mut pos = if idx == 0 {
+                0
+            } else {
+                self.wrapped_cache.rows[idx - 1].visible_cum
+            };
+            'rows: while idx < self.wrapped_cache.rows.len() {
+                let layout = &self.wrapped_cache.rows[idx];
+                if layout.visible {
+                    for line in &self.wrapped_cache.lines[layout.lines.clone()] {
+                        if pos >= end {
+                            break 'rows;
+                        }
+                        if pos >= top {
+                            out.push(line.clone());
+                        }
+                        pos += 1;
+                    }
+                }
+                idx += 1;
+            }
+        }
+        if end > committed
+            && let Some(memo) = self.streaming_render.as_ref()
+        {
+            let from = top.max(committed) - committed;
+            let until = end - committed;
+            out.extend(memo.lines[from..until].iter().cloned());
+        }
+        out
+    }
+
     pub(super) fn render_incremental(&mut self, width: u16) -> TranscriptRender {
         self.render_cached(width, true)
     }
@@ -1928,25 +2036,11 @@ impl Transcript {
         // mutate retained row ranges. Its wrapped lines are memoized on
         // `(len, width)` so only frames where the stream actually grew pay the
         // markdown re-parse.
-        if let Some(text) = self.streaming.as_ref() {
-            let fresh = self
-                .streaming_render
-                .as_ref()
-                .is_some_and(|memo| memo.len == text.len() && memo.width == width);
-            if !fresh {
-                let mut lines = Vec::new();
-                for row in &pane::streaming_assistant_rows(text, width) {
-                    row.render_rows(width, &mut lines);
-                }
-                self.streaming_render = Some(StreamingRender {
-                    len: text.len(),
-                    width,
-                    lines,
-                });
-            }
-            if let Some(memo) = self.streaming_render.as_ref() {
-                out.extend(memo.lines.iter().cloned());
-            }
+        self.refresh_streaming_memo(width);
+        if self.streaming.is_some()
+            && let Some(memo) = self.streaming_render.as_ref()
+        {
+            out.extend(memo.lines.iter().cloned());
         }
         let total_lines = stable_prefix + out.len();
         TranscriptRender {

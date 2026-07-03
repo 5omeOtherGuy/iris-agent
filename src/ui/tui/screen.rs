@@ -578,6 +578,14 @@ pub(crate) struct Screen {
     /// stable-prefix hint stays accurate: the transcript's stable prefix only
     /// extends below the bar when the bar itself did not change.
     last_session_bar: Option<(u16, Vec<Line<'static>>)>,
+    /// Pager-mode scroll offset + follow state (ADR-0029). Unused (and never
+    /// mutated) in inline mode; the only pager-only state besides the mode
+    /// flag, per the ADR's "no pager-only transcript state beyond
+    /// scroll/focus" rule.
+    pub(crate) scroll: super::pager::ScrollState,
+    /// Whether the alt-screen pager renders this screen. Gates the pager-only
+    /// scroll keys so inline-mode input routing is untouched.
+    pub(crate) pager_active: bool,
 }
 
 impl Screen {
@@ -599,6 +607,8 @@ impl Screen {
             approval_policy: ApprovalPolicy::OnRequest,
             start_page: None,
             last_session_bar: None,
+            scroll: super::pager::ScrollState::default(),
+            pager_active: false,
         }
     }
 
@@ -714,6 +724,21 @@ impl Screen {
     /// Render all transcript rows plus any in-flight stream, wrapped to `width`.
     /// Finalized history is intentionally retained here; the terminal surface
     /// owns append/diff/full-replay decisions instead of draining UI state.
+    /// Total visible transcript lines at `width` (pager layout math).
+    pub(super) fn transcript_visible_total(&mut self, width: u16) -> usize {
+        self.transcript.visible_total(width)
+    }
+
+    /// Clone the visible transcript window `[top .. top+rows)` (pager render).
+    pub(super) fn transcript_window(
+        &mut self,
+        width: u16,
+        top: usize,
+        rows: usize,
+    ) -> Vec<Line<'static>> {
+        self.transcript.render_window(width, top, rows)
+    }
+
     pub(super) fn wrapped_lines(&mut self, width: u16) -> TranscriptRender {
         self.transcript.render(width)
     }
@@ -824,6 +849,8 @@ impl Screen {
         // A submitted task enters the session: the launcher gives way to the
         // normal transcript, under the same chrome.
         self.start_page = None;
+        // Pager: a submitted prompt snaps the view back to the live tail.
+        self.scroll.follow_latest();
         self.spinner.start();
         self.turn_divider = TurnDivider::default();
         self.approval_hint = None;
@@ -1066,7 +1093,7 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
 /// The filler section between the transcript and the bottom-pinned tail:
 /// blank rows normally, or the start page's centered IrisMark + launcher block
 /// (vertically centered, truncated when the viewport is too short).
-fn filler_lines(screen: &Screen, filler_rows: usize, width: u16) -> Vec<Line<'static>> {
+pub(super) fn filler_lines(screen: &Screen, filler_rows: usize, width: u16) -> Vec<Line<'static>> {
     let Some(page) = &screen.start_page else {
         return std::iter::repeat_with(Line::default)
             .take(filler_rows)
@@ -1452,7 +1479,11 @@ fn composer_text_x_offset(box_width: u16) -> u16 {
         .min(box_width.saturating_sub(1))
 }
 
-fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Line<'static>> {
+pub(super) fn render_editor_chrome(
+    screen: &mut Screen,
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
     let area = Rect::new(0, 0, width, height);
 
     // The composer editor always renders at its natural height; the approval

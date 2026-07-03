@@ -1429,6 +1429,13 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // Pager scroll keys act before editor routing (scrollback has implicit
+    // focus for the nav keys); typing/other keys fall through to the composer.
+    if pager_scroll_key(screen, key.code, ctrl, alt) {
+        return IdleKey::Continue;
+    }
+
     let input = screen.editor_text();
 
     // Explicit focus routing (Editor < Palette < Modal). Modals run in their own
@@ -1692,6 +1699,27 @@ fn resolve_input_eof(
 /// While a tool is awaiting approval the composer is frozen and only the
 /// approval keys (plus Ctrl-C/-O) act, so a `y`/`n` can't be both an answer and
 /// typed text. Returns whether a redraw is needed.
+/// Pager-mode scrollback navigation (ADR-0029). Consumes the key when it
+/// scrolled: PageUp/PageDown page, Alt+Up/Alt+Down scroll one line (Ctrl+J/K
+/// stay editor kill-ring keys), and Home/End jump to the ends -- but only
+/// while the composer is empty, so editing keeps its line-start/end keys.
+/// Inline mode (`pager_active == false`) never consumes anything.
+fn pager_scroll_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    if !screen.pager_active || ctrl {
+        return false;
+    }
+    match code {
+        KeyCode::PageUp => screen.scroll.page_up(),
+        KeyCode::PageDown => screen.scroll.page_down(),
+        KeyCode::Up if alt => screen.scroll.scroll_up(1),
+        KeyCode::Down if alt => screen.scroll.scroll_down(1),
+        KeyCode::Home if !alt && screen.editor_is_empty() => screen.scroll.jump_to_start(),
+        KeyCode::End if !alt && screen.editor_is_empty() => screen.scroll.follow_latest(),
+        _ => return false,
+    }
+    true
+}
+
 fn handle_running_event(
     screen: &mut Screen,
     event: Event,
@@ -1758,6 +1786,11 @@ fn handle_running_event(
                     return true;
                 }
                 return false;
+            }
+            // Pager scroll keys stay live while a turn runs (that is the
+            // point of follow mode); they never edit or steer.
+            if pager_scroll_key(screen, key.code, ctrl, alt) {
+                return true;
             }
             // No approval pending: the composer is live for steering. Enter
             // queues a steering message (injected before the next provider
@@ -1950,6 +1983,38 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn pager_scroll_keys_gate_on_pager_mode_and_composer_state() {
+        let mut screen = Screen::new();
+        // Inline mode: nothing is consumed, editor keeps every key.
+        assert!(!pager_scroll_key(
+            &mut screen,
+            KeyCode::PageUp,
+            false,
+            false
+        ));
+        assert!(!pager_scroll_key(&mut screen, KeyCode::Home, false, false));
+
+        screen.pager_active = true;
+        screen.scroll.sync(100, 20);
+        // PageUp scrolls and disengages follow.
+        assert!(pager_scroll_key(&mut screen, KeyCode::PageUp, false, false));
+        assert!(!screen.scroll.is_following());
+        // Alt+Down line-scrolls; plain Down stays with the editor.
+        assert!(pager_scroll_key(&mut screen, KeyCode::Down, false, true));
+        assert!(!pager_scroll_key(&mut screen, KeyCode::Down, false, false));
+        // Ctrl chords never scroll (Ctrl+J/K stay editor kill-ring keys).
+        assert!(!pager_scroll_key(&mut screen, KeyCode::PageUp, true, false));
+        // Home/End scroll only while the composer is empty.
+        assert!(pager_scroll_key(&mut screen, KeyCode::Home, false, false));
+        screen.set_editor("draft");
+        assert!(!pager_scroll_key(&mut screen, KeyCode::Home, false, false));
+        assert!(!pager_scroll_key(&mut screen, KeyCode::End, false, false));
+        screen.clear_editor();
+        assert!(pager_scroll_key(&mut screen, KeyCode::End, false, false));
+        assert!(screen.scroll.is_following());
     }
 
     fn key_mod(code: KeyCode, mods: KeyModifiers) -> Event {
