@@ -164,6 +164,69 @@ pub(crate) fn handle_model_command<P: ChatProvider>(
     }
 }
 
+/// Route `/rollback`, `/accept`, and `/checkpoint` through the harness-owned
+/// checkpoint API (issue #263, ADR-0028). Returns `None` when the line is not
+/// one of these commands (the caller submits it as a normal prompt);
+/// `Some(lines)` when handled, with the notices to display. `/rollback` requires
+/// an explicit restore-point number: typing it is the confirmation that Iris's
+/// own work at/after that point may be discarded (user paths are never touched).
+pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
+    line: &str,
+    harness: &mut Harness<P>,
+) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (trimmed, ""),
+    };
+    match cmd {
+        "/accept" => Some(match harness.accept_checkpoint() {
+            Some(summary) => vec![summary],
+            None => vec!["no unsettled Iris changes to accept".to_string()],
+        }),
+        "/checkpoint" => Some(match harness.save_checkpoint() {
+            Some(summary) => vec![summary],
+            None => vec!["no Iris changes to checkpoint".to_string()],
+        }),
+        "/rollback" => Some(handle_rollback(rest, harness)),
+        _ => None,
+    }
+}
+
+/// `/rollback` (no args) lists the restore points; `/rollback <n>` restores that
+/// point. Only Iris-authored work and the user's index are affected.
+fn handle_rollback<P: ChatProvider>(rest: &str, harness: &mut Harness<P>) -> Vec<String> {
+    let points = harness.checkpoint_restore_points();
+    if points.is_empty() {
+        return vec!["no unsettled Iris changes to roll back".to_string()];
+    }
+    if rest.is_empty() {
+        let mut lines =
+            vec!["restore points (/rollback <n> discards Iris's own work at/after n):".to_string()];
+        for point in &points {
+            lines.push(format!("  {} - {}", point.seq, point.label));
+        }
+        return lines;
+    }
+    let seq = match rest.parse::<u64>() {
+        Ok(seq) => seq,
+        Err(_) => return vec!["usage: /rollback <n> (a restore point number)".to_string()],
+    };
+    if !points.iter().any(|point| point.seq == seq) {
+        return vec![format!(
+            "no restore point {seq}; run /rollback to list them"
+        )];
+    }
+    match harness.rollback_checkpoint(seq) {
+        Ok(outcome) => {
+            let mut lines = vec![outcome.summary];
+            lines.extend(outcome.index_warning);
+            lines
+        }
+        Err(error) => vec![format!("rollback failed: {error:#}")],
+    }
+}
+
 /// `/model` (no args) shows the current selection; `/model <provider>/<model>`
 /// or `/model <model>` switches by exact id.
 fn handle_model<P: ChatProvider>(
@@ -598,6 +661,14 @@ fn run_session_inner<P: ChatProvider>(
             }
             continue;
         }
+        // Checkpoint/rollback commands (issue #263) settle or restore the current
+        // Iris task at this same safe boundary.
+        if let Some(lines) = handle_checkpoint_command(prompt, harness) {
+            for line in lines {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
 
         // Clear any stale interrupt BEFORE arming the watcher, so a Ctrl-C left
         // over from the idle prompt cannot cancel this fresh turn immediately.
@@ -816,6 +887,28 @@ mod tests {
         assert_eq!(lines[0], format!("session: {id}"));
         assert_eq!(lines[1], format!("file: {}", path.display()));
         assert!(lines[3].contains("no budget"), "{lines:?}");
+    }
+
+    #[test]
+    fn checkpoint_command_routes_and_ignores_others() {
+        let (mut harness, _dir) = fake_harness();
+        // Non-checkpoint lines fall through so the caller sends them as prompts.
+        assert!(handle_checkpoint_command("hello there", &mut harness).is_none());
+        assert!(handle_checkpoint_command("/model", &mut harness).is_none());
+        // With no active task, each command reports the empty state (never panics
+        // or sends the line to the model).
+        assert_eq!(
+            handle_checkpoint_command("/accept", &mut harness).unwrap(),
+            vec!["no unsettled Iris changes to accept".to_string()]
+        );
+        assert_eq!(
+            handle_checkpoint_command("/rollback", &mut harness).unwrap(),
+            vec!["no unsettled Iris changes to roll back".to_string()]
+        );
+        assert_eq!(
+            handle_checkpoint_command("/checkpoint", &mut harness).unwrap(),
+            vec!["no Iris changes to checkpoint".to_string()]
+        );
     }
 
     #[test]

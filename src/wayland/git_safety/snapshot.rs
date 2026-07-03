@@ -52,6 +52,14 @@ impl Snapshot {
         Self { files }
     }
 
+    /// The pre-call bytes captured for `path`: `Some(Some(bytes))` = present at
+    /// snapshot time, `Some(None)` = captured-but-absent, `None` = not captured.
+    /// The checkpoint chain (#263) reads this to blob a ledger path's exact
+    /// pre-task content without re-reading a now-mutated file.
+    pub(super) fn pre_bytes(&self, path: &Path) -> Option<&Option<Vec<u8>>> {
+        self.files.get(path)
+    }
+
     /// Paths whose on-disk bytes differ from the snapshot (created, deleted, or
     /// modified since capture).
     pub(super) fn changed_paths(&self) -> Vec<PathBuf> {
@@ -85,5 +93,93 @@ impl Snapshot {
             }
         }
         Ok(())
+    }
+}
+
+/// Non-git checkpoint fallback (issue #263, ADR-0028 Alternative 3): plain
+/// content snapshots of the paths Iris touches, so a rollback can restore them
+/// even in a directory git cannot back. It mirrors the git chain's before/point
+/// model (`seq 0` = pre-task base, `seq >= 1` = each op) but with reduced
+/// guarantees -- in-process restore points only, no ref-anchored durability
+/// across a crash, no git rename/mode object semantics -- which the guard
+/// announces as degraded. Deliberately minimal: the honest fallback, not a
+/// second full engine.
+/// A path -> pre/at-op bytes map (`None` = absent). The shared shape of the
+/// fallback base and each op restore point.
+type ContentMap = BTreeMap<PathBuf, Option<Vec<u8>>>;
+
+#[derive(Default)]
+pub(super) struct FallbackStore {
+    /// Pre-task bytes per touched path (first-touch wins). `None` = the path did
+    /// not exist pre-task, so a base rollback removes it.
+    before: ContentMap,
+    /// Ordered op restore points (seq 1..), each a full snapshot of every
+    /// touched path at that op, with its label.
+    points: Vec<(String, ContentMap)>,
+}
+
+impl FallbackStore {
+    /// Capture a path's pre-task bytes the first time it is touched (idempotent).
+    pub(super) fn note_before(&mut self, path: &Path, bytes: Option<Vec<u8>>) {
+        self.before.entry(path.to_path_buf()).or_insert(bytes);
+    }
+
+    /// Append a restore point snapshotting the current on-disk bytes of every
+    /// touched path.
+    pub(super) fn checkpoint(&mut self, label: String) {
+        let snapshot = self
+            .before
+            .keys()
+            .map(|path| (path.clone(), fs::read(path).ok()))
+            .collect();
+        self.points.push((label, snapshot));
+    }
+
+    /// Number of op restore points recorded (excludes the base).
+    pub(super) fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Restore-point labels for the UI: base first, then each op oldest-first.
+    pub(super) fn labels(&self) -> Vec<String> {
+        let mut out = vec!["pre-task baseline".to_string()];
+        out.extend(self.points.iter().map(|(label, _)| label.clone()));
+        out
+    }
+
+    /// Restore every touched path to its state at `seq` (0 = pre-task base).
+    pub(super) fn rollback_to(&self, seq: u64) -> Result<()> {
+        let files: &ContentMap = if seq == 0 {
+            &self.before
+        } else {
+            match self.points.get((seq - 1) as usize) {
+                Some((_, files)) => files,
+                None => return Ok(()),
+            }
+        };
+        for (path, bytes) in files {
+            match bytes {
+                Some(bytes) => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!("failed to recreate parent for {}", path.display())
+                        })?;
+                    }
+                    fs::write(path, bytes)
+                        .with_context(|| format!("failed to restore {}", path.display()))?;
+                }
+                None => {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep only the newest `keep` op restore points (base always kept),
+    /// mirroring the git chain's settlement GC.
+    pub(super) fn gc(&mut self, keep: usize) {
+        let drop = self.points.len().saturating_sub(keep);
+        self.points.drain(0..drop);
     }
 }

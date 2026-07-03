@@ -222,7 +222,7 @@ fn bash_violation_detected_and_restored() {
 
     // A mutating tool with no approved target (bash): snapshot, then simulate
     // the command overwriting both a dirty and an untracked protected file.
-    guard.before_exec();
+    guard.before_exec(&[]);
     fs::write(&dirty, "clobbered\n").unwrap();
     fs::write(&untracked, "clobbered\n").unwrap();
 
@@ -258,7 +258,7 @@ fn non_git_directory_degrades_without_gating() {
             .is_empty()
     );
     // The detection path is a no-op in degraded mode.
-    guard.before_exec();
+    guard.before_exec(&[]);
     fs::write(dir.path.join("file.txt"), "changed\n").unwrap();
     assert!(guard.after_exec(&[], None).is_empty());
 }
@@ -292,7 +292,7 @@ fn approved_change_is_ledgered_not_flagged() {
     guard.note_mutation();
     guard.approve(std::slice::from_ref(&target), false);
 
-    guard.before_exec();
+    guard.before_exec(&[]);
     fs::write(&target, "iris edit\n").unwrap();
     // Confirmed: the on-disk bytes equal what the tool reported writing.
     let violations = guard.after_exec(
@@ -322,7 +322,7 @@ fn approved_target_unconfirmed_change_stays_protected() {
 
     // The tool was approved and "intended" to write "iris edit\n", but a
     // concurrent external change lands different bytes on disk before the check.
-    guard.before_exec();
+    guard.before_exec(&[]);
     fs::write(&target, "user raced\n").unwrap();
     let violations = guard.after_exec(
         std::slice::from_ref(&target),
@@ -357,7 +357,7 @@ fn approved_change_without_confirmation_stays_protected() {
     guard.note_mutation();
     guard.approve(std::slice::from_ref(&target), false);
 
-    guard.before_exec();
+    guard.before_exec(&[]);
     fs::write(&target, "partial\n").unwrap();
     // `None` expected-after models a failed/cancelled or non-reporting tool.
     let violations = guard.after_exec(std::slice::from_ref(&target), None);
@@ -393,7 +393,7 @@ fn non_utf8_filename_is_protected_and_restorable() {
     );
 
     // A bash-like out-of-band overwrite is detected and restored to exact bytes.
-    guard.before_exec();
+    guard.before_exec(&[]);
     fs::write(&path, "clobbered\n").unwrap();
     let violations = guard.after_exec(&[], None);
     assert_eq!(violations.len(), 1, "the out-of-band change is flagged");
