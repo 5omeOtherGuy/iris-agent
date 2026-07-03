@@ -1,7 +1,13 @@
 # ADR-0028: Git workflow — dirty-tree safety, task checkpointing, and rollback semantics
 
 **Date**: 2026-07-03
-**Status**: accepted
+**Status**: accepted — amended by
+[ADR-0030](0030-git-safety-task-ownership-lease-and-mutation-lock.md)
+(recovery ownership: lease + mutation lock; auto-adopt superseded by explicit
+adoption) and
+[ADR-0031](0031-task-identity-session-linkage-and-resumable-tasks.md)
+(task records carry opaque body + session links; `taskLifecycle` session
+entries)
 **Deciders**: operator + agent design review (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261))
 
 ## Context
@@ -118,6 +124,9 @@ it. Approvals expire at settlement with the baseline they were judged against.
 
 - Session end does **not** settle a task. Passive actions never make safety
   decisions.
+- **Amended by ADR-0030/0031:** recovery no longer auto-adopts when multiple
+  records or a live foreign task exist; adoption is lease-aware and explicit.
+  The reconciliation below (divergence snapshot, notice, expiry) is unchanged.
 - On resume (or a new session in the same repo), apply the jj
   stale-working-copy pattern: compare the recorded op-log state against disk;
   if they diverged (crash, `^C`, external edits), synthesize a **recovery
