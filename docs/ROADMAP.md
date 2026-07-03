@@ -161,9 +161,10 @@ Implemented today:
 Not implemented yet:
 
 - Persistent approval policies, transcript-tree branching/rollback, modes,
-  subagents, context ledger/planner, handle dereference UI/tool,
+  subagents, context ledger/planner, handle dereference UI (browser),
   provider-side compact replay, token-efficiency benchmark proof, git
-  automation, and GitHub integration.
+  automation, and GitHub integration. [The model-facing handle dereference
+  tool shipped ([#205](https://github.com/5omeOtherGuy/iris-agent/issues/205)).]
 
 ## Runtime completion — finish Nexus before Milestone 2 [SHIPPED 2026-06-17]
 
@@ -762,11 +763,23 @@ Potential scope:
   failure the full output stays inline rather than being truncated/discarded.
   Because the substitution happens before the message enters context, resume
   rebuilds the compact form for free and never re-inlines the payload. Deferred
-  (outside #61): a model-facing dereference tool / TUI attachment browser
-  (`HandleStore::get` is the retrieval seam), binary artifacts, and
-  search/indexing.]
+  (outside #61): a TUI attachment browser, binary artifacts, and
+  search/indexing; the model-facing dereference tool that consumes the
+  `HandleStore::get` retrieval seam shipped separately
+  ([#205](https://github.com/5omeOtherGuy/iris-agent/issues/205)).]
 - Micro-summary schema for large results.
-- Selective handle dereferencing.
+- Selective handle dereferencing. [Shipped
+  ([#205](https://github.com/5omeOtherGuy/iris-agent/issues/205)): a read-only
+  model-facing `read_output` tool pages an offloaded output back into context by
+  its `outputHandle` id (`handle_id`/`offset`/`limit`), through the same
+  line-window + truncation contract as `read` (2000-line / 50 KiB caps, shared
+  `render_line_window`). Retrieval is exposed on the Tier-1 `ToolOutputStore`
+  contract (`get`), so the tool depends on the contract, not the concrete
+  `HandleStore`; a malformed/unknown/expired id returns a tool error (never a
+  filesystem escape), and a dereference result over the 50 KiB threshold is
+  itself re-offloaded behind a fresh handle (no re-inlining loop). Deferred
+  (outside #205): grep-over-handle search within an offloaded output (a
+  follow-up), and a TUI handle browser.]
 - Token accounting per turn. [Foundation shipped
   ([#54](https://github.com/5omeOtherGuy/iris-agent/issues/54)): each `message`
   session entry persists a conservative content-derived `tokenEstimate`, the
