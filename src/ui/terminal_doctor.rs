@@ -58,17 +58,17 @@ pub(crate) fn report(env: &DoctorEnv) -> Vec<String> {
     // Multiplexer.
     if env.tmux_control_mode {
         lines.push(format!(
-            "{REVIEW} multiplexer: tmux control mode (iTerm2 -CC) -- pager degrades to inline"
+            "{REVIEW} multiplexer: tmux control mode (iTerm2 -CC); pager degrades to inline"
         ));
     } else if env.tmux {
         lines.push(format!("{DONE} multiplexer: tmux"));
     } else if env.zellij {
         lines.push(format!(
-            "{REVIEW} multiplexer: Zellij -- pager degrades to inline"
+            "{REVIEW} multiplexer: Zellij; pager degrades to inline"
         ));
     } else if env.gnu_screen {
         lines.push(format!(
-            "{REVIEW} multiplexer: GNU screen -- alt screen and OSC 52 are best-effort"
+            "{REVIEW} multiplexer: GNU screen; alt screen and OSC 52 are best-effort"
         ));
     } else {
         lines.push(format!("{DONE} multiplexer: none"));
@@ -93,14 +93,14 @@ pub(crate) fn report(env: &DoctorEnv) -> Vec<String> {
         ));
     } else {
         lines.push(format!(
-            "{REVIEW} kitty keyboard protocol: not supported -- Shift+Enter may equal Enter"
+            "{REVIEW} kitty keyboard protocol: not supported; Shift+Enter may equal Enter"
         ));
         lines.push(
             "    newline fallback: use Ctrl+J to insert a newline in the composer".to_string(),
         );
         if env.tmux {
             lines.push("    tmux: set -g extended-keys on".to_string());
-            lines.push("    tmux: set -as terminal-features 'xterm*:extkeys'".to_string());
+            lines.push("    tmux: set -as terminal-features ',xterm*:extkeys'".to_string());
         }
     }
 
@@ -110,7 +110,7 @@ pub(crate) fn report(env: &DoctorEnv) -> Vec<String> {
             Some("on") => lines.push(format!("{DONE} tmux set-clipboard: on (OSC 52 copy works)")),
             Some(value) => {
                 lines.push(format!(
-                    "{REVIEW} tmux set-clipboard: {value} -- OSC 52 clipboard passthrough is limited"
+                    "{REVIEW} tmux set-clipboard: {value}; OSC 52 clipboard passthrough is limited"
                 ));
                 lines.push("    fix: set -g set-clipboard on".to_string());
             }
@@ -127,7 +127,7 @@ pub(crate) fn report(env: &DoctorEnv) -> Vec<String> {
             }
             Some(value) => {
                 lines.push(format!(
-                    "{REVIEW} tmux allow-passthrough: {value} -- nested escape passthrough is off"
+                    "{REVIEW} tmux allow-passthrough: {value}; nested escape passthrough is off"
                 ));
                 lines.push("    fix: set -g allow-passthrough on".to_string());
             }
@@ -159,7 +159,7 @@ pub(crate) fn detect(kitty_keyboard: bool, pager_active: bool) -> DoctorEnv {
         tmux,
         tmux_control_mode: tmux
             && tmux_probe(&["display-message", "-p", "#{client_control_mode}"])
-                .is_none_or(|value| value != "0"),
+                .is_some_and(|value| value != "0"),
         zellij: std::env::var_os("ZELLIJ").is_some(),
         gnu_screen: term
             .as_deref()
@@ -184,12 +184,19 @@ pub(crate) fn detect(kitty_keyboard: bool, pager_active: bool) -> DoctorEnv {
     }
 }
 
-/// Best-effort tmux query; `None` on any failure.
+/// Best-effort tmux query with a hard timeout; `None` on any failure. The
+/// probe runs on a helper thread so a wedged tmux server can never block the
+/// TUI event loop; on timeout the thread is abandoned (it exits when the
+/// child does) and the capability reports as unknown.
 fn tmux_probe(args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("tmux")
-        .args(args)
-        .output()
-        .ok()?;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("tmux").args(&args).output();
+        let _ = tx.send(result);
+    });
+    let output = rx.recv_timeout(PROBE_TIMEOUT).ok()?.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -246,7 +253,7 @@ mod tests {
         assert!(all.contains("fix: set -g set-clipboard on"));
         assert!(all.contains("fix: set -g allow-passthrough on"));
         assert!(all.contains("set -g extended-keys on"));
-        assert!(all.contains("set -as terminal-features 'xterm*:extkeys'"));
+        assert!(all.contains("set -as terminal-features ',xterm*:extkeys'"));
         assert!(all.contains("use Ctrl+J to insert a newline"));
     }
 
