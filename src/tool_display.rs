@@ -24,7 +24,7 @@ pub(crate) const APPROVAL_DESTRUCTIVE_NOTE: &str =
 /// The base explanatory sentence for an approval prompt, derived deterministically
 /// from the call — the muted lead of the reason line. Presentation-only Tier-3
 /// copy (never sent to the model): `bash` runs a shell command, `edit`/`write`
-/// name the file (falling back to a generic clause when the path is unparseable),
+/// name the file (falling back to a generic clause when the path is unparsable),
 /// and any other tool reports its name.
 pub(crate) fn approval_reason_lead(call: &ToolCall) -> String {
     match call.name.as_str() {
