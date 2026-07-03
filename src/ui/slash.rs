@@ -111,6 +111,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/diff",
+        description: "Show the current task's net diff (Iris's own changes)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/rollback",
         description: "List or restore a task checkpoint (undoes Iris's own work)",
         action: SlashAction::Submit,

@@ -1536,6 +1536,40 @@ mod tests {
     }
 
     #[test]
+    fn task_diff_panel_shows_summary_and_colorized_diff() {
+        // Issue #264: the /diff panel renders the per-file summary rows plus the
+        // unified diff through the shared diff_table_rows colorizer.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::TaskDiff {
+            summary: vec![
+                "1 file changed, +1/-1".to_string(),
+                "  +1/-1  note.txt".to_string(),
+            ],
+            diff: "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        });
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("+1/-1  note.txt")),
+            "per-file line"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("--- a/note.txt")),
+            "header dropped"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("+  new")),
+            "colorized add row"
+        );
+        let add = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|row| row.text.contains("+  new"))
+            .expect("addition row");
+        assert_eq!(add.style, ok_style());
+    }
+
+    #[test]
     fn diff_preview_appends_added_removed_footer_tinted_to_diff_inks() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::DiffPreview {

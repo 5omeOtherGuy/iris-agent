@@ -605,3 +605,196 @@ fn recovery_checkpoint_is_full_snapshot_not_delete_bomb() {
         "the recovery snapshot captures the diverged path's actual disk state"
     );
 }
+
+// --- final task diff (issue #264) -----------------------------------------
+
+// Drive a bash-style out-of-band change (no approved target) through the guard,
+// so the async attribution scan runs; the caller joins it at a later sync
+// barrier (e.g. `task_diff`). Mutates `path` on disk via `mutate`.
+fn bash_change(guard: &GitSafety, mutate: impl FnOnce()) {
+    guard.before_exec(&[]);
+    mutate();
+    let _ = guard.after_exec(&[], None);
+}
+
+// Deliverable 1 + test 1: the net diff is scoped to ledger paths only. A dirty
+// tracked file and an untracked file the user (not Iris) owns never appear;
+// only Iris's own change does.
+#[test]
+fn net_diff_excludes_user_dirty_and_untracked() {
+    let repo = init_repo();
+    // User's pre-task work: a modified tracked file and an untracked file.
+    fs::write(repo.path.join("committed.txt"), "user dirty\n").unwrap();
+    fs::write(repo.path.join("user_untracked.txt"), "user only\n").unwrap();
+
+    let guard = GitSafety::new(&repo.path);
+    guard.note_mutation();
+    // Iris's own work: a brand-new file.
+    iris_write(&guard, &repo.path.join("iris_new.txt"), b"iris made this\n");
+
+    let diff = guard.task_diff(None);
+    assert_eq!(diff.files.len(), 1, "only Iris's ledger path appears");
+    assert_eq!(diff.files[0].path, "iris_new.txt");
+    assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Create);
+    assert!(
+        !diff.unified().contains("user dirty") && !diff.unified().contains("user only"),
+        "the user's dirty/untracked work never leaks into the diff"
+    );
+}
+
+// Test 2: a file edited several times in one task shows one net hunk set
+// (baseline -> current), not a per-step diff.
+#[test]
+fn net_diff_collapses_repeated_edits() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let file = repo.path.join("committed.txt");
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"step one\n");
+    iris_write(&guard, &file, b"step two\n");
+    iris_write(&guard, &file, b"final\n");
+
+    let diff = guard.task_diff(None);
+    assert_eq!(diff.files.len(), 1);
+    let file_diff = &diff.files[0];
+    assert_eq!(file_diff.kind, super::net_diff::ChangeKind::Edit);
+    // Net is base -> final: one line removed, one added; the intermediate
+    // "step one"/"step two" never appear.
+    assert_eq!((file_diff.added, file_diff.removed), (1, 1));
+    assert!(file_diff.unified.contains("+final"));
+    assert!(file_diff.unified.contains("-base"));
+    assert!(!file_diff.unified.contains("step one"));
+    assert!(!file_diff.unified.contains("step two"));
+}
+
+// Test 3: a binary file Iris changes is summarized as a binary change with no
+// text diff.
+#[test]
+fn net_diff_reports_binary_without_text() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let bin = repo.path.join("blob.bin");
+
+    guard.note_mutation();
+    iris_write(&guard, &bin, &[0u8, 1, 2, 3, 255]);
+
+    let diff = guard.task_diff(None);
+    assert_eq!(diff.files.len(), 1);
+    assert!(diff.files[0].binary, "NUL content is reported as binary");
+    assert_eq!((diff.files[0].added, diff.files[0].removed), (0, 0));
+    assert!(diff.unified().contains("Binary file blob.bin changed"));
+    assert!(diff.summary_lines().iter().any(|l| l.contains("binary")));
+}
+
+// Test 3 (delete/rename shape): a bash-attributed delete of a pre-existing
+// tracked file renders as a delete. A rename in the ledger's shape is exactly
+// this delete of the old path plus a create of the new one.
+#[test]
+fn net_diff_reports_delete_via_attribution() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let file = repo.path.join("committed.txt");
+
+    guard.note_mutation();
+    bash_change(&guard, || {
+        fs::remove_file(&file).unwrap();
+    });
+
+    let diff = guard.task_diff(None);
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, "committed.txt");
+    assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Delete);
+    assert!(diff.files[0].unified.contains("+++ /dev/null"));
+}
+
+// Test 4: an empty diff is honest -- no task, or a task whose changes net to
+// nothing (edited then reverted), both report no files.
+#[test]
+fn net_diff_empty_for_no_task_and_reverted_change() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    // No mutation yet: no unsettled task.
+    assert!(guard.task_diff(None).is_empty());
+
+    let file = repo.path.join("committed.txt");
+    guard.note_mutation();
+    iris_write(&guard, &file, b"changed\n");
+    iris_write(&guard, &file, b"base\n"); // reverted to the pre-task content
+    assert!(
+        guard.task_diff(None).is_empty(),
+        "a change reverted to its pre-task state nets to nothing"
+    );
+}
+
+// Deliverable 3 + test 6: the source-tree root is a parameter. The current side
+// is read from the given root, not the hardcoded workspace, so the same ledger
+// diffs against an alternate tree.
+#[test]
+fn net_diff_respects_alternate_source_root() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let file = repo.path.join("committed.txt");
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"workspace version\n");
+
+    // An alternate tree holds a different current version of the same rel path.
+    let alt = temp_dir();
+    fs::write(alt.path.join("committed.txt"), "alt version\n").unwrap();
+
+    let diff = guard.task_diff(Some(&alt.path));
+    assert_eq!(diff.files.len(), 1);
+    assert!(
+        diff.files[0].unified.contains("+alt version"),
+        "the current side comes from the alternate root, not the workspace"
+    );
+    assert!(!diff.files[0].unified.contains("workspace version"));
+}
+
+// Deliverable 2 + test 7: `task_diff` joins the async attribution scan at its
+// sync barrier, so a bash-attributed change to a previously-clean file is
+// visible in the diff.
+#[test]
+fn net_diff_includes_bash_attributed_change_after_barrier() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let file = repo.path.join("committed.txt");
+
+    guard.note_mutation();
+    // A bash-style change with no approved target: attribution runs async.
+    bash_change(&guard, || {
+        fs::write(&file, "bash changed\n").unwrap();
+    });
+
+    // The barrier inside task_diff joins the scan before computing.
+    let diff = guard.task_diff(None);
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, "committed.txt");
+    assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Edit);
+    assert!(diff.files[0].unified.contains("+bash changed"));
+    assert!(diff.files[0].unified.contains("-base"));
+}
+
+// The non-git fallback computes the same ledger-scoped net diff from content
+// snapshots (reduced guarantees, ADR-0028 Alternative 3).
+#[test]
+fn net_diff_degraded_fallback_scopes_to_touched_paths() {
+    let dir = temp_dir(); // not a git repo -> degraded mode
+    let guard = GitSafety::new(&dir.path);
+    guard.note_mutation();
+    let file = dir.path.join("note.txt");
+    // Degraded writes go through an approved target so the fallback records them.
+    guard.approve(std::slice::from_ref(&file), false);
+    guard.before_exec(std::slice::from_ref(&file));
+    fs::write(&file, "iris note\n").unwrap();
+    let _ = guard.after_exec(
+        std::slice::from_ref(&file),
+        Some(&crate::tools::content_hash(b"iris note\n")),
+    );
+
+    let diff = guard.task_diff(None);
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, "note.txt");
+    assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Create);
+}

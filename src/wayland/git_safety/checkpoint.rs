@@ -231,6 +231,29 @@ impl CheckpointChain {
         self.before.len()
     }
 
+    /// Net-diff inputs (issue #264): for every ledger path, its pre-task bytes
+    /// (read back from the base snapshot blob; `None` = a create) and its current
+    /// bytes read from `root`. `root` is the source tree the current side comes
+    /// from -- normally the workspace, but a parameter so a later worktree-apply
+    /// review (#267/#271) can diff the same ledger against a different tree. Only
+    /// ledger paths are visited, so a user-modified file never appears.
+    pub(super) fn net_diff_inputs(&self, root: &Path) -> Result<Vec<super::net_diff::NetPath>> {
+        let mut out = Vec::new();
+        for (path, blob) in &self.before {
+            let rel = path
+                .strip_prefix(&self.workspace)
+                .unwrap_or(path)
+                .to_path_buf();
+            let pre = match blob {
+                Some(blob) => Some(self.read_blob(&blob.sha)?),
+                None => None,
+            };
+            let cur = std::fs::read(root.join(&rel)).ok();
+            out.push(super::net_diff::NetPath { rel, pre, cur });
+        }
+        Ok(out)
+    }
+
     /// Record the pre-task content of a ledger path the first time it is seen.
     /// Idempotent: a later touch of the same path never overwrites the captured
     /// pre-task bytes. `bytes` is `None` for a path that did not exist pre-task.

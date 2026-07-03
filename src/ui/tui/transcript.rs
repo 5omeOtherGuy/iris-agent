@@ -828,6 +828,41 @@ impl Transcript {
         self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
     }
 
+    /// Render the final task diff (issue #264) as a bordered panel: a `DIFF`
+    /// header carrying the summary meta, each per-file summary line, then the
+    /// combined unified diff through the shared `diff_table_rows` colorizer.
+    /// Read-only presentation -- not tracked as an active edit.
+    fn push_task_diff_panel(&mut self, summary: &[String], diff: &str) {
+        self.begin_block();
+        // The first summary line ("N files changed, +X/-Y") rides in the header
+        // meta; the per-file lines render as body rows below it.
+        let meta = summary.first().cloned().unwrap_or_default();
+        self.push_panel_header(PanelHeaderSpec {
+            title: "DIFF",
+            meta: &meta,
+            plain_meta: &meta,
+            state: PanelState::Done,
+            duration: None,
+            started: None,
+        });
+        for line in summary.iter().skip(1) {
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::from(Span::styled(line.clone(), dim_style())),
+                    bg: None,
+                },
+                line.clone(),
+                dim_style(),
+            ));
+        }
+        self.rows.extend(diff_table_rows(diff));
+        let (added, removed) = diff_counts(diff);
+        if added + removed > 0 {
+            self.rows.push(diff_footer_row(added, removed, None));
+        }
+        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+    }
+
     /// Open (or reopen) the EDIT panel for a pending mutation: `◇ PREVIEW`,
     /// diff body, tracked as the active edit so the same panel is finalized in
     /// place when the tool runs.
@@ -1627,6 +1662,9 @@ impl Transcript {
             }
             UiEvent::Notice(message) => {
                 self.push_notice_row(crate::ui::symbols::SEP, dim_style(), &message, "");
+            }
+            UiEvent::TaskDiff { summary, diff } => {
+                self.push_task_diff_panel(&summary, &diff);
             }
             UiEvent::TurnError { kind, message } => match kind {
                 TurnErrorKind::Auth => {

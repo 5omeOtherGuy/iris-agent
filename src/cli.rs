@@ -180,9 +180,18 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
         None => (trimmed, ""),
     };
     match cmd {
-        "/accept" => Some(match harness.accept_checkpoint() {
-            Some(summary) => vec![summary],
-            None => vec!["no unsettled Iris changes to accept".to_string()],
+        "/accept" => Some({
+            // Compute the net-diff summary BEFORE accepting settles the task
+            // (issue #264): show what is being accepted, per file.
+            let summary = harness.task_diff().summary_lines();
+            match harness.accept_checkpoint() {
+                Some(outcome) => {
+                    let mut lines = summary;
+                    lines.push(outcome);
+                    lines
+                }
+                None => vec!["no unsettled Iris changes to accept".to_string()],
+            }
         }),
         "/checkpoint" => Some(match harness.save_checkpoint() {
             Some(summary) => vec![summary],
@@ -190,6 +199,21 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
         }),
         "/rollback" => Some(handle_rollback(rest, harness)),
         _ => None,
+    }
+}
+
+/// Build the Tier-3 event for `/diff` (issue #264): the task's net diff as a
+/// summary + colorized unified diff, or an honest notice when there are no net
+/// Iris changes (or no unsettled task). Shared by the TUI and text drivers so
+/// both render the same computation.
+pub(crate) fn task_diff_event<P: ChatProvider>(harness: &Harness<P>) -> UiEvent {
+    let diff = harness.task_diff();
+    if diff.is_empty() {
+        return UiEvent::Notice("no Iris changes in this task".to_string());
+    }
+    UiEvent::TaskDiff {
+        summary: diff.summary_lines(),
+        diff: diff.unified(),
     }
 }
 
@@ -660,6 +684,12 @@ fn run_session_inner<P: ChatProvider>(
             for line in lines {
                 ui.emit(UiEvent::Notice(line))?;
             }
+            continue;
+        }
+        // The final task diff (issue #264): render the net diff on demand at this
+        // safe boundary. Emits a colorized/plain diff event, not just notices.
+        if prompt.trim() == "/diff" {
+            ui.emit(task_diff_event(harness))?;
             continue;
         }
         // Checkpoint/rollback commands (issue #263) settle or restore the current

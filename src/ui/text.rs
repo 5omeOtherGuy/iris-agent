@@ -532,6 +532,16 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                     sgr(self.ansi, "2", &format!("note: {message}"))
                 )?;
             }
+            UiEvent::TaskDiff { summary, diff } => {
+                // The final task diff (issue #264): the per-file summary followed
+                // by the colorized unified diff, in one frame -- the same
+                // colorizer the DiffPreview arm uses.
+                self.finish_assistant_stream()?;
+                self.start_block()?;
+                let mut body = summary;
+                body.extend(self.diff_body(&diff));
+                self.write_frame("task diff", &body)?;
+            }
             UiEvent::TurnError { kind, message } => {
                 self.finish_assistant_stream()?;
                 match kind {
@@ -875,6 +885,29 @@ mod tests {
             "no red remove"
         );
         assert!(rendered.contains("diff \u{b7} edit note.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn task_diff_renders_summary_and_colorized_diff() -> Result<()> {
+        // Issue #264: the text/non-TTY path shows the per-file summary plus the
+        // unified diff through the same colorizer as DiffPreview.
+        let diff = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new()).with_ansi(true);
+        ui.emit(UiEvent::TaskDiff {
+            summary: vec![
+                "1 file changed, +1/-1".to_string(),
+                "  +1/-1  note.txt".to_string(),
+            ],
+            diff: diff.to_string(),
+        })?;
+        let (_, out, _) = ui.into_parts();
+        let rendered = String::from_utf8(out)?;
+        assert!(rendered.contains("task diff"), "panel titled");
+        assert!(rendered.contains("1 file changed, +1/-1"), "summary shown");
+        assert!(!rendered.contains("--- a/note.txt"), "file header dropped");
+        assert!(rendered.contains("\u{1b}[32m+new\u{1b}[0m"), "green add");
+        assert!(rendered.contains("\u{1b}[31m-old\u{1b}[0m"), "red remove");
         Ok(())
     }
 
