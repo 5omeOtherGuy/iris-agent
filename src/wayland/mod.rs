@@ -262,7 +262,11 @@ impl<P: ChatProvider> Harness<P> {
     /// current bytes, one hunk set per file (issue #264). Empty when no task is
     /// unsettled. Computed against the workspace; the engine keeps a source-tree
     /// parameter for a later worktree-apply review (#267/#271).
-    pub(crate) fn task_diff(&self) -> git_safety::TaskNetDiff {
+    ///
+    /// Fails closed (issue #264 finding 2): a checkpoint/blob read error is
+    /// returned, never swallowed into an empty diff, so callers surface an honest
+    /// error instead of a misleading "no changes".
+    pub(crate) fn task_diff(&self) -> Result<git_safety::TaskNetDiff> {
         self.git_safety.task_diff(None)
     }
 

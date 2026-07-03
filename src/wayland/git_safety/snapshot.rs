@@ -201,6 +201,9 @@ impl FallbackStore {
                     rel,
                     pre: pre.clone(),
                     cur,
+                    // Degraded fallback has no checkpoint tip to compare against,
+                    // so no divergence detection (reduced guarantees, ADR-0028).
+                    diverged: false,
                 }
             })
             .collect()

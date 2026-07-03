@@ -182,15 +182,24 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
     match cmd {
         "/accept" => Some({
             // Compute the net-diff summary BEFORE accepting settles the task
-            // (issue #264): show what is being accepted, per file.
-            let summary = harness.task_diff().summary_lines();
-            match harness.accept_checkpoint() {
-                Some(outcome) => {
-                    let mut lines = summary;
-                    lines.push(outcome);
-                    lines
+            // (issue #264): show what is being accepted, per file. Fail closed
+            // (finding 2): a diff read error must NOT settle the task as if there
+            // were nothing to accept.
+            match harness.task_diff() {
+                Err(error) => vec![format!(
+                    "could not compute task diff: {error:#}; not accepting (nothing settled)"
+                )],
+                Ok(diff) => {
+                    let summary = diff.summary_lines();
+                    match harness.accept_checkpoint() {
+                        Some(outcome) => {
+                            let mut lines = summary;
+                            lines.push(outcome);
+                            lines
+                        }
+                        None => vec!["no unsettled Iris changes to accept".to_string()],
+                    }
                 }
-                None => vec!["no unsettled Iris changes to accept".to_string()],
             }
         }),
         "/checkpoint" => Some(match harness.save_checkpoint() {
@@ -207,7 +216,14 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
 /// Iris changes (or no unsettled task). Shared by the TUI and text drivers so
 /// both render the same computation.
 pub(crate) fn task_diff_event<P: ChatProvider>(harness: &Harness<P>) -> UiEvent {
-    let diff = harness.task_diff();
+    // Fail closed (issue #264 finding 2): a checkpoint/blob read error surfaces
+    // as an honest error notice, never a misleading "no Iris changes".
+    let diff = match harness.task_diff() {
+        Ok(diff) => diff,
+        Err(error) => {
+            return UiEvent::Notice(format!("could not compute task diff: {error:#}"));
+        }
+    };
     if diff.is_empty() {
         return UiEvent::Notice("no Iris changes in this task".to_string());
     }

@@ -24,6 +24,8 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
+
 use super::{Chain, GitSafety};
 
 /// One ledger path's pre-task and current content for the net diff. `pre` is the
@@ -36,6 +38,13 @@ pub(crate) struct NetPath {
     pub(crate) rel: PathBuf,
     pub(crate) pre: Option<Vec<u8>>,
     pub(crate) cur: Option<Vec<u8>>,
+    /// `true` when the path's current on-disk bytes diverged from Iris's last
+    /// recorded write (the checkpoint-chain tip): a user edit landed after
+    /// Iris's last touch. ADR-0028's TOCTOU rule attributes the ambiguous bytes
+    /// to the user, so `cur` here is Iris's last recorded state (the tip blob),
+    /// NOT the user's newer disk bytes, and the diff carries a divergence
+    /// notice. Always `false` for the non-git fallback (no tip to compare).
+    pub(crate) diverged: bool,
 }
 
 /// How a ledger path changed across the task, net of intermediate steps.
@@ -61,6 +70,11 @@ pub(crate) struct FileDiff {
     pub(crate) removed: usize,
     /// Unified diff text for this file (headers + hunks), or the binary marker.
     pub(crate) unified: String,
+    /// `true` when the current side is Iris's last recorded state rather than the
+    /// live disk bytes, because the user edited this path after Iris's last write
+    /// (ADR-0028 TOCTOU rule). Surfaced as a per-file notice in the summary so
+    /// both the TUI and text renderers show that user bytes were excluded.
+    pub(crate) diverged: bool,
 }
 
 /// A task's net diff: one [`FileDiff`] per changed ledger path, sorted by path.
@@ -102,17 +116,21 @@ impl TaskNetDiff {
             self.files.len()
         )];
         for file in &self.files {
-            let note = match (file.binary, file.kind) {
+            let kind_note = match (file.binary, file.kind) {
                 (true, _) => " (binary)",
                 (false, ChangeKind::Create) => " (new file)",
                 (false, ChangeKind::Delete) => " (deleted)",
                 (false, ChangeKind::Edit) => "",
             };
+            let divergence_note = if file.diverged { DIVERGENCE_NOTICE } else { "" };
             if file.binary {
-                lines.push(format!("  binary  {}{note}", file.path));
+                lines.push(format!(
+                    "  binary  {}{kind_note}{divergence_note}",
+                    file.path
+                ));
             } else {
                 lines.push(format!(
-                    "  +{}/-{}  {}{note}",
+                    "  +{}/-{}  {}{kind_note}{divergence_note}",
                     file.added, file.removed, file.path
                 ));
             }
@@ -134,6 +152,12 @@ impl TaskNetDiff {
         out
     }
 }
+
+/// The per-file notice appended in the summary when a ledger path's current disk
+/// bytes diverged from Iris's last recorded write: the diff shows Iris's last
+/// recorded state, not the user's newer bytes (ADR-0028 TOCTOU rule).
+const DIVERGENCE_NOTICE: &str =
+    " (modified after Iris's last write; showing Iris's last recorded state)";
 
 /// Whether the bytes look binary. Git's heuristic: a NUL byte in the content.
 /// Cheap and matches how the diff colorizer would choke on binary anyway.
@@ -166,6 +190,7 @@ pub(crate) fn compute(inputs: Vec<NetPath>) -> TaskNetDiff {
                 binary: true,
                 added: 0,
                 removed: 0,
+                diverged: input.diverged,
             });
             continue;
         }
@@ -180,15 +205,67 @@ pub(crate) fn compute(inputs: Vec<NetPath>) -> TaskNetDiff {
             added,
             removed,
             unified,
+            diverged: input.diverged,
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     TaskNetDiff { files }
 }
 
-/// Workspace-relative display path, forward-slashed regardless of platform.
+/// Workspace-relative display path. An ASCII-clean path renders verbatim
+/// (forward-slashed); a path whose bytes are non-UTF-8 or contain control /
+/// quote / backslash characters is rendered git `core.quotePath`-style so its
+/// exact byte identity survives instead of collapsing to U+FFFD replacement
+/// characters (issue #264 finding 3).
 fn display_path(rel: &Path) -> String {
-    rel.to_string_lossy().replace('\\', "/")
+    quote_path(&display_bytes(rel))
+}
+
+/// Raw display bytes of a workspace-relative path. On Unix the exact filesystem
+/// bytes (which may not be UTF-8); elsewhere the lossy string with backslashes
+/// normalized to forward slashes (Windows separators are not literal bytes).
+#[cfg(unix)]
+fn display_bytes(rel: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    rel.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn display_bytes(rel: &Path) -> Vec<u8> {
+    rel.to_string_lossy().replace('\\', "/").into_bytes()
+}
+
+/// git `core.quotePath`-style C quoting of raw path bytes. A path that is valid
+/// UTF-8 with no control / quote / backslash bytes renders verbatim (common
+/// unicode names stay readable); anything else is wrapped in double quotes with
+/// C-style escapes and octal (`\NNN`) escapes for the remaining bytes, so a
+/// non-UTF-8 name keeps its exact identity.
+fn quote_path(bytes: &[u8]) -> String {
+    let special = bytes
+        .iter()
+        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\');
+    if !special && let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    for &b in bytes {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x09 => out.push_str("\\t"),
+            0x0a => out.push_str("\\n"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            0x0d => out.push_str("\\r"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\{b:03o}")),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Count net added / removed lines between `old` and `new` via `similar`, the
@@ -237,18 +314,24 @@ impl GitSafety {
     /// open. Joins the async attribution scan first (a ledger-consuming sync
     /// barrier, ADR-0028), so a bash-attributed change is included. Returns an
     /// empty diff when no task is unsettled.
-    pub(crate) fn task_diff(&self, root: Option<&Path>) -> TaskNetDiff {
+    ///
+    /// Fails closed (issue #264 finding 2): a checkpoint/blob read error is
+    /// propagated, never swallowed into an empty diff. A silent empty diff would
+    /// read as "no Iris changes" and let the accept flow settle a task whose
+    /// changes were never actually shown -- so callers must surface the error and
+    /// must NOT proceed as if the diff were empty.
+    pub(crate) fn task_diff(&self, root: Option<&Path>) -> Result<TaskNetDiff> {
         self.sync_barrier();
         let state = self.state.lock().unwrap();
         let Some(task) = state.task.as_ref() else {
-            return TaskNetDiff::default();
+            return Ok(TaskNetDiff::default());
         };
         let root = root.unwrap_or(&self.workspace);
         let inputs = match &task.chain {
-            Chain::Git(chain) => chain.net_diff_inputs(root).unwrap_or_default(),
+            Chain::Git(chain) => chain.net_diff_inputs(root)?,
             Chain::Fallback(store) => store.net_diff_inputs(root, &self.workspace),
         };
-        compute(inputs)
+        Ok(compute(inputs))
     }
 }
 
@@ -261,6 +344,7 @@ mod tests {
             rel: PathBuf::from(rel),
             pre: pre.map(|s| s.as_bytes().to_vec()),
             cur: cur.map(|s| s.as_bytes().to_vec()),
+            diverged: false,
         }
     }
 
@@ -308,6 +392,7 @@ mod tests {
             rel: PathBuf::from("blob.bin"),
             pre: Some(pre),
             cur: Some(cur),
+            diverged: false,
         }]);
         let file = &diff.files[0];
         assert!(file.binary);
@@ -327,5 +412,52 @@ mod tests {
         let summary = diff.summary_lines();
         assert_eq!(summary[0], "2 files changed, +2/-0");
         assert!(summary[1].contains("a.txt (new file)"));
+    }
+
+    #[test]
+    fn diverged_path_carries_a_summary_notice() {
+        // A diverged path (user edited after Iris's last write): `cur` is Iris's
+        // last recorded state and the summary flags it so the exclusion is
+        // visible in both renderers.
+        let diff = compute(vec![NetPath {
+            rel: PathBuf::from("a.txt"),
+            pre: Some(b"base\n".to_vec()),
+            cur: Some(b"iris last\n".to_vec()),
+            diverged: true,
+        }]);
+        assert!(diff.files[0].diverged);
+        let summary = diff.summary_lines();
+        assert!(
+            summary[1].contains("showing Iris's last recorded state"),
+            "summary: {summary:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_renders_git_quoted_not_replacement_chars() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // A filename with a raw 0xFF byte -- not valid UTF-8.
+        let rel = PathBuf::from(OsStr::from_bytes(b"bad\xff.txt"));
+        let diff = compute(vec![NetPath {
+            rel,
+            pre: None,
+            cur: Some(b"hi\n".to_vec()),
+            diverged: false,
+        }]);
+        let path = &diff.files[0].path;
+        assert_eq!(path, "\"bad\\377.txt\"", "got: {path}");
+        assert!(
+            !path.contains('\u{fffd}'),
+            "path identity must not collapse to U+FFFD: {path}"
+        );
+    }
+
+    #[test]
+    fn utf8_path_with_unicode_renders_verbatim() {
+        // A valid-UTF-8 unicode name stays readable (not octal-escaped).
+        let diff = compute(vec![np("caf\u{e9}.txt", None, Some("x\n"))]);
+        assert_eq!(diff.files[0].path, "caf\u{e9}.txt");
     }
 }

@@ -632,7 +632,7 @@ fn net_diff_excludes_user_dirty_and_untracked() {
     // Iris's own work: a brand-new file.
     iris_write(&guard, &repo.path.join("iris_new.txt"), b"iris made this\n");
 
-    let diff = guard.task_diff(None);
+    let diff = guard.task_diff(None).unwrap();
     assert_eq!(diff.files.len(), 1, "only Iris's ledger path appears");
     assert_eq!(diff.files[0].path, "iris_new.txt");
     assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Create);
@@ -655,7 +655,7 @@ fn net_diff_collapses_repeated_edits() {
     iris_write(&guard, &file, b"step two\n");
     iris_write(&guard, &file, b"final\n");
 
-    let diff = guard.task_diff(None);
+    let diff = guard.task_diff(None).unwrap();
     assert_eq!(diff.files.len(), 1);
     let file_diff = &diff.files[0];
     assert_eq!(file_diff.kind, super::net_diff::ChangeKind::Edit);
@@ -679,7 +679,7 @@ fn net_diff_reports_binary_without_text() {
     guard.note_mutation();
     iris_write(&guard, &bin, &[0u8, 1, 2, 3, 255]);
 
-    let diff = guard.task_diff(None);
+    let diff = guard.task_diff(None).unwrap();
     assert_eq!(diff.files.len(), 1);
     assert!(diff.files[0].binary, "NUL content is reported as binary");
     assert_eq!((diff.files[0].added, diff.files[0].removed), (0, 0));
@@ -701,7 +701,7 @@ fn net_diff_reports_delete_via_attribution() {
         fs::remove_file(&file).unwrap();
     });
 
-    let diff = guard.task_diff(None);
+    let diff = guard.task_diff(None).unwrap();
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].path, "committed.txt");
     assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Delete);
@@ -715,14 +715,14 @@ fn net_diff_empty_for_no_task_and_reverted_change() {
     let repo = init_repo();
     let guard = GitSafety::new(&repo.path);
     // No mutation yet: no unsettled task.
-    assert!(guard.task_diff(None).is_empty());
+    assert!(guard.task_diff(None).unwrap().is_empty());
 
     let file = repo.path.join("committed.txt");
     guard.note_mutation();
     iris_write(&guard, &file, b"changed\n");
     iris_write(&guard, &file, b"base\n"); // reverted to the pre-task content
     assert!(
-        guard.task_diff(None).is_empty(),
+        guard.task_diff(None).unwrap().is_empty(),
         "a change reverted to its pre-task state nets to nothing"
     );
 }
@@ -743,7 +743,7 @@ fn net_diff_respects_alternate_source_root() {
     let alt = temp_dir();
     fs::write(alt.path.join("committed.txt"), "alt version\n").unwrap();
 
-    let diff = guard.task_diff(Some(&alt.path));
+    let diff = guard.task_diff(Some(&alt.path)).unwrap();
     assert_eq!(diff.files.len(), 1);
     assert!(
         diff.files[0].unified.contains("+alt version"),
@@ -768,7 +768,7 @@ fn net_diff_includes_bash_attributed_change_after_barrier() {
     });
 
     // The barrier inside task_diff joins the scan before computing.
-    let diff = guard.task_diff(None);
+    let diff = guard.task_diff(None).unwrap();
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].path, "committed.txt");
     assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Edit);
@@ -793,8 +793,64 @@ fn net_diff_degraded_fallback_scopes_to_touched_paths() {
         Some(&crate::tools::content_hash(b"iris note\n")),
     );
 
-    let diff = guard.task_diff(None);
+    let diff = guard.task_diff(None).unwrap();
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].path, "note.txt");
     assert_eq!(diff.files[0].kind, super::net_diff::ChangeKind::Create);
+}
+
+// Finding 1 (issue #264, ADR-0028 TOCTOU): when the user edits a ledger path
+// after Iris's last recorded write, the net diff must show Iris's last recorded
+// state (the chain tip), NOT the user's bytes as Iris output, and must flag the
+// divergence with an explicit per-path notice.
+#[test]
+fn net_diff_excludes_user_bytes_written_after_iris() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let file = repo.path.join("committed.txt");
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"iris content\n");
+    // The user edits the same ledger path out of band, after Iris's last write.
+    fs::write(&file, "user content\n").unwrap();
+
+    let diff = guard.task_diff(None).unwrap();
+    assert_eq!(diff.files.len(), 1);
+    let file_diff = &diff.files[0];
+    assert!(file_diff.diverged, "the path is flagged diverged");
+    assert!(
+        file_diff.unified.contains("iris content"),
+        "the diff shows Iris's last recorded state, not the user's bytes"
+    );
+    assert!(
+        !file_diff.unified.contains("user content"),
+        "the user's bytes never render as Iris output"
+    );
+    assert!(
+        diff.summary_lines()
+            .iter()
+            .any(|l| l.contains("showing Iris's last recorded state")),
+        "an explicit per-path divergence notice is surfaced in the summary"
+    );
+}
+
+// Finding 2 (issue #264): a checkpoint/blob read failure must fail closed --
+// `task_diff` returns an error, never a silent empty "no Iris changes" diff that
+// would let the accept flow settle a task whose changes were never shown.
+#[test]
+fn net_diff_fails_closed_on_unreadable_checkpoint() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let file = repo.path.join("committed.txt");
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"iris content\n");
+
+    // Corrupt the object store so the checkpoint tree/blob reads fail.
+    fs::remove_dir_all(repo.path.join(".git/objects")).unwrap();
+
+    assert!(
+        guard.task_diff(None).is_err(),
+        "a checkpoint read error must propagate, not become an empty diff"
+    );
 }
