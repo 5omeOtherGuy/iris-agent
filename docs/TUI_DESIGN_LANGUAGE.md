@@ -87,6 +87,26 @@ never 2-line gaps; never a gap that depends on block type.
 
 ---
 
+### 1.1 Screen modes — pager & inline
+
+The pane anatomy above is rendered by one of two backends
+([ADR-0029](adr/0029-adopt-alt-screen-pager-tui.md)). Both render the same
+logical `Screen` state; the design language is identical in both.
+
+| Mode | Surface | Session bar | Scrollback |
+|---|---|---|---|
+| **Pager** (rich default once stable) | Alternate screen, full-frame ratatui `Terminal`, synchronized updates | Literally viewport-pinned (rows 0–1) | Iris-owned scroll offset; native scrollback unused |
+| **Inline** (automatic fallback) | Scrollback-append terminal surface (ADR-0006) | Top of the rendered document; scrolls with history | Native terminal scrollback |
+
+Mode policy: `tui.altScreen = "auto" | "always" | "never"` in settings,
+`--no-alt-screen`, `IRIS_NO_ALT_SCREEN=1`. `auto` selects the pager on plain
+terminals and normal tmux; tmux control mode, Zellij, `TERM=dumb`, and
+non-TTY stdio degrade to inline with a one-line notice. `--plain` remains the
+ANSI-free text path. Detection failures degrade to inline, never to a broken
+alt screen.
+
+---
+
 ## 2 · Color
 
 **Terminal-relative.** Every role binds to an ANSI named slot so Iris inherits
