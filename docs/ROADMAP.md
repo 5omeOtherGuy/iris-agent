@@ -887,9 +887,14 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
 
 Later slices (not in #261):
 
-- Per-hunk staging.
-- Optional auto-commit behind explicit approval.
-- Worktree support implementation (design: #267; own gate).
+- Per-hunk staging
+  ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
+- Optional auto-commit behind explicit approval
+  ([#270](https://github.com/5omeOtherGuy/iris-agent/issues/270); needs its own
+  ADR per the still-binding gate).
+- Worktree support implementation
+  ([#271](https://github.com/5omeOtherGuy/iris-agent/issues/271); blocked on the
+  #267 design ADR).
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user
