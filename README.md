@@ -252,9 +252,13 @@ Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
 
 ## Status
 
-As of 2026-06-26: Milestone 1, the async-hard runtime, and the Milestone 2
-foundations are complete. The next milestone gate is proving the token-efficiency
-thesis with benchmark evidence; efficiency claims wait on measurement.
+As of 2026-07-03: Milestone 1, the async-hard runtime, and the Milestone 2
+foundations are complete. The active gate is the first Git-Centered Workflow
+slice — dirty-tree safety, task checkpoint/rollback, final diff summary, and
+the verification loop (epic
+[#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), design accepted
+in ADR-0028). The token-efficiency benchmark proof follows it; efficiency
+claims wait on measurement.
 
 Implemented:
 
@@ -269,8 +273,10 @@ Implemented:
 
 Next:
 
-- Token-efficiency benchmark proof.
-- Persistent approval policies, transcript branching/rollback, modes, and subagents.
+- Git-centered workflow slice: dirty-tree safety, checkpoint/rollback, final
+  diff summary, verification loop (epic #261, ADR-0028).
+- Token-efficiency benchmark proof (follows #261).
+- Persistent approval policies, modes, and subagents.
 
 ## Testing
 

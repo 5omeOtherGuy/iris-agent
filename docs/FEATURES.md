@@ -1,7 +1,9 @@
 # Iris — Feature List
 
-> Status (2026-06-26): Milestone 2 foundations are implemented; the remaining
-> Milestone 2 gate is benchmark proof plus consumer slices. Labels:
+> Status (2026-07-03): Milestone 2 foundations are implemented. The active gate
+> is the Git-Centered Workflow slice (epic
+> [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), ADR-0028);
+> the Milestone 2 benchmark proof follows it. Labels:
 > **[Implemented]** · **[Partial]** · **[Planned · MVP]** · **[Planned]** ·
 > **[Research]**. This file is
 > a capability inventory, not a build sequence; use [`ROADMAP.md`](ROADMAP.md) for
