@@ -200,6 +200,10 @@ pub(super) struct Transcript {
     /// Memoized wrapped lines for the current streaming preview; see
     /// [`StreamingRender`].
     streaming_render: Option<StreamingRender>,
+    /// Row indices where a committed user prompt starts (first content row of
+    /// each `commit_user`), maintained incrementally so the pager's sticky
+    /// prompt header is an O(prompts-above-view) lookup, never a row scan.
+    user_prompt_starts: Vec<usize>,
 }
 
 impl Transcript {
@@ -1714,6 +1718,13 @@ impl Transcript {
         self.thinking_header_row = self
             .thinking_header_row
             .and_then(|index| index.checked_sub(remove));
+        // Prompt-start anchors shift with the trimmed head; trimmed-away
+        // prompts are dropped.
+        self.user_prompt_starts = self
+            .user_prompt_starts
+            .iter()
+            .filter_map(|&index| index.checked_sub(remove))
+            .collect();
         self.exploring_open = self.trailing_explore_panel_open();
     }
 
@@ -1915,8 +1926,23 @@ impl Transcript {
     pub(super) fn commit_user(&mut self, text: &str) {
         self.mark_append_dirty();
         self.push_blank();
+        self.user_prompt_starts.push(self.rows.len());
         pane::push_user_rows(&mut self.rows, text);
         self.trim_history();
+    }
+
+    /// Visible line of the newest user prompt that begins strictly above the
+    /// viewport top -- the pager's sticky header anchor. Requires a warm wrap
+    /// cache (compose refreshes it every frame). Binary search over the
+    /// sorted anchors (prompt rows are always visible and line positions are
+    /// monotone in row order), so the per-frame cost is O(log prompts), never
+    /// a prompt walk.
+    pub(super) fn sticky_prompt_line(&self, top: usize) -> Option<usize> {
+        let above = self
+            .user_prompt_starts
+            .partition_point(|&row| self.visible_line_of_row(row).is_some_and(|line| line < top));
+        let row = *self.user_prompt_starts.get(above.checked_sub(1)?)?;
+        self.visible_line_of_row(row).filter(|&line| line < top)
     }
 
     fn ensure_wrapped_cache(&mut self, width: usize) {
