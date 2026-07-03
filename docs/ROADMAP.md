@@ -881,9 +881,15 @@ slice; any deviation requires superseding ADR-0028, not a fresh discussion.
 Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)):
 
 - Dirty-tree detection and unrelated-change safety
-  ([#262](https://github.com/5omeOtherGuy/iris-agent/issues/262)) — gates the rest.
+  ([#262](https://github.com/5omeOtherGuy/iris-agent/issues/262)) — gates the rest. Done.
 - Task-scoped checkpoint/rollback
-  ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)).
+  ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — in review. Op-log-shaped
+  git checkpoint chain under `refs/iris/checkpoints/<task-id>/` (plumbing only,
+  temporary index), auto-checkpoint over the unsettled diff, rollback of ledger
+  paths + user index, settlement GC (keep last N), crash-recovery reconciliation,
+  30-day expiry, non-git content-snapshot fallback, and `/rollback`/`/accept`/
+  `/checkpoint` slash commands. Seam left for #264: net-diff over the chain with a
+  source-tree parameter.
 - Final diff summary as the task deliverable
   ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)).
 - Verification loop (moved from Milestone 1): run the project's test/lint/build

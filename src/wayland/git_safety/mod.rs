@@ -29,11 +29,14 @@
 //! storage are the seams they build on.
 
 mod baseline;
+mod checkpoint;
 mod git;
 mod ledger;
+mod settlement;
 mod snapshot;
+mod task_state;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -44,8 +47,46 @@ use anyhow::Result;
 use crate::nexus::MutationGuard;
 
 use baseline::Baseline;
+use checkpoint::{CheckpointChain, Mode as FileMode};
 use ledger::{Attribution, Ledger, LedgerEntry};
-use snapshot::Snapshot;
+use settlement::{checkpoint_label, new_task_id};
+use snapshot::{FallbackStore, Snapshot};
+
+/// A ledger path's pre-task content for the checkpoint chain: the exact bytes
+/// and file mode captured before Iris first touched it, or `None` when the path
+/// did not exist pre-task (a create).
+type PreImage = Option<(Vec<u8>, FileMode)>;
+
+/// One confirmed Iris change fed to the checkpoint chain: the touched path plus
+/// its captured pre-task image.
+type IrisChange = (PathBuf, PreImage);
+
+/// Checkpoints kept per task after a settlement GC (ADR-0028 "keep last N").
+/// Small by design: intermediate restore points are a safety buffer, not
+/// history, so a handful covers the realistic "undo the last few steps" need.
+const KEEP_CHECKPOINTS: usize = 3;
+
+/// A restore point offered to the user by the rollback UI (Tier 3 renders it).
+/// `seq` names the checkpoint (0 = pre-task baseline); `label` is the op-log
+/// description.
+#[derive(Debug, Clone)]
+pub(crate) struct RestorePoint {
+    pub(crate) seq: u64,
+    pub(crate) label: String,
+}
+
+/// Outcome of a rollback attempt, surfaced to the user (Tier 3).
+pub(crate) struct RollbackOutcome {
+    /// Human summary of what was restored.
+    pub(crate) summary: String,
+    /// Set when the user index could not be safely restored (mid-merge/rebase):
+    /// the degrade-to-detect-and-warn path (ADR-0028).
+    pub(crate) index_warning: Option<String>,
+    /// Per-path notices for ledger paths left untouched because the user edited
+    /// them after Iris's last write (ADR-0028 TOCTOU rule): rollback preserves
+    /// the user's newer bytes instead of clobbering them.
+    pub(crate) preserved_notices: Vec<String>,
+}
 
 /// How the guard operates for this workspace.
 enum Mode {
@@ -56,38 +97,70 @@ enum Mode {
     Degraded(String),
 }
 
+/// The task's rollback store: a git-object checkpoint chain for a git worktree,
+/// or plain content snapshots for a degraded (non-git / jj) workspace.
+enum Chain {
+    Git(CheckpointChain),
+    Fallback(FallbackStore),
+}
+
 /// Per-task state, created lazily at the first mutating call.
 struct Task {
     /// `true` for a degraded task: no baseline, no gating.
     degraded: bool,
+    /// Stable id anchoring the `refs/iris/checkpoints/<task-id>/` namespace and
+    /// the persisted recovery record.
+    task_id: String,
     baseline: Baseline,
     ledger: Ledger,
     /// Per-file approvals granted this task (normalized absolute paths).
     approved: BTreeSet<PathBuf>,
     /// The "all dirty files this task" escalation.
     all_dirty_approved: bool,
-    /// Pre-call byte snapshot of the protected set (refreshed each call).
+    /// Pre-call byte snapshot of the protected set + this call's targets
+    /// (refreshed each call).
     snapshot: Snapshot,
+    /// Pre-call file modes for the snapshotted paths, so a checkpoint captures a
+    /// path's pre-mutation mode (refreshed each call alongside `snapshot`).
+    pre_modes: BTreeMap<PathBuf, FileMode>,
     /// Task-local op sequence, advanced per recorded mutation.
     turn: u64,
+    /// Rollback store (git chain or content-snapshot fallback).
+    chain: Chain,
+    /// Resolved git directory for the persisted recovery record (`None` in
+    /// degraded mode).
+    git_dir: Option<PathBuf>,
+    /// When this task first opened (epoch millis), for the expiry sweep.
+    created_ms: u64,
 }
 
 impl Task {
-    fn active(baseline: Baseline) -> Self {
+    fn active(
+        task_id: String,
+        baseline: Baseline,
+        chain: CheckpointChain,
+        git_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             degraded: false,
+            task_id,
             baseline,
             ledger: Ledger::default(),
             approved: BTreeSet::new(),
             all_dirty_approved: false,
             snapshot: Snapshot::default(),
+            pre_modes: BTreeMap::new(),
             turn: 0,
+            chain: Chain::Git(chain),
+            git_dir,
+            created_ms: task_state::now_ms(),
         }
     }
 
-    fn degraded() -> Self {
+    fn degraded(task_id: String) -> Self {
         Self {
             degraded: true,
+            task_id,
             baseline: Baseline {
                 protected: Default::default(),
                 dirty_count: 0,
@@ -98,7 +171,11 @@ impl Task {
             approved: BTreeSet::new(),
             all_dirty_approved: false,
             snapshot: Snapshot::default(),
+            pre_modes: BTreeMap::new(),
             turn: 0,
+            chain: Chain::Fallback(FallbackStore::default()),
+            git_dir: None,
+            created_ms: task_state::now_ms(),
         }
     }
 }
@@ -226,10 +303,68 @@ impl GitSafety {
         {
             let mut state = self.state.lock().unwrap();
             if let Some(task) = state.task.as_mut() {
+                let mut touched: Vec<PathBuf> = Vec::new();
                 for entry in entries {
+                    touched.push(entry.path.clone());
                     task.ledger.record(entry);
                 }
+                // Fold the async bash attribution into the checkpoint chain: for
+                // a previously-clean file a command changed, capture its
+                // committed content as the pre-task image (best-effort) and open
+                // a restore point over the running diff. A file with no committed
+                // predecessor is treated as a create (base rollback deletes it).
+                if !touched.is_empty()
+                    && let Chain::Git(chain) = &mut task.chain
+                {
+                    for path in &touched {
+                        let pre = checkpoint::committed_blob(&self.workspace, path);
+                        if let Err(error) = chain.note_before(path, pre) {
+                            tracing::warn!(error = %format!("{error:#}"), "bash checkpoint pre-image capture failed");
+                        }
+                    }
+                    let turn = task.turn;
+                    if let Err(error) = chain.checkpoint(turn, None, "bash change".to_string()) {
+                        tracing::warn!(error = %format!("{error:#}"), "bash checkpoint create failed");
+                    }
+                }
+                self.persist_task(task);
             }
+        }
+    }
+
+    /// Persist the current task's minimal recovery record (git tasks only).
+    /// Best-effort: a persistence failure is logged, never fatal to the turn.
+    fn persist_task(&self, task: &Task) {
+        if task.degraded {
+            return;
+        }
+        let Some(git_dir) = task.git_dir.as_ref() else {
+            return;
+        };
+        let tip_seq = match &task.chain {
+            Chain::Git(chain) => chain.len() as u64,
+            Chain::Fallback(store) => store.len() as u64,
+        };
+        // Expected on-disk state = the latest recorded content hash per ledger
+        // path (later entries win), for resume-time divergence detection.
+        let mut expected = BTreeMap::new();
+        for entry in &task.ledger.entries {
+            expected.insert(
+                entry.path.to_string_lossy().into_owned(),
+                entry.after.clone(),
+            );
+        }
+        let record = task_state::PersistedTask {
+            task_id: task.task_id.clone(),
+            workspace: self.workspace.to_string_lossy().into_owned(),
+            created_ms: task.created_ms,
+            updated_ms: task_state::now_ms(),
+            expected,
+            tip_seq,
+            baseline_index: task.baseline.index.clone(),
+        };
+        if let Err(error) = task_state::save(git_dir, &record) {
+            tracing::warn!(error = %format!("{error:#}"), "failed to persist task recovery record");
         }
     }
 }
@@ -300,9 +435,10 @@ impl MutationGuard for GitSafety {
             // Baseline already captured and announced for this task.
             return None;
         }
+        let task_id = new_task_id();
         match &self.mode {
             Mode::Degraded(reason) => {
-                state.task = Some(Task::degraded());
+                state.task = Some(Task::degraded(task_id));
                 Some(reason.clone())
             }
             Mode::Git => match baseline::capture(&self.workspace, |path| self.normalize(path)) {
@@ -314,12 +450,16 @@ impl MutationGuard for GitSafety {
                             baseline.dirty_count, baseline.untracked_count
                         )
                     });
-                    state.task = Some(Task::active(baseline));
+                    let git_dir = task_state::git_dir(&self.workspace);
+                    let chain = CheckpointChain::new(self.workspace.clone(), task_id.clone());
+                    let task = Task::active(task_id, baseline, chain, git_dir);
+                    self.persist_task(&task);
+                    state.task = Some(task);
                     summary
                 }
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "git baseline capture failed; degrading dirty-tree safety this task");
-                    state.task = Some(Task::degraded());
+                    state.task = Some(Task::degraded(task_id));
                     Some(format!(
                         "could not read git status ({error:#}); dirty-tree gating disabled this task"
                     ))
@@ -362,16 +502,32 @@ impl MutationGuard for GitSafety {
         }
     }
 
-    fn before_exec(&self) {
+    fn before_exec(&self, paths: &[PathBuf]) {
         let mut state = self.state.lock().unwrap();
         let Some(task) = state.task.as_mut() else {
             return;
         };
-        if task.degraded {
-            return;
-        }
-        let protected: Vec<PathBuf> = task.baseline.protected.keys().cloned().collect();
-        task.snapshot = Snapshot::capture(protected);
+        // Snapshot the protected set (git mode) plus this call's known targets so
+        // the checkpoint chain can capture a clean file's exact pre-task content
+        // before Iris overwrites it. In degraded mode there is no protected set,
+        // but the targets still feed the content-snapshot fallback.
+        let targets = paths.iter().map(|path| self.normalize(path));
+        let capture: BTreeSet<PathBuf> = if task.degraded {
+            targets.collect()
+        } else {
+            task.baseline
+                .protected
+                .keys()
+                .cloned()
+                .chain(targets)
+                .collect()
+        };
+        task.pre_modes = capture
+            .iter()
+            .filter(|path| path.exists())
+            .map(|path| (path.clone(), FileMode::of(path)))
+            .collect();
+        task.snapshot = Snapshot::capture(capture);
     }
 
     fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> Vec<PathBuf> {
@@ -383,10 +539,19 @@ impl MutationGuard for GitSafety {
                 return Vec::new();
             };
             if task.degraded {
+                // Degraded (non-git / jj): no gating or violation detection, but
+                // still record a content-snapshot restore point for the known
+                // targets so a rollback can undo Iris's own work (reduced
+                // guarantees, ADR-0028 Alternative 3).
+                self.checkpoint_degraded(task, approved);
                 return Vec::new();
             }
             let approved_set: BTreeSet<PathBuf> =
                 approved.iter().map(|path| self.normalize(path)).collect();
+            // Confirmed Iris changes to feed the checkpoint chain: (path, pre-task
+            // bytes+mode). Collected first so the chain's git work runs after the
+            // ledger loop without overlapping the snapshot borrow.
+            let mut iris_changes: Vec<IrisChange> = Vec::new();
             for path in task.snapshot.changed_paths() {
                 let after = snapshot::hash_file(&path);
                 // Attribute an approved-target change to Iris only when the
@@ -404,6 +569,22 @@ impl MutationGuard for GitSafety {
                     // Expected: a confirmed Iris mutation. Record it and advance
                     // the baseline hash so a later call sees the new content.
                     let before = task.baseline.protected.get(&path).cloned().flatten();
+                    // Capture the path's exact pre-task bytes + mode for the
+                    // checkpoint chain's base (first-touch only; the chain keeps
+                    // the earliest).
+                    let pre = task
+                        .snapshot
+                        .pre_bytes(&path)
+                        .and_then(|opt| opt.as_ref())
+                        .map(|bytes| {
+                            let mode = task
+                                .pre_modes
+                                .get(&path)
+                                .copied()
+                                .unwrap_or(FileMode::Normal);
+                            (bytes.clone(), mode)
+                        });
+                    iris_changes.push((path.clone(), pre));
                     task.turn += 1;
                     task.ledger.record(LedgerEntry {
                         path: path.clone(),
@@ -420,6 +601,24 @@ impl MutationGuard for GitSafety {
                     // attributed to the user (TOCTOU rule) and halted by the loop.
                     violations.push(path);
                 }
+            }
+            // A confirmed set of Iris changes opens a new checkpoint over the
+            // running (unsettled) diff: snapshot the current ledger-path content
+            // into the chain as one restore point (ADR-0028 auto-checkpoint).
+            if !iris_changes.is_empty() {
+                let turn = task.turn;
+                let label = checkpoint_label(&iris_changes);
+                if let Chain::Git(chain) = &mut task.chain {
+                    for (path, pre) in &iris_changes {
+                        if let Err(error) = chain.note_before(path, pre.clone()) {
+                            tracing::warn!(error = %format!("{error:#}"), "checkpoint pre-image capture failed");
+                        }
+                    }
+                    if let Err(error) = chain.checkpoint(turn, None, label) {
+                        tracing::warn!(error = %format!("{error:#}"), "checkpoint create failed");
+                    }
+                }
+                self.persist_task(task);
             }
             // Async attribution only for the non-targeted (bash-like) path: a
             // command with no statically-known target may have changed other
@@ -450,5 +649,7 @@ impl MutationGuard for GitSafety {
     }
 }
 
+#[cfg(test)]
+mod checkpoint_tests;
 #[cfg(test)]
 mod tests;

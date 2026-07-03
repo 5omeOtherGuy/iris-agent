@@ -433,8 +433,12 @@ pub(crate) trait MutationGuard {
     fn approve(&self, paths: &[PathBuf], all_dirty: bool);
 
     /// Snapshot the protected set's contents before a mutating call executes so
-    /// an out-of-band write can be detected and restored afterward.
-    fn before_exec(&self);
+    /// an out-of-band write can be detected and restored afterward. `paths` are
+    /// the call's statically-known mutation targets (empty for `bash`): the
+    /// guard also snapshots their pre-call bytes so the checkpoint chain (#263)
+    /// can capture the exact pre-task content of a clean file Iris is about to
+    /// edit, not just the pre-existing dirty set.
+    fn before_exec(&self, paths: &[PathBuf]);
 
     /// Re-check the protected set after a mutating call. `approved` are the
     /// paths this call was allowed to change; `expected_after` is the SHA-256
@@ -1523,7 +1527,7 @@ impl<P: ChatProvider> Agent<P> {
                 // snapshot, and surface which files changed.
                 let guard = env.mutation_guard.filter(|_| is_mutating);
                 if let Some(guard) = guard {
-                    guard.before_exec();
+                    guard.before_exec(&mutated_paths);
                 }
                 let outcome = run_tool(tool, &call.arguments, &call_env, token.child_token()).await;
                 if let Some(guard) = guard {

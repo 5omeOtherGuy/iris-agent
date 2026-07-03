@@ -227,6 +227,36 @@ impl<P: ChatProvider> Harness<P> {
         self.git_safety.discard_approvals();
     }
 
+    /// Restore points offered for `/rollback` (Tier 3 renders them). Base first,
+    /// then each auto-checkpoint. Empty when no unsettled Iris task is active.
+    pub(crate) fn checkpoint_restore_points(&self) -> Vec<git_safety::RestorePoint> {
+        self.git_safety.restore_points()
+    }
+
+    /// Settle the current task as accepted (`/accept`): freeze the ledger and GC
+    /// intermediate checkpoints. `None` when no task is active.
+    pub(crate) fn accept_checkpoint(&self) -> Option<String> {
+        self.git_safety.accept()
+    }
+
+    /// Record an explicit checkpoint and settle the task (`/checkpoint`).
+    pub(crate) fn save_checkpoint(&self) -> Option<String> {
+        self.git_safety.checkpoint_now()
+    }
+
+    /// Roll back Iris's own work to restore point `seq` (`/rollback <seq>`). Only
+    /// Iris-authored ledger paths and the user's index are affected.
+    pub(crate) fn rollback_checkpoint(&self, seq: u64) -> Result<git_safety::RollbackOutcome> {
+        self.git_safety.rollback(seq)
+    }
+
+    /// On resume / a new session in the same repo: reconcile a crashed task and
+    /// expire stale ones, returning a one-line recovery notice for the event
+    /// stream (ADR-0028). `None` when nothing is unsettled.
+    pub(crate) fn recover_checkpoints(&self) -> Option<String> {
+        self.git_safety.recover_and_expire()
+    }
+
     /// Id of the attached transcript log, or `None` for an in-memory session.
     pub(crate) fn session_id(&self) -> Option<&str> {
         self.session.as_ref().map(SessionLog::id)

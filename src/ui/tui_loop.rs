@@ -240,6 +240,11 @@ async fn session_loop<P: ChatProvider>(
 
     tui.screen.apply(UiEvent::SessionStarted);
     refresh_footer(tui, switch);
+    // On startup, reconcile any crashed/unsettled Iris task in this repo and
+    // expire stale ones (issue #263, ADR-0028), surfacing the recovery notice.
+    if let Some(recovery) = harness.recover_checkpoints() {
+        apply_notices(tui, vec![recovery]);
+    }
     // `iris resume` (no id) on a rich TTY opens the resume picker on start by
     // handing a pre-built modal here. Open it before the first draw and before
     // the blocking input reader starts, so the first key acts on a visible
@@ -393,6 +398,12 @@ fn perform_swap<P: ChatProvider>(
         }
     };
     apply_notices(tui, vec![notice]);
+    // A session swap is a safe boundary to reconcile a crashed/unsettled task in
+    // this repo and expire stale ones (issue #263, ADR-0028): surface the
+    // one-line recovery notice if anything is unsettled.
+    if let Some(recovery) = harness.recover_checkpoints() {
+        apply_notices(tui, vec![recovery]);
+    }
     Ok(())
 }
 
@@ -633,6 +644,14 @@ fn route_command<P: ChatProvider>(
             // takes the whole `Option<ModelSwitch>` like the text driver does.
             tui.screen.commit_user(prompt);
             if let Some(lines) = crate::cli::handle_model_command(prompt, harness, switch) {
+                apply_notices(tui, lines);
+            }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/rollback" | "/accept" | "/checkpoint" => {
+            // Checkpoint/rollback settlement (issue #263) at this safe boundary.
+            tui.screen.commit_user(prompt);
+            if let Some(lines) = crate::cli::handle_checkpoint_command(prompt, harness) {
                 apply_notices(tui, lines);
             }
             Ok(RouteOutcome::Consumed)

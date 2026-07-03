@@ -110,6 +110,21 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         description: "Remove provider authentication",
         action: SlashAction::Submit,
     },
+    SlashCommand {
+        name: "/rollback",
+        description: "List or restore a task checkpoint (undoes Iris's own work)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/accept",
+        description: "Accept the current Iris changes and settle the task",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/checkpoint",
+        description: "Save an explicit checkpoint and settle the task",
+        action: SlashAction::Submit,
+    },
 ];
 
 /// Whether `input` is a command line: a single line beginning with `/`. A
@@ -248,16 +263,21 @@ mod tests {
         p.sync("/");
         assert!(p.is_active("/"));
         assert_eq!(p.selected(), 0);
-        // Registry order ends with /logout. Down walks to the last
-        // row, then clamps there.
+        // Down walks to the last row, then clamps there.
         for _ in 0..COMMANDS.len() + 6 {
             p.down("/");
         }
         assert_eq!(p.selected(), COMMANDS.len() - 1);
-        assert_eq!(p.accept("/").unwrap().name, "/logout");
-        // Up returns toward the top.
+        assert_eq!(
+            p.accept("/").unwrap().name,
+            COMMANDS[COMMANDS.len() - 1].name
+        );
+        // Up returns toward the second-to-last row.
         p.up();
-        assert_eq!(p.accept("/").unwrap().name, "/login");
+        assert_eq!(
+            p.accept("/").unwrap().name,
+            COMMANDS[COMMANDS.len() - 2].name
+        );
     }
 
     #[test]
