@@ -4,8 +4,67 @@ use anyhow::Result;
 
 use crate::nexus::{
     AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ProviderUsage,
-    ToolCall,
+    ToolCall, VerificationOutcome,
 };
+
+/// Maximum characters of failing verification output carried into a notice, so
+/// a large build/test log is truncated (tail-first: the failure is usually at
+/// the end) rather than flooding the transcript.
+const MAX_VERIFICATION_OUTPUT_CHARS: usize = 2000;
+
+/// Honest one-line (plus output on failure) summary of a verification outcome
+/// for the notice channel (issue #265). Never claims pass on failure; preserves
+/// the failing output, truncated to [`MAX_VERIFICATION_OUTPUT_CHARS`].
+fn verification_notice(outcome: &VerificationOutcome) -> String {
+    match outcome {
+        VerificationOutcome::Passed { attempts } => {
+            if *attempts <= 1 {
+                "verification passed".to_string()
+            } else {
+                format!("verification passed after {attempts} attempts")
+            }
+        }
+        VerificationOutcome::Failed {
+            attempts,
+            exit_code,
+            last_output,
+        } => {
+            let code = match exit_code {
+                Some(code) => format!(" (exit code {code})"),
+                None => String::new(),
+            };
+            let attempts_label = if *attempts == 1 {
+                "1 attempt".to_string()
+            } else {
+                format!("{attempts} attempts")
+            };
+            let output = truncate_tail(last_output.trim(), MAX_VERIFICATION_OUTPUT_CHARS);
+            if output.is_empty() {
+                format!("verification failed after {attempts_label}{code}")
+            } else {
+                format!("verification failed after {attempts_label}{code}:\n{output}")
+            }
+        }
+        VerificationOutcome::SkippedUnconfigured => {
+            "verification skipped: no verify.command configured".to_string()
+        }
+        VerificationOutcome::SkippedApprovalDenied => {
+            "verification skipped: approval denied".to_string()
+        }
+    }
+}
+
+/// Keep at most `max` characters from the END of `text` (char-boundary safe),
+/// prefixing a marker when truncated. The tail is where a failing command's
+/// error usually lands.
+fn truncate_tail(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - max).collect();
+    format!("...(truncated)\n{tail}")
+}
 
 pub(crate) mod clipboard;
 pub(crate) mod login;
@@ -285,6 +344,11 @@ impl UiEvent {
                     paths.join(", ")
                 ))
             }
+            // Post-change verification (issue #265) surfaces through the notice
+            // channel: an honest one-line pass/fail/skipped summary, plus the
+            // failing command output on failure (never suppressed, never a false
+            // pass). No new UI surface.
+            AgentEvent::Verification(outcome) => UiEvent::Notice(verification_notice(&outcome)),
             AgentEvent::TurnComplete => UiEvent::TurnComplete,
         }
     }

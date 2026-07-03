@@ -895,7 +895,15 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
 - Verification loop (moved from Milestone 1): run the project's test/lint/build
   command, feed failures back, retry bounded; external-signal driven, not an
   LLM self-critique pass
-  ([#265](https://github.com/5omeOtherGuy/iris-agent/issues/265)).
+  ([#265](https://github.com/5omeOtherGuy/iris-agent/issues/265)). Done. Explicit
+  per-project `verify.command` + `verify.maxAttempts` (no auto-detection); the
+  command runs after a turn that changed files as a NORMAL gated shell execution
+  (unchanged approval gate, no persistent allow-always per ADR-0010, dirty-tree
+  guard protects any build artifacts); failure output is fed back to the model as
+  a user message for a bounded retry (each retry only after the model made
+  further changes; stop at the cap); honest pass/fail-after-N/skipped events;
+  verification never settles the task, so a failed loop stays rollbackable
+  (ADR-0028).
 - Worktree isolation slice — design ADR only
   ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267)). Settled
   framing: worktree isolation is Tier 0 of the ADR-0028 guarantee model; apply

@@ -491,6 +491,7 @@ mod tests {
             max_tool_roundtrips: None,
             retry: None,
             open_ai_compatible: None,
+            verify: None,
         }
     }
 

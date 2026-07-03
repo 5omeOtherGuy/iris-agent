@@ -142,6 +142,31 @@ fn bash_prefix_matches(prefix: &str, command: &str) -> bool {
     command.len() == prefix.len() || command[prefix.len()..].starts_with(char::is_whitespace)
 }
 
+/// Terminal outcome of a task's post-change verification loop (issue #265).
+/// Carried by [`AgentEvent::Verification`]; every variant is honest about what
+/// actually happened -- a failure is never reported as a pass, and the failing
+/// output is preserved (truncated) rather than suppressed. The failed task
+/// stays unsettled and rollbackable (ADR-0028): verification never settles it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerificationOutcome {
+    /// The verification command passed after `attempts` run(s) (1 = first try).
+    Passed { attempts: u32 },
+    /// The command still failed after `attempts` run(s) (== the configured cap,
+    /// or fewer when the model stopped making changes). `last_output` is the
+    /// final command output, truncated to a sane size for display.
+    Failed {
+        attempts: u32,
+        exit_code: Option<i32>,
+        last_output: String,
+    },
+    /// The `verify` block is present but configures no command: the feature is
+    /// engaged yet has nothing to run, reported honestly rather than silently.
+    SkippedUnconfigured,
+    /// The user denied the verification command's approval prompt, so no
+    /// verification claim is made (not a pass, not silently dropped).
+    SkippedApprovalDenied,
+}
+
 /// The semantic events the loop emits during a turn. Provider- and UI-neutral:
 /// a front-end maps these onto its own rendering. Mirrors pi's `AgentEvent`
 /// union (`packages/agent/src/types.ts`).
@@ -196,6 +221,11 @@ pub(crate) enum AgentEvent {
         bytes: usize,
         lines: usize,
     },
+    /// Terminal outcome of the post-change verification loop (issue #265),
+    /// surfaced so Tier 3 renders an honest pass/fail/skipped line. Emitted at
+    /// most once per turn, only when Iris changed files. Never claims pass on a
+    /// failure and never suppresses the failing output.
+    Verification(VerificationOutcome),
     /// The harness compacted persisted context at a safe turn boundary.
     /// Contains ids and token estimates, not the generated summary text.
     CompactionApplied {
@@ -752,6 +782,16 @@ pub(crate) struct Agent<P> {
     // round-trips instead of a fatal error. Cancellation remains the always-on
     // runaway guard regardless. Supplied by the host from `Settings`.
     max_tool_roundtrips: Option<usize>,
+    // Whether a mutating tool call (edit/write/bash) SUCCEEDED during the turn
+    // currently running or just completed. Reset at the start of every
+    // `submit_turn` and set when a mutating call's final outcome is `Ok`, so the
+    // harness can tell an end-of-turn "Iris changed files" from a pure Q&A turn
+    // (issue #265 post-change verification trigger). Independent of git state,
+    // so it is correct in non-git/degraded workspaces too. Read only right after
+    // a `submit_turn` returns; a directly-run verification command
+    // ([`run_verification_command`]) may also set it, but that value is always
+    // overwritten by the next `submit_turn` reset before the harness reads it.
+    mutated_this_turn: bool,
 }
 
 /// Result of consuming one provider stream to its terminal event (or to a
@@ -784,6 +824,25 @@ enum ToolOutcome {
     Denied,
 }
 
+/// Classified result of one gated verification-command run (issue #265),
+/// returned by [`Agent::run_verification_command`] so the harness's loop can
+/// decide pass / retry / report-skipped without re-parsing tool metadata.
+pub(crate) enum VerifyRun {
+    /// The command exited 0.
+    Passed,
+    /// The command exited non-zero (or reported no status / errored). `output`
+    /// is the command's rendered output, fed back to the model on retry and
+    /// surfaced (truncated) in the final failure report.
+    Failed {
+        output: String,
+        exit_code: Option<i32>,
+    },
+    /// The user denied the verification command's approval prompt.
+    Denied,
+    /// The turn was cancelled while the verification command was gated/running.
+    Cancelled,
+}
+
 impl<P: ChatProvider> Agent<P> {
     /// A bare, in-memory agent: it owns the provider, conversation, injected
     /// tools, and approval policy, but no filesystem or persistence. Mirrors
@@ -803,6 +862,7 @@ impl<P: ChatProvider> Agent<P> {
             policy_sink: None,
             next_provider_turn_seq: 0,
             max_tool_roundtrips: None,
+            mutated_this_turn: false,
         }
     }
 
@@ -852,6 +912,7 @@ impl<P: ChatProvider> Agent<P> {
             policy_sink: None,
             next_provider_turn_seq,
             max_tool_roundtrips: None,
+            mutated_this_turn: false,
         }
     }
 
@@ -859,6 +920,13 @@ impl<P: ChatProvider> Agent<P> {
     /// without the core loop owning a session store.
     pub(crate) fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Whether a mutating tool call succeeded during the turn just run (issue
+    /// #265). The harness reads this right after [`submit_turn`] to decide
+    /// whether to run post-change verification; a pure Q&A turn returns `false`.
+    pub(crate) fn mutated_this_turn(&self) -> bool {
+        self.mutated_this_turn
     }
 
     /// Replace the in-memory provider-visible context. The Tier-2 harness uses
@@ -905,6 +973,11 @@ impl<P: ChatProvider> Agent<P> {
         token: &CancellationToken,
         steer: Option<&dyn SteeringSource>,
     ) -> Result<()> {
+        // Reset the per-turn mutation signal so the harness's post-change
+        // verification trigger (issue #265) reflects only this turn: a pure Q&A
+        // turn stays `false` and runs no verification. A retry turn resets it too,
+        // so "did the model make further changes" is measured fresh each attempt.
+        self.mutated_this_turn = false;
         // Index of the just-pushed prompt: the start of the unanswered user run
         // a cancellation before any provider answer truncates back to.
         let unanswered_start = self.messages.len();
@@ -913,6 +986,78 @@ impl<P: ChatProvider> Agent<P> {
         // onto its session store after the turn returns (even on error).
         self.complete_turn(unanswered_start, obs, gate, env, token, steer)
             .await
+    }
+
+    /// Run one post-change verification command (issue #265) as a NORMAL gated
+    /// shell execution: a `bash` tool call routed through the exact same
+    /// approval gate, dirty-tree guard (#262), and cancellation path as any
+    /// model-issued shell call. No approval bypass and no persistent
+    /// allow-always -- `bash` opts out (ADR-0010), so it re-prompts every run.
+    ///
+    /// The command's outcome is emitted as a display-only tool result (so Tier 3
+    /// renders the run and its output) but is NOT recorded into provider context
+    /// here: the harness feeds a failure back to the model as an explicit user
+    /// message instead of fabricating an assistant tool call. Returns the
+    /// classified [`VerifyRun`] so the harness can decide pass/fail/retry.
+    pub(crate) async fn run_verification_command(
+        &mut self,
+        command: &str,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+        env: &ToolEnv<'_>,
+        token: &CancellationToken,
+    ) -> Result<VerifyRun> {
+        let provider_turn_id = self.next_provider_turn_id();
+        let call = ToolCall {
+            id: format!("verify_{provider_turn_id}"),
+            name: "bash".to_string(),
+            arguments: json!({ "command": command }),
+            thought_signature: None,
+        };
+        let outcome = self
+            .run_gated_single(&call, obs, gate, env, token, &provider_turn_id)
+            .await?;
+        // Classify before `record_call` consumes the outcome. Pass = exit 0;
+        // any non-zero/absent status or tool error is a failure carrying the
+        // command output (the guard-halt error text, when that is the failure).
+        let run = match &outcome {
+            ToolOutcome::Ok(output) => {
+                let exit_code = output
+                    .metadata
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .map(|code| code as i32);
+                if exit_code == Some(0) {
+                    VerifyRun::Passed
+                } else {
+                    VerifyRun::Failed {
+                        output: output.content.clone(),
+                        exit_code,
+                    }
+                }
+            }
+            ToolOutcome::Err(error) => VerifyRun::Failed {
+                output: format!("{error:#}"),
+                exit_code: None,
+            },
+            ToolOutcome::Denied => VerifyRun::Denied,
+            ToolOutcome::Cancelled => VerifyRun::Cancelled,
+        };
+        // Emit the display-only tool result (proposed/started already fired in
+        // `run_gated_single`). A throwaway message buffer and `None` store keep
+        // the result out of provider context and off the handle store: this call
+        // was Iris's own check, not a model tool call. The harness surfaces the
+        // failure to the model as a user message instead.
+        let mut display_only = Vec::new();
+        record_call(
+            &mut display_only,
+            obs,
+            None,
+            &call,
+            outcome,
+            &provider_turn_id,
+        )?;
+        Ok(run)
     }
 
     async fn complete_turn(
@@ -1579,6 +1724,14 @@ impl<P: ChatProvider> Agent<P> {
             }
             None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
         };
+        // Record that Iris changed the workspace this turn when a mutating tool's
+        // FINAL outcome is Ok (a guard-halted/restored call ends as Err and does
+        // not count). Drives the harness's post-change verification trigger
+        // (issue #265). Uses the post-guard outcome so a violation that restored
+        // the file is not mistaken for a real mutation.
+        if is_mutating && matches!(outcome, ToolOutcome::Ok(_)) {
+            self.mutated_this_turn = true;
+        }
         Ok(outcome)
     }
 
