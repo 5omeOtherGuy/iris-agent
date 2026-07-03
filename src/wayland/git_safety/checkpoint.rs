@@ -231,6 +231,72 @@ impl CheckpointChain {
         self.before.len()
     }
 
+    /// Net-diff inputs (issue #264): for every ledger path, its pre-task bytes
+    /// (read back from the base snapshot blob; `None` = a create) and its current
+    /// bytes. `root` is the source tree the current side comes from -- normally
+    /// the workspace, but a parameter so a later worktree-apply review
+    /// (#267/#271) can diff the same ledger against a different tree. Only ledger
+    /// paths are visited, so a user-modified file never appears.
+    ///
+    /// TOCTOU exclusion (issue #264 finding 1, ADR-0028): when diffing the live
+    /// workspace, each path's current disk bytes are compared against Iris's last
+    /// recorded write (the checkpoint-chain tip, the same tip [`diverged_from_tip`]
+    /// reconciles rollback against). If they differ, the user edited the path
+    /// after Iris's last touch; those bytes are user-attributed, so the current
+    /// side becomes the tip blob (Iris's last recorded state) -- never the user's
+    /// bytes rendered as Iris output -- and the path is flagged diverged so the
+    /// diff carries an explicit notice. Divergence detection is skipped for an
+    /// alternate `root` (the worktree-apply seam), where the current side is that
+    /// tree by definition and there is no "live disk vs tip" relationship.
+    pub(super) fn net_diff_inputs(&self, root: &Path) -> Result<Vec<super::net_diff::NetPath>> {
+        // Iris's last recorded snapshot of every ledger path, only when diffing
+        // the live workspace (see divergence note above).
+        let tip_tree = if root == self.workspace {
+            match self.tip_commit()? {
+                Some(tip) => Some(self.tree_entries(&tip)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mut out = Vec::new();
+        for (path, blob) in &self.before {
+            let rel = path
+                .strip_prefix(&self.workspace)
+                .unwrap_or(path)
+                .to_path_buf();
+            let pre = match blob {
+                Some(blob) => Some(self.read_blob(&blob.sha)?),
+                None => None,
+            };
+            let disk = std::fs::read(root.join(&rel)).ok();
+            let (cur, diverged) = match &tip_tree {
+                Some(tree) => {
+                    let rel_key = self.rel_bytes(path)?;
+                    let tip = match tree.get(&rel_key) {
+                        Some(blob) => Some(self.read_blob(&blob.sha)?),
+                        None => None,
+                    };
+                    if disk == tip {
+                        (disk, false)
+                    } else {
+                        // User bytes landed after Iris's last write: show Iris's
+                        // last recorded state, flag the divergence.
+                        (tip, true)
+                    }
+                }
+                None => (disk, false),
+            };
+            out.push(super::net_diff::NetPath {
+                rel,
+                pre,
+                cur,
+                diverged,
+            });
+        }
+        Ok(out)
+    }
+
     /// Record the pre-task content of a ledger path the first time it is seen.
     /// Idempotent: a later touch of the same path never overwrites the captured
     /// pre-task bytes. `bytes` is `None` for a path that did not exist pre-task.

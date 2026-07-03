@@ -150,6 +150,14 @@ pub(crate) enum UiEvent {
     /// matches provider context. See [`AgentEvent::UserMessage`].
     UserMessage(String),
     Notice(String),
+    /// The task's final net diff (issue #264, `/diff`): a per-file summary plus
+    /// the combined unified diff. Rendered through the existing diff colorizer
+    /// in the TUI and as plain text on the non-TTY path. A UI-only event -- it
+    /// has no `AgentEvent` source (the model never emits it).
+    TaskDiff {
+        summary: Vec<String>,
+        diff: String,
+    },
     TurnError {
         kind: TurnErrorKind,
         message: String,

@@ -32,6 +32,7 @@ mod baseline;
 mod checkpoint;
 mod git;
 mod ledger;
+mod net_diff;
 mod settlement;
 mod snapshot;
 mod task_state;
@@ -51,6 +52,8 @@ use checkpoint::{CheckpointChain, Mode as FileMode};
 use ledger::{Attribution, Ledger, LedgerEntry};
 use settlement::{checkpoint_label, new_task_id};
 use snapshot::{FallbackStore, Snapshot};
+
+pub(crate) use net_diff::TaskNetDiff;
 
 /// A ledger path's pre-task content for the checkpoint chain: the exact bytes
 /// and file mode captured before Iris first touched it, or `None` when the path

@@ -182,4 +182,30 @@ impl FallbackStore {
         let drop = self.points.len().saturating_sub(keep);
         self.points.drain(0..drop);
     }
+
+    /// Net-diff inputs (issue #264) for the degraded (non-git) fallback: each
+    /// touched path's pre-task bytes and its current bytes read from `root`,
+    /// with the same ledger-path-only scoping as the git chain. `workspace`
+    /// maps an absolute touched path to the relative key joined under `root`.
+    pub(super) fn net_diff_inputs(
+        &self,
+        root: &Path,
+        workspace: &Path,
+    ) -> Vec<super::net_diff::NetPath> {
+        self.before
+            .iter()
+            .map(|(path, pre)| {
+                let rel = path.strip_prefix(workspace).unwrap_or(path).to_path_buf();
+                let cur = fs::read(root.join(&rel)).ok();
+                super::net_diff::NetPath {
+                    rel,
+                    pre: pre.clone(),
+                    cur,
+                    // Degraded fallback has no checkpoint tip to compare against,
+                    // so no divergence detection (reduced guarantees, ADR-0028).
+                    diverged: false,
+                }
+            })
+            .collect()
+    }
 }

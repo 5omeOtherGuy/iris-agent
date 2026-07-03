@@ -257,6 +257,19 @@ impl<P: ChatProvider> Harness<P> {
         self.git_safety.recover_and_expire()
     }
 
+    /// The current task's net diff (`/diff`, and the accept-flow summary): the
+    /// change from each Iris-authored ledger path's pre-task state to its
+    /// current bytes, one hunk set per file (issue #264). Empty when no task is
+    /// unsettled. Computed against the workspace; the engine keeps a source-tree
+    /// parameter for a later worktree-apply review (#267/#271).
+    ///
+    /// Fails closed (issue #264 finding 2): a checkpoint/blob read error is
+    /// returned, never swallowed into an empty diff, so callers surface an honest
+    /// error instead of a misleading "no changes".
+    pub(crate) fn task_diff(&self) -> Result<git_safety::TaskNetDiff> {
+        self.git_safety.task_diff(None)
+    }
+
     /// Id of the attached transcript log, or `None` for an in-memory session.
     pub(crate) fn session_id(&self) -> Option<&str> {
         self.session.as_ref().map(SessionLog::id)

@@ -648,6 +648,13 @@ fn route_command<P: ChatProvider>(
             }
             Ok(RouteOutcome::Consumed)
         }
+        "/diff" if rest.is_empty() => {
+            // The final task diff (issue #264): render the net diff on demand
+            // through the diff colorizer at this safe boundary.
+            tui.screen.commit_user(prompt);
+            tui.screen.apply(crate::cli::task_diff_event(harness));
+            Ok(RouteOutcome::Consumed)
+        }
         "/rollback" | "/accept" | "/checkpoint" => {
             // Checkpoint/rollback settlement (issue #263) at this safe boundary.
             tui.screen.commit_user(prompt);
