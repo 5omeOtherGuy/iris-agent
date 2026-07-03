@@ -408,6 +408,23 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
             span.style = span.style.bg(crate::ui::palette::SURFACE);
         }
     }
+    // Sticky user-prompt header (grok `sticky_headers`): when the newest
+    // prompt above the viewport has scrolled past the top, pin its first line
+    // (dimmed) on the first transcript row so the reader always knows which
+    // prompt the visible content answers. Applied last for row 0, so it wins
+    // over a selection/search fill that would land on the same row.
+    if view_rows >= 2
+        && top > 0
+        && let Some(line) = screen.transcript.sticky_prompt_line(top)
+    {
+        let mut header = screen.transcript_window(width, line, 1);
+        if let Some(mut header_line) = header.pop() {
+            for span in &mut header_line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+            body[0] = header_line;
+        }
+    }
     // Bottom overlay row: an active search shows its position indicator;
     // otherwise disengaged follow shows how much is below. Search wins (it is
     // the mode the user just entered).
@@ -908,6 +925,53 @@ mod tests {
         assert_eq!(state.total, 0);
         assert!(state.line.is_none());
         assert!(!screen.search_step(-1));
+    }
+
+    #[test]
+    fn sticky_prompt_header_pins_the_newest_prompt_scrolled_past() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.commit_user("first question about apples");
+        for i in 0..60 {
+            screen.apply(UiEvent::Notice(format!("answer detail {i}")));
+        }
+        screen.commit_user("second question about oranges");
+        for i in 0..60 {
+            screen.apply(UiEvent::Notice(format!("more detail {i}")));
+        }
+        let size = Size::new(80, 24);
+        // Following at the bottom: the second prompt has scrolled past the
+        // top, so it is pinned (dimmed) on the first transcript row.
+        let frame = compose_frame(&mut screen, size).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        assert!(
+            rows[2].contains("second question about oranges"),
+            "sticky header pins the governing prompt: {:?}",
+            rows[2]
+        );
+
+        // Scrolled into the first answer: the FIRST prompt is the sticky one.
+        screen.scroll.jump_to_start();
+        screen.scroll.scroll_down(10);
+        let frame = compose_frame(&mut screen, size).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        assert!(
+            rows[2].contains("first question about apples"),
+            "older region pins the older prompt: {:?}",
+            rows[2]
+        );
+
+        // At the very top nothing has scrolled past: no sticky overlay (the
+        // first prompt is simply the first content row, and the newer prompt
+        // is not pinned over it).
+        screen.scroll.jump_to_start();
+        let frame = compose_frame(&mut screen, size).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        assert!(
+            !rows[2].contains("second question"),
+            "no sticky at the top: {:?}",
+            rows[2]
+        );
     }
 
     #[test]
