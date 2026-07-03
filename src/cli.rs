@@ -546,10 +546,11 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     force_plain: bool,
     swap: &SessionLoader<'_>,
     startup_modal: Option<crate::ui::modal::Modal>,
+    start_page: bool,
 ) -> Result<()> {
     if !prefers_text_ui(force_plain) {
         match TuiUi::new() {
-            Ok(tui) => return run_tui(harness, tui, switch, swap, startup_modal),
+            Ok(tui) => return run_tui(harness, tui, switch, swap, startup_modal, start_page),
             Err(error) => {
                 if startup_modal.is_some() {
                     bail!(
@@ -599,9 +600,18 @@ fn run_tui<P: ChatProvider>(
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<crate::ui::modal::Modal>,
+    start_page: bool,
 ) -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    let result = crate::ui::tui_loop::run(harness, &runtime, tui, switch, swap, startup_modal);
+    let result = crate::ui::tui_loop::run(
+        harness,
+        &runtime,
+        tui,
+        switch,
+        swap,
+        startup_modal,
+        start_page,
+    );
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
 }

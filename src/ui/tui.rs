@@ -45,6 +45,7 @@ mod panel;
 mod rows;
 mod screen;
 mod shell_command;
+mod startup;
 mod text;
 mod tool_render;
 mod transcript;
@@ -56,13 +57,14 @@ pub(crate) use overlay::{FocusTarget, overlay_box};
 use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
-pub(crate) use screen::Screen;
+pub(crate) use screen::{ApprovalPolicy, Screen};
 use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
 use screen::{
     composer_statusline, editor_visual_rows, fresh_editor, render_document,
-    render_document_with_chrome_tail, working_indicator_line,
+    render_document_with_chrome_tail, session_bar, working_indicator_line,
 };
+pub(crate) use startup::StartAction;
 #[cfg(test)]
 use transcript::Transcript;
 #[cfg(test)]
@@ -71,15 +73,19 @@ pub(crate) use wrap::wrap_to_width;
 
 /// Editor box grows with content up to this many text rows, then scrolls
 /// internally (keeps the transcript from being squeezed by a huge paste).
-const MAX_EDITOR_ROWS: u16 = 5;
+const MAX_EDITOR_ROWS: u16 = 8;
 
 /// Above-editor menu height cap, including the blank row above and below.
 const MAX_MENU_ROWS: u16 = 16;
-/// Minimum composer height: hairline + statusline + blank spacer + one input row.
+/// Minimum composer height: hairline + one input row + internal rule + statusline.
 const MIN_EDITOR_H: u16 = 4;
-/// Composer chrome above the input rows: the hairline top edge, statusline, and spacer.
+/// Composer chrome rows around the input: the hairline top edge above, plus
+/// the internal rule and bottom statusline below.
 const EDITOR_VERTICAL_CHROME_ROWS: u16 = 3;
-/// Blank row below the input so the composer text does not sit on the screen edge.
+/// Composer chrome above the input rows: the hairline top edge only (the rule
+/// and statusline sit below the input).
+const EDITOR_CHROME_ROWS_ABOVE: u16 = 1;
+/// Blank row below the composer statusline so it does not sit on the screen edge.
 const EDITOR_BOTTOM_PADDING_ROWS: u16 = 1;
 
 /// Safety valve for long-running sessions: keep rendering and retained
@@ -1425,7 +1431,9 @@ mod tests {
             .iter()
             .take_while(|line| line.trim().is_empty())
             .count();
-        assert_eq!(blank_rows_after_placeholder, 1, "{lines:?}");
+        // Internal-rule and statusline rows (blank before a footer exists) plus
+        // the one intentional soft bottom row.
+        assert_eq!(blank_rows_after_placeholder, 3, "{lines:?}");
     }
 
     #[test]
@@ -1437,11 +1445,11 @@ mod tests {
     }
 
     #[test]
-    fn editor_visual_rows_cap_at_five_lines() {
+    fn editor_visual_rows_cap_at_eight_lines() {
         let mut editor = fresh_editor();
-        editor.insert_str("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+        editor.insert_str("abcdefghijk".repeat(12));
 
-        assert_eq!(editor_visual_rows(&editor, 18), 5);
+        assert_eq!(editor_visual_rows(&editor, 18), MAX_EDITOR_ROWS);
     }
 
     #[test]
@@ -1863,9 +1871,13 @@ mod tests {
         );
         let rendered = rendered_text(&mut screen, 180, 12);
 
-        // Runtime status is the composer statusline under the hairline edge.
-        assert!(rendered.contains("◉ CODE ─ SONNET 3.5 HIGH"), "{rendered}");
-        // Workspace state right-aligns on the statusline itself.
+        // Runtime status is the composer's bottom statusline, with the
+        // approval-policy segment (symbol + label) after the model.
+        assert!(
+            rendered.contains("◉ CODE ─ SONNET 3.5 HIGH ─ ▲ on-request"),
+            "{rendered}"
+        );
+        // Workspace state lives on the pane-top session bar.
         assert!(
             rendered.contains("~/workspace/user-auth ┊ git feat/rate-limit"),
             "{rendered}"
@@ -1923,12 +1935,10 @@ mod tests {
             .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
             .expect("hairline top edge");
 
-        // Statusline row (blank before a footer exists), spacer row, then the input row.
-        assert!(!texts[top + 1].contains("Give Iris"), "{texts:?}");
-        assert_eq!(texts[top + 2].trim(), "", "{texts:?}");
-        assert!(texts[top + 3].contains("Give Iris a task..."), "{texts:?}");
+        // The input row sits directly under the composer's top edge.
+        assert!(texts[top + 1].contains("Give Iris a task..."), "{texts:?}");
         assert!(
-            texts[top + 3].starts_with("      Give Iris a task..."),
+            texts[top + 1].starts_with("      Give Iris a task..."),
             "input should align with transcript text: {texts:?}"
         );
         // No box: no side borders, no bottom border, no hint row.
@@ -1954,12 +1964,14 @@ mod tests {
             .expect("composer input");
 
         assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+        // Below the input: the internal-rule and statusline rows (blank before
+        // a footer exists) and the one intentional soft bottom row.
         assert_eq!(
-            input_idx + 2,
+            input_idx + 4,
             texts.len(),
-            "only the intentional one blank row should sit below composer input: {texts:?}"
+            "only the composer's bottom chrome should sit below the input: {texts:?}"
         );
-        assert_eq!(texts[input_idx + 1].trim(), "", "{texts:?}");
+        assert_eq!(texts[input_idx + 3].trim(), "", "{texts:?}");
     }
 
     #[test]
@@ -2008,7 +2020,7 @@ mod tests {
             .iter()
             .position(|line| line.contains("Give Iris a task..."))
             .expect("composer input");
-        assert_eq!(input_idx + 2, texts.len(), "{texts:?}");
+        assert_eq!(input_idx + 4, texts.len(), "{texts:?}");
         let hairline = texts
             .iter()
             .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
@@ -2017,6 +2029,83 @@ mod tests {
             texts[..hairline].iter().all(|line| line.trim().is_empty()),
             "launch filler above the composer must be blank: {texts:?}"
         );
+    }
+
+    #[test]
+    fn start_page_shows_centered_launcher_inside_the_shared_chrome() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("xhigh".to_string()),
+            "~/demo (main)".to_string(),
+        );
+        screen.apply(UiEvent::SessionStarted);
+        screen.show_start_page();
+
+        let height = 24u16;
+        let lines = rendered_lines(&mut screen, 80, height);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+
+        // Session bar on top with the launch cwd and an empty meter.
+        assert!(texts[0].contains("~/demo ┊ git main"), "{texts:?}");
+        assert!(
+            texts[0].trim_end().ends_with("CTX 0/300k ○○○○○○○○○○"),
+            "{texts:?}"
+        );
+        // The IrisMark LED strip sits above the launcher menu.
+        let mark_idx = texts
+            .iter()
+            .position(|line| line.contains('●') && line.contains('○') && !line.contains("CTX"))
+            .expect("IrisMark strip");
+        let menu_idx = texts
+            .iter()
+            .position(|line| line.contains("New session"))
+            .expect("launcher menu");
+        assert!(mark_idx < menu_idx, "{texts:?}");
+        // All four rows, in order, with their key hints and the house idiom:
+        // ◉ marker on the selected row, dotted leaders, no hairline dividers.
+        assert!(texts[menu_idx].contains("◉ New session"), "{texts:?}");
+        assert!(texts[menu_idx].trim_end().ends_with("ctrl-n"), "{texts:?}");
+        assert!(texts[menu_idx + 1].contains("Resume session"), "{texts:?}");
+        assert!(
+            texts[menu_idx + 1].trim_end().ends_with("ctrl-r"),
+            "{texts:?}"
+        );
+        assert!(
+            texts[menu_idx + 2].trim_end().ends_with("ctrl-,"),
+            "{texts:?}"
+        );
+        assert!(
+            texts[menu_idx + 3].trim_end().ends_with("ctrl-q"),
+            "{texts:?}"
+        );
+        // The composer chrome stays live below the launcher.
+        assert!(
+            texts
+                .iter()
+                .skip(menu_idx)
+                .any(|line| line.contains("Give Iris a task...")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("◉ CODE ─ GPT-5.5 XHIGH ─ ▲ on-request")),
+            "{texts:?}"
+        );
+
+        // Entering a session replaces the launcher; the chrome is unchanged.
+        screen.start_turn();
+        let after: Vec<String> = rendered_lines(&mut screen, 80, height)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            !after.iter().any(|line| line.contains("New session")),
+            "{after:?}"
+        );
+        assert!(after[0].contains("~/demo ┊ git main"), "{after:?}");
     }
 
     #[test]
@@ -2062,29 +2151,42 @@ mod tests {
             Some("off".to_string()),
             "~/project".to_string(),
         );
-        let lines = rendered_lines(&mut screen, 120, 8);
+        let lines = rendered_lines(&mut screen, 120, 10);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        let status = texts
-            .iter()
-            .find(|line| line.contains("◉ CODE"))
-            .expect("statusline");
-
-        // Mode/model/effort/context + 10-dot meter, all uppercase.
-        assert!(
-            status.contains("◉ CODE ─ GPT-5.4-MINI OFF ─ CTX 300K ○○○○○○○○○○"),
-            "{status:?}"
-        );
-        // The workspace right-aligns on the same line.
-        assert!(status.trim_end().ends_with("~/project"), "{status:?}");
-        // The statusline is followed by a blank spacer, then the aligned input.
         let status_idx = texts
             .iter()
             .position(|line| line.contains("◉ CODE"))
             .expect("statusline");
-        assert_eq!(texts[status_idx + 1].trim(), "", "{texts:?}");
+        let status = &texts[status_idx];
+
+        // Mode/model/effort + approval policy, uppercase runtime tokens.
         assert!(
-            texts[status_idx + 2].starts_with("      Give Iris a task..."),
+            status.contains("◉ CODE ─ GPT-5.4-MINI OFF ─ ▲ on-request"),
+            "{status:?}"
+        );
+        // Location and context moved to the pane-top session bar: cwd on the
+        // left, right-aligned `CTX used/cap` readout with the 10-dot meter.
+        assert!(texts[0].starts_with("  ~/project"), "{texts:?}");
+        assert!(
+            texts[0].trim_end().ends_with("CTX 0/300k ○○○○○○○○○○"),
+            "{texts:?}"
+        );
+        assert!(!status.contains("CTX"), "{status:?}");
+        assert!(!status.contains("~/project"), "{status:?}");
+        // A soft hairline sits under the session bar.
+        assert!(
+            texts[1].trim().chars().all(|ch| ch == '─') && texts[1].contains('─'),
+            "{texts:?}"
+        );
+        // The statusline is the last content row: input, then the lighter
+        // internal rule, then the statusline.
+        assert!(
+            texts[status_idx - 2].starts_with("      Give Iris a task..."),
             "input should align with transcript text: {texts:?}"
+        );
+        assert!(
+            texts[status_idx - 1].contains('╌'),
+            "internal rule above the statusline: {texts:?}"
         );
         // No box corners anywhere in the composer chrome.
         assert!(!status.contains('┌'), "{status:?}");
@@ -2103,18 +2205,23 @@ mod tests {
             "~/projects/iris (feat/composer-statusline)".to_string(),
         );
 
-        // At a constrained width the statusline falls back to the minimum:
-        // mode + model only (effort, meter, and CTX dropped, in that order).
+        // Narrow widths drop the policy segment first (effort survives)...
         let status = composer_statusline(&screen, 30)
             .map(|line| line_text(&line))
             .expect("statusline");
-
-        assert!(status.contains("◉ CODE ─ GPT-5.4-MINI"), "{status:?}");
-        assert!(!status.contains("OFF"), "{status:?}");
-        assert!(!status.contains("CTX"), "{status:?}");
-        assert!(!status.contains('○'), "{status:?}");
-        assert!(status.matches('◉').count() == 1, "{status:?}");
+        assert!(status.contains("◉ CODE ─ GPT-5.4-MINI OFF"), "{status:?}");
+        assert!(!status.contains("on-request"), "{status:?}");
         assert!(display_width(&status) <= 30, "{status:?}");
+
+        // ...then effort, leaving the minimum: mode + model only.
+        let minimum = composer_statusline(&screen, 22)
+            .map(|line| line_text(&line))
+            .expect("statusline");
+        assert!(minimum.contains("◉ CODE ─ GPT-5.4-MINI"), "{minimum:?}");
+        assert!(!minimum.contains("OFF"), "{minimum:?}");
+        assert!(!minimum.contains("on-request"), "{minimum:?}");
+        assert!(minimum.matches('◉').count() == 1, "{minimum:?}");
+        assert!(display_width(&minimum) <= 22, "{minimum:?}");
     }
 
     #[test]
@@ -2139,13 +2246,11 @@ mod tests {
             .iter()
             .position(|line| line.contains("Give Iris a task"))
             .expect("composer remains visible");
-        // The statusline stays in the composer chrome above the spacer/input; the workspace label
-        // right-aligns on the statusline itself.
-        assert!(status_idx < editor_idx, "{texts:?}");
-        assert!(
-            texts[status_idx].contains("~/repo ┊ git feat/pin-rail"),
-            "{texts:?}"
-        );
+        // The bottom statusline sits below the input; the workspace label lives
+        // on the session bar at the top of the document.
+        assert!(editor_idx < status_idx, "{texts:?}");
+        assert!(texts[0].contains("~/repo ┊ git feat/pin-rail"), "{texts:?}");
+        assert!(!texts[status_idx].contains("~/repo"), "{texts:?}");
     }
 
     #[test]
@@ -2158,10 +2263,10 @@ mod tests {
             "~/repo".to_string(),
         );
         // No usage yet: meter is all empty.
-        let empty = composer_statusline(&screen, 110)
+        let empty = session_bar(&screen, 110)
             .map(|l| line_text(&l))
-            .expect("top");
-        assert!(empty.contains("CTX 300K ○○○○○○○○○○"), "{empty:?}");
+            .expect("session bar");
+        assert!(empty.contains("CTX 0/300k ○○○○○○○○○○"), "{empty:?}");
 
         screen.start_turn();
         screen.apply(UiEvent::ProviderTurnCompleted {
@@ -2181,17 +2286,17 @@ mod tests {
         });
         screen.end_turn();
         // 90k/300k => 30% => 3 lit dots (last is the orange edge).
-        let filled = composer_statusline(&screen, 110)
+        let filled = session_bar(&screen, 110)
             .map(|l| line_text(&l))
-            .expect("top");
-        assert!(filled.contains("CTX 300K ●●●○○○○○○○"), "{filled:?}");
+            .expect("session bar");
+        assert!(filled.contains("CTX 90k/300k ●●●○○○○○○○"), "{filled:?}");
 
         // The meter must NOT drop to empty at the start of the next turn.
         screen.start_turn();
-        let during = composer_statusline(&screen, 110)
+        let during = session_bar(&screen, 110)
             .map(|l| line_text(&l))
-            .expect("top");
-        assert!(during.contains("CTX 300K ●●●○○○○○○○"), "{during:?}");
+            .expect("session bar");
+        assert!(during.contains("CTX 90k/300k ●●●○○○○○○○"), "{during:?}");
     }
 
     #[test]
@@ -2213,17 +2318,17 @@ mod tests {
                 cache_creation: None,
             }),
         });
-        let before = composer_statusline(&screen, 110)
+        let before = session_bar(&screen, 110)
             .map(|l| line_text(&l))
-            .expect("top");
-        assert!(before.contains("CTX 300K ●●●●●○○○○○"), "{before:?}");
+            .expect("session bar");
+        assert!(before.contains("CTX 150k/300k ●●●●●○○○○○"), "{before:?}");
 
         // Switching model clears the meter (prior usage no longer maps).
         screen.set_footer("gpt-5.4".to_string(), None, "~/repo".to_string());
-        let after = composer_statusline(&screen, 110)
+        let after = session_bar(&screen, 110)
             .map(|l| line_text(&l))
-            .expect("top");
-        assert!(after.contains("CTX 300K ○○○○○○○○○○"), "{after:?}");
+            .expect("session bar");
+        assert!(after.contains("CTX 0/300k ○○○○○○○○○○"), "{after:?}");
     }
 
     #[test]
@@ -2252,10 +2357,10 @@ mod tests {
                 cache_creation: None,
             }),
         });
-        let before = composer_statusline(&screen, 110)
+        let before = session_bar(&screen, 110)
             .map(|l| line_text(&l))
-            .expect("top");
-        assert!(before.contains("CTX 300K ●●●●●○○○○○"), "{before:?}");
+            .expect("session bar");
+        assert!(before.contains("CTX 150k/300k ●●●●●○○○○○"), "{before:?}");
 
         // A refresh with a differently-cased same model id must NOT reset the meter.
         screen.set_footer_with_context(
@@ -2264,10 +2369,10 @@ mod tests {
             Some("300k".to_string()),
             "~/repo".to_string(),
         );
-        let after = composer_statusline(&screen, 110)
+        let after = session_bar(&screen, 110)
             .map(|l| line_text(&l))
-            .expect("top");
-        assert!(after.contains("CTX 300K ●●●●●○○○○○"), "{after:?}");
+            .expect("session bar");
+        assert!(after.contains("CTX 150k/300k ●●●●●○○○○○"), "{after:?}");
     }
 
     #[test]
@@ -2278,13 +2383,13 @@ mod tests {
             None,
             "~/projects/very/deeply/nested/path/iris-agent (main)".to_string(),
         );
-        let label = composer_statusline(&screen, 80)
+        let label = session_bar(&screen, 50)
             .map(|line| line_text(&line))
-            .expect("statusline");
-        assert!(display_width(&label) <= 80, "{label:?}");
+            .expect("session bar");
+        assert!(display_width(&label) <= 50, "{label:?}");
         assert!(label.contains("iris-agent"), "{label:?}");
         assert!(label.contains('…'), "{label:?}");
-        assert!(label.trim_end().ends_with("┊ git main"), "{label:?}");
+        assert!(label.contains("┊ git main"), "{label:?}");
     }
 
     #[test]
@@ -2355,8 +2460,8 @@ mod tests {
         );
         assert_eq!(texts[working_idx - 1].trim(), "", "{texts:?}");
         assert_eq!(texts[working_idx + 1].trim(), "", "{texts:?}");
-        // blank, then the composer hairline, then the statusline.
-        assert_eq!(status_idx, working_idx + 3, "{texts:?}");
+        // blank, hairline, input, internal rule, then the bottom statusline.
+        assert_eq!(status_idx, working_idx + 5, "{texts:?}");
         assert!(texts[working_idx].contains("↑5.4k ↓137"), "{texts:?}");
     }
 
@@ -3210,13 +3315,14 @@ mod tests {
         screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
         let rendered = rendered_text(&mut screen, 100, 10);
 
-        // No effort token between the model and the CTX separator.
+        // No effort token between the model and the policy separator.
         assert!(
-            rendered.contains("◉ CODE ─ GPT-5.5 ─ CTX 300K"),
+            rendered.contains("◉ CODE ─ GPT-5.5 ─ ▲ on-request"),
             "{rendered}"
         );
-        // No branch: a bare cwd label with no git suffix.
+        // No branch: a bare cwd label with no git suffix on the session bar.
         assert!(rendered.contains("~/repo"), "{rendered}");
+        assert!(rendered.contains("CTX 0/300k"), "{rendered}");
         assert!(!rendered.contains("┊ git"), "{rendered}");
     }
 
@@ -3231,10 +3337,11 @@ mod tests {
         let rendered = rendered_text(&mut screen, 100, 10);
 
         assert!(
-            rendered.contains("◉ CODE ─ GPT-5.5 HIGH ─ CTX 300K"),
+            rendered.contains("◉ CODE ─ GPT-5.5 HIGH ─ ▲ on-request"),
             "{rendered}"
         );
         assert!(rendered.contains("~/repo ┊ git branch"), "{rendered}");
+        assert!(rendered.contains("CTX 0/300k"), "{rendered}");
     }
 
     fn transcript_text(screen: &mut Screen, width: u16) -> String {
@@ -4076,7 +4183,9 @@ mod tests {
             .take_while(|line| line.trim().is_empty())
             .count();
 
-        assert_eq!(blank_rows_after_placeholder, 0, "{lines:?}");
+        // The internal-rule and statusline rows are blank before a footer
+        // exists; the soft bottom padding row itself is reclaimed by the modal.
+        assert_eq!(blank_rows_after_placeholder, 2, "{lines:?}");
     }
 
     #[test]

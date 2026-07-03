@@ -22,6 +22,7 @@ use crate::ui::terminal_surface::CURSOR_MARKER;
 
 use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
+use super::startup::StartPage;
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::transcript::{Transcript, TranscriptRender};
 use super::wrap::{
@@ -29,9 +30,10 @@ use super::wrap::{
     truncate_line, truncate_to_width, wrap_to_width,
 };
 use super::{
-    BOX_X_PADDING_U16, EDITOR_BOTTOM_PADDING_ROWS, EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS,
-    MAX_MENU_ROWS, MIN_EDITOR_H, TEXT_COLUMN_X_PADDING, WORKING_FRAMES, border_style, dim_style,
-    err_style, format_elapsed_compact, panel_style, prompt_style,
+    BOX_X_PADDING_U16, EDITOR_BOTTOM_PADDING_ROWS, EDITOR_CHROME_ROWS_ABOVE,
+    EDITOR_VERTICAL_CHROME_ROWS, MAX_EDITOR_ROWS, MAX_MENU_ROWS, MIN_EDITOR_H,
+    TEXT_COLUMN_X_PADDING, WORKING_FRAMES, border_style, dim_style, err_style,
+    format_elapsed_compact, panel_style, prompt_style,
 };
 
 /// Animated turn-progress spinner. Advances only while `active`, so an idle
@@ -151,6 +153,60 @@ impl Spinner {
 /// (`IRIS_REDUCED_MOTION`); read once when the screen is constructed.
 fn reduced_motion() -> bool {
     crate::config::iris_flag_enabled("IRIS_REDUCED_MOTION")
+}
+
+/// Effective approval-policy posture shown on the composer's bottom
+/// statusline. State is always symbol + label, never color alone. The mapping
+/// follows the runtime's real approval surface: the interactive loop gates
+/// every non-allowlisted tool through the approval prompt (`on-request`);
+/// `always-approve` mirrors the auto-approving print gate, and `read-only` /
+/// `off` are reserved postures for gates that deny or skip approvals entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalPolicy {
+    /// Gated tools are auto-approved (the print gate's `--approve` posture).
+    /// Not constructed by the interactive loop today; kept so the statusline
+    /// vocabulary covers every runtime posture.
+    #[allow(dead_code)]
+    AlwaysApprove,
+    /// Gated tools prompt for a decision — the interactive loop's posture.
+    OnRequest,
+    /// Gated tools are denied. Reserved posture; not constructed yet.
+    #[allow(dead_code)]
+    ReadOnly,
+    /// Approvals are disabled entirely. Reserved posture; not constructed yet.
+    #[allow(dead_code)]
+    Off,
+}
+
+impl ApprovalPolicy {
+    /// State glyph from the symbol vocabulary (`◆`/`▲`/`■`/`○`).
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::AlwaysApprove => crate::ui::symbols::DONE,
+            Self::OnRequest => crate::ui::symbols::REVIEW,
+            Self::ReadOnly => crate::ui::symbols::ERROR,
+            Self::Off => crate::ui::symbols::EMPTY,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AlwaysApprove => "always-approve",
+            Self::OnRequest => "on-request",
+            Self::ReadOnly => "read-only",
+            Self::Off => "off",
+        }
+    }
+
+    /// Symbol color role: green done / orange review / red error / dim empty.
+    fn symbol_style(self) -> Style {
+        match self {
+            Self::AlwaysApprove => Style::default().fg(crate::ui::palette::GREEN),
+            Self::OnRequest => prompt_style(),
+            Self::ReadOnly => Style::default().fg(crate::ui::palette::RED),
+            Self::Off => dim_style(),
+        }
+    }
 }
 
 /// Session rail metadata.
@@ -513,6 +569,15 @@ pub(crate) struct Screen {
     /// backgrounded Iris panes in a tmux session do not each animate at 10Hz;
     /// event-driven redraws (streaming, tool output) continue as normal.
     terminal_focused: bool,
+    /// Effective approval-policy posture for the bottom statusline.
+    approval_policy: ApprovalPolicy,
+    /// The start page (IrisMark + launcher), shown before the first session
+    /// activity when Iris launched interactively with no task/resume target.
+    pub(crate) start_page: Option<StartPage>,
+    /// The session bar as last rendered `(width, lines)`, so the document
+    /// stable-prefix hint stays accurate: the transcript's stable prefix only
+    /// extends below the bar when the bar itself did not change.
+    last_session_bar: Option<(u16, Vec<Line<'static>>)>,
 }
 
 impl Screen {
@@ -531,7 +596,30 @@ impl Screen {
             modal: None,
             queued: 0,
             terminal_focused: true,
+            approval_policy: ApprovalPolicy::OnRequest,
+            start_page: None,
+            last_session_bar: None,
         }
+    }
+
+    /// Show the start page (IrisMark + launcher) until the session begins.
+    pub(crate) fn show_start_page(&mut self) {
+        self.start_page = Some(StartPage::new(reduced_motion()));
+    }
+
+    /// Dismiss the start page: entering a session replaces the launcher with
+    /// the normal transcript; the shared chrome stays.
+    pub(crate) fn leave_start_page(&mut self) {
+        self.start_page = None;
+    }
+
+    pub(crate) fn start_page_active(&self) -> bool {
+        self.start_page.is_some()
+    }
+
+    /// Set the effective approval-policy posture shown on the bottom statusline.
+    pub(crate) fn set_approval_policy(&mut self, policy: ApprovalPolicy) {
+        self.approval_policy = policy;
     }
 
     /// Record the terminal's focus state (crossterm `FocusGained`/`FocusLost`).
@@ -733,6 +821,9 @@ impl Screen {
     }
 
     pub(crate) fn start_turn(&mut self) {
+        // A submitted task enters the session: the launcher gives way to the
+        // normal transcript, under the same chrome.
+        self.start_page = None;
         self.spinner.start();
         self.turn_divider = TurnDivider::default();
         self.approval_hint = None;
@@ -763,6 +854,12 @@ impl Screen {
     pub(crate) fn tick(&mut self) -> bool {
         if self.approval_hint.is_some() || !self.terminal_focused {
             return false;
+        }
+        // The start page's IrisMark reuses the spinner tick machinery: it
+        // animates only while the terminal is focused, and holds still under
+        // reduced motion (StartPage::tick handles both cadence and freeze).
+        if let Some(page) = &mut self.start_page {
+            return page.tick();
         }
         self.spinner.tick()
     }
@@ -896,19 +993,34 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
         block
     };
     let chrome = render_editor_chrome(screen, width, height);
+    // The session bar (bar + soft hairline) is reserved ahead of the
+    // transcript: it occupies the top pane rows and the transcript flows
+    // beneath it. The stable-prefix hint covers the bar only while the bar
+    // itself is unchanged at this width; a bar change (context meter movement,
+    // branch switch) resets the hint so the diff never reuses a stale bar row.
+    let bar = session_bar_lines(screen, width);
+    let bar_rows = bar.len();
+    let bar_stable = screen
+        .last_session_bar
+        .as_ref()
+        .is_some_and(|(prev_width, prev)| *prev_width == width && *prev == bar);
+    if !bar_stable {
+        screen.last_session_bar = Some((width, bar.clone()));
+    }
     // Full-pane takeover: while the transcript is shorter than the pane, blank
     // filler rows sit BETWEEN the transcript and the bottom-pinned tail, so the
     // conversation reads top-down from the first pane row while the working
     // indicator and composer always occupy the bottom rows (Claude Code-style).
     // The filler lives in the volatile tail: it shrinks as the transcript
     // grows, the document holds exactly the viewport height until content
-    // overflows, and no blank row ever scrolls into native scrollback. Because
-    // the transcript keeps document row 0, the stable-prefix hint stays valid
-    // across padded and unpadded frames alike.
+    // overflows, and no blank row ever scrolls into native scrollback. On the
+    // start page the filler carries the centered IrisMark + launcher instead of
+    // blanks.
     let tail_rows = chrome.len() + working_block.len();
     let filler_rows = usize::from(height)
         .saturating_sub(tail_rows)
-        .saturating_sub(transcript.total_lines);
+        .saturating_sub(transcript.total_lines)
+        .saturating_sub(bar_rows);
     let volatile_tail = tail_rows + filler_rows;
     // The transcript is the scrolling base, moved into the document and never
     // cloned. The bottom-pinned tail -- viewport filler, working indicator,
@@ -918,15 +1030,22 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     // not the transcript length, so the container's only per-frame copy is
     // small and constant.
     let mut tail = Container::new();
-    tail.add_child(Box::new(LinesSection(
-        std::iter::repeat_with(Line::default)
-            .take(filler_rows)
-            .collect(),
-    )));
+    tail.add_child(Box::new(LinesSection(filler_lines(
+        screen,
+        filler_rows,
+        width,
+    ))));
     tail.add_child(Box::new(LinesSection(working_block)));
     tail.add_child(Box::new(LinesSection(chrome)));
-    let stable_prefix = transcript.stable_prefix;
-    let mut document = transcript.lines;
+    // The bar rows shift the whole document down, so the transcript's stable
+    // prefix only holds when the bar rows above it are themselves unchanged.
+    let stable_prefix = if bar_stable {
+        transcript.stable_prefix.saturating_add(bar_rows)
+    } else {
+        0
+    };
+    let mut document = bar;
+    document.extend(transcript.lines);
     tail.render_into(usize::from(width), &mut document);
     // Locate-and-strip any focus cursor marker before the document reaches the
     // terminal surface. The cursor only ever lives in the composer chrome, so
@@ -942,6 +1061,26 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
         chrome_tail: volatile_tail,
         stable_prefix,
     }
+}
+
+/// The filler section between the transcript and the bottom-pinned tail:
+/// blank rows normally, or the start page's centered IrisMark + launcher block
+/// (vertically centered, truncated when the viewport is too short).
+fn filler_lines(screen: &Screen, filler_rows: usize, width: u16) -> Vec<Line<'static>> {
+    let Some(page) = &screen.start_page else {
+        return std::iter::repeat_with(Line::default)
+            .take(filler_rows)
+            .collect();
+    };
+    let mut block = Component::render(page, usize::from(width));
+    block.truncate(filler_rows);
+    let top = filler_rows.saturating_sub(block.len()) / 2;
+    let bottom = filler_rows.saturating_sub(block.len()).saturating_sub(top);
+    let mut lines = Vec::with_capacity(filler_rows);
+    lines.extend(std::iter::repeat_with(Line::default).take(top));
+    lines.extend(block);
+    lines.extend(std::iter::repeat_with(Line::default).take(bottom));
+    lines
 }
 
 /// Number of dots in the top-frame context meter; each dot is ~10% usage.
@@ -997,14 +1136,15 @@ fn context_meter_spans(filled: u64) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Build the composer statusline — the composer's top content line, under the
-/// full-width hairline (`composer_hairline`):
-/// `◉ CODE ─ GPT-5.5 XHIGH ─ CTX 300K ●●●○○○○○○○    ~/iris-agent ┊ git main`.
+/// Build the composer's bottom statusline — the composer's last content row,
+/// under the input and the lighter internal rule:
+/// `◉ CODE ─ GPT-5.5 XHIGH ─ ◆ always-approve`.
 /// The mode glyph is the orange accent; `CODE` is bold; the model name is the
-/// underlined model-picker button; effort and the CTX label are muted; the
-/// 10-dot meter follows; the workspace `cwd ┊ git branch` right-aligns when it
-/// fits. Returns `None` when there is no footer yet or even the minimum
-/// content cannot fit.
+/// underlined model-picker button; effort is muted; the approval-policy
+/// segment carries its state symbol + label (never color alone). Location and
+/// context moved to the pane-top [`session_bar_lines`] and never appear here.
+/// Narrow widths drop, in order: policy → effort → minimum `◉ CODE ─ MODEL`.
+/// Returns `None` when there is no footer yet or even the minimum cannot fit.
 pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
     let footer = screen.footer.as_ref()?;
     let width = usize::from(box_width);
@@ -1021,15 +1161,6 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
         .as_ref()
         .map(|effort| strip_ansi_for_text(effort).to_uppercase())
         .filter(|effort| !effort.is_empty());
-    let context = footer
-        .context
-        .as_ref()
-        .map(|context| strip_ansi_for_text(context).to_uppercase())
-        .filter(|context| !context.is_empty());
-    let meter_filled = context
-        .as_deref()
-        .and_then(parse_context_window)
-        .map(|window| context_meter_filled(footer.context_used_tokens.unwrap_or(0), window));
 
     let mode_seg = || {
         vec![
@@ -1055,51 +1186,152 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
         None => vec![model_span()],
     };
     let model_only = || vec![model_span()];
-    let ctx_meter = |with_meter: bool| {
-        context.as_ref().map(|context| {
-            let mut spans = vec![Span::styled(format!("CTX {context}"), dim_style())];
-            if let (true, Some(filled)) = (with_meter, meter_filled) {
-                spans.push(Span::raw(" "));
-                spans.extend(context_meter_spans(filled));
-            }
-            spans
-        })
+    let policy = screen.approval_policy;
+    let policy_seg = || {
+        vec![
+            Span::styled(format!("{} ", policy.symbol()), policy.symbol_style()),
+            Span::styled(policy.label().to_string(), dim_style()),
+        ]
     };
 
     // Candidates from fullest to minimum. The drop order is monotonic and
-    // matches the spec: drop effort, then the meter, then the CTX label, leaving
-    // the minimum `◉ CODE ─ MODEL`. Effort never reappears once dropped.
-    let mut candidates: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
-    match (ctx_meter(true), ctx_meter(false)) {
-        (Some(with_meter), Some(without_meter)) => {
-            candidates.push(vec![mode_seg(), model_with_effort(), with_meter.clone()]);
-            candidates.push(vec![mode_seg(), model_only(), with_meter]);
-            candidates.push(vec![mode_seg(), model_only(), without_meter]);
-        }
-        _ => {
-            // No known context window: the fullest form is mode + model + effort.
-            candidates.push(vec![mode_seg(), model_with_effort()]);
-        }
-    }
-    candidates.push(vec![mode_seg(), model_only()]);
+    // matches the spec: drop the policy segment, then effort, leaving the
+    // minimum `◉ CODE ─ MODEL`.
+    let candidates: Vec<Vec<Vec<Span<'static>>>> = vec![
+        vec![mode_seg(), model_with_effort(), policy_seg()],
+        vec![mode_seg(), model_with_effort()],
+        vec![mode_seg(), model_only()],
+    ];
 
-    let left = candidates
+    let spans = candidates
         .into_iter()
         .find_map(|segments| statusline_left(width, segments))?;
-    let left_w = spans_width(&left);
-    let mut spans = left;
-    // Right-aligned quiet workspace label: `~/iris-agent ┊ git main`.
-    if let Some(ws) = workspace_spans(footer, width.saturating_sub(left_w).saturating_sub(2)) {
-        let ws_w = spans_width(&ws);
-        let gap = width.saturating_sub(left_w).saturating_sub(ws_w);
-        if gap >= 2 {
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.extend(ws);
-        }
-    }
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     Some(line)
+}
+
+/// Build the session bar — the pane-top "where am I / how full am I" row:
+/// `<cwd> ┊ git <branch>` on the left (cwd body ink, separator and branch
+/// dim), and the right-aligned context readout `CTX <used>/<cap> <meter>`
+/// (`CTX` and `/<cap>` dim, `<used>` body ink, then the 10-dot meter). With an
+/// unknown context window the readout is `CTX <used>` with no meter. Narrow
+/// widths drop, in order: meter → `/<cap>` → branch → middle-truncate the cwd
+/// harder; the minimum form is the cwd alone. Returns `None` when there is no
+/// footer yet.
+pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> {
+    let footer = screen.footer.as_ref()?;
+    let width = usize::from(width).max(1);
+    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
+    if cwd.is_empty() {
+        return None;
+    }
+    let used = footer.context_used_tokens.unwrap_or(0);
+    let used_text = compact_count(used);
+    let cap = footer
+        .context
+        .as_ref()
+        .map(|context| strip_ansi_for_text(context))
+        .filter(|context| !context.is_empty());
+    let meter_filled = cap
+        .as_deref()
+        .and_then(parse_context_window)
+        .map(|window| context_meter_filled(used, window));
+
+    // The context readout, fullest form first: used/cap + meter, then used/cap,
+    // then used alone, then nothing.
+    let ctx_spans = |with_cap: bool, with_meter: bool| -> Vec<Span<'static>> {
+        let mut spans = vec![
+            Span::styled("CTX ".to_string(), dim_style()),
+            Span::styled(used_text.clone(), Style::default()),
+        ];
+        if with_cap && let Some(cap) = cap.as_deref() {
+            spans.push(Span::styled(format!("/{cap}"), dim_style()));
+        }
+        if with_meter && let Some(filled) = meter_filled {
+            spans.push(Span::raw(" "));
+            spans.extend(context_meter_spans(filled));
+        }
+        spans
+    };
+    let right_candidates: Vec<Vec<Span<'static>>> = vec![
+        ctx_spans(true, true),
+        ctx_spans(true, false),
+        ctx_spans(false, false),
+    ];
+
+    let branch_suffix = branch
+        .as_ref()
+        .map(|branch| format!(" {} git {branch}", crate::ui::symbols::SEP))
+        .unwrap_or_default();
+    // A middle-truncated cwd keeps at least `…/<project>`-ish room before a
+    // lower-priority segment is dropped instead.
+    const CWD_MIN: usize = 12;
+
+    // Drop order: meter → `/<cap>` → branch → hard cwd truncation.
+    for (right, with_branch) in right_candidates
+        .iter()
+        .map(|right| (Some(right), true))
+        .chain([(right_candidates.last(), false), (None, false)])
+    {
+        let right_w = right.map(|spans| spans_width(spans)).unwrap_or(0);
+        let suffix = if with_branch {
+            branch_suffix.as_str()
+        } else {
+            ""
+        };
+        let gap = if right_w > 0 { 2 } else { 0 };
+        let avail_cwd = width
+            .saturating_sub(right_w)
+            .saturating_sub(gap)
+            .saturating_sub(display_width(suffix));
+        if right.is_some() && avail_cwd < CWD_MIN.min(display_width(&cwd)) {
+            continue;
+        }
+        if avail_cwd == 0 {
+            continue;
+        }
+        let shown_cwd = truncate_cwd_middle(&cwd, avail_cwd);
+        if shown_cwd.is_empty() {
+            continue;
+        }
+        let mut spans = vec![Span::styled(shown_cwd.clone(), Style::default())];
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix.to_string(), dim_style()));
+        }
+        if let Some(right) = right {
+            let left_w = spans_width(&spans);
+            let fill = width.saturating_sub(left_w).saturating_sub(right_w);
+            if fill >= 2 {
+                spans.push(Span::raw(" ".repeat(fill)));
+                spans.extend(right.iter().cloned());
+            }
+        }
+        let mut line = Line::from(spans);
+        truncate_line(&mut line, width);
+        return Some(line);
+    }
+    // Minimum form: the cwd alone, truncated to whatever fits.
+    let shown = truncate_cwd_middle(&cwd, width);
+    (!shown.is_empty()).then(|| Line::from(Span::styled(shown, Style::default())))
+}
+
+/// The session bar block: the bar row plus its soft hairline (a dim `─`
+/// repeat, visibly lighter than the composer's border-weight top edge),
+/// inset to the shared pane measure. Empty when there is no footer yet.
+pub(super) fn session_bar_lines(screen: &Screen, width: u16) -> Vec<Line<'static>> {
+    let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
+    let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let Some(mut bar) = session_bar(screen, content_width) else {
+        return Vec::new();
+    };
+    pad_line_left(&mut bar, usize::from(inset));
+    let mut rule = Line::from(Span::styled(
+        "─".repeat(usize::from(content_width)),
+        dim_style(),
+    ));
+    pad_line_left(&mut rule, usize::from(inset));
+    vec![bar, rule]
 }
 
 /// Assemble one statusline candidate at `width`, or `None` if its segments do
@@ -1115,33 +1347,16 @@ fn statusline_left(width: usize, segments: Vec<Vec<Span<'static>>>) -> Option<Ve
     (spans_width(&joined) <= width).then_some(joined)
 }
 
-/// The dim `cwd ┊ git branch` workspace spans, middle-truncating the cwd to
-/// `max` columns. `None` when there is no cwd or no room at all.
-fn workspace_spans(footer: &Footer, max: usize) -> Option<Vec<Span<'static>>> {
-    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
-    if cwd.is_empty() || max == 0 {
-        return None;
-    }
-    let suffix = branch
-        .as_ref()
-        .map(|branch| format!(" ┊ git {branch}"))
-        .unwrap_or_default();
-    let avail = max.saturating_sub(display_width(&suffix)).max(1);
-    let cwd = truncate_cwd_middle(&cwd, avail);
-    if cwd.is_empty() {
-        return None;
-    }
-    let mut spans = vec![Span::styled(cwd, dim_style())];
-    if !suffix.is_empty() {
-        spans.push(Span::styled(suffix, dim_style()));
-    }
-    Some(spans)
-}
-
 /// The composer's top edge: a full-width hairline in the border role — the one
 /// rule separating the composer from the transcript (the composer has no box).
 fn composer_hairline(width: usize) -> Line<'static> {
     Line::from(Span::styled("─".repeat(width.max(1)), border_style()))
+}
+
+/// The composer's internal rule between the input rows and the bottom
+/// statusline: a lighter hairline (dim `╌` repeat, not border weight).
+fn composer_internal_rule(width: usize) -> Line<'static> {
+    Line::from(Span::styled("╌".repeat(width.max(1)), dim_style()))
 }
 
 /// Middle-ellipsis truncation that preserves the final path segment (the
@@ -1206,7 +1421,7 @@ struct ChromeHeights {
 }
 
 /// Allocate chrome rows. The composer is protected first: the menu yields to
-/// `MIN_EDITOR_H` (hairline + statusline + spacer + one input row) before anything else
+/// `MIN_EDITOR_H` (hairline + one input row + internal rule + statusline) before anything else
 /// is squeezed. The bottom padding is preferred, not protected, so overlays can
 /// reclaim it in tight viewports.
 fn chrome_heights(
@@ -1276,9 +1491,9 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         .unwrap_or(0);
 
     // Bottom-anchored, clamped to the fixed viewport. The composer tail is a
-    // full hairline top edge, the statusline, a blank spacer, then the input
-    // rows. No box, no hint row, no separate workspace label (the workspace
-    // lives right-aligned in the statusline).
+    // full hairline top edge, then the input rows, a lighter internal rule,
+    // and the bottom statusline. No box, no hint row; location/context live in
+    // the pane-top session bar, never here.
     // Keep one soft row under the normal composer, but do not spend an extra
     // blank row while a docked overlay (or the docked approval panel, which now
     // lives in the same region) already occupies the lower viewport.
@@ -1317,14 +1532,17 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
         height: editor_area.height,
     };
     let text_x_offset = composer_text_x_offset(box_area.width);
+    // Padding is preferred, not protected: at the minimum composer height the
+    // input row wins over the soft bottom row.
+    let pad_rows = bottom_padding_rows.min(editor_area.height.saturating_sub(MIN_EDITOR_H));
     let text_area = Rect {
         x: box_area.x + text_x_offset,
-        y: editor_area.y + EDITOR_VERTICAL_CHROME_ROWS.min(editor_area.height.saturating_sub(1)),
+        y: editor_area.y + EDITOR_CHROME_ROWS_ABOVE.min(editor_area.height.saturating_sub(1)),
         width: box_area.width.saturating_sub(text_x_offset).max(1),
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
-            .saturating_sub(bottom_padding_rows)
+            .saturating_sub(pad_rows)
             .max(1),
     };
     // Cell of the editor's hardware-cursor (IME) marker, in buffer coordinates.
@@ -1335,17 +1553,35 @@ fn render_editor_chrome(screen: &mut Screen, width: u16, height: u16) -> Vec<Lin
     if screen.composer_focused() {
         cursor_cell = find_reversed_cell(&buf, text_area);
     }
-    // The composer's chrome rows: the full-width hairline top edge, then the
-    // statusline, then a blank spacer before the input. Painted last so they
-    // are never overwritten by the textarea/approval body at very small heights.
+    // The composer's chrome rows: the full-width hairline top edge above the
+    // input, then — below the input — the lighter internal rule and the bottom
+    // statusline. Painted last so they are never overwritten by the
+    // textarea/approval body at very small heights.
     if heights.editor > 0 {
         let hairline = composer_hairline(usize::from(box_area.width));
         buf.set_line(box_area.x, box_area.y, &hairline, box_area.width);
     }
-    if heights.editor > 1
+    let status_y = heights.editor.saturating_sub(pad_rows).saturating_sub(1);
+    if status_y >= 2
         && let Some(statusline) = composer_statusline(screen, box_area.width)
     {
-        buf.set_line(box_area.x, box_area.y + 1, &statusline, box_area.width);
+        buf.set_line(
+            box_area.x,
+            editor_area.y + status_y,
+            &statusline,
+            box_area.width,
+        );
+        // The internal rule sits directly above the statusline, only when a
+        // row remains for the input above it (hairline + input + rule + status).
+        if status_y >= 3 {
+            let rule = composer_internal_rule(usize::from(box_area.width));
+            buf.set_line(
+                box_area.x,
+                editor_area.y + status_y - 1,
+                &rule,
+                box_area.width,
+            );
+        }
     }
     buffer_to_lines(&buf, cursor_cell)
 }
@@ -1406,9 +1642,9 @@ mod tests {
     use ratatui::text::Line;
 
     use super::{
-        ApprovalHint, CONTEXT_METER_DOTS, Screen, Spinner, approval_hint_spans,
-        approval_panel_lines, context_meter_filled, display_width, line_text, parse_context_window,
-        truncate_cwd_middle, working_lines,
+        ApprovalHint, ApprovalPolicy, CONTEXT_METER_DOTS, Screen, Spinner, approval_hint_spans,
+        approval_panel_lines, composer_statusline, context_meter_filled, display_width, line_text,
+        parse_context_window, session_bar, truncate_cwd_middle, working_lines,
     };
     use crate::ui::tui::WORKING_FRAMES;
 
@@ -1434,6 +1670,161 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn footer_screen(cwd: &str) -> Screen {
+        let mut screen = Screen::new();
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            Some("300k".to_string()),
+            cwd.to_string(),
+        );
+        screen
+    }
+
+    #[test]
+    fn session_bar_shows_location_left_and_context_right() {
+        let mut screen = footer_screen("~/repo (main)");
+        screen.apply(crate::ui::UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(crate::nexus::ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 90_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 90_000,
+                cache_creation: None,
+            }),
+        });
+        let bar = session_bar(&screen, 80)
+            .map(|l| line_text(&l))
+            .expect("bar");
+        assert!(bar.starts_with("~/repo ┊ git main"), "{bar:?}");
+        assert!(
+            bar.trim_end().ends_with("CTX 90k/300k ●●●○○○○○○○"),
+            "{bar:?}"
+        );
+        // Mode/model/policy never appear on the session bar.
+        assert!(!bar.contains("CODE"), "{bar:?}");
+        assert!(!bar.contains("GPT"), "{bar:?}");
+    }
+
+    #[test]
+    fn session_bar_drops_meter_then_cap_then_branch_then_truncates() {
+        let screen = footer_screen("~/repo (main)");
+        // Wide: everything fits.
+        let full = session_bar(&screen, 60)
+            .map(|l| line_text(&l))
+            .expect("bar");
+        assert!(full.contains("┊ git main"), "{full:?}");
+        assert!(full.contains("CTX 0/300k ○○○○○○○○○○"), "{full:?}");
+
+        // 1) The meter drops first.
+        let no_meter = session_bar(&screen, 34)
+            .map(|l| line_text(&l))
+            .expect("bar");
+        assert!(no_meter.contains("CTX 0/300k"), "{no_meter:?}");
+        assert!(!no_meter.contains('○'), "{no_meter:?}");
+        assert!(no_meter.contains("┊ git main"), "{no_meter:?}");
+
+        // 2) Then the `/<cap>` suffix.
+        let no_cap = session_bar(&screen, 25)
+            .map(|l| line_text(&l))
+            .expect("bar");
+        assert!(no_cap.contains("CTX 0"), "{no_cap:?}");
+        assert!(!no_cap.contains("/300k"), "{no_cap:?}");
+        assert!(no_cap.contains("┊ git main"), "{no_cap:?}");
+
+        // 3) Then the branch.
+        let no_branch = session_bar(&screen, 16)
+            .map(|l| line_text(&l))
+            .expect("bar");
+        assert!(no_branch.contains("~/repo"), "{no_branch:?}");
+        assert!(!no_branch.contains("git"), "{no_branch:?}");
+        assert!(no_branch.contains("CTX 0"), "{no_branch:?}");
+
+        // 4) Minimum form: the cwd alone.
+        let minimum = session_bar(&screen, 7).map(|l| line_text(&l)).expect("bar");
+        assert!(minimum.contains("~/repo"), "{minimum:?}");
+        assert!(!minimum.contains("CTX"), "{minimum:?}");
+
+        // Never overflows at any width.
+        for width in 1..=80u16 {
+            if let Some(line) = session_bar(&screen, width) {
+                assert!(
+                    display_width(&line_text(&line)) <= usize::from(width),
+                    "width {width}: {:?}",
+                    line_text(&line)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_bar_without_context_window_shows_used_tokens_only() {
+        let mut screen = Screen::new();
+        screen.set_footer_with_context("custom".to_string(), None, None, "~/repo".to_string());
+        let bar = session_bar(&screen, 60)
+            .map(|l| line_text(&l))
+            .expect("bar");
+        assert!(bar.contains("CTX 0"), "{bar:?}");
+        assert!(!bar.contains("CTX 0/"), "{bar:?}");
+        assert!(
+            !bar.contains('○') && !bar.contains('●'),
+            "no meter: {bar:?}"
+        );
+    }
+
+    #[test]
+    fn bottom_statusline_policy_segment_carries_symbol_and_label() {
+        let mut screen = footer_screen("~/repo");
+        for (policy, expected) in [
+            (ApprovalPolicy::AlwaysApprove, "◆ always-approve"),
+            (ApprovalPolicy::OnRequest, "▲ on-request"),
+            (ApprovalPolicy::ReadOnly, "■ read-only"),
+            (ApprovalPolicy::Off, "○ off"),
+        ] {
+            screen.set_approval_policy(policy);
+            let status = composer_statusline(&screen, 80)
+                .map(|l| line_text(&l))
+                .expect("statusline");
+            assert!(status.contains(expected), "{policy:?}: {status:?}");
+            // Location/context never return to the composer statusline.
+            assert!(!status.contains("~/repo"), "{status:?}");
+            assert!(!status.contains("CTX"), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn document_stable_prefix_covers_bar_only_while_it_is_unchanged() {
+        use super::render_document_with_hints;
+        use ratatui::layout::Size;
+
+        let mut screen = footer_screen("~/repo");
+        screen.commit_user("hello");
+        let size = Size::new(80, 12);
+        let _ = render_document_with_hints(&mut screen, size);
+        // Unchanged bar: the stable prefix extends past the two bar rows.
+        let unchanged = render_document_with_hints(&mut screen, size);
+        assert!(
+            unchanged.stable_prefix >= 2,
+            "stable prefix must cover the unchanged session bar: {}",
+            unchanged.stable_prefix
+        );
+        // A bar change (new branch) resets the hint so no stale bar row is reused.
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            Some("300k".to_string()),
+            "~/repo (feat/x)".to_string(),
+        );
+        let changed = render_document_with_hints(&mut screen, size);
+        assert_eq!(changed.stable_prefix, 0, "bar change must reset the hint");
     }
 
     #[test]
