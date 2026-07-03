@@ -32,7 +32,15 @@ pub(super) fn execute(
     let input: WriteInput = serde_json::from_value(args.clone())
         .context("write tool arguments must include path and content")?;
     let message = write_file(root, &input, observed)?;
-    Ok(super::ToolOutput::text(message).with("bytes_written", json!(input.content.len())))
+    // Report the exact bytes written so the dirty-tree guard can confirm an
+    // approved write against disk (ADR-0028 TOCTOU rule); Nexus strips this key
+    // before it reaches provider context.
+    Ok(super::ToolOutput::text(message)
+        .with("bytes_written", json!(input.content.len()))
+        .with(
+            crate::nexus::WRITE_CONFIRM_HASH_KEY,
+            json!(super::content_hash(input.content.as_bytes())),
+        ))
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {

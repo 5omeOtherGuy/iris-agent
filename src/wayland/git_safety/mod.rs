@@ -136,10 +136,30 @@ impl GitSafety {
     /// Settle the current task (ADR-0028 settlement boundary): join any pending
     /// scan, freeze and drop the ledger/approvals, so the next mutation opens a
     /// fresh baseline. This is the seam #263 replaces with commit/rollback
-    /// settlement; the checkpoint chain hangs off the same call.
+    /// settlement; the checkpoint chain hangs off the same call. Only an
+    /// explicit user action settles (accept/rollback/checkpoint) -- passive
+    /// actions like a session swap use [`discard_approvals`](Self::discard_approvals)
+    /// instead. Exercised by tests; wired into production by #263.
+    #[allow(dead_code)]
     pub(crate) fn settle(&self) {
         self.sync_barrier();
         self.state.lock().unwrap().task = None;
+    }
+
+    /// Drop per-task approvals WITHOUT settling the task (ADR-0028: session end
+    /// and other passive actions never settle -- settlement is accept, rollback,
+    /// or an explicit checkpoint only). A session swap (`/new`/`/resume`) is such
+    /// a passive boundary: it must not mark the dirty task accepted or reset the
+    /// baseline's protection. The task's baseline/ledger persist so protection
+    /// survives the swap; only the per-file approvals -- judged against the prior
+    /// conversation -- are cleared, so the next touch of a still-dirty file
+    /// re-prompts (the safe direction). The resume/recovery notice is #263.
+    pub(crate) fn discard_approvals(&self) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(task) = state.task.as_mut() {
+            task.approved.clear();
+            task.all_dirty_approved = false;
+        }
     }
 
     /// Number of ledger entries recorded in the current task (test-only).
@@ -354,7 +374,7 @@ impl MutationGuard for GitSafety {
         task.snapshot = Snapshot::capture(protected);
     }
 
-    fn after_exec(&self, approved: &[PathBuf]) -> Vec<PathBuf> {
+    fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> Vec<PathBuf> {
         let mut violations = Vec::new();
         let mut scan_input = None;
         {
@@ -368,11 +388,22 @@ impl MutationGuard for GitSafety {
             let approved_set: BTreeSet<PathBuf> =
                 approved.iter().map(|path| self.normalize(path)).collect();
             for path in task.snapshot.changed_paths() {
-                if approved_set.contains(&path) {
-                    // Expected: an approved Iris mutation. Record it and advance
+                let after = snapshot::hash_file(&path);
+                // Attribute an approved-target change to Iris only when the
+                // post-call bytes are exactly what the tool reported writing.
+                // A mismatch means the change is ambiguous -- a concurrent user
+                // edit landed on the approved file, or the write failed/was
+                // partial -- so ADR-0028's TOCTOU rule keeps it user-attributed
+                // and protected rather than silently advancing the baseline.
+                let confirmed = approved_set.contains(&path)
+                    && match (expected_after, after.as_deref()) {
+                        (Some(expected), Some(actual)) => expected == actual,
+                        _ => false,
+                    };
+                if confirmed {
+                    // Expected: a confirmed Iris mutation. Record it and advance
                     // the baseline hash so a later call sees the new content.
                     let before = task.baseline.protected.get(&path).cloned().flatten();
-                    let after = snapshot::hash_file(&path);
                     task.turn += 1;
                     task.ledger.record(LedgerEntry {
                         path: path.clone(),
@@ -385,8 +416,8 @@ impl MutationGuard for GitSafety {
                     });
                     task.baseline.protected.insert(path, after);
                 } else {
-                    // Out-of-band change to a protected file: attributed to the
-                    // user (TOCTOU rule) and halted by the loop.
+                    // Out-of-band or unconfirmed change to a protected file:
+                    // attributed to the user (TOCTOU rule) and halted by the loop.
                     violations.push(path);
                 }
             }

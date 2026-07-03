@@ -428,11 +428,16 @@ pub(crate) trait MutationGuard {
     fn before_exec(&self);
 
     /// Re-check the protected set after a mutating call. `approved` are the
-    /// paths this call was allowed to change (recorded to the ledger, not
-    /// flagged); any *other* protected file that changed is returned as a
-    /// violation (attributed to the user under the TOCTOU rule) for the loop to
-    /// halt and offer restore.
-    fn after_exec(&self, approved: &[PathBuf]) -> Vec<PathBuf>;
+    /// paths this call was allowed to change; `expected_after` is the SHA-256
+    /// hex of the exact bytes the tool reported writing (`None` when the tool
+    /// did not confirm a write -- e.g. it failed, was cancelled, or is not a
+    /// content-reporting tool). An approved path is recorded to the ledger as
+    /// Iris-authored only when its post-call bytes match `expected_after`; on
+    /// any mismatch (a concurrent user edit, or a failed/partial write) the
+    /// change is ambiguous and, per ADR-0028's TOCTOU rule, treated as a
+    /// user-attributed violation. Any *other* protected file that changed is
+    /// likewise a violation for the loop to halt and offer restore.
+    fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> Vec<PathBuf>;
 
     /// Restore the given protected files from the pre-exec snapshot. Best-effort
     /// recovery invoked by the loop after a detected violation.
@@ -440,6 +445,13 @@ pub(crate) trait MutationGuard {
 }
 
 /// Structured result of a successful tool call: the model-facing text plus
+/// Internal metadata key a mutating tool sets to the SHA-256 hex of the exact
+/// bytes it wrote to its target (ADR-0028 write confirmation). The dirty-tree
+/// guard confirms an approved change against this before attributing it to Iris;
+/// [`record_call`] strips it before serialization, so it never reaches provider
+/// context (like `exitCode`/`durationMs`). Not a git concept -- a content hash.
+pub(crate) const WRITE_CONFIRM_HASH_KEY: &str = "__iris_after_hash";
+
 /// optional structured metadata. Tier-1 result contract (the analogue of pi's
 /// `AgentToolResult`); tools with nothing structured to report use
 /// [`ToolOutput::text`] and the metadata is omitted from the wire.
@@ -1330,9 +1342,15 @@ impl<P: ChatProvider> Agent<P> {
                     diff,
                 })?;
             }
-            if !tool.requires_approval() {
+            if !tool.requires_approval() && !dirty_gate {
                 obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
             } else {
+                // A dirty-tree gate (issue #262) forces the approval path even
+                // for a tool that does not otherwise require approval: a
+                // mutating tool with `requires_approval() == false` but a
+                // protected `mutates_paths()` target must never skip the gate.
+                // The `auto_approved` computation below keeps `dirty_gate` a hard
+                // floor, so entering this branch always prompts for such a tool.
                 // The destructive floor (ADR-0010): a destructive call (e.g.
                 // `rm`) always re-prompts, before any allow layer is consulted.
                 // Neither a session allow-always nor a persistent project grant
@@ -1500,7 +1518,20 @@ impl<P: ChatProvider> Agent<P> {
                 }
                 let outcome = run_tool(tool, &call.arguments, &call_env, token.child_token()).await;
                 if let Some(guard) = guard {
-                    let violations = guard.after_exec(&mutated_paths);
+                    // Confirm an approved change against the exact bytes the tool
+                    // reported writing (ADR-0028 TOCTOU rule). A failed/cancelled
+                    // call, or a tool that reports no hash, yields `None`, so any
+                    // change to a protected file stays user-attributed. The key
+                    // is stripped from provider context in `record_call`.
+                    let expected_after = match &outcome {
+                        ToolOutcome::Ok(output) => output
+                            .metadata
+                            .get(WRITE_CONFIRM_HASH_KEY)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        _ => None,
+                    };
+                    let violations = guard.after_exec(&mutated_paths, expected_after.as_deref());
                     if !violations.is_empty() {
                         let restored = guard.restore(&violations).is_ok();
                         let paths: Vec<String> = violations
@@ -1788,6 +1819,10 @@ fn record_call(
             // serialization so the non-deterministic duration and the exit code
             // ride the event, never entering provider context (and the wire
             // shape stays byte-identical to a plain text-only result).
+            // The dirty-tree write-confirmation hash (ADR-0028) is an internal
+            // signal consumed in `run_gated_single`; strip it here so it never
+            // enters provider context (the wire shape stays identical).
+            output.metadata.remove(WRITE_CONFIRM_HASH_KEY);
             let exit_code = output
                 .metadata
                 .remove("exitCode")

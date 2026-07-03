@@ -12,22 +12,16 @@
 //! checkpoint chain (#263) layers on top; this is its storage seam.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 
-/// Hex SHA-256 of `bytes`. Shared content-hash convention for the baseline and
-/// ledger (mirrors [`crate::handles`], which content-addresses tool output).
+/// Hex SHA-256 of `bytes`. Delegates to [`crate::tools::content_hash`] so the
+/// guard's on-disk re-hash and a mutating tool's reported post-write hash use
+/// one convention and stay directly comparable (ADR-0028 write confirmation).
 pub(super) fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    crate::tools::content_hash(bytes)
 }
 
 /// Hex SHA-256 of a file's contents, or `None` when the path cannot be read

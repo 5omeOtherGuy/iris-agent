@@ -217,10 +217,14 @@ impl<P: ChatProvider> Harness<P> {
         self.persisted = resumed;
         self.entry_ids = vec![None; resumed];
         self.agent.reset_session(messages);
-        // A session swap (`/new`, `/resume`) settles the current dirty-tree
-        // task: its baseline/approvals belonged to the prior conversation, so
-        // the next mutation opens a fresh baseline.
-        self.git_safety.settle();
+        // A session swap (`/new`, `/resume`) is a PASSIVE boundary: ADR-0028
+        // forbids passive actions from settling a task (settlement is accept,
+        // rollback, or an explicit checkpoint only), so it must not mark the
+        // dirty task accepted or drop the baseline's protection. Keep the
+        // baseline/ledger and only drop the per-file approvals (judged against
+        // the prior conversation) so the next touch of a still-dirty file
+        // re-prompts. The resume/recovery notice is #263.
+        self.git_safety.discard_approvals();
     }
 
     /// Id of the attached transcript log, or `None` for an in-memory session.

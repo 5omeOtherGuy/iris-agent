@@ -85,7 +85,15 @@ fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<
         "Successfully replaced {occurrences} occurrence{plural} in {}.",
         input.file_path
     );
-    Ok(super::ToolOutput::text(message).with("occurrences", json!(occurrences)))
+    // Report the exact post-edit bytes so the dirty-tree guard can confirm an
+    // approved edit against disk (ADR-0028 TOCTOU rule); Nexus strips this key
+    // before it reaches provider context.
+    Ok(super::ToolOutput::text(message)
+        .with("occurrences", json!(occurrences))
+        .with(
+            crate::nexus::WRITE_CONFIRM_HASH_KEY,
+            json!(super::content_hash(plan.new_content.as_bytes())),
+        ))
 }
 
 struct EditPlan {

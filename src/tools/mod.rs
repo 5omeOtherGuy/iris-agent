@@ -44,6 +44,25 @@ pub(crate) use registry::built_in_tools;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 1024 * 1024;
 
+/// SHA-256 hex of `bytes`: the single content-hash convention shared by the
+/// dirty-tree guard's baseline/snapshot re-hash and the mutating tools'
+/// post-write confirmation hash. One implementation keeps a tool's reported
+/// written-content hash directly comparable to the guard's on-disk re-hash, so
+/// an approved write is attributed to Iris only when the bytes match (ADR-0028
+/// TOCTOU rule); any mismatch stays protected/user-attributed.
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Mutable per-agent state threaded into tools via [`crate::nexus::ToolEnv`]:
 /// observed-file tracking for read-before-write safety plus the bash tool's
 /// persistent-session registry. Owned by the `Agent` so no global mutable state

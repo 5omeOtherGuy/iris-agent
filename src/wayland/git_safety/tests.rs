@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 use super::GitSafety;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
-    AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream, ToolCall,
-    Tools,
+    AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream, Tool,
+    ToolCall, ToolEnv, ToolFuture, ToolOutput, Tools,
 };
 use crate::tools::ToolState;
 use crate::wayland::Harness;
@@ -226,7 +226,7 @@ fn bash_violation_detected_and_restored() {
     fs::write(&dirty, "clobbered\n").unwrap();
     fs::write(&untracked, "clobbered\n").unwrap();
 
-    let mut violations = guard.after_exec(&[]);
+    let mut violations = guard.after_exec(&[], None);
     violations.sort();
     assert_eq!(violations.len(), 2, "both protected files flagged");
 
@@ -260,7 +260,7 @@ fn non_git_directory_degrades_without_gating() {
     // The detection path is a no-op in degraded mode.
     guard.before_exec();
     fs::write(dir.path.join("file.txt"), "changed\n").unwrap();
-    assert!(guard.after_exec(&[]).is_empty());
+    assert!(guard.after_exec(&[], None).is_empty());
 }
 
 // A `.jj/` workspace degrades like non-git (ADR-0028 interop note).
@@ -280,7 +280,8 @@ fn jj_workspace_degrades() {
     );
 }
 
-// An approved edit target that changes is recorded to the ledger, not flagged.
+// An approved edit target whose post-call bytes match what the tool wrote is
+// recorded to the ledger as Iris, not flagged.
 #[test]
 fn approved_change_is_ledgered_not_flagged() {
     let repo = init_repo();
@@ -293,12 +294,157 @@ fn approved_change_is_ledgered_not_flagged() {
 
     guard.before_exec();
     fs::write(&target, "iris edit\n").unwrap();
-    let violations = guard.after_exec(std::slice::from_ref(&target));
+    // Confirmed: the on-disk bytes equal what the tool reported writing.
+    let violations = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris edit\n")),
+    );
     assert!(
         violations.is_empty(),
-        "an approved change is not a violation"
+        "a confirmed approved change is not a violation"
     );
-    assert_eq!(guard.ledger_len(), 1, "the approved change is ledgered");
+    assert_eq!(guard.ledger_len(), 1, "the confirmed change is ledgered");
+}
+
+// TOCTOU (finding 2, ADR-0028): an approved target whose post-call bytes do NOT
+// match what the tool wrote -- a concurrent user edit, or a failed/partial
+// write -- is ambiguous, so it stays user-attributed and protected (a
+// violation), never silently ledgered as Iris.
+#[test]
+fn approved_target_unconfirmed_change_stays_protected() {
+    let repo = init_repo();
+    let target = repo.path.join("committed.txt");
+    fs::write(&target, "dirty\n").unwrap();
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.approve(std::slice::from_ref(&target), false);
+
+    // The tool was approved and "intended" to write "iris edit\n", but a
+    // concurrent external change lands different bytes on disk before the check.
+    guard.before_exec();
+    fs::write(&target, "user raced\n").unwrap();
+    let violations = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris edit\n")),
+    );
+
+    assert_eq!(
+        violations.len(),
+        1,
+        "an unconfirmed approved change is a violation, not an Iris mutation"
+    );
+    assert_eq!(
+        guard.ledger_len(),
+        0,
+        "an ambiguous change is never attributed to Iris"
+    );
+    // Restore recovers the exact raced bytes' predecessor from the pre-call
+    // snapshot, so the user's work is protected.
+    guard.restore(&violations).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "dirty\n");
+}
+
+// A failed/partial approved write (tool reports no confirmation hash) is
+// likewise ambiguous and protected, not attributed to Iris.
+#[test]
+fn approved_change_without_confirmation_stays_protected() {
+    let repo = init_repo();
+    let target = repo.path.join("committed.txt");
+    fs::write(&target, "dirty\n").unwrap();
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.approve(std::slice::from_ref(&target), false);
+
+    guard.before_exec();
+    fs::write(&target, "partial\n").unwrap();
+    // `None` expected-after models a failed/cancelled or non-reporting tool.
+    let violations = guard.after_exec(std::slice::from_ref(&target), None);
+    assert_eq!(violations.len(), 1, "an unconfirmed change is a violation");
+    assert_eq!(guard.ledger_len(), 0, "not attributed to Iris");
+}
+
+// Non-UTF-8 filenames (finding 3, Unix): a dirty file whose name is not valid
+// UTF-8 is parsed from the raw `git status -z` byte stream, so it is protected
+// and restorable under its exact on-disk name.
+#[cfg(unix)]
+#[test]
+fn non_utf8_filename_is_protected_and_restorable() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = init_repo();
+    let name = std::ffi::OsStr::from_bytes(b"bad-\xff-name.txt");
+    let path = repo.path.join(name);
+    fs::write(&path, "user bytes\n").unwrap();
+
+    let guard = guard(&repo.path);
+    let summary = guard
+        .note_mutation()
+        .expect("an untracked non-UTF-8 file surfaces a summary");
+    assert!(summary.contains("untracked"), "summary: {summary}");
+
+    assert_eq!(
+        guard
+            .unapproved_protected(std::slice::from_ref(&path))
+            .len(),
+        1,
+        "a non-UTF-8 filename must be protected (not lossy-corrupted)"
+    );
+
+    // A bash-like out-of-band overwrite is detected and restored to exact bytes.
+    guard.before_exec();
+    fs::write(&path, "clobbered\n").unwrap();
+    let violations = guard.after_exec(&[], None);
+    assert_eq!(violations.len(), 1, "the out-of-band change is flagged");
+    guard.restore(&violations).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"user bytes\n");
+}
+
+// Finding 4 (ADR-0028): a session swap is passive -- it drops per-file approvals
+// (safe: re-prompt) but must NOT settle the task or lose the baseline's
+// protection.
+#[test]
+fn session_swap_drops_approvals_without_settling() {
+    let repo = init_repo();
+    let target = repo.path.join("committed.txt");
+    fs::write(&target, "dirty\n").unwrap();
+
+    let provider = FakeProvider::new(vec![AssistantTurn::text("done")]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    // Open a task and approve the dirty file (as an in-flight edit would).
+    harness.git_safety.note_mutation();
+    harness
+        .git_safety
+        .approve(std::slice::from_ref(&target), false);
+    assert!(
+        harness
+            .git_safety
+            .unapproved_protected(std::slice::from_ref(&target))
+            .is_empty(),
+        "the file is approved before the swap"
+    );
+
+    // A passive session swap (`/new`).
+    harness.swap_session(None, Vec::new(), 0);
+
+    assert!(
+        harness.git_safety.has_task(),
+        "a passive swap must NOT settle the task (baseline protection persists)"
+    );
+    assert!(
+        !harness
+            .git_safety
+            .unapproved_protected(std::slice::from_ref(&target))
+            .is_empty(),
+        "the swap drops per-file approvals so the next touch re-prompts"
+    );
 }
 
 // --- loop-level integration (fake provider + Harness) -------------------
@@ -493,6 +639,100 @@ fn escalation_in_loop_covers_second_dirty_file() -> Result<()> {
         frontend.reviews.get(),
         1,
         "escalation on the first dirty file must cover the second"
+    );
+    Ok(())
+}
+
+/// A mutating tool that does NOT require approval (unlike the built-in
+/// edit/write) yet targets a statically-known path. Exercises finding 1: a
+/// mutating-but-ungated tool must still be routed through the dirty gate, not
+/// skipped because `requires_approval()` is false.
+struct UngatedMutator;
+
+impl Tool for UngatedMutator {
+    fn name(&self) -> &str {
+        "ungated_mutate"
+    }
+    fn description(&self) -> &str {
+        "test-only mutating tool with no approval gate"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a serde_json::Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        let target = env
+            .workspace
+            .join(args["path"].as_str().unwrap_or_default());
+        let content = args["content"].as_str().unwrap_or_default().to_string();
+        Box::pin(async move {
+            fs::write(&target, &content)?;
+            // Report the written bytes so a confirmed approved write is not
+            // spuriously flagged; keeps this test focused on the gate firing.
+            Ok(ToolOutput::text("wrote").with(
+                crate::nexus::WRITE_CONFIRM_HASH_KEY,
+                json!(crate::tools::content_hash(content.as_bytes())),
+            ))
+        })
+    }
+    fn is_mutating(&self) -> bool {
+        true
+    }
+    fn mutates_paths(&self, args: &serde_json::Value) -> Vec<PathBuf> {
+        match args["path"].as_str() {
+            Some(path) => vec![PathBuf::from(path)],
+            None => Vec::new(),
+        }
+    }
+    // requires_approval() defaults to false -- the crux of finding 1.
+}
+
+// Finding 1: a mutating tool with `is_mutating() == true` and a protected
+// `mutates_paths()` target but `requires_approval() == false` must still route
+// the dirty file through approval -- the dirty gate cannot be skipped.
+#[test]
+fn ungated_mutating_tool_still_gates_dirty_file() -> Result<()> {
+    let repo = init_repo();
+    fs::write(repo.path.join("committed.txt"), "dirty\n").unwrap();
+
+    let provider = FakeProvider::new(vec![
+        AssistantTurn {
+            tool_calls: vec![ToolCall {
+                id: "c1".to_string(),
+                name: "ungated_mutate".to_string(),
+                arguments: json!({ "path": "committed.txt", "content": "iris\n" }),
+                thought_signature: None,
+            }],
+            ..Default::default()
+        },
+        AssistantTurn::text("done"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, Tools::new(vec![Box::new(UngatedMutator)])),
+        repo.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert_eq!(
+        frontend.reviews.get(),
+        1,
+        "a mutating-but-ungated tool must still route a baseline-dirty target through approval"
     );
     Ok(())
 }

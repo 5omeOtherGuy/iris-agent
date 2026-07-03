@@ -30,11 +30,13 @@ pub(super) struct Baseline {
     pub(super) index: String,
 }
 
-/// One `git status --porcelain=v1 -z` record.
+/// One `git status --porcelain=v1 -z` record. Paths are kept as [`PathBuf`]
+/// (built from raw bytes, never lossy-decoded) so a non-UTF-8 filename is
+/// hashed, snapshotted, and restored under its exact on-disk name.
 struct StatusEntry {
-    path: String,
+    path: PathBuf,
     /// Rename/copy source path, also protected.
-    source: Option<String>,
+    source: Option<PathBuf>,
     untracked: bool,
 }
 
@@ -58,11 +60,11 @@ pub(super) fn capture(workspace: &Path, normalize: impl Fn(&Path) -> PathBuf) ->
         } else {
             dirty_count += 1;
         }
-        let abs = normalize(Path::new(&entry.path));
+        let abs = normalize(&entry.path);
         let hash = hash_file(&abs);
         protected.insert(abs, hash);
         if let Some(source) = entry.source {
-            let abs = normalize(Path::new(&source));
+            let abs = normalize(&source);
             let hash = hash_file(&abs);
             protected.insert(abs, hash);
         }
@@ -76,27 +78,55 @@ pub(super) fn capture(workspace: &Path, normalize: impl Fn(&Path) -> PathBuf) ->
     })
 }
 
-/// Parse NUL-delimited porcelain-v1 status. Each record is `XY <path>`; a
-/// rename/copy (`R`/`C` in either column) is followed by an extra NUL token
-/// holding the source path. `!!` (ignored) records are skipped.
+/// Build a [`PathBuf`] from raw git path bytes without lossy decoding. On Unix
+/// the bytes are the exact on-disk filename (`git status -z` never quotes), so a
+/// non-UTF-8 name round-trips and stays protected/restorable.
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+/// Documented degrade for non-Unix targets (this repo targets Unix): a non-UTF-8
+/// path cannot be represented losslessly, so it is decoded lossily with a
+/// warning rather than silently corrupted. Iris does not currently ship on such
+/// targets; this keeps the code honest if that changes.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => PathBuf::from(text),
+        Err(_) => {
+            tracing::warn!(
+                "non-UTF-8 git path on a non-Unix target; dirty-tree protection degraded for this path"
+            );
+            PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+        }
+    }
+}
+
+/// Parse NUL-delimited porcelain-v1 status directly over the byte stream (paths
+/// are not guaranteed UTF-8). Each record is `XY <path>`; a rename/copy (`R`/`C`
+/// in either column) is followed by an extra NUL token holding the source path.
+/// `!!` (ignored) records are skipped.
 fn parse_status_z(bytes: &[u8]) -> Vec<StatusEntry> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut tokens = text.split('\0').filter(|token| !token.is_empty());
+    let mut tokens = bytes.split(|&b| b == 0).filter(|token| !token.is_empty());
     let mut entries = Vec::new();
     while let Some(token) = tokens.next() {
-        // "XY " prefix (2 status chars + space) then the path.
+        // "XY " prefix (2 ASCII status chars + a space) then the path bytes.
         if token.len() < 4 {
             continue;
         }
-        let status = &token[..2];
-        if status == "!!" {
+        let (x, y) = (token[0], token[1]);
+        if x == b'!' && y == b'!' {
             continue;
         }
-        let path = token[3..].to_string();
-        let untracked = status == "??";
-        let is_rename = status.contains('R') || status.contains('C');
+        let path = path_from_bytes(&token[3..]);
+        let untracked = x == b'?' && y == b'?';
+        let is_rename = x == b'R' || y == b'R' || x == b'C' || y == b'C';
         let source = if is_rename {
-            tokens.next().map(str::to_string)
+            tokens.next().map(path_from_bytes)
         } else {
             None
         };
