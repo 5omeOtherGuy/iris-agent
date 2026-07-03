@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn utf8_path_with_unicode_renders_verbatim() {
         // A valid-UTF-8 unicode name stays readable (not octal-escaped).
-        let diff = compute(vec![np("caf\u{e9}.txt", None, Some("x\n"))]);
-        assert_eq!(diff.files[0].path, "caf\u{e9}.txt");
+        let diff = compute(vec![np("sm\u{f8}rg\u{e5}s.txt", None, Some("x\n"))]);
+        assert_eq!(diff.files[0].path, "sm\u{f8}rg\u{e5}s.txt");
     }
 }
