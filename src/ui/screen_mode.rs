@@ -181,7 +181,7 @@ fn detect_environment() -> TerminalEnv {
 
 /// Best-effort tmux control-mode probe. Only called when `$TMUX` is set, so
 /// the `tmux` binary exists in any healthy environment. A failed or
-/// unparseable probe reports control mode (-> inline): detection must fail
+/// unparsable probe reports control mode (-> inline): detection must fail
 /// toward the inline fallback, never toward a broken alt screen.
 fn tmux_control_mode_probe() -> bool {
     match std::process::Command::new("tmux")
