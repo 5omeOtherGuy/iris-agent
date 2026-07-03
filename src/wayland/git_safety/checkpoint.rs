@@ -15,7 +15,7 @@
 //! Nothing here reads `HEAD`, the working index, or any ref outside the task's
 //! own namespace; GC on settlement is likewise scoped to that namespace only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -128,15 +128,107 @@ impl CheckpointChain {
         }
     }
 
+    /// Rehydrate a chain for an unsettled task from its durable git refs on
+    /// resume (ADR-0028 crash recovery), so a post-restart `/rollback`,
+    /// `/accept`, or `/checkpoint` operates on the real checkpoint chain instead
+    /// of reporting "no unsettled Iris changes". `ledger_paths` is the full set
+    /// of ledger paths (absolute) recovered from the persisted record -- it is
+    /// the authoritative key set because a create (`before = None`) is absent
+    /// from the base tree yet is still a ledger path that a base rollback must
+    /// delete. The base (seq 0) tree supplies each path's pre-task blob; a path
+    /// missing from it is a create. Intermediate refs (seq >= 1) become restore
+    /// points with generic op-log labels (the original turn/tool metadata lived
+    /// only in memory; the commit trailer keeps the durable copy for #264).
+    pub(super) fn load(
+        workspace: PathBuf,
+        task_id: String,
+        ledger_paths: &[PathBuf],
+    ) -> Result<Self> {
+        let mut chain = Self::new(workspace, task_id);
+        let refs = list_task_refs(&chain.workspace, &chain.task_id)?;
+        let base_tree = match refs.get(&BASE_SEQ) {
+            Some(commit) => chain.tree_entries(commit)?,
+            None => BTreeMap::new(),
+        };
+        for path in ledger_paths {
+            let rel = chain.rel_bytes(path)?;
+            let blob = base_tree.get(&rel).cloned();
+            chain.before.insert(path.clone(), blob);
+        }
+        let mut seqs: Vec<u64> = refs.keys().copied().filter(|&s| s != BASE_SEQ).collect();
+        seqs.sort_unstable();
+        for seq in &seqs {
+            let commit = refs.get(seq).cloned().unwrap_or_default();
+            chain.points.push(RestorePoint {
+                seq: *seq,
+                commit,
+                turn: 0,
+                tool_call: None,
+                timestamp: SystemTime::now(),
+                label: "recovered checkpoint".to_string(),
+            });
+        }
+        chain.next_seq = seqs.last().copied().unwrap_or(BASE_SEQ) + 1;
+        Ok(chain)
+    }
+
     /// Restore points offered by the rollback UI: the pre-task base first, then
     /// each intermediate checkpoint oldest-to-newest.
     pub(super) fn restore_points(&self) -> Vec<RestorePoint> {
         self.points.clone()
     }
 
+    /// Ledger paths whose current on-disk bytes diverged from the chain tip --
+    /// Iris's last recorded (expected-after) state. A non-empty result means a
+    /// user edit (or deletion, or re-creation) landed on a ledger path after
+    /// Iris's last write: ADR-0028's TOCTOU rule attributes the ambiguous bytes
+    /// to the user, so rollback must NOT clobber them. Byte-exact comparison
+    /// against the tip tree (the last full checkpoint of every ledger path).
+    pub(super) fn diverged_from_tip(&self) -> Result<Vec<PathBuf>> {
+        let Some(tip) = self.tip_commit()? else {
+            return Ok(Vec::new());
+        };
+        let tree = self.tree_entries(&tip)?;
+        let mut diverged = Vec::new();
+        for path in self.before.keys() {
+            let rel = self.rel_bytes(path)?;
+            let expected = match tree.get(&rel) {
+                Some(blob) => Some(self.read_blob(&blob.sha)?),
+                None => None,
+            };
+            let current = std::fs::read(path).ok();
+            if current != expected {
+                diverged.push(path.clone());
+            }
+        }
+        Ok(diverged)
+    }
+
+    /// The chain tip commit: the highest intermediate ref (seq >= 1), or the base
+    /// (seq 0) when no intermediate exists. Resolved from the durable refs, not
+    /// the in-memory points, so a recovery append (which advances refs without
+    /// touching `points`) is still seen as the tip.
+    fn tip_commit(&self) -> Result<Option<String>> {
+        let refs = list_task_refs(&self.workspace, &self.task_id)?;
+        let tip = refs
+            .iter()
+            .filter(|(seq, _)| **seq != BASE_SEQ)
+            .max_by_key(|(seq, _)| **seq)
+            .map(|(_, commit)| commit.clone())
+            .or_else(|| refs.get(&BASE_SEQ).cloned());
+        Ok(tip)
+    }
+
     /// Number of intermediate checkpoints recorded (test/GC accounting).
     pub(super) fn len(&self) -> usize {
         self.points.len()
+    }
+
+    /// Number of distinct ledger paths tracked by the chain. The rollback
+    /// summary uses it as an Iris-change count for a rehydrated task, whose
+    /// in-memory ledger is empty but whose paths survive in the chain.
+    pub(super) fn ledger_path_count(&self) -> usize {
+        self.before.len()
     }
 
     /// Record the pre-task content of a ledger path the first time it is seen.
@@ -208,16 +300,27 @@ impl CheckpointChain {
         Ok(point)
     }
 
-    /// Materialize every ledger path from the checkpoint tree at `seq`: a path
-    /// present in the tree is written back byte-for-byte with its recorded mode;
-    /// a ledger path absent from the tree is deleted (undoing a create). Only
-    /// ledger paths are touched -- user paths never appear in `before`.
-    pub(super) fn rollback_to(&self, seq: u64) -> Result<()> {
+    /// Materialize every ledger path from the checkpoint tree at `seq`, EXCEPT
+    /// paths in `excluded` -- the user-diverged paths whose current disk bytes
+    /// rollback must preserve (ADR-0028 TOCTOU rule). A path present in the tree
+    /// (and not excluded) is written back byte-for-byte with its recorded mode; a
+    /// ledger path absent from the tree is deleted (undoing a create); an
+    /// excluded path is left exactly as it is on disk, neither rewritten nor
+    /// deleted. Only ledger paths are touched -- user paths never appear in
+    /// `before`.
+    pub(super) fn rollback_to_excluding(
+        &self,
+        seq: u64,
+        excluded: &BTreeSet<PathBuf>,
+    ) -> Result<()> {
         let commit = self
             .resolve_ref(seq)?
             .with_context(|| format!("checkpoint {seq} for task {} is missing", self.task_id))?;
         let tree = self.tree_entries(&commit)?;
         for path in self.before.keys() {
+            if excluded.contains(path) {
+                continue;
+            }
             let rel = self.rel_bytes(path)?;
             match tree.get(&rel) {
                 Some(blob) => {
@@ -288,13 +391,24 @@ impl CheckpointChain {
     /// `update-index --index-info` on stdin (`<mode> SP <sha>TAB<relpath>`, raw
     /// bytes for non-UTF-8 paths) then `write-tree`.
     fn build_tree(&self, entries: impl Iterator<Item = (PathBuf, Blob)>) -> Result<String> {
+        let mut raw = Vec::new();
+        for (path, blob) in entries {
+            raw.push((self.rel_bytes(&path)?, blob));
+        }
+        self.build_tree_raw(raw.into_iter())
+    }
+
+    /// Build a tree from already-workspace-relative path bytes. The lower-level
+    /// half of [`build_tree`]: recovery snapshots overlay diverged blobs onto a
+    /// previous checkpoint's tree entries, which are already `relpath` bytes, so
+    /// they skip the [`PathBuf`] round-trip.
+    fn build_tree_raw(&self, entries: impl Iterator<Item = (Vec<u8>, Blob)>) -> Result<String> {
         let index = TempIndex::new(&self.task_id);
         let index_env: &OsStr = index.path.as_os_str();
         let env = [("GIT_INDEX_FILE", index_env)];
 
         let mut stdin: Vec<u8> = Vec::new();
-        for (path, blob) in entries {
-            let rel = self.rel_bytes(&path)?;
+        for (rel, blob) in entries {
             stdin.extend_from_slice(blob.mode.as_octal().as_bytes());
             stdin.push(b' ');
             stdin.extend_from_slice(blob.sha.as_bytes());
@@ -429,29 +543,49 @@ pub(super) fn committed_blob(workspace: &Path, path: &Path) -> Option<(Vec<u8>, 
 }
 
 /// Append a recovery checkpoint to an existing chain WITHOUT a live in-memory
-/// [`CheckpointChain`] (crash recovery on resume, ADR-0028): snapshot the
-/// current on-disk bytes of `paths` into a tree, commit it parented to the
-/// chain's current tip, and advance the tip ref. The `base` ref is left
+/// [`CheckpointChain`] (crash recovery on resume, ADR-0028): snapshot the FULL
+/// current on-disk state of every ledger path into a tree, commit it parented to
+/// the chain's current tip, and advance the tip ref. The `base` ref is left
 /// untouched so the pre-task snapshot is preserved. No-op when the task has no
 /// existing refs (nothing to recover).
-pub(super) fn append_recovery(workspace: &Path, task_id: &str, paths: &[PathBuf]) -> Result<()> {
+///
+/// The recovery tree is a *complete* snapshot, not just the diverged paths: it
+/// starts from the current tip's tree (the last full checkpoint of every ledger
+/// path) and overlays each diverged path's current disk bytes (or removes it
+/// when it now vanished). A recovery tree built from only the diverged paths
+/// would be a delete-bomb -- [`CheckpointChain::rollback_to_excluding`] treats any ledger
+/// path absent from the tree as a delete, so rolling back to a diverged-only
+/// recovery point would delete every non-diverged ledger path.
+pub(super) fn append_recovery(workspace: &Path, task_id: &str, diverged: &[PathBuf]) -> Result<()> {
     let refs = list_task_refs(workspace, task_id)?;
     if refs.is_empty() {
         return Ok(());
     }
     let chain = CheckpointChain::new(workspace.to_path_buf(), task_id.to_string());
-    // Blob the current disk bytes of each path and build the recovery tree.
-    let mut entries = Vec::new();
-    for path in paths {
-        if let Ok(bytes) = std::fs::read(path) {
-            let blob = chain.write_blob(path, &bytes, Mode::of(path))?;
-            entries.push((path.clone(), blob));
+    let tip_seq = refs.keys().copied().max().unwrap_or(BASE_SEQ);
+    let tip_commit = refs.get(&tip_seq).cloned();
+    // Start from the tip's full tree so every non-diverged ledger path keeps its
+    // last-checkpoint blob; only the diverged paths are overlaid/removed.
+    let mut entries: BTreeMap<Vec<u8>, Blob> = match &tip_commit {
+        Some(commit) => chain.tree_entries(commit)?,
+        None => BTreeMap::new(),
+    };
+    for path in diverged {
+        let rel = chain.rel_bytes(path)?;
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let blob = chain.write_blob(path, &bytes, Mode::of(path))?;
+                entries.insert(rel, blob);
+            }
+            Err(_) => {
+                // The path diverged by vanishing from disk: drop it from the
+                // snapshot so a rollback to recovery reproduces the deletion.
+                entries.remove(&rel);
+            }
         }
     }
-    let tree = chain.build_tree(entries.into_iter())?;
-    let tip_seq = refs.keys().copied().max().unwrap_or(BASE_SEQ);
-    let parent = refs.get(&tip_seq).cloned();
-    let commit = chain.commit_tree(&tree, parent.as_deref(), "iris-checkpoint recovery")?;
+    let tree = chain.build_tree_raw(entries.into_iter())?;
+    let commit = chain.commit_tree(&tree, tip_commit.as_deref(), "iris-checkpoint recovery")?;
     chain.update_ref(tip_seq + 1, &commit)?;
     Ok(())
 }

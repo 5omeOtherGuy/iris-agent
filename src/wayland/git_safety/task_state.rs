@@ -45,6 +45,13 @@ pub(super) struct PersistedTask {
     pub(super) expected: BTreeMap<String, Option<String>>,
     /// Highest checkpoint sequence recorded, so recovery can append after it.
     pub(super) tip_seq: u64,
+    /// The task baseline's `git ls-files --stage` output, so a post-restart
+    /// rollback can restore the user's staged selection (ADR-0028: the index is
+    /// protected state). `#[serde(default)]` so a record written before this
+    /// field existed deserializes to an empty index (rollback then leaves
+    /// staging untouched rather than failing).
+    #[serde(default)]
+    pub(super) baseline_index: String,
 }
 
 impl PersistedTask {

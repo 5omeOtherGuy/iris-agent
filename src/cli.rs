@@ -220,6 +220,7 @@ fn handle_rollback<P: ChatProvider>(rest: &str, harness: &mut Harness<P>) -> Vec
     match harness.rollback_checkpoint(seq) {
         Ok(outcome) => {
             let mut lines = vec![outcome.summary];
+            lines.extend(outcome.preserved_notices);
             lines.extend(outcome.index_warning);
             lines
         }

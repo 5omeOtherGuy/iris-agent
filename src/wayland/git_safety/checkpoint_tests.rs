@@ -153,7 +153,9 @@ fn engine_round_trips_create_edit_delete_rename_binary() {
     chain.checkpoint(1, None, "changes".to_string()).unwrap();
 
     // Roll back to the pre-task base: every ledger path returns to pre-task.
-    chain.rollback_to(0).unwrap();
+    chain
+        .rollback_to_excluding(0, &std::collections::BTreeSet::new())
+        .unwrap();
     assert_eq!(fs::read(&edit).unwrap(), b"base\n");
     assert!(
         !created.exists(),
@@ -441,4 +443,165 @@ fn iris_write_degraded(guard: &GitSafety, path: &Path, content: &[u8]) {
     guard.before_exec(&targets);
     fs::write(path, content).unwrap();
     let _ = guard.after_exec(&targets, Some(&crate::tools::content_hash(content)));
+}
+
+// Finding 1 (CRITICAL): a user edit to a ledger path landing after Iris's last
+// write is preserved on rollback -- rollback must not clobber the user's newer
+// bytes (ADR-0028 TOCTOU rule). Non-diverged ledger paths still roll back, and
+// the user is told which path was kept.
+#[test]
+fn rollback_preserves_user_edit_to_ledger_path() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    let edited = repo.path.join("committed.txt");
+    let created = repo.path.join("iris_only.txt");
+
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"iris wrote this\n");
+    iris_write(&guard, &created, b"iris made this\n");
+
+    // The user edits a ledger path out of band, after Iris's last recorded write.
+    fs::write(&edited, b"user changed it later\n").unwrap();
+
+    let outcome = guard.rollback(0).unwrap();
+
+    // The user's newer bytes survive: nothing silently lost.
+    assert_eq!(
+        fs::read(&edited).unwrap(),
+        b"user changed it later\n",
+        "a user edit after Iris's last write is never clobbered by rollback"
+    );
+    // A non-diverged ledger path still rolls back (the created file is removed).
+    assert!(
+        !created.exists(),
+        "non-diverged ledger paths still roll back"
+    );
+    // The user is told which path was preserved.
+    assert!(
+        outcome
+            .preserved_notices
+            .iter()
+            .any(|line| line.contains("committed.txt")),
+        "a per-path preserved notice names the diverged file: {:?}",
+        outcome.preserved_notices
+    );
+}
+
+// Finding 2 (HIGH): after a restart the unsettled task is rehydrated from its
+// persisted record + refs, so `/rollback` actually rolls back instead of
+// reporting "no unsettled Iris changes".
+#[test]
+fn resume_rehydrates_task_and_rollback_restores() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let created = repo.path.join("iris_new.txt");
+
+    // Session A: Iris works, task stays unsettled (a crash -- no accept/rollback).
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.note_mutation();
+        iris_write(&guard, &edited, b"iris edit\n");
+        iris_write(&guard, &created, b"iris new file\n");
+    }
+
+    // Session B: a fresh guard over the same repo/session dir reconciles and
+    // rehydrates the unsettled task.
+    let guard_b = GitSafety::new(&repo.path);
+    let notice = guard_b
+        .recover_and_expire()
+        .expect("unsettled task noticed");
+    assert!(notice.contains("unsettled"), "notice: {notice}");
+
+    let points = guard_b.restore_points();
+    assert!(
+        !points.is_empty(),
+        "the rehydrated task offers restore points post-restart"
+    );
+
+    let outcome = guard_b.rollback(0).unwrap();
+    assert!(
+        outcome.summary.contains("rolled back"),
+        "rollback succeeds post-restart: {}",
+        outcome.summary
+    );
+    assert_eq!(
+        fs::read(&edited).unwrap(),
+        b"base\n",
+        "the pre-task content is restored after a simulated restart"
+    );
+    assert!(
+        !created.exists(),
+        "Iris's created file is removed on rollback"
+    );
+}
+
+// Finding 3 (HIGH): a recovery checkpoint is a FULL snapshot of every ledger
+// path, not just the diverged ones -- rolling back to a recovery point must not
+// delete-bomb the non-diverged ledger paths.
+#[test]
+fn recovery_checkpoint_is_full_snapshot_not_delete_bomb() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+
+    // Session A: Iris touches two ledger paths, task stays unsettled.
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.note_mutation();
+        iris_write(&guard, &edited, b"iris edited\n");
+        iris_write(&guard, &repo.path.join("iris_extra.txt"), b"iris extra\n");
+    }
+
+    // Divergence on ONE path only (a crash-time external edit).
+    fs::write(&edited, b"diverged content\n").unwrap();
+
+    // Session B: reconcile (append a recovery checkpoint) + rehydrate.
+    let guard_b = GitSafety::new(&repo.path);
+    guard_b
+        .recover_and_expire()
+        .expect("unsettled task noticed");
+
+    // A recovery checkpoint was appended (the newest restore point past base).
+    let points = guard_b.restore_points();
+    assert!(
+        points.iter().map(|p| p.seq).max().unwrap() > 0,
+        "a recovery checkpoint was appended"
+    );
+
+    // Inspect the recovery commit's tree directly: it must be a FULL snapshot of
+    // every ledger path, not just the diverged one. (Asserting on the tree
+    // isolates finding 3 -- a rollback-time check would be masked by finding 1's
+    // divergence exclusion, which independently spares an on-disk path.)
+    let task_id = task_state::load_all(&task_state::git_dir(&repo.path).unwrap())
+        .pop()
+        .unwrap()
+        .task_id;
+    let recovery_ref = git_out(
+        &repo.path,
+        &[
+            "for-each-ref",
+            "--sort=-refname",
+            "--count=1",
+            "--format=%(objectname)",
+            &format!("refs/iris/checkpoints/{task_id}/"),
+        ],
+    );
+    let tree = git_out(&repo.path, &["ls-tree", "-r", "--name-only", &recovery_ref]);
+    let names: Vec<&str> = tree.lines().collect();
+    assert!(
+        names.contains(&"committed.txt"),
+        "recovery tree holds the diverged path: {names:?}"
+    );
+    assert!(
+        names.contains(&"iris_extra.txt"),
+        "recovery tree holds the non-diverged path too (no delete-bomb): {names:?}"
+    );
+    // The diverged path's ACTUAL disk bytes are what the snapshot captured.
+    let captured = git_out(
+        &repo.path,
+        &["cat-file", "blob", &format!("{recovery_ref}:committed.txt")],
+    );
+    assert_eq!(
+        captured, "diverged content",
+        "the recovery snapshot captures the diverged path's actual disk state"
+    );
 }

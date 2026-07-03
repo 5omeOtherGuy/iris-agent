@@ -82,6 +82,10 @@ pub(crate) struct RollbackOutcome {
     /// Set when the user index could not be safely restored (mid-merge/rebase):
     /// the degrade-to-detect-and-warn path (ADR-0028).
     pub(crate) index_warning: Option<String>,
+    /// Per-path notices for ledger paths left untouched because the user edited
+    /// them after Iris's last write (ADR-0028 TOCTOU rule): rollback preserves
+    /// the user's newer bytes instead of clobbering them.
+    pub(crate) preserved_notices: Vec<String>,
 }
 
 /// How the guard operates for this workspace.
@@ -357,6 +361,7 @@ impl GitSafety {
             updated_ms: task_state::now_ms(),
             expected,
             tip_seq,
+            baseline_index: task.baseline.index.clone(),
         };
         if let Err(error) = task_state::save(git_dir, &record) {
             tracing::warn!(error = %format!("{error:#}"), "failed to persist task recovery record");

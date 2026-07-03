@@ -8,14 +8,15 @@
 //! these methods sit on the same [`GitSafety`] but read as one cohesive
 //! "settlement" concern.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Result;
 
 use super::{
-    Chain, GitSafety, IrisChange, KEEP_CHECKPOINTS, Mode, RestorePoint, RollbackOutcome, Task,
-    checkpoint, git, task_state,
+    Baseline, Chain, CheckpointChain, GitSafety, IrisChange, KEEP_CHECKPOINTS, Mode, RestorePoint,
+    RollbackOutcome, Task, baseline, checkpoint, git, task_state,
 };
 
 impl GitSafety {
@@ -116,20 +117,47 @@ impl GitSafety {
             return Ok(RollbackOutcome {
                 summary: "no active Iris task to roll back".to_string(),
                 index_warning: None,
+                preserved_notices: Vec::new(),
             });
         };
-        let count = task.ledger.entries.len();
         let Task {
             mut chain,
             git_dir,
             task_id,
             baseline,
+            ledger,
+            turn,
             ..
         } = task;
         let mut index_warning = None;
+        let mut preserved_notices = Vec::new();
+        let mut count = ledger.entries.len();
         match &mut chain {
             Chain::Git(chain) => {
-                chain.rollback_to(seq)?;
+                count = count.max(chain.ledger_path_count());
+                // ADR-0028 TOCTOU reconciliation: before restoring, re-hash every
+                // ledger path against Iris's last recorded state (the chain tip).
+                // Any diverged path was edited by the user after Iris's last
+                // write -- it is user-attributed and must never be clobbered.
+                let diverged = chain.diverged_from_tip().unwrap_or_default();
+                let excluded: BTreeSet<PathBuf> = diverged.iter().cloned().collect();
+                if !excluded.is_empty() {
+                    // Capture the current disk (including the user's newer bytes)
+                    // as a full recovery checkpoint first, so nothing is lost even
+                    // transiently, then exclude the diverged paths from restore.
+                    if let Err(error) =
+                        chain.checkpoint(turn, None, "pre-rollback snapshot".to_string())
+                    {
+                        tracing::warn!(error = %format!("{error:#}"), "pre-rollback recovery snapshot failed");
+                    }
+                    for path in &diverged {
+                        preserved_notices.push(format!(
+                            "kept your edit to {} (changed after Iris's last write; not rolled back)",
+                            path.display()
+                        ));
+                    }
+                }
+                chain.rollback_to_excluding(seq, &excluded)?;
                 index_warning = self.restore_user_index(&baseline.index);
                 if let Err(error) = chain.destroy() {
                     tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on rollback failed");
@@ -143,6 +171,7 @@ impl GitSafety {
         Ok(RollbackOutcome {
             summary: format!("rolled back {count} Iris change(s) to restore point {seq}"),
             index_warning,
+            preserved_notices,
         })
     }
 
@@ -197,16 +226,18 @@ impl GitSafety {
 
     /// On resume or a new session in the same repo (ADR-0028): expire stale
     /// unsettled tasks (auto-settle accepted, GC refs) and, for a live unsettled
-    /// task whose disk diverged from the op-log, append a recovery checkpoint and
-    /// return a one-line notice for the event stream. `None` when nothing is
-    /// unsettled. Lazy: called at startup/resume, no daemon.
+    /// task whose disk diverged from the op-log, append a recovery checkpoint,
+    /// rehydrate it as the active task so a post-restart `/rollback` / `/accept`
+    /// / `/checkpoint` operates on the real chain, and return a one-line notice
+    /// for the event stream. `None` when nothing is unsettled. Lazy: called at
+    /// startup/resume, no daemon.
     pub(crate) fn recover_and_expire(&self) -> Option<String> {
         if !matches!(self.mode, Mode::Git) {
             return None;
         }
         let git_dir = task_state::git_dir(&self.workspace)?;
         let now = SystemTime::now();
-        let workspace = self.workspace.to_string_lossy();
+        let workspace = self.workspace.to_string_lossy().into_owned();
         let mut notice = None;
         for task in task_state::load_all(&git_dir) {
             if task.workspace != workspace {
@@ -217,6 +248,9 @@ impl GitSafety {
                 task_state::remove(&git_dir, &task.task_id);
                 continue;
             }
+            // Reconcile disk vs the op-log first (append a FULL recovery snapshot
+            // for any diverged path), so the rehydrated chain's tip reflects the
+            // actual disk state before it is offered for rollback.
             let diverged = task_state::diverged_paths(&task);
             if !diverged.is_empty()
                 && let Err(error) =
@@ -224,9 +258,57 @@ impl GitSafety {
             {
                 tracing::warn!(error = %format!("{error:#}"), "recovery checkpoint append failed");
             }
+            self.rehydrate_task(&git_dir, &task);
             notice = Some(task.recovery_notice(now));
         }
         notice
+    }
+
+    /// Rebuild an active [`Task`] from a persisted unsettled record and its
+    /// durable `refs/iris/*` chain (ADR-0028 crash recovery), so settlement
+    /// operations work after a restart. The chain is loaded from refs; the
+    /// baseline is re-captured against the current disk (so continued mutation
+    /// still gates today's dirty files -- the safe direction) but its index is
+    /// the ORIGINAL staged state from the record, the selection a rollback must
+    /// restore. No-op when a task is already active.
+    fn rehydrate_task(&self, git_dir: &Path, persisted: &task_state::PersistedTask) {
+        {
+            let state = self.state.lock().unwrap();
+            if state.task.is_some() {
+                return;
+            }
+        }
+        let ledger_paths: Vec<PathBuf> = persisted.expected.keys().map(PathBuf::from).collect();
+        let chain = match CheckpointChain::load(
+            self.workspace.clone(),
+            persisted.task_id.clone(),
+            &ledger_paths,
+        ) {
+            Ok(chain) => chain,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "could not rehydrate checkpoint chain on resume");
+                return;
+            }
+        };
+        let mut baseline = baseline::capture(&self.workspace, |path| self.normalize(path))
+            .unwrap_or_else(|_| Baseline {
+                protected: BTreeMap::new(),
+                dirty_count: 0,
+                untracked_count: 0,
+                index: String::new(),
+            });
+        baseline.index = persisted.baseline_index.clone();
+        let mut task = Task::active(
+            persisted.task_id.clone(),
+            baseline,
+            chain,
+            Some(git_dir.to_path_buf()),
+        );
+        task.created_ms = persisted.created_ms;
+        let mut state = self.state.lock().unwrap();
+        if state.task.is_none() {
+            state.task = Some(task);
+        }
     }
 }
 
