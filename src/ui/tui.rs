@@ -36,10 +36,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::nexus::ProviderUsage;
+use crate::ui::screen_mode::ScreenMode;
 use crate::ui::terminal_surface::TerminalSurface;
+use pager::PagerSurface;
 
 mod component;
 mod overlay;
+mod pager;
 mod pane;
 mod panel;
 mod rows;
@@ -253,6 +256,9 @@ fn disable_keyboard_enhancement<W: Write>(writer: &mut W, enabled: bool) -> io::
 /// [`crate::ui::tui_loop`] feeds it events and calls [`TuiUi::draw`].
 pub(crate) struct TuiUi {
     surface: TerminalSurface<Stdout>,
+    /// Alt-screen pager lifecycle guard (ADR-0029). `Some` only in pager mode;
+    /// inline mode never touches the alternate screen.
+    pager: Option<PagerSurface<Stdout>>,
     pub(crate) screen: Screen,
     active: bool,
     /// Whether keyboard-enhancement flags were successfully pushed, so they are
@@ -267,11 +273,16 @@ impl TuiUi {
     /// capture is deliberately NOT enabled so the terminal owns scroll/select/
     /// copy over the normal screen scrollback. Restored on `drop`/`shutdown`,
     /// and by the signal handler's emergency escape on a force-quit.
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(mode: ScreenMode) -> Result<Self> {
         // Capture cooked-mode termios before raw mode so the force-quit signal
         // handler can restore the tty even though Drop will not run then.
         crate::signals::save_termios_for_force_quit();
         enable_raw_mode()?;
+        // Arm the force-quit emergency restore BEFORE any terminal-owned state
+        // beyond raw mode is entered, so a repeat Ctrl-C in the setup window
+        // (paste/focus flags, keyboard protocol, alt screen) still restores the
+        // tty. Every error unwind below disarms it again.
+        crate::signals::enable_terminal_restore_on_force_quit();
         let mut stdout = io::stdout();
         // Probe Kitty keyboard-protocol support before negotiating so the push is
         // gated and the matching pop is conditional. A probe error is treated as
@@ -284,15 +295,37 @@ impl TuiUi {
         if let Err(error) = execute!(stdout, EnableBracketedPaste, EnableFocusChange, Hide) {
             let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
             let _ = disable_raw_mode();
+            crate::signals::disable_terminal_restore_on_force_quit();
             return Err(error.into());
         }
         // Best-effort: a failure to negotiate the protocol must not abort startup.
         let keyboard_enhanced =
             enable_keyboard_enhancement(&mut stdout, supports_enhancement).unwrap_or(false);
-        crate::signals::enable_terminal_restore_on_force_quit();
+        // Pager mode: enter the alternate screen last (after every mode toggle
+        // above), with the panic hook installed first so a panic between here
+        // and shutdown always restores the normal screen before the message
+        // prints. On enter failure, unwind the setup exactly like the paste/
+        // focus error path.
+        let pager = match mode {
+            ScreenMode::Inline => None,
+            ScreenMode::Pager => {
+                pager::install_panic_hook();
+                match PagerSurface::enter(io::stdout()) {
+                    Ok(pager) => Some(pager),
+                    Err(error) => {
+                        let _ = disable_keyboard_enhancement(&mut stdout, keyboard_enhanced);
+                        let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
+                        let _ = disable_raw_mode();
+                        crate::signals::disable_terminal_restore_on_force_quit();
+                        return Err(error.into());
+                    }
+                }
+            }
+        };
         crate::telemetry::set_tui_active(true);
         Ok(Self {
             surface: TerminalSurface::new(stdout),
+            pager,
             screen: Screen::new(),
             active: true,
             keyboard_enhanced,
@@ -340,15 +373,29 @@ impl TuiUi {
 
     fn restore(&mut self) {
         if self.active {
-            // Replace the interactive chrome with transcript-only content so
-            // the shell prompt resumes below conversation history, not below a
-            // stale editor box.
-            if let Ok((width, height)) = terminal_size() {
-                let size = Size::new(width.max(1), height.max(1));
-                let transcript = self.screen.wrapped_lines(size.width);
-                let _ = self.surface.render(size, &transcript.lines);
+            match self.pager.take() {
+                Some(mut pager) => {
+                    // Pager mode: reset render-toggled terminal modes (autowrap,
+                    // synchronized output -- they are terminal-global, not
+                    // per-screen) while still inside the alt screen, then leave;
+                    // the terminal restores the pre-session normal screen, so
+                    // there is no transcript replay (the alt screen owns no
+                    // scrollback to hand back).
+                    let _ = self.surface.cleanup_modes();
+                    let _ = pager.leave();
+                }
+                None => {
+                    // Replace the interactive chrome with transcript-only
+                    // content so the shell prompt resumes below conversation
+                    // history, not below a stale editor box.
+                    if let Ok((width, height)) = terminal_size() {
+                        let size = Size::new(width.max(1), height.max(1));
+                        let transcript = self.screen.wrapped_lines(size.width);
+                        let _ = self.surface.render(size, &transcript.lines);
+                    }
+                    let _ = self.surface.finish();
+                }
             }
-            let _ = self.surface.finish();
             // Restore the keyboard protocol first (pop only if pushed), then the
             // paste mode and cursor, then raw mode. Ordering mirrors setup in
             // reverse so no terminal mode Iris toggled is left enabled.
