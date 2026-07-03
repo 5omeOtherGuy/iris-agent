@@ -1461,18 +1461,27 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // Pager scroll keys act before editor routing (scrollback has implicit
-    // focus for the nav keys); typing/other keys fall through to the composer.
-    if pager_scroll_key(screen, key.code, ctrl, alt) {
-        return IdleKey::Continue;
-    }
-
     let input = screen.editor_text();
 
     // Explicit focus routing (Editor < Palette < Modal). Modals run in their own
     // phase, so idle focus is only ever Editor or Palette here. Reuse the input
     // snapshot already computed above instead of re-joining the editor buffer.
     let focus = screen.focus_for(&input);
+
+    // Pager scroll keys act before editor routing (scrollback has implicit
+    // focus for the nav keys); typing/other keys fall through to the composer.
+    if pager_scroll_key(screen, key.code, ctrl, alt) {
+        return IdleKey::Continue;
+    }
+    // Tab focus toggle + focused-scrollback entry navigation (ADR-0029).
+    // Never on the start page (no transcript to focus) and never while the
+    // slash palette is open (Tab/arrows stay palette keys there).
+    if !screen.start_page_active()
+        && focus != FocusTarget::Palette
+        && scrollback_focus_key(screen, key.code, ctrl, alt)
+    {
+        return IdleKey::Continue;
+    }
 
     // Start-page launcher routing: the listed ctrl-chords activate directly,
     // and while the composer is empty ↑/↓/↵ drive the launcher selection. The
@@ -1734,6 +1743,52 @@ fn resolve_input_eof(
 /// While a tool is awaiting approval the composer is frozen and only the
 /// approval keys (plus Ctrl-C/-O) act, so a `y`/`n` can't be both an answer and
 /// typed text. Returns whether a redraw is needed.
+/// Tab focus toggle and focused-scrollback entry keys (ADR-0029): arrows
+/// select entries (falling back to line scroll with none), Left/Right
+/// fold/reveal, Enter toggles the fold. Typing a printable character returns
+/// focus to the prompt WITHOUT being consumed, so it lands in the composer;
+/// Esc is never a focus or nav key.
+fn scrollback_focus_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    if !screen.pager_active || ctrl || alt {
+        return false;
+    }
+    match code {
+        KeyCode::Tab => {
+            screen.toggle_scrollback_focus();
+            true
+        }
+        _ if !screen.scrollback_focus => false,
+        KeyCode::Up => {
+            screen.move_selection(-1);
+            true
+        }
+        KeyCode::Down => {
+            screen.move_selection(1);
+            true
+        }
+        KeyCode::Left => {
+            screen.set_selected_expanded(false);
+            true
+        }
+        KeyCode::Right => {
+            screen.set_selected_expanded(true);
+            true
+        }
+        KeyCode::Enter => {
+            screen.toggle_selected_entry();
+            true
+        }
+        // Typing always returns to the prompt; the key falls through and is
+        // handled by the composer (it types). Esc keeps its cancel/clear
+        // semantics untouched.
+        KeyCode::Char(_) | KeyCode::Backspace => {
+            screen.focus_prompt();
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Pager-mode wheel scrolling: ±`scroll_speed` lines per wheel tick. Only the
 /// wheel is consumed; clicks/drags are ignored (in-app selection is a later
 /// slice -- the Ctrl+T toggle restores terminal-native selection until then).
@@ -1862,6 +1917,11 @@ fn handle_running_event(
                     return true;
                 }
                 return false;
+            }
+            // Tab focus + entry selection stay available while a turn runs
+            // (after the approval block, so approval keys always win).
+            if scrollback_focus_key(screen, key.code, ctrl, alt) {
+                return true;
             }
             // No approval pending: the composer is live for steering. Enter
             // queues a steering message (injected before the next provider
@@ -2113,6 +2173,60 @@ mod tests {
         );
         assert!(matches!(outcome, IdleKey::Continue));
         assert!(!screen.mouse_capture);
+    }
+
+    #[test]
+    fn tab_toggles_scrollback_focus_and_typing_returns_to_prompt() {
+        let mut screen = Screen::new();
+        // Inline mode: Tab is not a focus key (editor keeps it).
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+
+        screen.pager_active = true;
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(screen.scrollback_focus);
+        // Arrows are consumed as selection/scroll while focused.
+        assert!(scrollback_focus_key(&mut screen, KeyCode::Up, false, false));
+        // Esc is never a focus/nav key: not consumed, focus unchanged.
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Esc,
+            false,
+            false
+        ));
+        assert!(screen.scrollback_focus);
+        // A printable character returns focus to the prompt WITHOUT being
+        // consumed, so it still types into the composer.
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('h'),
+            false,
+            false
+        ));
+        assert!(!screen.scrollback_focus);
+        // Tab toggles back out too.
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(!screen.scrollback_focus);
     }
 
     #[test]
