@@ -2,7 +2,9 @@
 //!
 //! These are workspace-scoped, synchronous ports of the seven built-in tools
 //! that pi_agent_rust exposes from its own `src/tools.rs`:
-//! `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`.
+//! `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`, plus the
+//! Iris-specific `read_output` (issue #205), which pages back an oversized tool
+//! output stored out of context behind a handle (issue #61).
 //!
 //! Fidelity notes:
 //! - The model-facing contract (tool name, description, and JSON Schema) is
@@ -31,6 +33,7 @@ mod ls;
 mod observe;
 pub(crate) mod path;
 mod read;
+mod read_output;
 mod registry;
 mod text;
 mod write;
@@ -64,6 +67,8 @@ impl ToolState {
 
 #[cfg(test)]
 pub(crate) use read::read_file;
+#[cfg(test)]
+pub(crate) use registry::read_output_tool;
 
 pub(super) enum Preview {
     Available {
@@ -157,7 +162,7 @@ mod tests {
                 "{name} should be gated"
             );
         }
-        for name in ["read", "grep", "find", "ls"] {
+        for name in ["read", "grep", "find", "ls", "read_output"] {
             assert!(
                 !tools.by_name(name).unwrap().requires_approval(),
                 "{name} should not be gated"
@@ -209,12 +214,21 @@ mod tests {
     }
 
     #[test]
-    fn built_in_tools_cover_all_seven_in_order() {
+    fn built_in_tools_cover_all_in_registration_order() {
         let tools = built_in_tools();
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
         assert_eq!(
             names,
-            vec!["read", "bash", "edit", "write", "grep", "find", "ls"]
+            vec![
+                "read",
+                "bash",
+                "edit",
+                "write",
+                "grep",
+                "find",
+                "ls",
+                "read_output"
+            ]
         );
     }
 

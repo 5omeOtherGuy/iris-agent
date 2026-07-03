@@ -27,11 +27,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
-use super::{Preview, ToolState, bash, edit, find, grep, ls, path, read, render_preview, write};
+use super::{
+    Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, render_preview, write,
+};
 
-/// Construct the seven workspace tools the CLI injects into the agent. The
-/// order is the provider-declaration order (`read, bash, edit, write, grep,
-/// find, ls`).
+/// Construct the workspace tools the CLI injects into the agent. The order is
+/// the provider-declaration order (`read, bash, edit, write, grep, find, ls`),
+/// with the Iris-specific `read_output` (issue #205) appended last.
 pub(crate) fn built_in_tools() -> Tools {
     Tools::new(vec![
         Box::new(ReadTool),
@@ -41,7 +43,15 @@ pub(crate) fn built_in_tools() -> Tools {
         Box::new(GrepTool),
         Box::new(FindTool),
         Box::new(LsTool),
+        Box::new(ReadOutputTool),
     ])
+}
+
+/// Boxed `read_output` tool for integration tests that pair it with a custom
+/// tool (e.g. one that emits an oversized output) in a single [`Tools`] set.
+#[cfg(test)]
+pub(crate) fn read_output_tool() -> Box<dyn Tool> {
+    Box::new(ReadOutputTool)
 }
 
 /// Resolve the canonicalized workspace root for an execution. Centralized here
@@ -279,6 +289,37 @@ impl Tool for FindTool {
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
         run_off_thread(root(env), args.clone(), "find", find::execute)
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+}
+
+struct ReadOutputTool;
+impl Tool for ReadOutputTool {
+    fn name(&self) -> &str {
+        "read_output"
+    }
+    fn description(&self) -> &str {
+        read_output::DESCRIPTION
+    }
+    fn parameters(&self) -> Value {
+        read_output::parameters()
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        // Reads back an offloaded output via the `ToolOutputStore` contract. The
+        // store is a non-`'static` borrow (`env.output_store`), so this cannot
+        // move the body onto `run_off_thread`'s blocking pool the way
+        // `grep`/`find`/`ls` do; it does the small store read inline in the async
+        // body like `read`/`edit`. It touches no `ToolState`, only the immutable
+        // store, so it is still `is_concurrency_safe` and may join a parallel
+        // read-only batch.
+        Box::pin(async move { read_output::execute(env.output_store, args) })
     }
     fn is_concurrency_safe(&self) -> bool {
         true

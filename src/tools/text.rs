@@ -8,8 +8,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rand::Rng;
+use serde_json::json;
 
 /// Default output cap: keep at most the first/last 2000 lines.
 pub(super) const DEFAULT_MAX_LINES: usize = 2000;
@@ -22,6 +23,148 @@ pub(super) const DEFAULT_MAX_BYTES: usize = 50 * 1024; // 50KB
 pub(super) const READ_TOOL_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// Largest content that `write`/`edit` will write to disk.
 pub(super) const WRITE_TOOL_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// Line-numbered, offset/limit-windowed rendering shared by `read` (over file
+/// bytes) and `read_output` (over a stored handle's bytes), so both page a large
+/// body through the identical 2000-line / 50KB caps and truncation notices
+/// instead of maintaining two subtly divergent copies. `content` is the full
+/// text; `offset` is 1-indexed; validation and out-of-range errors match `read`.
+pub(super) struct LineWindow {
+    /// Rendered, line-numbered window plus any truncation notice.
+    pub(super) content: String,
+    /// Total byte length of the full source text.
+    pub(super) total_bytes: usize,
+    /// Number of lines actually rendered in this window.
+    pub(super) lines_shown: usize,
+    /// Total line count of the full source text.
+    pub(super) total_lines: usize,
+    /// Whether the window omitted lines (line/byte cap or more content follows).
+    pub(super) truncated: bool,
+}
+
+impl LineWindow {
+    /// Attach this window's counts onto a [`ToolOutput`] under the same metadata
+    /// keys `read` reports, so both tools expose an identical result contract.
+    pub(super) fn into_output(self) -> crate::nexus::ToolOutput {
+        crate::nexus::ToolOutput::text(self.content)
+            .with("bytes", json!(self.total_bytes))
+            .with("lines", json!(self.lines_shown))
+            .with("total_lines", json!(self.total_lines))
+            .with("truncated", json!(self.truncated))
+    }
+}
+
+/// Validate the shared window arguments. Exposed separately so a caller that
+/// does file I/O (e.g. `read`) can reject bad `offset`/`limit` *before* touching
+/// the filesystem -- preserving the original pre-I/O validation order -- while
+/// [`render_line_window`] still enforces the same checks for every caller from a
+/// single source of truth.
+pub(super) fn validate_offset_limit(offset: Option<i64>, limit: Option<i64>) -> Result<()> {
+    if matches!(limit, Some(limit) if limit <= 0) {
+        bail!("`limit` must be greater than 0");
+    }
+    if matches!(offset, Some(offset) if offset < 0) {
+        bail!("`offset` must be non-negative");
+    }
+    Ok(())
+}
+
+/// Render `content` as line-numbered output windowed by 1-indexed `offset` and
+/// `limit`, capped at [`DEFAULT_MAX_LINES`] lines / [`DEFAULT_MAX_BYTES`] bytes.
+pub(super) fn render_line_window(
+    content: &str,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> Result<LineWindow> {
+    validate_offset_limit(offset, limit)?;
+
+    let total_bytes = content.len();
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    // A trailing newline produces a final empty element that is not a real line.
+    if content.ends_with('\n') {
+        lines.pop();
+    }
+    let total_lines = lines.len();
+    if total_lines == 0 {
+        return Ok(LineWindow {
+            content: String::new(),
+            total_bytes,
+            lines_shown: 0,
+            total_lines: 0,
+            truncated: false,
+        });
+    }
+
+    let offset = offset.unwrap_or(1).max(1) as usize;
+    let start = offset - 1;
+    if start >= total_lines {
+        bail!("offset {offset} is beyond end of file ({total_lines} lines total)");
+    }
+    let limit = limit.map_or(DEFAULT_MAX_LINES, |l| l as usize).max(1);
+    let mut end = (start + limit).min(total_lines);
+
+    let width = end.to_string().len().max(1);
+    let mut rendered: Vec<String> = Vec::new();
+    let mut byte_count = 0usize;
+    let mut byte_capped = false;
+    let mut line_capped = false;
+    for (offset_in_window, idx) in (start..end).enumerate() {
+        let line = lines[idx].strip_suffix('\r').unwrap_or(lines[idx]);
+        let formatted = format!("{:>width$}\u{2192}{line}", idx + 1);
+        let (formatted, capped_line) = clamp_line_to_byte_cap(&formatted);
+        byte_count += formatted.len() + 1;
+        if byte_count > DEFAULT_MAX_BYTES && offset_in_window > 0 {
+            end = idx;
+            byte_capped = true;
+            break;
+        }
+        rendered.push(formatted);
+        if capped_line {
+            end = idx + 1;
+            line_capped = true;
+            break;
+        }
+    }
+
+    let lines_shown = end - start;
+    let truncated = line_capped || end < total_lines;
+    let mut out = rendered.join("\n");
+    if line_capped {
+        out.push_str("\n\n[Line truncated at 50KB limit.]");
+    } else if end < total_lines {
+        let next_offset = end + 1;
+        if byte_capped {
+            out.push_str(&format!(
+                "\n\n[Showing lines {}-{end} of {total_lines} (50KB limit). Use offset={next_offset} to continue.]",
+                start + 1
+            ));
+        } else {
+            let remaining = total_lines - end;
+            let plural = if remaining == 1 { "" } else { "s" };
+            out.push_str(&format!(
+                "\n\n[{remaining} more line{plural} in file. Use offset={next_offset} to continue.]"
+            ));
+        }
+    }
+    Ok(LineWindow {
+        content: out,
+        total_bytes,
+        lines_shown,
+        total_lines,
+        truncated,
+    })
+}
+
+fn clamp_line_to_byte_cap(line: &str) -> (String, bool) {
+    if line.len() <= DEFAULT_MAX_BYTES {
+        return (line.to_string(), false);
+    }
+    let mut cut = DEFAULT_MAX_BYTES.saturating_sub(3);
+    while cut > 0 && !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (format!("{}...", &line[..cut]), true)
+}
 
 pub(super) fn strip_bom(s: &str) -> (&str, bool) {
     s.strip_prefix('\u{FEFF}')

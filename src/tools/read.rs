@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::ObservedFiles;
 use super::path::resolve_existing;
-use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, READ_TOOL_MAX_BYTES};
+use super::text::{READ_TOOL_MAX_BYTES, render_line_window, validate_offset_limit};
 
 pub(super) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
 
@@ -45,12 +45,9 @@ struct ReadInput {
 }
 
 fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<super::ToolOutput> {
-    if matches!(input.limit, Some(limit) if limit <= 0) {
-        bail!("`limit` must be greater than 0");
-    }
-    if matches!(input.offset, Some(offset) if offset < 0) {
-        bail!("`offset` must be non-negative");
-    }
+    // Reject bad window args before any filesystem work, matching `read`'s
+    // original pre-I/O validation order (the shared windower re-checks anyway).
+    validate_offset_limit(input.offset, input.limit)?;
 
     let resolved = resolve_existing(root, &input.path)?;
     let metadata =
@@ -83,88 +80,9 @@ fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<
     // the full file even when offset/limit windows the output.
     observed.observe(&resolved, &bytes);
 
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    // A trailing newline produces a final empty element that is not a real line.
-    if content.ends_with('\n') {
-        lines.pop();
-    }
-    let total_lines = lines.len();
-    let file_bytes = bytes.len();
-    if total_lines == 0 {
-        return Ok(super::ToolOutput::text(String::new())
-            .with("bytes", json!(file_bytes))
-            .with("lines", json!(0))
-            .with("total_lines", json!(0))
-            .with("truncated", json!(false)));
-    }
-
-    let offset = input.offset.unwrap_or(1).max(1) as usize;
-    let start = offset - 1;
-    if start >= total_lines {
-        bail!("offset {offset} is beyond end of file ({total_lines} lines total)");
-    }
-    let limit = input.limit.map_or(DEFAULT_MAX_LINES, |l| l as usize).max(1);
-    let mut end = (start + limit).min(total_lines);
-
-    let width = end.to_string().len().max(1);
-    let mut rendered: Vec<String> = Vec::new();
-    let mut byte_count = 0usize;
-    let mut byte_capped = false;
-    let mut line_capped = false;
-    for (offset_in_window, idx) in (start..end).enumerate() {
-        let line = lines[idx].strip_suffix('\r').unwrap_or(lines[idx]);
-        let formatted = format!("{:>width$}\u{2192}{line}", idx + 1);
-        let (formatted, capped_line) = clamp_line_to_byte_cap(&formatted);
-        byte_count += formatted.len() + 1;
-        if byte_count > DEFAULT_MAX_BYTES && offset_in_window > 0 {
-            end = idx;
-            byte_capped = true;
-            break;
-        }
-        rendered.push(formatted);
-        if capped_line {
-            end = idx + 1;
-            line_capped = true;
-            break;
-        }
-    }
-
-    let lines_shown = end - start;
-    let truncated = line_capped || end < total_lines;
-    let mut out = rendered.join("\n");
-    if line_capped {
-        out.push_str("\n\n[Line truncated at 50KB limit.]");
-    } else if end < total_lines {
-        let next_offset = end + 1;
-        if byte_capped {
-            out.push_str(&format!(
-                "\n\n[Showing lines {}-{end} of {total_lines} (50KB limit). Use offset={next_offset} to continue.]",
-                start + 1
-            ));
-        } else {
-            let remaining = total_lines - end;
-            let plural = if remaining == 1 { "" } else { "s" };
-            out.push_str(&format!(
-                "\n\n[{remaining} more line{plural} in file. Use offset={next_offset} to continue.]"
-            ));
-        }
-    }
-    Ok(super::ToolOutput::text(out)
-        .with("bytes", json!(file_bytes))
-        .with("lines", json!(lines_shown))
-        .with("total_lines", json!(total_lines))
-        .with("truncated", json!(truncated)))
-}
-
-fn clamp_line_to_byte_cap(line: &str) -> (String, bool) {
-    if line.len() <= DEFAULT_MAX_BYTES {
-        return (line.to_string(), false);
-    }
-    let mut cut = DEFAULT_MAX_BYTES.saturating_sub(3);
-    while cut > 0 && !line.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    (format!("{}...", &line[..cut]), true)
+    // `bytes.len()` equals `content.len()` here (valid UTF-8), so the shared
+    // windower's `total_bytes` matches the file's byte length.
+    Ok(render_line_window(content, input.offset, input.limit)?.into_output())
 }
 
 /// Convenience entry used by integration tests: read with default options.
@@ -187,6 +105,7 @@ pub(crate) fn read_file(workspace: &Path, path: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::tools::test_support::{root_of, temp_dir};
+    use crate::tools::text::DEFAULT_MAX_BYTES;
 
     #[test]
     fn read_returns_line_numbered_content() {
@@ -261,6 +180,26 @@ mod tests {
             &out[out.len().saturating_sub(128)..]
         );
         assert!(out.contains("50KB limit"), "{out}");
+    }
+
+    #[test]
+    fn read_validates_window_args_before_touching_the_file() {
+        // `limit`/`offset` are rejected before path resolution / file I/O, so a
+        // bad arg surfaces the arg error even when the path does not exist.
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let err = read(
+            &root,
+            &ReadInput {
+                path: "missing.txt".into(),
+                offset: None,
+                limit: Some(0),
+            },
+            &mut ObservedFiles::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`limit` must be greater than 0"), "{err}");
     }
 
     #[test]

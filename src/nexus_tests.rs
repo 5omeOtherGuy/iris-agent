@@ -3036,6 +3036,126 @@ fn offloaded_preview_is_safe_on_multibyte_boundaries() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Handle dereference (issue #205): the model reads an offloaded output back into
+// context via the `read_output` tool, paging through the same line-window as
+// `read`, and a dereference result that itself exceeds the inline threshold is
+// re-offloaded behind a fresh handle (no re-inlining loop).
+// ---------------------------------------------------------------------------
+
+/// A body of uniquely numbered lines, comfortably over the inline threshold, so
+/// it is offloaded and `read_output` must page it. Each line is distinct so
+/// paging assertions can pin exact line ranges.
+fn numbered_oversized_body() -> String {
+    let mut body = String::new();
+    for i in 1..=6000 {
+        body.push_str(&format!("L{i:05}-marker\n"));
+    }
+    assert!(
+        body.len() > MAX_INLINE_TOOL_OUTPUT_BYTES,
+        "body must exceed the inline threshold"
+    );
+    body
+}
+
+#[test]
+fn read_output_pages_an_offloaded_handle_and_reoffloads_a_large_dereference() -> Result<()> {
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let body = numbered_oversized_body();
+
+    // The handle id is content-addressed (SHA-256 of the body), independent of
+    // the session path, so we can compute it up front and script the model's
+    // `read_output` calls against the id the harness will mint for `big`.
+    let precompute = test_workspace()?;
+    let precompute_store = crate::handles::HandleStore::with_dir(precompute.path.join("outputs"));
+    let expected_id = precompute_store.put(&body)?;
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("big", json!({}))),
+        Ok(single_call_turn(
+            "read_output",
+            json!({ "handle_id": expected_id, "limit": 3 }),
+        )),
+        Ok(single_call_turn(
+            "read_output",
+            json!({ "handle_id": expected_id, "offset": 4, "limit": 3 }),
+        )),
+        Ok(single_call_turn(
+            "read_output",
+            json!({ "handle_id": expected_id, "limit": 6000 }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(
+        provider,
+        Tools::new(vec![
+            Box::new(BigTool { body: body.clone() }),
+            crate::tools::read_output_tool(),
+        ]),
+    );
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+
+    // Request 2 carries the offloaded `big` result: the handle the model then
+    // dereferences is exactly the content-addressed id we precomputed.
+    let big_result = &seen[1].last().unwrap().content;
+    assert_eq!(output_handle_id(big_result), expected_id);
+
+    // Request 3 carries read_output#1 (limit 3): the first three lines, paged
+    // with a `read`-style continuation notice, and small enough to stay inline.
+    let page1 = &seen[2].last().unwrap().content;
+    assert!(page1.contains("L00001-marker"), "page1={page1}");
+    assert!(page1.contains("L00003-marker"));
+    assert!(!page1.contains("L00004-marker"), "limit must window");
+    assert!(page1.contains("Use offset=4 to continue"));
+    assert!(
+        !page1.contains("outputHandle"),
+        "a small paged result stays inline, not re-offloaded"
+    );
+
+    // Request 4 carries read_output#2 (offset 4, limit 3): the continuation picks
+    // up exactly where page 1 stopped.
+    let page2 = &seen[3].last().unwrap().content;
+    assert!(page2.contains("L00004-marker"), "page2={page2}");
+    assert!(page2.contains("L00006-marker"));
+    assert!(!page2.contains("L00001-marker"));
+    assert!(!page2.contains("L00007-marker"));
+
+    // Request 5 carries read_output#3 (limit 6000): the window byte-caps at ~50KB,
+    // so the dereference result itself exceeds the inline threshold and is
+    // offloaded again behind a fresh handle -- no re-inlining loop.
+    let page3 = &seen[4].last().unwrap().content;
+    assert!(
+        page3.contains("outputHandle"),
+        "a >50KB dereference result must be re-offloaded"
+    );
+    let reoffload_id = output_handle_id(page3);
+    assert_ne!(
+        reoffload_id, expected_id,
+        "re-offload mints a new content-addressed handle"
+    );
+    let store = crate::handles::HandleStore::for_session(&log_path);
+    assert!(
+        store.get(&reoffload_id)?.is_some(),
+        "the re-offloaded page is itself retrievable by handle"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn structured_result_contract_serializes_stable_success_error_denied_and_cancelled_shapes() {
     let mut metadata = serde_json::Map::new();
@@ -3128,6 +3248,9 @@ fn offload_falls_back_to_inline_when_the_store_errors() {
     impl ToolOutputStore for FailingStore {
         fn put(&self, _content: &str) -> Result<String> {
             Err(anyhow!("disk full"))
+        }
+        fn get(&self, _id: &str) -> Result<Option<String>> {
+            Ok(None)
         }
     }
 
@@ -4526,7 +4649,16 @@ impl ChatProvider for SurfaceProbe {
     }
 }
 
-const FULL_SURFACE: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const FULL_SURFACE: [&str; 8] = [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "read_output",
+];
 
 #[test]
 fn surface_plan_defaults_to_full_built_in_surface() {
@@ -4544,7 +4676,10 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
     tools.plan_surface(&ProviderCapabilities { native_edit: true });
 
     let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-    assert_eq!(visible, ["read", "bash", "write", "grep", "find", "ls"]);
+    assert_eq!(
+        visible,
+        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
+    );
     assert!(
         !visible.contains(&"edit"),
         "edit must be hidden from the model"
@@ -4620,7 +4755,7 @@ fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
     let advertised = harness.agent.provider.advertised.borrow();
     assert_eq!(
         advertised[0],
-        ["read", "bash", "write", "grep", "find", "ls"]
+        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
     );
     assert!(!advertised[0].iter().any(|name| name == "edit"));
     Ok(())
