@@ -385,7 +385,7 @@ impl Drop for TuiUi {
 mod tests {
     use super::panel::{inset_rule_line, panel_body_line, panel_header_line, panel_rule_line};
     use super::*;
-    use crate::nexus::{ApprovalDecision, ToolCall};
+    use crate::nexus::{ApprovalDecision, ReviewContext, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::terminal_surface::{RenderKind, TerminalSurface};
     use ratatui::style::Color;
@@ -1333,16 +1333,51 @@ mod tests {
             &call_args("bash", json!({ "command": "echo hi" })),
             false,
             false,
+            &ReviewContext::default(),
         );
-        let rendered = rendered_text(&mut screen, 80, 12);
+        let rendered = rendered_text(&mut screen, 80, 14);
         assert!(rendered.contains("REVIEW"), "{rendered}");
+        assert!(rendered.contains("bash"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
-        assert!(rendered.contains("[y] once"), "{rendered}");
-        assert!(rendered.contains("[N] deny"), "{rendered}");
+        // The explanatory reason line and the new `┊`-separated decision hints.
+        assert!(
+            rendered.contains("Runs a shell command in the workspace."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("y approve"), "{rendered}");
+        assert!(rendered.contains("n deny"), "{rendered}");
     }
 
     #[test]
-    fn approval_prompt_renders_inside_editor_panel_and_wraps() {
+    fn approval_panel_renders_above_composer_and_keeps_editor_visible() {
+        // The approval docks in the overlay region ABOVE the composer; the
+        // composer body (placeholder) stays visible below it, and the approval
+        // is not painted into the editor text rows.
+        let mut screen = Screen::new();
+        screen.show_approval(
+            &call_args("bash", json!({ "command": "echo hi" })),
+            false,
+            false,
+            &ReviewContext::default(),
+        );
+        let lines = rendered_lines(&mut screen, 80, 16);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let review_row = texts
+            .iter()
+            .position(|t| t.contains("\u{25b2} REVIEW"))
+            .expect("REVIEW header row present");
+        let placeholder_row = texts
+            .iter()
+            .position(|t| t.contains("Give Iris a task..."))
+            .expect("composer placeholder still visible");
+        assert!(
+            review_row < placeholder_row,
+            "approval must render above the composer: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn approval_prompt_renders_above_composer_and_wraps() {
         let mut screen = Screen::new();
         screen.show_approval(
             &call_args(
@@ -1354,8 +1389,9 @@ mod tests {
             ),
             false,
             false,
+            &ReviewContext::default(),
         );
-        let lines = rendered_lines(&mut screen, 48, 12);
+        let lines = rendered_lines(&mut screen, 48, 16);
         assert!(
             lines
                 .iter()
@@ -1365,7 +1401,7 @@ mod tests {
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("$ printf 'global:"));
         assert!(rendered.contains("120s)"), "{rendered}");
-        assert!(rendered.contains("[N] deny"), "{rendered}");
+        assert!(rendered.contains("n deny"), "{rendered}");
         assert!(!rendered.contains("\u{21b5} to send"), "{rendered}");
         assert!(
             !rendered.contains("Ask the agent anything..."),

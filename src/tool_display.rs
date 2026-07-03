@@ -15,6 +15,74 @@ use serde_json::Value;
 
 use crate::nexus::ToolCall;
 
+/// The danger-toned clause appended to an approval reason when the call tripped
+/// the destructive floor (ADR-0010). Rendered red in the TUI; the sentence
+/// itself carries the meaning so the warning survives the monochrome test.
+pub(crate) const APPROVAL_DESTRUCTIVE_NOTE: &str =
+    "Flagged destructive: may delete or overwrite data.";
+
+/// The base explanatory sentence for an approval prompt, derived deterministically
+/// from the call — the muted lead of the reason line. Presentation-only Tier-3
+/// copy (never sent to the model): `bash` runs a shell command, `edit`/`write`
+/// name the file (falling back to a generic clause when the path is unparseable),
+/// and any other tool reports its name.
+pub(crate) fn approval_reason_lead(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "bash" => "Runs a shell command in the workspace.".to_string(),
+        "edit" => match approval_reason_path(call) {
+            Some(path) => format!("Modifies {path}."),
+            None => "Modifies files in the workspace.".to_string(),
+        },
+        "write" => match approval_reason_path(call) {
+            Some(path) => format!("Creates or overwrites {path}."),
+            None => "Modifies files in the workspace.".to_string(),
+        },
+        other => format!("Runs the {other} tool."),
+    }
+}
+
+/// The display path an `edit`/`write` approval reason names, or `None` when the
+/// call carries no usable path (so the caller uses the generic fallback). Mirrors
+/// [`file_summary`]'s key precedence (`file_path` then `path`).
+fn approval_reason_path(call: &ToolCall) -> Option<String> {
+    call.arguments
+        .get("file_path")
+        .or_else(|| call.arguments.get("path"))
+        .and_then(Value::as_str)
+        .map(display_path)
+}
+
+/// The muted dirty-tree clause for an approval reason, or `None` when the gate
+/// did not fire. Lists the workspace-relative paths, truncating the tail with an
+/// `…` once the joined list would exceed `max` display columns so a long list
+/// never blows past the surface width. Presentation-only.
+pub(crate) fn approval_dirty_note(dirty_paths: &[String], max: usize) -> Option<String> {
+    if dirty_paths.is_empty() {
+        return None;
+    }
+    let prefix = "Touches uncommitted user changes: ";
+    let budget = max.saturating_sub(prefix.chars().count() + 1);
+    let mut list = String::new();
+    let mut shown = 0usize;
+    for path in dirty_paths {
+        let candidate = if list.is_empty() {
+            path.clone()
+        } else {
+            format!("{list}, {path}")
+        };
+        // Keep room for the trailing "…" if more paths remain unshown.
+        if shown > 0 && candidate.chars().count() > budget {
+            break;
+        }
+        list = candidate;
+        shown += 1;
+    }
+    if shown < dirty_paths.len() {
+        list.push_str(", \u{2026}");
+    }
+    Some(format!("{prefix}{list}."))
+}
+
 // Display caps for folded tool output bodies; presentation-only, never affect
 // the model (the full output still flows to the provider independently).
 const MAX_DISPLAY_LINES: usize = 12;

@@ -109,6 +109,9 @@ struct RecordingFrontend {
     events: RefCell<Vec<AgentEvent>>,
     decision: Cell<ApprovalDecision>,
     events_at_review: RefCell<Option<Vec<AgentEvent>>>,
+    /// The structured review facts the last `review` call received, so a test
+    /// can assert Nexus threads `destructive`/`dirty_paths` to the gate.
+    last_ctx: RefCell<Option<ReviewContext>>,
 }
 
 impl RecordingFrontend {
@@ -117,6 +120,7 @@ impl RecordingFrontend {
             events: RefCell::new(Vec::new()),
             decision: Cell::new(decision),
             events_at_review: RefCell::new(None),
+            last_ctx: RefCell::new(None),
         }
     }
 }
@@ -134,11 +138,13 @@ impl ApprovalGate for RecordingFrontend {
         _call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         let mut snapshot = self.events_at_review.borrow_mut();
         if snapshot.is_none() {
             *snapshot = Some(self.events.borrow().clone());
         }
+        *self.last_ctx.borrow_mut() = Some(ctx);
         let decision = self.decision.get();
         Box::pin(async move { Ok(decision) })
     }
@@ -1403,6 +1409,7 @@ fn observer_error_on_tool_result_still_records_paired_transcript() -> Result<()>
             _call: &'a ToolCall,
             _allow_always: bool,
             _allow_project: bool,
+            _ctx: ReviewContext,
         ) -> ApprovalFuture<'a> {
             Box::pin(async move { Ok(ApprovalDecision::Allow) })
         }
@@ -2244,6 +2251,18 @@ fn invariant_2_destructive_bash_reprompts_despite_project_grants() -> Result<()>
     assert!(
         frontend.events_at_review.borrow().is_some(),
         "a destructive command must re-prompt even when granted"
+    );
+    // The gate receives the structured facts, not UI copy: the destructive
+    // floor is threaded through `ReviewContext` (issue #262/ADR-0010).
+    let ctx = frontend
+        .last_ctx
+        .borrow()
+        .clone()
+        .expect("the gate received a review context");
+    assert!(ctx.destructive, "destructive fact is threaded to the gate");
+    assert!(
+        ctx.dirty_paths.is_empty(),
+        "no dirty-tree gate fired for this call"
     );
     let events = frontend.events.borrow();
     assert!(
@@ -3458,6 +3477,7 @@ impl ApprovalGate for BlockingApprovalGate {
         _call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        _ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             futures::future::pending::<()>().await;
@@ -5658,6 +5678,7 @@ impl ApprovalGate for DenyToolGate {
         call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        _ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         let decision = if call.name == self.deny {
             ApprovalDecision::Deny
