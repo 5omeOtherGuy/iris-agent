@@ -29,6 +29,7 @@
 | [0026](0026-make-system-prompt-fragments-fully-internal.md) | Make system-prompt fragments fully internal | proposed | 2026-07-02 |
 | [0027](0027-repurpose-trust-store-as-per-cwd-project-permission-policy.md) | Repurpose the trust store as a per-cwd project permission policy | proposed | 2026-07-02 |
 | [0028](0028-git-workflow-dirty-tree-safety-and-task-checkpointing.md) | Git workflow — dirty-tree safety, task checkpointing, and rollback semantics | accepted | 2026-07-03 |
+| [0029](0029-git-worktree-isolation-and-apply-as-settlement.md) | Git worktree isolation — Tier 0 of the ADR-0028 guarantee model, apply = settlement | proposed | 2026-07-03 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.
