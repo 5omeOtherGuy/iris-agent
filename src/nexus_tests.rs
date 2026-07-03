@@ -5803,3 +5803,205 @@ fn verification_stops_when_model_makes_no_further_changes() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Epic #261 acceptance (Milestone 5, git-centered workflow): the whole
+// dirty-tree safety + net-diff + rollback contract proven end to end over a
+// real Harness driven by the fake provider. One task edits a clean tracked file
+// and creates a new file while a user's dirty tracked file and untracked file
+// sit untouched. Asserts, in one flow: (a) user files byte-identical through the
+// task; (b) the net diff is scoped to exactly Iris's authored paths; (c)
+// rollback restores Iris's paths byte-identically while user files stay intact;
+// (d) settlement leaves the refs/iris/* namespace empty.
+// ---------------------------------------------------------------------------
+
+/// Init a scratch git repo with two committed tracked files, so the acceptance
+/// test has real committed history (2+ files) plus room for a dirty and a clean
+/// tracked file.
+fn acceptance_git_workspace() -> Result<TestWorkspace> {
+    let workspace = test_workspace()?;
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    // Neutralize any global ignore patterns for the harness's own git calls
+    // (which do not scrub the env like this helper): the untracked user file
+    // must actually be untracked-and-visible, not globally ignored.
+    git(&["config", "core.excludesFile", "/dev/null"]);
+    fs::write(workspace.path.join("alpha.txt"), "alpha base\n")?;
+    fs::write(workspace.path.join("beta.txt"), "beta base\n")?;
+    git(&["add", "alpha.txt", "beta.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    Ok(workspace)
+}
+
+/// Read `refs/iris/` in `root` and return its `git for-each-ref` output.
+fn iris_refs(root: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["for-each-ref", "refs/iris/"])
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("spawn git");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn epic_261_acceptance_end_to_end() -> Result<()> {
+    let workspace = acceptance_git_workspace()?;
+    let root = &workspace.path;
+
+    // The user's uncommitted work before the task: a DIRTY tracked file (an
+    // uncommitted modification of committed history) and an UNTRACKED file. Iris
+    // must never touch either.
+    let dirty = root.join("alpha.txt");
+    let untracked = root.join("user_notes.txt");
+    let dirty_pre = b"alpha base\nuser uncommitted edit\n".to_vec();
+    let untracked_pre = b"user scratch notes\n".to_vec();
+    fs::write(&dirty, &dirty_pre)?;
+    fs::write(&untracked, &untracked_pre)?;
+
+    // Iris's own targets: a CLEAN committed file it edits, and a new file it
+    // creates. `clean_pre` is the committed (clean) content rollback must
+    // restore.
+    let clean = root.join("beta.txt");
+    let created = root.join("gamma.txt");
+    let clean_pre = b"beta base\n".to_vec();
+
+    // The scripted task: read the clean tracked file (satisfies read-before-write),
+    // edit it, then create a new file; a final text turn ends the model turn.
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("read", json!({ "path": "beta.txt" }))),
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "beta.txt", "content": "beta base\niris edit\n" }),
+        )),
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "gamma.txt", "content": "iris created this\n" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, root, crate::tools::built_in_tools());
+    // Allow whatever the gate asks on Iris's own targets. The user's dirty file
+    // is never an Iris target, so it is never prompted for or approved.
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        "edit beta and add gamma",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    // Iris's edits landed as scripted.
+    assert_eq!(fs::read(&clean)?, b"beta base\niris edit\n");
+    assert_eq!(fs::read(&created)?, b"iris created this\n");
+
+    // (a) The user's dirty and untracked files are byte-identical to pre-task.
+    assert_eq!(
+        fs::read(&dirty)?,
+        dirty_pre,
+        "the dirty user file is untouched during the task"
+    );
+    assert_eq!(
+        fs::read(&untracked)?,
+        untracked_pre,
+        "the untracked user file is untouched during the task"
+    );
+
+    // (b) The task net diff covers exactly Iris's authored paths -- the user's
+    // dirty and untracked paths are absent, and their bytes never leak.
+    let diff = harness.task_diff()?;
+    let mut paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["beta.txt", "gamma.txt"],
+        "the net diff is scoped to Iris's authored paths only: {paths:?}"
+    );
+    let unified = diff.unified();
+    assert!(
+        !unified.contains("user uncommitted edit"),
+        "the user's dirty edit never leaks into the diff"
+    );
+    assert!(
+        !unified.contains("user scratch notes"),
+        "the untracked user file never leaks into the diff"
+    );
+    let gamma = diff
+        .files
+        .iter()
+        .find(|f| f.path == "gamma.txt")
+        .expect("gamma.txt in the diff");
+    assert!(
+        gamma.unified.contains("--- /dev/null"),
+        "gamma.txt renders as a create"
+    );
+    let beta = diff
+        .files
+        .iter()
+        .find(|f| f.path == "beta.txt")
+        .expect("beta.txt in the diff");
+    assert!(
+        beta.unified.contains("+iris edit"),
+        "beta.txt renders the edit"
+    );
+
+    // The git-backed checkpoint chain must actually have been exercised (not
+    // the non-git fallback): refs exist under refs/iris/ before settlement.
+    assert!(
+        iris_refs(root).contains("refs/iris/checkpoints/"),
+        "checkpoint chain refs exist pre-settlement: {:?}",
+        iris_refs(root)
+    );
+
+    // (c) Rollback restores Iris's paths to their pre-task state byte-identically
+    // -- the created file is gone, the edited file is back to its committed
+    // content -- while the user's dirty/untracked work stays byte-identical.
+    let outcome = harness.rollback_checkpoint(0)?;
+    assert!(
+        outcome.summary.contains("rolled back"),
+        "rollback summary: {}",
+        outcome.summary
+    );
+    assert!(
+        !created.exists(),
+        "the Iris-created file is removed on rollback"
+    );
+    assert_eq!(
+        fs::read(&clean)?,
+        clean_pre,
+        "the Iris-edited file is restored to its pre-task content"
+    );
+    assert_eq!(
+        fs::read(&dirty)?,
+        dirty_pre,
+        "the dirty user file remains byte-identical after rollback"
+    );
+    assert_eq!(
+        fs::read(&untracked)?,
+        untracked_pre,
+        "the untracked user file remains byte-identical after rollback"
+    );
+
+    // (d) Settlement (the rollback) leaves the refs/iris/* namespace empty: the
+    // checkpoint chain is torn down, no refs accumulate.
+    assert!(
+        iris_refs(root).is_empty(),
+        "refs/iris/ is empty after settlement: {:?}",
+        iris_refs(root)
+    );
+
+    Ok(())
+}
