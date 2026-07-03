@@ -323,10 +323,12 @@ impl TuiUi {
             }
         };
         crate::telemetry::set_tui_active(true);
+        let mut screen = Screen::new();
+        screen.pager_active = pager.is_some();
         Ok(Self {
             surface: TerminalSurface::new(stdout),
             pager,
-            screen: Screen::new(),
+            screen,
             active: true,
             keyboard_enhanced,
         })
@@ -431,7 +433,9 @@ impl TuiUi {
     /// the next draw starts the swapped session with an empty transcript. The
     /// caller re-applies the banner and refreshes the footer afterward.
     pub(crate) fn reset_screen(&mut self) {
+        let pager_active = self.screen.pager_active;
         self.screen = Screen::new();
+        self.screen.pager_active = pager_active;
     }
 }
 

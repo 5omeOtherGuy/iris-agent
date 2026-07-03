@@ -36,7 +36,115 @@ use ratatui::crossterm::{execute, queue};
 use ratatui::layout::Size;
 use ratatui::text::Line;
 
-use super::screen::{Screen, render_document_with_hints, session_bar_lines};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Span;
+
+use super::screen::{Screen, filler_lines, render_editor_chrome, session_bar_lines};
+
+/// Iris-owned scrollback state for pager mode (ADR-0029).
+///
+/// `top_offset` is the visible-line index of the viewport top within the
+/// transcript (offset-from-top): appends below the viewport never move an
+/// anchored view, which is also what keeps a fold of the latest (bottom)
+/// panel from shifting an anchored reader (grok's `anchor_on_fold`).
+/// `follow` pins the view to the live tail; any upward scroll disengages it
+/// and scrolling back past the bottom re-engages it (grok's
+/// `follow_by_overscroll`).
+#[derive(Debug)]
+pub(crate) struct ScrollState {
+    top_offset: usize,
+    follow: bool,
+    /// Layout metrics from the last composed frame, so key handling clamps
+    /// against the real wrapped layout without recomputing it.
+    view_rows: usize,
+    max_top: usize,
+    total: usize,
+}
+
+impl Default for ScrollState {
+    fn default() -> Self {
+        Self {
+            top_offset: 0,
+            follow: true,
+            view_rows: 0,
+            max_top: 0,
+            total: 0,
+        }
+    }
+}
+
+impl ScrollState {
+    pub(crate) fn is_following(&self) -> bool {
+        self.follow
+    }
+
+    /// Record the frame layout and clamp the offset. Called once per compose;
+    /// a shrunken transcript (session swap) or grown viewport re-engages
+    /// follow when nothing is left to scroll.
+    pub(in crate::ui) fn sync(&mut self, total: usize, view_rows: usize) {
+        self.total = total;
+        self.view_rows = view_rows;
+        self.max_top = total.saturating_sub(view_rows);
+        self.top_offset = self.top_offset.min(self.max_top);
+        if self.max_top == 0 {
+            self.follow = true;
+        }
+    }
+
+    /// The viewport-top line index for the current frame.
+    fn top(&self) -> usize {
+        if self.follow {
+            self.max_top
+        } else {
+            self.top_offset.min(self.max_top)
+        }
+    }
+
+    /// Visible lines below the viewport (0 while following).
+    fn lines_below(&self) -> usize {
+        self.total
+            .saturating_sub(self.top() + self.view_rows.min(self.total))
+    }
+
+    /// Scroll up `n` lines; disengages follow.
+    pub(crate) fn scroll_up(&mut self, n: usize) {
+        self.top_offset = self.top().saturating_sub(n);
+        self.follow = false;
+    }
+
+    /// Scroll down `n` lines; reaching (or overshooting) the bottom re-engages
+    /// follow (`follow_by_overscroll`).
+    pub(crate) fn scroll_down(&mut self, n: usize) {
+        if self.follow {
+            return;
+        }
+        self.top_offset = self.top_offset.saturating_add(n);
+        if self.top_offset >= self.max_top {
+            self.top_offset = self.max_top;
+            self.follow = true;
+        }
+    }
+
+    pub(crate) fn page_up(&mut self) {
+        self.scroll_up(self.view_rows.max(1));
+    }
+
+    pub(crate) fn page_down(&mut self) {
+        self.scroll_down(self.view_rows.max(1));
+    }
+
+    /// Jump to the transcript start (disengages follow while there is history
+    /// below).
+    pub(crate) fn jump_to_start(&mut self) {
+        self.top_offset = 0;
+        self.follow = self.max_top == 0;
+    }
+
+    /// Jump to the live tail and re-engage follow.
+    pub(crate) fn follow_latest(&mut self) {
+        self.follow = true;
+    }
+}
 
 /// Owns the alternate-screen lifecycle for pager mode. The writer is a second
 /// handle to the same terminal the `TerminalSurface` writes through; this type
@@ -194,27 +302,62 @@ pub(super) struct ComposedFrame {
     pub(super) cursor: Option<(u16, u16)>,
 }
 
-/// Compose the pager frame for `size` from the same logical document the
-/// inline surface renders: session bar pinned at the top, bottom-anchored
-/// transcript tail (follow view), working indicator + composer pinned at the
-/// bottom. Slicing the shared document -- rather than re-composing regions --
-/// guarantees both modes render identical logical state (ADR-0029).
+/// Compose the pager frame for `size` from the same components the inline
+/// document renderer assembles, in the same order: session bar pinned at the
+/// top, the transcript window at the Iris-owned scroll offset, filler (or the
+/// start page) while the transcript is short, then the working indicator and
+/// composer chrome pinned at the bottom. The transcript is rendered
+/// visible-range-only through the wrap cache, so frame cost is O(viewport),
+/// independent of transcript length (ADR-0029).
 pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
-    let document = render_document_with_hints(screen, size);
-    let height = usize::from(size.height);
-    let mut frame = if document.lines.len() <= height {
-        // The document pads itself to exactly the viewport height until the
-        // transcript overflows, so this is the whole frame.
-        document.lines
-    } else {
-        let bar_rows = session_bar_lines(screen, size.width).len().min(height);
-        let body_rows = height - bar_rows;
-        let start = document.lines.len() - body_rows;
-        let mut frame = Vec::with_capacity(height);
-        frame.extend_from_slice(&document.lines[..bar_rows]);
-        frame.extend_from_slice(&document.lines[start..]);
-        frame
-    };
+    let width = size.width.max(1);
+    let height = usize::from(size.height.max(1));
+
+    let bar = session_bar_lines(screen, width);
+    let bar_rows = bar.len().min(height);
+
+    // Bottom-pinned tail: blank-padded working indicator + composer chrome
+    // (which carries the docked overlays/modals), exactly as inline.
+    let working = screen.working_lines(width);
+    let mut tail: Vec<Line<'static>> = Vec::new();
+    if !working.is_empty() {
+        tail.push(Line::default());
+        tail.extend(working);
+        tail.push(Line::default());
+    }
+    tail.extend(render_editor_chrome(screen, width, size.height.max(1)));
+    // On very short viewports keep the BOTTOM of the tail (statusline edge),
+    // mirroring the inline surface's bottom-anchored behavior.
+    let tail_budget = height - bar_rows;
+    if tail.len() > tail_budget {
+        tail.drain(..tail.len() - tail_budget);
+    }
+
+    let view_rows = tail_budget - tail.len();
+    let total = screen.transcript_visible_total(width);
+    screen.scroll.sync(total, view_rows);
+    let top = screen.scroll.top();
+
+    let mut body = screen.transcript_window(width, top, view_rows);
+    if body.len() < view_rows {
+        // Blank filler (or the centered start page) sits BETWEEN the
+        // transcript and the tail, exactly as in the inline document.
+        body.extend(filler_lines(screen, view_rows - body.len(), width));
+    }
+    // Disengaged follow: overlay a dim indicator on the last transcript row
+    // (symbol + label, per the design language) showing how much is below.
+    if !screen.scroll.is_following() && view_rows > 0 {
+        let below = screen.scroll.lines_below();
+        if below > 0 {
+            body[view_rows - 1] = follow_indicator_line(below, width);
+        }
+    }
+
+    let mut frame = Vec::with_capacity(height);
+    frame.extend(bar.into_iter().take(bar_rows));
+    frame.extend(body);
+    frame.extend(tail);
+
     // The zero-width hardware-cursor marker is located and stripped here (the
     // inline surface does this in its line renderer); its position drives IME
     // candidate-window placement. Bounded scan: at most one viewport of lines.
@@ -227,6 +370,22 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         lines: frame,
         cursor,
     }
+}
+
+/// Dim centered `▾ N lines below` indicator shown while follow is
+/// disengaged, on the row just above the pinned tail.
+fn follow_indicator_line(below: usize, width: u16) -> Line<'static> {
+    let label = if below == 1 {
+        format!("{} 1 line below", crate::ui::symbols::EXPANDED)
+    } else {
+        format!("{} {below} lines below", crate::ui::symbols::EXPANDED)
+    };
+    let width = usize::from(width);
+    let pad = width.saturating_sub(super::wrap::display_width(&label)) / 2;
+    Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+    ])
 }
 
 /// Place composed lines into the frame buffer, top-aligned, truncated to the
@@ -339,6 +498,142 @@ mod tests {
         assert!(
             all.contains("Iris") || all.contains("iris"),
             "start page content present"
+        );
+    }
+
+    #[test]
+    fn follow_state_table_engage_disengage_overscroll() {
+        let mut scroll = ScrollState::default();
+        // 100 lines, 20-row view: max_top 80.
+        scroll.sync(100, 20);
+        assert!(scroll.is_following(), "initial state follows");
+        assert_eq!(scroll.top(), 80);
+
+        // Any upward scroll disengages and anchors.
+        scroll.scroll_up(5);
+        assert!(!scroll.is_following());
+        assert_eq!(scroll.top(), 75);
+        assert_eq!(scroll.lines_below(), 5);
+
+        // Appends below do not move an anchored view (offset-from-top).
+        scroll.sync(150, 20);
+        assert_eq!(scroll.top(), 75);
+        assert!(!scroll.is_following());
+
+        // Scrolling down short of the bottom stays disengaged.
+        scroll.scroll_down(10);
+        assert!(!scroll.is_following());
+        assert_eq!(scroll.top(), 85);
+
+        // Overscrolling past the bottom re-engages follow.
+        scroll.scroll_down(1000);
+        assert!(scroll.is_following());
+        assert_eq!(scroll.top(), 130);
+
+        // Home jumps to the start (disengaged); End re-follows.
+        scroll.jump_to_start();
+        assert!(!scroll.is_following());
+        assert_eq!(scroll.top(), 0);
+        scroll.follow_latest();
+        assert!(scroll.is_following());
+    }
+
+    #[test]
+    fn scroll_clamps_and_re_follows_when_content_fits() {
+        let mut scroll = ScrollState::default();
+        scroll.sync(100, 20);
+        scroll.scroll_up(1_000_000);
+        assert_eq!(scroll.top(), 0, "scroll-up clamps at the start");
+        scroll.page_down();
+        assert_eq!(scroll.top(), 20);
+        // A shrunken transcript (or grown viewport) with nothing to scroll
+        // re-engages follow on the next layout sync.
+        scroll.sync(10, 20);
+        assert!(scroll.is_following());
+        assert_eq!(scroll.top(), 0);
+    }
+
+    #[test]
+    fn scrolled_frame_shows_history_and_follow_indicator() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        for i in 0..200 {
+            screen.apply(UiEvent::Notice(format!("row {i}")));
+        }
+        // Warm the layout (sync populates the scroll metrics), then page up.
+        let _ = compose_frame(&mut screen, Size::new(80, 24));
+        assert!(screen.scroll.is_following());
+        screen.scroll.page_up();
+        screen.scroll.page_up();
+        let frame = compose_frame(&mut screen, Size::new(80, 24)).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        let body = rows[2..].join("\n");
+        assert!(
+            !body.contains("row 199"),
+            "scrolled view no longer shows the tail"
+        );
+        assert!(
+            body.contains("lines below"),
+            "disengaged follow shows the dim indicator: {body}"
+        );
+        assert!(
+            body.contains('\u{25be}'),
+            "indicator carries the \u{25be} symbol"
+        );
+        // Scrolling far down re-engages follow and drops the indicator.
+        screen.scroll.scroll_down(10_000);
+        let frame = compose_frame(&mut screen, Size::new(80, 24)).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        let body = rows[2..].join("\n");
+        assert!(screen.scroll.is_following());
+        assert!(body.contains("row 199"));
+        assert!(!body.contains("lines below"));
+    }
+
+    #[test]
+    fn resize_keeps_the_anchored_row_visible() {
+        let mut screen = footer_screen();
+        for i in 0..200 {
+            screen.apply(UiEvent::Notice(format!("row {i}")));
+        }
+        let _ = compose_frame(&mut screen, Size::new(80, 24));
+        screen.scroll.jump_to_start();
+        let frame = compose_frame(&mut screen, Size::new(80, 24)).lines;
+        let anchor = frame_rows(&frame, 80, 24)[2].clone();
+        assert!(anchor.contains("row 0") || anchor.trim().is_empty());
+        // Height-only resize: the same top offset stays anchored.
+        let frame = compose_frame(&mut screen, Size::new(80, 12)).lines;
+        let rows = frame_rows(&frame, 80, 12);
+        assert_eq!(rows[2], anchor, "anchor row survives a resize");
+    }
+
+    #[test]
+    fn frame_cost_is_independent_of_transcript_length() {
+        use std::time::Instant;
+        fn warm_compose_cost(rows: usize) -> std::time::Duration {
+            let mut screen = footer_screen();
+            for i in 0..rows {
+                screen.apply(UiEvent::Notice(format!("row {i}")));
+            }
+            let size = Size::new(100, 40);
+            // Warm the wrap cache; the measured frames must be pure window
+            // clones + chrome.
+            let _ = compose_frame(&mut screen, size);
+            let start = Instant::now();
+            for _ in 0..200 {
+                let frame = compose_frame(&mut screen, size);
+                assert_eq!(frame.lines.len(), 40);
+            }
+            start.elapsed()
+        }
+        let small = warm_compose_cost(500);
+        let large = warm_compose_cost(10_000);
+        // O(viewport) rendering: a 20x transcript must not cost 20x. The bound
+        // is deliberately loose (8x) to absorb CI timing noise while still
+        // failing any regression to whole-transcript rendering.
+        assert!(
+            large < small * 8,
+            "10k-row frame cost {large:?} vs 500-row {small:?} suggests O(transcript) rendering"
         );
     }
 

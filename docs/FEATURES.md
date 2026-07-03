@@ -19,6 +19,17 @@
   highlights, streamed GFM-style Markdown rendering, collapsed reasoning panels,
   `/exit` and `/quit`; text REPL fallback for pipes/CI or TUI startup failure.
   [Implemented]
+- **Alt-screen pager TUI** — full-frame alternate-screen renderer
+  ([ADR-0029](adr/0029-adopt-alt-screen-pager-tui.md)): viewport-pinned
+  session bar, Iris-owned scrollback with follow mode
+  (PageUp/PageDown, Alt+Up/Down line scroll, Home/End, re-engage by
+  overscroll, dim `▾ N lines below` indicator), O(viewport) windowed
+  rendering over the wrap cache, panic-safe alt-screen restore. Policy:
+  `tui.altScreen = auto|always|never` (default `never` until mouse/clipboard
+  land), `--no-alt-screen`, `IRIS_NO_ALT_SCREEN`; tmux control mode, Zellij,
+  dumb terminals, and non-TTY stdio degrade to the inline renderer with a
+  notice. Mouse wheel + clipboard ladder and the capability doctor are next.
+  [Partial]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process, plus linear session resume from persisted transcripts.
   [Partial]
