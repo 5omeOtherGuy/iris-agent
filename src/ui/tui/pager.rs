@@ -145,6 +145,20 @@ impl ScrollState {
     pub(crate) fn follow_latest(&mut self) {
         self.follow = true;
     }
+
+    /// Scroll the minimum distance so visible line `line` is inside the
+    /// viewport (selection keep-visible). A reveal that lands at the bottom
+    /// re-engages follow; one that scrolls up disengages it.
+    pub(in crate::ui) fn reveal(&mut self, line: usize) {
+        let top = self.top();
+        if line < top {
+            self.top_offset = line;
+            self.follow = false;
+        } else if self.view_rows > 0 && line >= top + self.view_rows {
+            self.top_offset = (line + 1 - self.view_rows).min(self.max_top);
+            self.follow = self.top_offset >= self.max_top;
+        }
+    }
 }
 
 /// Owns the alternate-screen lifecycle for pager mode. The writer is a second
@@ -350,6 +364,18 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     let view_rows = tail_budget - tail.len();
     let total = screen.transcript_visible_total(width);
     screen.scroll.sync(total, view_rows);
+    // Keep the selected scrollback entry visible (the wrap cache is warm
+    // after `transcript_visible_total`, so the line lookup is O(1)).
+    let selected_line = if screen.scrollback_focus {
+        screen
+            .selected_entry
+            .and_then(|row| screen.transcript_line_of_row(row))
+    } else {
+        None
+    };
+    if let Some(line) = selected_line {
+        screen.scroll.reveal(line);
+    }
     let top = screen.scroll.top();
 
     let mut body = screen.transcript_window(width, top, view_rows);
@@ -357,6 +383,16 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         // Blank filler (or the centered start page) sits BETWEEN the
         // transcript and the tail, exactly as in the inline document.
         body.extend(filler_lines(screen, view_rows - body.len(), width));
+    }
+    // Focused-scrollback selection highlight: the selected entry's header
+    // line gets the surface fill (the single permitted tonal selection fill).
+    if let Some(line) = selected_line
+        && line >= top
+        && line - top < body.len()
+    {
+        for span in &mut body[line - top].spans {
+            span.style = span.style.bg(crate::ui::palette::SURFACE);
+        }
     }
     // Disengaged follow: overlay a dim indicator on the last transcript row
     // (symbol + label, per the design language) showing how much is below.
@@ -676,6 +712,92 @@ mod tests {
             large < small * 8,
             "10k-row frame cost {large:?} vs 500-row {small:?} suggests O(transcript) rendering"
         );
+    }
+
+    fn tool_call(id: usize) -> crate::nexus::ToolCall {
+        crate::nexus::ToolCall {
+            id: format!("call_{id}"),
+            thought_signature: None,
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": "seq 40" }),
+        }
+    }
+
+    /// Screen with `n` foldable tool panels (long output triggers the fold).
+    fn screen_with_panels(n: usize) -> Screen {
+        let mut screen = footer_screen();
+        let long_output: String = (0..40).map(|i| format!("out {i}\n")).collect();
+        for i in 0..n {
+            screen.apply(UiEvent::ToolResult {
+                call: tool_call(i),
+                content: long_output.clone(),
+                exit_code: Some(0),
+                duration: None,
+            });
+        }
+        screen
+    }
+
+    #[test]
+    fn scrollback_focus_selects_folds_and_highlights_entries() {
+        let mut screen = screen_with_panels(3);
+        screen.pager_active = true;
+        let _ = compose_frame(&mut screen, Size::new(80, 24));
+
+        // Entering focus selects the newest entry.
+        assert!(screen.toggle_scrollback_focus());
+        let headers = screen.transcript.panel_header_rows();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(screen.selected_entry, headers.last().copied());
+
+        // Selection moves up/down and clamps at the ends.
+        screen.move_selection(-1);
+        assert_eq!(screen.selected_entry, Some(headers[1]));
+        screen.move_selection(-1);
+        screen.move_selection(-1);
+        assert_eq!(screen.selected_entry, Some(headers[0]));
+        screen.move_selection(1);
+        assert_eq!(screen.selected_entry, Some(headers[1]));
+
+        // Reveal/fold the selected panel (tool panels start collapsed to the
+        // capped preview).
+        assert!(screen.set_selected_expanded(true));
+        assert!(!screen.set_selected_expanded(true), "already revealed");
+        assert!(screen.toggle_selected_entry(), "toggle folds back");
+        assert!(screen.set_selected_expanded(true), "and reveals again");
+
+        // The selected header line carries the surface selection fill.
+        let composed = compose_frame(&mut screen, Size::new(80, 24));
+        let selected_line = screen
+            .transcript_line_of_row(screen.selected_entry.expect("selected"))
+            .expect("visible");
+        let highlighted = composed.lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))
+        });
+        assert!(
+            highlighted,
+            "selected entry header carries the surface fill"
+        );
+        assert!(selected_line < screen.transcript_visible_total(80));
+    }
+
+    #[test]
+    fn reveal_scrolls_selection_into_view() {
+        let mut scroll = ScrollState::default();
+        scroll.sync(100, 20);
+        assert!(scroll.is_following());
+        // Selection far above: view scrolls up to it.
+        scroll.reveal(10);
+        assert!(!scroll.is_following());
+        assert_eq!(scroll.top(), 10);
+        // Selection below the view: minimal scroll down; at bottom re-follows.
+        scroll.reveal(99);
+        assert!(scroll.is_following());
+        // Selection already visible: no movement.
+        scroll.reveal(85);
+        assert!(scroll.is_following());
     }
 
     #[test]

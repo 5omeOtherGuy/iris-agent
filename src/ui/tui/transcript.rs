@@ -1784,6 +1784,80 @@ impl Transcript {
         }
     }
 
+    /// Row indices of every panel header (EXPLORE/SHELL/EDIT/thinking rails):
+    /// the selectable scrollback entries for keyboard navigation. O(rows),
+    /// called per selection keypress, never per frame.
+    pub(super) fn panel_header_rows(&self) -> Vec<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Header { .. } | ChromeRow::RailHeader { .. })
+                )
+                .then_some(idx)
+            })
+            .collect()
+    }
+
+    /// Set the fold state of the panel whose header row is `header`. Returns
+    /// whether the state changed (false for non-headers, panels with nothing
+    /// hidden, or an already-matching state).
+    pub(super) fn set_panel_expanded_at(&mut self, header: usize, expand: bool) -> bool {
+        if header >= self.rows.len() {
+            return false;
+        }
+        if !matches!(
+            self.rows[header].chrome.as_ref(),
+            Some(ChromeRow::Header { .. } | ChromeRow::RailHeader { .. })
+        ) {
+            return false;
+        }
+        let end = self.panel_end_from(header);
+        if !self.rows[header..end]
+            .iter()
+            .any(|row| row.fold != FoldVis::Always)
+        {
+            return false;
+        }
+        match self.rows[header].chrome.as_mut() {
+            Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. })
+                if *expanded != expand =>
+            {
+                *expanded = expand;
+                self.mark_dirty_from(header);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Current fold state of the panel header at `header`, if it is one.
+    pub(super) fn panel_expanded_at(&self, header: usize) -> Option<bool> {
+        match self.rows.get(header)?.chrome.as_ref() {
+            Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. }) => {
+                Some(*expanded)
+            }
+            _ => None,
+        }
+    }
+
+    /// Visible physical line index of logical `row` under the WARM wrap cache
+    /// (callers refresh via [`Self::visible_total`] first). `None` when the
+    /// row is folded away or the cache does not cover it yet.
+    pub(super) fn visible_line_of_row(&self, row: usize) -> Option<usize> {
+        let layout = self.wrapped_cache.rows.get(row)?;
+        if !layout.visible {
+            return None;
+        }
+        Some(if row == 0 {
+            0
+        } else {
+            self.wrapped_cache.rows[row - 1].visible_cum
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn latest_panel_collapsed(&self) -> bool {
         self.rows

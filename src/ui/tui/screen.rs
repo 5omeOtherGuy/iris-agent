@@ -592,6 +592,13 @@ pub(crate) struct Screen {
     pub(crate) mouse_capture: bool,
     /// Wheel scroll step in lines (pager mode; `tui.scrollSpeed`, default 3).
     pub(crate) scroll_speed: u16,
+    /// Pager focus: `true` while the scrollback pane has keyboard focus (Tab
+    /// toggles; typing a printable character always returns to the prompt;
+    /// Esc is never a focus key -- ADR-0029).
+    pub(crate) scrollback_focus: bool,
+    /// Selected scrollback entry (a panel-header transcript row index) while
+    /// the scrollback pane is focused.
+    pub(crate) selected_entry: Option<usize>,
 }
 
 impl Screen {
@@ -617,7 +624,71 @@ impl Screen {
             pager_active: false,
             mouse_capture: true,
             scroll_speed: 3,
+            scrollback_focus: false,
+            selected_entry: None,
         }
+    }
+
+    /// Tab: toggle prompt <-> scrollback focus (pager only). Entering the
+    /// scrollback selects the newest entry when none is selected yet.
+    pub(crate) fn toggle_scrollback_focus(&mut self) -> bool {
+        self.scrollback_focus = !self.scrollback_focus;
+        if self.scrollback_focus && self.selected_entry.is_none() {
+            self.selected_entry = self.transcript.panel_header_rows().last().copied();
+        }
+        self.scrollback_focus
+    }
+
+    /// Return focus to the prompt (typing always wins).
+    pub(crate) fn focus_prompt(&mut self) {
+        self.scrollback_focus = false;
+    }
+
+    /// Move the entry selection up (`-1`) or down (`+1`). With no selectable
+    /// entries the keys fall back to one-line scrolling so the pane still
+    /// responds. Selection drift after history trimming snaps to the nearest
+    /// entry.
+    pub(crate) fn move_selection(&mut self, delta: isize) {
+        let headers = self.transcript.panel_header_rows();
+        if headers.is_empty() {
+            if delta < 0 {
+                self.scroll.scroll_up(1);
+            } else {
+                self.scroll.scroll_down(1);
+            }
+            return;
+        }
+        let current = self
+            .selected_entry
+            .and_then(|row| headers.iter().position(|&h| h >= row))
+            .unwrap_or(headers.len().saturating_sub(1));
+        let next = current.saturating_add_signed(delta).min(headers.len() - 1);
+        self.selected_entry = Some(headers[next]);
+    }
+
+    /// Fold (`false`) or reveal (`true`) the selected entry's panel.
+    pub(crate) fn set_selected_expanded(&mut self, expand: bool) -> bool {
+        let Some(row) = self.selected_entry else {
+            return false;
+        };
+        self.transcript.set_panel_expanded_at(row, expand)
+    }
+
+    /// Toggle the selected entry's fold (Enter while scrollback-focused).
+    pub(crate) fn toggle_selected_entry(&mut self) -> bool {
+        let Some(row) = self.selected_entry else {
+            return false;
+        };
+        match self.transcript.panel_expanded_at(row) {
+            Some(expanded) => self.transcript.set_panel_expanded_at(row, !expanded),
+            None => false,
+        }
+    }
+
+    /// Visible line index of a transcript row under the warm wrap cache
+    /// (pager selection reveal/highlight).
+    pub(crate) fn transcript_line_of_row(&self, row: usize) -> Option<usize> {
+        self.transcript.visible_line_of_row(row)
     }
 
     /// Flip the desired pager mouse-capture state; returns the new state.
