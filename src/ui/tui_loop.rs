@@ -1729,7 +1729,11 @@ fn resolve_input_eof(
 /// wheel is consumed; clicks/drags are ignored (in-app selection is a later
 /// slice -- the Ctrl+T toggle restores terminal-native selection until then).
 fn pager_wheel(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
-    if !screen.pager_active {
+    // Gate on capture INTENT too: after Ctrl+T / `/mouse` turns capture off,
+    // queued events (or events still arriving because the disable write
+    // failed) must not scroll a transcript whose UI says native selection is
+    // active.
+    if !screen.pager_active || !screen.mouse_capture {
         return false;
     }
     let step = usize::from(screen.scroll_speed.max(1));
@@ -2074,6 +2078,10 @@ mod tests {
         for _ in 0..100 {
             let _ = pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollDown));
         }
+        assert!(screen.scroll.is_following());
+        // Capture toggled off: queued/late wheel events are ignored.
+        screen.mouse_capture = false;
+        assert!(!pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
         assert!(screen.scroll.is_following());
     }
 

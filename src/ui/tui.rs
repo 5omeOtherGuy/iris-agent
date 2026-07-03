@@ -273,10 +273,13 @@ pub(crate) struct TuiUi {
 
 impl TuiUi {
     /// Enter raw mode ONCE, enable bracketed paste + modified-key reporting,
-    /// hide the hardware cursor, and create the Iris terminal surface. Mouse
-    /// capture is deliberately NOT enabled so the terminal owns scroll/select/
-    /// copy over the normal screen scrollback. Restored on `drop`/`shutdown`,
-    /// and by the signal handler's emergency escape on a force-quit.
+    /// hide the hardware cursor, and create the Iris terminal surface. Inline
+    /// mode deliberately does NOT capture the mouse, so the terminal owns
+    /// scroll/select/copy over the normal screen scrollback; pager mode
+    /// captures it by default (wheel scrolls the Iris-owned scrollback) with a
+    /// Ctrl+T / `/mouse` runtime toggle. Everything is restored on
+    /// `drop`/`shutdown`, the panic hook, and the signal handler's emergency
+    /// escape on a force-quit.
     pub(crate) fn new(mode: ScreenMode) -> Result<Self> {
         // Capture cooked-mode termios before raw mode so the force-quit signal
         // handler can restore the tty even though Drop will not run then.
