@@ -7,6 +7,7 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+pub(crate) mod git_safety;
 pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
@@ -65,6 +66,11 @@ pub(crate) struct Harness<P> {
     // typed while the turn ran; the bare agent drains it at safe injection
     // points. Forwarded per-turn as a borrow; never owned by the bare agent.
     steering: Option<Rc<dyn SteeringSource>>,
+    // Dirty-tree safety guard (issue #262, ADR-0028). Owns all git knowledge;
+    // injected per-turn into the loop's `ToolEnv` as a `&dyn MutationGuard`.
+    // Spans turns like the session (a task continues across turns), so it lives
+    // on the harness rather than being rebuilt each turn.
+    git_safety: git_safety::GitSafety,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -138,6 +144,7 @@ impl<P: ChatProvider> Harness<P> {
         let output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
+        let git_safety = git_safety::GitSafety::new(&workspace);
         Self {
             agent,
             workspace,
@@ -148,6 +155,7 @@ impl<P: ChatProvider> Harness<P> {
             budget,
             output_store,
             steering: None,
+            git_safety,
         }
     }
 
@@ -209,6 +217,14 @@ impl<P: ChatProvider> Harness<P> {
         self.persisted = resumed;
         self.entry_ids = vec![None; resumed];
         self.agent.reset_session(messages);
+        // A session swap (`/new`, `/resume`) is a PASSIVE boundary: ADR-0028
+        // forbids passive actions from settling a task (settlement is accept,
+        // rollback, or an explicit checkpoint only), so it must not mark the
+        // dirty task accepted or drop the baseline's protection. Keep the
+        // baseline/ledger and only drop the per-file approvals (judged against
+        // the prior conversation) so the next touch of a still-dirty file
+        // re-prompts. The resume/recovery notice is #263.
+        self.git_safety.discard_approvals();
     }
 
     /// Id of the attached transcript log, or `None` for an in-memory session.
@@ -286,6 +302,9 @@ impl<P: ChatProvider> Harness<P> {
             // Streaming is Nexus-owned: it injects a per-call sink on the
             // exclusive path. The harness env carries none.
             output_sink: None,
+            // Dirty-tree safety (issue #262): the loop consults this seam around
+            // every mutating call; git knowledge stays behind it.
+            mutation_guard: Some(&self.git_safety),
         };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).

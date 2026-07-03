@@ -167,6 +167,12 @@ impl Tool for BashTool {
         // shell stays approval-per-call.
         false
     }
+    fn is_mutating(&self) -> bool {
+        // A shell command may write anything: it opens the dirty-tree task and
+        // is bracketed by the guard's snapshot/verify (issue #262). No static
+        // path set, so `mutates_paths` stays empty and detection runs instead.
+        true
+    }
 }
 
 struct EditTool;
@@ -202,6 +208,14 @@ impl Tool for EditTool {
         // any workspace file; edits stay approval-per-call until policy is
         // path/exact-call scoped (roadmap #14).
         false
+    }
+    fn is_mutating(&self) -> bool {
+        true
+    }
+    fn mutates_paths(&self, args: &Value) -> Vec<PathBuf> {
+        // `edit` targets its `file_path` argument. The guard normalizes it
+        // against the workspace, so a relative or absolute value both resolve.
+        mutated_path(args, "file_path")
     }
     fn diff_preview(&self, workspace: &Path, args: &Value) -> Option<String> {
         render(workspace, |root| edit::preview(root, args))
@@ -241,6 +255,13 @@ impl Tool for WriteTool {
         // any workspace file; writes stay approval-per-call until policy is
         // path/exact-call scoped (roadmap #14).
         false
+    }
+    fn is_mutating(&self) -> bool {
+        true
+    }
+    fn mutates_paths(&self, args: &Value) -> Vec<PathBuf> {
+        // `write` targets its `path` argument.
+        mutated_path(args, "path")
     }
     fn diff_preview(&self, workspace: &Path, args: &Value) -> Option<String> {
         render(workspace, |root| write::preview(root, args))
@@ -350,6 +371,17 @@ impl Tool for LsTool {
     }
 }
 
+/// Extract a single mutated path from a string-valued tool argument (issue
+/// #262). Returns an empty vec when the argument is missing or not a string, so
+/// a malformed call is simply not dirty-gated (it fails in the tool body).
+fn mutated_path(args: &Value, key: &str) -> Vec<PathBuf> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![PathBuf::from(value)])
+        .unwrap_or_default()
+}
+
 /// Whether a bash command performs a destructive, data-losing operation. The
 /// check is deliberately conservative and biased toward flagging: a false
 /// positive costs one extra prompt, a false negative could auto-run an `rm`.
@@ -378,6 +410,10 @@ fn bash_command_is_destructive(args: &Value) -> bool {
         "-delete",
         "git reset --hard",
         "git clean",
+        // Recoverability destroyers that discard uncommitted work (ADR-0028):
+        // both restore working-tree paths from the index/HEAD, wiping edits.
+        "git checkout --",
+        "git restore",
         "git push --force",
         "git push -f",
         "chmod -r",
@@ -416,6 +452,25 @@ mod tests {
             "/bin/rm -rf target",
             "/usr/bin/dd if=/dev/zero of=file",
             "mkfs.ext4 /dev/sdz",
+        ] {
+            assert!(
+                bash_command_is_destructive(&bash_args(command)),
+                "{command} should be destructive"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_bash_detection_catches_recoverability_destroyers() {
+        // ADR-0028: commands that discard uncommitted work must re-prompt.
+        for command in [
+            "git checkout -- .",
+            "git checkout -- src/main.rs",
+            "git clean -fd",
+            "git restore .",
+            "git restore --staged --worktree file",
+            "rm -rf target",
+            "git reset --hard HEAD",
         ] {
             assert!(
                 bash_command_is_destructive(&bash_args(command)),

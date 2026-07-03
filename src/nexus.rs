@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -265,6 +265,20 @@ pub(crate) enum AgentEvent {
     /// The message is also pushed into provider context.
     UserMessage(String),
     Notice(String),
+    /// Dirty-tree state observed at the first mutating tool call of a task
+    /// (issue #262). Carries a one-line human summary (dirty/untracked counts,
+    /// or a degrade notice for a non-git / jj workspace); Tier 3 renders it so
+    /// the user sees the pre-existing state before any file is touched.
+    DirtyBaseline(String),
+    /// A mutating call modified a protected (pre-existing dirty/untracked) file
+    /// that was not approved for change (issue #262). The call is failed and, if
+    /// `restored`, the file's pre-call contents were recovered from snapshot.
+    /// Carries workspace-relative paths only, never file contents.
+    MutationViolation {
+        call: ToolCall,
+        paths: Vec<String>,
+        restored: bool,
+    },
     TurnComplete,
 }
 
@@ -388,7 +402,65 @@ pub(crate) trait ApprovalGate {
     ) -> ApprovalFuture<'a>;
 }
 
+/// Dirty-tree safety seam (issue #262, ADR-0028). Consulted by the core loop
+/// around every mutating tool call so a pre-existing uncommitted change is never
+/// silently damaged. Nexus owns the *enforcement* (routing a protected path
+/// through the approval gate, halting a violating call); the *git knowledge*
+/// lives entirely behind this contract in the Tier-2 harness, so the core loop
+/// carries no baseline, hashing, or `git` awareness.
+///
+/// Contract, mirroring [`ApprovalGate`]/[`ChatProvider`]: the loop calls these
+/// hooks; the implementation answers using the task baseline it captured lazily
+/// on the first mutating call. Every method is synchronous and cheap by design
+/// (the protected set is a known, small set of files); the harness may run
+/// heavier attribution work asynchronously behind its own barriers.
+pub(crate) trait MutationGuard {
+    /// Called before the first (and every) mutating tool call. On the first
+    /// mutation of a task it lazily captures the baseline and returns a
+    /// one-line summary to surface (dirty/untracked counts, or a degrade
+    /// notice); later calls in the same task return `None`. Pure Q&A turns
+    /// never reach this, so they take no snapshot.
+    fn note_mutation(&self) -> Option<String>;
+
+    /// Of `paths`, which are in the dirty baseline and not yet approved this
+    /// task. A non-empty result routes the call through the approval gate even
+    /// when a session/project allow layer would otherwise auto-run it.
+    fn unapproved_protected(&self, paths: &[PathBuf]) -> Vec<PathBuf>;
+
+    /// Record approval for `paths` this task. `all_dirty` escalates the grant to
+    /// every dirty file in the baseline (the prompt's "all dirty files this
+    /// task" option). Approvals expire when the task settles.
+    fn approve(&self, paths: &[PathBuf], all_dirty: bool);
+
+    /// Snapshot the protected set's contents before a mutating call executes so
+    /// an out-of-band write can be detected and restored afterward.
+    fn before_exec(&self);
+
+    /// Re-check the protected set after a mutating call. `approved` are the
+    /// paths this call was allowed to change; `expected_after` is the SHA-256
+    /// hex of the exact bytes the tool reported writing (`None` when the tool
+    /// did not confirm a write -- e.g. it failed, was cancelled, or is not a
+    /// content-reporting tool). An approved path is recorded to the ledger as
+    /// Iris-authored only when its post-call bytes match `expected_after`; on
+    /// any mismatch (a concurrent user edit, or a failed/partial write) the
+    /// change is ambiguous and, per ADR-0028's TOCTOU rule, treated as a
+    /// user-attributed violation. Any *other* protected file that changed is
+    /// likewise a violation for the loop to halt and offer restore.
+    fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> Vec<PathBuf>;
+
+    /// Restore the given protected files from the pre-exec snapshot. Best-effort
+    /// recovery invoked by the loop after a detected violation.
+    fn restore(&self, paths: &[PathBuf]) -> Result<()>;
+}
+
 /// Structured result of a successful tool call: the model-facing text plus
+/// Internal metadata key a mutating tool sets to the SHA-256 hex of the exact
+/// bytes it wrote to its target (ADR-0028 write confirmation). The dirty-tree
+/// guard confirms an approved change against this before attributing it to Iris;
+/// [`record_call`] strips it before serialization, so it never reaches provider
+/// context (like `exitCode`/`durationMs`). Not a git concept -- a content hash.
+pub(crate) const WRITE_CONFIRM_HASH_KEY: &str = "__iris_after_hash";
+
 /// optional structured metadata. Tier-1 result contract (the analogue of pi's
 /// `AgentToolResult`); tools with nothing structured to report use
 /// [`ToolOutput::text`] and the metadata is omitted from the wire.
@@ -434,6 +506,11 @@ pub(crate) struct ToolEnv<'a> {
     /// non-streaming; Nexus injects a per-call sink on the exclusive path so a
     /// streaming tool's chunks reach the front-end as display-only deltas.
     pub(crate) output_sink: Option<&'a dyn ToolOutputSink>,
+    /// Optional dirty-tree safety guard (issue #262). `None` (tests, non-git or
+    /// degraded harness) disables dirty gating entirely, preserving the original
+    /// approval behavior. The Tier-2 harness injects it so the core loop can
+    /// gate mutating calls without any git knowledge of its own.
+    pub(crate) mutation_guard: Option<&'a dyn MutationGuard>,
 }
 
 /// A tool the agent can invoke. Mirrors pi-ai's `Tool`
@@ -467,6 +544,22 @@ pub(crate) trait Tool {
     /// Whether a call to this tool must be approved before it runs.
     fn requires_approval(&self) -> bool {
         false
+    }
+    /// Whether this tool mutates the workspace, so the dirty-tree guard (issue
+    /// #262) should capture a baseline on the first such call in a task and
+    /// snapshot/verify the protected set around this call. Default: read-only.
+    /// `edit`/`write`/`bash` opt in; the core loop never name-matches them.
+    fn is_mutating(&self) -> bool {
+        false
+    }
+    /// The concrete workspace paths this call will modify, when statically known
+    /// from the arguments (e.g. `edit`/`write` target their `file_path`/`path`).
+    /// Used by the dirty-tree guard to decide whether a call touches a
+    /// pre-existing dirty file and must route through approval. Empty when the
+    /// set is not statically knowable (e.g. an arbitrary `bash` command), which
+    /// falls back to the snapshot/verify detection path instead.
+    fn mutates_paths(&self, _args: &Value) -> Vec<PathBuf> {
+        Vec::new()
     }
     /// Whether these arguments perform a destructive, data-losing operation that
     /// must be re-approved every time, even when the tool is "always allowed".
@@ -1231,6 +1324,26 @@ impl<P: ChatProvider> Agent<P> {
         provider_turn_id: &str,
     ) -> Result<ToolOutcome> {
         emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Proposed)?;
+        // Dirty-tree safety (issue #262, ADR-0028). A mutating call lazily opens
+        // the task baseline (surfaced once) and, when it targets a statically
+        // known set of paths, is checked against the dirty baseline. A protected
+        // path not yet approved this task must route through the approval gate
+        // even if a session/project allow layer would auto-run it. Nexus owns
+        // this enforcement; the git knowledge lives behind the guard seam.
+        let (is_mutating, mutated_paths) = self
+            .tools
+            .by_name(&call.name)
+            .map(|tool| (tool.is_mutating(), tool.mutates_paths(&call.arguments)))
+            .unwrap_or((false, Vec::new()));
+        let dirty_protected: Vec<PathBuf> = if let Some(guard) = env.mutation_guard {
+            if is_mutating && let Some(summary) = guard.note_mutation() {
+                obs.on_event(AgentEvent::DirtyBaseline(summary))?;
+            }
+            guard.unapproved_protected(&mutated_paths)
+        } else {
+            Vec::new()
+        };
+        let dirty_gate = !dirty_protected.is_empty();
         if let Some(tool) = self.tools.by_name(&call.name) {
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
                 obs.on_event(AgentEvent::DiffPreview {
@@ -1238,9 +1351,15 @@ impl<P: ChatProvider> Agent<P> {
                     diff,
                 })?;
             }
-            if !tool.requires_approval() {
+            if !tool.requires_approval() && !dirty_gate {
                 obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
             } else {
+                // A dirty-tree gate (issue #262) forces the approval path even
+                // for a tool that does not otherwise require approval: a
+                // mutating tool with `requires_approval() == false` but a
+                // protected `mutates_paths()` target must never skip the gate.
+                // The `auto_approved` computation below keeps `dirty_gate` a hard
+                // floor, so entering this branch always prompts for such a tool.
                 // The destructive floor (ADR-0010): a destructive call (e.g.
                 // `rm`) always re-prompts, before any allow layer is consulted.
                 // Neither a session allow-always nor a persistent project grant
@@ -1252,7 +1371,12 @@ impl<P: ChatProvider> Agent<P> {
                 // layer is allow-only, so "most specific wins" reduces to a
                 // union of the allow layers over the prompting default.
                 let project_allowed = self.project_policy.allows(&call.name, &call.arguments);
-                let auto_approved = !destructive && (session_allowed || project_allowed);
+                // A dirty-tree gate (issue #262) sits above every allow layer:
+                // touching a pre-existing dirty file always prompts this task,
+                // no matter what the session/project policy grants. Like the
+                // destructive floor, it cannot be silently auto-run.
+                let auto_approved =
+                    !destructive && !dirty_gate && (session_allowed || project_allowed);
                 if auto_approved {
                     obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
                     emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
@@ -1261,6 +1385,21 @@ impl<P: ChatProvider> Agent<P> {
                     if destructive && (session_allowed || project_allowed) {
                         let message = "destructive command: approval required even though this tool is allowed";
                         obs.on_event(AgentEvent::Notice(message.to_string()))?;
+                    }
+                    if dirty_gate {
+                        let list = dirty_protected
+                            .iter()
+                            .map(|path| {
+                                path.strip_prefix(env.workspace)
+                                    .unwrap_or(path)
+                                    .display()
+                                    .to_string()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        obs.on_event(AgentEvent::Notice(format!(
+                            "uncommitted changes in {list}: approval required before Iris modifies it"
+                        )))?;
                     }
                     // Race the approval against cancellation so a pending prompt
                     // does not pin the turn open after a Ctrl-C. Cancellation is
@@ -1276,8 +1415,16 @@ impl<P: ChatProvider> Agent<P> {
                         biased;
                         _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
                         // A project grant is never offered for a destructive
-                        // call: it must not be persistable (ADR-0010 floor).
-                        decision = gate.review(call, tool.supports_allow_always(), !destructive) => decision?,
+                        // call: it must not be persistable (ADR-0010 floor). A
+                        // dirty-tree gate offers the "all dirty files this task"
+                        // escalation via allow-always and suppresses the project
+                        // grant (a dirty file cannot be pre-approved for a
+                        // project).
+                        decision = gate.review(
+                            call,
+                            tool.supports_allow_always() || dirty_gate,
+                            !destructive && !dirty_gate,
+                        ) => decision?,
                     };
                     // A blocking front-end prompt (real terminal) cannot observe
                     // the token mid-read, so it may still return a decision after a
@@ -1293,7 +1440,14 @@ impl<P: ChatProvider> Agent<P> {
                             return Ok(ToolOutcome::Denied);
                         }
                         ApprovalDecision::AllowAlways => {
-                            if tool.supports_allow_always() {
+                            if dirty_gate {
+                                // In the dirty-tree context "always" means "all
+                                // dirty files this task" (ADR-0028 escalation),
+                                // not a persistent session grant for the tool.
+                                if let Some(guard) = env.mutation_guard {
+                                    guard.approve(&dirty_protected, true);
+                                }
+                            } else if tool.supports_allow_always() {
                                 tracing::info!(tool = %call.name, "tool always-allowed this session");
                                 self.session_allowed.insert(call.name.clone());
                             } else {
@@ -1309,14 +1463,28 @@ impl<P: ChatProvider> Agent<P> {
                             // AllowProject for a destructive call (it was not
                             // offered), the grant is refused -- the call still
                             // runs once, but nothing is persisted (invariant 2).
-                            if destructive {
+                            if dirty_gate {
+                                // A dirty file is never project-granted; approve
+                                // it for this task only.
+                                if let Some(guard) = env.mutation_guard {
+                                    guard.approve(&dirty_protected, false);
+                                }
+                            } else if destructive {
                                 let message = "destructive command: cannot be granted for this project; allowed once";
                                 obs.on_event(AgentEvent::Notice(message.to_string()))?;
                             } else {
                                 self.record_project_grant(call, obs)?;
                             }
                         }
-                        ApprovalDecision::Allow => {}
+                        ApprovalDecision::Allow => {
+                            if dirty_gate {
+                                // Approve just the dirty paths this call touches,
+                                // for the remainder of the task.
+                                if let Some(guard) = env.mutation_guard {
+                                    guard.approve(&dirty_protected, false);
+                                }
+                            }
+                        }
                     }
                     emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
                 }
@@ -1346,8 +1514,64 @@ impl<P: ChatProvider> Agent<P> {
                     state: env.state,
                     output_store: env.output_store,
                     output_sink: Some(&emitter),
+                    mutation_guard: env.mutation_guard,
                 };
-                run_tool(tool, &call.arguments, &call_env, token.child_token()).await
+                // Dirty-tree detection layer (issue #262, ADR-0028): snapshot the
+                // protected set before a mutating call, then re-check it after.
+                // A protected file changed out-of-band (not an approved target of
+                // this call) is a violation: fail the call, restore from
+                // snapshot, and surface which files changed.
+                let guard = env.mutation_guard.filter(|_| is_mutating);
+                if let Some(guard) = guard {
+                    guard.before_exec();
+                }
+                let outcome = run_tool(tool, &call.arguments, &call_env, token.child_token()).await;
+                if let Some(guard) = guard {
+                    // Confirm an approved change against the exact bytes the tool
+                    // reported writing (ADR-0028 TOCTOU rule). A failed/cancelled
+                    // call, or a tool that reports no hash, yields `None`, so any
+                    // change to a protected file stays user-attributed. The key
+                    // is stripped from provider context in `record_call`.
+                    let expected_after = match &outcome {
+                        ToolOutcome::Ok(output) => output
+                            .metadata
+                            .get(WRITE_CONFIRM_HASH_KEY)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        _ => None,
+                    };
+                    let violations = guard.after_exec(&mutated_paths, expected_after.as_deref());
+                    if !violations.is_empty() {
+                        let restored = guard.restore(&violations).is_ok();
+                        let paths: Vec<String> = violations
+                            .iter()
+                            .map(|path| {
+                                path.strip_prefix(env.workspace)
+                                    .unwrap_or(path)
+                                    .display()
+                                    .to_string()
+                            })
+                            .collect();
+                        obs.on_event(AgentEvent::MutationViolation {
+                            call: call.clone(),
+                            paths: paths.clone(),
+                            restored,
+                        })?;
+                        let recovery = if restored {
+                            "; restored from snapshot"
+                        } else {
+                            "; snapshot restore failed"
+                        };
+                        ToolOutcome::Err(anyhow::anyhow!(
+                            "halted: modified protected uncommitted file(s): {}{recovery}",
+                            paths.join(", ")
+                        ))
+                    } else {
+                        outcome
+                    }
+                } else {
+                    outcome
+                }
             }
             None => ToolOutcome::Err(anyhow::anyhow!("unknown tool: {}", call.name)),
         };
@@ -1604,6 +1828,10 @@ fn record_call(
             // serialization so the non-deterministic duration and the exit code
             // ride the event, never entering provider context (and the wire
             // shape stays byte-identical to a plain text-only result).
+            // The dirty-tree write-confirmation hash (ADR-0028) is an internal
+            // signal consumed in `run_gated_single`; strip it here so it never
+            // enters provider context (the wire shape stays identical).
+            output.metadata.remove(WRITE_CONFIRM_HASH_KEY);
             let exit_code = output
                 .metadata
                 .remove("exitCode")
