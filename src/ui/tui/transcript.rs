@@ -1933,13 +1933,16 @@ impl Transcript {
 
     /// Visible line of the newest user prompt that begins strictly above the
     /// viewport top -- the pager's sticky header anchor. Requires a warm wrap
-    /// cache (compose refreshes it every frame).
+    /// cache (compose refreshes it every frame). Binary search over the
+    /// sorted anchors (prompt rows are always visible and line positions are
+    /// monotone in row order), so the per-frame cost is O(log prompts), never
+    /// a prompt walk.
     pub(super) fn sticky_prompt_line(&self, top: usize) -> Option<usize> {
-        self.user_prompt_starts
-            .iter()
-            .rev()
-            .filter_map(|&row| self.visible_line_of_row(row))
-            .find(|&line| line < top)
+        let above = self
+            .user_prompt_starts
+            .partition_point(|&row| self.visible_line_of_row(row).is_some_and(|line| line < top));
+        let row = *self.user_prompt_starts.get(above.checked_sub(1)?)?;
+        self.visible_line_of_row(row).filter(|&line| line < top)
     }
 
     fn ensure_wrapped_cache(&mut self, width: usize) {
