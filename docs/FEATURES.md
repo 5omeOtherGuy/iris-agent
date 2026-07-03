@@ -300,14 +300,31 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 ## Git
 
+Design for the first slice (dirty-tree safety, checkpoint/rollback, final diff,
+verification loop) is accepted in
+[ADR-0028](adr/0028-git-workflow-dirty-tree-safety-and-task-checkpointing.md)
+and tracked by epic
+[#261](https://github.com/5omeOtherGuy/iris-agent/issues/261). Do not re-derive
+task boundaries, checkpoint storage, or approval semantics — they are decided.
+
+- **Dirty-state handling** — baseline + attribution ledger; never silently
+  overwrite uncommitted work (files or index); per-file per-task approvals.
+  Spec: ADR-0028; issue
+  [#262](https://github.com/5omeOtherGuy/iris-agent/issues/262). [Planned · MVP]
+- **Checkpoint / rollback** — op-log-shaped checkpoint chain under
+  `refs/iris/*`; task-scoped rollback restoring only Iris-authored changes.
+  Spec: ADR-0028; issue
+  [#263](https://github.com/5omeOtherGuy/iris-agent/issues/263). [Planned · MVP]
+- **Final diff summary** — net task diff (Iris-authored paths only) as the
+  deliverable, TUI + plain-text. Issue
+  [#264](https://github.com/5omeOtherGuy/iris-agent/issues/264). [Planned · MVP]
+- **Verification loop** — run the project's test/lint/build after changes, feed
+  failures back, bounded retries; same shell approval policy. Issue
+  [#265](https://github.com/5omeOtherGuy/iris-agent/issues/265). [Planned · MVP]
 - **Diff view** — present changes as git diffs. [Planned]
-- **Checkpoint / rollback** — snapshot before multi-step edits and roll back a
-  whole task. [Planned]
 - **Auto-commit** — commit changes with generated messages after explicit
-  approval. [Planned]
+  approval. Gated on ADR-0028's still-binding pre-automation gate. [Planned]
 - **Per-hunk staging** — stage and commit logically separate changes separately.
-  [Planned]
-- **Dirty-state handling** — never overwrite uncommitted work; surface conflicts.
   [Planned]
 - **Pre-commit self-review** — agent reviews its own diff before committing.
   [Planned]

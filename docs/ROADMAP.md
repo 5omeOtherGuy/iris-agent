@@ -734,6 +734,13 @@ large outputs can later become handle-backed without changing every caller.
 
 **Goal:** prove the first unique Iris thesis with measurement.
 
+**Sequencing (2026-07-03): the benchmark proof
+([#210](https://github.com/5omeOtherGuy/iris-agent/issues/210)) now follows the
+first Git-Centered Workflow slice (epic
+[#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), Milestone 5).**
+A safe, diff-centric change workflow is a prerequisite for credible benchmark
+runs; see [ADR-0028](adr/0028-git-workflow-dirty-tree-safety-and-task-checkpointing.md).
+
 Potential scope:
 
 - Content-addressed store. [Foundation shipped as part of
@@ -840,18 +847,39 @@ same Nexus safety policy as the main agent.
 
 **Goal:** make the diff the central deliverable.
 
-Potential scope:
+**Sequencing (2026-07-03): the first slice of this milestone is pulled ahead of
+the Milestone 2 benchmark proof
+([#210](https://github.com/5omeOtherGuy/iris-agent/issues/210)).** A safe,
+diff-centric change workflow is a prerequisite for credible benchmark runs.
+Epic: [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261).
 
-- Diff view after every file change.
-- Checkpoint/rollback.
-- Dirty-tree detection.
+**Design is specified and accepted — do not re-derive it.**
+[ADR-0028](adr/0028-git-workflow-dirty-tree-safety-and-task-checkpointing.md)
+settles dirty-tree behavior, rollback semantics, approval requirements, task
+boundaries (settlement-based), checkpoint storage (op-log-shaped chain under
+`refs/iris/*`), index protection, bash detection + snapshot-restore, the
+blocking/async performance split, session-end/crash recovery, and the tiered
+guarantee language. The pre-automation gate below is satisfied for the #261
+slice; any deviation requires superseding ADR-0028, not a fresh discussion.
+
+Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)):
+
+- Dirty-tree detection and unrelated-change safety
+  ([#262](https://github.com/5omeOtherGuy/iris-agent/issues/262)) — gates the rest.
+- Task-scoped checkpoint/rollback
+  ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)).
+- Final diff summary as the task deliverable
+  ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)).
+- Verification loop (moved from Milestone 1): run the project's test/lint/build
+  command, feed failures back, retry bounded; external-signal driven, not an
+  LLM self-critique pass
+  ([#265](https://github.com/5omeOtherGuy/iris-agent/issues/265)).
+
+Later slices (not in #261):
+
 - Per-hunk staging.
 - Optional auto-commit behind explicit approval.
 - Worktree support.
-- Optional verification loop (moved from Milestone 1): after a change, run the
-  project's test/lint/build command and feed failures back before the final
-  answer. External-signal driven, not an LLM self-critique pass; depends on the
-  safer-`bash` policy.
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user
@@ -859,7 +887,8 @@ changes.
 
 Gate before Git automation: dirty-tree behavior, rollback semantics, and approval
 requirements must be specified before auto-commit, worktree, GitHub, or CI features
-are implemented.
+are implemented. [Satisfied for the #261 slice by ADR-0028 (2026-07-03); still
+binding for auto-commit, worktree, GitHub, and CI slices.]
 
 ## Architecture work — Tier-Boundary Enforcement
 
