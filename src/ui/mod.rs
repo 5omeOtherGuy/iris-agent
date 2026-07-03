@@ -77,6 +77,7 @@ pub(crate) mod selector;
 pub(crate) mod slash;
 pub(crate) mod steering;
 pub(crate) mod symbols;
+pub(crate) mod terminal_doctor;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
 

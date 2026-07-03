@@ -111,6 +111,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/terminal-setup",
+        description: "Check terminal capabilities (multiplexer, OSC 52, keys) with fixes",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/mouse",
         description: "Toggle mouse capture (off = terminal-native select/copy)",
         action: SlashAction::Submit,

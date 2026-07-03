@@ -690,6 +690,15 @@ fn route_command<P: ChatProvider>(
             }
             Ok(RouteOutcome::Consumed)
         }
+        "/terminal-setup" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            let env = crate::ui::terminal_doctor::detect(
+                tui.keyboard_enhanced(),
+                tui.screen.pager_active,
+            );
+            apply_notices(tui, crate::ui::terminal_doctor::report(&env));
+            Ok(RouteOutcome::Consumed)
+        }
         "/mouse" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             let notice = if tui.screen.pager_active {
