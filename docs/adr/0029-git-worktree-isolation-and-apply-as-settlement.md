@@ -109,9 +109,23 @@ not committing by default"). A future approved auto-stage feature is already
 contemplated by ADR-0028 (Iris-authored index changes go in the ledger); apply
 would opt into that path, not bypass it.
 
-Conflict handling therefore reduces to the ADR-0028 dirty-file rule: a parent
-path that is clean is written directly; a parent path that carries an unapproved
-pre-existing change prompts before overwrite; the user resolves. No bespoke
+**Base-drift precondition.** The dirty-baseline check protects only uncommitted
+parent state; it says nothing about committed drift. If the parent `HEAD` has
+moved since the worktree was created (pull, checkout, commit), a "clean" parent
+path may still hold committed content that differs from the child's base, and
+writing the child's bytes over it would silently revert committed work. Apply
+therefore records the worktree's base (`head_commit`) at creation and, before
+writing, compares each touched path's blob in the current parent `HEAD` against
+the same path in the recorded base. Paths whose base blob is unchanged apply
+under the dirty-file rule below. Paths that drifted are surfaced as conflicts in
+the apply review -- per-path: skip, or overwrite with explicit per-file approval
+(the same prompt shape as the dirty-file rule; never silent). Apply never
+rebases or merges content in this slice.
+
+Conflict handling therefore reduces to the ADR-0028 dirty-file rule plus the
+base-drift precondition: a parent path that is clean and un-drifted is written
+directly; a parent path that carries an unapproved pre-existing change, or whose
+committed base drifted, prompts before overwrite; the user resolves. No bespoke
 three-way merge is introduced in this slice.
 
 ### Registry: session-sibling JSONL, not SQLite
@@ -177,12 +191,29 @@ The SQLite tradeoff is revisited in Alternatives.
   **skip worktrees whose `creator_pid` is still alive unless forced**;
   `--dry-run` reports the plan without deleting.
 
-**Guarded deletion (security-relevant).** Removal refuses any path outside the
-known storage root (`~/.iris/worktrees/` or `IRIS_WORKTREE_DIR`). A registry
-record whose `path` escapes that root is treated as corrupt and never
-`rm -rf`-ed. This mirrors Grok's "deletion is constrained to known storage"
-invariant (spec section 14) and keeps worktree cleanup inside the workspace
-fence.
+**Guarded deletion (security-relevant).** Deletion never trusts a registry
+`path` field. The rules, all of which must hold before any recursive removal:
+
+1. **Canonicalize first.** The candidate path is canonicalized (symlinks and
+   `..` resolved) and the storage root is canonicalized; the containment check
+   runs on the canonical forms, component-wise, never as a lexical prefix
+   comparison.
+2. **Id-derived shape only.** The only deletable shape is
+   `<storage-root>/<worktree-id>` where `<worktree-id>` matches the registry
+   record's id exactly (single path component, no separators). Arbitrary deeper
+   or shallower paths from a record are treated as corrupt, never removed.
+3. **Ownership marker.** Worktree creation writes a marker file
+   (`.iris-worktree` carrying the worktree id) inside the directory; deletion
+   verifies the marker matches the record before removing. A directory without
+   a matching marker is reported, not deleted.
+4. **Constrained root.** `IRIS_WORKTREE_DIR` is refused if it canonicalizes to
+   `/`, the user's home directory itself, the source repository, or any
+   ancestor of either; the default remains `~/.iris/worktrees/`.
+
+A registry record failing any rule is treated as corrupt: surfaced, skipped,
+and left on disk. This strengthens Grok's "deletion is constrained to known
+storage" invariant (spec section 14) against misconfigured roots, symlinked
+components, and corrupt records.
 
 **Prune coordination.** After removing a linked worktree directory, run
 `git worktree prune` on the source repo to clear the stale
