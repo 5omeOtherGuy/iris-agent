@@ -30,6 +30,10 @@
 | [0027](0027-repurpose-trust-store-as-per-cwd-project-permission-policy.md) | Repurpose the trust store as a per-cwd project permission policy | proposed | 2026-07-02 |
 | [0028](0028-git-workflow-dirty-tree-safety-and-task-checkpointing.md) | Git workflow — dirty-tree safety, task checkpointing, and rollback semantics | accepted | 2026-07-03 |
 | [0029](0029-adopt-alt-screen-pager-tui.md) | Adopt an alt-screen pager TUI with an Iris-owned scrollback pane | accepted | 2026-07-03 |
+| [0030](0030-git-safety-task-ownership-lease-and-mutation-lock.md) | Git-safety task ownership — per-task lease and repo mutation lock | accepted | 2026-07-03 |
+| [0031](0031-task-identity-session-linkage-and-resumable-tasks.md) | Task identity — opaque body, session linkage, and explicit task resumption | accepted | 2026-07-03 |
+| [0032](0032-approval-presets-auto-and-safety-floors.md) | Approval presets, auto mode, and non-bypassable safety floors | accepted | 2026-07-04 |
+| [0033](0033-ratatui-native-adoption-boundary.md) | Define the ratatui-native adoption boundary for the TUI | accepted | 2026-07-04 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.

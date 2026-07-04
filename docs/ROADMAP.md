@@ -1037,6 +1037,52 @@ have kept (the retained `Screen` state is the source of truth); every slice
 keeps `--plain` and inline fallback working; no pane-rendering change ships
 without `TestBackend` frame assertions.
 
+## Milestone 7 — IDE-Grade Transcript
+
+**Goal:** code, markdown, and tool output render like an IDE — syntax-highlighted
+code blocks and clickable hyperlinks — without breaking the accessible plain
+path or the dual-backend render model.
+
+**Design is specified — do not re-derive it.**
+[ADR-0033](adr/0033-ratatui-native-adoption-boundary.md) settles the boundary:
+highlighting implements the existing `HighlightFn` seam in the markdown
+renderer; hyperlinks are spans-first (link targets as span metadata, OSC 8
+emitted at serialization — inline surface directly, pager via hit-testing or
+cell-splitting, decided in-slice); the plain text UI stays ANSI-free.
+
+Slices, in order:
+
+- **Syntax-highlighted code blocks** ([#324](https://github.com/5omeOtherGuy/iris-agent/issues/324)) —
+  `syntect` through `HighlightFn`; design-system palette, lazy-loaded syntax
+  sets, unknown languages and `--plain` render exactly as today.
+- **OSC 8 hyperlinks** ([#325](https://github.com/5omeOtherGuy/iris-agent/issues/325)) —
+  markdown links + workspace `file:line` refs clickable; wrapped links stay
+  clickable per physical row; no escape bytes in `Screen` state (unit-tested
+  invariant).
+
+Gate: `--plain` output stays byte-identical in both slices; no width or wrap
+regressions (wide-glyph tests); every pane-rendering change carries frame
+assertions.
+
+## Maintenance — TUI Consolidation Sweep
+
+Findings from the 2026-07-04 full-TUI review, sequenced as independent batches
+(each one worktree → gate → PR). Boundary rationale:
+[ADR-0033](adr/0033-ratatui-native-adoption-boundary.md).
+
+| Batch | Issue | Scope | Depends on |
+|-------|-------|-------|------------|
+| 1 | [#318](https://github.com/5omeOtherGuy/iris-agent/issues/318) | Remove dead `ModalKey::Tab` + reserved `ansi_aware` module | — |
+| 2 | [#319](https://github.com/5omeOtherGuy/iris-agent/issues/319) | Fold `markdown.rs` width/truncation into `textengine`; fix stale ADR-0006 Cargo.toml comment | #318 |
+| 3 | [#320](https://github.com/5omeOtherGuy/iris-agent/issues/320) | Consolidate list selection on `Selector`; one `fuzzy_match`; one right-align helper | #318 |
+| 4 | [#321](https://github.com/5omeOtherGuy/iris-agent/issues/321) | Centralize glyph literals in `symbols.rs` | — |
+| 5 | [#322](https://github.com/5omeOtherGuy/iris-agent/issues/322) | Shared terminal-capability detector (timeout-guarded tmux probe) | — |
+| 6 | [#323](https://github.com/5omeOtherGuy/iris-agent/issues/323) | CLI help/dispatch/palette text polish | — |
+
+Open design question: pager scrollbar vs text indicators
+([#326](https://github.com/5omeOtherGuy/iris-agent/issues/326)) — decision
+before code.
+
 ## Architecture work — Tier-Boundary Enforcement
 
 **Goal:** make the code match the three-tier ownership split in
