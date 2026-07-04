@@ -315,6 +315,13 @@ impl TuiUi {
         // Best-effort: a failure to negotiate the protocol must not abort startup.
         let keyboard_enhanced =
             enable_keyboard_enhancement(&mut stdout, supports_enhancement).unwrap_or(false);
+        // One-time ZWJ-shaping probe (issue #351): measure a family emoji on a
+        // scratch line while still on the normal screen -- after raw mode, before
+        // the first frame and before any alt-screen entry -- so the glyph never
+        // leaks into scrollback (inline) or the pager frame. Rich-TTY path only:
+        // `TuiUi::new` is unreachable on the --plain/non-TTY path. The verdict is
+        // recorded in `textengine` for transcript substitution and the doctor.
+        crate::ui::zwj_probe::run_startup_probe();
         // Pager mode: enter the alternate screen last (after every mode toggle
         // above), with the panic hook installed first so a panic between here
         // and shutdown always restores the normal screen before the message
