@@ -57,9 +57,10 @@ halves are never merged onto one line again:
 │    user text                                                                 │
 │    › assistant text                                                          │
 │    THINKING ▸ …                                                              │
-│    ┌ EXPLORE  src              ◆ DONE   0.0s ┐   (tool panel — bordered)      │
-│    │ …                                        │                              │
-│    └──────────────────────────────────────────┘                             │
+│    ▾ EXPLORE  src                       0.0s   (tool block — frameless)      │
+│       Read  src/lib.rs           142 lines                                   │
+│       ─────────────────────────────────────  (hairline footer rule)    │
+│       DONE                              ↑1.4k ↓38 ┊ cache 16.8k ┊ ctx +0.9%  │
 │    ●··· 0:13 ┊ ESC ┊ ↑177k ↓5.7k             (working indicator, inline)     │
 │    ── 7.6s ┊ ↑18.2k ↓846 ───────────────────  (turn divider)                │
 │                                                                              │
@@ -81,7 +82,7 @@ the terminal width.
 
 **Vertical rhythm.** Exactly **one blank line** (`--block-rhythm`, 1.5rem)
 separates every top-level block: user turn, assistant message, thinking block,
-plan, notice, each tool panel, the working indicator, and the turn divider. The
+plan, notice, each tool block, the working indicator, and the turn divider. The
 calm of the interface comes from **varying nothing else.** Never 0.5-line,
 never 2-line gaps; never a gap that depends on block type.
 
@@ -198,21 +199,17 @@ marker (see §7, §8).
 | Token | Value | Meaning |
 |---|---|---|
 | `--cell` | `1ch` | One character width — the grid unit. |
-| `--pane-indent` | `2ch` | Tool panels & composer indent from the pane edge. |
+| `--pane-indent` | `2ch` | Tool blocks & composer indent from the pane edge. |
 | `--marker-gap` | `2ch` | Assistant `›` marker → its text. |
-| `--panel-pad` | `4ch` | Tool-panel **body** left padding. |
-| `--panel-pad-y` | `0.5rem` | Compact vertical padding inside panels. |
+| body hang | `3ch` | Tool-block body/footer indent under the header (the spec's `2.5ch` snapped to the cell grid). |
 | `--block-rhythm` | `1.5rem` | The one blank line between top-level blocks. |
 | `--line` | `1.5em` | One line of vertical rhythm. |
 
-**Header/label rows** (panel headers, statusline) use `1.25ch`–`1.5ch`
-horizontal padding — tighter than the 4-cell body indent so the label column
-and the disclosure glyph sit close to the frame edge.
-
-**Golden rule:** inside a tool panel every row is exactly **one** of
-{ top border · header · separator · body · bottom border } and **all rows share
-one width**. Never merge two roles into one row; never let a body row be wider
-than the header.
+**Golden rule:** inside a tool block every row is exactly **one** of
+{ header · body · footer rule · footer } and **all rows share one width**. The
+column discipline is the design: left edges (disclosure · TOOL · body indent ·
+state label) and right edges (elapsed · op metas · diagnostics) form the two
+rails that make the transcript scan as a table without drawing one.
 
 ---
 
@@ -240,6 +237,10 @@ DIFF / TELEMETRY
   ↑  input tokens                           ↓  output / generated tokens
   ┊  soft metadata separator (NOT ASCII |)  ─  rule / frame line / statusline separator
 
+GIT / TASK (session bar + git console)
+  ⇡  commits ahead of upstream              ⇣  commits behind upstream
+  ±  uncommitted modification               [WT]  linked-worktree text tag (a label, not a glyph)
+
 METER
   ●●●○○○○○○○  context meter — 10-dot LED strip (filled muted · edge orange · empty dim)
 
@@ -251,6 +252,24 @@ FRAME (box-drawing, square corners ONLY)
 `−` for removals (never ASCII `-`); use `┊` as the soft separator (never ASCII
 `|`). A glyph is added only when it carries meaning — do not decorate.
 
+**Git/task senses (exact, one job each):**
+
+- `⇡` / `⇣` — ahead/behind the **last-fetched** upstream, git console only.
+  `↑`/`↓` remain token telemetry ONLY; never reuse them for sync state.
+- `±` — uncommitted modification relative to committed state: diff modified
+  rows, the session-bar dirty count, and user-attributed dirty files. One
+  meaning everywhere.
+- `◇` — pending / not yet settled ("exists, awaiting acceptance"): tool
+  previews AND unsettled Iris task changes (ADR-0028). One meaning.
+- `▲` conflicts / `■` detached — the existing warning/error roles paired with
+  a label (`▲2`, `■ detached @ 46b104`), never color alone.
+- `WT` — a boxed **text tag**, not a glyph, marking a linked worktree.
+  Staged/untracked counts are **words** (`1 staged · 3 untracked`); `+`/`○`
+  keep their single jobs.
+- TAB inside a create input toggles the creation **target** (branch ⇄
+  worktree). Distinct from the SlashMenu's tab-to-accept, which is a
+  completion context; a target toggle never completes text.
+
 The only raster/vector brand asset is the hero banner (`assets/hero-*.svg`),
 itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
 
@@ -261,9 +280,10 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
 - **Flat by construction.** No z-layers in the transcript; `--radius: 0`
   everywhere (square corners are intrinsic to box-drawing). No decorative
   shadows, no faux-3D, no gradients, no textures, no images (except the hero).
-- **Depth is structural.** A bordered box-drawing panel sits "above" plain
-  unboxed transcript text, which recedes. The **1px frame in the `border` role
-  is the only elevation cue** in the transcript.
+- **Depth is structural.** Tool output is unboxed text like the rest of the
+  transcript; structure comes from the block grammar (header · hanging body ·
+  hairline footer) and its two alignment rails, not from a frame. The composer
+  keeps its frame — it is the only hard chrome on screen.
 - **The one permitted shadow** is a faint cast under a genuine overlay
   (`--overlay-shadow`), which is the real top layer. Overlays sit on a
   low-opacity black scrim; the pane is otherwise fully opaque. No blur, no glass.
@@ -309,7 +329,7 @@ hierarchy from weight/case/color/marker, **never a size jump**:
 | *Italic* | Slanted (JetBrains Mono italic). |
 | `Inline code` | Cyan interactive, monospace (already monospace — color is the cue). |
 | `[link](url)` | Link blue, **dotted** underline, 2px offset. |
-| Fenced ```` ``` ```` | `CodeBlock`: quiet **left rail**, muted `lang · file` caption, ink body, horizontal scroll. **Never boxed** (a box = tool panel). |
+| Fenced ```` ``` ```` | `CodeBlock`: quiet **left rail**, muted `lang · file` caption, ink body, horizontal scroll. **Never boxed**. |
 | List `-`/`*`/`+` | Muted `•` marker column, hanging indent. |
 | List `1.` | Muted right-aligned `1.` marker column. |
 | Blockquote `>` | Muted **left rail**, muted text. |
@@ -362,55 +382,73 @@ purely conversational turns). Compact elapsed + optional token telemetry with
 
 ---
 
-## 8 · Tool-panel grammar — the four families
+## 8 · Tool-block grammar — the frameless families
 
-The **tool panel** is Iris's primary structured-output primitive and — with the
-composer — the **only** thing that gets hard chrome: a single box-drawing frame
-(1px square border, `border` role) with a header row, an optional separator, and
-a body. There are **exactly four families.** Never invent a fifth; never render
-standalone `READ` / `GREP` / `LS` / `DIFF` panels.
+The **tool block** is Iris's primary structured-output primitive. It is
+**frameless**: no border, no background, no header/body separator — unboxed
+text, like the rest of the transcript. Every block is **header · body ·
+footer**, stacked, sharing one width at the 2-cell tool indent. The transcript
+families are **EXPLORE / SHELL / EDIT** (plus the docked APPROVAL review,
+§8.5). Never invent another; never render standalone `READ` / `GREP` / `LS`
+panels.
 
-### 8.1 Shared header grammar
+### 8.1 Shared block grammar
 ```
-▾  TOOL  meta                                        SYMBOL STATE   ELAPSED
+▾ TOOL  meta                                                        ELAPSED
+   <body — hangs 3 cells under the header, unmounts when collapsed>
+   ─────────────────────────────────────────────────────────────
+   STATE  [family extras]              ↑sent ↓recv ┊ cache <n> ┊ ctx <Δ%>
 ```
-- **Disclosure glyph** `▾`/`▸` (muted) — present when the panel is foldable.
-- **TOOL** — the family name, bold uppercase (`EXPLORE`/`SHELL`/`EDIT`/`APPROVAL`).
-- **meta** — muted context (`bash ┊ ~/iris-agent`, a path, `src`), truncates
-  with `…` before it can overflow.
-- **State** — a `StateSymbol` (glyph + label) from §5; `running` pulses.
-- **Elapsed** — right-aligned compact duration (`4.1s`, `0:13`); omitted for a
-  pending `preview`.
+**Header** — disclosure `▾`/`▸` (muted) · bold uppercase family label · muted
+meta (a path, scope, or the shell command), truncating with `…` · right edge
+carries **only the elapsed time** (omitted for a pending `preview`). No state
+symbol in the header.
 
-`ctrl+o` toggles the **latest** foldable panel; in scrollback focus (Tab) the
-selected panel folds via Left/Right/Enter. Mouse clicks never fold — in-app
-click interaction is deliberately not implemented (only the wheel is
-consumed). Collapsed = a capped preview + an elided-lines affordance
-(`… N lines hidden   ctrl+o to expand`).
+**Footer** — the block's last row, always visible, opened by a muted hairline
+rule from the body indent to the right rail. Left edge: the **state as label
+only** (`DONE` / `ERROR` / `PREVIEW` / `RUNNING` / `CANCELLED`), bold
+uppercase, colored by state — **no glyph**. After it, `┊`-joined family
+extras (EDIT counts + note, SHELL `EXIT <code>` + result meta). Right-bound:
+the optional token diagnostics cluster, all muted, honest (rendered only when
+measured). The `┊` law: only BETWEEN sibling fields, one space each side,
+never leading/trailing, never after the state label — fields are joined
+programmatically so a missing field can never leave a dangling `┊`.
 
-The status glyph column is fixed across all four families: label field 13
-cells, elapsed right-aligned in 8, two-cell right pad — `◆`/`■`/`◇`/`●`
-always land in the same column.
+**Disclosure** — binary, whole-block. Expanded (`▾`) = header + body +
+footer; collapsed (`▸`) = header + footer, exactly two rows, body
+**unmounted** — no partial preview, no elision affordance. **Compact by
+default**: every foldable block **arrives collapsed** regardless of body
+size (the two rows still answer *what ran · on what · how long · outcome ·
+cost*). Two exceptions: a **running** block stays expanded on its bounded
+live tail (it collapses when it finalizes unless the user explicitly
+expanded it), and a **pending EDIT preview** (`◇ PREVIEW`) arrives expanded
+for review (it collapses once applied). `ctrl+o` toggles **all** foldable
+blocks at once — tool blocks and thinking rails: if any is collapsed it
+expands them all, otherwise it collapses them all. A **click on a block's
+header row** toggles that one block. State is per-block; an explicit user
+expand/collapse survives the block's in-place rebuilds.
 
-`/find` searches canonical transcript content — folded panel bodies included,
-collapsed head/tail previews and fold affordance rows excluded. Jumping to a
-match inside a folded panel expands it; the newest match stays clear of the
-find indicator row.
+`/find` searches canonical transcript content — the body of a collapsed block
+is searched even though it is unmounted from the view. Jumping to a match
+inside a collapsed block expands it; the newest match stays clear of the find
+indicator row.
 
 ### 8.2 EXPLORE — read / grep / list / find
 The **single container** for every read-side op. Each op is **one row**:
 ```
-VERB   target [code][after]                                   meta(count)
+VERB  target [code][after]                                    meta(count)
 ```
 - `verb` (fixed 5-cell column, medium weight): `Read` · `Grep` · `List` · `Find`.
 - `target` ink path; `code` cyan (a grep pattern); `after` muted (` in src/…`).
-- `meta` muted right-aligned count (`142 lines`, `3 matches · 2 files`).
+- `meta` muted count, right-bound at the block's right rail (`142 lines`,
+  `3 matches · 2 files`).
 
-Never break a read op into its own panel — batch them here.
+Never break a read op into its own block — batch them here. The EXPLORE footer
+is state + diagnostics only (no family extras).
 
 ### 8.3 SHELL — command execution
-Body line types, in the recessive order below (the command is brightest, output
-recedes):
+Header meta is the command. Body line types, in the recessive order below (the
+command is brightest, output recedes):
 
 | `type` | Rendering |
 |---|---|
@@ -419,20 +457,20 @@ recedes):
 | `err` | **Danger** red (stderr). |
 | `note` | Muted aside. |
 
-A live command shows the inline **working indicator** in the body and **no
-result row yet**. A finished command ends with a hairline-ruled **exit row**:
-```
-◆ EXIT 0   ┊ 142 passed · 0 failed        (done — green ◆)
-■ EXIT 101 ┊ 1 error · compile failed      (error — red ■)
-```
-The exit row is symbol + `EXIT <code>` label + muted meta. Long output folds to
-a capped preview (§8.1).
+A live command streams a bounded tail in the body (with an honest
+`… N earlier lines hidden` marker) and has **no exit field yet**. A finished
+command reports its status in the **footer**: `EXIT <code>` (bold, uppercase,
+muted) then the honest result meta as a sibling field —
+`DONE  EXIT 0 ┊ 142 passed` / `ERROR  EXIT 101 ┊ cargo bench failed`. The
+footer state comes from the result (`exit 0` → done, else error); an unknown
+exit status is omitted, never guessed.
 
 ### 8.4 EDIT — mutation & diff preview
 **One canonical body:** the wrapped **block diff** (`DiffBlock`) for every file
-type (code, prose, config, markdown), plus an optional quiet `+add −del ┊ note`
-footer. Use `state="preview"` (`◇`, **no elapsed**) for a pending apply;
-`state="done"` (`◆`) once applied.
+type (code, prose, config, markdown). The footer carries the counts as ONE
+field (`+n` add-ink, `−n` del-ink, 1ch apart) plus a muted note (`new file`).
+Use `state="preview"` (**no elapsed**) for a pending apply; `state="done"`
+once applied.
 
 ### 8.5 APPROVAL — authorization review
 Compact. The **header carries the decision** (`▲ REVIEW` · `◆ APPROVED` · `■
@@ -471,14 +509,65 @@ background fill, no color bar.
 ────────────────────────────────────────────────────────────────────
 ```
 
-- **Left:** `<cwd> ┊ git <branch>` — cwd in body ink, `┊` and `git <branch>`
-  dim. Paths middle-ellipsize (never break; the project name survives). In a
-  worktree, the worktree path is the cwd.
+- **Left:** `<cwd> ┊ git <branch> [state cluster]` — cwd in body ink, `┊` and
+  `git <branch>` dim. Paths middle-ellipsize (never break; the project name
+  survives). In a worktree, the worktree path is the cwd and a dim `[WT]` tag
+  follows the cluster.
+- **State cluster** (mutually exclusive base states, precedence order):
+  1. unmerged `▲N` (orange) — overrides everything until resolved;
+  2. task-partitioned `±N ◇M` — `±N` orange = user-attributed dirty files,
+     `◇M` dim = Iris-unsettled ledger files; either half omitted at zero;
+  3. plain dirty `±N` (orange) — one number, no task;
+  4. clean — no glyph. Silence is the signal.
+  Detached HEAD renders `■ detached @ <short-sha>` in place of the branch. No
+  `⇡⇣` at rest — sync is git-console detail.
 - **Right, right-aligned:** `CTX <used>/<cap>` + the 10-dot LED meter. `CTX`
   and `/<cap>` dim; `<used>` body ink. Unknown context window: `CTX <used>`
   with no meter.
-- **Narrow widths, drop in order:** meter → `/<cap>` → branch →
-  middle-truncate the cwd harder. Minimum form: cwd alone.
+- **Narrow widths, drop in order:** meter → `/<cap>` → counts (`±2 ◇3` →
+  `±`) → `WT` tag → whole git segment → middle-truncate the cwd harder.
+  Minimum form: cwd alone.
+
+#### 9.1.1 SessionBar disclosures — the directory tree & the git console
+
+Two momentary dropdowns share one slot under the bar: the **directory tree**
+(from the cwd; `/tree`, or `@` as the first character of an empty composer —
+opens straight into filter mode) and the **git console** (from the git
+segment; `ctrl-g` or `/git`). They are **top chrome, not overlays**: rows
+render between the bar and its soft hairline (which becomes the closing rule),
+pushing the transcript down — plain `bg`, no box, no shadow, no scrim. At most
+one is open; opening one closes the other; a docked modal or approval closes
+both. A dim `▾ ` prefixes the open dropdown's segment only while it is open.
+Height caps at 16 rows or ⅓ of the pane.
+
+- **Focus:** `Editor < Palette < SessionMenu < Modal`. While open the dropdown
+  owns keys; `esc` closes it and never reaches the turn-interrupt path. The
+  **list-state law**: while a LIST has focus there is no free typing —
+  single-letter commands (`a r n w s /`) are legal only there; any INPUT row
+  (filter, create) makes printable keys text, always.
+- **While a turn runs** dropdowns open as READOUTS: rows dim, every mutating
+  key is a no-op, and the footer reads `● agent running ┊ read-only — actions
+  return when idle ┊ esc`.
+- **Git console** = the settlement surface for ADR-0028 tasks: a dim status
+  line (`main → origin/main ┊ ±2 yours · 1 staged · 3 untracked ┊ ⇡2 ┊ stash
+  1 ┊ 3h ago`), a TASK group (`a accept ┊ r roll back` — `r` swaps in the
+  restore-point sublist from `restore_points()`), a SWITCH list (≤8 recent
+  branches, `[WT]` rows redirect to "open session there"), and a WORKTREES
+  board with `◇ unsettled · <age>` badges. Switching with dirt confirms first
+  (settle / stash / carry); conflicts disable switching. `n`/`w` create a
+  branch/worktree from the selected base — TAB toggles the target, validation
+  gates `↵`, and the resolved worktree path (config `worktreeRoot`, default
+  `../wt`) is always visible before create. Settlement goes through the
+  existing `GitSafety` API only.
+- **Directory tree**: breadcrumb (parents dim, clickable re-root up), 2-cell
+  indent per level, `▾`/`▸` disclosure on dirs — no box-drawing tree guides.
+  Attribution metas from the task partition: `◇ iris` dim, `± yours` orange,
+  `◉ open` for the composer-referenced file. `↵` on a file inserts
+  `@<relative-path>` into the composer; `/` filters flat (parent path as dim
+  meta). Data: `git ls-files --cached --others --exclude-standard`, plain
+  readdir outside a repo; 500 visible rows, then a dim `… N more` row.
+- These are **disclosures, not sidebars**: invariant #1 stands — nothing
+  persistent, nothing beside the transcript.
 
 ### 9.2 The composer
 
@@ -628,8 +717,8 @@ starts the session with it.
 2. **One blank line** between every top-level block. No other gap value.
 3. **Shared measure.** Panels + composer share one width and a 2-cell indent;
    transcript text shares one column.
-4. **Panel rows** are each exactly one of {top·header·separator·body·bottom} and
-   all share one width; no row overflows the frame.
+4. **Block rows** are each exactly one of {header·body·footer rule·footer} and
+   all share one width; no row overflows the block's rails.
 5. **Four tool families only.** No standalone READ/GREP/LS/DIFF panels.
 6. **Chrome is for tools.** Conversation, thinking, plans, and notices are never
    boxed. Boxes are never used for prose.
@@ -649,7 +738,7 @@ starts the session with it.
 
 - ✗ A role card / bubble / avatar for user or assistant messages.
 - ✗ A colored left-border accent on active rows (use the `surface` fill).
-- ✗ Boxing a code block, a plan, or a notice (that reads as a tool panel).
+- ✗ Boxing a code block, a plan, a notice, or tool output — nothing in the transcript is boxed.
 - ✗ A braille spinner, a rainbow/percentage meter, or an animated progress bar.
 - ✗ A larger font, all-caps prose, or bold-for-emphasis to signal importance.
 - ✗ Emoji, gradients, rounded corners, drop shadows in the transcript, glass/blur.

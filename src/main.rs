@@ -16,6 +16,7 @@ mod approval;
 mod cli;
 mod config;
 mod errors;
+mod git;
 mod handles;
 mod mimir;
 mod nexus;
@@ -118,16 +119,6 @@ fn dispatch() -> Result<()> {
             if command == "login" && provider == "anthropic" && flag == "--api-key" =>
         {
             login_api_key(mimir::selection::ProviderId::Anthropic)
-        }
-        [command, provider, flag]
-            if command == "login" && provider == "openai" && flag == "--api-key" =>
-        {
-            login_api_key(mimir::selection::ProviderId::OpenAi)
-        }
-        [command, provider, flag]
-            if command == "login" && provider == "openai-compatible" && flag == "--api-key" =>
-        {
-            login_api_key(mimir::selection::ProviderId::OpenAiCompatible)
         }
         [command] if command == "update" => update_agent(),
         [command] if command == "help" || command == "--help" || command == "-h" => {
@@ -839,8 +830,8 @@ fn print_help() {
     eprintln!("  iris resume                       Pick a session to resume (picker on a TTY)");
     eprintln!("  iris resume <session-id>          Resume a prior session by id");
     eprintln!("    (in-session: /resume picks a session, /new starts a fresh one)");
+    eprintln!("    (all resume forms accept --plain)");
     eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
-    eprintln!("  iris login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
     eprintln!("  iris login openai                 Store an OpenAI API key");
     eprintln!("  iris login openai-compatible      Store an OpenAI-compatible API key");

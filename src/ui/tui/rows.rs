@@ -5,8 +5,9 @@ use ratatui::text::{Line, Span};
 
 use super::component::Component;
 use super::panel::{
-    apply_width_bg, inset_rule_line, panel_body_content_width, panel_body_line, panel_body_lines,
-    panel_header_line, panel_rule_line, rail_header_line,
+    apply_width_bg, footer_rule_line, inset_rule_line, panel_body_content_width, panel_body_line,
+    panel_body_lines, panel_footer_content_width, panel_footer_line, panel_header_line,
+    rail_header_line,
 };
 use super::wrap::{
     display_width, line_text, pad_line_left, pad_line_right, push_wrapped_line,
@@ -102,6 +103,11 @@ impl TranscriptRow {
     /// `ui::tui` modules can append rows without a trait import.
     pub(super) fn render_rows(&self, width: usize, out: &mut Vec<Line<'static>>) {
         if let Some(chrome) = &self.chrome {
+            // Block boundary markers are structural only: a frameless block
+            // draws no top or bottom border row.
+            if matches!(chrome, ChromeRow::BlockStart | ChromeRow::BlockEnd) {
+                return;
+            }
             if let ChromeRow::Body { line, bg } = chrome {
                 panel_body_lines(width, line.clone(), *bg, out);
                 return;
@@ -199,15 +205,32 @@ impl Component for TranscriptRow {
 
 #[derive(Clone)]
 pub(super) enum ChromeRow {
-    Top,
+    /// Start-of-block marker. Renders nothing (frameless blocks have no top
+    /// border); bounds the block for trim/replace logic and resets fold state.
+    BlockStart,
+    /// The frameless block header: `▾ TOOL  meta … elapsed`. The right edge
+    /// carries ONLY the elapsed time; state lives in the footer.
     Header {
         expanded: bool,
         title: &'static str,
         meta: String,
-        right: Vec<(String, Style)>,
+        elapsed: String,
     },
-    Separator,
-    Bottom,
+    /// The hairline rule that opens the always-visible block footer.
+    FooterRule,
+    /// The block footer row: state label (+ family extras) left, right-bound
+    /// dim diagnostics. Always visible, expanded or collapsed. `diag_call` tags
+    /// the tool call whose footer this is, so a following provider turn can
+    /// locate and patch the right-bound `↑/cache/ctx` diagnostics in place
+    /// (forward attribution); `None` for non-tool footers (task diff, denials).
+    Footer {
+        left: Line<'static>,
+        right: String,
+        diag_call: Option<String>,
+    },
+    /// End-of-block marker. Renders nothing; the footer is the last visible
+    /// row of a block.
+    BlockEnd,
     Body {
         line: Line<'static>,
         bg: Option<Color>,
@@ -252,15 +275,29 @@ pub(super) enum ChromeRow {
 impl ChromeRow {
     pub(super) fn render(&self, width: usize) -> Line<'static> {
         match self {
-            ChromeRow::Top => panel_rule_line(width, '┌', '┐'),
+            // Structural markers; render_rows short-circuits before this.
+            ChromeRow::BlockStart | ChromeRow::BlockEnd => Line::default(),
             ChromeRow::Header {
                 expanded,
                 title,
                 meta,
-                right,
-            } => panel_header_line(width, *expanded, title, meta, right),
-            ChromeRow::Separator => panel_rule_line(width, '├', '┤'),
-            ChromeRow::Bottom => panel_rule_line(width, '└', '┘'),
+                elapsed,
+            } => panel_header_line(width, *expanded, title, meta, elapsed),
+            ChromeRow::FooterRule => footer_rule_line(width),
+            // The state label (and family extras) always win the footer row:
+            // when the optional diagnostics cluster does not fit, it is
+            // dropped rather than displacing the left side.
+            ChromeRow::Footer { left, right, .. } => {
+                let content_width = panel_footer_content_width(width);
+                let left_w = display_width(&line_text(left));
+                let right_w = display_width(right);
+                let line = if right.is_empty() || left_w + 1 + right_w > content_width {
+                    left.clone()
+                } else {
+                    right_aligned_line(left.clone(), right, dim_style(), content_width)
+                };
+                panel_footer_line(width, line)
+            }
             ChromeRow::Body { line, bg } => panel_body_line(width, line.clone(), *bg),
             ChromeRow::BodyRight {
                 left,
@@ -301,6 +338,43 @@ impl ChromeRow {
             } => rail_header_line(width, *expanded, *foldable, label, right),
             ChromeRow::RailEnd => Line::default(),
         }
+    }
+}
+
+/// Which side survives when `left` and `right` cannot both fit in `width`.
+pub(super) enum Overflow {
+    /// Drop `left` entirely, keep `right` hugging the right edge (tool-panel
+    /// fold affordances / metadata).
+    DropLeft,
+    /// Keep `left` in full, drop `right` (the transcript fold hint).
+    KeepLeft,
+}
+
+/// Pad `left` so `right` hugs the right edge of a `width`-column field, keeping
+/// at least `min_gap` blank columns between them. When they cannot both fit,
+/// `overflow` decides which side survives. The single string right-align helper,
+/// unifying the former `tool_render::right_align_hint` (`DropLeft` with a
+/// one-column min gap) and `transcript::right_align_pair` (`KeepLeft` with a
+/// two-column min gap) -- which did not render identically, differing in exactly
+/// this overflow policy.
+pub(super) fn right_align(
+    left: &str,
+    right: &str,
+    width: usize,
+    min_gap: usize,
+    overflow: Overflow,
+) -> String {
+    let left_w = display_width(left);
+    let right_w = display_width(right);
+    if left_w + min_gap + right_w <= width {
+        let gap = (width - left_w - right_w).max(min_gap);
+        return format!("{left}{}{right}", " ".repeat(gap));
+    }
+    match overflow {
+        Overflow::DropLeft => {
+            format!("{}{right}", " ".repeat(width.saturating_sub(right_w)))
+        }
+        Overflow::KeepLeft => left.to_string(),
     }
 }
 
@@ -404,5 +478,50 @@ pub(super) fn row_text_padding(row: &TranscriptRow) -> usize {
         0
     } else {
         TEXT_COLUMN_X_PADDING
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn right_align_pads_right_when_both_fit() {
+        // Both sides fit: `right` hugs the edge, `left` stays put.
+        let out = right_align("left", "right", 20, 1, Overflow::DropLeft);
+        assert_eq!(display_width(&out), 20);
+        assert!(out.starts_with("left"));
+        assert!(out.ends_with("right"));
+        // At least `min_gap` blank columns separate them.
+        assert!(out.contains("left") && out.contains("  "));
+    }
+
+    #[test]
+    fn right_align_drop_left_policy_keeps_right_on_overflow() {
+        // Too narrow for both: DropLeft discards `left`, right-aligns `right`.
+        let out = right_align("a-very-long-left", "hint", 8, 1, Overflow::DropLeft);
+        assert_eq!(out, "    hint");
+        assert!(!out.contains("long"));
+    }
+
+    #[test]
+    fn right_align_keep_left_policy_drops_right_on_overflow() {
+        // Too narrow for both: KeepLeft returns `left` unchanged, drops `right`.
+        let out = right_align("a-very-long-left", "hint", 8, 2, Overflow::KeepLeft);
+        assert_eq!(out, "a-very-long-left");
+    }
+
+    #[test]
+    fn right_align_min_gap_governs_the_overflow_threshold() {
+        // left=5, right=3, width=9. DropLeft (min_gap 1): 5+1+3=9 <= 9 -> fits.
+        assert_eq!(
+            right_align("lllll", "rrr", 9, 1, Overflow::DropLeft),
+            "lllll rrr"
+        );
+        // KeepLeft (min_gap 2): 5+2+3=10 > 9 -> overflow, keep left only.
+        assert_eq!(
+            right_align("lllll", "rrr", 9, 2, Overflow::KeepLeft),
+            "lllll"
+        );
     }
 }

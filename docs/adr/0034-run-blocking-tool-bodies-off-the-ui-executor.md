@@ -1,4 +1,4 @@
-# ADR-0032: Run blocking tool bodies off the UI executor with channel-bridged streaming
+# ADR-0034: Run blocking tool bodies off the UI executor with channel-bridged streaming
 
 **Date**: 2026-07-04
 **Status**: accepted (extends ADR-0002; amends ADR-0008's bash state ownership)

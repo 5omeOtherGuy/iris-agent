@@ -116,7 +116,7 @@ impl ScrollState {
     }
 
     /// The viewport-top line index for the current frame.
-    fn top(&self) -> usize {
+    pub(super) fn top(&self) -> usize {
         if self.follow {
             self.max_top()
         } else {
@@ -376,7 +376,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     let width = size.width.max(1);
     let height = usize::from(size.height.max(1));
 
-    let bar = session_bar_lines(screen, width);
+    let bar = session_bar_lines(screen, width, size.height.max(1));
     let bar_rows = bar.len().min(height);
 
     // Bottom-pinned tail: blank-padded working indicator + composer chrome
@@ -866,8 +866,8 @@ mod tests {
         screen.move_selection(1);
         assert_eq!(screen.selected_entry, Some(headers[1]));
 
-        // Reveal/fold the selected panel (tool panels start collapsed to the
-        // capped preview).
+        // Reveal/fold the selected block. These over-budget bodies arrive
+        // collapsed (the flood guard); collapsed = header + footer only.
         assert!(screen.set_selected_expanded(true));
         assert!(!screen.set_selected_expanded(true), "already revealed");
         assert!(screen.toggle_selected_entry(), "toggle folds back");

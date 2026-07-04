@@ -10,14 +10,120 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
 use super::{
     Baseline, Chain, CheckpointChain, GitSafety, IrisChange, KEEP_CHECKPOINTS, Mode, RestorePoint,
-    RollbackOutcome, Task, baseline, checkpoint, git, task_state,
+    RollbackOutcome, Settlement, Task, baseline, checkpoint, git, lock, push_session_deduped,
+    task_state,
 };
+
+/// How a persisted record classifies during recovery (ADR-0030). Leased (live
+/// foreign) records never reach this enum -- they are skipped before classifying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskClass {
+    /// Lease-free and lock-protocol-stamped: a crashed orphan safe to adopt.
+    Recoverable,
+    /// No lock metadata (predates the lease protocol): unknown, never
+    /// auto-adopted (ADR-0030). Explicit selection required.
+    Legacy,
+}
+
+/// A record surfaced to recovery: a crashed orphan or an unknown-legacy record.
+/// Live foreign (leased) tasks are never included. The #288 resume-task picker
+/// (Tier 3) renders these rows, so the display payload (`body`/`sessions`) is
+/// surfaced alongside the recovery seam fields. `body`/`sessions` are opaque
+/// display copy (ADR-0031): recovery classification never branches on them.
+#[derive(Debug, Clone)]
+pub(crate) struct RecoverableTask {
+    pub(crate) task_id: String,
+    // `workspace` is part of the recovery seam spec (#285); it is surfaced (and
+    // asserted by tests) but the picker does not render it -- rows are already
+    // workspace-scoped -- so no production code reads it yet.
+    #[allow(dead_code)]
+    pub(crate) workspace: String,
+    /// Age since the record was last updated, for notice wording / picker order.
+    pub(crate) age: Duration,
+    /// Opaque display body (ADR-0031): the prompt preview of the turn that
+    /// opened the task, or `None` for a legacy record with no recorded body.
+    pub(crate) body: Option<String>,
+    /// Opaque display join (ADR-0031): the session ids that worked this task.
+    /// The picker shows `sessions.len()` as the linked-session count.
+    pub(crate) sessions: Vec<String>,
+    /// Recovery classification (ADR-0030). The picker does not branch on it
+    /// (rows are rendered from `body`/`sessions`); recovery policy does.
+    pub(crate) class: TaskClass,
+}
+
+impl RecoverableTask {
+    /// Whether this record predates the lease protocol (ADR-0030): an unknown
+    /// record adoptable only by explicit selection, marked as legacy in the UI.
+    /// Display-only classification; recovery policy uses the private [`TaskClass`]
+    /// directly and never this bool.
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self.class, TaskClass::Legacy)
+    }
+}
+
+#[cfg(test)]
+impl RecoverableTask {
+    /// Construct a recoverable row for Tier-3 unit tests (`ui::picker`) without a
+    /// repo. Fixed to the `Recoverable` class -- the picker renders body / age /
+    /// sessions and never branches on the class -- so tests do not need to name
+    /// the git-safety-private [`TaskClass`].
+    pub(crate) fn for_test(
+        task_id: &str,
+        age: Duration,
+        body: Option<&str>,
+        sessions: &[&str],
+    ) -> Self {
+        RecoverableTask {
+            task_id: task_id.to_string(),
+            workspace: "/proj".to_string(),
+            age,
+            body: body.map(str::to_string),
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+            class: TaskClass::Recoverable,
+        }
+    }
+
+    /// Construct a legacy row (no recorded body, `Legacy` class) for Tier-3 unit
+    /// tests that need the legacy marker without naming the private [`TaskClass`].
+    pub(crate) fn for_test_legacy(task_id: &str, age: Duration) -> Self {
+        RecoverableTask {
+            task_id: task_id.to_string(),
+            workspace: "/proj".to_string(),
+            age,
+            body: None,
+            sessions: Vec::new(),
+            class: TaskClass::Legacy,
+        }
+    }
+}
+
+/// The outcome of adopting a recoverable task, surfaced to Tier 3 (#288). Maps
+/// the internal [`PersistedTask`](task_state::PersistedTask) to just the opaque
+/// display payload the adoption notice / "also resume" offer needs, so the
+/// private record type never leaks past the `Harness`.
+#[derive(Debug, Clone)]
+pub(crate) struct AdoptedTask {
+    pub(crate) task_id: String,
+    pub(crate) body: Option<String>,
+    pub(crate) sessions: Vec<String>,
+}
+
+/// What resume/startup recovery decided (ADR-0030/ADR-0031 policy), returned to
+/// Tier 3 so the >1/legacy case opens the picker instead of only printing a
+/// notice. `None` = nothing recoverable; `Notice` = the single-orphan auto-adopt
+/// (unchanged UX); `Picker` = explicit selection required over these rows.
+#[derive(Debug)]
+pub(crate) enum RecoveryOutcome {
+    None,
+    Notice(String),
+    Picker(Vec<RecoverableTask>),
+}
 
 impl GitSafety {
     /// Restore points offered by the rollback UI (Tier 3): the pre-task baseline
@@ -57,40 +163,54 @@ impl GitSafety {
 
     /// Settle the current task as ACCEPTED (ADR-0028): freeze the ledger, GC the
     /// intermediate checkpoints keeping the last N, and drop the recovery record
-    /// so the accepted work is no longer offered for rollback. Returns a one-line
-    /// summary, or `None` when no task is active.
-    pub(crate) fn accept(&self) -> Option<String> {
+    /// so the accepted work is no longer offered for rollback. Returns the
+    /// settled task id plus a one-line summary (ADR-0031: the harness appends a
+    /// `TaskSettled` audit entry from the id), or `None` when no task is active.
+    pub(crate) fn accept(&self) -> Option<Settlement> {
         self.sync_barrier();
         let mut state = self.state.lock().unwrap();
         let task = state.task.take()?;
         let count = task.ledger.entries.len();
+        // Keep the task lease held (`_lease`) through the whole teardown: while it
+        // is held no other process can adopt or checkpoint this task, closing the
+        // TOCTOU window between settling and record removal (ADR-0030).
         let Task {
             mut chain,
             git_dir,
             task_id,
+            _lease,
             ..
         } = task;
-        match &mut chain {
+        let gc_chain = |chain: &mut Chain| match chain {
             Chain::Git(chain) => {
                 if let Err(error) = chain.gc(KEEP_CHECKPOINTS) {
                     tracing::warn!(error = %format!("{error:#}"), "checkpoint GC on accept failed");
                 }
             }
             Chain::Fallback(store) => store.gc(KEEP_CHECKPOINTS),
-        }
+        };
+        // Serialize the ref GC + record removal against concurrent processes
+        // (ADR-0030): one short mutation-lock hold around the shared writes.
         if let Some(git_dir) = git_dir {
-            task_state::remove(&git_dir, &task_id);
+            lock::with_mutation_lock(&git_dir, || {
+                gc_chain(&mut chain);
+                task_state::remove(&git_dir, &task_id);
+            });
+        } else {
+            gc_chain(&mut chain);
         }
-        Some(format!(
-            "accepted {count} Iris change(s); checkpoints pruned"
-        ))
+        drop(_lease);
+        Some(Settlement {
+            summary: format!("accepted {count} Iris change(s); checkpoints pruned"),
+            task_id,
+        })
     }
 
     /// Record an explicit user checkpoint (the `/checkpoint` command) and settle
     /// the task like accept, so the next mutation opens a fresh baseline
-    /// (ADR-0028: an explicit checkpoint command freezes the ledger). Returns a
-    /// summary, or `None` when no task is active.
-    pub(crate) fn checkpoint_now(&self) -> Option<String> {
+    /// (ADR-0028: an explicit checkpoint command freezes the ledger). Returns the
+    /// settled task id plus a summary, or `None` when no task is active.
+    pub(crate) fn checkpoint_now(&self) -> Option<Settlement> {
         self.sync_barrier();
         {
             let mut state = self.state.lock().unwrap();
@@ -101,8 +221,10 @@ impl GitSafety {
                 let _ = chain.checkpoint(turn, None, "explicit checkpoint".to_string());
             }
         }
-        self.accept()
-            .map(|_| "checkpoint saved; task settled".to_string())
+        self.accept().map(|settled| Settlement {
+            summary: "checkpoint saved; task settled".to_string(),
+            task_id: settled.task_id,
+        })
     }
 
     /// Roll back the current task to restore point `seq` (0 = pre-task baseline):
@@ -116,10 +238,13 @@ impl GitSafety {
         let Some(task) = state.task.take() else {
             return Ok(RollbackOutcome {
                 summary: "no active Iris task to roll back".to_string(),
+                settled_task_id: None,
                 index_warning: None,
                 preserved_notices: Vec::new(),
             });
         };
+        // Keep the task lease held (`_lease`) through teardown so no concurrent
+        // recovery can adopt this task while it is being rolled back (ADR-0030).
         let Task {
             mut chain,
             git_dir,
@@ -127,6 +252,7 @@ impl GitSafety {
             baseline,
             ledger,
             turn,
+            _lease,
             ..
         } = task;
         let mut index_warning = None;
@@ -159,17 +285,27 @@ impl GitSafety {
                 }
                 chain.rollback_to_excluding(seq, &excluded)?;
                 index_warning = self.restore_user_index(&baseline.index);
-                if let Err(error) = chain.destroy() {
-                    tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on rollback failed");
+                // Serialize the ref destroy against concurrent processes
+                // (ADR-0030); the held lease already blocks any adopt.
+                let destroy = |chain: &mut CheckpointChain| {
+                    if let Err(error) = chain.destroy() {
+                        tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on rollback failed");
+                    }
+                };
+                match git_dir.as_ref() {
+                    Some(gd) => lock::with_mutation_lock(gd, || destroy(chain)),
+                    None => destroy(chain),
                 }
             }
             Chain::Fallback(store) => store.rollback_to(seq)?,
         }
         if let Some(git_dir) = git_dir {
-            task_state::remove(&git_dir, &task_id);
+            lock::with_mutation_lock(&git_dir, || task_state::remove(&git_dir, &task_id));
         }
+        drop(_lease);
         Ok(RollbackOutcome {
             summary: format!("rolled back {count} Iris change(s) to restore point {seq}"),
+            settled_task_id: Some(task_id),
             index_warning,
             preserved_notices,
         })
@@ -224,44 +360,193 @@ impl GitSafety {
         }
     }
 
-    /// On resume or a new session in the same repo (ADR-0028): expire stale
-    /// unsettled tasks (auto-settle accepted, GC refs) and, for a live unsettled
-    /// task whose disk diverged from the op-log, append a recovery checkpoint,
-    /// rehydrate it as the active task so a post-restart `/rollback` / `/accept`
-    /// / `/checkpoint` operates on the real chain, and return a one-line notice
-    /// for the event stream. `None` when nothing is unsettled. Lazy: called at
-    /// startup/resume, no daemon.
-    pub(crate) fn recover_and_expire(&self) -> Option<String> {
+    /// On resume or a new session in the same repo: reconcile the unsettled tasks
+    /// this process may adopt and surface a one-line notice for the event stream.
+    /// Composes the ADR-0030 recovery policy from the three seams below:
+    /// [`expire_stale`](Self::expire_stale) sweeps stale records, then
+    /// [`recoverable_tasks`](Self::recoverable_tasks) classifies the rest
+    /// (leased/live-foreign records are skipped). Exactly one lease-free
+    /// non-legacy orphan preserves the current auto-adopt UX via
+    /// [`adopt_task`](Self::adopt_task); more than one, or any unknown-legacy
+    /// record, requires explicit selection: Tier 3 opens the resume-task picker
+    /// over the recoverable rows (#288). `None` when nothing is recoverable. A
+    /// `Notice` always names the record actually adopted, fixing the ADR-0030
+    /// notice/adopt mismatch. Lazy: called at startup/resume, no daemon.
+    pub(crate) fn recover_and_expire(&self) -> RecoveryOutcome {
         if !matches!(self.mode, Mode::Git) {
-            return None;
+            return RecoveryOutcome::None;
         }
-        let git_dir = task_state::git_dir(&self.workspace)?;
+        let Some(git_dir) = task_state::git_dir(&self.workspace) else {
+            return RecoveryOutcome::None;
+        };
+        let now = SystemTime::now();
+        self.expire_stale(&git_dir, now);
+        let recoverable = self.recoverable_tasks();
+        if recoverable.is_empty() {
+            return RecoveryOutcome::None;
+        }
+        let adoptable: Vec<&RecoverableTask> = recoverable
+            .iter()
+            .filter(|task| task.class == TaskClass::Recoverable)
+            .collect();
+        let has_legacy = recoverable
+            .iter()
+            .any(|task| task.class == TaskClass::Legacy);
+        if adoptable.len() == 1 && !has_legacy {
+            // Preserve the current UX: auto-adopt the single orphan, naming the
+            // record actually adopted in the notice.
+            return match self.adopt_task(&adoptable[0].task_id) {
+                Some(record) => RecoveryOutcome::Notice(record.recovery_notice(now)),
+                None => RecoveryOutcome::None,
+            };
+        }
+        // More than one orphan, or any unknown-legacy record: explicit selection
+        // is required (ADR-0030). Tier 3 opens the resume-task picker over these
+        // rows (#288) instead of auto-adopting.
+        RecoveryOutcome::Picker(recoverable)
+    }
+
+    /// Expire stale unsettled tasks in this workspace (ADR-0028 30-day window):
+    /// each auto-settles as accepted and its `refs/iris/*` refs are GC'd -- by
+    /// then the changes are the user's de facto working state. Each record's
+    /// teardown runs under the repo mutation lock so it never tears against a
+    /// concurrent write (ADR-0030).
+    pub(super) fn expire_stale(&self, git_dir: &Path, now: SystemTime) {
+        let workspace = self.workspace.to_string_lossy().into_owned();
+        for task in task_state::load_all(git_dir) {
+            if task.workspace != workspace {
+                continue;
+            }
+            if !task.is_expired(now, task_state::DEFAULT_EXPIRY) {
+                continue;
+            }
+            // Never touch a live foreign task, even an old one (ADR-0030): claim
+            // its lease non-blocking first. A held lease means a live process
+            // still owns it -- skip. For a legacy record with no lease file the
+            // claim creates and takes it (lease-free), so legacy expiry still
+            // works. Holding the claimed lease through teardown also blocks a
+            // concurrent adopt of this orphan mid-delete.
+            let lease = match lock::try_exclusive(&lock::lease_path(git_dir, &task.task_id)) {
+                Ok(Some(guard)) => guard,
+                _ => continue,
+            };
+            lock::with_mutation_lock(git_dir, || {
+                let _ = checkpoint::destroy_task_refs(&self.workspace, &task.task_id);
+                task_state::remove(git_dir, &task.task_id);
+            });
+            drop(lease);
+        }
+    }
+
+    /// Enumerate this workspace's unsettled records and classify each (ADR-0030).
+    /// A **leased** record is a live foreign task -- skipped, never returned, so
+    /// a caller can never adopt or checkpoint a task another process owns. A
+    /// **lease-free, lock-protocol** record is a recoverable orphan; a record
+    /// with no lock metadata is unknown-**legacy**. Returns the recoverable +
+    /// legacy records only. This is the seam the #288 resume picker plugs into.
+    pub(crate) fn recoverable_tasks(&self) -> Vec<RecoverableTask> {
+        if !matches!(self.mode, Mode::Git) {
+            return Vec::new();
+        }
+        let Some(git_dir) = task_state::git_dir(&self.workspace) else {
+            return Vec::new();
+        };
         let now = SystemTime::now();
         let workspace = self.workspace.to_string_lossy().into_owned();
-        let mut notice = None;
+        let mut out = Vec::new();
         for task in task_state::load_all(&git_dir) {
             if task.workspace != workspace {
                 continue;
             }
-            if task.is_expired(now, task_state::DEFAULT_EXPIRY) {
-                let _ = checkpoint::destroy_task_refs(&self.workspace, &task.task_id);
-                task_state::remove(&git_dir, &task.task_id);
+            // Never list a live foreign task: probe the record's lease FIRST. If
+            // any process holds it the task is live and owned elsewhere -- skip
+            // it regardless of protocol. A legacy record another process has
+            // adopted holds its lease while still reading lock_protocol=None, so
+            // classifying before the lease check would wrongly list it
+            // (ADR-0030/0031 invariant: leased tasks are never listed).
+            if !lock::is_lease_free(&lock::lease_path(&git_dir, &task.task_id)) {
                 continue;
             }
-            // Reconcile disk vs the op-log first (append a FULL recovery snapshot
-            // for any diverged path), so the rehydrated chain's tip reflects the
-            // actual disk state before it is offered for rollback.
-            let diverged = task_state::diverged_paths(&task);
-            if !diverged.is_empty()
-                && let Err(error) =
-                    checkpoint::append_recovery(&self.workspace, &task.task_id, &diverged)
-            {
-                tracing::warn!(error = %format!("{error:#}"), "recovery checkpoint append failed");
-            }
-            self.rehydrate_task(&git_dir, &task);
-            notice = Some(task.recovery_notice(now));
+            // Lease-free: classify by lock protocol. The known protocol is a
+            // recoverable orphan; a missing (legacy) or unknown/future protocol
+            // is surfaced as unknown and never auto-adopted (ADR-0030 degrade
+            // direction -- spurious "unknown", never adoption of a task we
+            // cannot vet).
+            let class = if task.lock_protocol.as_deref() == Some(lock::LOCK_PROTOCOL) {
+                TaskClass::Recoverable
+            } else {
+                TaskClass::Legacy
+            };
+            let age = now
+                .duration_since(UNIX_EPOCH + Duration::from_millis(task.updated_ms))
+                .unwrap_or_default();
+            out.push(RecoverableTask {
+                task_id: task.task_id,
+                workspace: task.workspace,
+                age,
+                body: task.body,
+                sessions: task.sessions,
+                class,
+            });
         }
-        notice
+        // Deterministic order so the picker's default (first) row is stable
+        // across runs -- `load_all` reflects nondeterministic `read_dir` order.
+        // Newest-updated first (smallest age), `task_id` as a stable tie-break.
+        out.sort_by(|a, b| a.age.cmp(&b.age).then_with(|| a.task_id.cmp(&b.task_id)));
+        out
+    }
+
+    /// Adopt a recoverable orphan by id (ADR-0030): claim its lease (bailing if a
+    /// live process grabbed it first), reconcile disk vs the op-log (append a
+    /// FULL recovery snapshot for any diverged path, under the mutation lock),
+    /// and rehydrate it as this process's active task so a post-restart
+    /// `/rollback` / `/accept` / `/checkpoint` operates on the real chain.
+    /// Returns the adopted record so the caller's notice names the record it
+    /// actually acted on; `None` when the record is gone or now leased.
+    pub(super) fn adopt_task(&self, task_id: &str) -> Option<task_state::PersistedTask> {
+        if !matches!(self.mode, Mode::Git) {
+            return None;
+        }
+        let git_dir = task_state::git_dir(&self.workspace)?;
+        let workspace = self.workspace.to_string_lossy().into_owned();
+        let record = task_state::load_all(&git_dir)
+            .into_iter()
+            .find(|task| task.task_id == task_id && task.workspace == workspace)?;
+        // Claim the lease for the task's lifetime. If a live process holds it,
+        // this is a foreign live task -- do not adopt.
+        let lease = match lock::try_exclusive(&lock::lease_path(&git_dir, task_id)) {
+            Ok(Some(guard)) => guard,
+            _ => return None,
+        };
+        // Reconcile disk vs the op-log first (append a FULL recovery snapshot for
+        // any diverged path), so the rehydrated chain's tip reflects the actual
+        // disk state before it is offered for rollback. Serialized against
+        // concurrent processes by the mutation lock.
+        let diverged = task_state::diverged_paths(&record);
+        if !diverged.is_empty() {
+            lock::with_mutation_lock(&git_dir, || {
+                if let Err(error) = checkpoint::append_recovery(&self.workspace, task_id, &diverged)
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "recovery checkpoint append failed");
+                }
+            });
+        }
+        self.rehydrate_task(&git_dir, &record, lease);
+        Some(record)
+    }
+
+    /// Adopt a recoverable task and surface just its opaque display payload to
+    /// Tier 3 (#288): the same [`adopt_task`](Self::adopt_task) side effects
+    /// (lease claim, disk reconciliation, chain rehydration, session-join
+    /// append), mapped to an [`AdoptedTask`] so the private record type stays
+    /// behind the seam. `None` when the record is gone or now leased.
+    pub(crate) fn adopt(&self, task_id: &str) -> Option<AdoptedTask> {
+        let record = self.adopt_task(task_id)?;
+        Some(AdoptedTask {
+            task_id: record.task_id,
+            body: record.body,
+            sessions: record.sessions,
+        })
     }
 
     /// Rebuild an active [`Task`] from a persisted unsettled record and its
@@ -270,14 +555,22 @@ impl GitSafety {
     /// baseline is re-captured against the current disk (so continued mutation
     /// still gates today's dirty files -- the safe direction) but its index is
     /// the ORIGINAL staged state from the record, the selection a rollback must
-    /// restore. No-op when a task is already active.
-    fn rehydrate_task(&self, git_dir: &Path, persisted: &task_state::PersistedTask) {
-        {
+    /// restore. The caller's already-acquired `lease` is moved onto the task so
+    /// this process holds ownership for the task's lifetime. No-op when a task is
+    /// already active.
+    fn rehydrate_task(
+        &self,
+        git_dir: &Path,
+        persisted: &task_state::PersistedTask,
+        lease: lock::FlockGuard,
+    ) {
+        let session_id = {
             let state = self.state.lock().unwrap();
             if state.task.is_some() {
                 return;
             }
-        }
+            state.session_id.clone()
+        };
         let ledger_paths: Vec<PathBuf> = persisted.expected.keys().map(PathBuf::from).collect();
         let chain = match CheckpointChain::load(
             self.workspace.clone(),
@@ -303,8 +596,29 @@ impl GitSafety {
             baseline,
             chain,
             Some(git_dir.to_path_buf()),
+            Some(lease),
         );
         task.created_ms = persisted.created_ms;
+        // Carry the record's opaque display payload (ADR-0031) so a later
+        // `persist_task` (on continued mutation) re-writes it verbatim instead
+        // of clobbering it. Then append THIS process's session id to the live
+        // join (ordered, consecutive-deduped) and persist just that under the
+        // mutation lock -- preserving `expected`/`tip_seq`, which a fresh
+        // `persist_task` (empty ledger) would reset. Never read by enforcement.
+        task.body = persisted.body.clone();
+        task.sessions = persisted.sessions.clone();
+        if let Some(id) = &session_id {
+            push_session_deduped(&mut task.sessions, id);
+        }
+        if task.sessions != persisted.sessions {
+            let mut updated = persisted.clone();
+            updated.sessions = task.sessions.clone();
+            lock::with_mutation_lock(git_dir, || {
+                if let Err(error) = task_state::save(git_dir, &updated) {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to persist session link on adopt");
+                }
+            });
+        }
         let mut state = self.state.lock().unwrap();
         if state.task.is_none() {
             state.task = Some(task);

@@ -35,21 +35,16 @@ use crate::tool_display::{
 };
 use crate::tool_summary::summarize_output;
 use crate::ui::palette;
-use crate::ui::symbols;
 
-use super::rows::{ChromeRow, FoldVis, TranscriptRow};
+use super::panel::FooterField;
+use super::rows::{ChromeRow, TranscriptRow};
 use super::shell_command::{self, ShellCommand};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::wrap::{clamp_output_line, display_width, truncate_chars, wrapped_row_estimate};
 use super::{
     MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, PANEL_BODY_CHROME_WIDTH, dim_style,
-    err_style, ok_style, panel_style,
+    err_style, panel_style,
 };
-
-// Stored EXPLORE rows are shaped inside the transcript text column. Align the
-// final unit word (`entries`/`files`/`lines`) to the panel-header state label
-// column (`DONE`/`ERROR`/`REVIEW`), while leaving the count text to extend left.
-const EXPLORE_META_UNIT_RIGHT_OFFSET: usize = 16;
 
 /// The panel family a tool renders as. Selects the stateful dispatch path in
 /// [`super::transcript`] (grouped EXPLORE, streaming SHELL exec cell, or a
@@ -113,9 +108,17 @@ pub(super) trait ToolRenderer: Sync {
         self.header_meta(call)
     }
 
-    /// Result body rows, rendered between the header separator and the bottom
-    /// border. EXPLORE returns exactly one row (its grouped summary line).
+    /// Result body rows, rendered between the frameless header and the
+    /// hairline footer. EXPLORE returns exactly one row (its grouped summary
+    /// line).
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow>;
+
+    /// Family extras for the block footer, rendered as `┊`-joined sibling
+    /// fields after the state label (SHELL: `EXIT <code>` + result meta).
+    /// Default: none (EXPLORE/EDIT-generic footers are state + diagnostics).
+    fn footer_extras(&self, _call: &ToolCall, _outcome: &ToolOutcome) -> Vec<FooterField> {
+        Vec::new()
+    }
 }
 
 // --- Built-in renderers -----------------------------------------------------
@@ -196,17 +199,17 @@ fn panel_body_width(width: usize) -> usize {
     width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1)
 }
 
-/// One EXPLORE op row (`ExploreOutput` design-system component):
-/// `VERB   target [code][after]                          meta(count)` — verb in
+/// One EXPLORE op row (`FramelessExplore` op grammar):
+/// `VERB  target [code][after]                           meta(count)` — verb in
 /// a fixed 5-cell column, target in ink, a grep/find pattern in cyan, the scope
-/// muted, and a right-aligned honest count derived from the finished result.
+/// muted, and the honest count right-bound at the block's right rail.
 fn explore_op_row(width: usize, call: &ToolCall, outcome: &ToolOutcome) -> TranscriptRow {
     if let ToolOutcome::Error { message, .. } = outcome {
         return styled_row(format!("error: {message}"), err_style());
     }
     let verb = explore_verb(call);
-    let mut spans = vec![Span::styled(format!("{verb:<5}  "), panel_style())];
-    let mut plain = format!("{verb:<5}  ");
+    let mut spans = vec![Span::styled(format!("{verb:<5} "), panel_style())];
+    let mut plain = format!("{verb:<5} ");
     let path = tool_path_arg(call).map(display_path);
     match call.name.as_str() {
         "grep" | "find" => {
@@ -234,23 +237,26 @@ fn explore_op_row(width: usize, call: &ToolCall, outcome: &ToolOutcome) -> Trans
             plain.push_str(&target);
         }
     }
-    // Right-aligned count, only when the op finished and the count is real.
+    // Right-bound count, only when the op finished and the count is real. A
+    // BodyRight chrome row re-aligns the meta to the block's right rail at
+    // render time, so op metas, the header elapsed, and the footer diagnostics
+    // share one right edge.
     if let ToolOutcome::Done { content, exit_code } = outcome
         && let Some(meta) =
             summarize_output(call, content, *exit_code).map(|summary| summary.render())
     {
-        let left_w = display_width(&plain);
-        let meta_w = display_width(&meta);
-        let unit_w = explore_meta_unit_offset(&meta);
-        let unit_col = width.saturating_sub(EXPLORE_META_UNIT_RIGHT_OFFSET);
-        let meta_start = unit_col.saturating_sub(unit_w);
-        if meta_start >= left_w + 2 && meta_start + meta_w <= width {
-            let gap = meta_start - left_w;
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(meta.clone(), dim_style()));
-            plain.push_str(&" ".repeat(gap));
-            plain.push_str(&meta);
-        }
+        let text =
+            super::rows::right_align(&plain, &meta, width, 1, super::rows::Overflow::DropLeft);
+        return TranscriptRow::chrome_with_text(
+            ChromeRow::BodyRight {
+                left: Line::from(spans),
+                right: meta,
+                right_style: dim_style(),
+                bg: None,
+            },
+            text,
+            panel_style(),
+        );
     }
     TranscriptRow::chrome_with_text(
         ChromeRow::Body {
@@ -271,11 +277,6 @@ fn explore_verb(call: &ToolCall) -> &'static str {
         "find" => "Find",
         _ => "Read",
     }
-}
-
-fn explore_meta_unit_offset(meta: &str) -> usize {
-    meta.rsplit_once(' ')
-        .map_or(0, |(prefix, _)| display_width(prefix) + 1)
 }
 
 /// Build a single-row, single-style panel body line carrying both the styled
@@ -301,11 +302,10 @@ impl ToolRenderer for ShellRenderer {
         "SHELL"
     }
 
-    fn header_meta(&self, _call: &ToolCall) -> String {
-        "bash".to_string()
-    }
-
-    fn plain_meta(&self, call: &ToolCall) -> String {
+    /// The frameless SHELL header carries the command as its meta
+    /// (`▾ SHELL  cargo test -p context`), truncating with `…` — not the
+    /// constant `bash` of the framed design.
+    fn header_meta(&self, call: &ToolCall) -> String {
         run_target(call)
     }
 
@@ -334,35 +334,9 @@ impl ToolRenderer for ShellRenderer {
                 }
                 body.line("$ \u{2588}", panel_style());
             }
-            ToolOutcome::Done { content, exit_code } => {
-                body.output(content);
-                // `None` is not "an unknown but presumably fine" code: the bash
-                // tool only omits it for a cancelled run, a timeout, or a
-                // session shell that exited (`src/tools/bash/mod.rs`), each of
-                // which already says so in `content`. Asserting `exit 0` here
-                // would fabricate a status the run never reported, so the row
-                // is omitted rather than guessed.
-                if let Some(code) = exit_code {
-                    // Per the design-system `ShellOutput`, the exit-status row
-                    // hides in a collapsed capped preview and reappears when
-                    // expanded -- but only once the OUTPUT itself has made the
-                    // panel foldable. On a short panel that shows in full, the
-                    // row must stay `Always`, otherwise a non-`Always` row would
-                    // itself force an always-expanded panel to fold.
-                    let fold = if body.is_foldable() {
-                        FoldVis::WhenExpanded
-                    } else {
-                        FoldVis::Always
-                    };
-                    body.line_folded("", panel_style(), fold);
-                    body.push(shell_result_row(
-                        *code,
-                        summarize_output(call, content, Some(*code))
-                            .map(|summary| summary.render()),
-                        fold,
-                    ));
-                }
-            }
+            // The exit status is no longer a body row: it moves to the block
+            // footer as `EXIT <code>` (+ result meta) via `footer_extras`.
+            ToolOutcome::Done { content, .. } => body.output(content),
             ToolOutcome::Error { message, streamed } => {
                 if !streamed.is_empty() {
                     body.output_tail(streamed);
@@ -377,39 +351,31 @@ impl ToolRenderer for ShellRenderer {
         }
         body.into_rows()
     }
-}
 
-/// The SHELL panel's closing exit-status row: `◆ EXIT 0  ┊ 142 passed · 0
-/// failed` on success, `■ EXIT <code>  ┊ <meta>` on failure — glyph + bold
-/// uppercase label sharing one color, then a muted `┊ meta` summary when the
-/// output yields an honest one (the design-system `ShellOutput` `ResultRow`).
-/// `fold` matches the `ShellOutput` reference: `WhenExpanded` (hidden in a
-/// collapsed capped preview, shown when expanded) for a foldable panel, and
-/// `Always` for a short panel whose output already shows in full.
-fn shell_result_row(code: i32, meta: Option<String>, fold: FoldVis) -> TranscriptRow {
-    let failed = code != 0;
-    let symbol = if failed {
-        symbols::ERROR
-    } else {
-        symbols::DONE
-    };
-    let style = if failed { err_style() } else { ok_style() };
-    let label = format!("{symbol} EXIT {code}");
-    let mut plain = label.clone();
-    let mut spans = vec![Span::styled(
-        label,
-        style.add_modifier(ratatui::style::Modifier::BOLD),
-    )];
-    if let Some(meta) = meta {
-        let aside = format!("  {} {meta}", symbols::SEP);
-        plain.push_str(&aside);
-        spans.push(Span::styled(aside, dim_style()));
+    /// SHELL footer extras: `EXIT <code>` (bold, uppercase, tracked, muted)
+    /// then the honest result meta as a sibling field. `None` exit codes are
+    /// omitted rather than guessed: the bash tool only omits the code for a
+    /// cancelled run, a timeout, or an exited session shell
+    /// (`src/tools/bash/mod.rs`), each of which already says so in `content`.
+    fn footer_extras(&self, call: &ToolCall, outcome: &ToolOutcome) -> Vec<FooterField> {
+        let ToolOutcome::Done {
+            content,
+            exit_code: Some(code),
+        } = outcome
+        else {
+            return Vec::new();
+        };
+        let mut fields = vec![FooterField::styled(
+            format!("EXIT {code}"),
+            dim_style().add_modifier(ratatui::style::Modifier::BOLD),
+        )];
+        if let Some(meta) =
+            summarize_output(call, content, Some(*code)).map(|summary| summary.render())
+        {
+            fields.push(FooterField::styled(meta, dim_style()));
+        }
+        fields
     }
-    let chrome = ChromeRow::Body {
-        line: Line::from(spans),
-        bg: None,
-    };
-    TranscriptRow::chrome_with_text(chrome, plain, style).with_fold(fold)
 }
 
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
@@ -543,12 +509,13 @@ impl PanelBody {
         line
     }
 
-    fn push_line(&mut self, line: Line<'static>, text: String, style: Style, fold: FoldVis) {
+    fn push_line(&mut self, line: Line<'static>, text: String, style: Style) {
         let line = self.indented_line(line);
-        self.rows.push(
-            TranscriptRow::chrome_with_text(ChromeRow::Body { line, bg: None }, text, style)
-                .with_fold(fold),
-        );
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Body { line, bg: None },
+            text,
+            style,
+        ));
     }
 
     fn push_right_line(
@@ -558,46 +525,25 @@ impl PanelBody {
         right: &str,
         row_style: Style,
         right_style: Style,
-        fold: FoldVis,
     ) {
-        let text = right_align_hint(&left_text, right, self.fold_hint_width());
-        let left = self.indented_line(left);
-        self.rows.push(
-            TranscriptRow::chrome_with_text(
-                ChromeRow::BodyRight {
-                    left,
-                    right: right.to_string(),
-                    right_style,
-                    bg: None,
-                },
-                text,
-                row_style,
-            )
-            .with_fold(fold),
+        let text = super::rows::right_align(
+            &left_text,
+            right,
+            self.hint_width(),
+            1,
+            super::rows::Overflow::DropLeft,
         );
-    }
-
-    /// Push a pre-built row (e.g. the SHELL exit-status row) verbatim.
-    fn push(&mut self, row: TranscriptRow) {
-        self.rows.push(row);
-    }
-
-    /// Mark the row just pushed as non-content control chrome so `/find` skips
-    /// it. Used for the fold affordance hints (`ctrl+o to expand`/`collapse`),
-    /// which are UI, not transcript text.
-    fn mark_last_non_searchable(&mut self) {
-        if let Some(row) = self.rows.last_mut() {
-            row.searchable = false;
-        }
-    }
-
-    /// Whether the body accumulated so far has made the panel foldable: true
-    /// once any row carries a non-`Always` fold (a capped-preview / expanded
-    /// pair). Mirrors the transcript's own foldability test so the SHELL result
-    /// row can track the panel's existing collapse state instead of creating
-    /// it.
-    fn is_foldable(&self) -> bool {
-        self.rows.iter().any(|row| row.fold != FoldVis::Always)
+        let left = self.indented_line(left);
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::BodyRight {
+                left,
+                right: right.to_string(),
+                right_style,
+                bg: None,
+            },
+            text,
+            row_style,
+        ));
     }
 
     /// Render the structured command region: the `$` prompt row (carrying the
@@ -617,7 +563,7 @@ impl PanelBody {
             self.line(&format!("  payload  {}", payload.lang), dim_style());
             self.payload_rule();
             self.payload_body(&payload.body);
-            self.payload_line(&payload.closing, FoldVis::Always);
+            self.payload_line(&payload.closing);
         }
         for cont in &cmd.trailing {
             self.command_continuation(cont);
@@ -647,35 +593,17 @@ impl PanelBody {
     }
 
     /// One dim heredoc body / closing-delimiter row.
-    fn payload_line(&mut self, text: &str, fold: FoldVis) {
+    fn payload_line(&mut self, text: &str) {
         let clamped = truncate_chars(text, MAX_TOOL_OUTPUT_LINE_CHARS);
-        self.line_folded(&format!("  {clamped}"), dim_style(), fold);
+        self.line(&format!("  {clamped}"), dim_style());
     }
 
-    /// Heredoc body with middle-folding: short bodies render whole; long bodies
-    /// show a head/tail slice plus a `\u{2026} N lines hidden` affordance while
-    /// collapsed, and the full body while expanded (ctrl+o toggles).
+    /// Heredoc body, rendered whole. Collapse is binary and owned by the block
+    /// header: an over-budget block arrives collapsed instead of eliding rows.
     fn payload_body(&mut self, body: &[String]) {
-        const HEAD: usize = 4;
-        const TAIL: usize = 2;
-        if body.len() <= HEAD + TAIL + 1 {
-            for line in body {
-                self.payload_line(line, FoldVis::Always);
-            }
-            return;
-        }
-        let hidden = body.len() - HEAD - TAIL;
-        for line in &body[..HEAD] {
-            self.payload_line(line, FoldVis::WhenCollapsed);
-        }
-        self.fold_expand_hint(hidden, false);
-        for line in &body[body.len() - TAIL..] {
-            self.payload_line(line, FoldVis::WhenCollapsed);
-        }
         for line in body {
-            self.payload_line(line, FoldVis::WhenExpanded);
+            self.payload_line(line);
         }
-        self.fold_collapse_hint();
     }
 
     /// The SHELL `$ command` row with the timeout rendered as right-aligned
@@ -695,16 +623,11 @@ impl PanelBody {
             ]
         };
         let Some(secs) = timeout.filter(|secs| *secs > 0) else {
-            self.push_line(
-                Line::from(cmd_spans(&command)),
-                left,
-                panel_style(),
-                FoldVis::Always,
-            );
+            self.push_line(Line::from(cmd_spans(&command)), left, panel_style());
             return;
         };
         let hint = format!("timeout {secs}s");
-        let width = self.fold_hint_width();
+        let width = self.hint_width();
         let left_w = display_width(&left);
         let hint_w = display_width(&hint);
         if left_w + 1 + hint_w <= width {
@@ -714,85 +637,58 @@ impl PanelBody {
                 &hint,
                 panel_style(),
                 dim_style(),
-                FoldVis::Always,
             );
         } else {
-            self.push_line(
-                Line::from(cmd_spans(&command)),
-                left,
-                panel_style(),
-                FoldVis::Always,
-            );
+            self.push_line(Line::from(cmd_spans(&command)), left, panel_style());
             self.push_right_line(
                 Line::default(),
                 String::new(),
                 &hint,
                 dim_style(),
                 dim_style(),
-                FoldVis::Always,
             );
         }
     }
 
     /// Push a plain panel body line (ANSI stripped), one row per `\n` segment.
     fn line(&mut self, text: &str, style: Style) {
-        self.line_folded(text, style, FoldVis::Always);
-    }
-
-    fn line_folded(&mut self, text: &str, style: Style, fold: FoldVis) {
         for line in text.split('\n') {
             let line = strip_ansi_for_text(line);
-            self.push_line(
-                Line::from(Span::styled(line.clone(), style)),
-                line,
-                style,
-                fold,
-            );
+            self.push_line(Line::from(Span::styled(line.clone(), style)), line, style);
         }
     }
 
-    /// Inner panel-body width available for right-aligning fold hints. Matches
-    /// the transcript's `fold_hint_width` (the wrap width already equals the
-    /// panel body width), so the hint hugs the right border.
-    fn fold_hint_width(&self) -> usize {
+    /// Inner block-body width available for right-aligning invocation hints
+    /// (the timeout field). Matches the transcript's wrap width so the hint
+    /// hugs the block's right rail.
+    fn hint_width(&self) -> usize {
         self.width
             .saturating_sub(PANEL_BODY_CHROME_WIDTH)
             .saturating_sub(self.indent)
             .max(1)
     }
 
-    /// Preview-state fold affordance: `\u{2026} N lines hidden    ctrl+o to expand`.
-    fn fold_expand_hint(&mut self, hidden: usize, earlier: bool) {
+    /// The honest flood-cap elision marker: `… N lines hidden` (or `… N
+    /// earlier lines hidden` for a live tail). A static, non-searchable body
+    /// row — NOT a fold affordance; frameless collapse is binary and owned by
+    /// the block header.
+    fn hidden_lines_marker(&mut self, hidden: usize, earlier: bool) {
         let noun = if earlier { "earlier lines" } else { "lines" };
-        let left = format!("\u{2026} {hidden} {noun} hidden");
-        self.push_right_line(
-            Line::from(Span::styled(left.clone(), dim_style())),
-            left,
-            "ctrl+o to expand",
+        let text = format!("\u{2026} {hidden} {noun} hidden");
+        self.push_line(
+            Line::from(Span::styled(text.clone(), dim_style())),
+            text,
             dim_style(),
-            dim_style(),
-            FoldVis::WhenCollapsed,
         );
-        self.mark_last_non_searchable();
-    }
-
-    /// Expanded-state fold affordance: right-aligned `ctrl+o to collapse`.
-    fn fold_collapse_hint(&mut self) {
-        self.push_right_line(
-            Line::default(),
-            String::new(),
-            "ctrl+o to collapse",
-            dim_style(),
-            dim_style(),
-            FoldVis::WhenExpanded,
-        );
-        self.mark_last_non_searchable();
+        if let Some(row) = self.rows.last_mut() {
+            row.searchable = false;
+        }
     }
 
     /// Push one gutter-prefixed tool-output line, preserving ANSI styling and
     /// hard-wrapping so leading indentation/aligned columns survive. `first`
     /// selects the `  \u{2514} ` head gutter vs the `    ` continuation gutter.
-    fn output_line(&mut self, raw: &str, first: bool, fold: FoldVis) {
+    fn output_line(&mut self, raw: &str, first: bool) {
         let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
         let legacy = if first {
             format!("  \u{2514} {line}")
@@ -803,96 +699,27 @@ impl PanelBody {
             tool_output_line("", &line),
             strip_ansi_for_text(&legacy),
             dim_style(),
-            fold,
         );
     }
 
-    /// Flood-safe AND compact tool output: wrap each line to the transcript
-    /// width FIRST, then keep a head slice and a tail slice that together fit
-    /// the physical-row budget. When output is elided, emit a collapsed preview
-    /// (`WhenCollapsed`) plus the full output (`WhenExpanded`) so ctrl+o can
-    /// toggle between them; otherwise rows stay `Always`.
+    /// Finalized tool output, stored whole (one row per logical line, each
+    /// line length-clamped). There is no head/tail elision: the flood guard is
+    /// the block's arrival fold — an over-budget body arrives collapsed to
+    /// header + footer, and ctrl+o reveals the full output.
     fn output(&mut self, content: &str) {
         if content.is_empty() {
             self.line("(no output)", dim_style());
             return;
         }
-        let width = self.width;
-        let lines: Vec<&str> = content.lines().collect();
-        let cost = |raw: &str| {
-            wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width)
-        };
-        let total_rows: usize = lines.iter().map(|raw| cost(raw)).sum();
-        if total_rows <= MAX_TOOL_OUTPUT_ROWS {
-            for (i, raw) in lines.iter().enumerate() {
-                self.output_line(raw, i == 0, FoldVis::Always);
-            }
-            return;
+        for (i, raw) in content.lines().enumerate() {
+            self.output_line(raw, i == 0);
         }
-        // One row is reserved for the ellipsis marker; the rest splits in half.
-        let budget = MAX_TOOL_OUTPUT_ROWS.saturating_sub(1).max(1);
-        let head_budget = budget / 2;
-        let tail_budget = budget - head_budget;
-        let mut head_rows = 0usize;
-        let mut head_end = 0usize;
-        // Always keep at least the first line so a single over-budget line never
-        // collapses the cell to just a marker (and so the head gutter is always
-        // emitted); only later lines are gated on the head budget.
-        while head_end < lines.len() {
-            let rows = cost(lines[head_end]);
-            if head_end > 0 && head_rows + rows > head_budget {
-                break;
-            }
-            head_rows += rows;
-            head_end += 1;
-        }
-        let mut tail_rows = 0usize;
-        let mut tail_start = lines.len();
-        while tail_start > head_end {
-            let rows = cost(lines[tail_start - 1]);
-            if tail_rows + rows > tail_budget {
-                break;
-            }
-            tail_rows += rows;
-            tail_start -= 1;
-        }
-        let hidden = tail_start.saturating_sub(head_end);
-        if hidden == 0 {
-            // Nothing elided (e.g. one over-budget line): keep the original
-            // clamped head/tail slices so a single huge line cannot blow the
-            // row cap, and stay non-foldable.
-            for (i, raw) in lines[..head_end].iter().enumerate() {
-                let clamped = clamp_output_line(raw, width, head_budget);
-                self.output_line(&clamped, i == 0, FoldVis::Always);
-            }
-            for raw in &lines[tail_start..] {
-                let clamped = clamp_output_line(raw, width, tail_budget);
-                self.output_line(&clamped, false, FoldVis::Always);
-            }
-            return;
-        }
-        // Preview set (shown while collapsed): clamped head slice, the hidden
-        // affordance, then the clamped tail slice.
-        for (i, raw) in lines[..head_end].iter().enumerate() {
-            let clamped = clamp_output_line(raw, width, head_budget);
-            self.output_line(&clamped, i == 0, FoldVis::WhenCollapsed);
-        }
-        self.fold_expand_hint(hidden, false);
-        for raw in &lines[tail_start..] {
-            let clamped = clamp_output_line(raw, width, tail_budget);
-            self.output_line(&clamped, false, FoldVis::WhenCollapsed);
-        }
-        // Full set (shown while expanded): every line, then the collapse hint.
-        for (i, raw) in lines.iter().enumerate() {
-            self.output_line(raw, i == 0, FoldVis::WhenExpanded);
-        }
-        self.fold_collapse_hint();
     }
 
     /// TAIL-capped tool output for the LIVE streaming cell: show the most recent
     /// physical rows so a growing stream scrolls instead of freezing on its
-    /// head. When output dropped, emit a collapsed preview (earlier-lines note +
-    /// recent tail) plus the full output, matching the finalized fold pair.
+    /// head. When earlier output dropped, an honest `… N earlier lines hidden`
+    /// marker precedes the tail.
     fn output_tail(&mut self, content: &str) {
         if content.is_empty() {
             self.line("(no output)", dim_style());
@@ -915,36 +742,17 @@ impl PanelBody {
         if start == 0 {
             for (offset, raw) in lines.iter().enumerate() {
                 let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
-                self.output_line(&clamped, offset == 0, FoldVis::Always);
+                self.output_line(&clamped, offset == 0);
             }
             return;
         }
-        // Preview set: the earlier-lines affordance, then the most recent tail.
-        self.fold_expand_hint(start, true);
+        // The earlier-lines marker, then the most recent tail.
+        self.hidden_lines_marker(start, true);
         for raw in &lines[start..] {
             let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
-            self.output_line(&clamped, false, FoldVis::WhenCollapsed);
+            self.output_line(&clamped, false);
         }
-        // Full set: every line in order (unclamped, matching the finalized path
-        // so revealing a streamed run shows the same rows), then the hint.
-        for (offset, raw) in lines.iter().enumerate() {
-            self.output_line(raw, offset == 0, FoldVis::WhenExpanded);
-        }
-        self.fold_collapse_hint();
     }
-}
-
-/// Pad `left` so `hint` hugs the right edge within `width`; drop `left` when too
-/// narrow rather than overflowing/wrapping the row. Mirrors the transcript
-/// helper so fold affordances render identically.
-fn right_align_hint(left: &str, hint: &str, width: usize) -> String {
-    let hint_w = display_width(hint);
-    let left_w = display_width(left);
-    if left.is_empty() || left_w + 1 + hint_w > width {
-        return format!("{}{hint}", " ".repeat(width.saturating_sub(hint_w)));
-    }
-    let gap = width.saturating_sub(left_w).saturating_sub(hint_w).max(1);
-    format!("{left}{}{hint}", " ".repeat(gap))
 }
 
 #[cfg(test)]
@@ -987,9 +795,12 @@ mod tests {
     }
 
     #[test]
-    fn shell_meta_is_constant_but_plain_meta_is_run_target() {
+    fn shell_header_meta_is_the_command() {
         let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
-        assert_eq!(renderer.header_meta(&call("bash", json!({}))), "bash");
+        assert_eq!(
+            renderer.header_meta(&call("bash", json!({ "command": "echo hi" }))),
+            "echo hi"
+        );
         assert_eq!(
             renderer.plain_meta(&call("bash", json!({ "command": "echo hi" }))),
             "echo hi"
@@ -1024,7 +835,7 @@ mod tests {
             },
         );
         assert_eq!(done.len(), 1);
-        assert_eq!(done[0].text, "Grep   \"needle\" in src");
+        assert_eq!(done[0].text, "Grep  \"needle\" in src");
         let errored = renderer.body(
             &ctx,
             &call("grep", json!({ "pattern": "needle", "path": "src" })),
@@ -1044,16 +855,19 @@ mod tests {
             },
         );
         assert_eq!(listed.len(), 1);
+        // The honest count is right-bound at the block's right rail via a
+        // BodyRight chrome row (render-time alignment).
         assert!(listed[0].text.ends_with("3 entries"), "{}", listed[0].text);
-        let unit_col = listed[0]
-            .text
-            .find("entries")
-            .map(|idx| display_width(&listed[0].text[..idx]))
-            .expect("entries unit");
         assert_eq!(
-            unit_col,
-            panel_body_width(ctx.width) - EXPLORE_META_UNIT_RIGHT_OFFSET
+            display_width(&listed[0].text),
+            panel_body_width(ctx.width),
+            "{}",
+            listed[0].text
         );
+        let Some(ChromeRow::BodyRight { right, .. }) = listed[0].chrome.as_ref() else {
+            panic!("expected a right-bound op meta");
+        };
+        assert_eq!(right, "3 entries");
     }
 
     #[test]
@@ -1168,7 +982,7 @@ mod tests {
                     "forbidden control {forbidden:?} leaked in rendered row {text:?}"
                 );
             }
-            assert_eq!(display_width(&text), ctx.width, "{text:?}");
+            assert!(display_width(&text) <= ctx.width, "{text:?}");
         }
         assert!(
             rendered_has_expanded_content,
@@ -1227,7 +1041,10 @@ mod tests {
     }
 
     #[test]
-    fn shell_folds_long_heredoc_body_into_collapsed_preview_and_full() {
+    fn shell_renders_long_heredoc_body_whole() {
+        // The heredoc payload is stored whole: collapse is binary and owned by
+        // the block header (an over-budget block arrives collapsed), so the
+        // body carries no elision markers and no fold-affordance chrome.
         let mut command = String::from("python3 - <<'PY'\n");
         for i in 0..40 {
             command.push_str(&format!("line {i}\n"));
@@ -1244,15 +1061,19 @@ mod tests {
                 exit_code: None,
             },
         );
+        for i in 0..40 {
+            assert!(
+                rows.iter().any(|r| r.text.contains(&format!("line {i}"))),
+                "payload line {i} missing"
+            );
+        }
         assert!(
-            rows.iter()
-                .any(|r| r.fold == FoldVis::WhenCollapsed && r.text.contains("lines hidden")),
-            "expected a collapsed hidden-lines affordance"
+            !rows.iter().any(|r| r.text.contains("lines hidden")),
+            "no elision marker in the stored body"
         );
         assert!(
-            rows.iter()
-                .any(|r| r.fold == FoldVis::WhenExpanded && r.text.contains("line 39")),
-            "expected the full body to include the elided tail"
+            !rows.iter().any(|r| r.text.contains("ctrl+o")),
+            "body rows must not carry fold affordance hints"
         );
     }
 
@@ -1275,9 +1096,13 @@ mod tests {
         fn assert_single_right_aligned(row: &TranscriptRow, width: usize, right: &str) {
             let rendered = rendered_texts(row, width);
             assert_eq!(rendered.len(), 1, "width {width}: {rendered:?}");
-            assert_eq!(display_width(&rendered[0]), width, "{:?}", rendered[0]);
             assert!(
-                rendered[0].trim_end().ends_with(&format!("{right}  │")),
+                display_width(&rendered[0]) <= width,
+                "width {width}: {:?}",
+                rendered[0]
+            );
+            assert!(
+                rendered[0].trim_end().ends_with(right),
                 "width {width}: {:?}",
                 rendered[0]
             );
@@ -1305,10 +1130,6 @@ mod tests {
             .iter()
             .find(|row| row.text.contains("timeout 120s"))
             .expect("timeout row");
-        let fold_hint = rows
-            .iter()
-            .find(|row| row.text.contains("lines hidden") && row.text.contains("ctrl+o to expand"))
-            .expect("fold hint row");
         let payload_rule = rows
             .iter()
             .find(|row| {
@@ -1319,10 +1140,9 @@ mod tests {
 
         for width in [120, 90, 130] {
             assert_single_right_aligned(timeout, width, "timeout 120s");
-            assert_single_right_aligned(fold_hint, width, "ctrl+o to expand");
             let rendered = rendered_texts(payload_rule, width);
             assert_eq!(rendered.len(), 1, "width {width}: {rendered:?}");
-            assert_eq!(display_width(&rendered[0]), width, "{:?}", rendered[0]);
+            assert!(display_width(&rendered[0]) <= width, "{:?}", rendered[0]);
         }
 
         let narrow_timeout = rendered_texts(timeout, 44);
@@ -1387,46 +1207,63 @@ mod tests {
     }
 
     #[test]
-    fn shell_done_appends_success_exit_status_row() {
+    fn shell_footer_extras_carry_exit_code_and_result_meta() {
+        // The exit status is a footer field cluster, not a body row: `EXIT 0`
+        // (bold, muted) then the honest result meta as a sibling field.
         let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
-        let ctx = RenderCtx { width: 80 };
-        let rows = renderer.body(
-            &ctx,
+        let fields = renderer.footer_extras(
             &call("bash", json!({ "command": "echo hi" })),
             &ToolOutcome::Done {
                 content: "hi",
                 exit_code: Some(0),
             },
         );
-        let last = rows.last().expect("expected a result row");
-        assert_eq!(last.text, "\u{25c6} EXIT 0", "{}", last.text);
-        assert_eq!(last.style.fg, ok_style().fg);
+        assert_eq!(fields[0].plain, "EXIT 0");
+        let body = renderer.body(
+            &RenderCtx { width: 80 },
+            &call("bash", json!({ "command": "echo hi" })),
+            &ToolOutcome::Done {
+                content: "hi",
+                exit_code: Some(0),
+            },
+        );
+        assert!(
+            !body.iter().any(|r| r.text.contains("EXIT")),
+            "exit status must not be a body row"
+        );
     }
 
     #[test]
-    fn shell_done_with_nonzero_exit_renders_red_error_result_row() {
+    fn shell_footer_extras_render_nonzero_exit_code() {
         let renderer = resolve(&call("bash", json!({ "command": "false" })));
-        let ctx = RenderCtx { width: 80 };
-        let rows = renderer.body(
-            &ctx,
+        let fields = renderer.footer_extras(
             &call("bash", json!({ "command": "false" })),
             &ToolOutcome::Done {
                 content: "",
                 exit_code: Some(1),
             },
         );
-        let last = rows.last().expect("expected a result row");
-        assert_eq!(last.text, "\u{25a0} EXIT 1", "{}", last.text);
-        assert_eq!(last.style.fg, err_style().fg);
+        assert_eq!(fields[0].plain, "EXIT 1");
     }
 
     #[test]
-    fn shell_done_with_unknown_exit_code_omits_result_row() {
+    fn shell_done_with_unknown_exit_code_omits_exit_field() {
         // `None` means the shell reported no status at all -- a cancelled run,
         // a timeout, or an exited session shell (`src/tools/bash/mod.rs`),
         // each of which already says so in `content`. Asserting `exit 0` would
-        // fabricate a status the run never reported, so no row is shown.
+        // fabricate a status the run never reported, so no field is shown.
         let renderer = resolve(&call("bash", json!({ "command": "sleep 30" })));
+        assert!(
+            renderer
+                .footer_extras(
+                    &call("bash", json!({ "command": "sleep 30" })),
+                    &ToolOutcome::Done {
+                        content: "Command cancelled by user",
+                        exit_code: None,
+                    },
+                )
+                .is_empty()
+        );
         let ctx = RenderCtx { width: 80 };
         let rows = renderer.body(
             &ctx,
@@ -1465,11 +1302,9 @@ mod tests {
     }
 
     #[test]
-    fn shell_result_row_hides_when_collapsed_and_shows_when_expanded_for_folded_output() {
-        // Per the design-system `ShellOutput`, the exit-status row is hidden in
-        // a collapsed capped preview (`WhenExpanded`) and reappears when the
-        // panel is expanded -- so a folded panel's preview stays a clean
-        // head/tail slice.
+    fn shell_long_output_body_is_capped_without_exit_row_or_fold_hints() {
+        // The frameless SHELL body is the flood-capped output alone: the exit
+        // status lives in the footer and there is no fold-affordance chrome.
         let content = (0..200)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1484,68 +1319,30 @@ mod tests {
                 exit_code: Some(0),
             },
         );
-        let result_rows: Vec<_> = rows.iter().filter(|r| r.text.contains("EXIT 0")).collect();
-        assert_eq!(
-            result_rows.len(),
-            1,
-            "expected exactly one result row, got {:?}",
+        // The body carries no exit status (a footer field), no fold-affordance
+        // hints, and no elision — the whole output is stored; the transcript's
+        // arrival fold is the flood guard.
+        assert!(
+            !rows.iter().any(|r| r.text.contains("EXIT 0")),
+            "exit status must not be a body row: {:?}",
             rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
         );
         assert!(
-            result_rows[0].fold == FoldVis::WhenExpanded,
-            "folded panel's result row must hide while collapsed: {}",
-            result_rows[0].text
-        );
-        // Hidden from the collapsed-visible set (fold != WhenExpanded), present
-        // in the expanded-visible set (fold != WhenCollapsed).
-        assert!(
-            !rows
-                .iter()
-                .filter(|r| r.fold != FoldVis::WhenExpanded)
-                .any(|r| r.text.contains("EXIT 0")),
-            "result row must not appear in the collapsed preview"
+            !rows.iter().any(|r| r.text.contains("ctrl+o")),
+            "body rows must not carry fold affordance hints"
         );
         assert!(
-            rows.iter()
-                .filter(|r| r.fold != FoldVis::WhenCollapsed)
-                .any(|r| r.text.contains("EXIT 0")),
-            "result row must appear in the expanded set"
-        );
-        assert!(
-            rows.iter()
-                .any(|r| r.fold == FoldVis::WhenCollapsed && r.text.contains("ctrl+o to expand")),
-            "collapsed hidden-lines affordance should carry the expand hint: {:?}",
-            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
+            rows.iter().any(|r| r.text.contains("line 0"))
+                && rows.iter().any(|r| r.text.contains("line 199")),
+            "the whole output is stored"
         );
     }
 
     #[test]
-    fn shell_result_row_stays_always_visible_for_short_unfolded_output() {
-        // A short panel shows its output in full and is not foldable; the
-        // result row must stay `Always` so it never forces the panel to fold.
-        let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
-        let ctx = RenderCtx { width: 80 };
-        let rows = renderer.body(
-            &ctx,
-            &call("bash", json!({ "command": "echo hi" })),
-            &ToolOutcome::Done {
-                content: "hi",
-                exit_code: Some(0),
-            },
-        );
-        assert!(
-            rows.iter().all(|r| r.fold == FoldVis::Always),
-            "short shell panel must not become foldable: {:?}",
-            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
-        );
-        assert_eq!(rows.last().unwrap().text, "\u{25c6} EXIT 0");
-    }
-
-    #[test]
-    fn generic_done_output_capped_into_collapsed_preview_and_expanded_full() {
-        // Far more logical lines than the physical-row budget forces a foldable
-        // body: a capped preview (WhenCollapsed) with a hidden marker, plus the
-        // full output (WhenExpanded) that ctrl+o reveals.
+    fn generic_done_output_is_stored_whole() {
+        // Far more logical lines than the physical-row budget: every line is
+        // still stored (searchable, revealable); the transcript folds the
+        // block on arrival instead of eliding rows.
         let content = (0..200)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1560,30 +1357,14 @@ mod tests {
                 exit_code: None,
             },
         );
-        // The collapsed-visible set (Always + WhenCollapsed) stays within the
-        // physical-row budget plus the single hidden-affordance row.
-        let collapsed_visible = rows
-            .iter()
-            .filter(|r| r.fold != FoldVis::WhenExpanded)
-            .count();
+        assert_eq!(rows.len(), 200);
         assert!(
-            collapsed_visible <= MAX_TOOL_OUTPUT_ROWS + 1,
-            "collapsed-visible {collapsed_visible} exceeds budget {}",
-            MAX_TOOL_OUTPUT_ROWS + 1
+            !rows.iter().any(|r| r.text.contains("hidden")),
+            "no elision marker in the stored body"
         );
         assert!(
-            rows.iter()
-                .any(|r| r.fold == FoldVis::WhenCollapsed && r.text.contains("hidden")),
-            "expected a collapsed hidden-content marker"
-        );
-        assert!(
-            rows.iter().any(|r| r.fold == FoldVis::WhenExpanded),
-            "expected the full expanded output set"
-        );
-        assert!(
-            rows.iter()
-                .any(|r| r.fold == FoldVis::WhenExpanded && r.text.contains("line 199")),
-            "expected the full set to include the elided tail"
+            rows.iter().any(|r| r.text.contains("line 199")),
+            "the tail is stored"
         );
     }
 

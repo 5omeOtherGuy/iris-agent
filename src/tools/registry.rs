@@ -291,6 +291,13 @@ impl Tool for EditTool {
         // against the workspace, so a relative or absolute value both resolve.
         mutated_path(args, "file_path")
     }
+    fn auto_approvable(&self, workspace: &Path, args: &Value) -> bool {
+        // Auto preset (ADR-0032): auto-run only an in-workspace target. The
+        // dirty/destructive floors are enforced by Nexus before this is
+        // consulted; here we only keep an outside-workspace edit on the prompt
+        // path (fail closed on a missing/escaping path).
+        auto_target_in_workspace(workspace, args, "file_path")
+    }
     fn diff_preview(&self, workspace: &Path, args: &Value) -> Option<String> {
         render(workspace, |root| edit::preview(root, args))
     }
@@ -336,6 +343,10 @@ impl Tool for WriteTool {
     fn mutates_paths(&self, args: &Value) -> Vec<PathBuf> {
         // `write` targets its `path` argument.
         mutated_path(args, "path")
+    }
+    fn auto_approvable(&self, workspace: &Path, args: &Value) -> bool {
+        // Auto preset (ADR-0032): auto-run only an in-workspace target.
+        auto_target_in_workspace(workspace, args, "path")
     }
     fn diff_preview(&self, workspace: &Path, args: &Value) -> Option<String> {
         render(workspace, |root| write::preview(root, args))
@@ -443,6 +454,24 @@ impl Tool for LsTool {
     fn is_concurrency_safe(&self) -> bool {
         true
     }
+}
+
+/// Whether a mutating tool's string-valued path argument resolves inside the
+/// workspace, for the ADR-0032 auto preset. A missing/non-string/escaping path
+/// fails closed (`false`), keeping such a call on the approval-prompt path.
+///
+/// This is an approval-time CLASSIFICATION, not the execution boundary: the
+/// tool body still re-resolves the path through `path::resolve_*`, which
+/// re-canonicalizes the deepest existing ancestor and bails on an escape when
+/// confinement is active. So auto never bypasses an active confinement, and it
+/// is strictly more conservative than execution (it refuses to auto-approve an
+/// outside-workspace target even where execution would not confine one). It is
+/// deliberately not a write-time TOCTOU boundary; closing the open()-follows
+/// -symlink race belongs to the execution path uniformly, not to this preset.
+fn auto_target_in_workspace(workspace: &Path, args: &Value, key: &str) -> bool {
+    args.get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|requested| path::is_inside_workspace(workspace, requested))
 }
 
 /// Extract a single mutated path from a string-valued tool argument (issue
