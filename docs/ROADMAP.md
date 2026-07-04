@@ -404,7 +404,7 @@ Shared tool infrastructure issues opened 2026-06-15:
 | [#11](https://github.com/5omeOtherGuy/iris-agent/issues/11) | Path identity and file observation store | Done (MVP): session-scoped `ObservedFiles` records `{mtime, content_hash}` per canonical path on read/write/edit (`src/tools/observe.rs`). |
 | [#12](https://github.com/5omeOtherGuy/iris-agent/issues/12) | Mutation preflight and stale-file detection | Done (MVP): `edit`/`write` reject mutating an existing file that was never read or changed since last read (hash-decided; mtime refreshed on benign change). New files may be created blind. |
 | [#13](https://github.com/5omeOtherGuy/iris-agent/issues/13) | Atomic file mutation layer | Partial: same-directory atomic replacement helper exists; observation refresh now happens after each mutation; no canonical mutation queue. |
-| [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Done (MVP): Nexus enforces a session allow-policy. Approval offers `[y] once` / `[a] always this session` / `[N] deny`; `always` records the tool name in a Nexus-owned `session_allowed` set so later same-tool calls auto-approve (emitted as `ToolAutoApproved`, never inferred by the UI). Deny stays safe-by-default (empty/invalid/EOF). Diff previews now render colored +/- with relative headers (the `a//abs` double-slash and write-vs-edit path inconsistency are fixed). Remaining: cross-session persistence, risk labels, and per-exact-command bash granularity (`always` on `bash` currently authorizes any later shell command this session). |
+| [#14](https://github.com/5omeOtherGuy/iris-agent/issues/14) | Diff/preview and approval policy | Done (MVP): Nexus enforces a session allow-policy. Approval offers `[y] once` / `[a] always this session` / `[N] deny`; `always` records the tool name in a Nexus-owned `session_allowed` set so later same-tool calls auto-approve (emitted as `ToolAutoApproved`, never inferred by the UI). Deny stays safe-by-default (empty/invalid/EOF). Diff previews now render colored +/- with relative headers (the `a//abs` double-slash and write-vs-edit path inconsistency are fixed). Cross-session persistence shipped via ADR-0027 ([#259](https://github.com/5omeOtherGuy/iris-agent/pull/259)): per-canonical-cwd project grants in the HOME-owned trust store, fail-closed loads, destructive floors non-persistable, persisted auto-approves emitted as `ToolAutoApproved`; `bash_exact` grants partly cover per-command granularity. Remaining: risk labels. |
 | [#15](https://github.com/5omeOtherGuy/iris-agent/issues/15) | Tool output/result/error contract | Done (MVP): tools return `ToolOutput { content, metadata }`; Nexus serializes the provider-visible `ToolResultContract` for success, tool error, denied, and cancelled results; success results carry optional per-tool `metadata` (`read` byte/line/`truncated`, `grep` metrics, `ls` entries, `write` bytes, `edit` occurrences). Handle-backing for large outputs shipped ([#61](https://github.com/5omeOtherGuy/iris-agent/issues/61)): oversized results are offloaded out of context behind a stable handle with a compact preview + typed `outputHandle { id, bytes, lines }` metadata. |
 
 Status: strong-standard on the read/grep/edit/write/ls cluster, with `edit` now
@@ -854,6 +854,44 @@ Potential scope:
   (`docs/benchmarks/issue-337-read-skim-tokens.md`): 52-72% token reduction
   on comment-heavy Rust/TypeScript/Python (>= 50% bars test-asserted), <10 ms
   overhead, every kept line and signature verbatim.]
+- `grep` per-file output guards
+  ([#338](https://github.com/5omeOtherGuy/iris-agent/issues/338)). [Shipped
+  (PR [#364](https://github.com/5omeOtherGuy/iris-agent/pull/364)): content
+  mode takes an opt-in `maxPerFile` cap that limits matches shown per file and
+  summarizes the rest with a `… N more matches in this file` count line
+  (`src/tools/grep.rs`). No silent drops: shown matches plus summed omitted
+  counts equal the exact total, and the header total plus every matched file
+  path always survive (both test-asserted). The cap defaults to unlimited, so
+  under-cap results stay byte-identical to prior output. Grouping (path printed
+  once per file, `> line│` markers) is asserted parity-or-better than the
+  ungrouped `path:line:content` form on every fixture, so the "group only if
+  smaller" guard is not shipped -- it would never fire. Benchmarked on a
+  committed corpus (`docs/benchmarks/issue-338-grep-output-tokens.md`): the
+  per-file cap cuts 88% (cap 5) on a high-match file and 72% (cap 20) on
+  long-line matches; grouping alone is a 3-27% reduction; <10 ms overhead.]
+- `find` truncation summaries and guarded grouping
+  ([#340](https://github.com/5omeOtherGuy/iris-agent/issues/340)). [Shipped
+  (PR [#363](https://github.com/5omeOtherGuy/iris-agent/pull/363)): a truncated
+  result (caps 2000 lines / 50 KB) now ends with an exact summary carrying the
+  total match count and the top directories by omitted-match count, replacing a
+  bare `[output truncated]` that forced a blind re-run (`src/tools/find.rs`).
+  No matches are dropped without a count. Directory grouping (`dir/ a.rs b.rs`)
+  is applied only when it is smaller than the flat listing: the runtime picks
+  the smaller of the two forms per result set, so a set that would not shrink
+  (one file per directory) passes through byte-identical to the historical flat
+  output. Benchmarked on a committed corpus
+  (`docs/benchmarks/issue-340-find-compaction.md`): grouping cuts 54% on a
+  concentrated `.rs` tree (>= 40% bar test-asserted); singletons stay flat at
+  0%.]
+- Opt-in `ls` output reduction
+  ([#339](https://github.com/5omeOtherGuy/iris-agent/issues/339)). [Open: not
+  yet started.]
+
+End-to-end measurement pending: the per-result reductions above (read skim,
+bash filtering, grep caps, find summaries) are asserted as minimum bars on
+committed corpora, but the tokens-per-task benchmark -- does the model still
+complete a realistic workflow from the reduced context -- is not yet run. It
+follows the first Git-Centered Workflow slice (see the sequencing note above).
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
 prompt tokens without reducing task success on at least one realistic workflow
