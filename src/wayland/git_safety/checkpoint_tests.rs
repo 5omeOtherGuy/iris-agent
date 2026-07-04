@@ -1249,6 +1249,55 @@ fn follow_up_leaves_body_unchanged_then_new_task_after_settle() {
     );
 }
 
+// Issue #287 (review fix): a passive session swap (/new, /resume) that joins
+// the SAME unsettled task appends the new session to the record's live join
+// (consecutive-deduped) without rewriting body -- the sessions vec is the
+// authoritative recovery-UX join (ADR-0031).
+#[test]
+fn session_swap_joining_unsettled_task_appends_new_session() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    // Session A opens the task.
+    guard.set_session_id("sessionaaaa".to_string());
+    guard.set_turn_context(Some("open in A".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"one\n");
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string()]
+    );
+
+    // Passive swap to session B (task stays unsettled); B mutates and joins.
+    guard.set_session_id("sessionbbbb".to_string());
+    guard.set_turn_context(Some("join in B".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"two\n");
+    let record = task_state::load_all(&git_dir).pop().unwrap();
+    assert_eq!(
+        record.sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "the joining session is appended to the live join, ordered after A"
+    );
+    assert_eq!(
+        record.body.as_deref(),
+        Some("open in A"),
+        "the swap-join never rewrites the body captured at open"
+    );
+
+    // A same-session follow-up is a no-op (consecutive-dedup).
+    guard.set_turn_context(Some("more in B".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"three\n");
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "a same-session follow-up does not duplicate the session id"
+    );
+}
+
 // Issue #287 test (3): a second process rehydrating (adopting) the orphan
 // appends its own session id to the record's join -- ordered and
 // consecutive-deduped, written under the mutation lock.

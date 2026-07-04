@@ -581,6 +581,24 @@ impl MutationGuard for GitSafety {
             // turn joining an unsettled task must NOT rewrite its body (captured
             // once at open, ADR-0031), so drop this turn's pending preview.
             state.pending_body = None;
+            // The live join, however, must record the CURRENT session: after a
+            // passive session swap (/new, /resume) the SAME unsettled task is
+            // joined by a new session, and the record's `sessions` vec is the
+            // authoritative live join for recovery UX (ADR-0031). Append it
+            // (consecutive-deduped, so a same-session follow-up is a no-op) and
+            // re-persist so the new join survives a crash -- without touching
+            // body. `sessions` stays opaque display payload; no enforcement path
+            // reads it.
+            let session_id = state.session_id.clone();
+            let mut changed = false;
+            if let (Some(id), Some(task)) = (session_id.as_ref(), state.task.as_mut()) {
+                let before = task.sessions.len();
+                push_session_deduped(&mut task.sessions, id);
+                changed = task.sessions.len() != before;
+            }
+            if changed && let Some(task) = state.task.as_ref() {
+                self.persist_task(task);
+            }
             return None;
         }
         let task_id = new_task_id();
