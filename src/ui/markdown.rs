@@ -24,7 +24,9 @@ use std::rc::Rc;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::ui::textengine::{cluster_advance, display_width, truncate_to_width};
 
 /// Indent applied per Markdown nesting level (list depth / blockquote).
 const INDENT: &str = "  ";
@@ -513,7 +515,7 @@ impl<'a> Renderer<'a> {
         let body_style = self.theme.base;
 
         let prefix = self.block_prefix();
-        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let prefix_width = display_width(&prefix);
         let prefix_style = self.theme.base.patch(self.theme.list_bullet);
         // Width available to the table itself, after the block indent.
         let table_width = self.width.saturating_sub(prefix_width).max(1);
@@ -521,11 +523,11 @@ impl<'a> Renderer<'a> {
         // Natural width per column from header + body cells.
         let mut natural = vec![0usize; cols];
         for (i, cell) in table.header.iter().enumerate() {
-            natural[i] = natural[i].max(UnicodeWidthStr::width(cell.as_str()));
+            natural[i] = natural[i].max(display_width(cell));
         }
         for row in &table.rows {
             for (i, cell) in row.iter().take(cols).enumerate() {
-                natural[i] = natural[i].max(UnicodeWidthStr::width(cell.as_str()));
+                natural[i] = natural[i].max(display_width(cell));
             }
         }
 
@@ -611,7 +613,7 @@ fn push_table_row(
         .enumerate()
         .map(|(i, w)| {
             let text = cells.get(i).map(String::as_str).unwrap_or("");
-            wrap_plain(text, *w)
+            wrap_table_cell(text, *w)
         })
         .collect();
     let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
@@ -631,7 +633,7 @@ fn push_table_row(
             // and pushes the border out of alignment.
             let text = truncate_to_width(cell, *w);
             let align = alignments.get(i).copied().unwrap_or(Alignment::None);
-            let (left, right) = pad_for(UnicodeWidthStr::width(text.as_str()), *w, align);
+            let (left, right) = pad_for(display_width(&text), *w, align);
             if left > 0 {
                 spans.push(Span::raw(" ".repeat(left)));
             }
@@ -657,7 +659,7 @@ fn render_table_fallback(
 ) {
     let mut push_row = |cells: &[String], style: Style| {
         let joined = cells.join(" | ");
-        for line in wrap_plain(&joined, width) {
+        for line in wrap_table_cell(&joined, width) {
             out.push(Line::from(Span::styled(line, style)));
         }
     };
@@ -704,26 +706,6 @@ fn fit_columns(natural: &[usize], available: usize) -> Vec<usize> {
     widths
 }
 
-/// Truncate `text` to at most `max` display columns on a char boundary, so a
-/// rendered table cell never overflows its column (e.g. a wide glyph that cannot
-/// be split into a 1-column slot).
-fn truncate_to_width(text: &str, max: usize) -> String {
-    if UnicodeWidthStr::width(text) <= max {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
-        if used + w > max {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out
-}
-
 /// Left/right padding to fit `text_width` into `col` for the given alignment.
 fn pad_for(text_width: usize, col: usize, align: Alignment) -> (usize, usize) {
     let slack = col.saturating_sub(text_width);
@@ -734,15 +716,17 @@ fn pad_for(text_width: usize, col: usize, align: Alignment) -> (usize, usize) {
     }
 }
 
-/// Wrap `text` to `width` columns on word boundaries, hard-breaking words that
-/// are themselves wider than the column. Always returns at least one line.
-fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+/// Word-wrap a table cell to `width` display columns, hard-breaking words that
+/// are themselves wider than the column. Splits on whitespace (cell content is
+/// re-flowed) and keeps grapheme clusters whole, so a wide/emoji glyph is never
+/// split across a column boundary. Always returns at least one line.
+fn wrap_table_cell(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut current_w = 0usize;
     for word in text.split_whitespace() {
-        let word_w = UnicodeWidthStr::width(word);
+        let word_w = display_width(word);
         if word_w > width {
             // Flush, then hard-break the oversized word by display column.
             if !current.is_empty() {
@@ -751,13 +735,13 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
             }
             let mut chunk = String::new();
             let mut chunk_w = 0;
-            for ch in word.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+            for cluster in word.graphemes(true) {
+                let cw = cluster_advance(cluster);
                 if chunk_w + cw > width {
                     lines.push(std::mem::take(&mut chunk));
                     chunk_w = 0;
                 }
-                chunk.push(ch);
+                chunk.push_str(cluster);
                 chunk_w += cw;
             }
             if !chunk.is_empty() {
@@ -1083,8 +1067,34 @@ mod tests {
         let lines = render_markdown_themed(md, &MarkdownTheme::default(), width);
         for line in &lines {
             assert!(
-                UnicodeWidthStr::width(text_of(line).as_str()) <= width,
+                display_width(&text_of(line)) <= width,
                 "table line exceeds width {width}: {:?}",
+                text_of(line)
+            );
+        }
+    }
+
+    #[test]
+    fn table_cell_sizes_by_display_width_and_keeps_emoji_cluster_whole() {
+        // A ZWJ family emoji is one grapheme cluster of several chars with a
+        // display width of 2. Column fitting must size by display width, and the
+        // defensive per-cell truncation must keep the cluster intact. The old
+        // char-based truncation split it after the first codepoint ("\u{1f468}"),
+        // corrupting the glyph; the grapheme-based engine keeps it whole.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        // Header "W" is 1 col, the body cell is 2 cols, so the column fits to 2 --
+        // exactly the cluster width, forcing the truncation path to run.
+        let md = format!("| W |\n| - |\n| {family} |");
+        let lines = render_markdown_themed(&md, &MarkdownTheme::default(), DEFAULT_RENDER_WIDTH);
+        let joined: String = lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains(family),
+            "emoji cluster split or dropped: {joined:?}"
+        );
+        for line in &lines {
+            assert!(
+                display_width(&text_of(line)) <= DEFAULT_RENDER_WIDTH,
+                "table line exceeds width: {:?}",
                 text_of(line)
             );
         }
@@ -1118,7 +1128,7 @@ mod tests {
         for l in &table_lines {
             assert!(l.starts_with("  "), "table line lost list indent: {l:?}");
             assert!(
-                UnicodeWidthStr::width(l.as_str()) <= width,
+                display_width(l) <= width,
                 "indented table line exceeds width: {l:?}"
             );
         }
