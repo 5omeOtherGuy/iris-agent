@@ -326,6 +326,9 @@ impl GitSafety {
                 // committed content as the pre-task image (best-effort) and open
                 // a restore point over the running diff. A file with no committed
                 // predecessor is treated as a create (base rollback deletes it).
+                // As in `after_exec`, these per-task ref writes are single-writer
+                // under the held lease and need no mutation lock; the shared
+                // record write in `persist_task` is the serialized one.
                 if !touched.is_empty()
                     && let Chain::Git(chain) = &mut task.chain
                 {
@@ -636,6 +639,15 @@ impl MutationGuard for GitSafety {
             // A confirmed set of Iris changes opens a new checkpoint over the
             // running (unsettled) diff: snapshot the current ledger-path content
             // into the chain as one restore point (ADR-0028 auto-checkpoint).
+            //
+            // The `refs/iris/checkpoints/<task-id>/` writes below are NOT wrapped
+            // in the repo mutation lock: this task's refs are single-writer by
+            // construction -- only the process holding this task's advisory lease
+            // writes them, and recovery/expiry/adoption in another process must
+            // first claim that lease (ADR-0030), so no other process can read or
+            // write these refs concurrently. The shared write that DOES race
+            // across processes -- the record file in the shared tasks dir -- is
+            // serialized inside `persist_task`.
             if !iris_changes.is_empty() {
                 let turn = task.turn;
                 let label = checkpoint_label(&iris_changes);

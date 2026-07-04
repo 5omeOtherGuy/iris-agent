@@ -77,17 +77,21 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
 /// (`EWOULDBLOCK`); `Err` = a real IO/lock error.
 pub(super) fn try_exclusive(path: &Path) -> io::Result<Option<FlockGuard>> {
     let file = open_lock_file(path)?;
-    // SAFETY: `file` owns a valid fd for the duration of the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(Some(FlockGuard { _file: file }));
-    }
-    let err = io::Error::last_os_error();
-    // LOCK_NB contention reports EWOULDBLOCK (== EAGAIN on Linux).
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(None)
-    } else {
-        Err(err)
+    loop {
+        // SAFETY: `file` owns a valid fd for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(FlockGuard { _file: file }));
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Interrupted by a signal before acquiring: retry rather than
+            // misreport contention or a hard error.
+            Some(libc::EINTR) => continue,
+            // LOCK_NB contention reports EWOULDBLOCK (== EAGAIN on Linux).
+            Some(libc::EWOULDBLOCK) => return Ok(None),
+            _ => return Err(err),
+        }
     }
 }
 
@@ -95,12 +99,20 @@ pub(super) fn try_exclusive(path: &Path) -> io::Result<Option<FlockGuard>> {
 /// short-lived mutation lock around a record/ref write sequence.
 pub(super) fn exclusive_blocking(path: &Path) -> io::Result<FlockGuard> {
     let file = open_lock_file(path)?;
-    // SAFETY: `file` owns a valid fd for the duration of the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc == 0 {
-        Ok(FlockGuard { _file: file })
-    } else {
-        Err(io::Error::last_os_error())
+    loop {
+        // SAFETY: `file` owns a valid fd for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            return Ok(FlockGuard { _file: file });
+        }
+        let err = io::Error::last_os_error();
+        // A blocking `flock` interrupted by a signal must retry: returning the
+        // error here would let `with_mutation_lock` proceed WITHOUT the lock and
+        // silently bypass cross-process serialization (ADR-0030).
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err);
     }
 }
 

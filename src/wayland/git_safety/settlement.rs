@@ -92,23 +92,35 @@ impl GitSafety {
         let mut state = self.state.lock().unwrap();
         let task = state.task.take()?;
         let count = task.ledger.entries.len();
+        // Keep the task lease held (`_lease`) through the whole teardown: while it
+        // is held no other process can adopt or checkpoint this task, closing the
+        // TOCTOU window between settling and record removal (ADR-0030).
         let Task {
             mut chain,
             git_dir,
             task_id,
+            _lease,
             ..
         } = task;
-        match &mut chain {
+        let gc_chain = |chain: &mut Chain| match chain {
             Chain::Git(chain) => {
                 if let Err(error) = chain.gc(KEEP_CHECKPOINTS) {
                     tracing::warn!(error = %format!("{error:#}"), "checkpoint GC on accept failed");
                 }
             }
             Chain::Fallback(store) => store.gc(KEEP_CHECKPOINTS),
-        }
+        };
+        // Serialize the ref GC + record removal against concurrent processes
+        // (ADR-0030): one short mutation-lock hold around the shared writes.
         if let Some(git_dir) = git_dir {
-            task_state::remove(&git_dir, &task_id);
+            lock::with_mutation_lock(&git_dir, || {
+                gc_chain(&mut chain);
+                task_state::remove(&git_dir, &task_id);
+            });
+        } else {
+            gc_chain(&mut chain);
         }
+        drop(_lease);
         Some(format!(
             "accepted {count} Iris change(s); checkpoints pruned"
         ))
@@ -148,6 +160,8 @@ impl GitSafety {
                 preserved_notices: Vec::new(),
             });
         };
+        // Keep the task lease held (`_lease`) through teardown so no concurrent
+        // recovery can adopt this task while it is being rolled back (ADR-0030).
         let Task {
             mut chain,
             git_dir,
@@ -155,6 +169,7 @@ impl GitSafety {
             baseline,
             ledger,
             turn,
+            _lease,
             ..
         } = task;
         let mut index_warning = None;
@@ -187,15 +202,24 @@ impl GitSafety {
                 }
                 chain.rollback_to_excluding(seq, &excluded)?;
                 index_warning = self.restore_user_index(&baseline.index);
-                if let Err(error) = chain.destroy() {
-                    tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on rollback failed");
+                // Serialize the ref destroy against concurrent processes
+                // (ADR-0030); the held lease already blocks any adopt.
+                let destroy = |chain: &mut CheckpointChain| {
+                    if let Err(error) = chain.destroy() {
+                        tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on rollback failed");
+                    }
+                };
+                match git_dir.as_ref() {
+                    Some(gd) => lock::with_mutation_lock(gd, || destroy(chain)),
+                    None => destroy(chain),
                 }
             }
             Chain::Fallback(store) => store.rollback_to(seq)?,
         }
         if let Some(git_dir) = git_dir {
-            task_state::remove(&git_dir, &task_id);
+            lock::with_mutation_lock(&git_dir, || task_state::remove(&git_dir, &task_id));
         }
+        drop(_lease);
         Ok(RollbackOutcome {
             summary: format!("rolled back {count} Iris change(s) to restore point {seq}"),
             index_warning,
@@ -303,12 +327,24 @@ impl GitSafety {
             if task.workspace != workspace {
                 continue;
             }
-            if task.is_expired(now, task_state::DEFAULT_EXPIRY) {
-                lock::with_mutation_lock(git_dir, || {
-                    let _ = checkpoint::destroy_task_refs(&self.workspace, &task.task_id);
-                    task_state::remove(git_dir, &task.task_id);
-                });
+            if !task.is_expired(now, task_state::DEFAULT_EXPIRY) {
+                continue;
             }
+            // Never touch a live foreign task, even an old one (ADR-0030): claim
+            // its lease non-blocking first. A held lease means a live process
+            // still owns it -- skip. For a legacy record with no lease file the
+            // claim creates and takes it (lease-free), so legacy expiry still
+            // works. Holding the claimed lease through teardown also blocks a
+            // concurrent adopt of this orphan mid-delete.
+            let lease = match lock::try_exclusive(&lock::lease_path(git_dir, &task.task_id)) {
+                Ok(Some(guard)) => guard,
+                _ => continue,
+            };
+            lock::with_mutation_lock(git_dir, || {
+                let _ = checkpoint::destroy_task_refs(&self.workspace, &task.task_id);
+                task_state::remove(git_dir, &task.task_id);
+            });
+            drop(lease);
         }
     }
 
@@ -337,11 +373,17 @@ impl GitSafety {
             // be inferred.
             let class = if task.lock_protocol.is_none() {
                 TaskClass::Legacy
-            } else if lock::is_lease_free(&lock::lease_path(&git_dir, &task.task_id)) {
-                TaskClass::Recoverable
-            } else {
+            } else if !lock::is_lease_free(&lock::lease_path(&git_dir, &task.task_id)) {
                 // Leased: a live foreign task. Never adopt or list it.
                 continue;
+            } else if task.lock_protocol.as_deref() == Some(lock::LOCK_PROTOCOL) {
+                TaskClass::Recoverable
+            } else {
+                // Lease-free but stamped with an unknown/future lock protocol
+                // whose liveness semantics this build cannot interpret: surface
+                // as unknown, never auto-adopt (ADR-0030 degrade direction --
+                // spurious "unknown", never adoption of a task we cannot vet).
+                TaskClass::Legacy
             };
             let age = now
                 .duration_since(UNIX_EPOCH + Duration::from_millis(task.updated_ms))
