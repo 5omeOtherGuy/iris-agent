@@ -1041,6 +1041,12 @@ without `TestBackend` frame assertions.
 
 ## Milestone 7 — IDE-Grade Transcript
 
+**Status: shipped (2026-07-04, PRs [#334](https://github.com/5omeOtherGuy/iris-agent/pull/334) and [#347](https://github.com/5omeOtherGuy/iris-agent/pull/347)).**
+Both slices landed through the gate with pre-merge review: syntect
+highlighting via the `HighlightFn` seam, and spans-first OSC 8 hyperlinks
+(inline serialization + pager hit-testing, URI sanitization choke point,
+marker-forgery defense). `--plain` byte-identical in both.
+
 **Goal:** code, markdown, and tool output render like an IDE — syntax-highlighted
 code blocks and clickable hyperlinks — without breaking the accessible plain
 path or the dual-backend render model.
@@ -1071,6 +1077,14 @@ assertions.
 Findings from the 2026-07-04 full-TUI review, sequenced as independent batches
 (each one worktree → gate → PR). Boundary rationale:
 [ADR-0033](adr/0033-ratatui-native-adoption-boundary.md).
+
+All six batches shipped 2026-07-04 (PRs
+[#327](https://github.com/5omeOtherGuy/iris-agent/pull/327),
+[#328](https://github.com/5omeOtherGuy/iris-agent/pull/328),
+[#330](https://github.com/5omeOtherGuy/iris-agent/pull/330)–[#333](https://github.com/5omeOtherGuy/iris-agent/pull/333)),
+plus post-merge review fixes
+([#335](https://github.com/5omeOtherGuy/iris-agent/pull/335): table-cell wrap
+contract, tmux probe lifetime deadline).
 
 | Batch | Issue | Scope | Depends on |
 |-------|-------|-------|------------|
