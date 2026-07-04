@@ -102,25 +102,79 @@ impl TerminalEnv {
     }
 }
 
-/// Best-effort tmux query with a hard timeout; `None` on any failure. The
-/// probe runs on a helper thread so a wedged tmux server can never block the
-/// TUI event loop; on timeout the thread is abandoned (it exits when the child
-/// does) and the caller sees `None`. Shared by the control-mode probe and the
-/// doctor's clipboard queries.
+/// Best-effort tmux query with a hard timeout; `None` on any failure. Shared by
+/// the control-mode probe and the doctor's clipboard queries.
 pub(crate) fn tmux_probe(args: &[&str]) -> Option<String> {
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = std::process::Command::new("tmux").args(&args).output();
-        let _ = tx.send(result);
-    });
-    let output = rx.recv_timeout(PROBE_TIMEOUT).ok()?.ok()?;
-    if !output.status.success() {
+    probe_command("tmux", args, PROBE_TIMEOUT)
+}
+
+/// Run `program args`, returning its trimmed stdout on success or `None` on any
+/// failure or timeout. The child is spawned (not `output()`d) so a wedged
+/// server can never wedge us: a helper thread drains stdout while the main
+/// thread waits under one deadline that covers the WHOLE child lifetime --
+/// stdout drain AND process exit. A child that closes stdout and then hangs is
+/// still killed at the deadline. On any timeout we `kill()` + `wait()` the
+/// child; killing closes the pipe, so the reader thread hits EOF and exits --
+/// no leaked thread and no leaked/zombie process per probe. (Assumes the small
+/// single-line output of a tmux query, so a full pipe can never deadlock the
+/// child before it exits.)
+fn probe_command(program: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
         return None;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let kill_and_reap = |child: &mut std::process::Child| {
+        // Kill closes the pipe so the reader unblocks, then reap.
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    match rx.recv_timeout(timeout) {
+        Ok(buf) => {
+            // Reader hit EOF (child closed stdout). The child may still hang, so
+            // poll its exit only until the same deadline, then kill it. 5ms poll
+            // is fine for a rare startup/doctor probe.
+            let success = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Ok(None) | Err(_) => {
+                        kill_and_reap(&mut child);
+                        break false;
+                    }
+                }
+            };
+            let _ = reader.join();
+            if !success {
+                return None;
+            }
+            let value = String::from_utf8_lossy(&buf).trim().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        }
+        Err(_) => {
+            kill_and_reap(&mut child);
+            let _ = reader.join();
+            None
+        }
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]
@@ -198,5 +252,79 @@ mod tests {
         let unavailable = env_with(Some("xterm"), true, ControlModeProbe::Unavailable);
         assert!(unavailable.tmux_control_mode_for_screen());
         assert!(!unavailable.tmux_control_mode_for_doctor());
+    }
+
+    // The probe tests exercise `probe_command` with ordinary commands instead
+    // of a real tmux, matching this module's tmux-free test style.
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_kills_and_reaps_child_on_timeout() {
+        // `sleep 5` far outlives the 50ms timeout. If the timeout path did not
+        // kill AND reap the child, the internal `wait()` would block for the
+        // full 5s; returning quickly proves the child was killed and reaped and
+        // the reader thread unblocked. Guards against the pre-fix leak where the
+        // helper thread stayed blocked in `output()` and the child was orphaned.
+        let start = std::time::Instant::now();
+        let result = probe_command("sleep", &["5"], std::time::Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert_eq!(result, None, "timed-out probe must be Unavailable");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "probe did not kill+reap the child within budget: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_kills_child_that_closes_stdout_then_hangs() {
+        // The deadline must cover the whole child lifetime, not just stdout
+        // EOF: a child that closes fd 1 and then sleeps would block a naive
+        // `wait()` after the successful drain. Returning quickly proves the
+        // post-EOF exit poll kills it at the deadline.
+        let start = std::time::Instant::now();
+        let result = probe_command(
+            "sh",
+            &["-c", "exec >&-; sleep 5"],
+            std::time::Duration::from_millis(50),
+        );
+        let elapsed = start.elapsed();
+        assert_eq!(result, None, "killed-at-deadline probe must be Unavailable");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "probe did not enforce the deadline past stdout EOF: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_returns_trimmed_stdout_on_success() {
+        let result = probe_command("printf", &["hello\n"], std::time::Duration::from_secs(5));
+        assert_eq!(result.as_deref(), Some("hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_empty_output_is_none() {
+        // Exit success but no output trims to empty -> None (unavailable).
+        let result = probe_command("true", &[], std::time::Duration::from_secs(5));
+        assert_eq!(result, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_command_nonzero_exit_is_none() {
+        let result = probe_command("false", &[], std::time::Duration::from_secs(5));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn probe_command_missing_program_is_none() {
+        let result = probe_command(
+            "iris-nonexistent-probe-binary",
+            &[],
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(result, None);
     }
 }
