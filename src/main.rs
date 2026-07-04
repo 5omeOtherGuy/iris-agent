@@ -386,6 +386,12 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
+    // preference; absent/invalid leaves the built-in default (`strict`). The live
+    // `/approval` command stays session-only and is unaffected.
+    harness.set_approval_mode(nexus::ApprovalMode::from_startup_setting(
+        settings.default_approval.as_deref(),
+    ));
     // Tier-3 mode-switch state: `/model` `/reasoning` rebuild a provider from the
     // same system prompt via `build_provider` and install it at a turn boundary.
     // The session id lives in a shared cell so an in-session `/resume` `/new`
@@ -592,6 +598,11 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     );
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
+    // preference; absent/invalid leaves the built-in default (`strict`).
+    harness.set_approval_mode(nexus::ApprovalMode::from_startup_setting(
+        settings.default_approval.as_deref(),
+    ));
     let session_cell = Rc::new(RefCell::new(session_id.clone()));
     let build_cell = session_cell.clone();
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
