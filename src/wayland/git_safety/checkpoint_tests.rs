@@ -1090,6 +1090,54 @@ fn legacy_record_is_unknown_and_never_auto_adopted() {
     );
 }
 
+// #288 review fix: a LEASED record is never listed, even a legacy one. Another
+// process may have adopted a legacy record and hold its lease while the record
+// still reads lock_protocol=None, so `recoverable_tasks` must probe the lease
+// BEFORE classifying. flock is per open-file-description, so a same-process
+// probe on a different fd still observes the held lease -- no subprocess needed.
+#[test]
+fn leased_legacy_record_is_not_listed() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = git_dir.join("iris").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+    let task_id = "legacyleased01";
+    let now_ms = task_state::now_ms();
+    let legacy_json = format!(
+        r#"{{"task_id":"{task_id}","workspace":"{ws}","created_ms":{now_ms},"updated_ms":{now_ms},"expected":{{}},"tip_seq":0}}"#
+    );
+    fs::write(tasks_dir.join(format!("{task_id}.json")), legacy_json).unwrap();
+
+    let guard = GitSafety::new(&repo.path);
+    // Hold the record's lease in-process (simulating a live adopter).
+    let held = lock::try_exclusive(&lock::lease_path(&git_dir, task_id))
+        .unwrap()
+        .expect("lease acquired");
+    assert!(
+        !guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id),
+        "a leased (live) legacy record is never listed"
+    );
+
+    // Once the lease is free, the same legacy record surfaces as unknown.
+    drop(held);
+    assert!(
+        guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id && t.class == TaskClass::Legacy),
+        "a lease-free legacy record is surfaced as unknown"
+    );
+}
+
 // Test 4 (#285): settle vs adopt are serialized by the repo mutation lock. A
 // foreign process holds the mutation lock, so an `adopt_task` that must write
 // (append a recovery checkpoint) blocks until the lock is released -- proving no

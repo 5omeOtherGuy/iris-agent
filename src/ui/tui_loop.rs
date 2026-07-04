@@ -290,12 +290,16 @@ async fn session_loop<P: ChatProvider>(
     // On startup, reconcile any crashed/unsettled Iris task in this repo and
     // expire stale ones (issue #263, ADR-0028): print the single-orphan notice
     // or open the resume-task picker for the >1/legacy case (#288, ADR-0031).
-    apply_recovery(harness.recover_checkpoints(), tui);
+    let recovery_picker_open = apply_recovery(harness.recover_checkpoints(), tui);
     // `iris resume` (no id) on a rich TTY opens the resume picker on start by
     // handing a pre-built modal here. Open it before the first draw and before
     // the blocking input reader starts, so the first key acts on a visible
-    // picker.
-    if let Some(modal) = startup_modal {
+    // picker. But the recovery task-picker (>1/legacy: explicit task selection
+    // required, #288/ADR-0031) takes priority -- do not overwrite it with the
+    // session-resume picker.
+    if let Some(modal) = startup_modal
+        && !recovery_picker_open
+    {
         tui.screen.open_modal(modal);
     }
     tui.draw()?;
@@ -505,15 +509,22 @@ fn perform_swap<P: ChatProvider>(
 /// Apply a [`RecoveryOutcome`] at a safe boundary (#288, ADR-0031): nothing for
 /// `None`, the single-orphan auto-adopt notice for `Notice`, and the resume-task
 /// picker for `Picker` (the >1/legacy case that requires explicit selection).
-fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
+/// Returns whether it opened a recovery picker modal, so a caller that also has
+/// a pending startup modal can let the recovery picker win.
+fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) -> bool {
     match outcome {
-        RecoveryOutcome::None => {}
-        RecoveryOutcome::Notice(notice) => apply_notices(tui, vec![notice]),
-        RecoveryOutcome::Picker(tasks) => {
-            if let Some(modal) = picker::tasks_modal(&tasks) {
-                tui.screen.open_modal(modal);
-            }
+        RecoveryOutcome::None => false,
+        RecoveryOutcome::Notice(notice) => {
+            apply_notices(tui, vec![notice]);
+            false
         }
+        RecoveryOutcome::Picker(tasks) => match picker::tasks_modal(&tasks) {
+            Some(modal) => {
+                tui.screen.open_modal(modal);
+                true
+            }
+            None => false,
+        },
     }
 }
 

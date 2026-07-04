@@ -435,21 +435,23 @@ impl GitSafety {
             if task.workspace != workspace {
                 continue;
             }
-            // A legacy record (no lock metadata) is always unknown, regardless of
-            // any lease -- it predates the protocol, so no reliable ownership can
-            // be inferred.
-            let class = if task.lock_protocol.is_none() {
-                TaskClass::Legacy
-            } else if !lock::is_lease_free(&lock::lease_path(&git_dir, &task.task_id)) {
-                // Leased: a live foreign task. Never adopt or list it.
+            // Never list a live foreign task: probe the record's lease FIRST. If
+            // any process holds it the task is live and owned elsewhere -- skip
+            // it regardless of protocol. A legacy record another process has
+            // adopted holds its lease while still reading lock_protocol=None, so
+            // classifying before the lease check would wrongly list it
+            // (ADR-0030/0031 invariant: leased tasks are never listed).
+            if !lock::is_lease_free(&lock::lease_path(&git_dir, &task.task_id)) {
                 continue;
-            } else if task.lock_protocol.as_deref() == Some(lock::LOCK_PROTOCOL) {
+            }
+            // Lease-free: classify by lock protocol. The known protocol is a
+            // recoverable orphan; a missing (legacy) or unknown/future protocol
+            // is surfaced as unknown and never auto-adopted (ADR-0030 degrade
+            // direction -- spurious "unknown", never adoption of a task we
+            // cannot vet).
+            let class = if task.lock_protocol.as_deref() == Some(lock::LOCK_PROTOCOL) {
                 TaskClass::Recoverable
             } else {
-                // Lease-free but stamped with an unknown/future lock protocol
-                // whose liveness semantics this build cannot interpret: surface
-                // as unknown, never auto-adopt (ADR-0030 degrade direction --
-                // spurious "unknown", never adoption of a task we cannot vet).
                 TaskClass::Legacy
             };
             let age = now
@@ -464,6 +466,10 @@ impl GitSafety {
                 class,
             });
         }
+        // Deterministic order so the picker's default (first) row is stable
+        // across runs -- `load_all` reflects nondeterministic `read_dir` order.
+        // Newest-updated first (smallest age), `task_id` as a stable tie-break.
+        out.sort_by(|a, b| a.age.cmp(&b.age).then_with(|| a.task_id.cmp(&b.task_id)));
         out
     }
 
