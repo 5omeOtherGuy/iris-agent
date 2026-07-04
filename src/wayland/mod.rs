@@ -290,9 +290,30 @@ impl<P: ChatProvider> Harness<P> {
 
     /// On resume / a new session in the same repo: reconcile a crashed task and
     /// expire stale ones, returning a one-line recovery notice for the event
-    /// stream (ADR-0028). `None` when nothing is unsettled.
-    pub(crate) fn recover_checkpoints(&self) -> Option<String> {
+    /// stream (ADR-0028). Returns a [`RecoveryOutcome`](git_safety::RecoveryOutcome)
+    /// so Tier 3 prints the single-orphan auto-adopt notice (unchanged UX) or
+    /// opens the resume-task picker for the >1/legacy case (#288, ADR-0031).
+    pub(crate) fn recover_checkpoints(&self) -> git_safety::RecoveryOutcome {
         self.git_safety.recover_and_expire()
+    }
+
+    /// The lease-free recoverable/legacy task records in this workspace, for the
+    /// `/tasks` resume-task picker (#288, ADR-0031). Live foreign (leased) tasks
+    /// are already excluded by the git-safety seam. `body`/`sessions` on each row
+    /// are opaque display payload -- the picker only renders them.
+    pub(crate) fn recoverable_tasks(&self) -> Vec<git_safety::RecoverableTask> {
+        self.git_safety.recoverable_tasks()
+    }
+
+    /// Adopt a recoverable task by id at the safe inter-turn boundary (#288,
+    /// ADR-0031): claim its lease, reconcile disk vs the op-log, and rehydrate
+    /// the checkpoint chain so a post-adoption `/rollback` / `/accept` /
+    /// `/checkpoint` operates on the real chain. Never implicitly resumes a
+    /// session -- the returned [`AdoptedTask`](git_safety::AdoptedTask) carries
+    /// the body + linked sessions so the caller can offer an explicit resume.
+    /// `None` when the record is gone or now leased.
+    pub(crate) fn adopt_task(&self, task_id: &str) -> Option<git_safety::AdoptedTask> {
+        self.git_safety.adopt(task_id)
     }
 
     /// Re-anchor the session in another worktree (the git dropdown's

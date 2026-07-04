@@ -16,9 +16,10 @@ use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
     EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
-    SettingsMenu, TrustMenu,
+    SettingsMenu, TaskPicker, TaskRow, TrustMenu,
 };
 use crate::wayland::Harness;
+use crate::wayland::git_safety::{AdoptedTask, RecoverableTask};
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -174,6 +175,106 @@ pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<Se
             age: session::relative_age(now_ms, entry.meta.updated_ms),
         })
         .collect()
+}
+
+/// Build the `/tasks` resume-task picker from the harness's recoverable-task
+/// records (#288, ADR-0031), or `None` when nothing is recoverable in this
+/// workspace. Live foreign (leased) tasks are already excluded by the git-safety
+/// seam. Pure row-building is split into [`task_rows`] so it is unit-tested
+/// without a repo.
+pub(crate) fn open_tasks<P: ChatProvider>(harness: &Harness<P>) -> Option<Modal> {
+    tasks_modal(&harness.recoverable_tasks())
+}
+
+/// Wrap already-fetched recoverable-task rows into the picker modal, or `None`
+/// when there are none. Shared by [`open_tasks`] (the `/tasks` command) and the
+/// startup/swap recovery sites, which already hold the rows.
+pub(crate) fn tasks_modal(tasks: &[RecoverableTask]) -> Option<Modal> {
+    if tasks.is_empty() {
+        return None;
+    }
+    Some(Modal::Tasks(TaskPicker::new(task_rows(tasks))))
+}
+
+/// Turn recoverable-task records into display rows (id, body preview, relative
+/// age, linked-session count), preserving input order. The body preview is the
+/// opaque `body` payload (already `preview_line`-shaped at capture, ADR-0031);
+/// a record with no recorded body renders `"(no description recorded)"`. Pure,
+/// so the picker construction is unit-tested without a repo.
+pub(crate) fn task_rows(tasks: &[RecoverableTask]) -> Vec<TaskRow> {
+    tasks
+        .iter()
+        .map(|task| TaskRow {
+            task_id: task.task_id.clone(),
+            preview: task_preview(task.body.as_deref()),
+            // Reuse the session picker's relative-age formatter: the record's age
+            // is a Duration, so measure it as a delta from an epoch of zero.
+            age: session::relative_age(task.age.as_millis(), 0),
+            sessions: task.sessions.len(),
+        })
+        .collect()
+}
+
+/// The body-preview cell for a task row: the opaque body, or the legacy
+/// placeholder when no body was recorded (or it is blank).
+fn task_preview(body: Option<&str>) -> String {
+    match body.map(str::trim) {
+        Some(text) if !text.is_empty() => text.to_string(),
+        _ => "(no description recorded)".to_string(),
+    }
+}
+
+/// Decide the adoption UX for an adopted task (#288, ADR-0031): the notice lines
+/// (body + linked-session summary) and, only when exactly one session is linked,
+/// the id of that session to offer as an explicit "also resume" second action.
+/// Adopting NEVER implicitly resumes a session; zero or multiple linked sessions
+/// yield `None` (multiple are never guessed between). Pure, so the offer policy
+/// is unit-tested without the loop.
+pub(crate) fn adopt_notice(adopted: &AdoptedTask) -> (Vec<String>, Option<String>) {
+    let short = short_id(&adopted.task_id);
+    let body = task_preview(adopted.body.as_deref());
+    let mut lines = vec![format!("Adopted task {short}: {body}")];
+    let resume = match adopted.sessions.as_slice() {
+        [] => {
+            lines.push("No linked sessions recorded.".to_string());
+            None
+        }
+        [one] => {
+            lines.push(format!(
+                "1 linked session ({}) -- adopt only; confirm to also resume it.",
+                short_id(one)
+            ));
+            Some(one.clone())
+        }
+        many => {
+            lines.push(format!(
+                "{} linked sessions -- adopt only; resume one explicitly with /resume.",
+                many.len()
+            ));
+            None
+        }
+    };
+    (lines, resume)
+}
+
+/// A short, display-friendly prefix of an opaque id (task or session): the first
+/// 8 chars, so notices stay readable without dropping uniqueness for the user.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// The explicit "also resume its session" offer shown after adopting a task with
+/// exactly one linked session (#288, ADR-0031). A single-row [`SessionPicker`]:
+/// Enter resumes that session (reusing the `/resume` swap path), Esc declines
+/// and leaves the task adopted. Reuses the session picker so resume goes through
+/// the exact same inter-turn swap as `/resume`.
+pub(crate) fn resume_offer(session_id: &str) -> Modal {
+    let row = SessionRow {
+        id: session_id.to_string(),
+        preview: "resume the session that worked this task".to_string(),
+        age: String::new(),
+    };
+    Modal::Session(SessionPicker::new(vec![row]))
 }
 
 /// Build the `/trust` project-permissions modal from the harness-owned policy
@@ -572,5 +673,81 @@ mod tests {
             ModelDecision::Open(search) => assert_eq!(search, "gpt-5.5"),
             _ => panic!("expected open (gpt-5.5 not in scope)"),
         }
+    }
+
+    // --- resume-task picker rows + adoption offer (#288, ADR-0031) ---
+
+    use std::time::Duration;
+
+    fn recoverable(
+        id: &str,
+        body: Option<&str>,
+        sessions: &[&str],
+        age: Duration,
+    ) -> RecoverableTask {
+        RecoverableTask::for_test(id, age, body, sessions)
+    }
+
+    #[test]
+    fn task_rows_render_body_preview_age_and_session_count() {
+        let tasks = vec![
+            recoverable(
+                "taskaaaa1111",
+                Some("fix the parser"),
+                &["s1", "s2"],
+                Duration::from_secs(3600),
+            ),
+            // A legacy row with no recorded body renders the placeholder.
+            recoverable("taskbbbb2222", None, &[], Duration::from_secs(120)),
+        ];
+        let rows = task_rows(&tasks);
+        assert_eq!(rows.len(), 2, "input order preserved");
+        assert_eq!(rows[0].task_id, "taskaaaa1111");
+        assert_eq!(rows[0].preview, "fix the parser");
+        assert_eq!(rows[0].age, "1h ago");
+        assert_eq!(rows[0].sessions, 2);
+        assert_eq!(
+            rows[1].preview, "(no description recorded)",
+            "a legacy row with no body shows the placeholder"
+        );
+        assert_eq!(rows[1].age, "2m ago");
+        assert_eq!(rows[1].sessions, 0);
+    }
+
+    fn adopted(id: &str, body: Option<&str>, sessions: &[&str]) -> AdoptedTask {
+        AdoptedTask {
+            task_id: id.to_string(),
+            body: body.map(str::to_string),
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn adopt_offer_only_for_exactly_one_linked_session() {
+        // Exactly one linked session: an explicit resume offer is surfaced.
+        let (lines, resume) = adopt_notice(&adopted("t1", Some("work"), &["sessone1"]));
+        assert_eq!(resume.as_deref(), Some("sessone1"));
+        assert!(lines.iter().any(|l| l.contains("work")), "body shown");
+        assert!(
+            lines.iter().any(|l| l.contains("1 linked session")),
+            "the single-session line is shown: {lines:?}"
+        );
+
+        // Zero linked sessions (legacy): adopt only, never resume.
+        let (lines, resume) = adopt_notice(&adopted("t2", None, &[]));
+        assert!(resume.is_none(), "zero sessions never offers a resume");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("(no description recorded)")),
+            "unknown body placeholder shown for a legacy adopt: {lines:?}"
+        );
+
+        // Multiple linked sessions: never guessed between, so no resume offer.
+        let (_, resume) = adopt_notice(&adopted("t3", Some("work"), &["sa", "sb"]));
+        assert!(
+            resume.is_none(),
+            "multiple linked sessions are never guessed between"
+        );
     }
 }

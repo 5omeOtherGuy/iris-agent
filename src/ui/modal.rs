@@ -94,6 +94,11 @@ pub(crate) enum ModalAction {
     /// the safe inter-turn boundary (reloads messages, session log, and harness
     /// state). Emitted by the `/resume` picker on Enter.
     ResumeSession(String),
+    /// Adopt the recoverable task with this id at the safe inter-turn boundary
+    /// (#288, ADR-0031): rehydrate its checkpoint chain so settlement operates on
+    /// the real chain. Never implicitly resumes a session. Emitted by the
+    /// `/tasks` picker on Enter.
+    AdoptTask(String),
     /// `/login` method chosen -> open the matching provider selector.
     ChooseLoginMethod(LoginMethod),
     /// Begin an OAuth/subscription login for this provider.
@@ -130,6 +135,7 @@ pub(crate) enum Modal {
     Settings(SettingsMenu),
     Trust(TrustMenu),
     Session(SessionPicker),
+    Tasks(TaskPicker),
     LoginMethod(MethodSelect),
     Providers(ProviderSelect),
     LoginDialog(LoginDialog),
@@ -145,6 +151,7 @@ impl Modal {
             Modal::Settings(menu) => menu.handle_key(key),
             Modal::Trust(menu) => menu.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
+            Modal::Tasks(picker) => picker.handle_key(key),
             Modal::LoginMethod(menu) => menu.handle_key(key),
             Modal::Providers(picker) => picker.handle_key(key),
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
@@ -174,6 +181,7 @@ impl Modal {
             Modal::Settings(menu) => menu.render(width),
             Modal::Trust(menu) => menu.render(width),
             Modal::Session(picker) => picker.render(width),
+            Modal::Tasks(picker) => picker.render(width),
             Modal::LoginMethod(menu) => menu.render(width),
             Modal::Providers(picker) => picker.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
@@ -1045,6 +1053,101 @@ impl SessionPicker {
             Some("Resume session"),
             rows,
             Some("↑↓ move · type to filter · ↵ resume · esc cancel"),
+            usize::from(width),
+        )
+    }
+}
+
+// --- resume-task picker (/tasks) ---
+
+/// One row for the `/tasks` resume-task picker (#288, ADR-0031): the task id
+/// (stable selector key), a one-line body preview, a human-relative age, and the
+/// count of linked sessions. Built by the orchestration layer from the
+/// recoverable-task records so this presentation code stays disk-free and
+/// unit-testable. `preview` is already `"(no description recorded)"` for a
+/// legacy row with no recorded body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskRow {
+    pub(crate) task_id: String,
+    pub(crate) preview: String,
+    pub(crate) age: String,
+    pub(crate) sessions: usize,
+}
+
+/// Searchable list of recoverable tasks for the current workspace. Confirming a
+/// row emits [`ModalAction::AdoptTask`]; the loop adopts the task at the safe
+/// inter-turn boundary (and never implicitly resumes a session). Input order
+/// (newest first) is preserved.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskPicker {
+    selector: Selector,
+}
+
+impl TaskPicker {
+    pub(crate) fn new(rows: Vec<TaskRow>) -> Self {
+        let items: Vec<SelectorItem> = rows
+            .into_iter()
+            .map(|row| {
+                let sessions = if row.sessions == 1 {
+                    "1 session".to_string()
+                } else {
+                    format!("{} sessions", row.sessions)
+                };
+                SelectorItem::new(row.task_id, row.preview)
+                    .detail(row.age)
+                    .trailing(sessions)
+            })
+            .collect();
+        TaskPicker {
+            selector: Selector::new(items, true, false, MODEL_ROWS),
+        }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some(id) => ModalOutcome::Emit(ModalAction::AdoptTask(id.to_string())),
+                None => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc => ModalOutcome::Close,
+            ModalKey::CtrlC => {
+                if self.selector.clear_search() {
+                    ModalOutcome::Redraw
+                } else {
+                    ModalOutcome::Close
+                }
+            }
+            ModalKey::Backspace => {
+                if self.selector.backspace() {
+                    ModalOutcome::Redraw
+                } else {
+                    ModalOutcome::Ignore
+                }
+            }
+            ModalKey::Char(c) => {
+                self.selector.push_char(c);
+                ModalOutcome::Redraw
+            }
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let rows = selector_rows(&self.selector, "No recoverable tasks");
+        crate::ui::tui::overlay_box(
+            Some("Resume task"),
+            rows,
+            Some(
+                "\u{2191}\u{2193} move \u{00b7} type to filter \u{00b7} \u{21b5} adopt \u{00b7} esc cancel",
+            ),
             usize::from(width),
         )
     }
@@ -2015,6 +2118,52 @@ mod tests {
         }
         match picker.handle_key(ModalKey::Enter) {
             ModalOutcome::Emit(ModalAction::ResumeSession(id)) => assert_eq!(id, "bbbb"),
+            other => panic!("expected the filtered row, got {other:?}"),
+        }
+        assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    fn task_rows() -> Vec<TaskRow> {
+        vec![
+            TaskRow {
+                task_id: "taskaaaa".to_string(),
+                preview: "fix the parser".to_string(),
+                age: "5m ago".to_string(),
+                sessions: 2,
+            },
+            TaskRow {
+                task_id: "taskbbbb".to_string(),
+                preview: "(no description recorded)".to_string(),
+                age: "2h ago".to_string(),
+                sessions: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn task_picker_enter_emits_adopt_for_selected_id() {
+        let mut picker = TaskPicker::new(task_rows());
+        // First row selected by default.
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskaaaa"),
+            other => panic!("expected AdoptTask, got {other:?}"),
+        }
+        // Down then Enter adopts the second task; only the chosen id is emitted.
+        picker.handle_key(ModalKey::Down);
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskbbbb"),
+            other => panic!("expected AdoptTask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_picker_search_filters_and_esc_closes() {
+        let mut picker = TaskPicker::new(task_rows());
+        for c in "parser".chars() {
+            picker.handle_key(ModalKey::Char(c));
+        }
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskaaaa"),
             other => panic!("expected the filtered row, got {other:?}"),
         }
         assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);

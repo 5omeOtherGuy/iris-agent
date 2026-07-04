@@ -51,6 +51,7 @@ use crate::nexus::MutationGuard;
 use baseline::Baseline;
 use checkpoint::{CheckpointChain, Mode as FileMode};
 use ledger::{Attribution, Ledger, LedgerEntry};
+pub(crate) use settlement::{AdoptedTask, RecoverableTask, RecoveryOutcome};
 use settlement::{checkpoint_label, new_task_id};
 use snapshot::{FallbackStore, Snapshot};
 

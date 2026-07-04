@@ -15,7 +15,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::checkpoint::{CheckpointChain, Mode};
 use super::settlement::TaskClass;
-use super::{GitSafety, lock, task_state};
+use super::{GitSafety, RecoveryOutcome, lock, task_state};
+
+/// Extract the single-orphan auto-adopt notice from a [`RecoveryOutcome`],
+/// panicking on any other variant. Keeps the recovery tests that assert on the
+/// notice wording terse after the #288 enum change.
+fn expect_notice(outcome: RecoveryOutcome) -> String {
+    match outcome {
+        RecoveryOutcome::Notice(notice) => notice,
+        other => panic!("expected a recovery notice, got {other:?}"),
+    }
+}
 use crate::nexus::MutationGuard;
 
 // --- scratch repo helpers (mirrors tests.rs; kept local for cohesion) ----
@@ -362,9 +372,7 @@ fn crash_resume_reconciles_and_notifies() {
 
     // Session B: a fresh guard in the same repo reconciles on resume.
     let guard_b = GitSafety::new(&repo.path);
-    let notice = guard_b
-        .recover_and_expire()
-        .expect("unsettled task noticed");
+    let notice = expect_notice(guard_b.recover_and_expire());
     assert!(notice.contains("unsettled"), "notice: {notice}");
     assert!(
         task_ref_count(&repo.path, &task_id) > refs_before,
@@ -397,9 +405,8 @@ fn expired_task_auto_settles_accepted_and_gcs_refs() {
 
     // Resume sweep expires it: no notice, refs gone, record removed.
     let guard = GitSafety::new(&repo.path);
-    let notice = guard.recover_and_expire();
     assert!(
-        notice.is_none(),
+        matches!(guard.recover_and_expire(), RecoveryOutcome::None),
         "an expired task surfaces no recovery notice"
     );
     assert_eq!(
@@ -508,9 +515,7 @@ fn resume_rehydrates_task_and_rollback_restores() {
     // Session B: a fresh guard over the same repo/session dir reconciles and
     // rehydrates the unsettled task.
     let guard_b = GitSafety::new(&repo.path);
-    let notice = guard_b
-        .recover_and_expire()
-        .expect("unsettled task noticed");
+    let notice = expect_notice(guard_b.recover_and_expire());
     assert!(notice.contains("unsettled"), "notice: {notice}");
 
     let points = guard_b.restore_points();
@@ -557,9 +562,7 @@ fn recovery_checkpoint_is_full_snapshot_not_delete_bomb() {
 
     // Session B: reconcile (append a recovery checkpoint) + rehydrate.
     let guard_b = GitSafety::new(&repo.path);
-    guard_b
-        .recover_and_expire()
-        .expect("unsettled task noticed");
+    expect_notice(guard_b.recover_and_expire());
 
     // A recovery checkpoint was appended (the newest restore point past base).
     let points = guard_b.restore_points();
@@ -1072,15 +1075,66 @@ fn legacy_record_is_unknown_and_never_auto_adopted() {
         .expect("the legacy record deserializes and is surfaced");
     assert_eq!(rec.class, TaskClass::Legacy, "no lock metadata => unknown");
 
-    // Recovery never auto-adopts it: the notice lists it, no task becomes active.
-    let notice = guard.recover_and_expire().expect("a notice surfaces");
+    // Recovery never auto-adopts it: it opens the picker (explicit selection),
+    // listing the legacy row, and no task becomes active (#288, ADR-0030).
+    let RecoveryOutcome::Picker(rows) = guard.recover_and_expire() else {
+        panic!("an unknown-legacy record requires explicit selection (picker)");
+    };
     assert!(
-        notice.contains(task_id) && notice.contains("unknown"),
-        "the notice lists the unknown-legacy task id: {notice}"
+        rows.iter().any(|t| t.task_id == task_id),
+        "the picker lists the unknown-legacy task id"
     );
     assert!(
         !guard.has_task(),
         "a legacy record is never auto-adopted as the active task"
+    );
+}
+
+// #288 review fix: a LEASED record is never listed, even a legacy one. Another
+// process may have adopted a legacy record and hold its lease while the record
+// still reads lock_protocol=None, so `recoverable_tasks` must probe the lease
+// BEFORE classifying. flock is per open-file-description, so a same-process
+// probe on a different fd still observes the held lease -- no subprocess needed.
+#[test]
+fn leased_legacy_record_is_not_listed() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = git_dir.join("iris").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+    let task_id = "legacyleased01";
+    let now_ms = task_state::now_ms();
+    let legacy_json = format!(
+        r#"{{"task_id":"{task_id}","workspace":"{ws}","created_ms":{now_ms},"updated_ms":{now_ms},"expected":{{}},"tip_seq":0}}"#
+    );
+    fs::write(tasks_dir.join(format!("{task_id}.json")), legacy_json).unwrap();
+
+    let guard = GitSafety::new(&repo.path);
+    // Hold the record's lease in-process (simulating a live adopter).
+    let held = lock::try_exclusive(&lock::lease_path(&git_dir, task_id))
+        .unwrap()
+        .expect("lease acquired");
+    assert!(
+        !guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id),
+        "a leased (live) legacy record is never listed"
+    );
+
+    // Once the lease is free, the same legacy record surfaces as unknown.
+    drop(held);
+    assert!(
+        guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id && t.class == TaskClass::Legacy),
+        "a lease-free legacy record is surfaced as unknown"
     );
 }
 
@@ -1151,7 +1205,7 @@ fn recovery_notice_names_the_adopted_record() {
     let mut holder = spawn_foreign_holder(&lock::lease_path(&git_dir, &foreign));
 
     let guard = GitSafety::new(&repo.path);
-    let notice = guard.recover_and_expire().expect("the orphan is recovered");
+    let notice = expect_notice(guard.recover_and_expire());
 
     assert!(
         notice.contains(&orphan),
@@ -1324,7 +1378,7 @@ fn rehydrate_appends_session_id_ordered_and_deduped() {
     {
         let guard_b = GitSafety::new(&repo.path);
         guard_b.set_session_id("sessionbbbb".to_string());
-        guard_b.recover_and_expire().expect("the orphan is adopted");
+        expect_notice(guard_b.recover_and_expire());
     }
     assert_eq!(
         task_state::load_all(&git_dir).pop().unwrap().sessions,
@@ -1337,9 +1391,7 @@ fn rehydrate_appends_session_id_ordered_and_deduped() {
     {
         let guard_c = GitSafety::new(&repo.path);
         guard_c.set_session_id("sessionbbbb".to_string());
-        guard_c
-            .recover_and_expire()
-            .expect("the orphan is adopted again");
+        expect_notice(guard_c.recover_and_expire());
     }
     assert_eq!(
         task_state::load_all(&git_dir).pop().unwrap().sessions,
@@ -1462,5 +1514,157 @@ fn expiry_removes_record_and_refs_but_leaves_session_log_untouched() {
         fs::read(&session_path).unwrap(),
         session_before,
         "expiry left the session log byte-for-byte untouched"
+    );
+}
+
+// --- resume-task picker seam (issue #288, ADR-0031) ----------------------
+
+// #288 test: multiple recoverable records => recovery opens the picker listing
+// ALL lease-free rows; adopting the chosen task leaves the others untouched.
+#[test]
+fn multiple_recoverable_tasks_open_picker_and_adopt_only_chosen() {
+    let repo = init_repo();
+
+    let first = create_unsettled_task(&repo.path, "first.txt");
+    let second = create_unsettled_task(&repo.path, "second.txt");
+
+    // More than one lease-free orphan: recovery requires explicit selection, so
+    // it opens the picker rather than auto-adopting either.
+    let guard = GitSafety::new(&repo.path);
+    let RecoveryOutcome::Picker(rows) = guard.recover_and_expire() else {
+        panic!("more than one recoverable task requires the picker");
+    };
+    let ids: Vec<&str> = rows.iter().map(|r| r.task_id.as_str()).collect();
+    assert!(
+        ids.contains(&first.as_str()) && ids.contains(&second.as_str()),
+        "the picker lists all lease-free rows: {ids:?}"
+    );
+    assert!(
+        !guard.has_task(),
+        "opening the picker never auto-adopts a task"
+    );
+
+    // Adopt exactly the chosen task; the other record stays recoverable.
+    let adopted = guard.adopt(&second).expect("the chosen task adopts");
+    assert_eq!(adopted.task_id, second);
+    assert!(guard.has_task(), "the chosen task is now active");
+    let remaining: Vec<String> = GitSafety::new(&repo.path)
+        .recoverable_tasks()
+        .into_iter()
+        .map(|r| r.task_id)
+        .collect();
+    assert!(
+        remaining.contains(&first),
+        "the unchosen task is untouched and still recoverable: {remaining:?}"
+    );
+}
+
+// #288 test: a recoverable row surfaces the opaque body + linked-session join so
+// the picker can render a body preview and a session count.
+#[test]
+fn recoverable_task_row_surfaces_body_and_sessions() {
+    let repo = init_repo();
+
+    // Session A opens the task with a body and its session id, then crashes.
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_session_id("sessionaaaa".to_string());
+        guard.set_turn_context(Some("fix the parser".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &repo.path.join("work.txt"), b"iris\n");
+    }
+
+    let rows = GitSafety::new(&repo.path).recoverable_tasks();
+    let row = rows.first().expect("one recoverable row");
+    assert_eq!(
+        row.body.as_deref(),
+        Some("fix the parser"),
+        "the row carries the opaque body for the picker preview"
+    );
+    assert_eq!(
+        row.sessions,
+        vec!["sessionaaaa".to_string()],
+        "the row carries the linked-session join"
+    );
+}
+
+// #288 test: adopt-then-settle round trip works post-restart. A crashed task is
+// adopted from the picker seam, then `/rollback`-equivalent settlement operates
+// on the rehydrated chain and undoes Iris's work.
+#[test]
+fn adopt_then_settle_round_trip_post_restart() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let created = repo.path.join("iris_new.txt");
+
+    // Session A works, task stays unsettled (a crash).
+    let task_id = {
+        let guard = GitSafety::new(&repo.path);
+        guard.note_mutation();
+        iris_write(&guard, &edited, b"iris edit\n");
+        iris_write(&guard, &created, b"iris new\n");
+        let git_dir = task_state::git_dir(&repo.path).unwrap();
+        task_state::load_all(&git_dir).pop().unwrap().task_id
+    };
+
+    // Session B adopts the orphan explicitly (picker path), then rolls it back.
+    let guard_b = GitSafety::new(&repo.path);
+    let adopted = guard_b.adopt(&task_id).expect("the orphan adopts");
+    assert_eq!(adopted.task_id, task_id);
+    let outcome = guard_b.rollback(0).unwrap();
+    assert!(
+        outcome.summary.contains("rolled back"),
+        "settlement operates on the rehydrated chain: {}",
+        outcome.summary
+    );
+    assert_eq!(
+        fs::read(&edited).unwrap(),
+        b"base\n",
+        "the adopted chain rolls back Iris's edit"
+    );
+    assert!(
+        !created.exists(),
+        "the adopted chain removes Iris's new file"
+    );
+}
+
+// #288 test: a legacy record (no body / no sessions) is adoptable from the
+// picker seam and surfaces an unknown (None) body + empty session join.
+#[test]
+fn legacy_record_adopts_with_unknown_body_and_no_sessions() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = git_dir.join("iris").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+
+    // A pre-ADR-0030/0031 record: no lock metadata, body, or sessions.
+    let task_id = "legacyadopt01";
+    let now_ms = task_state::now_ms();
+    let legacy_json = format!(
+        r#"{{"task_id":"{task_id}","workspace":"{ws}","created_ms":{now_ms},"updated_ms":{now_ms},"expected":{{}},"tip_seq":0}}"#
+    );
+    fs::write(tasks_dir.join(format!("{task_id}.json")), legacy_json).unwrap();
+
+    let guard = GitSafety::new(&repo.path);
+    let row = guard
+        .recoverable_tasks()
+        .into_iter()
+        .find(|r| r.task_id == task_id)
+        .expect("the legacy row is surfaced");
+    assert!(row.body.is_none(), "legacy body is unknown (None)");
+    assert!(row.sessions.is_empty(), "legacy session join is empty");
+
+    let adopted = guard.adopt(task_id).expect("the legacy record adopts");
+    assert_eq!(adopted.task_id, task_id);
+    assert!(adopted.body.is_none(), "adopted legacy body stays unknown");
+    assert!(
+        adopted.sessions.is_empty(),
+        "adopted legacy record has zero linked sessions"
     );
 }
