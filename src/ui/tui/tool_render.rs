@@ -245,7 +245,8 @@ fn explore_op_row(width: usize, call: &ToolCall, outcome: &ToolOutcome) -> Trans
         && let Some(meta) =
             summarize_output(call, content, *exit_code).map(|summary| summary.render())
     {
-        let text = right_align_hint(&plain, &meta, width);
+        let text =
+            super::rows::right_align(&plain, &meta, width, 1, super::rows::Overflow::DropLeft);
         return TranscriptRow::chrome_with_text(
             ChromeRow::BodyRight {
                 left: Line::from(spans),
@@ -525,7 +526,13 @@ impl PanelBody {
         row_style: Style,
         right_style: Style,
     ) {
-        let text = right_align_hint(&left_text, right, self.hint_width());
+        let text = super::rows::right_align(
+            &left_text,
+            right,
+            self.hint_width(),
+            1,
+            super::rows::Overflow::DropLeft,
+        );
         let left = self.indented_line(left);
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::BodyRight {
@@ -746,19 +753,6 @@ impl PanelBody {
             self.output_line(&clamped, false);
         }
     }
-}
-
-/// Pad `left` so `hint` hugs the right edge within `width`; drop `left` when too
-/// narrow rather than overflowing/wrapping the row. Mirrors the transcript
-/// helper so fold affordances render identically.
-fn right_align_hint(left: &str, hint: &str, width: usize) -> String {
-    let hint_w = display_width(hint);
-    let left_w = display_width(left);
-    if left.is_empty() || left_w + 1 + hint_w > width {
-        return format!("{}{hint}", " ".repeat(width.saturating_sub(hint_w)));
-    }
-    let gap = width.saturating_sub(left_w).saturating_sub(hint_w).max(1);
-    format!("{left}{}{hint}", " ".repeat(gap))
 }
 
 #[cfg(test)]

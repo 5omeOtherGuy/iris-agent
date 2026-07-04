@@ -313,13 +313,30 @@ pub(super) fn input_row(
     line
 }
 
-/// Case-insensitive subsequence fuzzy match (the filter idiom).
+/// Case-insensitive (Unicode) subsequence fuzzy match (the filter idiom). These
+/// dropdowns hold no lowercased haystack cache, so they lower both sides inline
+/// with `str::to_lowercase` (full Unicode case folding) and defer the
+/// subsequence check to the shared [`crate::ui::selector::fuzzy_match`].
 pub(super) fn fuzzy_match(needle: &str, haystack: &str) -> bool {
-    let mut chars = haystack.chars().flat_map(char::to_lowercase);
-    needle
-        .chars()
-        .flat_map(char::to_lowercase)
-        .all(|n| chars.any(|h| h == n))
+    crate::ui::selector::fuzzy_match(&needle.to_lowercase(), &haystack.to_lowercase())
+}
+
+/// Wrap-around list step: advance `selected` by `delta` within a list of `len`
+/// rows, wrapping past either end. `len == 0` yields 0. The single wrap-around
+/// selection helper for the SessionBar dropdowns (git console + directory tree)
+/// and their filter/rollback sublists -- replaces the per-menu `rem_euclid`
+/// copies so no wrap math lives outside the shared primitives.
+///
+/// Wrap policy: these SPATIAL menus WRAP (pi-mono model-list feel), matching
+/// [`crate::ui::selector::Selector`]'s `wrap = true`. The type-ahead slash
+/// palette CLAMPS instead ([`crate::ui::slash::Palette`]) so a fast typist
+/// never leaps the far end mid-filter. Two behaviors, one documented split.
+pub(super) fn step_wrapped(selected: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let current = selected.min(len - 1) as isize;
+    (current + delta).rem_euclid(len as isize) as usize
 }
 
 /// Home-relativize a path for display (`/home/u/x` → `~/x`).
@@ -364,6 +381,22 @@ mod tests {
         assert!(fuzzy_match("FEAT", "feat/split-statusline"));
         assert!(!fuzzy_match("zzz", "src/main.rs"));
         assert!(fuzzy_match("", "anything"));
+        // Unicode case folding still holds after delegating to the shared fn.
+        assert!(fuzzy_match("Ä", "strände"));
+    }
+
+    #[test]
+    fn step_wrapped_wraps_past_both_ends() {
+        // Forward past the end wraps to the top.
+        assert_eq!(step_wrapped(2, 3, 1), 0);
+        // Backward past the top wraps to the last row.
+        assert_eq!(step_wrapped(0, 3, -1), 2);
+        // Interior steps are plain.
+        assert_eq!(step_wrapped(1, 3, 1), 2);
+        assert_eq!(step_wrapped(1, 3, -1), 0);
+        // Empty list is inert; an out-of-range cursor clamps before stepping.
+        assert_eq!(step_wrapped(5, 0, 1), 0);
+        assert_eq!(step_wrapped(9, 3, 1), 0);
     }
 
     #[test]

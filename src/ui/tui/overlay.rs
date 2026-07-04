@@ -166,14 +166,12 @@ impl Component for PaletteView<'_> {
             .map(|cmd| display_width(cmd.name))
             .max()
             .unwrap_or(0);
-        // Scrolled window over the matches, keeping the selection visible
-        // (same offset math as `Selector::scroll_offset`).
+        // Scrolled window over the matches, keeping the selection visible. The
+        // scroll arithmetic and the position row below are the shared
+        // `Selector` windowing helpers -- the palette clamps and filters by
+        // prefix, so it reuses the math without adopting the full Selector.
         let scrolled = self.matches.len() > PALETTE_WINDOW;
-        let offset = if self.selected < PALETTE_WINDOW {
-            0
-        } else {
-            self.selected - PALETTE_WINDOW + 1
-        };
+        let offset = crate::ui::selector::scroll_offset(self.selected, PALETTE_WINDOW);
         let mut rows: Vec<(Line<'static>, bool)> = self
             .matches
             .iter()
@@ -206,7 +204,7 @@ impl Component for PaletteView<'_> {
         if scrolled {
             rows.push((
                 Line::from(Span::styled(
-                    format!("({}/{})", self.selected + 1, self.matches.len()),
+                    crate::ui::selector::position_label(self.selected, self.matches.len()),
                     dim_style(),
                 )),
                 false,

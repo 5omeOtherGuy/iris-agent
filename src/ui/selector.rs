@@ -68,6 +68,12 @@ impl SelectorItem {
 /// A list-with-search picker. `searchable` toggles the search row; `wrap`
 /// chooses wrap-around vs clamp at the list boundaries (pi-mono wraps the model
 /// list but clamps the provider list); `window` is the max rows shown at once.
+///
+/// Wrap policy (the single selection-navigation split, shared with the session
+/// dropdowns' `step_wrapped` and the slash palette): SPATIAL pickers/menus WRAP
+/// past either end; the type-ahead slash palette CLAMPS (no wrap) so a fast
+/// typist never jumps the far end mid-filter. See `wrap` below and
+/// [`crate::ui::slash::Palette`].
 #[derive(Debug, Clone)]
 pub(crate) struct Selector {
     items: Vec<SelectorItem>,
@@ -247,11 +253,7 @@ impl Selector {
     /// First filtered index shown given the window, scrolled to keep the cursor
     /// visible.
     fn scroll_offset(&self) -> usize {
-        if self.cursor < self.window {
-            0
-        } else {
-            self.cursor - self.window + 1
-        }
+        scroll_offset(self.cursor, self.window)
     }
 
     /// Whether the list is scrolled (more rows than the window).
@@ -262,7 +264,7 @@ impl Selector {
     /// The `(selectedIndex/filteredCount)` position label pi-mono shows when the
     /// list is scrolled. 1-based selected index.
     pub(crate) fn position_label(&self) -> String {
-        format!("({}/{})", self.cursor + 1, self.filtered.len())
+        position_label(self.cursor, self.filtered.len())
     }
 
     /// The visible window of rows, with the selected flag set on the cursor row.
@@ -289,14 +291,36 @@ impl Selector {
     }
 }
 
-/// Case-insensitive subsequence match: every char of `needle` (already
-/// lowercased) appears in `haystack` (already lowercased) in order. An empty
-/// needle matches everything.
-fn fuzzy_match(needle: &str, haystack: &str) -> bool {
+/// Case-insensitive subsequence match: every char of `needle` appears in
+/// `haystack` in order. Both are assumed ALREADY LOWERCASED by the caller --
+/// `Selector` caches lowercased haystacks in [`SelectorItem::filter`] and lowers
+/// the needle once per re-filter, so this stays allocation-free on the hot path.
+/// Callers without that cache (the session dropdowns) lower inline before
+/// calling. An empty needle matches everything. The single fuzzy filter shared
+/// by every list picker.
+pub(crate) fn fuzzy_match(needle: &str, haystack: &str) -> bool {
     let mut chars = haystack.chars();
     needle
         .chars()
         .all(|target| chars.any(|candidate| candidate == target))
+}
+
+/// First visible row index for a `window`-row viewport scrolled to keep `cursor`
+/// visible. Free function so the slash palette view -- which clamps rather than
+/// wraps and filters by prefix, not fuzzy -- reuses the scroll arithmetic
+/// without adopting the full [`Selector`].
+pub(crate) fn scroll_offset(cursor: usize, window: usize) -> usize {
+    if cursor < window {
+        0
+    } else {
+        cursor - window + 1
+    }
+}
+
+/// The pi-mono `(selectedIndex/total)` position label (1-based). Shared with the
+/// slash palette so the scrolled-list position row is written in one place.
+pub(crate) fn position_label(cursor: usize, total: usize) -> String {
+    format!("({}/{})", cursor + 1, total)
 }
 
 #[cfg(test)]
@@ -321,6 +345,22 @@ mod tests {
         assert!(!fuzzy_match("zzz", "openai-codex"));
         // Out-of-order chars do not match.
         assert!(!fuzzy_match("tpg", "gpt"));
+    }
+
+    #[test]
+    fn scroll_offset_free_fn_matches_window_math() {
+        // Cursor inside the first window: no scroll.
+        assert_eq!(scroll_offset(0, 5), 0);
+        assert_eq!(scroll_offset(4, 5), 0);
+        // Past the window: scroll so the cursor is the last visible row.
+        assert_eq!(scroll_offset(5, 5), 1);
+        assert_eq!(scroll_offset(7, 5), 3);
+    }
+
+    #[test]
+    fn position_label_free_fn_is_one_based() {
+        assert_eq!(position_label(0, 20), "(1/20)");
+        assert_eq!(position_label(7, 20), "(8/20)");
     }
 
     #[test]
