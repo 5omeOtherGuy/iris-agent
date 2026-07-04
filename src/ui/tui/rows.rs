@@ -219,8 +219,15 @@ pub(super) enum ChromeRow {
     /// The hairline rule that opens the always-visible block footer.
     FooterRule,
     /// The block footer row: state label (+ family extras) left, right-bound
-    /// dim diagnostics. Always visible, expanded or collapsed.
-    Footer { left: Line<'static>, right: String },
+    /// dim diagnostics. Always visible, expanded or collapsed. `diag_call` tags
+    /// the tool call whose footer this is, so a following provider turn can
+    /// locate and patch the right-bound `↑/cache/ctx` diagnostics in place
+    /// (forward attribution); `None` for non-tool footers (task diff, denials).
+    Footer {
+        left: Line<'static>,
+        right: String,
+        diag_call: Option<String>,
+    },
     /// End-of-block marker. Renders nothing; the footer is the last visible
     /// row of a block.
     BlockEnd,
@@ -280,7 +287,7 @@ impl ChromeRow {
             // The state label (and family extras) always win the footer row:
             // when the optional diagnostics cluster does not fit, it is
             // dropped rather than displacing the left side.
-            ChromeRow::Footer { left, right } => {
+            ChromeRow::Footer { left, right, .. } => {
                 let content_width = panel_footer_content_width(width);
                 let left_w = display_width(&line_text(left));
                 let right_w = display_width(right);
