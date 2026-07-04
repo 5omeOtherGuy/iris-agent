@@ -951,6 +951,14 @@ binding for auto-commit, worktree, GitHub, and CI slices.]
 
 ## Milestone 6 — Alt-Screen Pager TUI
 
+**Status: shipped (2026-07-03, PRs [#291]–[#298]).** The rich TUI is a
+full-frame alternate-screen pager by default (`tui.altScreen = auto`): a
+viewport-pinned session bar, an Iris-owned scrollback pane with follow mode
+and in-app scrolling/search, and mouse/clipboard behavior that degrades
+honestly — with the inline renderer as the automatic fallback and `--plain`
+untouched. Remaining optional affordances (block fullscreen viewer, in-app
+text selection) are unscheduled follow-ups.
+
 **Goal:** make the rich TUI a full-frame alternate-screen pager — a
 viewport-pinned session bar, an Iris-owned scrollback pane with follow mode
 and in-app scrolling, and mouse/clipboard behavior that degrades honestly —
@@ -966,29 +974,41 @@ panes; typing returns to the prompt; Esc is never nav), the mouse-capture
 runtime toggle, and the clipboard ladder (native → OSC 52 → tmux buffer).
 Binary-verified reference behavior: `.iris-reference/grok-pager-dossier.md`.
 
-Slices, in order (each lands green through the gate):
+Slices, in order (each landed green through the gate):
 
-- **Backend seam + screen-mode policy** — a `RenderMode` seam over the
-  existing `TuiUi`/`TerminalSurface`; alt-screen enter/leave lifecycle with
-  panic-safe restore; `alt_screen` config + `--no-alt-screen`; multiplexer
-  detection and degradation notices. Inline mode is bit-for-bit unchanged.
-- **Full-frame pager render** — render the logical document (session bar
-  pinned, transcript slice, working indicator, composer) into ratatui frames;
-  synchronized output; resize as re-render. Golden-frame tests on a
-  `TestBackend`.
-- **Scroll state + follow mode** — Iris-owned scroll offset; PageUp/PageDown,
-  line scroll, ends; follow-by-overscroll re-engage; follow indicator;
-  per-row layout cache with visible-range-only rendering (perf gate: 10k-row
-  transcript renders O(viewport)).
-- **Mouse + clipboard** — wheel scrolling under mouse capture; the runtime
-  mouse-reporting toggle (key + slash command) restoring native select/copy;
-  OSC 52 copy with tmux fallbacks; `/copy` unchanged.
-- **Capability doctor + key fallbacks** — a `/terminal-setup`-style check
-  (multiplexer, OSC 52, kitty keyboard protocol, Shift+Enter) with exact fix
-  lines and per-terminal keybinding fallbacks.
-- **Pager-only affordances (follow-ups, each optional)** — scrollback focus +
-  keyboard entry selection/folding, transcript search, sticky user-prompt
-  headers, block fullscreen viewer, in-app text selection.
+- **Backend seam + screen-mode policy** — done ([#291]). Mode seam over
+  `TuiUi`/`TerminalSurface`; alt-screen enter/leave with panic-hook + Drop +
+  force-quit restore; `tui.altScreen` config + `--no-alt-screen` +
+  `IRIS_NO_ALT_SCREEN`; tmux control mode/Zellij/dumb/non-TTY degrade with
+  notices. Inline mode bit-for-bit unchanged.
+- **Full-frame pager render** — done ([#292]). Full frames through ratatui
+  `Terminal` in `?2026` sync blocks; session bar pinned, composer pinned;
+  resize = re-render; `TestBackend` golden-frame tests.
+- **Scroll state + follow mode** — done ([#293]). Offset-from-top scroll
+  state; PageUp/PageDown, Alt+Up/Down line scroll, Home/End;
+  follow-by-overscroll; dim `▾ N lines below` indicator; windowed
+  O(viewport) render over the wrap cache with a perf gate.
+- **Mouse + clipboard** — done ([#294]). SGR mouse capture + wheel scroll
+  (`tui.scrollSpeed`); Ctrl+T + `/mouse` toggle restores native select/copy
+  (`○ mouse off` statusline hint); clipboard ladder (native → OSC 52)
+  unchanged behind `/copy`; `alt_screen` default flipped to `auto`.
+- **Capability doctor** — done ([#295]). `/terminal-setup` reports terminal,
+  multiplexer, SSH, kitty keyboard protocol, OSC 52/tmux clipboard with exact
+  `set -g …` fix lines and the Ctrl+J newline fallback.
+- **Pager-only affordances** — scrollback focus (Tab) + entry
+  selection/folding done ([#296]); transcript search `/find` with n/N done
+  ([#297]); sticky user-prompt headers done ([#298]). Still optional, not
+  scheduled: block fullscreen viewer, in-app text selection (the mouse
+  toggle covers selection until then).
+
+[#291]: https://github.com/5omeOtherGuy/iris-agent/pull/291
+[#292]: https://github.com/5omeOtherGuy/iris-agent/pull/292
+[#293]: https://github.com/5omeOtherGuy/iris-agent/pull/293
+[#294]: https://github.com/5omeOtherGuy/iris-agent/pull/294
+[#295]: https://github.com/5omeOtherGuy/iris-agent/pull/295
+[#296]: https://github.com/5omeOtherGuy/iris-agent/pull/296
+[#297]: https://github.com/5omeOtherGuy/iris-agent/pull/297
+[#298]: https://github.com/5omeOtherGuy/iris-agent/pull/298
 
 Gate: the pager must never lose transcript content that inline mode would
 have kept (the retained `Screen` state is the source of truth); every slice
