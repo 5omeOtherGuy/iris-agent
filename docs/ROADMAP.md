@@ -927,6 +927,26 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
 
 Later slices (not in #261):
 
+- Task recovery ownership fix
+  ([#285](https://github.com/5omeOtherGuy/iris-agent/issues/285),
+  [ADR-0030](adr/0030-git-safety-task-ownership-lease-and-mutation-lock.md)) —
+  **ships first, alone**: multi-process recovery can adopt a live foreign
+  task and entangle two agents' chains. Per-task flock lease + repo-scoped
+  mutation lock; recovery claims only lease-free tasks; explicit selection
+  when more than one is recoverable.
+- Task identity epic
+  ([#286](https://github.com/5omeOtherGuy/iris-agent/issues/286),
+  [ADR-0031](adr/0031-task-identity-session-linkage-and-resumable-tasks.md);
+  depends on #285) — task records gain an opaque body + session links and the
+  session log gains `taskLifecycle` audit entries
+  ([#287](https://github.com/5omeOtherGuy/iris-agent/issues/287)); a
+  resume-task picker replaces multi-record auto-adopt
+  ([#288](https://github.com/5omeOtherGuy/iris-agent/issues/288));
+  deterministic cwd-scoped find/read of prior sessions by task
+  ([#289](https://github.com/5omeOtherGuy/iris-agent/issues/289)).
+  Enforcement never reads the new metadata; the session log is never a
+  recovery input. Deferred to Milestone 4 (#216): subagent-backed session
+  summarization and model-generated task titles.
 - Per-hunk staging
   ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
 - Optional auto-commit behind explicit approval
