@@ -225,6 +225,13 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   stored beside the session transcript in `<session>.outputs/` by stable
   truncated SHA-256 handle. Files/web pages/diffs/summaries are not yet covered.
   [Partial]
+- **Native bash output filtering** — captured command output is reduced at one
+  seam before `truncate_tail` and the transcript: structured Rust filters for
+  cargo test/build/check/clippy, git status/log/diff, and npm/pnpm test
+  (jest/vitest); declarative TOML filters for ~60 more commands. Fail-safe raw
+  fallback, failure detail verbatim, `raw: true` bypass; reduction measured on
+  a committed corpus (`docs/benchmarks/adr-0037-bash-filter-tokens.md`,
+  ADR-0036/0037). [Implemented]
 - **Handle-returning tool outputs** — large successful tool outputs return a
   compact head/tail preview, structured `outputHandle` metadata, and a handle to
   full content. [Implemented]
