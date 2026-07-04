@@ -178,6 +178,7 @@ impl OpenAiCompatibleChatProvider {
         if status.is_success() {
             let mut parser = ChatStreamParser::new(self.provider.as_str(), &self.model);
             if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                sink.on_activity()?;
                 parser.ingest_event(data, sink)
             }) {
                 // A mid-stream read failure is retryable only when this attempt

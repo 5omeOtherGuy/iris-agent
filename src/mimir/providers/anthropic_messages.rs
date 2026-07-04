@@ -309,6 +309,7 @@ impl AnthropicProvider {
                 last_event_type,
             };
             if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                sink.on_activity()?;
                 parser.ingest_event(data, sink)
             }) {
                 let last = parser.last_event_type.clone();

@@ -308,10 +308,23 @@ fn working_sep() -> Span<'static> {
     Span::styled(format!(" {} ", crate::ui::symbols::SEP), dim_style())
 }
 
+#[cfg(test)]
 pub(super) fn working_indicator_line(
     frame: &str,
     elapsed: Duration,
     can_interrupt: bool,
+    usage: Option<&ProviderUsage>,
+    queued: usize,
+    width: usize,
+) -> Line<'static> {
+    working_indicator_line_with_activity(frame, elapsed, can_interrupt, None, usage, queued, width)
+}
+
+fn working_indicator_line_with_activity(
+    frame: &str,
+    elapsed: Duration,
+    can_interrupt: bool,
+    activity: Option<&str>,
     usage: Option<&ProviderUsage>,
     queued: usize,
     width: usize,
@@ -322,6 +335,10 @@ pub(super) fn working_indicator_line(
     if can_interrupt {
         spans.push(working_sep());
         spans.push(Span::styled("ESC", panel_style()));
+    }
+    if let Some(activity) = activity {
+        spans.push(working_sep());
+        spans.push(Span::styled(activity.to_string(), dim_style()));
     }
     // Surface queued steering/follow-up the user typed during the turn but the
     // loop has not injected yet, so submitted input visibly registers.
@@ -359,13 +376,15 @@ fn working_lines(
     frame: &str,
     elapsed: Option<Duration>,
     footer: Option<&Footer>,
+    activity: Option<&str>,
     queued: usize,
     width: usize,
 ) -> Vec<Line<'static>> {
-    vec![working_indicator_line(
+    vec![working_indicator_line_with_activity(
         frame,
         elapsed.unwrap_or_default(),
         true,
+        activity,
         footer.and_then(|footer| footer.usage.as_ref()),
         queued,
         width,
@@ -598,6 +617,10 @@ pub(crate) struct Screen {
     /// user sees their queued input register before it is injected. Reset at
     /// each turn boundary.
     queued: usize,
+    /// Whether the active turn is currently awaiting the provider rather than a
+    /// local tool or approval. Surfaced on the working indicator so a provider
+    /// stall is distinguishable from a hidden local prompt or blocked tool.
+    provider_waiting: bool,
     /// Whether the terminal (pane) reports itself focused. Terminals without
     /// focus reporting never send focus events, so this stays true. While
     /// unfocused the spinner holds its frame and requests no tick redraws, so N
@@ -690,6 +713,7 @@ impl Screen {
             footer: None,
             modal: None,
             queued: 0,
+            provider_waiting: false,
             terminal_focused: true,
             approval_policy: ApprovalPolicy::OnRequest,
             start_page: None,
@@ -1013,6 +1037,24 @@ impl Screen {
             footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
         }
+        match &event {
+            UiEvent::ProviderTurnStarted { .. } => {
+                self.provider_waiting = true;
+            }
+            UiEvent::ProviderTurnCompleted { .. }
+            | UiEvent::ProviderTurnCancelled { .. }
+            | UiEvent::ProviderTurnError { .. }
+            | UiEvent::AssistantTextDelta(_)
+            | UiEvent::ToolStarted(_)
+            | UiEvent::ToolAutoApproved(_)
+            | UiEvent::ToolResult { .. }
+            | UiEvent::ToolError { .. }
+            | UiEvent::ToolCancelled(_)
+            | UiEvent::ToolDenied(_) => {
+                self.provider_waiting = false;
+            }
+            _ => {}
+        }
         // `UiEvent::UserMessage` (a mid-run injected steering/follow-up message)
         // is committed as a user row inside `transcript.apply`, so order matches
         // provider context; the initial prompt is committed by the session
@@ -1280,6 +1322,7 @@ impl Screen {
                 self.spinner.frame(),
                 self.spinner.elapsed(),
                 self.footer.as_ref(),
+                self.provider_waiting.then_some("model"),
                 self.queued,
                 usize::from(width),
             )
@@ -2241,6 +2284,7 @@ mod tests {
         approval_panel_lines, composer_statusline, context_meter_filled, display_width, line_text,
         parse_context_window, session_bar, truncate_cwd_middle, working_lines,
     };
+    use crate::ui::UiEvent;
     use crate::ui::tui::WORKING_FRAMES;
 
     /// A minimal review hint for the docked-approval rendering tests.
@@ -2737,6 +2781,29 @@ mod tests {
     }
 
     #[test]
+    fn working_indicator_names_provider_waits() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn_0".to_string(),
+        });
+
+        let text = line_text(&screen.working_lines(80).remove(0));
+        assert!(text.contains("model"), "provider wait is visible: {text:?}");
+
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_0".to_string(),
+            response_id: None,
+            usage: None,
+        });
+        let text = line_text(&screen.working_lines(80).remove(0));
+        assert!(
+            !text.contains("model"),
+            "provider wait label clears after completion: {text:?}"
+        );
+    }
+
+    #[test]
     fn parse_context_window_handles_k_m_and_plain() {
         assert_eq!(parse_context_window("300k"), Some(300_000));
         assert_eq!(parse_context_window("300K"), Some(300_000));
@@ -2848,6 +2915,7 @@ mod tests {
             for line in working_lines(
                 WORKING_FRAMES[0],
                 Some(Duration::from_secs(1)),
+                None,
                 None,
                 0,
                 width,
