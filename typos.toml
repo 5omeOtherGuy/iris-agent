@@ -10,6 +10,8 @@ extend-exclude = [
   "src/tools/skim/corpus/",
   # Real source files copied verbatim as grep-output benchmark fixtures.
   "src/tools/grep_corpus/",
+  # Captured real find listings used as find-compaction benchmark fixtures.
+  "src/tools/find_corpus/",
 ]
 [default.extend-identifiers]
 # Repository owner / handle.
