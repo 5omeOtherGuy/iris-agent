@@ -266,6 +266,11 @@ Implemented:
 - Tokio async runtime with turn-level cancellation.
 - Multiple providers (OpenAI Codex, Anthropic, Antigravity) with runtime model/reasoning switching.
 - Workspace-scoped tools: read, write, edit, bash, grep, find, ls.
+- Opt-in `read` skim mode: language-aware stripping of comments, docstrings,
+  and blank lines for exploration reads (50-72% token reduction on
+  comment-heavy source, asserted as minimum bars; data formats pass through
+  byte-identical; a skim read does not satisfy read-before-edit). See the
+  [read skim benchmark](docs/benchmarks/issue-337-read-skim-tokens.md).
 - Approval gates with diff previews for mutating tools.
 - JSONL transcript persistence and linear resume (`iris --continue`, `iris
   resume`, in-session `/resume` picker and `/new`).
