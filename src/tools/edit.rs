@@ -15,7 +15,7 @@ use super::text::{
 };
 use super::{ObservedFiles, Preview};
 
-pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default old_string must match a unique region; set replace_all=true to replace every occurrence. Matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace.";
+pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default old_string must match a unique region; set replace_all=true to replace every occurrence. old_string must match the file's current contents exactly.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -81,15 +81,34 @@ fn edit(root: &Path, input: &EditInput, observed: &mut ObservedFiles) -> Result<
 
     let occurrences = plan.replaced;
     let plural = if occurrences == 1 { "" } else { "s" };
-    let message = format!(
+    let mut message = format!(
         "Successfully replaced {occurrences} occurrence{plural} in {}.",
         input.file_path
     );
+    // Conditional echo (ADR-0038): an exact-match success stays terse; when the
+    // tolerant (fuzzy) fallback fired, append a compact snippet of the applied
+    // region so the model's view of the file cannot drift silently. Failure
+    // detail is never echoed on success (ADR-0036: success is cheap).
+    if let Some(snippet) = &plan.applied_snippet {
+        message.push_str("\nApplied region (tolerant match):\n");
+        message.push_str(snippet);
+    }
+    // Failure-class telemetry (ADR-0038): record only the outcome class in
+    // metadata (ADR-0021) so a transcript-level, per-model join can measure how
+    // often each recovery path fires. Success is exact vs tolerant-match-fired;
+    // the failure classes (not-found / not-unique / stale-file) ride their
+    // actionable error text, which is the transcript record for a failed call.
+    let outcome_class = if plan.used_fuzzy {
+        "tolerant-match-fired"
+    } else {
+        "exact"
+    };
     // Report the exact post-edit bytes so the dirty-tree guard can confirm an
     // approved edit against disk (ADR-0028 TOCTOU rule); Nexus strips this key
     // before it reaches provider context.
     Ok(super::ToolOutput::text(message)
         .with("occurrences", json!(occurrences))
+        .with("edit_outcome", json!(outcome_class))
         .with(
             crate::nexus::WRITE_CONFIRM_HASH_KEY,
             json!(super::content_hash(plan.new_content.as_bytes())),
@@ -101,6 +120,13 @@ struct EditPlan {
     old_content: String,
     new_content: String,
     replaced: usize,
+    /// True when the tolerant (fuzzy) fallback matched, i.e. the exact pass
+    /// found nothing. Drives the conditional echo and telemetry class.
+    used_fuzzy: bool,
+    /// Compact, line-numbered snippet of the first applied region, present only
+    /// when `used_fuzzy` so the conditional echo can show the model what the
+    /// tolerant match actually changed.
+    applied_snippet: Option<String>,
 }
 
 fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
@@ -130,7 +156,7 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
         bail!("old_string cannot be empty");
     }
 
-    let ranges = locate_matches(
+    let (ranges, used_fuzzy) = locate_matches(
         &normalized_content,
         &normalized_old,
         input.replace_all,
@@ -139,17 +165,28 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
 
     // Build the replacement against the LF-normalized content, then restore the
     // file's original line ending on write. Ranges are non-overlapping and
-    // ascending, so one left-to-right pass applies every replacement.
+    // ascending, so one left-to-right pass applies every replacement. Record the
+    // byte span of the first replacement in the rebuilt content so a tolerant
+    // match can echo the applied region.
     let normalized_new = normalize_to_lf(&input.new_string);
     let mut new_content =
         String::with_capacity(normalized_content.len() + ranges.len() * normalized_new.len());
     let mut cursor = 0;
+    let mut first_change: Option<(usize, usize)> = None;
     for &(start, len) in &ranges {
         new_content.push_str(&normalized_content[cursor..start]);
+        let change_start = new_content.len();
         new_content.push_str(&normalized_new);
+        first_change.get_or_insert((change_start, new_content.len()));
         cursor = start + len;
     }
     new_content.push_str(&normalized_content[cursor..]);
+
+    let applied_snippet = if used_fuzzy {
+        first_change.map(|(start, end)| region_snippet(&new_content, start, end))
+    } else {
+        None
+    };
 
     if new_content == normalized_content {
         bail!(
@@ -170,6 +207,8 @@ fn build_edit(root: &Path, input: &EditInput) -> Result<EditPlan> {
         old_content: raw_content,
         new_content: final_content,
         replaced: ranges.len(),
+        used_fuzzy,
+        applied_snippet,
     })
 }
 
@@ -184,14 +223,14 @@ fn locate_matches(
     needle: &str,
     replace_all: bool,
     path: &str,
-) -> Result<Vec<(usize, usize)>> {
+) -> Result<(Vec<(usize, usize)>, bool)> {
     let exact = find_all(haystack, needle);
     if !exact.is_empty() {
         let ranges = exact
             .into_iter()
             .map(|start| (start, needle.len()))
             .collect();
-        return select(ranges, replace_all, path);
+        return Ok((select(ranges, replace_all, path)?, false));
     }
 
     // Fuzzy fallback over normalized text with an offset map back to the
@@ -199,11 +238,11 @@ fn locate_matches(
     let (norm_hay, map) = normalize_for_fuzzy(haystack);
     let (norm_needle, _) = normalize_for_fuzzy(needle);
     if norm_needle.is_empty() {
-        bail!("{}", not_found_message(path));
+        bail!("{}", not_found_message(path, haystack, needle));
     }
     let fuzzy = find_all(&norm_hay, &norm_needle);
     if fuzzy.is_empty() {
-        bail!("{}", not_found_message(path));
+        bail!("{}", not_found_message(path, haystack, needle));
     }
     let ranges = fuzzy
         .into_iter()
@@ -213,7 +252,7 @@ fn locate_matches(
             (orig_start, orig_end - orig_start)
         })
         .collect();
-    select(ranges, replace_all, path)
+    Ok((select(ranges, replace_all, path)?, true))
 }
 
 /// Apply the uniqueness policy: `replace_all` keeps every range; otherwise the
@@ -235,13 +274,85 @@ fn select(
     }
 }
 
-fn not_found_message(path: &str) -> String {
-    format!(
+fn not_found_message(path: &str, haystack: &str, needle: &str) -> String {
+    let mut message = format!(
         "could not find the text in {path}. old_string must match the file's current contents \
          (line endings and Unicode spaces/quotes/dashes are normalized and trailing whitespace is \
          ignored, but indentation and other characters must match exactly). Re-read the file and \
          copy the exact text to replace."
-    )
+    );
+    // Failure detail is complete but compact (ADR-0036): point at the region of
+    // the file that most resembles old_string so the model can re-anchor without
+    // re-reading the whole file.
+    if let Some((line, region)) = closest_candidate_region(haystack, needle) {
+        message.push_str(&format!(
+            "\nClosest matching region (around line {line}):\n{region}"
+        ));
+    }
+    message
+}
+
+/// A compact, line-numbered snippet of the content spanning the byte range
+/// `[start, end)` plus two lines of surrounding context. Used to echo an
+/// applied tolerant-match region back to the model.
+fn region_snippet(content: &str, start: usize, end: usize) -> String {
+    let start_line = content[..start.min(content.len())].matches('\n').count();
+    let end_line = content[..end.min(content.len())].matches('\n').count();
+    numbered_lines(content, start_line, end_line, 2)
+}
+
+/// Find the file line that most resembles the first non-blank line of `needle`
+/// (by shared whitespace-delimited words) and return its 1-based line number
+/// plus a small numbered snippet around it. `None` when nothing overlaps.
+fn closest_candidate_region(content: &str, needle: &str) -> Option<(usize, String)> {
+    let target = needle.lines().find(|line| !line.trim().is_empty())?.trim();
+    let target_words: Vec<&str> = target.split_whitespace().collect();
+    if target_words.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut best: Option<(usize, usize)> = None; // (score, line index)
+    for (idx, line) in lines.iter().enumerate() {
+        let score = line
+            .split_whitespace()
+            .filter(|word| target_words.contains(word))
+            .count();
+        if score > 0
+            && best
+                .map(|(best_score, _)| score > best_score)
+                .unwrap_or(true)
+        {
+            best = Some((score, idx));
+        }
+    }
+    let (_, idx) = best?;
+    Some((idx + 1, numbered_lines(content, idx, idx, 2)))
+}
+
+/// Render lines `[from_line - context ..= to_line + context]` (0-based, clamped)
+/// as `NNNN | text`, with over-long lines truncated. Shared by the tolerant-echo
+/// snippet and the not-found closest-candidate region.
+fn numbered_lines(content: &str, from_line: usize, to_line: usize, context: usize) -> String {
+    const MAX_LINE_CHARS: usize = 200;
+    let lines: Vec<&str> = content.split('\n').collect();
+    let last = lines.len().saturating_sub(1);
+    let from = from_line.saturating_sub(context);
+    let to = (to_line + context).min(last);
+    let mut out = String::new();
+    for (offset, idx) in (from..=to).enumerate() {
+        if offset > 0 {
+            out.push('\n');
+        }
+        let text = lines.get(idx).copied().unwrap_or("");
+        let shown: String = text.chars().take(MAX_LINE_CHARS).collect();
+        let ellipsis = if text.chars().count() > MAX_LINE_CHARS {
+            " ..."
+        } else {
+            ""
+        };
+        out.push_str(&format!("{:>4} | {shown}{ellipsis}", idx + 1));
+    }
+    out
 }
 
 /// All non-overlapping occurrences of `needle` in `haystack`, as ascending byte
@@ -342,7 +453,13 @@ mod tests {
     use super::*;
     use crate::tools::test_support::{root_of, temp_dir};
 
-    fn run(root: &Path, path: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
+    fn run_output(
+        root: &Path,
+        path: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> Result<super::super::ToolOutput> {
         // The mechanics tests below exercise matching/replacement, not the
         // stale-file guard, so simulate a prior read of the existing file.
         let mut observed = ObservedFiles::new();
@@ -359,7 +476,10 @@ mod tests {
             },
             &mut observed,
         )
-        .map(|output| output.content)
+    }
+
+    fn run(root: &Path, path: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
+        run_output(root, path, old, new, replace_all).map(|output| output.content)
     }
 
     #[test]
@@ -462,6 +582,64 @@ mod tests {
             "a\nB\nc\n"
         );
         assert!(msg.contains("1 occurrence"), "{msg}");
+    }
+
+    #[test]
+    fn edit_exact_success_payload_has_no_file_content_and_exact_class() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("d.txt"), "one\ntwo\nthree\n").unwrap();
+        let out = run_output(&root, "d.txt", "two", "TWO", false).unwrap();
+        // Exact-match success stays terse: one line, no echoed file content and
+        // no applied-region snippet.
+        assert_eq!(out.content, "Successfully replaced 1 occurrence in d.txt.");
+        assert!(!out.content.contains("Applied region"), "{}", out.content);
+        assert!(!out.content.contains("three"), "{}", out.content);
+        // Telemetry class rides the metadata (ADR-0021), visible in the transcript.
+        assert_eq!(
+            out.metadata.get("edit_outcome").and_then(|v| v.as_str()),
+            Some("exact")
+        );
+    }
+
+    #[test]
+    fn edit_tolerant_success_echoes_applied_region_and_class() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // File uses ASCII quotes; old_string uses Unicode curly quotes, so the
+        // exact pass misses and the tolerant (fuzzy) fallback fires.
+        fs::write(dir.path.join("c.txt"), "let name = \"Iris\";\n").unwrap();
+        let out = run_output(&root, "c.txt", "\u{201C}Iris\u{201D}", "\"IRIS\"", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path.join("c.txt")).unwrap(),
+            "let name = \"IRIS\";\n"
+        );
+        // Conditional echo (ADR-0038): tolerant success carries a compact
+        // snippet of the applied region so the model's file view cannot drift.
+        assert!(out.content.contains("Applied region"), "{}", out.content);
+        assert!(out.content.contains("IRIS"), "{}", out.content);
+        assert_eq!(
+            out.metadata.get("edit_outcome").and_then(|v| v.as_str()),
+            Some("tolerant-match-fired")
+        );
+    }
+
+    #[test]
+    fn edit_not_found_includes_closest_candidate_region() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(
+            dir.path.join("p.txt"),
+            "the quick brown fox\njumps over\nthe lazy dog\n",
+        )
+        .unwrap();
+        let err = run(&root, "p.txt", "the quick brown cat", "x", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not find the text"), "{err}");
+        // Failure carries the closest-candidate region so the model can re-anchor.
+        assert!(err.contains("Closest matching region"), "{err}");
+        assert!(err.contains("the quick brown fox"), "{err}");
     }
 
     #[test]
