@@ -287,10 +287,11 @@ pub(super) fn compact_count(value: u64) -> String {
 }
 
 fn led_frame_spans(frame: &str) -> Vec<Span<'static>> {
+    let running = crate::ui::symbols::RUNNING.chars().next();
     frame
         .chars()
         .map(|ch| {
-            let style = if ch == '●' {
+            let style = if Some(ch) == running {
                 prompt_style()
             } else {
                 dim_style()
@@ -301,7 +302,7 @@ fn led_frame_spans(frame: &str) -> Vec<Span<'static>> {
 }
 
 fn working_sep() -> Span<'static> {
-    Span::styled(" ┊ ", dim_style())
+    Span::styled(format!(" {} ", crate::ui::symbols::SEP), dim_style())
 }
 
 pub(super) fn working_indicator_line(
@@ -1651,7 +1652,8 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
         ]);
     }
     candidates.push((None, None));
-    let tree_prefix = tree_open.then(|| Span::styled("▾ ".to_string(), dim_style()));
+    let tree_prefix =
+        tree_open.then(|| Span::styled(format!("{} ", crate::ui::symbols::EXPANDED), dim_style()));
     let prefix_w = if tree_open { 2 } else { 0 };
     for (right_idx, git_idx) in candidates {
         let right = right_idx.map(|index| &right_candidates[index]);
@@ -1715,7 +1717,10 @@ fn git_segment_spans(status: &GitStatus, level: u8, open: bool) -> Vec<Span<'sta
         dim_style(),
     )];
     if open {
-        spans.push(Span::styled("▾ ".to_string(), dim_style()));
+        spans.push(Span::styled(
+            format!("{} ", crate::ui::symbols::EXPANDED),
+            dim_style(),
+        ));
     }
     spans.push(Span::styled("git ".to_string(), dim_style()));
     match (&status.branch, &status.detached_at) {
