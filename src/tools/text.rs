@@ -76,6 +76,20 @@ pub(super) fn render_line_window(
     offset: Option<i64>,
     limit: Option<i64>,
 ) -> Result<LineWindow> {
+    render_line_window_masked(content, offset, limit, None)
+}
+
+/// [`render_line_window`] with an optional keep-mask over 0-based original
+/// line indices (read's skim mode, issue #337). Masked-out lines are omitted
+/// from the rendering but keep their place in the file: line numbers,
+/// `offset`/`limit` window bounds, and the continuation notices all stay in
+/// original-file line space, so a follow-up full read is coherent.
+pub(super) fn render_line_window_masked(
+    content: &str,
+    offset: Option<i64>,
+    limit: Option<i64>,
+    keep: Option<&[bool]>,
+) -> Result<LineWindow> {
     validate_offset_limit(offset, limit)?;
 
     let total_bytes = content.len();
@@ -108,12 +122,15 @@ pub(super) fn render_line_window(
     let mut byte_count = 0usize;
     let mut byte_capped = false;
     let mut line_capped = false;
-    for (offset_in_window, idx) in (start..end).enumerate() {
-        let line = lines[idx].strip_suffix('\r').unwrap_or(lines[idx]);
+    for (idx, raw_line) in lines.iter().enumerate().take(end).skip(start) {
+        if keep.is_some_and(|mask| !mask.get(idx).copied().unwrap_or(true)) {
+            continue;
+        }
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let formatted = format!("{:>width$}\u{2192}{line}", idx + 1);
         let (formatted, capped_line) = clamp_line_to_byte_cap(&formatted);
         byte_count += formatted.len() + 1;
-        if byte_count > DEFAULT_MAX_BYTES && offset_in_window > 0 {
+        if byte_count > DEFAULT_MAX_BYTES && !rendered.is_empty() {
             end = idx;
             byte_capped = true;
             break;
@@ -126,7 +143,7 @@ pub(super) fn render_line_window(
         }
     }
 
-    let lines_shown = end - start;
+    let lines_shown = rendered.len();
     let truncated = line_capped || end < total_lines;
     let mut out = rendered.join("\n");
     if line_capped {
