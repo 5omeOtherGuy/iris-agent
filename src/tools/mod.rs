@@ -72,14 +72,21 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
 /// is needed (relocated to the harness tier in Step C).
 pub(crate) struct ToolState {
     pub(crate) observed: ObservedFiles,
-    pub(crate) bash: bash::BashState,
+    /// The bash tool's persistent-session/background-job registry. Held behind
+    /// an `Arc<Mutex<_>>` (not just the env's `RefCell`) so a `bash` run can be
+    /// moved onto `tokio::task::spawn_blocking` while keeping the executor free
+    /// to poll: the blocking task and this persistent state share ownership, so
+    /// a cancelled (and thus detached, un-abortable) `spawn_blocking` still
+    /// mutates the same registry rather than dropping every session/job on the
+    /// floor. The bash tool is exclusive, so the lock never actually contends.
+    pub(crate) bash: std::sync::Arc<std::sync::Mutex<bash::BashState>>,
 }
 
 impl ToolState {
     pub(crate) fn new() -> Self {
         Self {
             observed: ObservedFiles::new(),
-            bash: bash::BashState::new(),
+            bash: std::sync::Arc::new(std::sync::Mutex::new(bash::BashState::new())),
         }
     }
 }

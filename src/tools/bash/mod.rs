@@ -365,6 +365,13 @@ fn bash(
     std::thread::spawn(move || pump_pipe(&mut stdout, BashStream::Stdout, &stdout_tx));
     std::thread::spawn(move || pump_pipe(&mut stderr, BashStream::Stderr, &tx));
 
+    // Accumulators for the final model-facing output. Filled live from the pump
+    // channel during the wait below and by the post-exit drain, so a chunk is
+    // forwarded to the sink the moment it is produced (not batched at the end).
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut capture_truncated = false;
+
     let start = Instant::now();
     let mut timed_out = false;
     let mut cancelled = false;
@@ -389,12 +396,30 @@ fn bash(
                     timed_out = true;
                     break None;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                // While the child runs, forward whatever it has produced so far
+                // instead of idle-sleeping: this is what makes the exec cell
+                // stream live. The bounded `recv_timeout` preserves the old
+                // ~20ms re-check cadence when the child is quiet, and a
+                // `Disconnected` channel (both pumps finished before the child
+                // exited) falls back to the plain poll sleep.
+                match rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(msg) => consume_pump_msg(
+                        msg,
+                        sink,
+                        &mut stdout_bytes,
+                        &mut stderr_bytes,
+                        &mut capture_truncated,
+                    ),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
             }
         }
     };
 
-    // Accumulate chunks from both streams until the pump threads finish (the
+    // Drain the remaining buffered chunks until the pump threads finish (the
     // channel disconnects) or the drain deadline passes. A process that escaped
     // the shell's group (setsid/double-fork) can keep a pipe open after the
     // shell exits; rather than block on it forever we return the output
@@ -410,9 +435,6 @@ fn bash(
     // and non-blocking pipes would force a busy-poll loop on every command for
     // this rare case. Upgrade path: an interruptible reader built on
     // poll/epoll + a self-pipe wakeup (libc) or a small poll crate.
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    let mut capture_truncated = false;
     let drain_deadline = Instant::now() + Duration::from_secs(BASH_DRAIN_TIMEOUT_SECS);
     loop {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
@@ -420,22 +442,13 @@ fn bash(
             break;
         }
         match rx.recv_timeout(remaining) {
-            Ok(PumpMsg::Chunk(stream, chunk)) => {
-                // Forward the chunk live to the sink (lossy decode) before
-                // accumulating it for the final result. ponytail: per-chunk
-                // lossy UTF-8 can emit a replacement char when a multibyte
-                // sequence straddles a chunk boundary -- display-only, so
-                // acceptable; the accumulated bytes below are decoded whole for
-                // the model-facing output.
-                if let Some(sink) = sink {
-                    sink.emit_chunk(&String::from_utf8_lossy(&chunk));
-                }
-                match stream {
-                    BashStream::Stdout => stdout_bytes.extend_from_slice(&chunk),
-                    BashStream::Stderr => stderr_bytes.extend_from_slice(&chunk),
-                }
-            }
-            Ok(PumpMsg::Truncated) => capture_truncated = true,
+            Ok(msg) => consume_pump_msg(
+                msg,
+                sink,
+                &mut stdout_bytes,
+                &mut stderr_bytes,
+                &mut capture_truncated,
+            ),
             Err(_) => break,
         }
     }
@@ -538,6 +551,34 @@ enum BashStream {
 enum PumpMsg {
     Chunk(BashStream, Vec<u8>),
     Truncated,
+}
+
+/// Forward one pump message to the live sink and accumulate it for the final
+/// result. Shared by the wait loop (live streaming) and the post-exit drain so
+/// both paths apply identical decode/accumulate/truncation handling.
+///
+/// ponytail: per-chunk lossy UTF-8 can emit a replacement char when a multibyte
+/// sequence straddles a chunk boundary -- display-only, so acceptable; the
+/// accumulated bytes are decoded whole for the model-facing output.
+fn consume_pump_msg(
+    msg: PumpMsg,
+    sink: Option<&dyn crate::nexus::ToolOutputSink>,
+    stdout_bytes: &mut Vec<u8>,
+    stderr_bytes: &mut Vec<u8>,
+    capture_truncated: &mut bool,
+) {
+    match msg {
+        PumpMsg::Chunk(stream, chunk) => {
+            if let Some(sink) = sink {
+                sink.emit_chunk(&String::from_utf8_lossy(&chunk));
+            }
+            match stream {
+                BashStream::Stdout => stdout_bytes.extend_from_slice(&chunk),
+                BashStream::Stderr => stderr_bytes.extend_from_slice(&chunk),
+            }
+        }
+        PumpMsg::Truncated => *capture_truncated = true,
+    }
 }
 
 /// Stream a child pipe to the collector in chunks so already-written output is

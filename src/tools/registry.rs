@@ -13,10 +13,15 @@
 //! them genuinely concurrently on the blocking pool, while awaiting the handle
 //! lets the loop's cancellation race abandon a cancelled call. `read` mutates
 //! `state.observed` (read-before-write tracking) through the env's `!Send`
-//! `RefCell`, so it cannot move off-thread and stays exclusive. Mutating/shell
-//! tools (`edit`/`write`/`bash`) wrap their synchronous body in a ready future
-//! and run exclusively; each borrows the shared `ToolState` only for its
-//! synchronous duration, never across an `.await`.
+//! `RefCell`, so it cannot move off-thread and stays exclusive. Mutating file
+//! tools (`edit`/`write`) wrap their synchronous body in a ready future and run
+//! exclusively; each borrows the shared `ToolState` only for its synchronous
+//! duration, never across an `.await`. `bash` also runs exclusively, but its
+//! long, blocking body (poll loop + pump threads) would starve the executor if
+//! run inline, so it is offloaded to `tokio::task::spawn_blocking`: its registry
+//! is shared via `Arc<Mutex<_>>` (see [`ToolState`]) and its live-output sink is
+//! bridged over a channel so `ToolOutputDelta` events stream while the command
+//! runs and the UI loop keeps polling.
 
 use std::cell::RefMut;
 use std::path::{Path, PathBuf};
@@ -131,6 +136,21 @@ impl Tool for ReadTool {
     // concurrency-safe; it takes the exclusive path (default).
 }
 
+/// Bridges the bash tool's live-output sink across the `spawn_blocking`
+/// boundary. The blocking body holds `Some(&ChannelSink)` and forwards each
+/// chunk over the channel; the async side forwards them into the real
+/// (non-`Send`) [`crate::nexus::ToolOutputSink`]. A closed receiver (dropped
+/// future) makes `send` fail silently -- streaming is best-effort.
+struct ChannelSink {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl crate::nexus::ToolOutputSink for ChannelSink {
+    fn emit_chunk(&self, chunk: &str) {
+        let _ = self.tx.send(chunk.to_string());
+    }
+}
+
 struct BashTool;
 impl Tool for BashTool {
     fn name(&self) -> &str {
@@ -150,8 +170,50 @@ impl Tool for BashTool {
     ) -> ToolFuture<'a> {
         Box::pin(async move {
             let root = root(env)?;
-            let mut state = state_mut(env)?;
-            bash::execute(&root, args, &mut state.bash, &cancel, env.output_sink)
+            let args = args.clone();
+            // Share the bash registry (not the env's `!Send` `RefCell`) with the
+            // blocking task. The bash tool is exclusive, so this lock never
+            // contends; the `Arc` clone keeps the registry alive even if this
+            // future is dropped on cancel and the blocking task is detached.
+            let bash_state = std::sync::Arc::clone(&state_mut(env)?.bash);
+
+            // Bridge the live-output sink across the thread boundary: the
+            // blocking body forwards each chunk over an unbounded channel and the
+            // async side (below) drains it into the real, non-`Send` sink while
+            // the command runs, so `ToolOutputDelta` events reach the UI live
+            // instead of only when the command returns.
+            let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let cancel_for_task = cancel.clone();
+            let mut handle = tokio::task::spawn_blocking(move || {
+                let sink = ChannelSink { tx: chunk_tx };
+                let mut guard = bash_state.lock().unwrap_or_else(|e| e.into_inner());
+                bash::execute(&root, &args, &mut guard, &cancel_for_task, Some(&sink))
+            });
+
+            // Keep polling the executor while the command runs: forward each
+            // streamed chunk as it arrives, and finish when the blocking task
+            // joins.
+            let result = loop {
+                tokio::select! {
+                    chunk = chunk_rx.recv() => {
+                        if let Some(chunk) = chunk
+                            && let Some(sink) = env.output_sink
+                        {
+                            sink.emit_chunk(&chunk);
+                        }
+                    }
+                    joined = &mut handle => {
+                        break joined.map_err(|e| anyhow!("bash tool task failed: {e}"))?;
+                    }
+                }
+            };
+            // Drain any chunks the task produced just before it finished.
+            while let Ok(chunk) = chunk_rx.try_recv() {
+                if let Some(sink) = env.output_sink {
+                    sink.emit_chunk(&chunk);
+                }
+            }
+            result
         })
     }
     fn requires_approval(&self) -> bool {
@@ -440,6 +502,7 @@ fn destructive_command_basename(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::test_support::{root_of, temp_dir};
     use serde_json::json;
 
     fn bash_args(command: &str) -> Value {
@@ -493,5 +556,149 @@ mod tests {
                 "{command} should be destructive"
             );
         }
+    }
+
+    /// A sink that records the wall-clock offset (from a shared start) of every
+    /// forwarded chunk, so a test can assert deltas arrive *while* the command
+    /// runs rather than only after it returns.
+    struct TimingSink {
+        start: std::time::Instant,
+        first_delta: std::cell::RefCell<Option<std::time::Duration>>,
+    }
+    impl crate::nexus::ToolOutputSink for TimingSink {
+        fn emit_chunk(&self, _chunk: &str) {
+            let mut slot = self.first_delta.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(self.start.elapsed());
+            }
+        }
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn bash_env<'a>(
+        workspace: &'a std::path::Path,
+        state: &'a std::cell::RefCell<ToolState>,
+        sink: Option<&'a dyn crate::nexus::ToolOutputSink>,
+    ) -> ToolEnv<'a> {
+        ToolEnv {
+            workspace,
+            state,
+            output_store: None,
+            output_sink: sink,
+            mutation_guard: None,
+        }
+    }
+
+    #[test]
+    fn bash_execute_does_not_block_the_executor() {
+        // Regression for the freeze bug: on a current-thread runtime (the TUI's
+        // runtime flavor) a running `bash` call must not starve the executor.
+        // A concurrent 100ms timer must complete long before a `sleep 1` bash
+        // call finishes -- if the tool body ran inline on the executor thread
+        // the timer could not be polled until the command returned (~1s).
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&root, &state, None);
+        let args = json!({ "command": "sleep 1" });
+
+        current_thread_runtime().block_on(async {
+            let start = std::time::Instant::now();
+            let tool = BashTool.execute(&args, &env, CancellationToken::new());
+            let timer = async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                start.elapsed()
+            };
+            let (tool_result, timer_elapsed) = tokio::join!(tool, timer);
+            let tool_elapsed = start.elapsed();
+
+            tool_result.expect("bash tool should succeed");
+            assert!(
+                timer_elapsed < std::time::Duration::from_millis(500),
+                "timer was starved by bash: fired at {timer_elapsed:?} (executor blocked)"
+            );
+            assert!(
+                tool_elapsed >= std::time::Duration::from_millis(900),
+                "sleep 1 returned too fast ({tool_elapsed:?}); test premise is wrong"
+            );
+        });
+    }
+
+    #[test]
+    fn bash_execute_streams_deltas_while_the_command_runs() {
+        // The sink must see output *before* the tool future resolves: the
+        // command prints immediately, then sleeps 1s. The first delta must land
+        // well within that window, proving live streaming (not a post-return
+        // flush).
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let state = std::cell::RefCell::new(ToolState::new());
+        let sink = TimingSink {
+            start: std::time::Instant::now(),
+            first_delta: std::cell::RefCell::new(None),
+        };
+        let env = bash_env(&root, &state, Some(&sink));
+        let args = json!({ "command": "echo start; sleep 1" });
+
+        let tool_elapsed = current_thread_runtime().block_on(async {
+            let start = std::time::Instant::now();
+            BashTool
+                .execute(&args, &env, CancellationToken::new())
+                .await
+                .expect("bash tool should succeed");
+            start.elapsed()
+        });
+
+        let first = sink
+            .first_delta
+            .borrow()
+            .expect("sink never received a live delta");
+        assert!(
+            first < std::time::Duration::from_millis(500),
+            "first delta arrived too late ({first:?}); output was not streamed live"
+        );
+        assert!(
+            tool_elapsed >= std::time::Duration::from_millis(900),
+            "command returned before its sleep completed ({tool_elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn bash_execute_preserves_sessions_across_calls() {
+        // The shared `Arc<Mutex<BashState>>` must carry persistent-session state
+        // across `execute` calls the same way the old in-place `&mut` did: a
+        // `cd` in one call is visible to a later `pwd` in the same session.
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&root, &state, None);
+        let runtime = current_thread_runtime();
+
+        runtime
+            .block_on(BashTool.execute(
+                &json!({ "command": "cd sub", "session": "s1" }),
+                &env,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        let pwd = runtime
+            .block_on(BashTool.execute(
+                &json!({ "command": "pwd", "session": "s1" }),
+                &env,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        assert!(
+            pwd.content.trim_end().ends_with("/sub"),
+            "session state lost across calls: {}",
+            pwd.content
+        );
     }
 }
