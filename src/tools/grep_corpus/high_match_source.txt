@@ -35,7 +35,7 @@ const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_CONTEXT: usize = 2;
 
-pub(super) const DESCRIPTION: &str = "Search file contents for a pattern. Native ripgrep-style exact search: list matching files, show matching content with context, or count matches. Respects .gitignore. Workspace confinement is opt-in via IRIS_SECURITY_OPT_IN=1. Output is bounded by limit/headLimit, maxPerFile caps content-mode matches shown per file (the rest are summarized, never dropped), and long lines are truncated to 500 chars.";
+pub(super) const DESCRIPTION: &str = "Search file contents for a pattern. Native ripgrep-style exact search: list matching files, show matching content with context, or count matches. Respects .gitignore. Workspace confinement is opt-in via IRIS_SECURITY_OPT_IN=1. Output is bounded by limit/headLimit and long lines are truncated to 500 chars.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -47,7 +47,6 @@ pub(super) fn parameters() -> Value {
             "ignoreCase": { "type": "boolean", "description": "Case-insensitive search (default: false)" },
             "literal": { "type": "boolean", "description": "Treat pattern as literal string instead of regex (default: false)" },
             "context": { "type": "integer", "description": "Lines of context before and after each match (default: 2)" },
-            "maxPerFile": { "type": "integer", "description": "content mode only: cap matches shown per file; omitted matches are summarized with a count, never dropped (default: unlimited)" },
             "limit": { "type": "integer", "description": "Maximum number of matches or matching files to scan (default: 100)" },
             "outputMode": { "type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Result shape: matching content, files containing matches, or per-file match counts (default: content)" },
             "headLimit": { "type": "integer", "description": "Maximum number of output rows to show from the selected mode (default: all)" },
@@ -78,8 +77,6 @@ struct GrepInput {
     literal: bool,
     #[serde(default)]
     context: Option<usize>,
-    #[serde(default)]
-    max_per_file: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
@@ -171,10 +168,6 @@ fn grep(root: &Path, input: &GrepInput) -> Result<(String, GrepMeta)> {
     let search_path = resolve_existing(root, search)?;
     let limit = positive_cap("limit", input.limit, DEFAULT_GREP_LIMIT)?;
     let context = input.context.unwrap_or(DEFAULT_CONTEXT);
-    let max_per_file = match input.max_per_file {
-        Some(0) => bail!("`maxPerFile` must be greater than 0"),
-        other => other,
-    };
     let page = Page::from(input)?;
 
     let matcher = RegexMatcherBuilder::new()
@@ -196,7 +189,6 @@ fn grep(root: &Path, input: &GrepInput) -> Result<(String, GrepMeta)> {
             context,
             limit,
             page,
-            max_per_file,
         ),
         OutputMode::FilesWithMatches => {
             grep_files(root, &search_path, &matcher, overrides, limit, page)
@@ -205,7 +197,6 @@ fn grep(root: &Path, input: &GrepInput) -> Result<(String, GrepMeta)> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn grep_content(
     root: &Path,
     search_path: &Path,
@@ -214,61 +205,7 @@ fn grep_content(
     context: usize,
     limit: usize,
     page: Page,
-    max_per_file: Option<usize>,
 ) -> Result<(String, GrepMeta)> {
-    let (files, total_matches, truncated_matches, skips) =
-        collect_content(root, search_path, matcher, overrides, context, limit)?;
-
-    let binary_skipped = skips.binary;
-    let unreadable_skipped = skips.unreadable;
-    if files.is_empty() {
-        return Ok((
-            render_no_matches(skips),
-            GrepMeta {
-                mode: OutputMode::Content,
-                matches: Some(0),
-                files: 0,
-                truncated: false,
-                binary_skipped,
-                unreadable_skipped,
-                next_offset: None,
-            },
-        ));
-    }
-
-    let (text, next_offset) = render_content(
-        &files,
-        total_matches,
-        truncated_matches,
-        skips,
-        page,
-        max_per_file,
-    );
-    Ok((
-        text,
-        GrepMeta {
-            mode: OutputMode::Content,
-            matches: Some(total_matches),
-            files: files.len(),
-            truncated: truncated_matches,
-            binary_skipped,
-            unreadable_skipped,
-            next_offset,
-        },
-    ))
-}
-
-/// Walk the tree and collect per-file match/context lines for content mode.
-/// Returns the collected files, the exact total match count, whether the
-/// global match limit truncated the walk, and skip stats.
-fn collect_content(
-    root: &Path,
-    search_path: &Path,
-    matcher: &RegexMatcher,
-    overrides: Option<Override>,
-    context: usize,
-    limit: usize,
-) -> Result<(Vec<FileHits>, usize, bool, SkipStats)> {
     let mut searcher = content_searcher(context);
     let mut files: Vec<FileHits> = Vec::new();
     let mut total_matches = 0usize;
@@ -315,7 +252,36 @@ fn collect_content(
         }
     }
 
-    Ok((files, total_matches, truncated_matches, skips))
+    let binary_skipped = skips.binary;
+    let unreadable_skipped = skips.unreadable;
+    if files.is_empty() {
+        return Ok((
+            render_no_matches(skips),
+            GrepMeta {
+                mode: OutputMode::Content,
+                matches: Some(0),
+                files: 0,
+                truncated: false,
+                binary_skipped,
+                unreadable_skipped,
+                next_offset: None,
+            },
+        ));
+    }
+
+    let (text, next_offset) = render_content(&files, total_matches, truncated_matches, skips, page);
+    Ok((
+        text,
+        GrepMeta {
+            mode: OutputMode::Content,
+            matches: Some(total_matches),
+            files: files.len(),
+            truncated: truncated_matches,
+            binary_skipped,
+            unreadable_skipped,
+            next_offset,
+        },
+    ))
 }
 
 fn grep_files(
@@ -618,7 +584,6 @@ fn render_content(
     trunc_matches: bool,
     skips: SkipStats,
     page: Page,
-    max_per_file: Option<usize>,
 ) -> (String, Option<usize>) {
     let file_word = plural(files.len(), "file");
     let match_word = plural(total_matches, "match");
@@ -629,20 +594,7 @@ fn render_content(
 
     let mut lines = Vec::new();
     for (file_idx, file) in files.iter().enumerate() {
-        // Per-file cap: show at most `max_per_file` match lines from this file,
-        // then a summary line accounting for the rest. The omitted matches are
-        // still counted (header total stays exact) -- never silently dropped.
-        let file_matches = file.lines.iter().filter(|l| l.is_match).count();
-        let mut shown_matches = 0usize;
-        let mut capped = false;
         for (idx, line) in file.lines.iter().enumerate() {
-            if line.is_match {
-                if max_per_file.is_some_and(|cap| shown_matches >= cap) {
-                    capped = true;
-                    break;
-                }
-                shown_matches += 1;
-            }
             let marker = if line.is_match { "> " } else { "  " };
             lines.push((
                 file_idx,
@@ -651,16 +603,6 @@ fn render_content(
             if file.breaks.contains(&idx) {
                 lines.push((file_idx, "  ⋯".to_string()));
             }
-        }
-        if capped {
-            let omitted = file_matches - shown_matches;
-            lines.push((
-                file_idx,
-                format!(
-                    "  … {omitted} more {} in this file",
-                    plural(omitted, "match")
-                ),
-            ));
         }
     }
 
@@ -936,49 +878,6 @@ impl Sink for CountSink {
     }
 }
 
-/// Collect content-mode `FileHits` through the same setup `grep()` uses, for
-/// the benchmark corpus. Returns the files and the exact total match count.
-#[cfg(test)]
-fn collect_for_bench(root: &Path, input: &GrepInput) -> (Vec<FileHits>, usize) {
-    let search = input.path.as_deref().unwrap_or(".");
-    let search_path = resolve_existing(root, search).unwrap();
-    let limit = positive_cap("limit", input.limit, DEFAULT_GREP_LIMIT).unwrap();
-    let context = input.context.unwrap_or(DEFAULT_CONTEXT);
-    let matcher = RegexMatcherBuilder::new()
-        .case_insensitive(input.ignore_case)
-        .fixed_strings(input.literal)
-        .build(&input.pattern)
-        .unwrap();
-    let overrides = build_overrides(&search_path, input.glob.as_deref()).unwrap();
-    let (files, total, _trunc, _skips) =
-        collect_content(root, &search_path, &matcher, overrides, context, limit).unwrap();
-    (files, total)
-}
-
-/// The ungrouped baseline for the benchmark: every rendered match/context line
-/// prefixed with its full path (`path:line:content`), no grouping and no
-/// context markers. This is the raw form grep grouping is compared against.
-#[cfg(test)]
-fn render_flat(files: &[FileHits]) -> String {
-    let mut out = String::new();
-    for file in files {
-        for line in &file.lines {
-            let sep = if line.is_match { ':' } else { '-' };
-            out.push_str(&file.path);
-            out.push(sep);
-            out.push_str(&line.number.to_string());
-            out.push(sep);
-            out.push_str(&clamp_line(&line.text));
-            out.push('\n');
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-#[path = "grep_corpus/corpus.rs"]
-mod corpus;
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1025,7 +924,6 @@ mod tests {
             ignore_case: false,
             literal: false,
             context: None,
-            max_per_file: None,
             limit: None,
             output_mode: OutputMode::Content,
             head_limit: None,
@@ -1173,111 +1071,6 @@ mod tests {
         let out = run(&root, limited);
         assert!(out.starts_with("3 matches in 1 file\n"), "out: {out}");
         assert!(out.contains("[truncated: match limit of 3"), "out: {out}");
-    }
-
-    #[test]
-    fn per_file_cap_caps_shown_matches_and_summarizes_omitted() {
-        // One file with more matches than the cap: show exactly the cap and
-        // account for the rest with a count line. The header total stays exact.
-        let dir = temp_dir();
-        let root = root_of(&dir);
-        let body: String = (0..10).map(|i| format!("needle {i}\n")).collect();
-        fs::write(dir.path.join("g.txt"), body).unwrap();
-
-        let mut capped = input("needle");
-        capped.context = Some(0);
-        capped.max_per_file = Some(3);
-        let out = run(&root, capped);
-
-        // Total is still exact and every matched file path appears.
-        assert!(out.starts_with("10 matches in 1 file\n"), "out: {out}");
-        assert!(out.contains("g.txt"), "out: {out}");
-        // Exactly the cap of match lines are rendered.
-        let match_lines = out.lines().filter(|l| l.starts_with("> ")).count();
-        assert_eq!(match_lines, 3, "out: {out}");
-        // The omitted count line is present and correct (10 - 3 = 7).
-        assert!(out.contains("… 7 more matches in this file"), "out: {out}");
-        assert!(out.contains("needle 0"), "out: {out}");
-        assert!(out.contains("needle 2"), "out: {out}");
-        assert!(!out.contains("needle 9"), "out: {out}");
-    }
-
-    #[test]
-    fn per_file_cap_never_drops_matches_silently() {
-        // No-silent-drop contract: (shown matches + omitted count) == true total,
-        // and every matched file path is represented.
-        let dir = temp_dir();
-        let root = root_of(&dir);
-        fs::write(
-            dir.path.join("a.txt"),
-            (0..7).map(|_| "needle\n").collect::<String>(),
-        )
-        .unwrap();
-        fs::write(
-            dir.path.join("b.txt"),
-            (0..4).map(|_| "needle\n").collect::<String>(),
-        )
-        .unwrap();
-
-        let mut capped = input("needle");
-        capped.context = Some(0);
-        capped.max_per_file = Some(2);
-        let out = run(&root, capped);
-
-        // 11 total across 2 files; both paths present.
-        assert!(out.starts_with("11 matches in 2 files\n"), "out: {out}");
-        assert!(out.contains("a.txt"), "out: {out}");
-        assert!(out.contains("b.txt"), "out: {out}");
-
-        let shown = out.lines().filter(|l| l.starts_with("> ")).count();
-        let omitted: usize = out
-            .lines()
-            .filter_map(|l| {
-                l.trim_start()
-                    .strip_prefix("… ")
-                    .and_then(|s| s.split_whitespace().next())
-                    .and_then(|n| n.parse::<usize>().ok())
-            })
-            .sum();
-        // a.txt: shows 2 omits 5; b.txt: shows 2 omits 2. shown+omitted == 11.
-        assert_eq!(shown, 4, "out: {out}");
-        assert_eq!(shown + omitted, 11, "out: {out}");
-    }
-
-    #[test]
-    fn per_file_cap_under_cap_is_byte_identical_to_uncapped() {
-        // A cap larger than the file's match count changes nothing: output is
-        // byte-identical to the uncapped render (default behavior preserved).
-        let dir = temp_dir();
-        let root = root_of(&dir);
-        let body: String = (0..5).map(|i| format!("needle {i}\n")).collect();
-        fs::write(dir.path.join("g.txt"), body).unwrap();
-
-        let mut uncapped = input("needle");
-        uncapped.context = Some(0);
-        let base = run(&root, uncapped);
-
-        let mut capped = input("needle");
-        capped.context = Some(0);
-        capped.max_per_file = Some(50);
-        let out = run(&root, capped);
-
-        assert_eq!(base, out);
-        assert!(!out.contains("more matches in this file"), "out: {out}");
-    }
-
-    #[test]
-    fn per_file_cap_rejects_zero() {
-        let dir = temp_dir();
-        let root = root_of(&dir);
-        fs::write(dir.path.join("g.txt"), "needle\n").unwrap();
-        let mut bad = input("needle");
-        bad.max_per_file = Some(0);
-        let err = grep(&root, &bad).unwrap_err().to_string();
-        assert!(
-            err.contains("`maxPerFile` must be greater than 0"),
-            "err: {err}"
-        );
     }
 
     #[test]
