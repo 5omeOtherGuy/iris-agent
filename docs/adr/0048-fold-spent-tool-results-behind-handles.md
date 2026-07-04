@@ -1,4 +1,4 @@
-# ADR-0047: Fold spent tool results behind handles (opt-in microcompaction)
+# ADR-0048: Fold spent tool results behind handles (opt-in microcompaction)
 
 **Date**: 2026-07-04
 **Status**: proposed
@@ -63,7 +63,7 @@ Fold spent tool results to deterministic stubs, opt-in, with recovery one step a
   over real session transcripts (per-entry `tokenEstimate` is persisted) establishes the
   residual tool-result mass by tool class and age, committed under `docs/benchmarks/`. If
   superseded reads do not dominate, the first slice is re-scoped. Folding then becomes an
-  arm in the ADR-0044 A/B, with the needle contract: a needle survives in rebuilt context or
+  arm in the ADR-0045 A/B, with the needle contract: a needle survives in rebuilt context or
   behind a named handle that survives verbatim.
 
 ## Alternatives Considered
@@ -90,7 +90,7 @@ Fold spent tool results to deterministic stubs, opt-in, with recovery one step a
 
 ### Alternative 4: Always-on folding
 - **Pros**: Benefit without a knob; one behavior to test.
-- **Cons**: Folding trades in-context detail for recoverable detail; until the ADR-0044
+- **Cons**: Folding trades in-context detail for recoverable detail; until the ADR-0045
   benchmark proves task success holds, forcing that trade on every session is premature.
 - **Why not**: Opt-in with a measured gate; the default can flip when the evidence exists.
 
@@ -101,7 +101,7 @@ Fold spent tool results to deterministic stubs, opt-in, with recovery one step a
   cost: no provider round-trip, no summary-quality risk.
 - Completes the reduction ladder — filter at capture (ADR-0037), offload oversized
   (ADR-0011), fold when spent (this ADR), summarize under pressure (ADR-0009/0041/0043),
-  recall on demand (ADR-0045) — each rung measured and reversible.
+  recall on demand (ADR-0046) — each rung measured and reversible.
 - Reuses the handle store, `read_output`, error classes (ADR-0040), and structured result
   paths (ADR-0021); no new tool surface.
 
@@ -115,10 +115,10 @@ Fold spent tool results to deterministic stubs, opt-in, with recovery one step a
 ### Risks
 - Double reduction defeats the ADR-0037 guards: folding a filtered result discards the
   failure detail filtering deliberately kept. Mitigate: the fold policy honors the same
-  guard classes (unresolved failures never fold), and ADR-0044 needles assert failure detail
+  guard classes (unresolved failures never fold), and ADR-0045 needles assert failure detail
   survives or sits behind a named handle.
 - A stub could mislead the model about what it has already seen. Mitigate: stubs are
   explicit about what was folded and how to recover it, and the system-prompt fragment
-  (ADR-0045) covers folds alongside compaction markers.
+  (ADR-0046) covers folds alongside compaction markers.
 - Fold-then-compact interleavings could corrupt rebuild. Mitigate: precedence is tested in
   both orders (fold then compact over the range; compact then attempted fold inside it).

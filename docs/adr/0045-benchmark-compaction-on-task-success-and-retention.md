@@ -1,4 +1,4 @@
-# ADR-0044: Benchmark compaction on task success and load-bearing-detail retention
+# ADR-0045: Benchmark compaction on task success and load-bearing-detail retention
 
 **Date**: 2026-07-04
 **Status**: proposed
@@ -34,19 +34,19 @@ compaction seam.
   not token delta alone.
 - **Retention needles.** Reuse `assert_survives_verbatim`: after compaction, required facts
   (file paths, prior decisions, identifiers) must survive in rebuilt context, whether in the
-  ADR-0043 carry or the summary. Retention is a pass/fail contract, like the tool-output
+  ADR-0044 carry or the summary. Retention is a pass/fail contract, like the tool-output
   needles.
-- **Retention vs. recoverability.** Once recall (ADR-0045) and folds (ADR-0047) exist, a
+- **Retention vs. recoverability.** Once recall (ADR-0046) and folds (ADR-0048) exist, a
   needle passes in one of two ways: it survives in rebuilt context, or it sits behind a
   named reference (recall handle, fold handle) that itself survives verbatim. The two
   outcomes are reported separately; a needle that is merely recoverable is not counted as
   retained.
 - **A/B the summarizer arms.** Report token delta and retention for `provider` and `excerpts`
-  (ADR-0041), `provider + structured carry` (ADR-0043), and `provider + carry +
-  microcompaction` (ADR-0047), so the cost/quality trade of each arm is measured, not
+  (ADR-0041), `provider + structured carry` (ADR-0044), and `provider + carry +
+  microcompaction` (ADR-0048), so the cost/quality trade of each arm is measured, not
   assumed.
 - **Report dimensions, not just arms.** Each arm reports by compaction generation
-  (ADR-0046) and covered-range size (summary quality degrades with the range one summary
+  (ADR-0047) and covered-range size (summary quality degrades with the range one summary
   must carry), plus two cache-economics measurements from `ProviderUsage` cache read/write
   splits: the summarization request's cache-hit rate, and post-compaction cache-write
   amplification. Both are measured because the warm-cache premise is narrow: the

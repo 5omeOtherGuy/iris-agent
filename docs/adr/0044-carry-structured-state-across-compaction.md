@@ -1,4 +1,4 @@
-# ADR-0043: Carry structured state across compaction, separate from the prose summary
+# ADR-0044: Carry structured state across compaction, separate from the prose summary
 
 **Date**: 2026-07-04
 **Status**: proposed
@@ -80,7 +80,7 @@ tool-result contract the carry reads. No provider-specific data enters the carry
 - **Cons**: Larger surface (a tool plus id-addressable ranges), a per-recall token cost, and
   it depends on the model choosing to recall the right thing.
 - **Why not**: Complementary, not a substitute. The carry is the zero-round-trip floor;
-  recall (ADR-0045) covers everything below the floor on demand.
+  recall (ADR-0046) covers everything below the floor on demand.
 
 ### Alternative 4: A full typed agent-state store (plans, file states, subagents, counts)
 - **Pros**: Matches the complete Cursor state shape.
@@ -95,7 +95,7 @@ tool-result contract the carry reads. No provider-specific data enters the carry
 - Load-bearing paths survive any summary, deterministically, with no extra provider
   round-trip.
 - Format-compatible with ADR-0009; older sessions rebuild unchanged.
-- Gives ADR-0044's benchmark a concrete A/B arm (provider + carry) and a retention-needle
+- Gives ADR-0045's benchmark a concrete A/B arm (provider + carry) and a retention-needle
   target.
 
 ### Negative

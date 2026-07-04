@@ -1,4 +1,4 @@
-# ADR-0046: Count and surface a compaction generation ordinal
+# ADR-0047: Count and surface a compaction generation ordinal
 
 **Date**: 2026-07-04
 **Status**: proposed
@@ -14,7 +14,7 @@ summary-of-summaries.
 
 Nothing counts compactions. `CompactionApplied` (`src/nexus.rs`) carries `compaction_id`, the
 covered range, `covered_messages`, and token estimates, but no generation ordinal, and the
-`compaction` entry stores no depth. Three gaps follow: the ADR-0044 benchmark cannot ask
+`compaction` entry stores no depth. Three gaps follow: the ADR-0045 benchmark cannot ask
 whether retention degrades with compaction depth; long-horizon accumulation of verbatim
 summaries has no signal; and a future generational policy has no durable ordinal to key on.
 
@@ -34,7 +34,7 @@ session plus one.
 - **Persist it, recompute when absent.** The ordinal attaches to the `compaction` entry as an
   additive optional field (ADR-0009 extension path); older readers ignore it, and a session
   without the field derives the ordinal from the order of its compaction entries.
-- **Feed the benchmark.** The ordinal is available to ADR-0044 as an A/B dimension, so
+- **Feed the benchmark.** The ordinal is available to ADR-0045 as an A/B dimension, so
   retention and token delta can be reported by depth.
 
 The ordinal does not change range selection or summary content, and it is not a re-compaction
@@ -53,18 +53,18 @@ ordinal that a later generational policy can use.
 ### Alternative 2: A full per-turn state block (Cursor's ConversationStateStructure)
 - **Pros**: Matches the complete Cursor state shape (todos, plans, mode, subagents, count).
 - **Cons**: Most of those fields do not exist in Iris (no plan/todo system, no modes/subagents
-  yet); premature. The path/read-state slice already has a home in ADR-0043.
+  yet); premature. The path/read-state slice already has a home in ADR-0044.
 - **Why not**: Ship the one cheap counter; extend when the state exists.
 
 ### Alternative 3: Defer until a re-compaction policy needs it
 - **Pros**: YAGNI.
-- **Cons**: ADR-0044 wants the depth dimension now, and the counter is near-zero cost.
+- **Cons**: ADR-0045 wants the depth dimension now, and the counter is near-zero cost.
 - **Why not**: The instrumentation value is immediate; the policy value is a free option later.
 
 ## Consequences
 
 ### Positive
-- The benchmark (ADR-0044) can report retention and token delta by compaction depth.
+- The benchmark (ADR-0045) can report retention and token delta by compaction depth.
 - Long-horizon accumulation of verbatim summaries becomes visible.
 - A durable ordinal is ready for a future generational policy, at no behavior cost now.
 

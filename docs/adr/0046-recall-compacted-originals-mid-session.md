@@ -1,4 +1,4 @@
-# ADR-0045: Recall compacted originals mid-session
+# ADR-0046: Recall compacted originals mid-session
 
 **Date**: 2026-07-04
 **Status**: proposed
@@ -51,7 +51,7 @@ discipline (ADR-0011).
   independent of recall.
 - **Teach the model the affordance.** A system-prompt fragment (ADR-0012) documents what a
   compaction marker is and when to recall; the rebuilt summary's handle reference is the
-  anchor. The reference itself is an ADR-0044 needle: it must survive rebuild verbatim, or
+  anchor. The reference itself is an ADR-0045 needle: it must survive rebuild verbatim, or
   the tool is unreachable exactly when needed.
 - **Retrieve, do not un-compact.** Recall returns turns as tool output; it never rewrites live
   context or re-inflates the compacted range. Tool-call/tool-result pairs are returned intact.
@@ -96,14 +96,14 @@ The rebuilt-context path is unchanged except for carrying the handle reference.
 - Adds a tool and a read path that resolves ids to original turns, plus the handle
   registration at compaction time.
 - Recovery depends on the model choosing to recall; it is an affordance, not a guarantee
-  (ADR-0043's carry is the guaranteed floor).
+  (ADR-0044's carry is the guaranteed floor).
 
 ### Risks
 - A recall over a huge range could re-inflate context; mitigate with windowing, caps, and
   handle-offload (ADR-0011).
 - Recall can loop: recall output inflates context, triggers auto-compaction, the summary
   drops the recalled detail, the model recalls again. Mitigate with the search mode (fetch
-  the hit, not the range), bounded windows, and the ADR-0043 carry as the floor that removes
+  the hit, not the range), bounded windows, and the ADR-0044 carry as the floor that removes
   the most common reason to recall.
 - Id mapping after resume must be correct; mitigate with the read-path id fixes (#375
   shipped, #377 pending) and a resume-compact-recall test.
