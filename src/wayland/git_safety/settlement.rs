@@ -23,7 +23,7 @@ use super::{
 /// How a persisted record classifies during recovery (ADR-0030). Leased (live
 /// foreign) records never reach this enum -- they are skipped before classifying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TaskClass {
+pub(crate) enum TaskClass {
     /// Lease-free and lock-protocol-stamped: a crashed orphan safe to adopt.
     Recoverable,
     /// No lock metadata (predates the lease protocol): unknown, never
@@ -32,20 +32,74 @@ pub(super) enum TaskClass {
 }
 
 /// A record surfaced to recovery: a crashed orphan or an unknown-legacy record.
-/// Live foreign (leased) tasks are never included. Kept small and evolvable --
-/// #287 adds body/session links and #288's resume picker reads this list.
+/// Live foreign (leased) tasks are never included. The #288 resume-task picker
+/// (Tier 3) renders these rows, so the display payload (`body`/`sessions`) is
+/// surfaced alongside the recovery seam fields. `body`/`sessions` are opaque
+/// display copy (ADR-0031): recovery classification never branches on them.
 #[derive(Debug, Clone)]
-pub(super) struct RecoverableTask {
-    pub(super) task_id: String,
-    // `workspace` and `age` are part of the recovery seam spec (#285) that the
-    // #288 resume picker consumes; they are surfaced now (and asserted by tests)
-    // but not yet read by non-test production code.
+pub(crate) struct RecoverableTask {
+    pub(crate) task_id: String,
+    // `workspace` is part of the recovery seam spec (#285); it is surfaced (and
+    // asserted by tests) but the picker does not render it -- rows are already
+    // workspace-scoped -- so no production code reads it yet.
     #[allow(dead_code)]
-    pub(super) workspace: String,
+    pub(crate) workspace: String,
     /// Age since the record was last updated, for notice wording / picker order.
-    #[allow(dead_code)]
-    pub(super) age: Duration,
-    pub(super) class: TaskClass,
+    pub(crate) age: Duration,
+    /// Opaque display body (ADR-0031): the prompt preview of the turn that
+    /// opened the task, or `None` for a legacy record with no recorded body.
+    pub(crate) body: Option<String>,
+    /// Opaque display join (ADR-0031): the session ids that worked this task.
+    /// The picker shows `sessions.len()` as the linked-session count.
+    pub(crate) sessions: Vec<String>,
+    /// Recovery classification (ADR-0030). The picker does not branch on it
+    /// (rows are rendered from `body`/`sessions`); recovery policy does.
+    pub(crate) class: TaskClass,
+}
+
+#[cfg(test)]
+impl RecoverableTask {
+    /// Construct a recoverable row for Tier-3 unit tests (`ui::picker`) without a
+    /// repo. Fixed to the `Recoverable` class -- the picker renders body / age /
+    /// sessions and never branches on the class -- so tests do not need to name
+    /// the git-safety-private [`TaskClass`].
+    pub(crate) fn for_test(
+        task_id: &str,
+        age: Duration,
+        body: Option<&str>,
+        sessions: &[&str],
+    ) -> Self {
+        RecoverableTask {
+            task_id: task_id.to_string(),
+            workspace: "/proj".to_string(),
+            age,
+            body: body.map(str::to_string),
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+            class: TaskClass::Recoverable,
+        }
+    }
+}
+
+/// The outcome of adopting a recoverable task, surfaced to Tier 3 (#288). Maps
+/// the internal [`PersistedTask`](task_state::PersistedTask) to just the opaque
+/// display payload the adoption notice / "also resume" offer needs, so the
+/// private record type never leaks past the `Harness`.
+#[derive(Debug, Clone)]
+pub(crate) struct AdoptedTask {
+    pub(crate) task_id: String,
+    pub(crate) body: Option<String>,
+    pub(crate) sessions: Vec<String>,
+}
+
+/// What resume/startup recovery decided (ADR-0030/ADR-0031 policy), returned to
+/// Tier 3 so the >1/legacy case opens the picker instead of only printing a
+/// notice. `None` = nothing recoverable; `Notice` = the single-orphan auto-adopt
+/// (unchanged UX); `Picker` = explicit selection required over these rows.
+#[derive(Debug)]
+pub(crate) enum RecoveryOutcome {
+    None,
+    Notice(String),
+    Picker(Vec<RecoverableTask>),
 }
 
 impl GitSafety {
@@ -291,21 +345,22 @@ impl GitSafety {
     /// (leased/live-foreign records are skipped). Exactly one lease-free
     /// non-legacy orphan preserves the current auto-adopt UX via
     /// [`adopt_task`](Self::adopt_task); more than one, or any unknown-legacy
-    /// record, requires explicit selection -- until the resume-task picker (#288)
-    /// lands this is a notice listing the task ids. `None` when nothing is
-    /// recoverable. The notice always names the record actually adopted, fixing
-    /// the ADR-0030 notice/adopt mismatch. Lazy: called at startup/resume, no
-    /// daemon.
-    pub(crate) fn recover_and_expire(&self) -> Option<String> {
+    /// record, requires explicit selection: Tier 3 opens the resume-task picker
+    /// over the recoverable rows (#288). `None` when nothing is recoverable. A
+    /// `Notice` always names the record actually adopted, fixing the ADR-0030
+    /// notice/adopt mismatch. Lazy: called at startup/resume, no daemon.
+    pub(crate) fn recover_and_expire(&self) -> RecoveryOutcome {
         if !matches!(self.mode, Mode::Git) {
-            return None;
+            return RecoveryOutcome::None;
         }
-        let git_dir = task_state::git_dir(&self.workspace)?;
+        let Some(git_dir) = task_state::git_dir(&self.workspace) else {
+            return RecoveryOutcome::None;
+        };
         let now = SystemTime::now();
         self.expire_stale(&git_dir, now);
         let recoverable = self.recoverable_tasks();
         if recoverable.is_empty() {
-            return None;
+            return RecoveryOutcome::None;
         }
         let adoptable: Vec<&RecoverableTask> = recoverable
             .iter()
@@ -317,10 +372,15 @@ impl GitSafety {
         if adoptable.len() == 1 && !has_legacy {
             // Preserve the current UX: auto-adopt the single orphan, naming the
             // record actually adopted in the notice.
-            let record = self.adopt_task(&adoptable[0].task_id)?;
-            return Some(record.recovery_notice(now));
+            return match self.adopt_task(&adoptable[0].task_id) {
+                Some(record) => RecoveryOutcome::Notice(record.recovery_notice(now)),
+                None => RecoveryOutcome::None,
+            };
         }
-        Some(selection_notice(&recoverable))
+        // More than one orphan, or any unknown-legacy record: explicit selection
+        // is required (ADR-0030). Tier 3 opens the resume-task picker over these
+        // rows (#288) instead of auto-adopting.
+        RecoveryOutcome::Picker(recoverable)
     }
 
     /// Expire stale unsettled tasks in this workspace (ADR-0028 30-day window):
@@ -361,7 +421,7 @@ impl GitSafety {
     /// **lease-free, lock-protocol** record is a recoverable orphan; a record
     /// with no lock metadata is unknown-**legacy**. Returns the recoverable +
     /// legacy records only. This is the seam the #288 resume picker plugs into.
-    pub(super) fn recoverable_tasks(&self) -> Vec<RecoverableTask> {
+    pub(crate) fn recoverable_tasks(&self) -> Vec<RecoverableTask> {
         if !matches!(self.mode, Mode::Git) {
             return Vec::new();
         }
@@ -399,6 +459,8 @@ impl GitSafety {
                 task_id: task.task_id,
                 workspace: task.workspace,
                 age,
+                body: task.body,
+                sessions: task.sessions,
                 class,
             });
         }
@@ -442,6 +504,20 @@ impl GitSafety {
         }
         self.rehydrate_task(&git_dir, &record, lease);
         Some(record)
+    }
+
+    /// Adopt a recoverable task and surface just its opaque display payload to
+    /// Tier 3 (#288): the same [`adopt_task`](Self::adopt_task) side effects
+    /// (lease claim, disk reconciliation, chain rehydration, session-join
+    /// append), mapped to an [`AdoptedTask`] so the private record type stays
+    /// behind the seam. `None` when the record is gone or now leased.
+    pub(crate) fn adopt(&self, task_id: &str) -> Option<AdoptedTask> {
+        let record = self.adopt_task(task_id)?;
+        Some(AdoptedTask {
+            task_id: record.task_id,
+            body: record.body,
+            sessions: record.sessions,
+        })
     }
 
     /// Rebuild an active [`Task`] from a persisted unsettled record and its
@@ -538,26 +614,6 @@ fn exotic_git_state(workspace: &Path) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// A one-line notice when recovery cannot auto-adopt (more than one recoverable
-/// orphan, or any unknown-legacy record): explicit selection is required
-/// (ADR-0030), and until the #288 resume picker lands this lists the task ids so
-/// the user can act. Legacy records are flagged as "unknown" so the user knows
-/// they are not auto-adopted.
-fn selection_notice(tasks: &[RecoverableTask]) -> String {
-    let ids: Vec<String> = tasks
-        .iter()
-        .map(|task| match task.class {
-            TaskClass::Recoverable => task.task_id.clone(),
-            TaskClass::Legacy => format!("{} (unknown)", task.task_id),
-        })
-        .collect();
-    format!(
-        "{} unsettled Iris task(s) need attention -- resume one to view / accept / roll back (tasks: {})",
-        tasks.len(),
-        ids.join(", ")
-    )
 }
 
 /// A short op-log label for a checkpoint from the paths it touched.

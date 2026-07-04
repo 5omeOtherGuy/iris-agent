@@ -51,6 +51,7 @@ use crate::ui::tui::{
     StartAction, TreeMenu, TuiUi,
 };
 use crate::wayland::Harness;
+use crate::wayland::git_safety::RecoveryOutcome;
 use crate::wayland::git_safety::git as git_cmd;
 
 /// Spinner cadence. Input redraws are immediate (channel-driven), so this paces
@@ -287,10 +288,9 @@ async fn session_loop<P: ChatProvider>(
     }
     refresh_footer(tui, switch);
     // On startup, reconcile any crashed/unsettled Iris task in this repo and
-    // expire stale ones (issue #263, ADR-0028), surfacing the recovery notice.
-    if let Some(recovery) = harness.recover_checkpoints() {
-        apply_notices(tui, vec![recovery]);
-    }
+    // expire stale ones (issue #263, ADR-0028): print the single-orphan notice
+    // or open the resume-task picker for the >1/legacy case (#288, ADR-0031).
+    apply_recovery(harness.recover_checkpoints(), tui);
     // `iris resume` (no id) on a rich TTY opens the resume picker on start by
     // handing a pre-built modal here. Open it before the first draw and before
     // the blocking input reader starts, so the first key acts on a visible
@@ -496,12 +496,25 @@ fn perform_swap<P: ChatProvider>(
     };
     apply_notices(tui, vec![notice]);
     // A session swap is a safe boundary to reconcile a crashed/unsettled task in
-    // this repo and expire stale ones (issue #263, ADR-0028): surface the
-    // one-line recovery notice if anything is unsettled.
-    if let Some(recovery) = harness.recover_checkpoints() {
-        apply_notices(tui, vec![recovery]);
-    }
+    // this repo and expire stale ones (issue #263, ADR-0028): surface the notice
+    // or open the resume-task picker if more than one task needs attention.
+    apply_recovery(harness.recover_checkpoints(), tui);
     Ok(())
+}
+
+/// Apply a [`RecoveryOutcome`] at a safe boundary (#288, ADR-0031): nothing for
+/// `None`, the single-orphan auto-adopt notice for `Notice`, and the resume-task
+/// picker for `Picker` (the >1/legacy case that requires explicit selection).
+fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
+    match outcome {
+        RecoveryOutcome::None => {}
+        RecoveryOutcome::Notice(notice) => apply_notices(tui, vec![notice]),
+        RecoveryOutcome::Picker(tasks) => {
+            if let Some(modal) = picker::tasks_modal(&tasks) {
+                tui.screen.open_modal(modal);
+            }
+        }
+    }
 }
 
 /// Request a coalesced render during an active turn: draw immediately when the
@@ -878,9 +891,7 @@ fn execute_menu_action<P: ChatProvider>(
                 )],
             );
             // Arriving in a worktree tells you what Iris left unsettled there.
-            if let Some(recovery) = harness.recover_checkpoints() {
-                apply_notices(tui, vec![recovery]);
-            }
+            apply_recovery(harness.recover_checkpoints(), tui);
             tui.screen.close_session_menu();
         }
         MenuAction::InsertReference(path) => {
@@ -957,6 +968,20 @@ fn route_command<P: ChatProvider>(
                 None => apply_notices(
                     tui,
                     vec!["No prior sessions to resume for this directory.".to_string()],
+                ),
+            }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/tasks" if rest.is_empty() => {
+            // Open the resume-task picker over this workspace's recoverable Iris
+            // tasks (#288, ADR-0031). Selection adopts at the inter-turn
+            // boundary; adoption never implicitly resumes a session.
+            tui.screen.commit_user(prompt);
+            match picker::open_tasks(harness) {
+                Some(modal) => tui.screen.open_modal(modal),
+                None => apply_notices(
+                    tui,
+                    vec!["No recoverable Iris tasks in this workspace.".to_string()],
                 ),
             }
             Ok(RouteOutcome::Consumed)
@@ -1500,6 +1525,29 @@ async fn dispatch_action<P: ChatProvider>(
             // performs the swap at the safe inter-turn boundary.
             tui.screen.close_modal();
             return Ok(Some(SessionSource::Resume(id)));
+        }
+        ModalAction::AdoptTask(id) => {
+            // Adopt the recoverable task at this safe inter-turn boundary (#288,
+            // ADR-0031): rehydrate its checkpoint chain so `/rollback` /
+            // `/accept` / `/checkpoint` operate on the real chain. Adoption never
+            // implicitly resumes a session; when exactly one session is linked we
+            // open an explicit "also resume" offer (a second, separate action).
+            tui.screen.close_modal();
+            match harness.adopt_task(&id) {
+                Some(adopted) => {
+                    let (lines, resume) = picker::adopt_notice(&adopted);
+                    apply_notices(tui, lines);
+                    if let Some(session_id) = resume {
+                        tui.screen.open_modal(picker::resume_offer(&session_id));
+                    }
+                }
+                None => apply_notices(
+                    tui,
+                    vec![format!(
+                        "could not adopt task {id}: it may have settled or been claimed by another process."
+                    )],
+                ),
+            }
         }
         ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {
             Ok(auth) => match login::provider_select(method, &auth) {
