@@ -9,7 +9,12 @@
 version = 2
 # RUSTSEC security advisories. Fail on vulnerable or yanked crates.
 yanked = "deny"
-ignore = []
+# RUSTSEC-2025-0141: bincode 1.x is unmaintained (advisory, not a
+# vulnerability). Pulled in only by syntect's `default-syntaxes` packdump
+# loader; the sole input it deserializes is the syntax dump embedded in our
+# own binary at build time -- never attacker-controlled data. Remove the
+# ignore when syntect moves off bincode 1 upstream.
+ignore = ["RUSTSEC-2025-0141"]
 
 [bans]
 # Warn (do not fail) on duplicate versions of the same crate; tighten to "deny"

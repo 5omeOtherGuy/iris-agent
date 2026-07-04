@@ -105,6 +105,21 @@ impl MarkdownTheme {
             ..Self::default()
         }
     }
+
+    /// Inject the `syntect`-backed fenced-code highlighter (#324). Only the TUI
+    /// span path calls this; the plain / non-TTY renderer never constructs a
+    /// highlighting theme, so its output stays byte-identical (highlighting is
+    /// gated at the TUI construction site, not inside the shared renderer). The
+    /// highlighter composes this theme's `base` onto hit spans (so the thinking
+    /// variant stays dimmed) and falls back to the dim `code_block` style for
+    /// unknown languages.
+    pub(crate) fn with_code_highlighting(mut self) -> Self {
+        self.highlight_code = Some(crate::ui::highlight::code_highlighter(
+            self.base,
+            self.base.patch(self.code_block),
+        ));
+        self
+    }
 }
 
 /// Render Markdown `text` into styled transcript lines with the default theme at
@@ -1277,6 +1292,52 @@ mod tests {
             joined.contains("HL[rust]:let x = 1;"),
             "highlight hook not honored: {joined:?}"
         );
+    }
+
+    #[test]
+    fn syntect_highlighting_colors_rust_and_falls_back_for_unknown_lang() {
+        let theme = MarkdownTheme::default().with_code_highlighting();
+
+        // Known language: a rust block must render with more than one distinct
+        // span style (keyword vs literal vs plain), proving highlighting ran.
+        let rust = "```rust\nfn main() { let x = 42; }\n```";
+        let hl = render_markdown_themed(rust, &theme, DEFAULT_RENDER_WIDTH);
+        let code_line = hl
+            .iter()
+            .find(|l| text_of(l).contains("let x"))
+            .expect("rust code line");
+        let colors: std::collections::HashSet<_> =
+            code_line.spans.iter().map(|s| s.style.fg).collect();
+        assert!(
+            colors.len() > 1,
+            "rust block not highlighted (single color): {colors:?}"
+        );
+
+        // Unknown language: must render exactly as the dim fallback does today.
+        // The fallback path splits the prefix into its own span, so compare at
+        // the rendered level (per-line text) rather than span structure.
+        let unknown = "```no-such-lang\nfn main() {}\n```";
+        let with_hl = render_markdown_themed(unknown, &theme, DEFAULT_RENDER_WIDTH);
+        let without_hl =
+            render_markdown_themed(unknown, &MarkdownTheme::default(), DEFAULT_RENDER_WIDTH);
+        let texts = |lines: &[Line<'static>]| lines.iter().map(text_of).collect::<Vec<_>>();
+        assert_eq!(
+            texts(&with_hl),
+            texts(&without_hl),
+            "unknown-language block text must match the dim fallback exactly"
+        );
+        // Every unknown-lang span stays dim with no color leaked in, in both.
+        for lines in [&with_hl, &without_hl] {
+            for line in lines.iter().filter(|l| text_of(l).contains("fn main")) {
+                assert!(
+                    line.spans
+                        .iter()
+                        .all(|s| s.style.fg.is_none()
+                            && s.style.add_modifier.contains(Modifier::DIM)),
+                    "unknown-lang code not dim/uncolored: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
