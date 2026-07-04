@@ -1,0 +1,13 @@
+    Checking gamma v0.1.0 (/tmp/fixgen336/ws/crates/gamma)
+    Checking beta v0.1.0 (/tmp/fixgen336/ws/crates/beta)
+    Checking alpha v0.1.0 (/tmp/fixgen336/ws/crates/alpha)
+warning: unused variable: `unused`
+ --> crates/beta/src/lib.rs:1:41
+  |
+1 | pub fn add(a: i32, b: i32) -> i32 { let unused = 7; a + b }
+  |                                         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `beta` (lib) generated 1 warning (run `cargo fix --lib -p beta` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s

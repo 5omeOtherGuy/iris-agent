@@ -1,0 +1,49 @@
+diff --git a/index.js b/index.js
+index 1e9648c..289fb19 100644
+--- a/index.js
++++ b/index.js
+@@ -1,2 +1,2 @@
+ const leftPad = require('left-pad');
+-module.exports = function pad5(s) { return leftPad(s, 5); };
++module.exports = function pad5(s) { return leftPad(String(s), 5); };
+diff --git a/package-lock.json b/package-lock.json
+index 25941fe..044f0a7 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -9,9 +9,23 @@
+       "version": "1.0.0",
+       "license": "ISC",
+       "dependencies": {
++        "inherits": "^2.0.4",
++        "isarray": "^2.0.5",
+         "left-pad": "^1.3.0"
+       }
+     },
++    "node_modules/inherits": {
++      "version": "2.0.4",
++      "resolved": "https://registry.npmjs.org/inherits/-/inherits-2.0.4.tgz",
++      "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
++      "license": "ISC"
++    },
++    "node_modules/isarray": {
++      "version": "2.0.5",
++      "resolved": "https://registry.npmjs.org/isarray/-/isarray-2.0.5.tgz",
++      "integrity": "sha512-xHjhDr3cNBK0BzdUJSPXZntQUx/mwMS5Rw4A7lPJ90XGAO6ISP/ePDNuo0vhqOZU+UD5JoodwCAAoZQd3FeAKw==",
++      "license": "MIT"
++    },
+     "node_modules/left-pad": {
+       "version": "1.3.0",
+       "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+diff --git a/package.json b/package.json
+index f6bdc7f..65f5640 100644
+--- a/package.json
++++ b/package.json
+@@ -11,6 +11,8 @@
+   "license": "ISC",
+   "type": "commonjs",
+   "dependencies": {
++    "inherits": "^2.0.4",
++    "isarray": "^2.0.5",
+     "left-pad": "^1.3.0"
+   }
+ }

@@ -2,9 +2,13 @@
 //!
 //! One seam: captured output is filtered after the command exits and before
 //! `truncate_tail`, for one-shot runs, persistent-session runs, and finalized
-//! background jobs. Filters are declarative TOML pipelines embedded at build
-//! time (`data/*.toml`, concatenated by `build.rs`); the engine lives in
-//! [`engine`], dispatch keying in [`command`].
+//! background jobs. Two filter kinds share the seam, structured first:
+//! hand-written Rust filters that parse and summarize the top command classes
+//! (cargo test/build, git status/log/diff, npm/pnpm test -- [`structured`]),
+//! then declarative TOML pipelines embedded at build time (`data/*.toml`,
+//! concatenated by `build.rs`; engine in [`engine`]). Dispatch keying for
+//! both lives in [`command`]. A structured filter that declines (cannot
+//! parse its output confidently) yields raw output, never a TOML fallback.
 //!
 //! Fail-safe contract (ADR-0036 "without quality loss"):
 //! - any filter error or panic yields the raw output;
@@ -17,6 +21,7 @@
 
 mod command;
 mod engine;
+mod structured;
 
 use std::sync::OnceLock;
 
@@ -52,6 +57,21 @@ pub(super) fn filter_output(command: &str, output: &str, exit_ok: bool) -> Optio
         return None;
     }
     let effective = command::effective_command(command)?;
+    if let Some(sf) = structured::find(&effective) {
+        // Structured filters own their command class: a decline (None), a
+        // panic, or a guard hit means raw passthrough, not a TOML fallback.
+        let filtered = run_guarded(|| (sf.apply)(output, exit_ok), sf.name)??;
+        if filtered.trim().is_empty() {
+            return None;
+        }
+        if filtered == output.trim_end_matches('\n') || filtered == output {
+            return None;
+        }
+        return Some(Filtered {
+            text: filtered,
+            name: sf.name.to_string(),
+        });
+    }
     let filter = registry().iter().find(|f| f.matches(&effective))?;
     let filtered = run_guarded(
         || engine::apply_filter(filter, output, exit_ok),
@@ -75,9 +95,9 @@ pub(super) fn filter_output(command: &str, output: &str, exit_ok: bool) -> Optio
 
 /// Run one filter application with panic containment: a panicking filter
 /// yields `None` (raw output) instead of poisoning the tool call.
-fn run_guarded(apply: impl FnOnce() -> String, name: &str) -> Option<String> {
+fn run_guarded<T>(apply: impl FnOnce() -> T, name: &str) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(apply)) {
-        Ok(text) => Some(text),
+        Ok(value) => Some(value),
         Err(_) => {
             tracing::warn!(filter = %name, "bash filter panicked; returning raw output");
             None
@@ -200,26 +220,64 @@ mod tests {
 
     #[test]
     fn failing_command_emptied_yields_raw_not_on_empty() {
-        // cargo-test has on_empty = "ok (...)"; on a non-zero exit whose lines
-        // are all stripped, the on_empty success message must be suppressed
-        // and the raw output returned instead (ADR-0036 failure-is-complete).
-        let chatter = "   Compiling foo v0.1.0 (/home/user/foo)\n";
+        // npm-install has on_empty = "ok (...)"; on a non-zero exit whose
+        // lines are all stripped, the on_empty success message must be
+        // suppressed and the raw output returned instead (ADR-0036
+        // failure-is-complete). (cargo test moved to a structured filter in
+        // PR 2 of #336; npm-install is the remaining on_empty TOML filter.)
+        let noise = "npm warn deprecated inflight@1.0.6: leaks memory\n";
         assert!(
-            filter_output("cargo test", chatter, false).is_none(),
+            filter_output("npm install", noise, false).is_none(),
             "failed command emptied by the filter must yield raw, not on_empty"
         );
         // Success path unchanged: the same emptied output renders on_empty.
-        let ok = filter_output("cargo test", chatter, true)
+        let ok = filter_output("npm install", noise, true)
             .expect("success emptied output should render on_empty");
-        assert_eq!(ok.text, "ok (cargo test: no summary output)");
+        assert_eq!(ok.text, "ok (installed; log was all noise)");
+    }
+
+    #[test]
+    fn structured_class_chatter_only_output_passes_through_raw() {
+        // With the TOML cargo-test filter retired, pure-chatter cargo test
+        // output is unparsable for the structured filter and passes through
+        // raw on both exit paths (never an invented success message).
+        let chatter = "   Compiling foo v0.1.0 (/home/user/foo)\n";
+        assert!(filter_output("cargo test", chatter, false).is_none());
+        assert!(filter_output("cargo test", chatter, true).is_none());
     }
 
     #[test]
     fn panicking_filter_yields_raw() {
-        assert_eq!(run_guarded(|| panic!("boom"), "test"), None);
+        assert_eq!(run_guarded(|| -> String { panic!("boom") }, "test"), None);
         assert_eq!(
             run_guarded(|| "ok".to_string(), "test"),
             Some("ok".to_string())
         );
+    }
+
+    #[test]
+    fn structured_filter_wins_over_registry() {
+        // `cargo build` clean output: the structured filter summarizes to
+        // "ok" (the TOML cargo-build filter was retired in PR 2 of #336).
+        let out = filter_output(
+            "cargo build",
+            "   Compiling foo v0.1.0 (/w/foo)\n    Finished `dev` profile target(s) in 1.0s\n",
+            true,
+        )
+        .expect("structured cargo-build applies");
+        assert_eq!(out.name, "cargo-build");
+        assert_eq!(out.text, "ok");
+    }
+
+    #[test]
+    fn structured_decline_yields_raw_not_toml() {
+        // Unparsable output for a structured class must pass through raw:
+        // garbage under `git log` is neither summarized nor TOML-filtered.
+        assert!(filter_output("git log", "complete garbage output\n", true).is_none());
+        assert!(filter_output("cargo test", "complete garbage output\n", true).is_none());
+        assert!(filter_output("git status", "complete garbage output\n", true).is_none());
+        assert!(filter_output("git diff", "complete garbage output\n", true).is_none());
+        assert!(filter_output("npm test", "complete garbage output\n", true).is_none());
+        assert!(filter_output("cargo build", "complete garbage output\n", true).is_none());
     }
 }
