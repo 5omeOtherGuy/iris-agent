@@ -79,10 +79,23 @@ pub(crate) struct RestorePoint {
     pub(crate) label: String,
 }
 
+/// A settled task (accept / explicit checkpoint): the user-facing summary plus
+/// the settled task id (ADR-0031), so the harness can append a `TaskSettled`
+/// audit entry. The id is metadata for the session-log join; enforcement never
+/// keys off it.
+pub(crate) struct Settlement {
+    pub(crate) summary: String,
+    pub(crate) task_id: String,
+}
+
 /// Outcome of a rollback attempt, surfaced to the user (Tier 3).
 pub(crate) struct RollbackOutcome {
     /// Human summary of what was restored.
     pub(crate) summary: String,
+    /// The settled task id when a task was actually rolled back (ADR-0031), for
+    /// the harness's `TaskSettled` audit append; `None` when there was no active
+    /// task. Display/join metadata only -- enforcement never reads it.
+    pub(crate) settled_task_id: Option<String>,
     /// Set when the user index could not be safely restored (mid-merge/rebase):
     /// the degrade-to-detect-and-warn path (ADR-0028).
     pub(crate) index_warning: Option<String>,
@@ -142,6 +155,14 @@ struct Task {
     /// orphaned. `None` in degraded mode or when the lease could not be
     /// acquired (a logged, best-effort degrade).
     _lease: Option<lock::FlockGuard>,
+    /// Opaque display body: the prompt preview of the turn whose first mutation
+    /// opened this task (ADR-0031), captured once and never rewritten. Written
+    /// verbatim into the persisted record; NO enforcement path reads it.
+    body: Option<String>,
+    /// Opaque display join: session ids that worked this task, ordered and
+    /// consecutive-deduped (ADR-0031). Written verbatim into the record; NO
+    /// enforcement path reads it.
+    sessions: Vec<String>,
 }
 
 impl Task {
@@ -166,6 +187,8 @@ impl Task {
             git_dir,
             created_ms: task_state::now_ms(),
             _lease: lease,
+            body: None,
+            sessions: Vec::new(),
         }
     }
 
@@ -189,12 +212,33 @@ impl Task {
             git_dir: None,
             created_ms: task_state::now_ms(),
             _lease: None,
+            body: None,
+            sessions: Vec::new(),
         }
     }
 }
 
 struct State {
     task: Option<Task>,
+    /// The current turn's prompt preview, handed by the harness before each turn
+    /// (ADR-0031). `note_mutation` consumes it as the opening task's `body` and
+    /// clears it; a follow-up turn joining an unsettled task clears it without
+    /// rewriting the body. Opaque display payload only.
+    pending_body: Option<String>,
+    /// The current session id, stamped onto a task's `sessions` join at open and
+    /// appended (consecutive-deduped) when a task is rehydrated/adopted. Opaque
+    /// display payload only.
+    session_id: Option<String>,
+}
+
+/// Append `session_id` to a task's `sessions` join, skipping a consecutive
+/// duplicate so re-adopting from the same session never grows the vec (ADR-0031
+/// ordered, consecutive-deduped). Opaque display payload; never read by
+/// enforcement.
+fn push_session_deduped(sessions: &mut Vec<String>, session_id: &str) {
+    if sessions.last().map(String::as_str) != Some(session_id) {
+        sessions.push(session_id.to_string());
+    }
 }
 
 /// The Tier-2 dirty-tree safety guard. Owned by the harness, injected into each
@@ -218,7 +262,11 @@ impl GitSafety {
         Self {
             workspace: canonical,
             mode,
-            state: Mutex::new(State { task: None }),
+            state: Mutex::new(State {
+                task: None,
+                pending_body: None,
+                session_id: None,
+            }),
             scan: Mutex::new(None),
         }
     }
@@ -250,6 +298,34 @@ impl GitSafety {
             task.approved.clear();
             task.all_dirty_approved = false;
         }
+    }
+
+    /// Set the current turn's prompt preview (ADR-0031), handed by the harness
+    /// before each turn. `note_mutation` consumes it as the opening task's
+    /// opaque `body` if this turn opens a task, and clears it otherwise so a
+    /// follow-up turn never rewrites an existing task's body. Deterministic
+    /// display payload; no enforcement path reads it.
+    pub(crate) fn set_turn_context(&self, preview: Option<String>) {
+        self.state.lock().unwrap().pending_body = preview;
+    }
+
+    /// Set the current session id (ADR-0031): stamped onto a task's opaque
+    /// `sessions` join at open, and appended (consecutive-deduped) when this
+    /// process rehydrates/adopts a task. Display payload only.
+    pub(crate) fn set_session_id(&self, id: String) {
+        self.state.lock().unwrap().session_id = Some(id);
+    }
+
+    /// The active task's id, or `None` when no task is open (ADR-0031). Polled by
+    /// the harness post-turn to observe "a task opened this turn" so it can
+    /// append the `TaskOpened` audit entry.
+    pub(crate) fn current_task_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .map(|task| task.task_id.clone())
     }
 
     /// Number of ledger entries recorded in the current task (test-only).
@@ -380,6 +456,10 @@ impl GitSafety {
             baseline_index: task.baseline.index.clone(),
             owner: Some(lock::process_owner()),
             lock_protocol: Some(lock::LOCK_PROTOCOL.to_string()),
+            // Opaque display payload, written verbatim (ADR-0031). Never read by
+            // any enforcement/recovery path.
+            body: task.body.clone(),
+            sessions: task.sessions.clone(),
         };
         // Serialize the record write against concurrent processes (ADR-0030).
         if let Err(error) = lock::with_mutation_lock(git_dir, || task_state::save(git_dir, &record))
@@ -497,13 +577,26 @@ impl MutationGuard for GitSafety {
         self.sync_barrier();
         let mut state = self.state.lock().unwrap();
         if state.task.is_some() {
-            // Baseline already captured and announced for this task.
+            // Baseline already captured and announced for this task. A follow-up
+            // turn joining an unsettled task must NOT rewrite its body (captured
+            // once at open, ADR-0031), so drop this turn's pending preview.
+            state.pending_body = None;
             return None;
         }
         let task_id = new_task_id();
+        // Consume the opening turn's prompt preview as the task body (once,
+        // never rewritten) and stamp the current session id onto its join. Both
+        // are opaque display payload -- no enforcement path reads them.
+        let body = state.pending_body.take();
+        let session_id = state.session_id.clone();
         match &self.mode {
             Mode::Degraded(reason) => {
-                state.task = Some(Task::degraded(task_id));
+                let mut task = Task::degraded(task_id);
+                task.body = body;
+                if let Some(id) = session_id {
+                    push_session_deduped(&mut task.sessions, &id);
+                }
+                state.task = Some(task);
                 Some(reason.clone())
             }
             Mode::Git => match baseline::capture(&self.workspace, |path| self.normalize(path)) {
@@ -531,14 +624,23 @@ impl MutationGuard for GitSafety {
                         }
                     });
                     let chain = CheckpointChain::new(self.workspace.clone(), task_id.clone());
-                    let task = Task::active(task_id, baseline, chain, git_dir, lease);
+                    let mut task = Task::active(task_id, baseline, chain, git_dir, lease);
+                    task.body = body;
+                    if let Some(id) = session_id {
+                        push_session_deduped(&mut task.sessions, &id);
+                    }
                     self.persist_task(&task);
                     state.task = Some(task);
                     summary
                 }
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "git baseline capture failed; degrading dirty-tree safety this task");
-                    state.task = Some(Task::degraded(task_id));
+                    let mut task = Task::degraded(task_id);
+                    task.body = body;
+                    if let Some(id) = session_id {
+                        push_session_deduped(&mut task.sessions, &id);
+                    }
+                    state.task = Some(task);
                     Some(format!(
                         "could not read git status ({error:#}); dirty-tree gating disabled this task"
                     ))

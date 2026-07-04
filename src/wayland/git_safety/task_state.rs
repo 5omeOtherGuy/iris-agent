@@ -63,6 +63,19 @@ pub(super) struct PersistedTask {
     /// classifies it as "unknown" and never auto-adopts it (ADR-0030).
     #[serde(default)]
     pub(super) lock_protocol: Option<String>,
+    /// Opaque display body: the prompt preview of the turn whose first mutation
+    /// opened this task (ADR-0031). Pass-through payload for the recovery UX --
+    /// NO git-safety enforcement/recovery/gating/checkpoint/expiry path parses
+    /// or branches on it. `#[serde(default)]` so a legacy record (written before
+    /// this field existed) deserializes to `None`.
+    #[serde(default)]
+    pub(super) body: Option<String>,
+    /// Opaque display join: the session ids that worked this task, ordered and
+    /// consecutive-deduped (ADR-0031). The live join, authoritative only for the
+    /// recovery UX; enforcement never reads it. `#[serde(default)]` so a legacy
+    /// record deserializes to an empty vec.
+    #[serde(default)]
+    pub(super) sessions: Vec<String>,
 }
 
 impl PersistedTask {

@@ -16,7 +16,8 @@ use anyhow::Result;
 
 use super::{
     Baseline, Chain, CheckpointChain, GitSafety, IrisChange, KEEP_CHECKPOINTS, Mode, RestorePoint,
-    RollbackOutcome, Task, baseline, checkpoint, git, lock, task_state,
+    RollbackOutcome, Settlement, Task, baseline, checkpoint, git, lock, push_session_deduped,
+    task_state,
 };
 
 /// How a persisted record classifies during recovery (ADR-0030). Leased (live
@@ -85,9 +86,10 @@ impl GitSafety {
 
     /// Settle the current task as ACCEPTED (ADR-0028): freeze the ledger, GC the
     /// intermediate checkpoints keeping the last N, and drop the recovery record
-    /// so the accepted work is no longer offered for rollback. Returns a one-line
-    /// summary, or `None` when no task is active.
-    pub(crate) fn accept(&self) -> Option<String> {
+    /// so the accepted work is no longer offered for rollback. Returns the
+    /// settled task id plus a one-line summary (ADR-0031: the harness appends a
+    /// `TaskSettled` audit entry from the id), or `None` when no task is active.
+    pub(crate) fn accept(&self) -> Option<Settlement> {
         self.sync_barrier();
         let mut state = self.state.lock().unwrap();
         let task = state.task.take()?;
@@ -121,16 +123,17 @@ impl GitSafety {
             gc_chain(&mut chain);
         }
         drop(_lease);
-        Some(format!(
-            "accepted {count} Iris change(s); checkpoints pruned"
-        ))
+        Some(Settlement {
+            summary: format!("accepted {count} Iris change(s); checkpoints pruned"),
+            task_id,
+        })
     }
 
     /// Record an explicit user checkpoint (the `/checkpoint` command) and settle
     /// the task like accept, so the next mutation opens a fresh baseline
-    /// (ADR-0028: an explicit checkpoint command freezes the ledger). Returns a
-    /// summary, or `None` when no task is active.
-    pub(crate) fn checkpoint_now(&self) -> Option<String> {
+    /// (ADR-0028: an explicit checkpoint command freezes the ledger). Returns the
+    /// settled task id plus a summary, or `None` when no task is active.
+    pub(crate) fn checkpoint_now(&self) -> Option<Settlement> {
         self.sync_barrier();
         {
             let mut state = self.state.lock().unwrap();
@@ -141,8 +144,10 @@ impl GitSafety {
                 let _ = chain.checkpoint(turn, None, "explicit checkpoint".to_string());
             }
         }
-        self.accept()
-            .map(|_| "checkpoint saved; task settled".to_string())
+        self.accept().map(|settled| Settlement {
+            summary: "checkpoint saved; task settled".to_string(),
+            task_id: settled.task_id,
+        })
     }
 
     /// Roll back the current task to restore point `seq` (0 = pre-task baseline):
@@ -156,6 +161,7 @@ impl GitSafety {
         let Some(task) = state.task.take() else {
             return Ok(RollbackOutcome {
                 summary: "no active Iris task to roll back".to_string(),
+                settled_task_id: None,
                 index_warning: None,
                 preserved_notices: Vec::new(),
             });
@@ -222,6 +228,7 @@ impl GitSafety {
         drop(_lease);
         Ok(RollbackOutcome {
             summary: format!("rolled back {count} Iris change(s) to restore point {seq}"),
+            settled_task_id: Some(task_id),
             index_warning,
             preserved_notices,
         })
@@ -452,12 +459,13 @@ impl GitSafety {
         persisted: &task_state::PersistedTask,
         lease: lock::FlockGuard,
     ) {
-        {
+        let session_id = {
             let state = self.state.lock().unwrap();
             if state.task.is_some() {
                 return;
             }
-        }
+            state.session_id.clone()
+        };
         let ledger_paths: Vec<PathBuf> = persisted.expected.keys().map(PathBuf::from).collect();
         let chain = match CheckpointChain::load(
             self.workspace.clone(),
@@ -486,6 +494,26 @@ impl GitSafety {
             Some(lease),
         );
         task.created_ms = persisted.created_ms;
+        // Carry the record's opaque display payload (ADR-0031) so a later
+        // `persist_task` (on continued mutation) re-writes it verbatim instead
+        // of clobbering it. Then append THIS process's session id to the live
+        // join (ordered, consecutive-deduped) and persist just that under the
+        // mutation lock -- preserving `expected`/`tip_seq`, which a fresh
+        // `persist_task` (empty ledger) would reset. Never read by enforcement.
+        task.body = persisted.body.clone();
+        task.sessions = persisted.sessions.clone();
+        if let Some(id) = &session_id {
+            push_session_deduped(&mut task.sessions, id);
+        }
+        if task.sessions != persisted.sessions {
+            let mut updated = persisted.clone();
+            updated.sessions = task.sessions.clone();
+            lock::with_mutation_lock(git_dir, || {
+                if let Err(error) = task_state::save(git_dir, &updated) {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to persist session link on adopt");
+                }
+            });
+        }
         let mut state = self.state.lock().unwrap();
         if state.task.is_none() {
             state.task = Some(task);

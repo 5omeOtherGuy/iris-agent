@@ -220,6 +220,69 @@ impl SessionLog {
         Ok(id)
     }
 
+    /// Append a `taskLifecycle` entry recording that a git-safety task opened
+    /// (`event: "opened"`, ADR-0031). This is the historical audit of the
+    /// task<->session join -- the only place it survives settlement (which
+    /// deletes the task record). Modeled on `modelSelection`: append-only, in the
+    /// leaf chain (so `scan_for_resume` chains through it and `parentId` stays
+    /// intact), and skipped by `read_messages` so it never enters provider
+    /// context. `body` is the opaque prompt preview captured at task open, or
+    /// `None` (legacy/no description). Never an enforcement or recovery input.
+    pub(crate) fn append_task_opened(
+        &mut self,
+        task_id: &str,
+        body: Option<&str>,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "taskLifecycle",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "event": "opened",
+            "taskId": task_id,
+            "body": body,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append task-opened lifecycle to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Append a `taskLifecycle` entry recording that a task settled
+    /// (`event: "settled"`, ADR-0031). `disposition` is a deterministic label
+    /// (`accepted`/`rolledback`/`checkpointed`). Same chain/skip semantics as
+    /// [`append_task_opened`](Self::append_task_opened); display-only audit,
+    /// never read by enforcement or recovery.
+    pub(crate) fn append_task_settled(
+        &mut self,
+        task_id: &str,
+        disposition: &str,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "taskLifecycle",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "event": "settled",
+            "taskId": task_id,
+            "disposition": disposition,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append task-settled lifecycle to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
     /// Reopen an existing transcript file for append, so a resumed session
     /// continues the same log instead of starting a new one. Reads the header
     /// id and the existing entries to restore the leaf link (`parentId` of the
@@ -542,13 +605,17 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        // `message`, `compaction`, and `modelSelection` entries all occupy the
-        // leaf chain and an entry-id slot, so a resumed append must link its
-        // `parentId` past, and count its `next_seq` beyond, whichever kind is the
-        // current leaf. (`modelSelection` is an audit record; the read/rebuild
-        // path skips it, but the chain must still flow through it.)
+        // `message`, `compaction`, `modelSelection`, and `taskLifecycle` entries
+        // all occupy the leaf chain and an entry-id slot, so a resumed append
+        // must link its `parentId` past, and count its `next_seq` beyond,
+        // whichever kind is the current leaf. (`modelSelection` and
+        // `taskLifecycle` are audit records; the read/rebuild path skips them,
+        // but the chain must still flow through them or `parentId` breaks.)
         match value.get("type").and_then(Value::as_str) {
-            Some("message") | Some("compaction") | Some("modelSelection") => {}
+            Some("message")
+            | Some("compaction")
+            | Some("modelSelection")
+            | Some("taskLifecycle") => {}
             _ => continue,
         }
         count += 1;
@@ -1516,6 +1583,69 @@ mod tests {
         // messages are reconstructed, in order.
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
         assert_eq!(contents(&session), ["hello", "hi"]);
+    }
+
+    // Issue #287 test (4), session-log side: `taskLifecycle` entries are
+    // first-class audit records chained onto the leaf, skipped by
+    // `read_messages` (never provider-visible), and resume chains its `parentId`
+    // through a `taskLifecycle` leaf so the chain stays intact.
+    #[test]
+    fn task_lifecycle_entries_are_chained_and_skipped_by_read() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let user_id = log.append(&Message::user("please fix it")).unwrap();
+        let opened_id = log
+            .append_task_opened("task-1", Some("please fix it"))
+            .unwrap();
+        let assistant_id = log.append(&Message::assistant("done")).unwrap();
+        let settled_id = log.append_task_settled("task-1", "accepted").unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        let entries = lines(&path);
+        // The opened entry is a first-class audit record chained onto the user
+        // message, carrying its opaque body.
+        let opened = entries
+            .iter()
+            .find(|e| e["type"] == "taskLifecycle" && e["event"] == "opened")
+            .expect("taskLifecycle opened entry present");
+        assert_eq!(opened["id"], opened_id);
+        assert_eq!(opened["parentId"], user_id);
+        assert_eq!(opened["taskId"], "task-1");
+        assert_eq!(opened["body"], "please fix it");
+        assert!(
+            opened.get("disposition").is_none(),
+            "an opened entry carries no disposition"
+        );
+        // The assistant message chained THROUGH the opened lifecycle entry.
+        assert_eq!(entries[3]["parentId"], opened_id);
+
+        let settled = entries
+            .iter()
+            .find(|e| e["type"] == "taskLifecycle" && e["event"] == "settled")
+            .expect("taskLifecycle settled entry present");
+        assert_eq!(settled["id"], settled_id);
+        assert_eq!(settled["parentId"], assistant_id);
+        assert_eq!(settled["taskId"], "task-1");
+        assert_eq!(settled["disposition"], "accepted");
+
+        // read_messages excludes both lifecycle entries: only the two real
+        // messages are reconstructed, in order.
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(contents(&session), ["please fix it", "done"]);
+
+        // Resume after a `taskLifecycle` leaf keeps the parentId chain intact:
+        // the next appended entry links to the lifecycle leaf, not past it.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        let next_id = resumed.append(&Message::user("thanks")).unwrap();
+        assert_ne!(next_id, settled_id, "the resumed entry gets a fresh id");
+        let resumed_entries = lines(&path);
+        let last = resumed_entries.last().unwrap();
+        assert_eq!(
+            last["parentId"], settled_id,
+            "resume chains parentId through the taskLifecycle leaf"
+        );
     }
 
     #[test]

@@ -1165,3 +1165,253 @@ fn recovery_notice_names_the_adopted_record() {
     holder.kill().unwrap();
     holder.wait().unwrap();
 }
+
+// --- task metadata: opaque body + session join (issue #287, ADR-0031) ----
+
+// Issue #287 test (1), record level: a mutating turn stamps the turn's prompt
+// preview as the task's opaque `body`, and the current session id onto its
+// `sessions` join.
+#[test]
+fn note_mutation_stamps_turn_context_as_body_and_session() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    guard.set_session_id("sessionaaaa".to_string());
+    guard.set_turn_context(Some("fix the parser bug".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &repo.path.join("committed.txt"), b"iris\n");
+
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let record = task_state::load_all(&git_dir)
+        .pop()
+        .expect("a task record was persisted");
+    assert_eq!(
+        record.body.as_deref(),
+        Some("fix the parser bug"),
+        "the opening turn's preview is captured as the opaque body"
+    );
+    assert_eq!(
+        record.sessions,
+        vec!["sessionaaaa".to_string()],
+        "the current session id is stamped onto the join at open"
+    );
+}
+
+// Issue #287 test (2): a follow-up turn joining an unsettled task never rewrites
+// the body; a follow-up AFTER settlement opens a fresh task capturing the new
+// turn's preview.
+#[test]
+fn follow_up_leaves_body_unchanged_then_new_task_after_settle() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    // Turn 1 opens the task with body "first turn".
+    guard.set_turn_context(Some("first turn".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"one\n");
+    assert_eq!(
+        task_state::load_all(&git_dir)
+            .pop()
+            .unwrap()
+            .body
+            .as_deref(),
+        Some("first turn")
+    );
+
+    // Turn 2 joins the SAME unsettled task: body must stay "first turn".
+    guard.set_turn_context(Some("second turn".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"two\n");
+    assert_eq!(
+        task_state::load_all(&git_dir)
+            .pop()
+            .unwrap()
+            .body
+            .as_deref(),
+        Some("first turn"),
+        "a follow-up turn joining an unsettled task never rewrites body"
+    );
+
+    // Settle, then a follow-up opens a fresh task capturing the new preview.
+    guard.accept().expect("a task was active to accept");
+    guard.set_turn_context(Some("third turn".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"three\n");
+    assert_eq!(
+        task_state::load_all(&git_dir)
+            .pop()
+            .unwrap()
+            .body
+            .as_deref(),
+        Some("third turn"),
+        "a post-settlement follow-up opens a new task with the new turn's body"
+    );
+}
+
+// Issue #287 test (3): a second process rehydrating (adopting) the orphan
+// appends its own session id to the record's join -- ordered and
+// consecutive-deduped, written under the mutation lock.
+#[test]
+fn rehydrate_appends_session_id_ordered_and_deduped() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    // Session A opens the task, then crashes (never settles).
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_session_id("sessionaaaa".to_string());
+        guard.set_turn_context(Some("work".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &edited, b"iris\n");
+    }
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string()]
+    );
+
+    // Session B adopts and appends its session id (ordered after A's).
+    {
+        let guard_b = GitSafety::new(&repo.path);
+        guard_b.set_session_id("sessionbbbb".to_string());
+        guard_b.recover_and_expire().expect("the orphan is adopted");
+    }
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "the adopting session id is appended in order"
+    );
+
+    // Session C re-adopts with the SAME id as the last: consecutive-deduped, so
+    // the join does not grow.
+    {
+        let guard_c = GitSafety::new(&repo.path);
+        guard_c.set_session_id("sessionbbbb".to_string());
+        guard_c
+            .recover_and_expire()
+            .expect("the orphan is adopted again");
+    }
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "a consecutive duplicate session id is not appended"
+    );
+}
+
+// Issue #287 test (5): recovery consults ONLY the task record (+ lease), never
+// the session log. The crash-skew rows degrade per the display rule while
+// recovery is unaffected:
+//   - record present, no `TaskOpened` event  -> still recoverable (row 1).
+//   - `TaskOpened` present, no record         -> nothing recoverable (row 2).
+//   - record removed at settle, no `TaskSettled` yet -> nothing recoverable (row 3).
+#[test]
+fn recovery_consults_only_record_not_lifecycle_events() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    // Row 2 baseline: no record at all -> recovery finds nothing (a dangling
+    // audit event in a session log could never make a task recoverable, because
+    // git-safety never reads the log).
+    assert!(GitSafety::new(&repo.path).recoverable_tasks().is_empty());
+
+    // Row 1: a record exists (task opened, then a crash before any settle) with
+    // no matching TaskSettled -- recovery lists it from the record alone.
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_session_id("s1".to_string());
+        guard.set_turn_context(Some("body".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &repo.path.join("committed.txt"), b"x\n");
+    }
+    assert_eq!(task_state::load_all(&git_dir).len(), 1);
+    let guard_b = GitSafety::new(&repo.path);
+    assert_eq!(
+        guard_b.recoverable_tasks().len(),
+        1,
+        "the record alone drives recovery"
+    );
+
+    // Row 3: settlement removes the record; nothing is recoverable afterward,
+    // independent of whether a TaskSettled audit entry was ever appended.
+    guard_b.recover_and_expire();
+    guard_b.accept().expect("the adopted task settles");
+    assert!(
+        task_state::load_all(&git_dir).is_empty(),
+        "settlement removed the record"
+    );
+    assert!(
+        GitSafety::new(&repo.path).recoverable_tasks().is_empty(),
+        "no record -> nothing recoverable (display rule: settled or expired)"
+    );
+}
+
+// Issue #287 test (6): a legacy record written before body/sessions existed
+// deserializes to defaults (None / empty).
+#[test]
+fn legacy_record_without_body_or_sessions_deserializes_to_defaults() {
+    let json = r#"{
+        "task_id": "abc",
+        "workspace": "/w",
+        "created_ms": 1,
+        "updated_ms": 2,
+        "expected": {},
+        "tip_seq": 0
+    }"#;
+    let record: task_state::PersistedTask =
+        serde_json::from_str(json).expect("legacy record deserializes");
+    assert!(record.body.is_none(), "missing body defaults to None");
+    assert!(
+        record.sessions.is_empty(),
+        "missing sessions defaults to empty"
+    );
+}
+
+// Issue #287 test (7): expiry removes the record and its refs but never touches
+// the session log (a separate file git-safety has no handle to).
+#[test]
+fn expiry_removes_record_and_refs_but_leaves_session_log_untouched() {
+    let repo = init_repo();
+    let session_root = temp_dir();
+    let mut log = crate::session::SessionLog::create_in(&session_root.path, &repo.path).unwrap();
+    log.append_task_opened("audit-task", Some("audit body"))
+        .unwrap();
+    log.append_task_settled("audit-task", "accepted").unwrap();
+    let session_path = log.path().to_path_buf();
+    drop(log);
+    let session_before = fs::read(&session_path).unwrap();
+
+    // Open a task, then backdate its record beyond the 30-day expiry window.
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_turn_context(Some("body".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &repo.path.join("committed.txt"), b"iris\n");
+    }
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let mut record = task_state::load_all(&git_dir).pop().unwrap();
+    let task_id = record.task_id.clone();
+    record.updated_ms = task_state::now_ms() - (31 * 24 * 60 * 60 * 1000);
+    task_state::save(&git_dir, &record).unwrap();
+    assert!(
+        task_ref_count(&repo.path, &task_id) > 0,
+        "refs exist pre-expiry"
+    );
+
+    GitSafety::new(&repo.path).recover_and_expire();
+
+    assert!(
+        task_state::load_all(&git_dir).is_empty(),
+        "expiry removed the record"
+    );
+    assert_eq!(
+        task_ref_count(&repo.path, &task_id),
+        0,
+        "expiry destroyed the task refs"
+    );
+    assert_eq!(
+        fs::read(&session_path).unwrap(),
+        session_before,
+        "expiry left the session log byte-for-byte untouched"
+    );
+}
