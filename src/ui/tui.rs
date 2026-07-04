@@ -402,6 +402,9 @@ impl TuiUi {
                     .iter()
                     .map(|span| span.content.as_ref())
                     .filter(|content| *content != crate::ui::terminal_surface::CURSOR_MARKER)
+                    // OSC 8 link markers are zero-width structured metadata, not
+                    // visible text: exclude them from the width dump too.
+                    .filter(|content| !crate::ui::hyperlink::is_marker(content))
                     .collect();
                 format!("[{idx}] (w={}) {text:?}", wrap::display_width(&text))
             })

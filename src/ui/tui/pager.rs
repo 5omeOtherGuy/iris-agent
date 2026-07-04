@@ -492,6 +492,14 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     frame.extend(body);
     frame.extend(tail);
 
+    // OSC 8 hyperlink markers are stripped from the frame here and their
+    // visible column regions recorded for mouse hit-testing: the ratatui
+    // `Buffer` the frame is drawn into cannot carry OSC 8, so the pager resolves
+    // clicks against these regions and opens via the `open_in_browser`/notice
+    // seam instead. Done before the cursor-marker strip; the two marker kinds
+    // are independent zero-width spans.
+    screen.pager_links = crate::ui::hyperlink::extract_and_strip_lines(&mut frame);
+
     // The zero-width hardware-cursor marker is located and stripped here (the
     // inline surface does this in its line renderer); its position drives IME
     // candidate-window placement. Bounded scan: at most one viewport of lines.
@@ -622,6 +630,57 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn compose_frame_strips_link_markers_and_resolves_a_click() {
+        // An assistant message with a markdown link: after compose, the frame
+        // cells carry NO escape markers (they cannot reach the ratatui Buffer),
+        // and a click on the link's visible columns resolves to its target.
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.apply(UiEvent::AssistantTextEnd(
+            "Read [guide](https://example.com/docs) now".to_string(),
+        ));
+        let size = Size::new(80, 24);
+        let composed = compose_frame(&mut screen, size);
+
+        // No frame line contains a link marker (clean cells for the Buffer).
+        assert!(
+            !composed
+                .lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| { crate::ui::hyperlink::is_marker(s.content.as_ref()) }),
+            "link markers leaked into the composed pager frame"
+        );
+
+        // A region was recorded, and a click inside it resolves to the target.
+        let region = screen
+            .pager_links
+            .first()
+            .expect("link region recorded")
+            .clone();
+        assert_eq!(region.uri, "https://example.com/docs");
+        let hit = screen
+            .pager_link_at(region.row as u16, region.start_col as u16)
+            .expect("click resolves");
+        assert_eq!(hit, "https://example.com/docs");
+        // Just past the region is not a hit.
+        assert!(
+            screen
+                .pager_link_at(region.row as u16, region.end_col as u16)
+                .is_none(),
+            "region end column is exclusive"
+        );
+
+        // The visible frame text still reads the label + destination verbatim.
+        let rows = frame_rows(&composed.lines, 80, 24);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("guide (https://example.com/docs)")),
+            "visible link text unchanged"
+        );
     }
 
     #[test]

@@ -360,7 +360,9 @@ impl Transcript {
                 dim_style(),
             ))]]
         } else {
-            let theme = MarkdownTheme::thinking().with_code_highlighting();
+            let theme = MarkdownTheme::thinking()
+                .with_code_highlighting()
+                .with_hyperlinks();
             let width = self.markdown_content_width();
             let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
             let mut current: Vec<Line<'static>> = Vec::new();

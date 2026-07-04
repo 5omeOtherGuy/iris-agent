@@ -641,6 +641,12 @@ pub(crate) struct Screen {
     /// One-shot scroll target consumed by the next pager compose (search
     /// jumps): reveal without pinning the view.
     pub(crate) reveal_line: Option<usize>,
+    /// Clickable OSC 8 link regions for the last composed pager frame, keyed by
+    /// frame `(row, column)`. Rebuilt every compose from the frame's link
+    /// markers (which are stripped before the cells reach the ratatui `Buffer`,
+    /// since it cannot carry OSC 8), so a mouse click resolves to a target via
+    /// [`Screen::pager_link_at`].
+    pub(crate) pager_links: Vec<crate::ui::hyperlink::LinkRegion>,
 }
 
 /// `/find` state: the query plus the current match position. Match lines are
@@ -689,7 +695,16 @@ impl Screen {
             selected_entry: None,
             search: None,
             reveal_line: None,
+            pager_links: Vec::new(),
         }
+    }
+
+    /// Resolve a pager-frame click `(row, column)` to an OSC 8 link target, if
+    /// any. Pure lookup over the regions the last compose recorded; a click
+    /// outside every link region returns `None`.
+    pub(crate) fn pager_link_at(&self, row: u16, column: u16) -> Option<&str> {
+        crate::ui::hyperlink::region_at(&self.pager_links, usize::from(row), usize::from(column))
+            .map(|region| region.uri.as_str())
     }
 
     /// Start (or clear, with an empty query) a transcript search. Jumps to the

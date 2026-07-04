@@ -144,6 +144,14 @@ pub(crate) fn report(env: &DoctorEnv) -> Vec<String> {
         ));
     }
 
+    // OSC 8 hyperlinks: emitted unconditionally (terminals ignore unknown OSC
+    // safely), so this is informational rather than a pass/fail probe. Widely
+    // supported: kitty, WezTerm, iTerm2, foot, Ghostty, and VTE terminals
+    // (GNOME Terminal); unsupported terminals render identical visible text.
+    lines.push(format!(
+        "{DONE} osc 8 hyperlinks: emitted for links and file:line refs (supported: kitty, WezTerm, iTerm2, foot, Ghostty, VTE; others show plain text)"
+    ));
+
     lines
 }
 
@@ -218,6 +226,15 @@ mod tests {
                 "line missing state symbol: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn report_notes_osc8_hyperlink_support() {
+        let all = report(&plain()).join("\n");
+        assert!(
+            all.contains("osc 8 hyperlinks"),
+            "doctor reports OSC 8 hyperlink support: {all}"
+        );
     }
 
     #[test]
