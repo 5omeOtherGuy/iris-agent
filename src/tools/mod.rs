@@ -37,6 +37,7 @@ pub(crate) mod path;
 mod read;
 mod read_output;
 mod registry;
+mod skim;
 mod text;
 mod write;
 

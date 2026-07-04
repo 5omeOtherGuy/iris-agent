@@ -6,6 +6,8 @@
 extend-exclude = [
   "src/tools/bash/filter/data/",
   "src/tools/bash/filter/corpus/",
+  # Real source files copied verbatim as skim-mode benchmark fixtures.
+  "src/tools/skim/corpus/",
 ]
 [default.extend-identifiers]
 # Repository owner / handle.
