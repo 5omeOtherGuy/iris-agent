@@ -178,6 +178,9 @@ fn corpus_iris_cuts_raw_ls_la() {
 
 #[test]
 fn corpus_overhead_under_10ms_per_call() {
+    // Measures the shipped default path (flat, names-only). The recursive walk's
+    // resource bound is covered separately by `ls_scan_budget_bounds_recursive_collection`
+    // in `super`, which caps collection regardless of tree size.
     for f in fixtures() {
         let entries = parse(f.raw);
         let (dir, _) = iris_listing(&entries);

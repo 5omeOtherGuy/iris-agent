@@ -20,6 +20,13 @@ const DEFAULT_LS_LIMIT: usize = 500;
 /// Number of top extensions named in a truncation summary.
 const SUMMARY_TOP_EXT: usize = 5;
 
+/// Upper bound on entries collected during the walk, so a model-supplied deep
+/// `depth`/`recursive` listing cannot traverse an arbitrarily large tree just
+/// to render a capped result. Well above `DEFAULT_LS_LIMIT`, so ordinary
+/// directories still get an exact total; past it, the summary reports a lower
+/// bound (`>=N ... scan capped`).
+const SCAN_BUDGET: usize = 10_000;
+
 pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Set long=true to prefix each entry with a type marker (d/f/l) and human-readable size. Output is truncated to 500 entries or 50KB (whichever is hit first); a truncated listing ends with a summary line carrying the exact total, the dirs/files split, and the dominant omitted extensions so what was cut is visible without a blind re-list.";
 
 pub(super) fn parameters() -> Value {
@@ -73,24 +80,27 @@ fn ls(root: &Path, input: &LsInput) -> Result<super::ToolOutput> {
         (false, None) => 1,
     };
 
-    // Collect the full depth-bounded entry set first, then render. Collection is
-    // not cap-bounded so the truncation summary can report exact totals; the
-    // walk is still bounded by `max_depth` and never follows symlinks, so it
-    // cannot loop or leave the resolved root.
+    // Collect the entry set first, then render. Collection walks only within
+    // `max_depth`, never follows symlinks (so it cannot loop or leave the
+    // resolved root), and stops at `SCAN_BUDGET` entries so a deep recursive
+    // request cannot traverse an unbounded tree. When the budget is hit the
+    // total becomes a lower bound and the summary says so.
     let mut entries: Vec<Entry> = Vec::new();
-    collect_entries(&dir_path, dir, 0, max_depth, &mut entries)?;
+    collect_entries(&dir_path, dir, 0, max_depth, SCAN_BUDGET, &mut entries)?;
 
     if entries.is_empty() {
         return Ok(super::ToolOutput::text("(empty directory)").with("entries", json!(0)));
     }
 
     let total = entries.len();
+    let scan_capped = total >= SCAN_BUDGET;
     let rendered = render_listing(
         &entries,
         limit,
         input.long,
         DEFAULT_MAX_LINES,
         DEFAULT_MAX_BYTES,
+        scan_capped,
     );
     Ok(super::ToolOutput::text(rendered.body)
         .with("entries", json!(total))
@@ -141,8 +151,12 @@ fn collect_entries(
     dir_label: &str,
     depth: usize,
     max_depth: usize,
+    budget: usize,
     out: &mut Vec<Entry>,
 ) -> Result<()> {
+    if out.len() >= budget {
+        return Ok(());
+    }
     let read = match fs::read_dir(dir_path) {
         Ok(read) => read,
         Err(error) if depth == 0 => {
@@ -179,6 +193,11 @@ fn collect_entries(
     level.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
 
     for entry in level {
+        // Stop the whole walk once the scan budget is reached; the caller marks
+        // the total as a lower bound.
+        if out.len() >= budget {
+            return Ok(());
+        }
         // Descend into real subdirectories only: never follow a symlink, so the
         // walk cannot cycle or leave the resolved root.
         let child = if entry.is_dir && !entry.is_symlink && depth + 1 < max_depth {
@@ -189,7 +208,7 @@ fn collect_entries(
         let child_label = entry.name.clone();
         out.push(entry);
         if let Some(child) = child {
-            collect_entries(&child, &child_label, depth + 1, max_depth, out)?;
+            collect_entries(&child, &child_label, depth + 1, max_depth, budget, out)?;
         }
     }
     Ok(())
@@ -229,6 +248,7 @@ fn render_listing(
     long: bool,
     max_lines: usize,
     max_bytes: usize,
+    scan_capped: bool,
 ) -> Rendered {
     let total = entries.len();
     let mut lines: Vec<String> = Vec::new();
@@ -254,9 +274,9 @@ fn render_listing(
     }
 
     let mut body = lines.join("\n");
-    let truncated = shown < total;
+    let truncated = shown < total || scan_capped;
     if truncated {
-        body.push_str(&summarize_omitted(entries, shown));
+        body.push_str(&summarize_omitted(entries, shown, scan_capped));
     }
     Rendered { body, truncated }
 }
@@ -265,7 +285,7 @@ fn render_listing(
 /// dirs/files split, the shown/omitted counts, and the dominant file extensions
 /// among the omitted entries, so the model knows what was cut without
 /// re-listing.
-fn summarize_omitted(entries: &[Entry], shown: usize) -> String {
+fn summarize_omitted(entries: &[Entry], shown: usize, scan_capped: bool) -> String {
     let total = entries.len();
     let dirs = entries.iter().filter(|e| e.is_dir).count();
     let files = total - dirs;
@@ -304,10 +324,19 @@ fn summarize_omitted(entries: &[Entry], shown: usize) -> String {
         format!("\nomitted ext: {listed}{more}")
     };
 
-    format!(
-        "\n\n[{total} entries: {dirs} dirs, {files} files; {shown} shown, {} omitted]{ext_line}",
-        omitted.len()
-    )
+    // When the scan hit its budget, total/dirs/files/omitted are lower bounds:
+    // mark it so the model does not read them as exact.
+    if scan_capped {
+        format!(
+            "\n\n[>={total} entries (scan capped): {dirs} dirs, {files} files; {shown} shown, >={} omitted]{ext_line}",
+            omitted.len()
+        )
+    } else {
+        format!(
+            "\n\n[{total} entries: {dirs} dirs, {files} files; {shown} shown, {} omitted]{ext_line}",
+            omitted.len()
+        )
+    }
 }
 
 #[cfg(test)]
@@ -575,5 +604,35 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("omitted ext: .rs (4)"), "{out}");
+    }
+
+    #[test]
+    fn ls_scan_budget_bounds_recursive_collection() {
+        // A deep recursive request must not traverse an unbounded tree. With a
+        // tiny budget the walk stops early and the summary reports a lower bound
+        // instead of an exact (and expensive-to-compute) total.
+        let dir = temp_dir();
+        for d in ["a", "b", "c"] {
+            fs::create_dir(dir.path.join(d)).unwrap();
+            for i in 0..3 {
+                fs::write(dir.path.join(format!("{d}/f{i}.rs")), "x").unwrap();
+            }
+        }
+        // Full depth-2 tree = 3 dirs + 9 files = 12 entries; budget 4 stops at 4.
+        let mut entries = Vec::new();
+        collect_entries(&dir.path, ".", 0, 2, 4, &mut entries).unwrap();
+        assert_eq!(entries.len(), 4, "collection is bounded by the scan budget");
+
+        let out = render_listing(
+            &entries,
+            2,
+            false,
+            DEFAULT_MAX_LINES,
+            DEFAULT_MAX_BYTES,
+            true,
+        )
+        .body;
+        assert!(out.contains("scan capped"), "{out}");
+        assert!(out.contains(">=4 entries"), "{out}");
     }
 }

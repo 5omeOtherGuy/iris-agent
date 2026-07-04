@@ -3,11 +3,12 @@
 Measured over captured real `ls -la` listings in `src/tools/ls_corpus/`
 (`flat_many.txt`: a directory of ~66 `.toml` files plus a LICENSE and a NOTICE;
 `mixed.txt`: source `.rs` files interleaved with subdirectories). Tokens are
-estimated at 4 bytes/token; only the ratios matter. Every number below is
-asserted by the tests in `src/tools/ls_corpus/corpus.rs`, built on the shared
-measurement core in `src/tools/bench_support.rs` (recipe: the
-`token-efficiency-benchmark` skill in `.pi/skills/`). Regenerate the tables
-with:
+estimated at 4 bytes/token; only the ratios matter. The contracts and bars below
+(iris <= rtk with verbatim survival; >= 60% reduction over raw) are asserted by
+the tests in `src/tools/ls_corpus/corpus.rs`, built on the shared measurement
+core in `src/tools/bench_support.rs` (recipe: the `token-efficiency-benchmark`
+skill in `.pi/skills/`); the exact table values are regenerated snapshots, not
+asserted figures. Regenerate the tables with:
 
 ```
 cargo test --bin iris ls_benchmark_report -- --nocapture
@@ -74,7 +75,10 @@ The summary carries the exact total with its dirs/files split, the
 shown/omitted counts, and the dominant file extensions among the omitted entries
 (directories carry no extension; extensionless files group under `(no ext)`), so
 the model knows what was cut without re-listing. In tree mode the counts span
-the whole depth-bounded walk, not just the shown prefix. These are asserted by
+the whole depth-bounded walk, not just the shown prefix. To keep a
+model-supplied deep recursive request from traversing an unbounded tree, the
+walk stops at a fixed scan budget (10,000 entries); past it the total is a lower
+bound and the summary reads `[>=N entries (scan capped): ...]`. These are asserted by
 `ls_truncation_appends_summary_with_totals_and_ext`,
 `ls_summary_labels_extensionless_files`, and
 `ls_tree_truncation_summary_counts_full_tree` in `src/tools/ls.rs`; an under-cap
