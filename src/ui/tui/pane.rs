@@ -74,6 +74,7 @@ fn user_row(text: &str) -> TranscriptRow {
         background: None,
         hrule: false,
         chrome: None,
+        searchable: true,
     }
 }
 
@@ -139,5 +140,6 @@ fn assistant_row(mut line: Line<'static>, show_marker: bool) -> TranscriptRow {
         background: None,
         hrule: false,
         chrome: None,
+        searchable: true,
     }
 }

@@ -58,8 +58,15 @@ pub(crate) struct ScrollState {
     /// Layout metrics from the last composed frame, so key handling clamps
     /// against the real wrapped layout without recomputing it.
     view_rows: usize,
-    max_top: usize,
     total: usize,
+    /// Virtual rows reserved at the bottom of the viewport for an overlay that
+    /// covers the last body row (the centered `/find` indicator). While set,
+    /// the scrollable range extends by this many rows so the tail -- including
+    /// a match on the very last transcript line -- can sit ABOVE the overlay
+    /// instead of being drawn into the row it overwrites. `0` (the default,
+    /// and whenever no search is active) leaves all scrolling/follow behavior
+    /// identical to a plain viewport.
+    bottom_pad: usize,
 }
 
 impl Default for ScrollState {
@@ -68,8 +75,8 @@ impl Default for ScrollState {
             top_offset: 0,
             follow: true,
             view_rows: 0,
-            max_top: 0,
             total: 0,
+            bottom_pad: 0,
         }
     }
 }
@@ -85,19 +92,35 @@ impl ScrollState {
     pub(in crate::ui) fn sync(&mut self, total: usize, view_rows: usize) {
         self.total = total;
         self.view_rows = view_rows;
-        self.max_top = total.saturating_sub(view_rows);
-        self.top_offset = self.top_offset.min(self.max_top);
-        if self.max_top == 0 {
+        let max_top = self.max_top();
+        self.top_offset = self.top_offset.min(max_top);
+        if max_top == 0 {
             self.follow = true;
         }
+    }
+
+    /// Reserve `pad` bottom rows for an overlay that covers the last body row
+    /// (the `/find` indicator), extending the scrollable range so the tail can
+    /// clear it. Set once per compose from the active search state; `0`
+    /// restores plain-viewport behavior.
+    pub(in crate::ui) fn set_bottom_pad(&mut self, pad: usize) {
+        self.bottom_pad = pad;
+    }
+
+    /// Greatest viewport-top offset. Reserves `bottom_pad` rows below the
+    /// transcript so a bottom overlay does not swallow the last line; with no
+    /// reservation this is the plain `total - view_rows`.
+    fn max_top(&self) -> usize {
+        self.total
+            .saturating_sub(self.view_rows.saturating_sub(self.bottom_pad))
     }
 
     /// The viewport-top line index for the current frame.
     fn top(&self) -> usize {
         if self.follow {
-            self.max_top
+            self.max_top()
         } else {
-            self.top_offset.min(self.max_top)
+            self.top_offset.min(self.max_top())
         }
     }
 
@@ -120,8 +143,9 @@ impl ScrollState {
             return;
         }
         self.top_offset = self.top_offset.saturating_add(n);
-        if self.top_offset >= self.max_top {
-            self.top_offset = self.max_top;
+        let max_top = self.max_top();
+        if self.top_offset >= max_top {
+            self.top_offset = max_top;
             self.follow = true;
         }
     }
@@ -138,7 +162,7 @@ impl ScrollState {
     /// below).
     pub(crate) fn jump_to_start(&mut self) {
         self.top_offset = 0;
-        self.follow = self.max_top == 0;
+        self.follow = self.max_top() == 0;
     }
 
     /// Jump to the live tail and re-engage follow.
@@ -165,8 +189,9 @@ impl ScrollState {
             self.top_offset = line;
             self.follow = false;
         } else if view > 0 && line >= top + view {
-            self.top_offset = (line + 1 - view).min(self.max_top);
-            self.follow = self.top_offset >= self.max_top;
+            let max_top = self.max_top();
+            self.top_offset = (line + 1 - view).min(max_top);
+            self.follow = self.top_offset >= max_top;
         }
     }
 }
@@ -373,6 +398,11 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
 
     let view_rows = tail_budget - tail.len();
     let total = screen.transcript_visible_total(width);
+    // An active search draws its indicator over the last body row, so reserve
+    // that row: the scrollable range extends by one and a tail-adjacent (or
+    // final-line) match can land above the indicator instead of under it.
+    let search_pad = usize::from(screen.search.is_some());
+    screen.scroll.set_bottom_pad(search_pad);
     screen.scroll.sync(total, view_rows);
     // Keep the selected scrollback entry visible (the wrap cache is warm
     // after `transcript_visible_total`, so the line lookup is O(1)).
@@ -1023,6 +1053,116 @@ mod tests {
         assert_eq!(state.total, 0);
         assert!(state.line.is_none());
         assert!(!screen.search_step(-1));
+    }
+
+    #[test]
+    fn find_does_not_match_fold_affordance_chrome() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        // A tool panel whose long body folds, rendering both fold affordance
+        // hints (`ctrl+o to expand`/`collapse`). None of the real output text
+        // contains "ctrl", "collapse" or "to expand".
+        let long_output: String = (0..40).map(|i| format!("body line {i}\n")).collect();
+        screen.apply(UiEvent::ToolResult {
+            call: tool_call(0),
+            content: long_output,
+            exit_code: Some(0),
+            duration: None,
+        });
+        let _ = compose_frame(&mut screen, Size::new(80, 24));
+
+        // The affordance rows carry `ctrl+o to expand`/`collapse` text but are
+        // control chrome, not transcript content: `/find` must skip them so a
+        // query never matches hidden UI or auto-expands the panel for it.
+        assert_eq!(
+            screen.start_search("ctrl+o"),
+            Some(0),
+            "fold affordance chrome is not searched"
+        );
+        assert!(
+            screen.search.as_ref().unwrap().line.is_none(),
+            "no chrome match means no jump"
+        );
+        assert!(
+            screen.transcript.latest_panel_collapsed(),
+            "a non-matching chrome query leaves the panel collapsed"
+        );
+        assert_eq!(screen.start_search("collapse"), Some(0));
+        assert_eq!(screen.start_search("to expand"), Some(0));
+        // Sanity: real folded body content is still matched.
+        assert_eq!(
+            screen.start_search("body line 20"),
+            Some(1),
+            "real transcript content is still searchable"
+        );
+    }
+
+    #[test]
+    fn search_reveal_lifts_the_final_line_above_the_indicator() {
+        // Without a reserved indicator row, revealing the final line pins it to
+        // the last body row (row 19) -- the row compose overwrites with the
+        // search indicator, hiding the match.
+        let mut scroll = ScrollState::default();
+        scroll.sync(100, 20);
+        scroll.jump_to_start();
+        scroll.reveal(99);
+        assert_eq!(scroll.top(), 80);
+        assert_eq!(99 - scroll.top(), 19, "plain reveal lands on the last row");
+
+        // Reserving the indicator row extends the scrollable range by one, so
+        // the same final-line match lands on row 18 -- one above the indicator.
+        let mut scroll = ScrollState::default();
+        scroll.set_bottom_pad(1);
+        scroll.sync(100, 20);
+        scroll.jump_to_start();
+        scroll.reveal_with_bottom_margin(99, 1);
+        assert!(scroll.is_following(), "an EOF reveal re-engages follow");
+        assert_eq!(scroll.top(), 81);
+        assert_eq!(
+            99 - scroll.top(),
+            18,
+            "final-line match sits above the reserved indicator row"
+        );
+    }
+
+    #[test]
+    fn final_line_match_stays_visible_above_the_search_indicator() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        for i in 0..80 {
+            screen.apply(UiEvent::Notice(format!("filler {i}")));
+        }
+        // The only match is on the very LAST transcript line.
+        screen.apply(UiEvent::Notice("needle tail".to_string()));
+        let size = Size::new(80, 24);
+        let _ = compose_frame(&mut screen, size);
+        assert_eq!(screen.start_search("needle tail"), Some(1));
+        // Compose reveals + highlights the match.
+        let frame = compose_frame(&mut screen, size).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        // The centered indicator draws its `k/N` on the last body row. The
+        // highlighted match must render on an EARLIER row, not under it.
+        let indicator_row = rows
+            .iter()
+            .position(|row| row.contains("1/1"))
+            .expect("indicator rendered");
+        let match_row = frame
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))
+            })
+            .expect("match highlighted");
+        assert!(
+            match_row < indicator_row,
+            "final-line match sits above the indicator: match@{match_row} indicator@{indicator_row}"
+        );
+        assert!(
+            rows[match_row].contains("needle tail"),
+            "the highlighted row is the match: {:?}",
+            rows[match_row]
+        );
     }
 
     #[test]

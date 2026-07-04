@@ -54,6 +54,7 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
         background: None,
         hrule: false,
         chrome: None,
+        searchable: true,
     }
 }
 
@@ -417,6 +418,7 @@ impl Transcript {
             background: None,
             hrule: true,
             chrome: None,
+            searchable: true,
         });
         self.push_blank();
     }
@@ -1870,7 +1872,10 @@ impl Transcript {
     /// folded or expanded ("search what is said, not what is shown"). The
     /// collapsed-preview rows (`FoldVis::WhenCollapsed`: the head/tail excerpt
     /// plus the `... N more lines` affordance) are skipped so a collapsed
-    /// panel does not double-count its preview against its full body; every
+    /// panel does not double-count its preview against its full body; the
+    /// fold affordance hints (`ctrl+o to expand`/`collapse`) are control
+    /// chrome (`searchable == false`) and are also skipped so a query never
+    /// matches hidden UI or auto-expands a panel for non-content text. Every
     /// other row (`Always` + `WhenExpanded`) is real transcript text and is
     /// searched even when a fold hides it. The cache is refreshed at its
     /// current width first, so appends and fold changes since the last frame
@@ -1892,7 +1897,11 @@ impl Transcript {
         self.ensure_wrapped_cache(width);
         let mut out = Vec::new();
         for (row_idx, layout) in self.wrapped_cache.rows.iter().enumerate() {
-            if self.rows[row_idx].fold == FoldVis::WhenCollapsed {
+            let row = &self.rows[row_idx];
+            // Skip collapsed-preview excerpts (searched via the full body) and
+            // control chrome such as the `ctrl+o to expand`/`collapse` fold
+            // hints, which are UI, not transcript content.
+            if row.fold == FoldVis::WhenCollapsed || !row.searchable {
                 continue;
             }
             for (sub, line) in self.wrapped_cache.lines[layout.lines.clone()]

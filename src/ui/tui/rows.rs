@@ -48,6 +48,12 @@ pub(super) struct TranscriptRow {
     /// optional centered label and the row renders as `─ label ─────` to width.
     pub(super) hrule: bool,
     pub(super) chrome: Option<ChromeRow>,
+    /// Whether this row is canonical transcript content that `/find` should
+    /// search. `false` marks fold affordance/control chrome (the `ctrl+o to
+    /// expand`/`collapse` hints) so searching for their literal text does not
+    /// match hidden UI and auto-expand panels for non-content. Defaults to
+    /// `true`; only the fold-hint builders clear it.
+    pub(super) searchable: bool,
 }
 
 impl TranscriptRow {
@@ -62,6 +68,7 @@ impl TranscriptRow {
             background: None,
             hrule: false,
             chrome: None,
+            searchable: true,
         }
     }
 
@@ -86,6 +93,7 @@ impl TranscriptRow {
             background: None,
             hrule: false,
             chrome: Some(chrome),
+            searchable: true,
         }
     }
 

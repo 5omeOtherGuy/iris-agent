@@ -582,6 +582,15 @@ impl PanelBody {
         self.rows.push(row);
     }
 
+    /// Mark the row just pushed as non-content control chrome so `/find` skips
+    /// it. Used for the fold affordance hints (`ctrl+o to expand`/`collapse`),
+    /// which are UI, not transcript text.
+    fn mark_last_non_searchable(&mut self) {
+        if let Some(row) = self.rows.last_mut() {
+            row.searchable = false;
+        }
+    }
+
     /// Whether the body accumulated so far has made the panel foldable: true
     /// once any row carries a non-`Always` fold (a capped-preview / expanded
     /// pair). Mirrors the transcript's own foldability test so the SHELL result
@@ -764,6 +773,7 @@ impl PanelBody {
             dim_style(),
             FoldVis::WhenCollapsed,
         );
+        self.mark_last_non_searchable();
     }
 
     /// Expanded-state fold affordance: right-aligned `ctrl+o to collapse`.
@@ -776,6 +786,7 @@ impl PanelBody {
             dim_style(),
             FoldVis::WhenExpanded,
         );
+        self.mark_last_non_searchable();
     }
 
     /// Push one gutter-prefixed tool-output line, preserving ANSI styling and
