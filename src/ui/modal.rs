@@ -36,7 +36,6 @@ pub(crate) enum ModalKey {
     Left,
     Right,
     Enter,
-    Tab,
     Esc,
     CtrlC,
     CtrlA,

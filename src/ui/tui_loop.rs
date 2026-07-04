@@ -1866,7 +1866,6 @@ fn to_modal_key(event: &Event) -> Option<ModalKey> {
         KeyCode::Left if !ctrl && !alt => ModalKey::Left,
         KeyCode::Right if !ctrl && !alt => ModalKey::Right,
         KeyCode::Enter => ModalKey::Enter,
-        KeyCode::Tab => ModalKey::Tab,
         KeyCode::Esc => ModalKey::Esc,
         KeyCode::Backspace => ModalKey::Backspace,
         KeyCode::Char('c') | KeyCode::Char('C') if ctrl => ModalKey::CtrlC,
@@ -3660,7 +3659,8 @@ mod tests {
     fn to_modal_key_maps_navigation_and_chords() {
         assert_eq!(to_modal_key(&key(KeyCode::Up)), Some(ModalKey::Up));
         assert_eq!(to_modal_key(&key(KeyCode::Enter)), Some(ModalKey::Enter));
-        assert_eq!(to_modal_key(&key(KeyCode::Tab)), Some(ModalKey::Tab));
+        // Tab is not consumed by any modal; it maps to None so it falls through.
+        assert_eq!(to_modal_key(&key(KeyCode::Tab)), None);
         assert_eq!(
             to_modal_key(&key(KeyCode::Char('j'))),
             Some(ModalKey::Char('j'))
