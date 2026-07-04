@@ -257,8 +257,9 @@ foundations are complete. The active gate is the first Git-Centered Workflow
 slice — dirty-tree safety, task checkpoint/rollback, final diff summary, and
 the verification loop (epic
 [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), design accepted
-in ADR-0028). The token-efficiency benchmark proof follows it; efficiency
-claims wait on measurement.
+in ADR-0028). Per-result output reduction is measured (see
+[Token efficiency](#token-efficiency)); the end-to-end task-success benchmark
+proof follows #261.
 
 Implemented:
 
@@ -270,6 +271,9 @@ Implemented:
 - JSONL transcript persistence and linear resume (`iris --continue`, `iris
   resume`, in-session `/resume` picker and `/new`).
 - Large-output handles and turn-boundary auto-compaction.
+- Native bash output filtering: command output is reduced inside the runtime
+  before it enters the transcript (measured; see
+  [Token efficiency](#token-efficiency)).
 
 Next:
 
@@ -277,6 +281,46 @@ Next:
   diff summary, verification loop (epic #261, ADR-0028).
 - Token-efficiency benchmark proof (follows #261).
 - Persistent approval policies, modes, and subagents.
+
+## Token efficiency
+
+Every tool result carries the fewest tokens that preserve full task success
+([ADR-0036](docs/adr/0036-tools-are-token-efficient-by-design.md)). Native
+tools return bounded windows, oversized results move behind session handles,
+and `bash` filters captured command output inside the runtime before it
+reaches the transcript
+([ADR-0037](docs/adr/0037-native-output-filtering-for-bash-pass-through.md)):
+structured Rust filters for the highest-volume command classes, declarative
+filters for roughly 60 more commands.
+
+Measured on a committed corpus of captured real command outputs; the numbers
+are asserted as minimum bars by tests, not just reported:
+
+| command class | token reduction |
+|---|---|
+| cargo build (pass) | 98% |
+| cargo test (pass) | 85–94% |
+| npm install | 79% |
+| npm test / vitest (pass) | 68% / 70% |
+| git log | 62% |
+| git diff (lockfile churn) | 58% |
+| git status | 50% |
+
+Reduction never changes semantics:
+
+- Failure detail is exempt: failing-test names, panic messages, `file:line`
+  references, compiler diagnostics, and source diff hunks survive verbatim
+  (test-asserted per fixture).
+- Any filter error or unparsable output returns the raw output; exit codes
+  are never altered.
+- `raw: true` on a bash call bypasses filtering; full output stays reachable
+  via session handles.
+- Filter overhead is under 10 ms per call (asserted).
+
+Full table, bars, and the regeneration command:
+[bash filter benchmark](docs/benchmarks/adr-0037-bash-filter-tokens.md).
+End-to-end task-success benchmarking (does the model still complete the task
+from reduced context) is a separate planned gate ([roadmap](docs/ROADMAP.md)).
 
 ## Testing
 
