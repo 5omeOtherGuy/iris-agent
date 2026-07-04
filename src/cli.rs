@@ -669,6 +669,11 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     startup_modal: Option<crate::ui::modal::Modal>,
     start_page: bool,
 ) -> Result<()> {
+    // Apply the persisted color theme before any rendering (ADR-0041); an
+    // invalid id logs a warning and falls back to the adaptive default.
+    if let Some(theme) = tui_settings.and_then(|t| t.theme.as_deref()) {
+        crate::ui::theme::set_active(theme);
+    }
     if !prefers_text_ui(force_plain) {
         // Screen-mode policy (ADR-0029): pager vs inline, resolved once per
         // startup. Degradation/config notices land in the transcript as

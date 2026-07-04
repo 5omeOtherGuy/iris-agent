@@ -69,7 +69,7 @@ impl Category {
     fn description(self) -> &'static str {
         match self {
             Category::ModelReasoning => "default model, reasoning effort",
-            Category::Display => "screen mode, scrolling, accessibility",
+            Category::Display => "theme, screen mode, scrolling, accessibility",
             Category::Approvals => "startup posture, project permissions",
             Category::Runtime => "context budget, tool loop, prompt cache",
             Category::Verification => "post-change checks",
@@ -86,6 +86,7 @@ pub(crate) enum Field {
     AltScreen,
     ScrollSpeed,
     ReducedMotion,
+    Theme,
     DefaultApproval,
     ContextTokenBudget,
     MaxToolRoundtrips,
@@ -115,7 +116,9 @@ pub(crate) enum FieldKind {
 impl Field {
     pub(crate) fn category(self) -> Category {
         match self {
-            Field::AltScreen | Field::ScrollSpeed | Field::ReducedMotion => Category::Display,
+            Field::AltScreen | Field::ScrollSpeed | Field::ReducedMotion | Field::Theme => {
+                Category::Display
+            }
             Field::DefaultApproval => Category::Approvals,
             Field::ContextTokenBudget | Field::MaxToolRoundtrips | Field::PromptCacheRetention => {
                 Category::Runtime
@@ -130,6 +133,7 @@ impl Field {
             Field::AltScreen => "Alt-screen",
             Field::ScrollSpeed => "Scroll speed",
             Field::ReducedMotion => "Reduced motion",
+            Field::Theme => "Theme",
             Field::DefaultApproval => "Default approval",
             Field::ContextTokenBudget => "Context token budget",
             Field::MaxToolRoundtrips => "Max tool round-trips",
@@ -150,6 +154,9 @@ impl Field {
             },
             Field::PromptCacheRetention => FieldKind::Enum {
                 options: &["none", "short", "long"],
+            },
+            Field::Theme => FieldKind::Enum {
+                options: crate::ui::theme::available(),
             },
             Field::ScrollSpeed => FieldKind::Numeric {
                 min: 1,
@@ -195,6 +202,7 @@ pub(crate) struct Snapshot {
     pub(crate) verify_command: Option<String>,
     pub(crate) verify_max_attempts: u32,
     pub(crate) worktree_root: Option<String>,
+    pub(crate) theme: String,
 }
 
 impl Snapshot {
@@ -205,6 +213,7 @@ impl Snapshot {
             Field::AltScreen => self.alt_screen.clone(),
             Field::ScrollSpeed => self.scroll_speed.to_string(),
             Field::ReducedMotion => on_off(self.reduced_motion),
+            Field::Theme => self.theme.clone(),
             Field::DefaultApproval => self.default_approval.clone(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
             Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
@@ -308,6 +317,7 @@ fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
             field_row(Field::AltScreen, snapshot),
             field_row(Field::ScrollSpeed, snapshot),
             field_row(Field::ReducedMotion, snapshot),
+            field_row(Field::Theme, snapshot),
         ],
         Category::Approvals => vec![
             field_row(Field::DefaultApproval, snapshot),
@@ -679,6 +689,7 @@ mod tests {
             verify_command: None,
             verify_max_attempts: 3,
             worktree_root: None,
+            theme: "terminal".to_string(),
         }
     }
 
@@ -855,6 +866,29 @@ mod tests {
     }
 
     #[test]
+    fn theme_row_opens_enum_listing_all_theme_ids() {
+        let snap = snapshot();
+        // Theme is the last Display row (after alt-screen, scroll, reduced-motion).
+        let mut display = SubMenu::new(Category::Display, &snap);
+        display.handle_key(ModalKey::Down);
+        display.handle_key(ModalKey::Down);
+        display.handle_key(ModalKey::Down);
+        assert_eq!(
+            display.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::OpenSettingsEnum(Field::Theme))
+        );
+        // The enum widget lists every available theme id in order.
+        let menu = EnumMenu::new(Field::Theme, &snap);
+        assert_eq!(
+            menu.selector.filtered_ids(),
+            crate::ui::theme::available()
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn every_field_maps_back_to_a_category_that_lists_it() {
         // A leaf's field.category() must contain a row that targets it, so
         // post-save refresh returns to a menu that includes the field.
@@ -870,6 +904,7 @@ mod tests {
             Field::VerifyCommand,
             Field::VerifyMaxAttempts,
             Field::WorktreeRoot,
+            Field::Theme,
         ];
         for field in fields {
             let rows = rows_for(field.category(), &snap);

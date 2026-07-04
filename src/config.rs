@@ -146,6 +146,9 @@ pub(crate) struct TuiSettings {
     /// `IRIS_REDUCED_MOTION` env switch to persisted config; the env flag still
     /// wins. Display-only preference, so a project may set it.
     pub(crate) reduced_motion: Option<bool>,
+    /// Color theme id (ADR-0041). Adaptive `terminal` default; an invalid id
+    /// falls back to that default.
+    pub(crate) theme: Option<String>,
 }
 
 /// Raw per-project verification config (issue #265). Both fields optional: a
@@ -468,6 +471,11 @@ pub(crate) fn save_scroll_speed(speed: u16) -> Result<()> {
 /// Persist the reduced-motion display preference under the `tui` block.
 pub(crate) fn save_reduced_motion(enabled: bool) -> Result<()> {
     update_global_block("tui", &[("reducedMotion", Value::Bool(enabled))])
+}
+
+/// Persist the selected color theme id under the `tui` block (ADR-0041).
+pub(crate) fn save_theme(theme: &str) -> Result<()> {
+    update_global_block("tui", &[("theme", Value::String(theme.to_string()))])
 }
 
 /// Persist (or clear) the verification command under the `verify` block. An
@@ -1096,6 +1104,16 @@ mod tests {
         let only_global = Settings::load_from(Some(&global), &dir.path.join("nope.json")).unwrap();
         let tui = only_global.tui_settings().unwrap();
         assert_eq!(tui.reduced_motion, Some(false));
+    }
+
+    #[test]
+    fn tui_theme_loads_from_global_block() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        fs::write(&global, r#"{ "tui": { "theme": "gruvbox" } }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &dir.path.join("nope.json")).unwrap();
+        let tui = settings.tui_settings().unwrap();
+        assert_eq!(tui.theme.as_deref(), Some("gruvbox"));
     }
 
     /// Point `IRIS_CONFIG_PATH` at a temp file for a save round-trip, restoring
