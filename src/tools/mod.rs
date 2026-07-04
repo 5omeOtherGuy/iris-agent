@@ -26,6 +26,8 @@
 //!   [`grep`], [`find`], [`ls`].
 
 mod bash;
+#[cfg(test)]
+pub(crate) mod bench_support;
 mod edit;
 mod find;
 mod grep;

@@ -3,13 +3,15 @@
 Measured over the committed corpus of captured real command outputs in
 `src/tools/bash/filter/corpus/`. Tokens estimated at 4 bytes/token; only the
 ratios matter. The numbers below are asserted (as minimum bars) by the corpus
-tests in `src/tools/bash/filter/corpus.rs`; regenerate the table with:
+tests in `src/tools/bash/filter/corpus.rs`, built on the shared measurement
+core in `src/tools/bench_support.rs` (recipe: the `token-efficiency-benchmark`
+skill in `.pi/skills/`). Regenerate the table with:
 
 ```
 cargo test corpus_benchmark_report -- --nocapture
 ```
 
-| class | tokens before | tokens after | reduction | filter |
+| class | tokens before | tokens after | reduction | via |
 |---|---|---|---|---|
 | cargo test (pass) | 439 | 47 | 89% | cargo-test |
 | cargo test (fail) | 255 | 183 | 28% | cargo-test |

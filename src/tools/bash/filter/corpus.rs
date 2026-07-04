@@ -12,8 +12,13 @@
 //! `corpus_benchmark_report` prints the per-class table behind the committed
 //! report in `docs/benchmarks/adr-0037-bash-filter-tokens.md`; regenerate with
 //! `cargo test corpus_benchmark_report -- --nocapture`.
+//!
+//! The tool-agnostic measurement core lives in `tools::bench_support`; the
+//! recipe for benchmarking other tools is the `token-efficiency-benchmark`
+//! skill (`.pi/skills/`).
 
 use super::filter_output;
+use crate::tools::bench_support;
 
 struct Sample {
     /// Command class for the report.
@@ -161,27 +166,12 @@ fn samples() -> Vec<Sample> {
     ]
 }
 
-/// Rough token estimate: 4 bytes per token, the standard heuristic for
-/// English/code text. Only ratios matter here, not absolute counts.
-fn est_tokens(s: &str) -> usize {
-    s.len().div_ceil(4)
-}
-
 /// Filtered text for a sample plus whether a filter actually applied.
 fn filtered(sample: &Sample) -> (String, bool) {
     match filter_output(sample.command, sample.raw, sample.exit_ok) {
         Some(f) => (f.text, true),
         None => (sample.raw.to_string(), false),
     }
-}
-
-fn reduction_pct(raw: &str, out: &str) -> f64 {
-    let before = est_tokens(raw) as f64;
-    let after = est_tokens(out) as f64;
-    if before == 0.0 {
-        return 0.0;
-    }
-    100.0 * (1.0 - after / before)
 }
 
 #[test]
@@ -192,12 +182,7 @@ fn corpus_noisy_classes_hit_reduction_bar() {
         };
         let (out, applied) = filtered(&sample);
         assert!(applied, "[{}] expected a filter to apply", sample.class);
-        let pct = reduction_pct(sample.raw, &out);
-        assert!(
-            pct >= f64::from(min),
-            "[{}] token reduction {pct:.1}% is below the {min}% bar\n--- filtered ---\n{out}",
-            sample.class,
-        );
+        bench_support::assert_min_reduction(sample.class, sample.raw, &out, min);
     }
 }
 
@@ -205,13 +190,7 @@ fn corpus_noisy_classes_hit_reduction_bar() {
 fn corpus_failure_and_summary_content_survives_verbatim() {
     for sample in samples() {
         let (out, _) = filtered(&sample);
-        for needle in sample.must_contain {
-            assert!(
-                out.contains(needle),
-                "[{}] filtered output lost {needle:?}\n--- filtered ---\n{out}",
-                sample.class,
-            );
-        }
+        bench_support::assert_survives_verbatim(sample.class, &out, sample.must_contain);
     }
 }
 
@@ -235,20 +214,12 @@ fn corpus_filter_overhead_under_10ms_per_call() {
     // overhead).
     let _ = filter_output("cargo test", "warmup", true);
     for sample in samples() {
-        // Best of three: absorbs scheduler noise in debug CI runs while still
-        // failing on a real regression (the bar is per-call cost).
-        let best = (0..3)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                let _ = filter_output(sample.command, sample.raw, sample.exit_ok);
-                start.elapsed()
-            })
-            .min()
-            .expect("three timed runs");
-        assert!(
-            best < std::time::Duration::from_millis(10),
-            "[{}] filter overhead {best:?} exceeds the 10 ms bar",
+        bench_support::assert_call_overhead_under(
             sample.class,
+            std::time::Duration::from_millis(10),
+            || {
+                let _ = filter_output(sample.command, sample.raw, sample.exit_ok);
+            },
         );
     }
 }
@@ -257,8 +228,7 @@ fn corpus_filter_overhead_under_10ms_per_call() {
 fn corpus_benchmark_report() {
     // Prints the table committed to
     // docs/benchmarks/adr-0037-bash-filter-tokens.md (run with --nocapture).
-    println!("| class | tokens before | tokens after | reduction | filter |");
-    println!("|---|---|---|---|---|");
+    println!("{}", bench_support::report_header());
     for sample in samples() {
         let result = filter_output(sample.command, sample.raw, sample.exit_ok);
         let (out, name) = match &result {
@@ -266,12 +236,8 @@ fn corpus_benchmark_report() {
             None => (sample.raw, "(passthrough)"),
         };
         println!(
-            "| {} | {} | {} | {:.0}% | {} |",
-            sample.class,
-            est_tokens(sample.raw),
-            est_tokens(out),
-            reduction_pct(sample.raw, out),
-            name,
+            "{}",
+            bench_support::report_row(sample.class, sample.raw, out, name)
         );
     }
 }
