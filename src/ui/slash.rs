@@ -71,6 +71,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/sessions",
+        description: "List sessions that worked a task id (deterministic lookup)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/copy",
         description: "Copy the last assistant reply to the clipboard",
         action: SlashAction::Submit,
@@ -267,11 +272,13 @@ mod tests {
         assert_eq!(matches("/rea")[0].name, "/reasoning");
         assert_eq!(matches("/c")[0].name, "/copy");
         assert_eq!(matches("/d")[0].name, "/debug");
-        // `/se` narrows to the session/settings pair, prefix order preserved.
+        // `/se` narrows to the session/sessions/settings set, registry order
+        // preserved.
         let se = matches("/se");
-        assert_eq!(se.len(), 2);
+        assert_eq!(se.len(), 3);
         assert_eq!(se[0].name, "/session");
-        assert_eq!(se[1].name, "/settings");
+        assert_eq!(se[1].name, "/sessions");
+        assert_eq!(se[2].name, "/settings");
         assert!(matches("/zzz").is_empty());
         assert!(matches("hello").is_empty());
     }

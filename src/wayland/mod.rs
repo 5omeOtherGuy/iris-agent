@@ -356,6 +356,20 @@ impl<P: ChatProvider> Harness<P> {
         self.session.as_ref().map(SessionLog::path)
     }
 
+    /// The workspace directory this harness is anchored to, used to scope the
+    /// deterministic session lookup (`/sessions`, ADR-0031) to this project's
+    /// cwd-slug directory.
+    pub(crate) fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
+    /// The active git-safety task's id, or `None` when no task is open. Lets the
+    /// `/sessions` route default to the current task when the user gives no id.
+    /// Display-only observation; never an enforcement or recovery input.
+    pub(crate) fn current_task_id(&self) -> Option<String> {
+        self.git_safety.current_task_id()
+    }
+
     /// The provider-visible conversation context, for read-only inspection
     /// (`/copy`, `/session`, `/debug`). Same view the persistence cursor walks.
     pub(crate) fn messages(&self) -> &[Message] {

@@ -430,6 +430,227 @@ impl SessionStore {
             })
             .collect())
     }
+
+    /// Find every session in `cwd`'s slug directory whose log carries a
+    /// `taskLifecycle` entry for `task_id`, returning each match's id/path plus
+    /// the lifecycle events it recorded (ADR-0031 session lookup, v1
+    /// deterministic). The scan is bounded by the cwd-slug directory -- no
+    /// index, no walk of any other cwd -- so the task<->session join stays
+    /// scoped to this project. Malformed/truncated lines and non-session files
+    /// are skipped, not fatal (matching the reader's never-crash stance). An
+    /// unknown task id, or a cwd with no session directory yet, yields an empty
+    /// vec. Read-side audit only: the session log is display-only here, never an
+    /// enforcement or recovery input.
+    pub(crate) fn sessions_for_task(
+        &self,
+        cwd: &Path,
+        task_id: &str,
+    ) -> Result<Vec<TaskSessionMatch>> {
+        let dir = self.root.join(cwd_slug(cwd));
+        let mut matches = Vec::new();
+        let Ok(files) = fs::read_dir(&dir) else {
+            // A cwd with no session directory yet just has no matches.
+            return Ok(matches);
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(m) = scan_task_lifecycle(&path, task_id) {
+                matches.push(m);
+            }
+        }
+        // Sort by path so repeated scans return a stable order regardless of the
+        // filesystem's directory-iteration order. File names begin with the
+        // creation unix-ms, so this is also chronological in practice.
+        matches.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(matches)
+    }
+}
+
+/// One session whose log carries `taskLifecycle` entries for a given task id:
+/// its header id and path plus the lifecycle events it recorded, in on-disk
+/// order (ADR-0031 session lookup). Display-only audit; never an enforcement or
+/// recovery input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskSessionMatch {
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
+    pub(crate) events: Vec<TaskLifecycleEvent>,
+}
+
+/// A single `taskLifecycle` audit event read back from a transcript: the event
+/// kind (`opened`/`settled`), the opaque body captured at open (or `None`), the
+/// deterministic disposition label recorded at settle (or `None`), and the
+/// entry timestamp. All fields come straight from disk, so extraction is stable
+/// across reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskLifecycleEvent {
+    pub(crate) event: String,
+    pub(crate) body: Option<String>,
+    pub(crate) disposition: Option<String>,
+    pub(crate) timestamp_ms: u128,
+}
+
+/// Deterministic extraction of one session (ADR-0031 `read_session`, v1): the
+/// header info plus, in on-disk order, each user message's bounded preview and
+/// each `taskLifecycle` event. No summarization, no model call, no clock or
+/// randomness in the output -- repeated reads of a fixed transcript produce an
+/// identical value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionExtract {
+    pub(crate) id: String,
+    pub(crate) cwd: String,
+    /// Header timestamp (unix ms) the session was created at.
+    pub(crate) created_ms: u128,
+    /// The extracted items in on-disk order.
+    pub(crate) items: Vec<ExtractItem>,
+}
+
+/// One deterministic-extraction item, in on-disk order: a user message's
+/// single-line preview or a task lifecycle event. Bounded by construction --
+/// user content is only ever a [`preview_line`], never a full body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExtractItem {
+    UserPreview(String),
+    Lifecycle(TaskLifecycleEvent),
+}
+
+/// Scan one transcript file for `taskLifecycle` entries matching `task_id`.
+/// Returns `Some` with the session's id/path and the matching events (in
+/// on-disk order) when at least one is found, else `None`. A file whose first
+/// line is not a session header, or that carries no matching event, yields
+/// `None`; malformed/truncated lines are skipped, not fatal.
+fn scan_task_lifecycle(path: &Path, task_id: &str) -> Option<TaskSessionMatch> {
+    let bytes = fs::read(path).ok()?;
+    let mut lines = jsonl_lines(&bytes);
+    let header = lines.next().and_then(|line| line.ok())?;
+    let header: Value = serde_json::from_str(header).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    let id = header.get("id").and_then(Value::as_str)?.to_string();
+    let mut events = Vec::new();
+    for line in lines {
+        let Ok(text) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if let Some((entry_task, event)) = parse_task_lifecycle(&value)
+            && entry_task == task_id
+        {
+            events.push(event);
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+    Some(TaskSessionMatch {
+        id,
+        path: path.to_path_buf(),
+        events,
+    })
+}
+
+/// Deterministic v1 read-back of a session file: header info plus user-message
+/// previews and `taskLifecycle` events in on-disk order. Bounded (previews
+/// only, never a full message body) and pure (no clock/randomness), so a fixed
+/// transcript extracts identically every time. Malformed/truncated lines are
+/// skipped rather than failing the whole read.
+pub(crate) fn extract_session(path: &Path) -> Result<SessionExtract> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut lines = jsonl_lines(&bytes);
+    let header_line = lines
+        .next()
+        .with_context(|| format!("empty session file {}", path.display()))?
+        .map_err(|_| anyhow::anyhow!("session header is not valid UTF-8 in {}", path.display()))?;
+    let header: Value = serde_json::from_str(header_line)
+        .with_context(|| format!("session header is not valid JSON in {}", path.display()))?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        bail!("first line is not a session header in {}", path.display());
+    }
+    let id = header
+        .get("id")
+        .and_then(Value::as_str)
+        .context("session header is missing id")?
+        .to_string();
+    let cwd = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let created_ms = header.get("timestamp").and_then(as_ms).unwrap_or(0);
+    let mut items = Vec::new();
+    for line in lines {
+        let Ok(text) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let message = value.get("message");
+                let role = message.and_then(|m| m.get("role")).and_then(Value::as_str);
+                if role == Some("user") {
+                    let content = message
+                        .and_then(|m| m.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    items.push(ExtractItem::UserPreview(preview_line(content)));
+                }
+            }
+            Some("taskLifecycle") => {
+                if let Some((_, event)) = parse_task_lifecycle(&value) {
+                    items.push(ExtractItem::Lifecycle(event));
+                }
+            }
+            _ => continue,
+        }
+    }
+    Ok(SessionExtract {
+        id,
+        cwd,
+        created_ms,
+        items,
+    })
+}
+
+/// Parse a `taskLifecycle` entry into its task id and a [`TaskLifecycleEvent`].
+/// `None` (skipped as not-a-lifecycle or malformed) when the type/event/taskId
+/// are absent, mirroring the line-level leniency the readers use for
+/// truncated/garbled entries.
+fn parse_task_lifecycle(value: &Value) -> Option<(String, TaskLifecycleEvent)> {
+    if value.get("type").and_then(Value::as_str) != Some("taskLifecycle") {
+        return None;
+    }
+    let task_id = value.get("taskId").and_then(Value::as_str)?.to_string();
+    let event = value.get("event").and_then(Value::as_str)?.to_string();
+    let body = value.get("body").and_then(Value::as_str).map(String::from);
+    let disposition = value
+        .get("disposition")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let timestamp_ms = value.get("timestamp").and_then(as_ms).unwrap_or(0);
+    Some((
+        task_id,
+        TaskLifecycleEvent {
+            event,
+            body,
+            disposition,
+            timestamp_ms,
+        },
+    ))
+}
+
+/// Split JSONL file bytes into trimmed, non-empty lines, tolerating a truncated
+/// trailing fragment that splits a multibyte char (yielded as an `Err` the
+/// caller skips) instead of failing the whole read. Shared by the deterministic
+/// session-lookup readers.
+fn jsonl_lines(bytes: &[u8]) -> impl Iterator<Item = std::result::Result<&str, ()>> {
+    bytes
+        .split(|&b| b == b'\n')
+        .map(|line| std::str::from_utf8(line).map(str::trim).map_err(|_| ()))
+        .filter(|line| !matches!(line, Ok(text) if text.is_empty()))
 }
 
 /// One resumable session's listing metadata plus a short preview of its first
@@ -1645,6 +1866,203 @@ mod tests {
         assert_eq!(
             last["parentId"], settled_id,
             "resume chains parentId through the taskLifecycle leaf"
+        );
+    }
+
+    /// Render extraction items to short strings so tests can assert on-disk
+    /// order and content without matching enum shapes inline.
+    fn describe_items(items: &[ExtractItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                ExtractItem::UserPreview(preview) => format!("user: {preview}"),
+                ExtractItem::Lifecycle(ev) => match ev.event.as_str() {
+                    "opened" => format!("opened: {}", ev.body.as_deref().unwrap_or("(none)")),
+                    "settled" => {
+                        format!("settled: {}", ev.disposition.as_deref().unwrap_or("(none)"))
+                    }
+                    other => format!("{other}: ?"),
+                },
+            })
+            .collect()
+    }
+
+    // Issue #289 test (1): `sessions_for_task` finds every session whose log
+    // carries the task id, scoped to the cwd slug; unknown task id => empty.
+    #[test]
+    fn sessions_for_task_finds_all_sessions_carrying_the_task_id() {
+        let dir = temp_dir();
+        let mut a = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        a.append(&Message::user("start")).unwrap();
+        a.append_task_opened("task-42", Some("fix login")).unwrap();
+        let a_id = a.id().to_string();
+        let session_dir = a.path().parent().unwrap().to_path_buf();
+        drop(a);
+        let mut b = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        b.append_task_opened("task-42", None).unwrap();
+        b.append_task_settled("task-42", "accepted").unwrap();
+        let b_id = b.id().to_string();
+        drop(b);
+        // A session that never touched the task must not match.
+        let mut c = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
+        c.append(&Message::user("unrelated")).unwrap();
+        drop(c);
+        // A stray non-session file in the same dir must be skipped, not fatal.
+        fs::write(session_dir.join("garbage.jsonl"), "not json\n").unwrap();
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let matches = store
+            .sessions_for_task(Path::new("/proj"), "task-42")
+            .unwrap();
+        let ids: Vec<&str> = matches.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(matches.len(), 2, "both sessions working task-42 match");
+        assert!(ids.contains(&a_id.as_str()));
+        assert!(ids.contains(&b_id.as_str()));
+        // Unknown task id => empty.
+        assert!(
+            store
+                .sessions_for_task(Path::new("/proj"), "nope")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Issue #289 test (1, scope): the scan is bounded to the cwd slug; the same
+    // task id in another cwd is never returned, and a cwd with no session
+    // directory yields empty rather than erroring.
+    #[test]
+    fn sessions_for_task_is_scoped_to_the_cwd_slug() {
+        let dir = temp_dir();
+        let mut here = SessionLog::create_in(&dir.path, Path::new("/here")).unwrap();
+        here.append_task_opened("shared-id", Some("here")).unwrap();
+        drop(here);
+        let mut elsewhere = SessionLog::create_in(&dir.path, Path::new("/elsewhere")).unwrap();
+        elsewhere
+            .append_task_opened("shared-id", Some("elsewhere"))
+            .unwrap();
+        drop(elsewhere);
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let matches = store
+            .sessions_for_task(Path::new("/here"), "shared-id")
+            .unwrap();
+        assert_eq!(matches.len(), 1, "only the /here session, not /elsewhere");
+        assert_eq!(matches[0].events.len(), 1);
+        assert_eq!(matches[0].events[0].body.as_deref(), Some("here"));
+        // A cwd with no session directory yet is empty, not an error.
+        assert!(
+            store
+                .sessions_for_task(Path::new("/never"), "shared-id")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Issue #289 test (1, events): a match carries its lifecycle events in
+    // on-disk order with body/disposition preserved.
+    #[test]
+    fn sessions_for_task_collects_lifecycle_events_in_order() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::user("please fix it")).unwrap();
+        log.append_task_opened("t1", Some("please fix it")).unwrap();
+        log.append(&Message::assistant("done")).unwrap();
+        log.append_task_settled("t1", "accepted").unwrap();
+        drop(log);
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let matches = store.sessions_for_task(Path::new("/w"), "t1").unwrap();
+        assert_eq!(matches.len(), 1);
+        let events = &matches[0].events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "opened");
+        assert_eq!(events[0].body.as_deref(), Some("please fix it"));
+        assert!(events[0].disposition.is_none());
+        assert_eq!(events[1].event, "settled");
+        assert_eq!(events[1].disposition.as_deref(), Some("accepted"));
+        assert!(events[1].body.is_none());
+    }
+
+    // Issue #289 test (2): deterministic extraction is stable across reads and
+    // emits header info + user previews + lifecycle events in on-disk order
+    // (assistant turns are not previewed -- user messages only).
+    #[test]
+    fn extract_session_is_deterministic_across_reads() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::user("first request")).unwrap();
+        log.append_task_opened("t1", Some("first request")).unwrap();
+        log.append(&Message::assistant("working")).unwrap();
+        log.append(&Message::user("second request")).unwrap();
+        log.append_task_settled("t1", "accepted").unwrap();
+        let path = log.path().to_path_buf();
+        let id = log.id().to_string();
+        drop(log);
+
+        let first = extract_session(&path).unwrap();
+        let second = extract_session(&path).unwrap();
+        assert_eq!(first, second, "extraction must be stable across reads");
+        assert_eq!(first.id, id);
+        assert_eq!(first.cwd, "/w");
+        assert_eq!(
+            describe_items(&first.items),
+            vec![
+                "user: first request".to_string(),
+                "opened: first request".to_string(),
+                "user: second request".to_string(),
+                "settled: accepted".to_string(),
+            ]
+        );
+    }
+
+    // Issue #289 test (3): malformed/truncated session lines are skipped, not
+    // fatal (matches the existing reader stance).
+    #[test]
+    fn extract_session_skips_malformed_and_truncated_lines() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::user("kept")).unwrap();
+        log.append_task_opened("t1", None).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        // A garbage line, then a truncated fragment with no trailing newline.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"not json at all\n").unwrap();
+        file.write_all(b"{\"type\":\"message\",\"id\"").unwrap();
+        drop(file);
+
+        let extract = extract_session(&path).unwrap();
+        assert_eq!(
+            describe_items(&extract.items),
+            vec!["user: kept".to_string(), "opened: (none)".to_string()],
+            "malformed and truncated lines are skipped, not fatal"
+        );
+    }
+
+    // Issue #289 test (4): extraction stays bounded -- a huge user body becomes
+    // a bounded preview, never a full-body dump.
+    #[test]
+    fn extract_session_stays_bounded_to_previews_for_a_large_transcript() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let huge = "x".repeat(10_000);
+        log.append(&Message::user(&huge)).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        let extract = extract_session(&path).unwrap();
+        assert_eq!(extract.items.len(), 1);
+        let ExtractItem::UserPreview(preview) = &extract.items[0] else {
+            panic!("expected a user preview");
+        };
+        assert!(
+            preview.chars().count() <= PREVIEW_CHARS + 1,
+            "preview must be bounded, got {} chars",
+            preview.chars().count()
+        );
+        assert!(
+            !preview.contains(&huge),
+            "the full body must never appear in the extraction"
         );
     }
 
