@@ -1,4 +1,5 @@
-//! Bordered panel chrome, panel metadata, and edit-table rendering.
+//! Frameless tool-block chrome (header · hanging body · hairline footer),
+//! block metadata, and edit-table rendering.
 
 use std::time::Instant;
 
@@ -13,9 +14,8 @@ use super::wrap::{
     take_spans_to_width, truncate_line,
 };
 use super::{
-    BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_BORDER_WIDTH, PANEL_BODY_CHROME_WIDTH,
-    PANEL_BODY_LEFT_PADDING, PANEL_BODY_RIGHT_PADDING, TEXT_COLUMN_X_PADDING, border_style,
-    dim_style, err_style, ok_style, panel_style, prompt_style,
+    BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT,
+    TEXT_COLUMN_X_PADDING, dim_style, err_style, ok_style, panel_style, prompt_style,
 };
 use crate::ui::{is_diff_file_header, symbols};
 
@@ -34,51 +34,38 @@ fn panel_width(width: usize) -> usize {
 }
 
 pub(super) fn panel_body_content_width(width: usize) -> usize {
+    panel_width(width).saturating_sub(PANEL_BODY_INDENT).max(1)
+}
+
+pub(super) fn panel_footer_content_width(width: usize) -> usize {
     panel_width(width)
-        .max(PANEL_BODY_BORDER_WIDTH)
-        .saturating_sub(PANEL_BODY_CHROME_WIDTH)
+        .saturating_sub(PANEL_FOOTER_INDENT)
         .max(1)
 }
 
-pub(super) fn panel_rule_line(width: usize, left: char, right: char) -> Line<'static> {
-    let outer = panel_outer_padding(width);
-    let rule_width = panel_width(width);
-    let rule = match rule_width {
-        0 => String::new(),
-        1 => left.to_string(),
-        2 => format!("{left}{right}"),
-        n => format!("{left}{}{right}", "─".repeat(n - 2)),
-    };
-    let mut line = Line::from(vec![
-        Span::raw(" ".repeat(outer)),
-        Span::styled(rule, border_style()),
-        Span::raw(" ".repeat(outer)),
-    ]);
-    truncate_line(&mut line, width.max(1));
-    line
-}
-
+/// The frameless block header (`FramelessHeader`):
+/// `▾ TOOL  meta …spacer… elapsed` — disclosure glyph (muted), bold uppercase
+/// family label, muted meta truncating with `…`, and the elapsed time as the
+/// only right-edge content. No state symbol, no frame.
 pub(super) fn panel_header_line(
     width: usize,
     expanded: bool,
     title: &'static str,
     meta: &str,
-    right: &[(String, Style)],
+    elapsed: &str,
 ) -> Line<'static> {
-    let panel_width = panel_width(width);
-    let inner_width = panel_width.saturating_sub(2);
+    let inner_width = panel_width(width);
     let arrow = if expanded {
         symbols::EXPANDED
     } else {
         symbols::COLLAPSED
     };
-    let title_width = title.len().max(7);
     let mut left = vec![
-        Span::styled(format!(" {arrow}  "), dim_style()),
-        // The tool family is the panel's identity. With no type-scale axis,
-        // weight is the hierarchy lever (DESIGN.md: label = bold).
+        Span::styled(format!("{arrow} "), dim_style()),
+        // The tool family is the block's identity. With no type-scale axis,
+        // weight is the hierarchy lever (DESIGN-LANGUAGE: label = bold).
         Span::styled(
-            format!("{title:<title_width$}"),
+            title.to_string(),
             panel_style().add_modifier(Modifier::BOLD),
         ),
     ];
@@ -86,27 +73,53 @@ pub(super) fn panel_header_line(
     if !meta.is_empty() {
         left.push(Span::styled(format!("  {meta}"), dim_style()));
     }
-    let right_full: Vec<Span<'static>> = right
-        .iter()
-        .map(|(text, style)| Span::styled(strip_ansi_for_text(text), *style))
-        .collect();
-    let right = take_spans_to_width(right_full, inner_width / 2);
+    let elapsed = strip_ansi_for_text(elapsed);
+    let right = if elapsed.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(elapsed, dim_style())]
+    };
+    let right = take_spans_to_width(right, inner_width / 2);
     let right_width = spans_width(&right);
-    let left = take_spans_to_width(left, inner_width.saturating_sub(right_width));
+    let reserve = if right_width == 0 { 0 } else { right_width + 1 };
+    let left = take_spans_to_width(left, inner_width.saturating_sub(reserve));
     let left_width = spans_width(&left);
     let spacer = inner_width
         .saturating_sub(left_width)
         .saturating_sub(right_width);
     let outer = panel_outer_padding(width);
-    let mut spans = vec![
-        Span::raw(" ".repeat(outer)),
-        Span::styled("│", border_style()),
-    ];
+    let mut spans = vec![Span::raw(" ".repeat(outer))];
     spans.extend(left);
-    spans.push(Span::styled(" ".repeat(spacer), panel_style()));
+    spans.push(Span::raw(" ".repeat(spacer)));
     spans.extend(right);
-    spans.push(Span::styled("│", border_style()));
-    spans.push(Span::raw(" ".repeat(outer)));
+    let mut line = Line::from(spans);
+    truncate_line(&mut line, width.max(1));
+    line
+}
+
+/// The hairline rule that opens every block footer: starts at the footer indent
+/// (one cell left of the body) and runs to the block's right edge. The one rule
+/// the frameless design keeps.
+pub(super) fn footer_rule_line(width: usize) -> Line<'static> {
+    let outer = panel_outer_padding(width);
+    let indent = PANEL_FOOTER_INDENT.min(panel_width(width));
+    let rule_width = panel_width(width).saturating_sub(indent).max(1);
+    let mut line = Line::from(vec![
+        Span::raw(" ".repeat(outer + indent)),
+        Span::styled("─".repeat(rule_width), dim_style()),
+    ]);
+    truncate_line(&mut line, width.max(1));
+    line
+}
+
+/// A footer content row (state label + extras): sits at the footer indent, one
+/// cell left of the body, its right edge on the block's right rail.
+pub(super) fn panel_footer_line(width: usize, mut line: Line<'static>) -> Line<'static> {
+    let footer_width = panel_footer_content_width(width);
+    truncate_line(&mut line, footer_width);
+    let outer = panel_outer_padding(width);
+    let mut spans = vec![Span::raw(" ".repeat(outer + PANEL_FOOTER_INDENT))];
+    spans.extend(line.spans);
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     line
@@ -121,27 +134,10 @@ pub(super) fn panel_body_line(
     truncate_line(&mut line, body_width);
     if let Some(bg) = bg {
         apply_width_bg(&mut line, bg, body_width);
-    } else {
-        let used = display_width(&line_text(&line));
-        if used < body_width {
-            line.spans.push(Span::styled(
-                " ".repeat(body_width - used),
-                Style::default(),
-            ));
-        }
     }
     let outer = panel_outer_padding(width);
-    let left_padding = " ".repeat(PANEL_BODY_LEFT_PADDING);
-    let right_padding = " ".repeat(PANEL_BODY_RIGHT_PADDING);
-    let mut spans = vec![
-        Span::raw(" ".repeat(outer)),
-        Span::styled("│", border_style()),
-        Span::styled(left_padding, panel_style()),
-    ];
+    let mut spans = vec![Span::raw(" ".repeat(outer + PANEL_BODY_INDENT))];
     spans.extend(line.spans);
-    spans.push(Span::styled(right_padding, panel_style()));
-    spans.push(Span::styled("│", border_style()));
-    spans.push(Span::raw(" ".repeat(outer)));
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     line
@@ -240,26 +236,16 @@ pub(super) enum PanelState {
 }
 
 impl PanelState {
+    /// Footer state label — label only, no glyph (`◆`/`■` are NOT rendered in
+    /// the frameless footer). The text carries the state in monochrome; color
+    /// reinforces it.
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Running => " RUNNING",
-            Self::Done => " DONE",
-            Self::Error => " ERROR",
-            Self::Cancelled => " CANCELLED",
-            Self::Preview => " PREVIEW",
-        }
-    }
-
-    /// State glyph from the symbol vocabulary in docs/TUI_DESIGN_LANGUAGE.md.
-    /// `●` is reserved for the live/running LED; settled states get their own
-    /// glyph so the header stays legible without color.
-    pub(super) fn symbol(self) -> &'static str {
-        match self {
-            Self::Running => symbols::RUNNING,
-            Self::Done => symbols::DONE,
-            Self::Error => symbols::ERROR,
-            Self::Cancelled => symbols::CANCELLED,
-            Self::Preview => symbols::PREVIEW,
+            Self::Running => "RUNNING",
+            Self::Done => "DONE",
+            Self::Error => "ERROR",
+            Self::Cancelled => "CANCELLED",
+            Self::Preview => "PREVIEW",
         }
     }
 
@@ -272,8 +258,8 @@ impl PanelState {
         }
     }
 
-    /// Header label style: the state color plus BOLD, so symbol + label share
-    /// one signal (the `StateSymbol` component: `◆ DONE` reads green as a unit).
+    /// Footer label style: the state color plus BOLD, matching the uppercase
+    /// tracked label treatment of the design's footer actor.
     pub(super) fn label_style(self) -> Style {
         self.dot_style().add_modifier(Modifier::BOLD)
     }
@@ -453,32 +439,109 @@ pub(super) fn diff_counts(diff: &str) -> (usize, usize) {
     (added, removed)
 }
 
-/// The quiet `+added  −removed` footer that closes an EDIT panel body, tinted to
-/// the diff inks (additions green, removals red) per the `EditOutput`
-/// design-system component. `note` adds a `┊ <note>` aside (e.g. `new file`).
-/// Symbol + color together carry the meaning; the counts read in monochrome.
-pub(super) fn diff_footer_row(added: usize, removed: usize, note: Option<&str>) -> TranscriptRow {
-    let mut plain = format!("{}{added}  {}{removed}", symbols::ADDED, symbols::REMOVED);
-    let mut spans = vec![
-        Span::styled(format!("{}{added}", symbols::ADDED), ok_style()),
-        Span::styled("  ", panel_style()),
-        Span::styled(format!("{}{removed}", symbols::REMOVED), err_style()),
-    ];
-    if let Some(note) = note {
-        plain.push_str(&format!("  {} {note}", symbols::SEP));
-        spans.push(Span::styled(
-            format!("  {} {note}", symbols::SEP),
-            dim_style(),
-        ));
+/// One footer metadata field: a styled span run plus its plain-text mirror.
+/// Fields are joined by [`join_meta_fields`]; a field is never split by `┊`
+/// internally (`+n −n`, `↑… ↓…`, and `EXIT n` are each ONE field).
+pub(super) struct FooterField {
+    pub(super) spans: Vec<Span<'static>>,
+    pub(super) plain: String,
+}
+
+impl FooterField {
+    pub(super) fn styled(text: impl Into<String>, style: Style) -> Self {
+        let text = text.into();
+        Self {
+            spans: vec![Span::styled(text.clone(), style)],
+            plain: text,
+        }
     }
-    TranscriptRow::chrome_with_text(
-        ChromeRow::Body {
-            line: Line::from(spans),
-            bg: None,
-        },
-        plain,
-        panel_style(),
-    )
+}
+
+/// The `┊` law (DESIGN-LANGUAGE §6), joined programmatically: the soft
+/// separator sits only BETWEEN sibling metadata fields, one space each side —
+/// never leading, never trailing, never doubled. Empty fields are filtered so
+/// a missing field can never leave a dangling `┊` (the `MetaFields` joiner).
+pub(super) fn join_meta_fields(fields: Vec<FooterField>) -> (Vec<Span<'static>>, String) {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    for field in fields.into_iter().filter(|field| !field.plain.is_empty()) {
+        if !plain.is_empty() {
+            spans.push(Span::styled(format!(" {} ", symbols::SEP), dim_style()));
+            plain.push_str(&format!(" {} ", symbols::SEP));
+        }
+        spans.extend(field.spans);
+        plain.push_str(&field.plain);
+    }
+    (spans, plain)
+}
+
+/// Token diagnostics for the block footer, right-bound:
+/// `↑<sent> ↓<received> ┊ cache <n> ┊ ctx <Δ%>`. Measured on the proposing
+/// provider turn (the finest honest granularity): `↑` fresh non-cached input
+/// processed that turn, `↓` tokens it generated, `cache` prompt-cache reads,
+/// `ctx` context growth vs the previous turn. Tool calls proposed by the same
+/// turn share these numbers. All fields are optional, preformatted strings
+/// (`"1.4k"`, `"+0.9%"`); a field is rendered only when the runtime measured
+/// it — never a fabricated per-call split.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolDiag {
+    pub(crate) sent: Option<String>,
+    pub(crate) received: Option<String>,
+    pub(crate) cache: Option<String>,
+    pub(crate) ctx: Option<String>,
+}
+
+impl ToolDiag {
+    /// Render the diagnostics cluster, or `None` when no field is present.
+    /// `↑sent ↓received` is one field; `cache` and `ctx` follow, `┊`-joined
+    /// via [`join_meta_fields`] so omissions never leave a dangling separator.
+    pub(super) fn render(&self) -> Option<String> {
+        let updown = match (&self.sent, &self.received) {
+            (Some(sent), Some(received)) => Some(format!("↑{sent} ↓{received}")),
+            (Some(sent), None) => Some(format!("↑{sent}")),
+            (None, Some(received)) => Some(format!("↓{received}")),
+            (None, None) => None,
+        };
+        let fields: Vec<FooterField> = [
+            updown,
+            self.cache.as_ref().map(|cache| format!("cache {cache}")),
+            self.ctx.as_ref().map(|ctx| format!("ctx {ctx}")),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|text| FooterField::styled(text, dim_style()))
+        .collect();
+        if fields.is_empty() {
+            return None;
+        }
+        let (_, plain) = join_meta_fields(fields);
+        Some(plain)
+    }
+}
+
+/// The EDIT footer extras: the `+n −n` counts as ONE field (additions green,
+/// removals red, 1ch apart), then the muted note (`new file`) as a sibling
+/// field. Unicode minus, never ASCII `-`.
+pub(super) fn edit_footer_extras(
+    added: usize,
+    removed: usize,
+    note: Option<&str>,
+) -> Vec<FooterField> {
+    let mut fields = Vec::new();
+    if added + removed > 0 {
+        fields.push(FooterField {
+            spans: vec![
+                Span::styled(format!("{}{added}", symbols::ADDED), ok_style()),
+                Span::raw(" "),
+                Span::styled(format!("{}{removed}", symbols::REMOVED), err_style()),
+            ],
+            plain: format!("{}{added} {}{removed}", symbols::ADDED, symbols::REMOVED),
+        });
+    }
+    if let Some(note) = note {
+        fields.push(FooterField::styled(note.to_string(), dim_style()));
+    }
+    fields
 }
 
 /// Build a diff table row whose code column is a single styled span.
@@ -614,5 +677,90 @@ mod tests {
 
         assert!(rendered.contains("-- comment"), "{rendered}");
         assert_eq!(diff_counts(diff), (0, 1));
+    }
+
+    #[test]
+    fn meta_fields_joiner_never_leaves_dangling_separators() {
+        // The `┊` law: only BETWEEN sibling fields, one space each side,
+        // never leading/trailing/doubled; empty fields are filtered.
+        let fields = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|t| FooterField::styled(t.to_string(), dim_style()))
+                .collect::<Vec<_>>()
+        };
+        let (_, plain) = join_meta_fields(fields(&["EXIT 0", "142 passed"]));
+        assert_eq!(plain, "EXIT 0 ┊ 142 passed");
+        let (_, plain) = join_meta_fields(fields(&["EXIT 0", "", "142 passed"]));
+        assert_eq!(plain, "EXIT 0 ┊ 142 passed");
+        let (_, plain) = join_meta_fields(fields(&["", "only"]));
+        assert_eq!(plain, "only");
+        let (spans, plain) = join_meta_fields(Vec::new());
+        assert!(spans.is_empty() && plain.is_empty());
+    }
+
+    #[test]
+    fn tool_diag_renders_optional_fields_without_dangling_separators() {
+        let full = ToolDiag {
+            sent: Some("1.4k".to_string()),
+            received: Some("38".to_string()),
+            cache: Some("16.8k".to_string()),
+            ctx: Some("+0.9%".to_string()),
+        };
+        assert_eq!(
+            full.render().as_deref(),
+            Some("↑1.4k ↓38 ┊ cache 16.8k ┊ ctx +0.9%")
+        );
+        // `↑sent ↓received` is ONE field; omitting parts never leaves a `┊`
+        // at a cluster edge or inside the field.
+        let partial = ToolDiag {
+            sent: None,
+            received: Some("38".to_string()),
+            cache: None,
+            ctx: Some("+0.9%".to_string()),
+        };
+        assert_eq!(partial.render().as_deref(), Some("↓38 ┊ ctx +0.9%"));
+        let sent_only = ToolDiag {
+            sent: Some("1.4k".to_string()),
+            ..ToolDiag::default()
+        };
+        assert_eq!(sent_only.render().as_deref(), Some("↑1.4k"));
+        assert_eq!(ToolDiag::default().render(), None);
+    }
+
+    #[test]
+    fn edit_footer_extras_join_counts_as_one_field_with_note() {
+        let (_, plain) = join_meta_fields(edit_footer_extras(1, 1, Some("new file")));
+        assert_eq!(plain, "+1 −1 ┊ new file");
+        let (_, plain) = join_meta_fields(edit_footer_extras(2, 0, None));
+        assert_eq!(plain, "+2 −0");
+        let (spans, plain) = join_meta_fields(edit_footer_extras(0, 0, None));
+        assert!(spans.is_empty() && plain.is_empty());
+    }
+
+    #[test]
+    fn footer_rule_is_a_hairline_from_the_footer_indent_to_the_right_edge() {
+        let line = footer_rule_line(80);
+        let text = line_text(&line);
+        assert!(text.starts_with("    ─"), "{text:?}");
+        assert_eq!(display_width(&text), 78, "{text:?}");
+        assert!(text.trim_start().chars().all(|c| c == '─'), "{text:?}");
+    }
+
+    #[test]
+    fn header_carries_disclosure_label_meta_and_elapsed_only() {
+        let line = panel_header_line(80, true, "EXPLORE", "src/context", "0.0s");
+        let text = line_text(&line);
+        assert!(text.starts_with("  ▾ EXPLORE  src/context"), "{text:?}");
+        assert!(text.trim_end().ends_with("0.0s"), "{text:?}");
+        assert_eq!(display_width(text.trim_end()), 78, "{text:?}");
+        let collapsed = line_text(&panel_header_line(
+            80,
+            false,
+            "EXPLORE",
+            "src/context",
+            "0.0s",
+        ));
+        assert!(collapsed.starts_with("  ▸ EXPLORE"), "{collapsed:?}");
     }
 }

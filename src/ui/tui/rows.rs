@@ -5,8 +5,9 @@ use ratatui::text::{Line, Span};
 
 use super::component::Component;
 use super::panel::{
-    apply_width_bg, inset_rule_line, panel_body_content_width, panel_body_line, panel_body_lines,
-    panel_header_line, panel_rule_line, rail_header_line,
+    apply_width_bg, footer_rule_line, inset_rule_line, panel_body_content_width, panel_body_line,
+    panel_body_lines, panel_footer_content_width, panel_footer_line, panel_header_line,
+    rail_header_line,
 };
 use super::wrap::{
     display_width, line_text, pad_line_left, pad_line_right, push_wrapped_line,
@@ -102,6 +103,11 @@ impl TranscriptRow {
     /// `ui::tui` modules can append rows without a trait import.
     pub(super) fn render_rows(&self, width: usize, out: &mut Vec<Line<'static>>) {
         if let Some(chrome) = &self.chrome {
+            // Block boundary markers are structural only: a frameless block
+            // draws no top or bottom border row.
+            if matches!(chrome, ChromeRow::BlockStart | ChromeRow::BlockEnd) {
+                return;
+            }
             if let ChromeRow::Body { line, bg } = chrome {
                 panel_body_lines(width, line.clone(), *bg, out);
                 return;
@@ -199,15 +205,25 @@ impl Component for TranscriptRow {
 
 #[derive(Clone)]
 pub(super) enum ChromeRow {
-    Top,
+    /// Start-of-block marker. Renders nothing (frameless blocks have no top
+    /// border); bounds the block for trim/replace logic and resets fold state.
+    BlockStart,
+    /// The frameless block header: `▾ TOOL  meta … elapsed`. The right edge
+    /// carries ONLY the elapsed time; state lives in the footer.
     Header {
         expanded: bool,
         title: &'static str,
         meta: String,
-        right: Vec<(String, Style)>,
+        elapsed: String,
     },
-    Separator,
-    Bottom,
+    /// The hairline rule that opens the always-visible block footer.
+    FooterRule,
+    /// The block footer row: state label (+ family extras) left, right-bound
+    /// dim diagnostics. Always visible, expanded or collapsed.
+    Footer { left: Line<'static>, right: String },
+    /// End-of-block marker. Renders nothing; the footer is the last visible
+    /// row of a block.
+    BlockEnd,
     Body {
         line: Line<'static>,
         bg: Option<Color>,
@@ -252,15 +268,29 @@ pub(super) enum ChromeRow {
 impl ChromeRow {
     pub(super) fn render(&self, width: usize) -> Line<'static> {
         match self {
-            ChromeRow::Top => panel_rule_line(width, '┌', '┐'),
+            // Structural markers; render_rows short-circuits before this.
+            ChromeRow::BlockStart | ChromeRow::BlockEnd => Line::default(),
             ChromeRow::Header {
                 expanded,
                 title,
                 meta,
-                right,
-            } => panel_header_line(width, *expanded, title, meta, right),
-            ChromeRow::Separator => panel_rule_line(width, '├', '┤'),
-            ChromeRow::Bottom => panel_rule_line(width, '└', '┘'),
+                elapsed,
+            } => panel_header_line(width, *expanded, title, meta, elapsed),
+            ChromeRow::FooterRule => footer_rule_line(width),
+            // The state label (and family extras) always win the footer row:
+            // when the optional diagnostics cluster does not fit, it is
+            // dropped rather than displacing the left side.
+            ChromeRow::Footer { left, right } => {
+                let content_width = panel_footer_content_width(width);
+                let left_w = display_width(&line_text(left));
+                let right_w = display_width(right);
+                let line = if right.is_empty() || left_w + 1 + right_w > content_width {
+                    left.clone()
+                } else {
+                    right_aligned_line(left.clone(), right, dim_style(), content_width)
+                };
+                panel_footer_line(width, line)
+            }
             ChromeRow::Body { line, bg } => panel_body_line(width, line.clone(), *bg),
             ChromeRow::BodyRight {
                 left,
