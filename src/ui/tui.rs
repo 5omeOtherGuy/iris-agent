@@ -1534,6 +1534,78 @@ mod tests {
     }
 
     #[test]
+    fn empty_composer_cursor_sits_on_placeholder_g() {
+        use crate::ui::terminal_surface::CURSOR_MARKER;
+
+        let mut screen = Screen::new();
+        let lines = rendered_lines(&mut screen, 80, 8);
+        let line = lines
+            .iter()
+            .find(|line| line_text(line).contains("Give Iris a task..."))
+            .expect("placeholder line");
+
+        // The zero-width cursor marker sits immediately before the cell it
+        // marks; find the display column of the marker and of the
+        // placeholder's `G` and require they match -- the cursor sits on the
+        // first letter, not one column to its left.
+        let mut col = 0usize;
+        let mut marker_col = None;
+        let mut g_col = None;
+        for span in &line.spans {
+            let content = span.content.as_ref();
+            if content == CURSOR_MARKER {
+                marker_col = Some(col);
+                continue;
+            }
+            if g_col.is_none() && content.starts_with('G') {
+                g_col = Some(col);
+            }
+            col += display_width(content);
+        }
+        assert!(marker_col.is_some(), "{line:?}");
+        assert_eq!(marker_col, g_col, "{line:?}");
+    }
+
+    #[test]
+    fn typed_text_starts_at_the_same_column_as_the_placeholder_g() {
+        let mut empty_screen = Screen::new();
+        let empty_lines = rendered_lines(&mut empty_screen, 80, 8)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>();
+        let placeholder_indent = empty_lines
+            .iter()
+            .find_map(|line| {
+                let trimmed = line.trim_start_matches(' ');
+                trimmed
+                    .starts_with("Give Iris a task...")
+                    .then(|| line.len() - trimmed.len())
+            })
+            .expect("placeholder line");
+
+        let mut typed_screen = Screen::new();
+        typed_screen.set_editor("hello");
+        let typed_lines = rendered_lines(&mut typed_screen, 80, 8)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>();
+        let typed_indent = typed_lines
+            .iter()
+            .find_map(|line| {
+                let trimmed = line.trim_start_matches(' ');
+                trimmed
+                    .starts_with("hello")
+                    .then(|| line.len() - trimmed.len())
+            })
+            .expect("typed input line");
+
+        assert_eq!(
+            placeholder_indent, typed_indent,
+            "placeholder {empty_lines:?} vs typed {typed_lines:?}"
+        );
+    }
+
+    #[test]
     fn editor_visual_rows_use_actual_inner_text_width() {
         let mut editor = fresh_editor();
         editor.insert_str("abcdefghijkl");
@@ -5115,8 +5187,8 @@ mod tests {
         screen.editor.insert_str("abcdefghijklmnopqrst");
 
         let rendered = rendered_text(&mut screen, 18, 8);
-        assert!(rendered.contains("abcdefghijk"), "{rendered}");
-        assert!(rendered.contains("lmnopqrst"), "{rendered}");
+        assert!(rendered.contains("abcdefghij"), "{rendered}");
+        assert!(rendered.contains("klmnopqrst"), "{rendered}");
         for line in rendered.lines() {
             assert!(display_width(line) <= 18, "{line:?}");
         }
