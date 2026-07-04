@@ -1700,6 +1700,9 @@ async fn dispatch_action<P: ChatProvider>(
             }
         },
         ModalAction::BackToLoginMethod => tui.screen.open_modal(login::open_login()),
+        // Settings -> Login / providers: open the existing `/login` method
+        // selector (the loop owns the auth store / login backend).
+        ModalAction::OpenLoginMethod => tui.screen.open_modal(login::open_login()),
         ModalAction::BeginLogin(provider) => {
             run_login(provider, tui, input_rx, tick, login_backend).await?;
         }

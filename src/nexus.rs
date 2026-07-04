@@ -104,6 +104,15 @@ impl ApprovalMode {
             _ => None,
         }
     }
+
+    /// Resolve the startup approval posture from the persisted `defaultApproval`
+    /// setting (GLOBAL-ONLY): a valid token is applied, while an absent or
+    /// invalid value leaves today's default (`strict`) so a missing or typo'd
+    /// setting never changes posture. The live `/approval` command is
+    /// unaffected and stays session-only.
+    pub(crate) fn from_startup_setting(setting: Option<&str>) -> Self {
+        setting.and_then(Self::parse).unwrap_or_default()
+    }
 }
 
 /// A single persistent project-policy grant (ADR-0027), derived by Nexus from

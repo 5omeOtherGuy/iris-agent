@@ -18,9 +18,12 @@
 //! tolerate newer config. A malformed file is a hard error -- a silently-ignored
 //! config is a footgun.
 //!
-//! Tool/approval policy is intentionally not configured here: pi's settings do
-//! not encode tool-execution policy either, and cross-session approval
-//! persistence is tracked separately (roadmap #14).
+//! Live tool/approval policy is not configured here: the session approval mode
+//! (`/approval`) and project permission grants (`/trust`) are session/project
+//! state, not settings keys. The one exception is `defaultApproval`, the
+//! startup approval posture, which is GLOBAL-ONLY (a cloned project must never
+//! be able to weaken it -- see `merged_with`). Cross-session approval-grant
+//! persistence is still tracked separately (roadmap #14).
 
 use std::env;
 use std::io::Write;
@@ -112,6 +115,14 @@ pub(crate) struct Settings {
     /// Terminal-UI behavior (ADR-0029 screen-mode policy). Display-only
     /// preferences: no security-sensitive capability lives here.
     pub(crate) tui: Option<TuiSettings>,
+    /// Startup approval posture (`strict|auto|never`, ADR-0032). Parsed by
+    /// [`crate::nexus::ApprovalMode::parse`] and applied to the harness at
+    /// startup; an absent/invalid value leaves today's default (`strict`).
+    /// GLOBAL-ONLY: a cloned project must never be able to lower the initial
+    /// posture to `never`, so (like `prompt_cache_retention`) it is taken from
+    /// global config and never from an untrusted project file. The live
+    /// `/approval` command stays session-only and is unaffected.
+    pub(crate) default_approval: Option<String>,
     /// Where the git dropdown's `w` (new worktree) gesture creates worktrees,
     /// relative to the main worktree root when not absolute. Absent ->
     /// `../wt`. Project-tunable: it only picks a local directory for a
@@ -131,6 +142,10 @@ pub(crate) struct TuiSettings {
     /// Mouse-wheel scroll step in lines for the pager (default 3, clamped to
     /// `[1, 100]`).
     pub(crate) scroll_speed: Option<u16>,
+    /// Freeze the working-indicator animation (accessibility). Promotes the
+    /// `IRIS_REDUCED_MOTION` env switch to persisted config; the env flag still
+    /// wins. Display-only preference, so a project may set it.
+    pub(crate) reduced_motion: Option<bool>,
 }
 
 /// Raw per-project verification config (issue #265). Both fields optional: a
@@ -264,6 +279,10 @@ impl Settings {
             // redirect, so a project may set it; project value wins, else
             // global.
             tui: project.tui.or(self.tui),
+            // Startup approval posture gates whether tools auto-run without a
+            // prompt, so (like prompt_cache_retention) it is GLOBAL-ONLY: a
+            // cloned project must never lower the initial posture to `never`.
+            default_approval: self.default_approval,
             // A local worktree location preference; project value wins.
             worktree_root: project.worktree_root.or(self.worktree_root),
         }
@@ -395,6 +414,92 @@ pub(crate) fn save_enabled_models(ids: Option<&[String]>) -> Result<()> {
     update_global(&[("enabledModels", value)])
 }
 
+/// Persist the startup approval posture (`strict|auto|never`) in the global
+/// settings file. GLOBAL-ONLY (like [`save_prompt_cache_retention`]): a cloned
+/// project must never redirect the initial posture, so this always writes the
+/// user-global file.
+pub(crate) fn save_default_approval(mode: &str) -> Result<()> {
+    update_global(&[("defaultApproval", Value::String(mode.to_string()))])
+}
+
+/// Persist the prompt-cache retention preset (`none|short|long`) in the global
+/// settings file. GLOBAL-ONLY, matching where the field is trusted on load.
+pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
+    update_global(&[("promptCacheRetention", Value::String(preset.to_string()))])
+}
+
+/// Persist the context token budget in the global settings file, clamped to a
+/// sane positive range so a hand-typed value cannot store a degenerate budget.
+pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {
+    let budget = budget.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    update_global(&[("contextTokenBudget", Value::from(budget))])
+}
+
+/// Persist (or clear) the tool round-trip soft cap in the global settings file.
+/// `None` removes `maxToolRoundtrips` (unbounded loop); a value is clamped to a
+/// sane positive range.
+pub(crate) fn save_max_tool_roundtrips(cap: Option<usize>) -> Result<()> {
+    let value = match cap {
+        Some(cap) => {
+            let cap = (cap as u64).clamp(MIN_TOOL_ROUNDTRIPS, MAX_TOOL_ROUNDTRIPS);
+            Value::from(cap)
+        }
+        None => Value::Null,
+    };
+    update_global(&[("maxToolRoundtrips", value)])
+}
+
+/// Persist (or clear) the worktree-root preference in the global settings file.
+/// An empty/`None` value removes `worktreeRoot` (fall back to `../wt`).
+pub(crate) fn save_worktree_root(root: Option<&str>) -> Result<()> {
+    update_global(&[("worktreeRoot", string_or_null(root))])
+}
+
+/// Persist the alt-screen policy (`auto|always|never`) under the `tui` block.
+pub(crate) fn save_alt_screen(policy: &str) -> Result<()> {
+    update_global_block("tui", &[("altScreen", Value::String(policy.to_string()))])
+}
+
+/// Persist the pager scroll speed under the `tui` block, clamped to `[1, 100]`.
+pub(crate) fn save_scroll_speed(speed: u16) -> Result<()> {
+    update_global_block("tui", &[("scrollSpeed", Value::from(speed.clamp(1, 100)))])
+}
+
+/// Persist the reduced-motion display preference under the `tui` block.
+pub(crate) fn save_reduced_motion(enabled: bool) -> Result<()> {
+    update_global_block("tui", &[("reducedMotion", Value::Bool(enabled))])
+}
+
+/// Persist (or clear) the verification command under the `verify` block. An
+/// empty/`None` command removes the key (feature reports skipped-unconfigured).
+pub(crate) fn save_verify_command(command: Option<&str>) -> Result<()> {
+    update_global_block("verify", &[("command", string_or_null(command))])
+}
+
+/// Persist the verification attempt cap under the `verify` block, clamped to
+/// `[1, MAX_VERIFY_MAX_ATTEMPTS]` so a hand-typed value cannot request an
+/// unbounded chain of effectful runs.
+pub(crate) fn save_verify_max_attempts(attempts: u32) -> Result<()> {
+    let attempts = attempts.clamp(1, MAX_VERIFY_MAX_ATTEMPTS);
+    update_global_block("verify", &[("maxAttempts", Value::from(attempts))])
+}
+
+/// Sane lower/upper bounds for a persisted context token budget.
+const MIN_CONTEXT_TOKEN_BUDGET: u64 = 1_000;
+const MAX_CONTEXT_TOKEN_BUDGET: u64 = 100_000_000;
+/// Sane lower/upper bounds for a persisted tool round-trip cap.
+const MIN_TOOL_ROUNDTRIPS: u64 = 1;
+const MAX_TOOL_ROUNDTRIPS: u64 = 1_000;
+
+/// A trimmed non-empty string as a JSON string, or `Value::Null` (the
+/// `update_global` "remove this key" sentinel) for an absent/blank value.
+fn string_or_null(value: Option<&str>) -> Value {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => Value::String(v.to_string()),
+        None => Value::Null,
+    }
+}
+
 /// Read the global settings file as a raw JSON object, apply `updates` (a
 /// `Value::Null` removes the key), and write it back atomically. Reading the raw
 /// map -- rather than reserializing the typed [`Settings`] -- preserves any keys
@@ -411,6 +516,33 @@ fn update_global(updates: &[(&str, Value)]) -> Result<()> {
             object.insert((*key).to_string(), value.clone());
         }
     }
+    write_object_atomically(&path, &object)
+}
+
+/// Apply `updates` to a nested object `block` (e.g. `tui`, `verify`) in the
+/// global settings file, preserving every other key inside and outside the
+/// block. A `Value::Null` removes a key within the block; keys this binary does
+/// not know about survive. The block is created on first write and left in place
+/// (an empty block is harmless) so unrelated sibling keys are never dropped.
+fn update_global_block(block: &str, updates: &[(&str, Value)]) -> Result<()> {
+    let path = global_path()
+        .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
+    let mut object = read_object(&path)?;
+    let nested = match object.remove(block) {
+        Some(Value::Object(existing)) => existing,
+        // A non-object (or absent) block is replaced with a fresh object rather
+        // than silently merged into a scalar.
+        _ => Map::new(),
+    };
+    let mut nested = nested;
+    for (key, value) in updates {
+        if value.is_null() {
+            nested.remove(*key);
+        } else {
+            nested.insert((*key).to_string(), value.clone());
+        }
+    }
+    object.insert(block.to_string(), Value::Object(nested));
     write_object_atomically(&path, &object)
 }
 
@@ -504,6 +636,17 @@ pub(crate) fn iris_flag_enabled(name: &str) -> bool {
 
 fn iris_flag_value(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "true" | "yes" | "on"))
+}
+
+/// Whether the working-indicator animation should be frozen: the
+/// `IRIS_REDUCED_MOTION` env flag wins, else the persisted `tui.reducedMotion`
+/// preference. `setting` is the loaded `tui.reducedMotion` (absent -> `None`).
+pub(crate) fn reduced_motion_enabled(setting: Option<bool>) -> bool {
+    reduced_motion_value(iris_flag_enabled("IRIS_REDUCED_MOTION"), setting)
+}
+
+fn reduced_motion_value(env_on: bool, setting: Option<bool>) -> bool {
+    env_on || setting == Some(true)
 }
 
 #[cfg(test)]
@@ -908,6 +1051,166 @@ mod tests {
         assert_eq!(
             settings.enabled_models.as_deref(),
             Some(["openai-codex/gpt-5.5".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn reduced_motion_value_env_wins_then_setting() {
+        assert!(reduced_motion_value(true, None), "env flag wins");
+        assert!(
+            reduced_motion_value(true, Some(false)),
+            "env flag still wins"
+        );
+        assert!(reduced_motion_value(false, Some(true)), "setting honored");
+        assert!(!reduced_motion_value(false, None), "neither set");
+        assert!(!reduced_motion_value(false, Some(false)), "explicit off");
+    }
+
+    #[test]
+    fn default_approval_is_global_only() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "defaultApproval": "strict" }"#).unwrap();
+        // A cloned project must never lower the posture to `never`.
+        fs::write(&project, r#"{ "defaultApproval": "never" }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(settings.default_approval.as_deref(), Some("strict"));
+        // Absent global -> None (today's default applies at startup).
+        let absent = Settings::load_from(Some(&dir.path.join("none.json")), &project).unwrap();
+        assert_eq!(absent.default_approval, None);
+    }
+
+    #[test]
+    fn tui_reduced_motion_loads_and_project_may_set() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "tui": { "reducedMotion": false } }"#).unwrap();
+        fs::write(&project, r#"{ "tui": { "reducedMotion": true } }"#).unwrap();
+        // Display preferences: the project block wins (project.tui.or(global)).
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        let tui = settings.tui_settings().unwrap();
+        assert_eq!(tui.reduced_motion, Some(true));
+        // Global-only surfaces when there is no project block.
+        let only_global = Settings::load_from(Some(&global), &dir.path.join("nope.json")).unwrap();
+        let tui = only_global.tui_settings().unwrap();
+        assert_eq!(tui.reduced_motion, Some(false));
+    }
+
+    /// Point `IRIS_CONFIG_PATH` at a temp file for a save round-trip, restoring
+    /// any previous value afterward. The save helpers write the user-global file,
+    /// which this override selects.
+    /// Serializes the save-round-trip tests: `IRIS_CONFIG_PATH` is process-
+    /// global, so tests that point it at a temp file must not run concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ConfigPathGuard {
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ConfigPathGuard {
+        fn set(path: &Path) -> Self {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = env::var("IRIS_CONFIG_PATH").ok();
+            // SAFETY: the ENV_LOCK guard serializes all IRIS_CONFIG_PATH writers;
+            // restored on drop.
+            unsafe { env::set_var("IRIS_CONFIG_PATH", path) };
+            ConfigPathGuard { prev, _lock }
+        }
+    }
+
+    impl Drop for ConfigPathGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(prev) => unsafe { env::set_var("IRIS_CONFIG_PATH", prev) },
+                None => unsafe { env::remove_var("IRIS_CONFIG_PATH") },
+            }
+        }
+    }
+
+    #[test]
+    fn save_helpers_round_trip_clamp_and_preserve_unknown_keys() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        fs::write(
+            &path,
+            r#"{ "futureKnob": 7, "tui": { "altScreen": "auto", "futureTui": 1 } }"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+
+        // Top-level scalar saves.
+        save_default_approval("auto").unwrap();
+        save_prompt_cache_retention("long").unwrap();
+        // Clamp: below/above the sane range is pulled into it.
+        save_context_token_budget(1).unwrap();
+        save_max_tool_roundtrips(Some(99_999)).unwrap();
+        save_worktree_root(Some("  ../trees  ")).unwrap();
+        // Nested block saves preserve sibling + unknown nested keys.
+        save_alt_screen("always").unwrap();
+        save_scroll_speed(500).unwrap();
+        save_reduced_motion(true).unwrap();
+        save_verify_command("  cargo test  ".into()).unwrap();
+        save_verify_max_attempts(99).unwrap();
+
+        let object = read_object(&path).unwrap();
+        assert_eq!(object.get("futureKnob"), Some(&Value::from(7)));
+        assert_eq!(
+            object.get("defaultApproval"),
+            Some(&Value::String("auto".into()))
+        );
+        assert_eq!(object.get("contextTokenBudget"), Some(&Value::from(1_000)));
+        assert_eq!(object.get("maxToolRoundtrips"), Some(&Value::from(1_000)));
+        assert_eq!(
+            object.get("worktreeRoot"),
+            Some(&Value::String("../trees".into()))
+        );
+        let tui = object.get("tui").and_then(Value::as_object).unwrap();
+        assert_eq!(tui.get("altScreen"), Some(&Value::String("always".into())));
+        assert_eq!(tui.get("scrollSpeed"), Some(&Value::from(100)));
+        assert_eq!(tui.get("reducedMotion"), Some(&Value::Bool(true)));
+        assert_eq!(
+            tui.get("futureTui"),
+            Some(&Value::from(1)),
+            "nested unknown kept"
+        );
+        let verify = object.get("verify").and_then(Value::as_object).unwrap();
+        assert_eq!(
+            verify.get("command"),
+            Some(&Value::String("cargo test".into()))
+        );
+        assert_eq!(verify.get("maxAttempts"), Some(&Value::from(10)));
+    }
+
+    #[test]
+    fn save_empty_values_clear_their_keys() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        fs::write(
+            &path,
+            r#"{ "maxToolRoundtrips": 20, "worktreeRoot": "../wt", "verify": { "command": "x", "maxAttempts": 2 } }"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+
+        save_max_tool_roundtrips(None).unwrap();
+        save_worktree_root(None).unwrap();
+        save_verify_command(None).unwrap();
+
+        let object = read_object(&path).unwrap();
+        assert!(
+            !object.contains_key("maxToolRoundtrips"),
+            "cleared to unbounded"
+        );
+        assert!(!object.contains_key("worktreeRoot"), "cleared to default");
+        let verify = object.get("verify").and_then(Value::as_object).unwrap();
+        assert!(!verify.contains_key("command"), "command cleared");
+        assert_eq!(
+            verify.get("maxAttempts"),
+            Some(&Value::from(2)),
+            "sibling kept"
         );
     }
 

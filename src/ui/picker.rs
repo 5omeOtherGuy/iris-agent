@@ -17,8 +17,9 @@ use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
     EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
-    SettingsMenu, TaskPicker, TrustMenu,
+    TaskPicker, TrustMenu,
 };
+use crate::ui::settings_menu::{self, SettingsMenu};
 use crate::ui::task_view::TaskCard;
 use crate::wayland::Harness;
 use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask, RecoverableTask};
@@ -297,13 +298,82 @@ pub(crate) fn open_trust<P: ChatProvider>(harness: &Harness<P>) -> Modal {
     ))
 }
 
-/// Build the `/settings` modal (effort picker entry).
-pub(crate) fn open_settings<P>(switch: &ModelSwitch<'_, P>) -> Modal {
-    let current = switch
-        .selection()
-        .reasoning
-        .unwrap_or(ReasoningEffort::DEFAULT);
-    Modal::Settings(SettingsMenu::new(current))
+/// Build the `/settings` modal: the top-level category list. Submenus are opened
+/// lazily (with a fresh settings snapshot) as the user navigates, reusing the
+/// existing "Replace the modal" pattern.
+pub(crate) fn open_settings<P>(_switch: &ModelSwitch<'_, P>) -> Modal {
+    Modal::Settings(SettingsMenu::new())
+}
+
+/// Snapshot the current persisted settings (plus the live model default) so the
+/// settings menus can show each field's current value as muted metadata. Reads
+/// the merged global+project config for `cwd`; a read failure degrades to
+/// built-in defaults rather than failing the menu.
+fn settings_snapshot<P>(switch: &ModelSwitch<'_, P>) -> settings_menu::Snapshot {
+    let settings = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::Settings::load(&cwd).ok())
+        .unwrap_or_default();
+    let tui = settings.tui_settings();
+    settings_menu::Snapshot {
+        default_model: config::default_model_qualified()
+            .unwrap_or_else(|| current_qualified(switch)),
+        default_reasoning: settings
+            .default_reasoning
+            .clone()
+            .unwrap_or_else(|| ReasoningEffort::DEFAULT.as_str().to_string()),
+        alt_screen: tui
+            .and_then(|t| t.alt_screen.clone())
+            .unwrap_or_else(|| "auto".to_string()),
+        scroll_speed: tui.and_then(|t| t.scroll_speed).unwrap_or(3),
+        reduced_motion: tui.and_then(|t| t.reduced_motion).unwrap_or(false),
+        default_approval: settings
+            .default_approval
+            .clone()
+            .unwrap_or_else(|| "strict".to_string()),
+        context_token_budget: settings.context_token_budget(),
+        max_tool_roundtrips: settings.max_tool_roundtrips(),
+        prompt_cache_retention: settings
+            .prompt_cache_retention
+            .clone()
+            .unwrap_or_else(|| "short".to_string()),
+        verify_command: settings
+            .verify
+            .as_ref()
+            .and_then(|v| v.command.clone())
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty()),
+        verify_max_attempts: settings.verification().map(|v| v.max_attempts).unwrap_or(3),
+        worktree_root: settings.worktree_root.clone(),
+    }
+}
+
+/// Persist a single settings field to the user-global file. The menu widgets
+/// pre-validate/clamp the value, so the parse here is a safety net; the typed
+/// `config::save_*` also clamp defensively. `value` is `None` for the
+/// empty-clears fields (unbounded round-trips, unset command/worktree root).
+fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyhow::Result<()> {
+    use settings_menu::Field;
+    let parse_bool = |v: Option<&str>| v == Some("true");
+    match field {
+        Field::AltScreen => config::save_alt_screen(value.unwrap_or("auto")),
+        Field::ScrollSpeed => config::save_scroll_speed(value.unwrap_or("3").parse()?),
+        Field::ReducedMotion => config::save_reduced_motion(parse_bool(value)),
+        Field::DefaultApproval => config::save_default_approval(value.unwrap_or("strict")),
+        Field::ContextTokenBudget => {
+            config::save_context_token_budget(value.unwrap_or("0").parse()?)
+        }
+        Field::MaxToolRoundtrips => config::save_max_tool_roundtrips(match value {
+            Some(v) => Some(v.parse::<usize>()?),
+            None => None,
+        }),
+        Field::PromptCacheRetention => {
+            config::save_prompt_cache_retention(value.unwrap_or("short"))
+        }
+        Field::VerifyCommand => config::save_verify_command(value),
+        Field::VerifyMaxAttempts => config::save_verify_max_attempts(value.unwrap_or("3").parse()?),
+        Field::WorktreeRoot => config::save_worktree_root(value),
+    }
 }
 
 /// Build the effort/thinking picker for the current model (settings submenu).
@@ -378,7 +448,81 @@ pub(crate) fn apply_action<P: ChatProvider>(
         ModalAction::OpenEffortPicker => {
             ActionResult::Replace(Box::new(effort_picker(switch)), Vec::new())
         }
-        // Login navigation/side effects are not picker concerns.
+        // --- settings menu tree ---
+        ModalAction::OpenSettingsRoot => {
+            ActionResult::Replace(Box::new(open_settings(switch)), Vec::new())
+        }
+        ModalAction::OpenSettingsCategory(category) => {
+            let snap = settings_snapshot(switch);
+            ActionResult::Replace(
+                Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
+                    category, &snap,
+                ))),
+                Vec::new(),
+            )
+        }
+        ModalAction::OpenSettingsEnum(field) => {
+            let snap = settings_snapshot(switch);
+            ActionResult::Replace(
+                Box::new(Modal::SettingsEnum(settings_menu::EnumMenu::new(
+                    field, &snap,
+                ))),
+                Vec::new(),
+            )
+        }
+        ModalAction::OpenSettingsEntry(field) => {
+            let snap = settings_snapshot(switch);
+            ActionResult::Replace(
+                Box::new(Modal::SettingsEntry(settings_menu::EntryDialog::new(
+                    field, &snap,
+                ))),
+                Vec::new(),
+            )
+        }
+        ModalAction::SaveSetting { field, value } => {
+            let lines = match save_setting_field(field, value.as_deref()) {
+                Ok(()) => Vec::new(),
+                Err(error) => vec![format!("could not save setting: {error:#}")],
+            };
+            // Re-open the parent category submenu on the refreshed values.
+            let snap = settings_snapshot(switch);
+            ActionResult::Replace(
+                Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
+                    field.category(),
+                    &snap,
+                ))),
+                lines,
+            )
+        }
+        ModalAction::OpenModelPicker => {
+            let available = available_now();
+            if available.is_empty() {
+                return ActionResult::Close(vec![
+                    "No models available. Use /login to add providers.".to_string(),
+                ]);
+            }
+            let current = current_qualified(switch);
+            let default = config::default_model_qualified().unwrap_or_else(|| current.clone());
+            let effort = switch
+                .selection()
+                .reasoning
+                .unwrap_or(ReasoningEffort::DEFAULT);
+            ActionResult::Replace(
+                Box::new(Modal::Model(ModelPicker::new(
+                    available, &current, &default, effort,
+                ))),
+                Vec::new(),
+            )
+        }
+        ModalAction::OpenTrustMenu => {
+            ActionResult::Replace(Box::new(open_trust(harness)), Vec::new())
+        }
+        ModalAction::OpenScopedModels => match open_scoped(switch) {
+            ModelCommand::Open(modal) => ActionResult::Replace(Box::new(modal), Vec::new()),
+            ModelCommand::Lines(lines) => ActionResult::Close(lines),
+        },
+        // Login navigation/side effects (incl. OpenLoginMethod) are handled by
+        // the loop, which owns the auth store / login backend.
         other => ActionResult::Close(vec![format!("unhandled action: {other:?}")]),
     }
 }
