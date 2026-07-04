@@ -1,7 +1,7 @@
 # ADR-0029: Adopt an alt-screen pager TUI with an Iris-owned scrollback pane
 
 **Date**: 2026-07-03
-**Status**: accepted (amends ADR-0006's terminal-lifecycle rule)
+**Status**: accepted (amends ADR-0006's terminal-lifecycle rule); ratatui widget/ecosystem adoption boundary defined in [ADR-0033](0033-ratatui-native-adoption-boundary.md)
 **Deciders**: operator + agent design review
 
 ## Context
