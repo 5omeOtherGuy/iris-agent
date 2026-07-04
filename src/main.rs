@@ -93,7 +93,7 @@ fn dispatch() -> Result<()> {
             resume_agent(session_id, true)
         }
         [command, provider] if command == "login" && provider == "openai-codex" => {
-            login_openai_codex(LoginMethod::Browser)
+            login_openai_codex(select_openai_codex_method()?)
         }
         [command, provider] if command == "login" && provider == "openai" => {
             login_api_key(mimir::selection::ProviderId::OpenAi)
@@ -132,10 +132,131 @@ fn dispatch() -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoginMethod {
     Browser,
     DeviceCode,
+}
+
+/// The `openai-codex` login methods offered by the interactive menu, in display
+/// order. The first entry is the non-interactive default.
+const OPENAI_CODEX_METHODS: [(LoginMethod, &str, &str); 2] = [
+    (
+        LoginMethod::Browser,
+        "Browser",
+        "opens a login page and waits for the callback",
+    ),
+    (
+        LoginMethod::DeviceCode,
+        "Device code",
+        "authorize on another device with a short code",
+    ),
+];
+
+/// A key press mapped to a menu action. Kept separate from the event loop so
+/// the key mapping is unit-testable without a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    Up,
+    Down,
+    Confirm,
+    Cancel,
+    Ignore,
+}
+
+/// Map a key press to a [`MenuAction`]. Arrows and `k`/`j` move, Enter confirms,
+/// Esc and Ctrl-C cancel; everything else is ignored.
+fn menu_action(event: &ratatui::crossterm::event::KeyEvent) -> MenuAction {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    match event.code {
+        KeyCode::Up | KeyCode::Char('k') => MenuAction::Up,
+        KeyCode::Down | KeyCode::Char('j') => MenuAction::Down,
+        KeyCode::Enter => MenuAction::Confirm,
+        KeyCode::Esc => MenuAction::Cancel,
+        KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => MenuAction::Cancel,
+        _ => MenuAction::Ignore,
+    }
+}
+
+/// Next index with wrap-around; `len` is assumed non-zero.
+fn menu_next(index: usize, len: usize) -> usize {
+    (index + 1) % len
+}
+
+/// Previous index with wrap-around; `len` is assumed non-zero.
+fn menu_prev(index: usize, len: usize) -> usize {
+    (index + len - 1) % len
+}
+
+/// Choose the `openai-codex` login method. On a TTY this shows an interactive
+/// menu; otherwise (piped/non-interactive stdin) it falls back to the default
+/// first method so scripts keep working.
+fn select_openai_codex_method() -> Result<LoginMethod> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(OPENAI_CODEX_METHODS[0].0);
+    }
+    prompt_openai_codex_method()
+}
+
+/// Render the method menu, moving the cursor back to the top of the list on
+/// each redraw so navigation updates in place.
+fn draw_method_menu(out: &mut impl Write, index: usize, redraw: bool) -> Result<()> {
+    use ratatui::crossterm::{cursor, execute, terminal};
+    if redraw {
+        execute!(out, cursor::MoveUp(OPENAI_CODEX_METHODS.len() as u16))?;
+    }
+    for (i, (_, label, hint)) in OPENAI_CODEX_METHODS.iter().enumerate() {
+        let marker = if i == index { '>' } else { ' ' };
+        execute!(
+            out,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::CurrentLine)
+        )?;
+        write!(out, "{marker} {label}  ({hint})\r\n")?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Interactive `openai-codex` method picker. Uses the same raw-mode approach as
+/// [`read_api_key`]; Esc / Ctrl-C cancel with an error.
+fn prompt_openai_codex_method() -> Result<LoginMethod> {
+    use ratatui::crossterm::event;
+
+    println!("How do you want to log in to OpenAI Codex?");
+    println!("  (up/down to move, Enter to confirm, Esc to cancel)");
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        }
+    }
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    let guard = RawModeGuard;
+
+    let mut out = std::io::stdout();
+    let mut index = 0usize;
+    draw_method_menu(&mut out, index, false)?;
+
+    let result: Result<LoginMethod> = loop {
+        match event::read()? {
+            event::Event::Key(ev) if ev.kind == event::KeyEventKind::Press => {
+                match menu_action(&ev) {
+                    MenuAction::Up => index = menu_prev(index, OPENAI_CODEX_METHODS.len()),
+                    MenuAction::Down => index = menu_next(index, OPENAI_CODEX_METHODS.len()),
+                    MenuAction::Confirm => break Ok(OPENAI_CODEX_METHODS[index].0),
+                    MenuAction::Cancel => break Err(anyhow!("login cancelled")),
+                    MenuAction::Ignore => continue,
+                }
+                draw_method_menu(&mut out, index, true)?;
+            }
+            _ => {}
+        }
+    };
+    drop(guard);
+    println!();
+    result
 }
 
 /// Whether a bare flag is the resume-newest shorthand (`-c` / `--continue`).
@@ -817,36 +938,33 @@ fn login_anthropic() -> Result<()> {
 }
 
 fn print_help() {
-    eprintln!("Usage:");
-    eprintln!("  iris                              Start interactive agent");
-    eprintln!("  iris --plain                      Start in the plain, ANSI-free text UI");
-    eprintln!("  iris --no-alt-screen              Run inline instead of the alternate screen");
-    eprintln!(
-        "  iris -p \"prompt\"                  Print mode: run one turn, print the answer, exit"
-    );
-    eprintln!("  iris --print \"prompt\" --approve   Print mode, auto-approving gated tools");
-    eprintln!("    (piped stdin is merged into the prompt, e.g. `cat log | iris -p \"explain\"`)");
+    eprintln!("Usage: iris [command] [options]");
+    eprintln!();
+    eprintln!("Sessions:");
+    eprintln!("  iris                              Start the interactive agent");
     eprintln!("  iris -c, --continue               Resume the newest session for this directory");
-    eprintln!("  iris resume                       Pick a session to resume (picker on a TTY)");
-    eprintln!("  iris resume <session-id>          Resume a prior session by id");
+    eprintln!("  iris resume [session-id]          Pick a session to resume, or resume one by id");
     eprintln!("    (in-session: /resume picks a session, /new starts a fresh one)");
-    eprintln!("    (all resume forms accept --plain)");
-    eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
-    eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
-    eprintln!("  iris login openai                 Store an OpenAI API key");
-    eprintln!("  iris login openai-compatible      Store an OpenAI-compatible API key");
-    eprintln!("  iris login antigravity            Login with Google account OAuth");
-    eprintln!("  iris login anthropic              Login with Anthropic OAuth (browser)");
-    eprintln!("  iris login anthropic --api-key    Store an Anthropic API key");
+    eprintln!();
+    eprintln!("Print mode (run one turn, print the answer, exit):");
+    eprintln!("  iris -p, --print \"prompt\"         Add --approve to auto-approve gated tools;");
+    eprintln!(
+        "                                   piped stdin is merged: cat log | iris -p \"explain\""
+    );
+    eprintln!();
+    eprintln!("Login / update:");
+    eprintln!("  iris login <provider>             openai-codex (default), openai,");
+    eprintln!("                                   openai-compatible, antigravity, anthropic");
+    eprintln!("                                   flags: --device-code (openai-codex),");
+    eprintln!("                                          --api-key (anthropic)");
     eprintln!("  iris update                       Update Iris from GitHub");
     eprintln!();
-    eprintln!("Accessibility (environment):");
+    eprintln!("Display (flag / env var):");
+    eprintln!("  --plain, IRIS_PLAIN=1, NO_COLOR   Plain, ANSI-free text UI");
     eprintln!(
-        "  IRIS_PLAIN=1                      Use the plain, ANSI-free text UI (like --plain)"
+        "  --no-alt-screen, IRIS_NO_ALT_SCREEN=1  Run inline instead of the alternate screen"
     );
-    eprintln!("  NO_COLOR                          Disable color; routes to the plain text UI");
     eprintln!("  IRIS_REDUCED_MOTION=1             Freeze the working-indicator animation");
-    eprintln!("  IRIS_NO_ALT_SCREEN=1              Run inline (like --no-alt-screen)");
 }
 
 #[cfg(test)]
@@ -877,6 +995,37 @@ mod tests {
         assert_eq!(
             update_args(),
             &["install", "--git", UPDATE_REPO, "--locked", "--force"]
+        );
+    }
+
+    #[test]
+    fn openai_codex_menu_defaults_to_browser_first() {
+        assert_eq!(OPENAI_CODEX_METHODS[0].0, LoginMethod::Browser);
+    }
+
+    #[test]
+    fn menu_navigation_wraps_around() {
+        let len = OPENAI_CODEX_METHODS.len();
+        assert_eq!(menu_next(0, len), 1);
+        assert_eq!(menu_next(len - 1, len), 0);
+        assert_eq!(menu_prev(0, len), len - 1);
+        assert_eq!(menu_prev(1, len), 0);
+    }
+
+    #[test]
+    fn menu_action_maps_keys() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code| menu_action(&KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(key(KeyCode::Up), MenuAction::Up);
+        assert_eq!(key(KeyCode::Char('k')), MenuAction::Up);
+        assert_eq!(key(KeyCode::Down), MenuAction::Down);
+        assert_eq!(key(KeyCode::Char('j')), MenuAction::Down);
+        assert_eq!(key(KeyCode::Enter), MenuAction::Confirm);
+        assert_eq!(key(KeyCode::Esc), MenuAction::Cancel);
+        assert_eq!(key(KeyCode::Char('x')), MenuAction::Ignore);
+        assert_eq!(
+            menu_action(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            MenuAction::Cancel
         );
     }
 }
