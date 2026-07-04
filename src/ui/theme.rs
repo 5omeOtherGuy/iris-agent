@@ -11,9 +11,9 @@
 //! `docs/TUI_DESIGN_LANGUAGE.md` §2 (color is a point signal; never color
 //! alone) are enforced by render code, not by the theme.
 //!
-//! Draft status: this module defines the trait, palettes, registry, and active
-//! accessor. Migrating call sites from `palette::ROLE` constants to
-//! `theme::active().role()` is the follow-up implementation task.
+//! Call sites read roles through the themed [`super::palette`] accessors (e.g.
+//! `palette::border()`), which delegate to [`active`]; the raw `palette::ROLE`
+//! constants remain only as the terminal theme's ANSI-slot source.
 
 use std::sync::RwLock;
 
@@ -150,8 +150,11 @@ static GRUVBOX: FixedTheme = FixedTheme {
     diff_del_bg: rgb(0x3c, 0x1f, 0x1e),
 };
 
-static CATPPUCCIN: FixedTheme = FixedTheme {
-    id: "catppuccin",
+// Catppuccin ships four flavors; each maps the same roles (Overlay0 border,
+// Peach accent, Teal interactive, Green/Red, Surface0 fill) onto that flavor's
+// palette. Diff backgrounds are hand-tinted from each flavor's Base.
+static CATPPUCCIN_MOCHA: FixedTheme = FixedTheme {
+    id: "catppuccin-mocha",
     name: "Catppuccin Mocha",
     border: rgb(0x6c, 0x70, 0x86),
     accent: rgb(0xfa, 0xb3, 0x87),
@@ -161,6 +164,48 @@ static CATPPUCCIN: FixedTheme = FixedTheme {
     surface: rgb(0x31, 0x32, 0x44),
     diff_add_bg: rgb(0x27, 0x3c, 0x2e),
     diff_del_bg: rgb(0x43, 0x27, 0x2e),
+};
+
+static CATPPUCCIN_MACCHIATO: FixedTheme = FixedTheme {
+    id: "catppuccin-macchiato",
+    name: "Catppuccin Macchiato",
+    border: rgb(0x6e, 0x73, 0x8d),
+    accent: rgb(0xf5, 0xa9, 0x7f),
+    interactive: rgb(0x8b, 0xd5, 0xca),
+    success: rgb(0xa6, 0xda, 0x95),
+    danger: rgb(0xed, 0x87, 0x96),
+    surface: rgb(0x36, 0x3a, 0x4f),
+    diff_add_bg: rgb(0x2d, 0x45, 0x3a),
+    diff_del_bg: rgb(0x49, 0x30, 0x3a),
+};
+
+static CATPPUCCIN_FRAPPE: FixedTheme = FixedTheme {
+    id: "catppuccin-frappe",
+    name: "Catppuccin Frappe",
+    border: rgb(0x73, 0x79, 0x94),
+    accent: rgb(0xef, 0x9f, 0x76),
+    interactive: rgb(0x81, 0xc8, 0xbe),
+    success: rgb(0xa6, 0xd1, 0x89),
+    danger: rgb(0xe7, 0x82, 0x84),
+    surface: rgb(0x41, 0x45, 0x59),
+    diff_add_bg: rgb(0x39, 0x52, 0x46),
+    diff_del_bg: rgb(0x55, 0x3d, 0x46),
+};
+
+// Latte is Catppuccin's light flavor: it sets light-tuned roles, but Iris does
+// not own the full-screen background, so it looks correct only on a light
+// terminal. Diff backgrounds are pale tints of the light Base.
+static CATPPUCCIN_LATTE: FixedTheme = FixedTheme {
+    id: "catppuccin-latte",
+    name: "Catppuccin Latte",
+    border: rgb(0x9c, 0xa0, 0xb0),
+    accent: rgb(0xfe, 0x64, 0x0b),
+    interactive: rgb(0x17, 0x92, 0x99),
+    success: rgb(0x40, 0xa0, 0x2b),
+    danger: rgb(0xd2, 0x0f, 0x39),
+    surface: rgb(0xcc, 0xd0, 0xda),
+    diff_add_bg: rgb(0xd1, 0xe9, 0xcd),
+    diff_del_bg: rgb(0xef, 0xce, 0xd7),
 };
 
 static NORD: FixedTheme = FixedTheme {
@@ -246,7 +291,10 @@ pub(crate) fn available() -> &'static [&'static str] {
     &[
         "terminal",
         "gruvbox",
-        "catppuccin",
+        "catppuccin-latte",
+        "catppuccin-frappe",
+        "catppuccin-macchiato",
+        "catppuccin-mocha",
         "nord",
         "tokyo-night",
         "dracula",
@@ -264,7 +312,12 @@ pub(crate) fn resolve(id: &str) -> Option<&'static dyn Theme> {
     match id {
         "terminal" => Some(&TERMINAL),
         "gruvbox" => Some(&GRUVBOX),
-        "catppuccin" => Some(&CATPPUCCIN),
+        "catppuccin-latte" => Some(&CATPPUCCIN_LATTE),
+        "catppuccin-frappe" => Some(&CATPPUCCIN_FRAPPE),
+        "catppuccin-macchiato" => Some(&CATPPUCCIN_MACCHIATO),
+        "catppuccin-mocha" => Some(&CATPPUCCIN_MOCHA),
+        // Legacy alias: `catppuccin` shipped as Mocha before the flavors split.
+        "catppuccin" => Some(&CATPPUCCIN_MOCHA),
         "nord" => Some(&NORD),
         "tokyo-night" => Some(&TOKYO_NIGHT),
         "dracula" => Some(&DRACULA),
@@ -306,9 +359,44 @@ mod tests {
     #[test]
     fn resolve_returns_requested_theme() {
         assert_eq!(resolve("gruvbox").unwrap().id(), "gruvbox");
-        assert_eq!(resolve("catppuccin").unwrap().id(), "catppuccin");
+        assert_eq!(
+            resolve("catppuccin-mocha").unwrap().id(),
+            "catppuccin-mocha"
+        );
         assert_eq!(resolve("nord").unwrap().id(), "nord");
         assert_eq!(resolve("tokyo-night").unwrap().id(), "tokyo-night");
+    }
+
+    #[test]
+    fn all_four_catppuccin_flavors_resolve() {
+        for id in [
+            "catppuccin-latte",
+            "catppuccin-frappe",
+            "catppuccin-macchiato",
+            "catppuccin-mocha",
+        ] {
+            let t = resolve(id).unwrap();
+            assert_eq!(t.id(), id);
+            // Flavors are distinct fixed-RGB palettes, not the same table.
+            assert!(matches!(t.accent(), Color::Rgb(..)));
+        }
+        // The four flavors carry different accent (Peach) values.
+        let accents: std::collections::HashSet<_> = [
+            "catppuccin-latte",
+            "catppuccin-frappe",
+            "catppuccin-macchiato",
+            "catppuccin-mocha",
+        ]
+        .into_iter()
+        .map(|id| format!("{:?}", resolve(id).unwrap().accent()))
+        .collect();
+        assert_eq!(accents.len(), 4);
+    }
+
+    #[test]
+    fn legacy_catppuccin_id_aliases_mocha() {
+        // Configs saved before the flavor split used the bare `catppuccin` id.
+        assert_eq!(resolve("catppuccin").unwrap().id(), "catppuccin-mocha");
     }
 
     #[test]
