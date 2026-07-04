@@ -102,6 +102,28 @@ pub(crate) struct Settings {
     /// presence of this block engages the feature; an absent block leaves the
     /// feature off (no post-change checks, no reporting).
     pub(crate) verify: Option<VerifySettings>,
+    /// Terminal-UI behavior (ADR-0029 screen-mode policy). Display-only
+    /// preferences: no security-sensitive capability lives here.
+    pub(crate) tui: Option<TuiSettings>,
+    /// Where the git dropdown's `w` (new worktree) gesture creates worktrees,
+    /// relative to the main worktree root when not absolute. Absent ->
+    /// `../wt`. Project-tunable: it only picks a local directory for a
+    /// user-confirmed `git worktree add` (the resolved path is always shown
+    /// before create), granting no new capability.
+    pub(crate) worktree_root: Option<String>,
+}
+
+/// Terminal-UI settings block (`"tui": { ... }` in settings.json).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TuiSettings {
+    /// Alt-screen pager policy: `"auto" | "always" | "never"` (ADR-0029).
+    /// Parsed by `ui::screen_mode`; an invalid value is reported and the
+    /// built-in default applies.
+    pub(crate) alt_screen: Option<String>,
+    /// Mouse-wheel scroll step in lines for the pager (default 3, clamped to
+    /// `[1, 100]`).
+    pub(crate) scroll_speed: Option<u16>,
 }
 
 /// Raw per-project verification config (issue #265). Both fields optional: a
@@ -228,7 +250,34 @@ impl Settings {
             // so a cloned project may set it like the model or round-trip cap;
             // project value wins, else global.
             verify: project.verify.or(self.verify),
+            // Screen-mode policy is a display preference, not a security
+            // redirect, so a project may set it; project value wins, else
+            // global.
+            tui: project.tui.or(self.tui),
+            // A local worktree location preference; project value wins.
+            worktree_root: project.worktree_root.or(self.worktree_root),
         }
+    }
+
+    /// Where new worktrees are created: the configured `worktreeRoot` (absolute
+    /// or relative to `main_root`), defaulting to `../wt` beside the main
+    /// worktree root.
+    pub(crate) fn worktree_root(&self, main_root: &Path) -> PathBuf {
+        let raw = self.worktree_root.as_deref().unwrap_or("../wt");
+        let path = Path::new(raw);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            main_root.join(path)
+        };
+        // Resolve `.`/`..` lexically so the previewed and created worktree path
+        // is clean (`/repos/wt/x`, not `/repos/main/../wt/x`).
+        crate::tools::path::lexical_normalize(&joined)
+    }
+
+    /// The `tui` settings block, if configured.
+    pub(crate) fn tui_settings(&self) -> Option<&TuiSettings> {
+        self.tui.as_ref()
     }
 
     /// Resolved verification config, or `None` when no `verify` block is present
@@ -438,6 +487,25 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn worktree_root_default_is_normalized_beside_the_main_root() {
+        let settings = Settings::default();
+        // Default `../wt` resolves lexically, without a `..` component.
+        assert_eq!(
+            settings.worktree_root(Path::new("/repos/main")),
+            PathBuf::from("/repos/wt")
+        );
+        // An absolute override is used as-is (still normalized).
+        let abs = Settings {
+            worktree_root: Some("/srv/trees/./x".to_string()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            abs.worktree_root(Path::new("/repos/main")),
+            PathBuf::from("/srv/trees/x")
+        );
+    }
+
+    #[test]
     fn iris_flag_value_matches_the_opt_in_convention() {
         for on in ["1", "true", "yes", "on"] {
             assert!(iris_flag_value(Some(on)), "{on:?} should enable");
@@ -475,6 +543,32 @@ mod tests {
         let path = env::temp_dir().join(format!("iris-config-test-{nanos}-{seq}"));
         fs::create_dir(&path).unwrap();
         TempDir { path }
+    }
+
+    #[test]
+    fn tui_alt_screen_parses_and_project_value_wins() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "tui": { "altScreen": "never" } }"#).unwrap();
+        fs::write(&project, r#"{ "tui": { "altScreen": "auto" } }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(
+            settings
+                .tui_settings()
+                .and_then(|t| t.alt_screen.as_deref()),
+            Some("auto")
+        );
+
+        // Global-only config still surfaces, and an absent block yields None.
+        let only_global = Settings::load_from(Some(&global), &dir.path.join("nope.json")).unwrap();
+        assert_eq!(
+            only_global
+                .tui_settings()
+                .and_then(|t| t.alt_screen.as_deref()),
+            Some("never")
+        );
+        assert!(Settings::default().tui_settings().is_none());
     }
 
     #[test]

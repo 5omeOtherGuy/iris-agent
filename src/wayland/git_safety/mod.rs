@@ -30,8 +30,9 @@
 
 mod baseline;
 mod checkpoint;
-mod git;
+pub(crate) mod git;
 mod ledger;
+mod lock;
 mod net_diff;
 mod settlement;
 mod snapshot;
@@ -50,6 +51,7 @@ use crate::nexus::MutationGuard;
 use baseline::Baseline;
 use checkpoint::{CheckpointChain, Mode as FileMode};
 use ledger::{Attribution, Ledger, LedgerEntry};
+pub(crate) use settlement::{AdoptedTask, RecoverableTask, RecoveryOutcome};
 use settlement::{checkpoint_label, new_task_id};
 use snapshot::{FallbackStore, Snapshot};
 
@@ -78,10 +80,23 @@ pub(crate) struct RestorePoint {
     pub(crate) label: String,
 }
 
+/// A settled task (accept / explicit checkpoint): the user-facing summary plus
+/// the settled task id (ADR-0031), so the harness can append a `TaskSettled`
+/// audit entry. The id is metadata for the session-log join; enforcement never
+/// keys off it.
+pub(crate) struct Settlement {
+    pub(crate) summary: String,
+    pub(crate) task_id: String,
+}
+
 /// Outcome of a rollback attempt, surfaced to the user (Tier 3).
 pub(crate) struct RollbackOutcome {
     /// Human summary of what was restored.
     pub(crate) summary: String,
+    /// The settled task id when a task was actually rolled back (ADR-0031), for
+    /// the harness's `TaskSettled` audit append; `None` when there was no active
+    /// task. Display/join metadata only -- enforcement never reads it.
+    pub(crate) settled_task_id: Option<String>,
     /// Set when the user index could not be safely restored (mid-merge/rebase):
     /// the degrade-to-detect-and-warn path (ADR-0028).
     pub(crate) index_warning: Option<String>,
@@ -135,6 +150,20 @@ struct Task {
     git_dir: Option<PathBuf>,
     /// When this task first opened (epoch millis), for the expiry sweep.
     created_ms: u64,
+    /// The per-task advisory `flock` lease, held for the task's lifetime
+    /// (ADR-0030). Kept only to be dropped at settlement -- closing the fd
+    /// releases the lease, so recovery in another process sees the task as
+    /// orphaned. `None` in degraded mode or when the lease could not be
+    /// acquired (a logged, best-effort degrade).
+    _lease: Option<lock::FlockGuard>,
+    /// Opaque display body: the prompt preview of the turn whose first mutation
+    /// opened this task (ADR-0031), captured once and never rewritten. Written
+    /// verbatim into the persisted record; NO enforcement path reads it.
+    body: Option<String>,
+    /// Opaque display join: session ids that worked this task, ordered and
+    /// consecutive-deduped (ADR-0031). Written verbatim into the record; NO
+    /// enforcement path reads it.
+    sessions: Vec<String>,
 }
 
 impl Task {
@@ -143,6 +172,7 @@ impl Task {
         baseline: Baseline,
         chain: CheckpointChain,
         git_dir: Option<PathBuf>,
+        lease: Option<lock::FlockGuard>,
     ) -> Self {
         Self {
             degraded: false,
@@ -157,6 +187,9 @@ impl Task {
             chain: Chain::Git(chain),
             git_dir,
             created_ms: task_state::now_ms(),
+            _lease: lease,
+            body: None,
+            sessions: Vec::new(),
         }
     }
 
@@ -179,12 +212,34 @@ impl Task {
             chain: Chain::Fallback(FallbackStore::default()),
             git_dir: None,
             created_ms: task_state::now_ms(),
+            _lease: None,
+            body: None,
+            sessions: Vec::new(),
         }
     }
 }
 
 struct State {
     task: Option<Task>,
+    /// The current turn's prompt preview, handed by the harness before each turn
+    /// (ADR-0031). `note_mutation` consumes it as the opening task's `body` and
+    /// clears it; a follow-up turn joining an unsettled task clears it without
+    /// rewriting the body. Opaque display payload only.
+    pending_body: Option<String>,
+    /// The current session id, stamped onto a task's `sessions` join at open and
+    /// appended (consecutive-deduped) when a task is rehydrated/adopted. Opaque
+    /// display payload only.
+    session_id: Option<String>,
+}
+
+/// Append `session_id` to a task's `sessions` join, skipping a consecutive
+/// duplicate so re-adopting from the same session never grows the vec (ADR-0031
+/// ordered, consecutive-deduped). Opaque display payload; never read by
+/// enforcement.
+fn push_session_deduped(sessions: &mut Vec<String>, session_id: &str) {
+    if sessions.last().map(String::as_str) != Some(session_id) {
+        sessions.push(session_id.to_string());
+    }
 }
 
 /// The Tier-2 dirty-tree safety guard. Owned by the harness, injected into each
@@ -208,7 +263,11 @@ impl GitSafety {
         Self {
             workspace: canonical,
             mode,
-            state: Mutex::new(State { task: None }),
+            state: Mutex::new(State {
+                task: None,
+                pending_body: None,
+                session_id: None,
+            }),
             scan: Mutex::new(None),
         }
     }
@@ -240,6 +299,49 @@ impl GitSafety {
             task.approved.clear();
             task.all_dirty_approved = false;
         }
+    }
+
+    /// Set the current turn's prompt preview (ADR-0031), handed by the harness
+    /// before each turn. `note_mutation` consumes it as the opening task's
+    /// opaque `body` if this turn opens a task, and clears it otherwise so a
+    /// follow-up turn never rewrites an existing task's body. Deterministic
+    /// display payload; no enforcement path reads it.
+    pub(crate) fn set_turn_context(&self, preview: Option<String>) {
+        self.state.lock().unwrap().pending_body = preview;
+    }
+
+    /// Set the current session id (ADR-0031): stamped onto a task's opaque
+    /// `sessions` join at open, and appended (consecutive-deduped) when this
+    /// process rehydrates/adopts a task. Display payload only.
+    pub(crate) fn set_session_id(&self, id: String) {
+        self.state.lock().unwrap().session_id = Some(id);
+    }
+
+    /// The active task's id, or `None` when no task is open (ADR-0031). Polled by
+    /// the harness post-turn to observe "a task opened this turn" so it can
+    /// append the `TaskOpened` audit entry.
+    pub(crate) fn current_task_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .map(|task| task.task_id.clone())
+    }
+
+    /// Read-only display payload of the ACTIVE (live, unsettled) task, for the
+    /// unified task UI (ADR-0031): its id plus the opaque `body`/`sessions`
+    /// copy, mapped exactly as the recovery DTOs surface them. `None` when no
+    /// task is open. Display-only observation -- no enforcement path reads it,
+    /// and reading it never mutates task state.
+    pub(crate) fn active_task_display(&self) -> Option<ActiveTaskDisplay> {
+        let state = self.state.lock().unwrap();
+        let task = state.task.as_ref()?;
+        Some(ActiveTaskDisplay {
+            task_id: task.task_id.clone(),
+            body: task.body.clone(),
+            sessions: task.sessions.clone(),
+        })
     }
 
     /// Number of ledger entries recorded in the current task (test-only).
@@ -316,6 +418,9 @@ impl GitSafety {
                 // committed content as the pre-task image (best-effort) and open
                 // a restore point over the running diff. A file with no committed
                 // predecessor is treated as a create (base rollback deletes it).
+                // As in `after_exec`, these per-task ref writes are single-writer
+                // under the held lease and need no mutation lock; the shared
+                // record write in `persist_task` is the serialized one.
                 if !touched.is_empty()
                     && let Chain::Git(chain) = &mut task.chain
                 {
@@ -365,8 +470,16 @@ impl GitSafety {
             expected,
             tip_seq,
             baseline_index: task.baseline.index.clone(),
+            owner: Some(lock::process_owner()),
+            lock_protocol: Some(lock::LOCK_PROTOCOL.to_string()),
+            // Opaque display payload, written verbatim (ADR-0031). Never read by
+            // any enforcement/recovery path.
+            body: task.body.clone(),
+            sessions: task.sessions.clone(),
         };
-        if let Err(error) = task_state::save(git_dir, &record) {
+        // Serialize the record write against concurrent processes (ADR-0030).
+        if let Err(error) = lock::with_mutation_lock(git_dir, || task_state::save(git_dir, &record))
+        {
             tracing::warn!(error = %format!("{error:#}"), "failed to persist task recovery record");
         }
     }
@@ -390,6 +503,62 @@ fn detect_mode(workspace: &Path) -> Mode {
                 .to_string(),
         )
     }
+}
+
+/// Read-only display payload of the active (live, unsettled) task, surfaced to
+/// the unified task UI (ADR-0031). Mirrors [`AdoptedTask`](settlement::AdoptedTask):
+/// opaque `body`/`sessions` display copy only, so the private [`Task`] never
+/// leaks past the harness. No enforcement or recovery path reads these fields.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveTaskDisplay {
+    pub(crate) task_id: String,
+    pub(crate) body: Option<String>,
+    pub(crate) sessions: Vec<String>,
+}
+
+/// Read-only view of one persisted (unsettled) Iris task, for the session-bar
+/// git status snapshot (issue: SessionBar disclosures). Sourced from the
+/// durable `<git-dir>/iris/tasks/*.json` records so it can be read from any
+/// thread and for any worktree without touching live [`GitSafety`] state.
+#[derive(Debug, Clone)]
+pub(crate) struct UnsettledTaskView {
+    pub(crate) task_id: String,
+    /// Time since the record was last updated.
+    pub(crate) age: std::time::Duration,
+    /// Ledger paths with the op-log's expected on-disk content hash (`None` =
+    /// the path should be absent). A path whose current hash matches is an
+    /// Iris-unsettled change; a diverged path is user-attributed (the same
+    /// certainty rule as rollback's TOCTOU reconciliation).
+    pub(crate) expected: Vec<(PathBuf, Option<String>)>,
+}
+
+/// Load the unsettled-task records for `workspace` (read-only; no rehydration,
+/// no expiry side effects). Empty when the directory is not a git worktree or
+/// holds no unsettled task. Task records are per-worktree by construction
+/// (linked worktrees resolve to `.git/worktrees/<name>`), so probing each
+/// worktree path yields that worktree's own tasks.
+pub(crate) fn unsettled_tasks(workspace: &Path) -> Vec<UnsettledTaskView> {
+    let Some(git_dir) = task_state::git_dir(workspace) else {
+        return Vec::new();
+    };
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace_str = canonical.to_string_lossy().into_owned();
+    let now = task_state::now_ms();
+    task_state::load_all(&git_dir)
+        .into_iter()
+        .filter(|task| task.workspace == workspace_str)
+        .map(|task| UnsettledTaskView {
+            age: std::time::Duration::from_millis(now.saturating_sub(task.updated_ms)),
+            expected: task
+                .expected
+                .iter()
+                .map(|(path, hash)| (PathBuf::from(path), hash.clone()))
+                .collect(),
+            task_id: task.task_id,
+        })
+        .collect()
 }
 
 /// Attribution scan body (runs on a background thread): re-capture status and
@@ -435,13 +604,44 @@ impl MutationGuard for GitSafety {
         self.sync_barrier();
         let mut state = self.state.lock().unwrap();
         if state.task.is_some() {
-            // Baseline already captured and announced for this task.
+            // Baseline already captured and announced for this task. A follow-up
+            // turn joining an unsettled task must NOT rewrite its body (captured
+            // once at open, ADR-0031), so drop this turn's pending preview.
+            state.pending_body = None;
+            // The live join, however, must record the CURRENT session: after a
+            // passive session swap (/new, /resume) the SAME unsettled task is
+            // joined by a new session, and the record's `sessions` vec is the
+            // authoritative live join for recovery UX (ADR-0031). Append it
+            // (consecutive-deduped, so a same-session follow-up is a no-op) and
+            // re-persist so the new join survives a crash -- without touching
+            // body. `sessions` stays opaque display payload; no enforcement path
+            // reads it.
+            let session_id = state.session_id.clone();
+            let mut changed = false;
+            if let (Some(id), Some(task)) = (session_id.as_ref(), state.task.as_mut()) {
+                let before = task.sessions.len();
+                push_session_deduped(&mut task.sessions, id);
+                changed = task.sessions.len() != before;
+            }
+            if changed && let Some(task) = state.task.as_ref() {
+                self.persist_task(task);
+            }
             return None;
         }
         let task_id = new_task_id();
+        // Consume the opening turn's prompt preview as the task body (once,
+        // never rewritten) and stamp the current session id onto its join. Both
+        // are opaque display payload -- no enforcement path reads them.
+        let body = state.pending_body.take();
+        let session_id = state.session_id.clone();
         match &self.mode {
             Mode::Degraded(reason) => {
-                state.task = Some(Task::degraded(task_id));
+                let mut task = Task::degraded(task_id);
+                task.body = body;
+                if let Some(id) = session_id {
+                    push_session_deduped(&mut task.sessions, &id);
+                }
+                state.task = Some(task);
                 Some(reason.clone())
             }
             Mode::Git => match baseline::capture(&self.workspace, |path| self.normalize(path)) {
@@ -454,15 +654,38 @@ impl MutationGuard for GitSafety {
                         )
                     });
                     let git_dir = task_state::git_dir(&self.workspace);
+                    // Acquire the per-task lease for the task's lifetime: it
+                    // proves this process owns and is live on the task, so
+                    // recovery in another process skips it (ADR-0030). A brand-new
+                    // random id is always lease-free; a lock-file IO error is a
+                    // logged, best-effort degrade (the turn still proceeds).
+                    let lease = git_dir.as_ref().and_then(|dir| {
+                        match lock::try_exclusive(&lock::lease_path(dir, &task_id)) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                tracing::warn!(error = %error, "could not acquire task lease; recovery liveness unprotected this task");
+                                None
+                            }
+                        }
+                    });
                     let chain = CheckpointChain::new(self.workspace.clone(), task_id.clone());
-                    let task = Task::active(task_id, baseline, chain, git_dir);
+                    let mut task = Task::active(task_id, baseline, chain, git_dir, lease);
+                    task.body = body;
+                    if let Some(id) = session_id {
+                        push_session_deduped(&mut task.sessions, &id);
+                    }
                     self.persist_task(&task);
                     state.task = Some(task);
                     summary
                 }
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "git baseline capture failed; degrading dirty-tree safety this task");
-                    state.task = Some(Task::degraded(task_id));
+                    let mut task = Task::degraded(task_id);
+                    task.body = body;
+                    if let Some(id) = session_id {
+                        push_session_deduped(&mut task.sessions, &id);
+                    }
+                    state.task = Some(task);
                     Some(format!(
                         "could not read git status ({error:#}); dirty-tree gating disabled this task"
                     ))
@@ -608,6 +831,15 @@ impl MutationGuard for GitSafety {
             // A confirmed set of Iris changes opens a new checkpoint over the
             // running (unsettled) diff: snapshot the current ledger-path content
             // into the chain as one restore point (ADR-0028 auto-checkpoint).
+            //
+            // The `refs/iris/checkpoints/<task-id>/` writes below are NOT wrapped
+            // in the repo mutation lock: this task's refs are single-writer by
+            // construction -- only the process holding this task's advisory lease
+            // writes them, and recovery/expiry/adoption in another process must
+            // first claim that lease (ADR-0030), so no other process can read or
+            // write these refs concurrently. The shared write that DOES race
+            // across processes -- the record file in the shared tasks dir -- is
+            // serialized inside `persist_task`.
             if !iris_changes.is_empty() {
                 let turn = task.turn;
                 let label = checkpoint_label(&iris_changes);

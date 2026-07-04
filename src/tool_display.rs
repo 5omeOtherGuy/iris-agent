@@ -15,6 +15,93 @@ use serde_json::Value;
 
 use crate::nexus::ToolCall;
 
+/// The danger-toned clause appended to an approval reason when the call tripped
+/// the destructive floor (ADR-0010). Rendered red in the TUI; the sentence
+/// itself carries the meaning so the warning survives the monochrome test.
+pub(crate) const APPROVAL_DESTRUCTIVE_NOTE: &str =
+    "Flagged destructive: may delete or overwrite data.";
+
+/// The base explanatory sentence for an approval prompt, derived deterministically
+/// from the call — the muted lead of the reason line. Presentation-only Tier-3
+/// copy (never sent to the model): `bash` runs a shell command, `edit`/`write`
+/// name the file (falling back to a generic clause when the path is unparsable),
+/// and any other tool reports its name.
+pub(crate) fn approval_reason_lead(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "bash" => "Runs a shell command in the workspace.".to_string(),
+        "edit" => match approval_reason_path(call) {
+            Some(path) => format!("Modifies {path}."),
+            None => "Modifies files in the workspace.".to_string(),
+        },
+        "write" => match approval_reason_path(call) {
+            Some(path) => format!("Creates or overwrites {path}."),
+            None => "Modifies files in the workspace.".to_string(),
+        },
+        other => format!("Runs the {other} tool."),
+    }
+}
+
+/// The display path an `edit`/`write` approval reason names, or `None` when the
+/// call carries no usable path (so the caller uses the generic fallback). Mirrors
+/// [`file_summary`]'s key precedence (`file_path` then `path`).
+fn approval_reason_path(call: &ToolCall) -> Option<String> {
+    call.arguments
+        .get("file_path")
+        .or_else(|| call.arguments.get("path"))
+        .and_then(Value::as_str)
+        .map(display_path)
+}
+
+/// The muted dirty-tree clause for an approval reason, or `None` when the gate
+/// did not fire. Lists the workspace-relative paths, truncating the tail with an
+/// `…` once the joined list would exceed `max` display columns so a long list
+/// never blows past the surface width. Width-aware (display columns, not
+/// chars), and ellipsizes even a single overlong first path so the clause never
+/// exceeds the budget on its own. Presentation-only.
+pub(crate) fn approval_dirty_note(dirty_paths: &[String], max: usize) -> Option<String> {
+    use crate::ui::textengine::{display_width, truncate_to_width};
+    if dirty_paths.is_empty() {
+        return None;
+    }
+    let prefix = "Touches uncommitted user changes: ";
+    let budget = max.saturating_sub(display_width(prefix) + 1);
+    let ellipsis = "\u{2026}";
+    // A first path that alone exceeds the budget is ellipsized in place rather
+    // than shown in full (which would overflow the surface width).
+    if display_width(&dirty_paths[0]) > budget {
+        let head = truncate_to_width(
+            &dirty_paths[0],
+            budget.saturating_sub(display_width(ellipsis)),
+        );
+        return Some(format!("{prefix}{head}{ellipsis}."));
+    }
+    let mut list = String::new();
+    let mut shown = 0usize;
+    for path in dirty_paths {
+        let candidate = if list.is_empty() {
+            path.clone()
+        } else {
+            format!("{list}, {path}")
+        };
+        // Keep room for the trailing ", …" if more paths remain unshown.
+        let reserve = if shown + 1 < dirty_paths.len() {
+            display_width(", ") + display_width(ellipsis)
+        } else {
+            0
+        };
+        if shown > 0 && display_width(&candidate) + reserve > budget {
+            break;
+        }
+        list = candidate;
+        shown += 1;
+    }
+    if shown < dirty_paths.len() {
+        list.push_str(", ");
+        list.push_str(ellipsis);
+    }
+    Some(format!("{prefix}{list}."))
+}
+
 // Display caps for folded tool output bodies; presentation-only, never affect
 // the model (the full output still flows to the provider independently).
 const MAX_DISPLAY_LINES: usize = 12;
@@ -348,6 +435,40 @@ fn truncate_inline(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dirty_note_truncates_by_display_width_not_chars() {
+        // Wide (2-column) CJK path: 10 chars but 20 columns. With a budget that
+        // fits the chars-count but not the columns, the note must ellipsize.
+        let wide = "\u{4e2d}".repeat(10);
+        let note =
+            approval_dirty_note(&[wide], "Touches uncommitted user changes: ".len() + 12).unwrap();
+        assert!(note.ends_with("\u{2026}."), "{note}");
+        assert!(
+            crate::ui::textengine::display_width(&note)
+                <= "Touches uncommitted user changes: ".len() + 12,
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn dirty_note_ellipsizes_a_single_overlong_first_path() {
+        let long = "a/".repeat(100);
+        let max = 60;
+        let note = approval_dirty_note(&[long], max).unwrap();
+        assert!(note.contains('\u{2026}'), "{note}");
+        assert!(
+            crate::ui::textengine::display_width(&note) <= max,
+            "{}: {note}",
+            crate::ui::textengine::display_width(&note)
+        );
+    }
+
+    #[test]
+    fn dirty_note_keeps_short_lists_verbatim() {
+        let note = approval_dirty_note(&["a.rs".into(), "b.rs".into()], 120).unwrap();
+        assert_eq!(note, "Touches uncommitted user changes: a.rs, b.rs.");
+    }
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall {

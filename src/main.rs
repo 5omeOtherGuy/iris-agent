@@ -16,6 +16,7 @@ mod approval;
 mod cli;
 mod config;
 mod errors;
+mod git;
 mod handles;
 mod mimir;
 mod nexus;
@@ -57,7 +58,15 @@ fn main() -> ExitCode {
 }
 
 fn dispatch() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    // `--no-alt-screen` (ADR-0029) is positional-agnostic: strip it before the
+    // command table so every entry point honors it, and record it for the
+    // screen-mode resolver.
+    let before = args.len();
+    args.retain(|arg| arg != "--no-alt-screen");
+    if args.len() != before {
+        ui::screen_mode::set_no_alt_screen_cli();
+    }
     // Headless `--print` mode is detected before the command table so `-p`/
     // `--print` (with an optional `--approve` in any position) dispatches to the
     // one-shot runner; a malformed print invocation falls through to the usage
@@ -110,16 +119,6 @@ fn dispatch() -> Result<()> {
             if command == "login" && provider == "anthropic" && flag == "--api-key" =>
         {
             login_api_key(mimir::selection::ProviderId::Anthropic)
-        }
-        [command, provider, flag]
-            if command == "login" && provider == "openai" && flag == "--api-key" =>
-        {
-            login_api_key(mimir::selection::ProviderId::OpenAi)
-        }
-        [command, provider, flag]
-            if command == "login" && provider == "openai-compatible" && flag == "--api-key" =>
-        {
-            login_api_key(mimir::selection::ProviderId::OpenAiCompatible)
         }
         [command] if command == "update" => update_agent(),
         [command] if command == "help" || command == "--help" || command == "-h" => {
@@ -283,7 +282,19 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
     let swap_cwd = cwd.clone();
     let swap =
         move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
-    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, startup_modal)
+    // The start page (IrisMark + launcher) shows only when Iris launches
+    // interactively with no task and no resume target; a bare `iris resume`
+    // opens the resume picker instead.
+    let start_page = startup_modal.is_none();
+    cli::run_interactive(
+        &mut harness,
+        &mut switch,
+        force_plain,
+        settings.tui_settings(),
+        &swap,
+        startup_modal,
+        start_page,
+    )
 }
 
 /// Load the transcript state for an in-session `/resume` `/new` swap and point
@@ -471,7 +482,15 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     let swap_cwd = cwd.clone();
     let swap =
         move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
-    cli::run_interactive(&mut harness, &mut switch, force_plain, &swap, None)
+    cli::run_interactive(
+        &mut harness,
+        &mut switch,
+        force_plain,
+        settings.tui_settings(),
+        &swap,
+        None,
+        false,
+    )
 }
 
 /// Log the most recent prior session for `cwd` (if any) via the read side of
@@ -801,6 +820,7 @@ fn print_help() {
     eprintln!("Usage:");
     eprintln!("  iris                              Start interactive agent");
     eprintln!("  iris --plain                      Start in the plain, ANSI-free text UI");
+    eprintln!("  iris --no-alt-screen              Run inline instead of the alternate screen");
     eprintln!(
         "  iris -p \"prompt\"                  Print mode: run one turn, print the answer, exit"
     );
@@ -810,8 +830,8 @@ fn print_help() {
     eprintln!("  iris resume                       Pick a session to resume (picker on a TTY)");
     eprintln!("  iris resume <session-id>          Resume a prior session by id");
     eprintln!("    (in-session: /resume picks a session, /new starts a fresh one)");
+    eprintln!("    (all resume forms accept --plain)");
     eprintln!("  iris login openai-codex           Login with browser OAuth (default)");
-    eprintln!("  iris login openai-codex --browser Login with browser OAuth");
     eprintln!("  iris login openai-codex --device-code Login with device-code OAuth");
     eprintln!("  iris login openai                 Store an OpenAI API key");
     eprintln!("  iris login openai-compatible      Store an OpenAI-compatible API key");
@@ -826,6 +846,7 @@ fn print_help() {
     );
     eprintln!("  NO_COLOR                          Disable color; routes to the plain text UI");
     eprintln!("  IRIS_REDUCED_MOTION=1             Freeze the working-indicator animation");
+    eprintln!("  IRIS_NO_ALT_SCREEN=1              Run inline (like --no-alt-screen)");
 }
 
 #[cfg(test)]

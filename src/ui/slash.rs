@@ -71,6 +71,16 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/tasks",
+        description: "Open the task surface (active + recoverable tasks; adopt/inspect)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/sessions",
+        description: "List sessions that worked a task id (deterministic lookup)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/copy",
         description: "Copy the last assistant reply to the clipboard",
         action: SlashAction::Submit,
@@ -91,6 +101,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/approval",
+        description: "Set the approval preset [strict|auto|never]",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/trust",
         description: "View or edit this project's permission policy",
         action: SlashAction::Submit,
@@ -108,6 +123,31 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/logout",
         description: "Remove provider authentication",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/find",
+        description: "Search the transcript (n/N navigate; /find clears) (pager mode)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/terminal-setup",
+        description: "Check terminal capabilities (multiplexer, OSC 52, keys) with fixes",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/mouse",
+        description: "Toggle mouse capture (off = terminal-native select/copy) (pager mode)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/git",
+        description: "Open the git console (switch, worktrees, settle the task)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/tree",
+        description: "Open the directory tree (↵ references a file in the composer)",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -242,13 +282,29 @@ mod tests {
         assert_eq!(matches("/rea")[0].name, "/reasoning");
         assert_eq!(matches("/c")[0].name, "/copy");
         assert_eq!(matches("/d")[0].name, "/debug");
-        // `/se` narrows to the session/settings pair, prefix order preserved.
+        // `/se` narrows to the session/sessions/settings set, registry order
+        // preserved.
         let se = matches("/se");
-        assert_eq!(se.len(), 2);
+        assert_eq!(se.len(), 3);
         assert_eq!(se[0].name, "/session");
-        assert_eq!(se[1].name, "/settings");
+        assert_eq!(se[1].name, "/sessions");
+        assert_eq!(se[2].name, "/settings");
         assert!(matches("/zzz").is_empty());
         assert!(matches("hello").is_empty());
+    }
+
+    #[test]
+    fn tasks_command_is_registered_and_submits() {
+        // Regression: `/tasks` has a real handler in `route_command` (the
+        // ADR-0031 task surface); it must be in the registry so the palette
+        // makes it discoverable, like every other backed command.
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.name == "/tasks")
+            .expect("/tasks must be registered");
+        assert_eq!(cmd.action, SlashAction::Submit);
+        // `/task` (and the full `/tasks`) narrow to it in the palette.
+        assert_eq!(matches("/task")[0].name, "/tasks");
     }
 
     #[test]

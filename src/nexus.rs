@@ -62,6 +62,50 @@ pub(crate) enum ApprovalDecision {
     Deny,
 }
 
+/// Operator-selected approval preset (ADR-0032). A UX-facing preset over the
+/// approval-policy axis; Nexus remains the enforcement point (ADR-0005). The
+/// mode never bypasses a safety floor (destructive/dirty/sandbox): it only
+/// decides what happens for a call that is NOT already blocked by a floor and
+/// NOT covered by an explicit session/project grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ApprovalMode {
+    /// `strict` / `on-request`: prompt for every non-allowlisted gated call.
+    /// The historical default; behavior is unchanged from before ADR-0032.
+    #[default]
+    Strict,
+    /// `auto`: additionally auto-run calls Nexus can prove safe under the
+    /// deterministic auto policy (a clean, in-workspace `edit`/`write`); every
+    /// other gated call still prompts. Never bypasses a floor.
+    Auto,
+    /// `never` / `never-ask`: never prompt. A call that would require a prompt
+    /// is denied and returned to the model as a normal denied result. Explicit
+    /// non-floor session/project grants still run (they are not "prompts").
+    NeverAsk,
+}
+
+impl ApprovalMode {
+    /// Stable lowercase token for parsing/rendering (`strict`/`auto`/`never`).
+    pub(crate) fn as_token(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Auto => "auto",
+            Self::NeverAsk => "never",
+        }
+    }
+
+    /// Parse a user token from `/approval <mode>`. Accepts the canonical tokens
+    /// plus the ADR's status-label spellings; unknown input yields `None` so
+    /// the caller can show usage.
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "strict" | "on-request" | "onrequest" => Some(Self::Strict),
+            "auto" => Some(Self::Auto),
+            "never" | "never-ask" | "neverask" => Some(Self::NeverAsk),
+            _ => None,
+        }
+    }
+}
+
 /// A single persistent project-policy grant (ADR-0027), derived by Nexus from
 /// an approved call. Data only: how it is persisted is the host's concern (a
 /// [`ProjectPolicySink`] injected at construction).
@@ -413,6 +457,25 @@ pub(crate) trait SteeringSource {
     fn take_follow_up(&self) -> Vec<String>;
 }
 
+/// Structured review facts Nexus derives at the gate and threads to the
+/// front-end (issue #262/ADR-0010, ADR-0028). Facts only, never UI copy: Nexus
+/// owns the contract and computes `destructive`/`dirty_paths` at the call site;
+/// Tier 3 turns them into the explanatory reason line at the decision point
+/// (docs/ARCHITECTURE.md tier rules). Cheap to clone (a bool plus a short list
+/// of already-computed display paths), so it crosses the seam by value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReviewContext {
+    /// The call performs a destructive, data-losing operation (the ADR-0010
+    /// floor fired): even an allowed tool re-prompts. Drives a danger-toned
+    /// note in the reason line.
+    pub(crate) destructive: bool,
+    /// Workspace-relative display paths of pre-existing uncommitted changes the
+    /// call would touch (ADR-0028 dirty-tree gate). Non-empty means the dirty
+    /// gate fired, so "always" here means "all dirty files this task" and no
+    /// per-project grant is offered.
+    pub(crate) dirty_paths: Vec<String>,
+}
+
 /// Request/response approval gate. Async so the loop can race a pending approval
 /// against cancellation (`tokio::select!`); the loop branches on the returned
 /// decision to control execution. Mirrors pi's `beforeToolCall` config hook,
@@ -423,12 +486,15 @@ pub(crate) trait ApprovalGate {
     /// front-end only offers an "always allow" choice the loop will honor (shell
     /// tools opt out, so their prompt is y/N only). `allow_project` is true when
     /// a persistent per-project grant (ADR-0027) is on offer -- never for a
-    /// destructive call (ADR-0010 floor).
+    /// destructive call (ADR-0010 floor). `ctx` carries the structured review
+    /// facts (destructive floor, dirty-tree paths) the front-end renders into
+    /// its reason line -- facts, never copy.
     fn review<'a>(
         &'a self,
         call: &'a ToolCall,
         allow_always: bool,
         allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a>;
 }
 
@@ -606,6 +672,16 @@ pub(crate) trait Tool {
     fn supports_allow_always(&self) -> bool {
         true
     }
+    /// Whether this exact call is eligible for deterministic auto-approval under
+    /// the `auto` preset (ADR-0032), ASSUMING no floor blocks it. This is a
+    /// classification request, never an authorization (ADR-0014): Nexus consults
+    /// it only when the session approval mode is `Auto`, and always applies the
+    /// destructive and dirty-tree floors first. Default: not auto-eligible, so a
+    /// tool must opt in. `edit`/`write` opt in for in-workspace targets; `bash`
+    /// does not (its safe-auto path needs a proven sandbox preflight, deferred).
+    fn auto_approvable(&self, _workspace: &Path, _args: &Value) -> bool {
+        false
+    }
     /// Optional pre-approval diff preview (Tier-3 presentation). `None` when the
     /// tool has no preview or the arguments are malformed.
     fn diff_preview(&self, _workspace: &Path, _args: &Value) -> Option<String> {
@@ -773,6 +849,11 @@ pub(crate) struct Agent<P> {
     // Persistence seam for new project grants. `None` (e.g. headless print)
     // keeps a grant in-memory for the process lifetime only.
     policy_sink: Option<Box<dyn ProjectPolicySink>>,
+    // Operator-selected approval preset (ADR-0032). Installed by the host at
+    // construction and changed at inter-turn boundaries via `set_approval_mode`.
+    // Nexus owns the enforcement: the mode only decides prompt-vs-auto-vs-deny
+    // for a call not already blocked by a floor or covered by an explicit grant.
+    approval_mode: ApprovalMode,
     // Provider/model round-trip id sequence. Nexus owns these ids because it
     // owns the provider loop; Wayland may persist them, but never mints them.
     next_provider_turn_seq: u32,
@@ -860,6 +941,7 @@ impl<P: ChatProvider> Agent<P> {
             session_allowed: HashSet::new(),
             project_policy: ProjectPolicy::default(),
             policy_sink: None,
+            approval_mode: ApprovalMode::default(),
             next_provider_turn_seq: 0,
             max_tool_roundtrips: None,
             mutated_this_turn: false,
@@ -883,6 +965,17 @@ impl<P: ChatProvider> Agent<P> {
     /// grant/revoke edits at the safe inter-turn boundary).
     pub(crate) fn set_project_policy(&mut self, policy: ProjectPolicy) {
         self.project_policy = policy;
+    }
+
+    /// Change the approval preset (ADR-0032). Called by the host at a safe
+    /// inter-turn boundary (the `/approval` control); enforcement stays here.
+    pub(crate) fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.approval_mode = mode;
+    }
+
+    /// The active approval preset, for the host to render the status label.
+    pub(crate) fn approval_mode(&self) -> ApprovalMode {
+        self.approval_mode
     }
 
     /// Install an optional graceful soft cap on tool round-trips per turn.
@@ -910,6 +1003,7 @@ impl<P: ChatProvider> Agent<P> {
             session_allowed: HashSet::new(),
             project_policy: ProjectPolicy::default(),
             policy_sink: None,
+            approval_mode: ApprovalMode::default(),
             next_provider_turn_seq,
             max_tool_roundtrips: None,
             mutated_this_turn: false,
@@ -1493,6 +1587,18 @@ impl<P: ChatProvider> Agent<P> {
             Vec::new()
         };
         let dirty_gate = !dirty_protected.is_empty();
+        // Workspace-relative display paths for the dirty-tree gate, computed
+        // once: reused by the Notice (transcript record) and threaded to the
+        // front-end via `ReviewContext` for the decision-point reason line.
+        let dirty_display: Vec<String> = dirty_protected
+            .iter()
+            .map(|path| {
+                path.strip_prefix(env.workspace)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
         if let Some(tool) = self.tools.by_name(&call.name) {
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
                 obs.on_event(AgentEvent::DiffPreview {
@@ -1524,8 +1630,23 @@ impl<P: ChatProvider> Agent<P> {
                 // touching a pre-existing dirty file always prompts this task,
                 // no matter what the session/project policy grants. Like the
                 // destructive floor, it cannot be silently auto-run.
-                let auto_approved =
-                    !destructive && !dirty_gate && (session_allowed || project_allowed);
+                //
+                // ADR-0032 floors: a destructive command or a protected dirty
+                // target prevents silent execution before any grant or preset is
+                // consulted. (The sandbox floor lives in the tool's
+                // `auto_approvable`, which returns false for `bash` in v1, so
+                // unproven sandboxed bash never auto-runs.)
+                let blocked_by_floor = destructive || dirty_gate;
+                let explicit_allowed = session_allowed || project_allowed;
+                // `auto` preset: additionally auto-run a call the deterministic
+                // auto policy proves safe. Consulted only in Auto mode and only
+                // after the floors, so it is a classification input, never an
+                // authority (ADR-0014). Explicit grants (`explicit_allowed`) run
+                // in every mode -- including `never` -- because they are not a
+                // prompt; the auto preset does not.
+                let auto_allowed = self.approval_mode == ApprovalMode::Auto
+                    && tool.auto_approvable(env.workspace, &call.arguments);
+                let auto_approved = !blocked_by_floor && (explicit_allowed || auto_allowed);
                 if auto_approved {
                     obs.on_event(AgentEvent::ToolAutoApproved(call.clone()))?;
                     emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
@@ -1536,20 +1657,36 @@ impl<P: ChatProvider> Agent<P> {
                         obs.on_event(AgentEvent::Notice(message.to_string()))?;
                     }
                     if dirty_gate {
-                        let list = dirty_protected
-                            .iter()
-                            .map(|path| {
-                                path.strip_prefix(env.workspace)
-                                    .unwrap_or(path)
-                                    .display()
-                                    .to_string()
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let list = dirty_display.join(", ");
                         obs.on_event(AgentEvent::Notice(format!(
                             "uncommitted changes in {list}: approval required before Iris modifies it"
                         )))?;
                     }
+                    // Never-ask (ADR-0032): a call that reaches the prompt path
+                    // is an unresolved prompt -- deny it instead of asking. An
+                    // explicit non-floor session/project grant already set
+                    // `auto_approved` above, so it never lands here; only a
+                    // floor-blocked call or an ungranted call does. Return a
+                    // normal denied result so the model sees a refusal, not a
+                    // silent bypass.
+                    if self.approval_mode == ApprovalMode::NeverAsk {
+                        tracing::info!(
+                            tool = %call.name,
+                            "tool call denied by never-ask mode (prompt suppressed)"
+                        );
+                        obs.on_event(AgentEvent::Notice(format!(
+                            "never-ask mode: `{}` would prompt for approval; denied",
+                            call.name
+                        )))?;
+                        return Ok(ToolOutcome::Denied);
+                    }
+                    // Facts, not copy: the destructive floor and the dirty-tree
+                    // paths cross to the front-end so it can render the reason
+                    // line at the decision point (docs/ARCHITECTURE.md).
+                    let review_ctx = ReviewContext {
+                        destructive,
+                        dirty_paths: dirty_display.clone(),
+                    };
                     // Race the approval against cancellation so a pending prompt
                     // does not pin the turn open after a Ctrl-C. Cancellation is
                     // recorded as a cancelled call (not a denial) so the transcript
@@ -1573,6 +1710,7 @@ impl<P: ChatProvider> Agent<P> {
                             call,
                             tool.supports_allow_always() || dirty_gate,
                             !destructive && !dirty_gate,
+                            review_ctx,
                         ) => decision?,
                     };
                     // A blocking front-end prompt (real terminal) cannot observe

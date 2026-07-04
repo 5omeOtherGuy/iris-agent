@@ -8,6 +8,7 @@
 
 use crate::cli::{self, ModelSwitch};
 use crate::config;
+use crate::git::status::GitStatus;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, CatalogModel, ExactMatch};
@@ -16,9 +17,11 @@ use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
     EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
-    SettingsMenu, TrustMenu,
+    SettingsMenu, TaskPicker, TrustMenu,
 };
+use crate::ui::task_view::TaskCard;
 use crate::wayland::Harness;
+use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask, RecoverableTask};
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -174,6 +177,112 @@ pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<Se
             age: session::relative_age(now_ms, entry.meta.updated_ms),
         })
         .collect()
+}
+
+/// Build the unified `/tasks` surface from the harness (ADR-0031): the active
+/// (live, unsettled) task as a non-selectable header, plus the recoverable/legacy
+/// tasks as selectable rows. The active card is enriched with the git-status
+/// snapshot's attribution counts + age when the snapshot's task id matches.
+/// `None` when there is neither an active nor a recoverable task in this
+/// workspace. Live foreign (leased) tasks are already excluded by the git-safety
+/// seam.
+pub(crate) fn build_tasks_modal<P: ChatProvider>(
+    harness: &Harness<P>,
+    git: Option<&GitStatus>,
+) -> Option<Modal> {
+    let recoverable = harness.recoverable_tasks();
+    let active = harness
+        .active_task()
+        .map(|display| active_card(&display, git));
+    if active.is_none() && recoverable.is_empty() {
+        return None;
+    }
+    let cards: Vec<TaskCard> = recoverable.iter().map(TaskCard::from_recoverable).collect();
+    Some(Modal::Tasks(TaskPicker::new(active, cards)))
+}
+
+/// Project the active task, enriched from the git-status snapshot's attribution
+/// split (iris/user file counts) and age -- but only when the snapshot's task id
+/// matches this active task, so a stale snapshot never mislabels the header
+/// (ADR-0031 counts stay honest). Otherwise the counts/age are left unknown.
+fn active_card(display: &ActiveTaskDisplay, git: Option<&GitStatus>) -> TaskCard {
+    let matched = git
+        .and_then(|status| status.task.as_ref().map(|task| (status, task)))
+        .filter(|(_, task)| task.task_id == display.task_id);
+    match matched {
+        Some((status, task)) => TaskCard::active(
+            display,
+            Some(task.age),
+            Some(status.iris_unsettled),
+            Some(status.user_dirty),
+        ),
+        None => TaskCard::active(display, None, None, None),
+    }
+}
+
+/// Wrap already-fetched recoverable-task rows into the unified modal (no active
+/// header), or `None` when there are none. Used by the startup/session-swap
+/// recovery sites, which already hold the rows and never have an active task
+/// (recovery runs before this process opens one).
+pub(crate) fn tasks_modal(tasks: &[RecoverableTask]) -> Option<Modal> {
+    if tasks.is_empty() {
+        return None;
+    }
+    let cards: Vec<TaskCard> = tasks.iter().map(TaskCard::from_recoverable).collect();
+    Some(Modal::Tasks(TaskPicker::new(None, cards)))
+}
+
+/// Decide the adoption UX for an adopted task (#288, ADR-0031): the notice lines
+/// (body + linked-session summary) and, only when exactly one session is linked,
+/// the id of that session to offer as an explicit "also resume" second action.
+/// Adopting NEVER implicitly resumes a session; zero or multiple linked sessions
+/// yield `None` (multiple are never guessed between). Pure, so the offer policy
+/// is unit-tested without the loop.
+pub(crate) fn adopt_notice(adopted: &AdoptedTask) -> (Vec<String>, Option<String>) {
+    let short = short_id(&adopted.task_id);
+    let body = crate::ui::task_view::body_preview(adopted.body.as_deref());
+    let mut lines = vec![format!("Adopted task {short}: {body}")];
+    let resume = match adopted.sessions.as_slice() {
+        [] => {
+            lines.push("No linked sessions recorded.".to_string());
+            None
+        }
+        [one] => {
+            lines.push(format!(
+                "1 linked session ({}) -- adopt only; confirm to also resume it.",
+                short_id(one)
+            ));
+            Some(one.clone())
+        }
+        many => {
+            lines.push(format!(
+                "{} linked sessions -- adopt only; resume one explicitly with /resume.",
+                many.len()
+            ));
+            None
+        }
+    };
+    (lines, resume)
+}
+
+/// A short, display-friendly prefix of an opaque id (task or session): the first
+/// 8 chars, so notices stay readable without dropping uniqueness for the user.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// The explicit "also resume its session" offer shown after adopting a task with
+/// exactly one linked session (#288, ADR-0031). A single-row [`SessionPicker`]:
+/// Enter resumes that session (reusing the `/resume` swap path), Esc declines
+/// and leaves the task adopted. Reuses the session picker so resume goes through
+/// the exact same inter-turn swap as `/resume`.
+pub(crate) fn resume_offer(session_id: &str) -> Modal {
+    let row = SessionRow {
+        id: session_id.to_string(),
+        preview: "resume the session that worked this task".to_string(),
+        age: String::new(),
+    };
+    Modal::Session(SessionPicker::new(vec![row]))
 }
 
 /// Build the `/trust` project-permissions modal from the harness-owned policy
@@ -572,5 +681,91 @@ mod tests {
             ModelDecision::Open(search) => assert_eq!(search, "gpt-5.5"),
             _ => panic!("expected open (gpt-5.5 not in scope)"),
         }
+    }
+
+    // --- adoption offer (#288, ADR-0031); row/projection rendering is covered
+    // by the `ui::task_view` unit tests. ---
+
+    fn adopted(id: &str, body: Option<&str>, sessions: &[&str]) -> AdoptedTask {
+        AdoptedTask {
+            task_id: id.to_string(),
+            body: body.map(str::to_string),
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn adopt_offer_only_for_exactly_one_linked_session() {
+        // Exactly one linked session: an explicit resume offer is surfaced.
+        let (lines, resume) = adopt_notice(&adopted("t1", Some("work"), &["sessone1"]));
+        assert_eq!(resume.as_deref(), Some("sessone1"));
+        assert!(lines.iter().any(|l| l.contains("work")), "body shown");
+        assert!(
+            lines.iter().any(|l| l.contains("1 linked session")),
+            "the single-session line is shown: {lines:?}"
+        );
+
+        // Zero linked sessions (legacy): adopt only, never resume.
+        let (lines, resume) = adopt_notice(&adopted("t2", None, &[]));
+        assert!(resume.is_none(), "zero sessions never offers a resume");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("(no description recorded)")),
+            "unknown body placeholder shown for a legacy adopt: {lines:?}"
+        );
+
+        // Multiple linked sessions: never guessed between, so no resume offer.
+        let (_, resume) = adopt_notice(&adopted("t3", Some("work"), &["sa", "sb"]));
+        assert!(
+            resume.is_none(),
+            "multiple linked sessions are never guessed between"
+        );
+    }
+
+    #[test]
+    fn active_card_enriches_counts_only_on_matching_snapshot_id() {
+        use crate::git::status::{GitStatus, TaskSummary};
+        use std::time::Duration;
+        let display = ActiveTaskDisplay {
+            task_id: "activetask01".to_string(),
+            body: Some("do the thing".to_string()),
+            sessions: vec!["s1".to_string()],
+        };
+        // Matching snapshot id: counts + age come from the git status snapshot.
+        let matching = GitStatus {
+            iris_unsettled: 3,
+            user_dirty: 2,
+            task: Some(TaskSummary {
+                task_id: "activetask01".to_string(),
+                age: Duration::from_secs(120),
+            }),
+            ..Default::default()
+        };
+        let card = active_card(&display, Some(&matching));
+        assert_eq!(card.iris_files, Some(3));
+        assert_eq!(card.user_files, Some(2));
+        assert_eq!(card.age_label(), "2m ago");
+
+        // Stale snapshot (different task id): counts/age left unknown so the
+        // header never mislabels a different task's numbers as this task's.
+        let stale = GitStatus {
+            iris_unsettled: 9,
+            user_dirty: 9,
+            task: Some(TaskSummary {
+                task_id: "someothertask".to_string(),
+                age: Duration::from_secs(1),
+            }),
+            ..Default::default()
+        };
+        let card = active_card(&display, Some(&stale));
+        assert_eq!(card.iris_files, None);
+        assert_eq!(card.user_files, None);
+        assert_eq!(card.age_label(), "");
+
+        // No snapshot at all: also unknown, never fabricated.
+        let card = active_card(&display, None);
+        assert_eq!(card.iris_files, None);
+        assert_eq!(card.user_files, None);
     }
 }

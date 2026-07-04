@@ -22,6 +22,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static RESTORE_TERMINAL_ON_FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+// Whether the alt-screen pager is currently active (ADR-0029). Owned here so
+// the async-signal-safe force-quit path, the panic hook, and normal Drop
+// restore can arbitrate who emits the single `?1049l` leave sequence.
+static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
 // The terminal's pre-raw-mode `termios`, leaked so the signal handler can read
 // it without allocation. Null until the TUI captures it at startup.
 static SAVED_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
@@ -32,6 +36,12 @@ static SAVED_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_m
 // instead of running crossterm/Drop code.
 const TUI_FORCE_QUIT_RESTORE: &[u8] =
     b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l\x1b[<1u";
+
+// Leave the alternate screen (pager mode only). Written before the mode resets
+// above so they apply to the restored normal screen. Kept separate and gated:
+// emitting `?1049l` when the alt screen was never entered can move the cursor
+// (DECRC restore), so inline mode must never send it.
+const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 
 /// Install the SIGINT handler. Call once at startup.
 pub(crate) fn install() {
@@ -77,6 +87,19 @@ fn restore_terminal_from_signal() {
     // editing -- `Drop` does not run on a signal-killed process, so the escape
     // write alone would leave the tty in raw mode. `tcsetattr` is POSIX
     // async-signal-safe.
+    // Leave the alt screen first (pager mode only) so every subsequent byte
+    // lands on the restored normal screen.
+    if ALT_SCREEN_ACTIVE.swap(false, Ordering::Relaxed) {
+        // SAFETY: `write` is async-signal-safe; pointer/length come from a
+        // static byte string.
+        let _ = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                ALT_SCREEN_LEAVE.as_ptr().cast(),
+                ALT_SCREEN_LEAVE.len(),
+            )
+        };
+    }
     let termios = SAVED_TERMIOS.load(Ordering::Acquire);
     if !termios.is_null() {
         // SAFETY: `termios` is a live, leaked pointer from
@@ -131,6 +154,36 @@ pub(crate) fn enable_terminal_restore_on_force_quit() {
 /// Disable emergency terminal cleanup once the TUI has restored normally.
 pub(crate) fn disable_terminal_restore_on_force_quit() {
     RESTORE_TERMINAL_ON_FORCE_QUIT.store(false, Ordering::Relaxed);
+}
+
+/// Mark the alt-screen pager active/inactive. Set by the pager surface on
+/// enter/leave so the force-quit and panic paths know a `?1049l` is owed.
+pub(crate) fn set_alt_screen_active(active: bool) {
+    ALT_SCREEN_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Whether the alt screen is currently marked active (test observability).
+#[cfg(test)]
+pub(crate) fn alt_screen_active() -> bool {
+    ALT_SCREEN_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Serialize (and reset) the process-global alt-screen flag for tests. Every
+/// test in any module that toggles the flag must hold this guard; the flag is
+/// cleared on acquisition so a panicked predecessor cannot leak state.
+#[cfg(test)]
+pub(crate) fn alt_screen_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    ALT_SCREEN_ACTIVE.store(false, Ordering::Relaxed);
+    guard
+}
+
+/// Atomically claim the pending alt-screen leave: returns `true` exactly once
+/// per enter, so racing restore paths (Drop, panic hook, signal) emit exactly
+/// one leave sequence.
+pub(crate) fn take_alt_screen_active() -> bool {
+    ALT_SCREEN_ACTIVE.swap(false, Ordering::Relaxed)
 }
 
 /// Record a terminal-driver Ctrl-C. Raw mode delivers Ctrl-C as a key event

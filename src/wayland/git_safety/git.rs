@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 /// check never contends for or leaves an index lock. Returns the raw output
 /// (caller inspects the exit status) so callers that tolerate a non-zero exit
 /// (e.g. the git-detection probe) can branch on it.
-pub(super) fn git(workspace: &Path, args: &[&str]) -> Result<Output> {
+pub(crate) fn git(workspace: &Path, args: &[&str]) -> Result<Output> {
     hardened(workspace, args, &[])
         .output()
         .context("failed to spawn git subprocess")
@@ -52,7 +52,7 @@ fn hardened(workspace: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> Command 
 /// (blob content) and `update-index --index-info` (tree entries) against a
 /// temporary `GIT_INDEX_FILE`. `stdin` bytes (not `String`) so binary blob
 /// content and non-UTF-8 index-info paths pass through verbatim.
-pub(super) fn git_io(
+pub(crate) fn git_io(
     workspace: &Path,
     args: &[&str],
     env: &[(&str, &OsStr)],
@@ -87,7 +87,7 @@ pub(super) fn git_io(
 /// zero exit. The env-carrying analogue of [`git_stdout`], for checkpoint
 /// commands that read/write against a temporary `GIT_INDEX_FILE` (`write-tree`,
 /// `read-tree`).
-pub(super) fn git_env_stdout(
+pub(crate) fn git_env_stdout(
     workspace: &Path,
     args: &[&str],
     env: &[(&str, &OsStr)],
@@ -108,7 +108,7 @@ pub(super) fn git_env_stdout(
 /// Run a git command and return its stdout as bytes, erroring on a non-zero
 /// exit. Bytes (not `String`) because `-z` porcelain output is NUL-delimited and
 /// paths are not guaranteed UTF-8.
-pub(super) fn git_stdout(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn git_stdout(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = git(workspace, args)?;
     if !output.status.success() {
         bail!(
@@ -124,7 +124,7 @@ pub(super) fn git_stdout(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// and treats any error or a non-`true` answer as "not a git working tree" so a
 /// missing `git` binary or a bare/again-degraded repo falls back cleanly to the
 /// degraded (non-git) mode rather than failing the run.
-pub(super) fn is_git_worktree(workspace: &Path) -> bool {
+pub(crate) fn is_git_worktree(workspace: &Path) -> bool {
     match git(workspace, &["rev-parse", "--is-inside-work-tree"]) {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim() == "true"

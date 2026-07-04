@@ -109,6 +109,9 @@ struct RecordingFrontend {
     events: RefCell<Vec<AgentEvent>>,
     decision: Cell<ApprovalDecision>,
     events_at_review: RefCell<Option<Vec<AgentEvent>>>,
+    /// The structured review facts the last `review` call received, so a test
+    /// can assert Nexus threads `destructive`/`dirty_paths` to the gate.
+    last_ctx: RefCell<Option<ReviewContext>>,
 }
 
 impl RecordingFrontend {
@@ -117,6 +120,7 @@ impl RecordingFrontend {
             events: RefCell::new(Vec::new()),
             decision: Cell::new(decision),
             events_at_review: RefCell::new(None),
+            last_ctx: RefCell::new(None),
         }
     }
 }
@@ -134,11 +138,13 @@ impl ApprovalGate for RecordingFrontend {
         _call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         let mut snapshot = self.events_at_review.borrow_mut();
         if snapshot.is_none() {
             *snapshot = Some(self.events.borrow().clone());
         }
+        *self.last_ctx.borrow_mut() = Some(ctx);
         let decision = self.decision.get();
         Box::pin(async move { Ok(decision) })
     }
@@ -1403,6 +1409,7 @@ fn observer_error_on_tool_result_still_records_paired_transcript() -> Result<()>
             _call: &'a ToolCall,
             _allow_always: bool,
             _allow_project: bool,
+            _ctx: ReviewContext,
         ) -> ApprovalFuture<'a> {
             Box::pin(async move { Ok(ApprovalDecision::Allow) })
         }
@@ -2244,6 +2251,18 @@ fn invariant_2_destructive_bash_reprompts_despite_project_grants() -> Result<()>
     assert!(
         frontend.events_at_review.borrow().is_some(),
         "a destructive command must re-prompt even when granted"
+    );
+    // The gate receives the structured facts, not UI copy: the destructive
+    // floor is threaded through `ReviewContext` (issue #262/ADR-0010).
+    let ctx = frontend
+        .last_ctx
+        .borrow()
+        .clone()
+        .expect("the gate received a review context");
+    assert!(ctx.destructive, "destructive fact is threaded to the gate");
+    assert!(
+        ctx.dirty_paths.is_empty(),
+        "no dirty-tree gate fired for this call"
     );
     let events = frontend.events.borrow();
     assert!(
@@ -3458,6 +3477,7 @@ impl ApprovalGate for BlockingApprovalGate {
         _call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        _ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             futures::future::pending::<()>().await;
@@ -5658,6 +5678,7 @@ impl ApprovalGate for DenyToolGate {
         call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        _ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         let decision = if call.name == self.deny {
             ApprovalDecision::Deny
@@ -5800,6 +5821,738 @@ fn verification_stops_when_model_makes_no_further_changes() -> Result<()> {
         fs::read_to_string(workspace.path.join("runs.log")).unwrap_or_default(),
         "x",
         "verification ran once; no retry without a further change"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Epic #261 acceptance (Milestone 5, git-centered workflow): the whole
+// dirty-tree safety + net-diff + rollback contract proven end to end over a
+// real Harness driven by the fake provider. One task edits a clean tracked file
+// and creates a new file while a user's dirty tracked file and untracked file
+// sit untouched. Asserts, in one flow: (a) user files byte-identical through the
+// task; (b) the net diff is scoped to exactly Iris's authored paths; (c)
+// rollback restores Iris's paths byte-identically while user files stay intact;
+// (d) settlement leaves the refs/iris/* namespace empty.
+// ---------------------------------------------------------------------------
+
+/// Init a scratch git repo with two committed tracked files, so the acceptance
+/// test has real committed history (2+ files) plus room for a dirty and a clean
+/// tracked file.
+fn acceptance_git_workspace() -> Result<TestWorkspace> {
+    let workspace = test_workspace()?;
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    // Neutralize any global ignore patterns for the harness's own git calls
+    // (which do not scrub the env like this helper): the untracked user file
+    // must actually be untracked-and-visible, not globally ignored.
+    git(&["config", "core.excludesFile", "/dev/null"]);
+    fs::write(workspace.path.join("alpha.txt"), "alpha base\n")?;
+    fs::write(workspace.path.join("beta.txt"), "beta base\n")?;
+    git(&["add", "alpha.txt", "beta.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    Ok(workspace)
+}
+
+/// Read `refs/iris/` in `root` and return its `git for-each-ref` output.
+fn iris_refs(root: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["for-each-ref", "refs/iris/"])
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("spawn git");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn epic_261_acceptance_end_to_end() -> Result<()> {
+    let workspace = acceptance_git_workspace()?;
+    let root = &workspace.path;
+
+    // The user's uncommitted work before the task: a DIRTY tracked file (an
+    // uncommitted modification of committed history) and an UNTRACKED file. Iris
+    // must never touch either.
+    let dirty = root.join("alpha.txt");
+    let untracked = root.join("user_notes.txt");
+    let dirty_pre = b"alpha base\nuser uncommitted edit\n".to_vec();
+    let untracked_pre = b"user scratch notes\n".to_vec();
+    fs::write(&dirty, &dirty_pre)?;
+    fs::write(&untracked, &untracked_pre)?;
+
+    // Iris's own targets: a CLEAN committed file it edits, and a new file it
+    // creates. `clean_pre` is the committed (clean) content rollback must
+    // restore.
+    let clean = root.join("beta.txt");
+    let created = root.join("gamma.txt");
+    let clean_pre = b"beta base\n".to_vec();
+
+    // The scripted task: read the clean tracked file (satisfies read-before-write),
+    // edit it, then create a new file; a final text turn ends the model turn.
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("read", json!({ "path": "beta.txt" }))),
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "beta.txt", "content": "beta base\niris edit\n" }),
+        )),
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "gamma.txt", "content": "iris created this\n" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, root, crate::tools::built_in_tools());
+    // Allow whatever the gate asks on Iris's own targets. The user's dirty file
+    // is never an Iris target, so it is never prompted for or approved.
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        "edit beta and add gamma",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    // Iris's edits landed as scripted.
+    assert_eq!(fs::read(&clean)?, b"beta base\niris edit\n");
+    assert_eq!(fs::read(&created)?, b"iris created this\n");
+
+    // (a) The user's dirty and untracked files are byte-identical to pre-task.
+    assert_eq!(
+        fs::read(&dirty)?,
+        dirty_pre,
+        "the dirty user file is untouched during the task"
+    );
+    assert_eq!(
+        fs::read(&untracked)?,
+        untracked_pre,
+        "the untracked user file is untouched during the task"
+    );
+
+    // (b) The task net diff covers exactly Iris's authored paths -- the user's
+    // dirty and untracked paths are absent, and their bytes never leak.
+    let diff = harness.task_diff()?;
+    let mut paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["beta.txt", "gamma.txt"],
+        "the net diff is scoped to Iris's authored paths only: {paths:?}"
+    );
+    let unified = diff.unified();
+    assert!(
+        !unified.contains("user uncommitted edit"),
+        "the user's dirty edit never leaks into the diff"
+    );
+    assert!(
+        !unified.contains("user scratch notes"),
+        "the untracked user file never leaks into the diff"
+    );
+    let gamma = diff
+        .files
+        .iter()
+        .find(|f| f.path == "gamma.txt")
+        .expect("gamma.txt in the diff");
+    assert!(
+        gamma.unified.contains("--- /dev/null"),
+        "gamma.txt renders as a create"
+    );
+    let beta = diff
+        .files
+        .iter()
+        .find(|f| f.path == "beta.txt")
+        .expect("beta.txt in the diff");
+    assert!(
+        beta.unified.contains("+iris edit"),
+        "beta.txt renders the edit"
+    );
+
+    // The git-backed checkpoint chain must actually have been exercised (not
+    // the non-git fallback): refs exist under refs/iris/ before settlement.
+    assert!(
+        iris_refs(root).contains("refs/iris/checkpoints/"),
+        "checkpoint chain refs exist pre-settlement: {:?}",
+        iris_refs(root)
+    );
+
+    // (c) Rollback restores Iris's paths to their pre-task state byte-identically
+    // -- the created file is gone, the edited file is back to its committed
+    // content -- while the user's dirty/untracked work stays byte-identical.
+    let outcome = harness.rollback_checkpoint(0)?;
+    assert!(
+        outcome.summary.contains("rolled back"),
+        "rollback summary: {}",
+        outcome.summary
+    );
+    assert!(
+        !created.exists(),
+        "the Iris-created file is removed on rollback"
+    );
+    assert_eq!(
+        fs::read(&clean)?,
+        clean_pre,
+        "the Iris-edited file is restored to its pre-task content"
+    );
+    assert_eq!(
+        fs::read(&dirty)?,
+        dirty_pre,
+        "the dirty user file remains byte-identical after rollback"
+    );
+    assert_eq!(
+        fs::read(&untracked)?,
+        untracked_pre,
+        "the untracked user file remains byte-identical after rollback"
+    );
+
+    // (d) Settlement (the rollback) leaves the refs/iris/* namespace empty: the
+    // checkpoint chain is torn down, no refs accumulate.
+    assert!(
+        iris_refs(root).is_empty(),
+        "refs/iris/ is empty after settlement: {:?}",
+        iris_refs(root)
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0032 approval presets (strict / auto / never-ask) and safety floors.
+//
+// These drive the bare `Agent` directly with a custom `ToolEnv` so the auto and
+// never-ask policy is exercised at the Nexus/tool-policy layer -- the enforcement
+// point (ADR-0005) -- rather than through a front-end. A `FakeGuard` stands in
+// for the dirty-tree `MutationGuard` so a "dirty" target is deterministic
+// without a real git repo.
+// ---------------------------------------------------------------------------
+
+/// A `MutationGuard` test double: the paths passed to `protecting` are reported
+/// as unapproved-protected until approved (mirroring a pre-existing dirty file).
+struct FakeGuard {
+    protected: Vec<PathBuf>,
+    approved: RefCell<Vec<PathBuf>>,
+    all_dirty: Cell<bool>,
+}
+
+impl FakeGuard {
+    fn none() -> Self {
+        Self {
+            protected: Vec::new(),
+            approved: RefCell::new(Vec::new()),
+            all_dirty: Cell::new(false),
+        }
+    }
+    fn protecting(paths: Vec<PathBuf>) -> Self {
+        Self {
+            protected: paths,
+            approved: RefCell::new(Vec::new()),
+            all_dirty: Cell::new(false),
+        }
+    }
+}
+
+impl MutationGuard for FakeGuard {
+    fn note_mutation(&self) -> Option<String> {
+        None
+    }
+    fn unapproved_protected(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        if self.all_dirty.get() {
+            return Vec::new();
+        }
+        let approved = self.approved.borrow();
+        paths
+            .iter()
+            .filter(|p| self.protected.contains(p) && !approved.contains(p))
+            .cloned()
+            .collect()
+    }
+    fn approve(&self, paths: &[PathBuf], all_dirty: bool) {
+        if all_dirty {
+            self.all_dirty.set(true);
+        }
+        self.approved.borrow_mut().extend_from_slice(paths);
+    }
+    fn before_exec(&self, _paths: &[PathBuf]) {}
+    fn after_exec(&self, _approved: &[PathBuf], _expected: Option<&str>) -> Vec<PathBuf> {
+        Vec::new()
+    }
+    fn restore(&self, _paths: &[PathBuf]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Drive one turn against the bare agent with a custom `ToolEnv` (optionally a
+/// dirty-tree guard). Uses the same current-thread `block_on` as the other
+/// direct-call tests.
+fn run_preset_turn(
+    agent: &mut Agent<FakeProvider>,
+    prompt: &str,
+    workspace: &Path,
+    guard: Option<&dyn MutationGuard>,
+    frontend: &RecordingFrontend,
+) -> Result<()> {
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace,
+        state: &state,
+        output_store: None,
+        output_sink: None,
+        mutation_guard: guard,
+    };
+    block_on(agent.submit_turn(
+        prompt,
+        frontend,
+        frontend,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))
+}
+
+fn write_turn(path: &str, content: &str) -> Vec<Result<AssistantTurn, &'static str>> {
+    // Leak the args into 'static values so the fixture matches FakeProvider's
+    // signature; the test process is short-lived so this is fine.
+    let args = json!({ "path": path, "content": content });
+    vec![
+        Ok(AssistantTurn {
+            text: None,
+            reasoning: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                thought_signature: None,
+                name: "write".to_string(),
+                arguments: args,
+            }],
+            response_id: None,
+            usage: None,
+            completion_reason: None,
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]
+}
+
+fn auto_approved_count(frontend: &RecordingFrontend) -> usize {
+    frontend
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolAutoApproved(_)))
+        .count()
+}
+
+fn denied_count(frontend: &RecordingFrontend) -> usize {
+    frontend
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolDenied(_)))
+        .count()
+}
+
+#[test]
+fn strict_mode_still_prompts_for_write() -> Result<()> {
+    // The default (strict) preset preserves the current behavior: a gated write
+    // consults the approval gate rather than auto-running.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    assert_eq!(agent.approval_mode(), ApprovalMode::Strict);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "strict mode must consult the approval gate for a write"
+    );
+    assert_eq!(auto_approved_count(&frontend), 0);
+    Ok(())
+}
+
+#[test]
+fn auto_mode_runs_clean_workspace_write_without_prompting() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+    // Deny would refuse if the gate were consulted -- it must not be.
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "auto mode must NOT consult the gate for a clean in-workspace write"
+    );
+    assert_eq!(
+        auto_approved_count(&frontend),
+        1,
+        "the write is auto-approved"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("out.txt"))?,
+        "new\n",
+        "the auto-approved write actually ran"
+    );
+    Ok(())
+}
+
+#[test]
+fn auto_mode_runs_clean_workspace_edit_without_prompting() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("code.txt"), "old line\n")?;
+    let args =
+        json!({ "file_path": "code.txt", "old_string": "old line", "new_string": "new line" });
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("edit", args)),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "edit it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    // The point of this test is the auto-approval ROUTING for a clean
+    // in-workspace edit: the gate is not consulted and the call is auto-approved.
+    // (Edit mechanics -- read-before-mutate, matching -- are covered elsewhere.)
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "auto mode must NOT consult the gate for a clean in-workspace edit"
+    );
+    assert_eq!(auto_approved_count(&frontend), 1);
+    Ok(())
+}
+
+#[test]
+fn auto_mode_prompts_for_dirty_write_target() -> Result<()> {
+    // The dirty-file floor overrides auto: a pre-existing dirty target still
+    // routes through the approval gate even in auto mode.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::protecting(vec![PathBuf::from("out.txt")]);
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    let ctx = frontend.last_ctx.borrow();
+    let ctx = ctx
+        .as_ref()
+        .expect("auto must consult the gate for a dirty target");
+    assert!(
+        !ctx.dirty_paths.is_empty(),
+        "the dirty-tree gate fired and threaded the protected paths"
+    );
+    assert_eq!(auto_approved_count(&frontend), 0);
+    Ok(())
+}
+
+#[test]
+fn auto_mode_prompts_for_outside_workspace_write() -> Result<()> {
+    // The auto target-in-workspace check keeps an escaping path on the prompt
+    // path, independent of the runtime path-confinement opt-in.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("../escape.txt", "x\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "an outside-workspace write must NOT auto-run"
+    );
+    assert_eq!(auto_approved_count(&frontend), 0);
+    Ok(())
+}
+
+#[test]
+fn auto_mode_prompts_for_destructive_bash() -> Result<()> {
+    // The destructive floor overrides auto: `rm -rf` still prompts in auto mode.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "rm -rf build" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "clean",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    let ctx = frontend.last_ctx.borrow();
+    let ctx = ctx
+        .as_ref()
+        .expect("destructive bash must consult the gate in auto");
+    assert!(ctx.destructive, "the destructive floor fired");
+    assert_eq!(auto_approved_count(&frontend), 0);
+    Ok(())
+}
+
+#[test]
+fn auto_mode_does_not_auto_run_plain_bash() -> Result<()> {
+    // v1 floor: bash is never auto-approved (the sandbox preflight is deferred),
+    // so even a clean, non-destructive shell command still prompts in auto.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("bash", json!({ "command": "echo hi" }))),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(&mut agent, "run", &workspace.path, Some(&guard), &frontend)?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "unproven sandboxed bash must NOT auto-run in auto mode"
+    );
+    assert_eq!(auto_approved_count(&frontend), 0);
+    Ok(())
+}
+
+#[test]
+fn never_ask_denies_unresolved_write_prompt() -> Result<()> {
+    // never-ask: a call that would prompt is denied without consulting the gate.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::NeverAsk);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "never-ask must not consult (prompt) the gate"
+    );
+    assert_eq!(denied_count(&frontend), 1, "the unresolved call is denied");
+    assert!(
+        !workspace.path.join("out.txt").exists(),
+        "the denied write never ran"
+    );
+    Ok(())
+}
+
+#[test]
+fn never_ask_denies_destructive_bash() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "rm -rf build" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::NeverAsk);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "clean",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(frontend.events_at_review.borrow().is_none());
+    assert_eq!(
+        denied_count(&frontend),
+        1,
+        "destructive bash denied in never-ask"
+    );
+    Ok(())
+}
+
+#[test]
+fn never_ask_honors_explicit_project_grant() -> Result<()> {
+    // never-ask denies PROMPTS, not explicit grants: a project-granted, clean,
+    // non-floor write still runs without prompting.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut policy = ProjectPolicy::default();
+    policy.tools.insert("write".to_string());
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_project_policy(policy, None);
+    agent.set_approval_mode(ApprovalMode::NeverAsk);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "an explicit grant is not a prompt"
+    );
+    assert_eq!(
+        auto_approved_count(&frontend),
+        1,
+        "the granted write auto-approves"
+    );
+    assert_eq!(denied_count(&frontend), 0);
+    assert_eq!(fs::read_to_string(workspace.path.join("out.txt"))?, "new\n");
+    Ok(())
+}
+
+#[test]
+fn never_ask_floor_overrides_explicit_grant_for_dirty_target() -> Result<()> {
+    // A floor still denies in never-ask even with an explicit grant: a project
+    // grant cannot pre-approve a pre-existing dirty file (ADR-0032 dirty floor).
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut policy = ProjectPolicy::default();
+    policy.tools.insert("write".to_string());
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_project_policy(policy, None);
+    agent.set_approval_mode(ApprovalMode::NeverAsk);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let guard = FakeGuard::protecting(vec![PathBuf::from("out.txt")]);
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(frontend.events_at_review.borrow().is_none());
+    assert_eq!(
+        denied_count(&frontend),
+        1,
+        "the dirty floor denies in never-ask despite the project grant"
+    );
+    Ok(())
+}
+
+#[test]
+fn approval_mode_parses_and_round_trips_tokens() {
+    assert_eq!(ApprovalMode::parse("strict"), Some(ApprovalMode::Strict));
+    assert_eq!(
+        ApprovalMode::parse("on-request"),
+        Some(ApprovalMode::Strict)
+    );
+    assert_eq!(ApprovalMode::parse("AUTO"), Some(ApprovalMode::Auto));
+    assert_eq!(ApprovalMode::parse("never"), Some(ApprovalMode::NeverAsk));
+    assert_eq!(
+        ApprovalMode::parse("never-ask"),
+        Some(ApprovalMode::NeverAsk)
+    );
+    assert_eq!(ApprovalMode::parse("bogus"), None);
+    assert_eq!(ApprovalMode::Auto.as_token(), "auto");
+    assert_eq!(ApprovalMode::default(), ApprovalMode::Strict);
+}
+
+#[test]
+fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
+    // End-to-end through the text session driver: `/approval auto` flips the
+    // session preset at the inter-turn boundary, so the following clean
+    // in-workspace write auto-runs without an approval prompt on stdin.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "write",
+            json!({ "path": "out.txt", "content": "auto\n" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    // No approval answer is supplied on stdin: if auto did not engage, the write
+    // would block on a prompt and the scripted provider turn would not complete.
+    run_text_session(
+        &mut harness,
+        b"/approval auto\nwrite it\n/exit\n",
+        &mut out,
+        &mut err,
+    )?;
+
+    let rendered = String::from_utf8_lossy(&out);
+    assert!(
+        rendered.contains("approval mode set to auto"),
+        "the command notice is shown: {rendered}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path.join("out.txt"))?,
+        "auto\n",
+        "the auto-approved write ran without a prompt"
     );
     Ok(())
 }

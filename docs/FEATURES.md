@@ -19,6 +19,19 @@
   highlights, streamed GFM-style Markdown rendering, collapsed reasoning panels,
   `/exit` and `/quit`; text REPL fallback for pipes/CI or TUI startup failure.
   [Implemented]
+- **Alt-screen pager TUI** — full-frame alternate-screen renderer
+  ([ADR-0029](adr/0029-adopt-alt-screen-pager-tui.md)): viewport-pinned
+  session bar, Iris-owned scrollback with follow mode
+  (PageUp/PageDown, Alt+Up/Down line scroll, Home/End, mouse wheel at
+  `tui.scrollSpeed` lines/tick, re-engage by overscroll, dim `▾ N lines
+  below` indicator), O(viewport) windowed rendering over the wrap cache,
+  panic-safe alt-screen restore, mouse capture with a runtime toggle (Ctrl+T
+  / `/mouse`; off restores terminal-native select/copy, statusline shows
+  `○ mouse off`), clipboard ladder (native tools → OSC 52) behind `/copy`.
+  Policy: `tui.altScreen = auto|always|never` (default `auto`),
+  `--no-alt-screen`, `IRIS_NO_ALT_SCREEN`; tmux control mode, Zellij, dumb
+  terminals, and non-TTY stdio degrade to the inline renderer with a notice.
+  The `/terminal-setup` capability doctor is next. [Partial]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process, plus linear session resume from persisted transcripts.
   [Partial]
@@ -312,14 +325,17 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
 - **Dirty-state handling** — baseline + attribution ledger; never silently
   overwrite uncommitted work (files or index); per-file per-task approvals.
   Spec: ADR-0028; issue
-  [#262](https://github.com/5omeOtherGuy/iris-agent/issues/262). [Planned · MVP]
+  [#262](https://github.com/5omeOtherGuy/iris-agent/issues/262). [Implemented]
 - **Checkpoint / rollback** — op-log-shaped checkpoint chain under
-  `refs/iris/*`; task-scoped rollback restoring only Iris-authored changes.
+  `refs/iris/*`; task-scoped rollback restoring only Iris-authored changes, plus
+  the user index; settlement GC, crash-recovery reconciliation, 30-day expiry,
+  non-git content-snapshot fallback, and `/rollback`/`/accept`/`/checkpoint`.
   Spec: ADR-0028; issue
-  [#263](https://github.com/5omeOtherGuy/iris-agent/issues/263). [Planned · MVP]
-- **Final diff summary** — net task diff (Iris-authored paths only) as the
-  deliverable, TUI + plain-text. Issue
-  [#264](https://github.com/5omeOtherGuy/iris-agent/issues/264). [Planned · MVP]
+  [#263](https://github.com/5omeOtherGuy/iris-agent/issues/263). [Implemented]
+- **Final diff summary** — net task diff (Iris-authored paths only, one hunk set
+  per file) as the deliverable, TUI + plain-text, via `/diff` and the accept-flow
+  summary; fails closed on an unreadable checkpoint. Issue
+  [#264](https://github.com/5omeOtherGuy/iris-agent/issues/264). [Implemented]
 - **Verification loop** — explicit per-project `verify.command` (+
   `verify.maxAttempts`, default 3, capped 10; no auto-detection) run after a turn
   that changed files, as a normal gated shell execution under the unchanged

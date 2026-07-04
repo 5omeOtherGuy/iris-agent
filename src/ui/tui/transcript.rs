@@ -13,12 +13,13 @@ use crate::ui::{TurnErrorKind, UiEvent};
 
 use super::pane;
 use super::panel::{
-    PanelHeaderSpec, PanelState, diff_counts, diff_footer_row, diff_table_rows, panel_state,
+    FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
+    edit_footer_extras, join_meta_fields, panel_state,
 };
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
 use super::text::ansi_spans;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
-use super::wrap::{display_width, line_text};
+use super::wrap::line_text;
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TRANSCRIPT_ROWS,
     TEXT_COLUMN_X_PADDING, dim_style, err_style, format_elapsed_compact, ok_style, panel_style,
@@ -32,6 +33,42 @@ const THINKING_LABEL: &str = "THINKING";
 /// Placeholder for reasoning the provider withheld; the original text is never
 /// available and is never rendered.
 const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
+
+/// The always-visible footer row of a frameless block: the state label as the
+/// row's actor (no `┊` between it and what follows — a 2-space layout gap
+/// separates), then `┊`-joined family extras, then the right-bound dim
+/// diagnostics cluster.
+fn block_footer_row(
+    label: &str,
+    label_style: Style,
+    extras: Vec<FooterField>,
+    diag: Option<&ToolDiag>,
+    diag_call: Option<&str>,
+) -> TranscriptRow {
+    let (extra_spans, extra_plain) = join_meta_fields(extras);
+    let mut spans = vec![Span::styled(label.to_string(), label_style)];
+    let mut plain = label.to_string();
+    if !extra_plain.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.extend(extra_spans);
+        plain.push_str("  ");
+        plain.push_str(&extra_plain);
+    }
+    let right = diag.and_then(ToolDiag::render).unwrap_or_default();
+    if !right.is_empty() {
+        plain.push_str("  ");
+        plain.push_str(&right);
+    }
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Footer {
+            left: Line::from(spans),
+            right,
+            diag_call: diag_call.map(str::to_string),
+        },
+        plain,
+        label_style,
+    )
+}
 
 /// One reasoning-trace row on the muted left rail: the dim `┊ ` rail prefix plus
 /// the line, word-wrapped with the rail carried onto continuation rows, and
@@ -54,18 +91,8 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
         background: None,
         hrule: false,
         chrome: None,
+        searchable: true,
     }
-}
-
-/// Pad `left` so `right` hugs the right edge of a `width`-column field; drops
-/// `right` when the field is too narrow rather than overflowing.
-fn right_align_pair(left: &str, right: &str, width: usize) -> String {
-    let left_w = display_width(left);
-    let right_w = display_width(right);
-    if left_w + 2 + right_w > width {
-        return left.to_string();
-    }
-    format!("{left}{}{right}", " ".repeat(width - left_w - right_w))
 }
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
@@ -77,6 +104,9 @@ struct ActiveExec {
     output: String,
     body_start: usize,
     started: Instant,
+    /// Explicit user fold intent (ctrl+o/selection/click), preserved across
+    /// in-place rebuilds so a finalized block honors the user, not its default.
+    user_expanded: Option<bool>,
 }
 
 struct ActiveExploration {
@@ -93,6 +123,8 @@ struct ActiveTool {
     call: ToolCall,
     body_start: usize,
     started: Instant,
+    /// Explicit user fold intent; see [`ActiveExec::user_expanded`].
+    user_expanded: Option<bool>,
 }
 
 /// The open EDIT panel for a mutation whose diff arrived via `DiffPreview`.
@@ -103,6 +135,8 @@ struct ActiveEdit {
     diff: String,
     body_start: usize,
     started: Option<Instant>,
+    /// Explicit user fold intent; see [`ActiveExec::user_expanded`].
+    user_expanded: Option<bool>,
 }
 
 /// Cached layout for one logical row: the physical-line range it wraps to plus
@@ -119,6 +153,17 @@ struct RowLayout {
     visible_cum: usize,
     /// Panel `expanded` state carried into the next row's visibility scan.
     expanded_after: bool,
+}
+
+/// One `/find` match in the canonical transcript content, located by the
+/// logical row that owns it (`row`) and the physical sub-line offset within
+/// that row's wrapped lines (`sub`). Row-relative rather than an absolute
+/// visible-line index because expanding a fold to reveal the match shifts
+/// every visible line after it -- the visible index is resolved only after
+/// the reveal, via [`Transcript::reveal_and_locate`].
+pub(super) struct SearchMatch {
+    pub(super) row: usize,
+    pub(super) sub: usize,
 }
 
 #[derive(Default)]
@@ -200,6 +245,34 @@ pub(super) struct Transcript {
     /// Memoized wrapped lines for the current streaming preview; see
     /// [`StreamingRender`].
     streaming_render: Option<StreamingRender>,
+    /// Row indices where a committed user prompt starts (first content row of
+    /// each `commit_user`), maintained incrementally so the pager's sticky
+    /// prompt header is an O(prompts-above-view) lookup, never a row scan.
+    user_prompt_starts: Vec<usize>,
+    /// Per-tool-call token diagnostics (`↑sent ↓received ┊ cache ┊ ctx`),
+    /// keyed by call id and rendered right-bound in the block footer. Forward
+    /// attribution: `↓received` is stamped from the proposing turn; `↑sent`,
+    /// `cache`, and `ctx` are patched in later from the following turn that
+    /// ingests the tool results. Numbers are honest: fields exist only when the
+    /// runtime measured them.
+    tool_diags: std::collections::HashMap<String, ToolDiag>,
+    /// The proposing turn's `↓received` diagnostic (output tokens it generated),
+    /// stamped onto every tool call that turn proposes. Holds only the output
+    /// side; the input side (`↑/cache/ctx`) comes from the following turn.
+    /// `None` until the turn reports usage; reset each turn start.
+    current_turn_diag: Option<ToolDiag>,
+    /// Call ids proposed by the current proposing turn, awaiting the following
+    /// turn's input-side numbers (`↑/cache/ctx`). Drained and patched onto the
+    /// rendered footers when the next `ProviderTurnCompleted` usage arrives.
+    awaiting_input_calls: Vec<String>,
+    /// `input_tokens` of the previous completed provider turn, so the following
+    /// turn's `ctx` field can report signed context growth against it. `None`
+    /// before the first completed turn (no prior turn to diff against).
+    last_turn_input_tokens: Option<u64>,
+    /// Context-window cap in tokens (same source as the session-bar meter),
+    /// used to scale the `ctx` growth delta into a percentage. `None` when the
+    /// model's window is unknown, in which case `ctx` is omitted.
+    context_cap: Option<u64>,
 }
 
 impl Transcript {
@@ -332,7 +405,13 @@ impl Transcript {
         if foldable {
             let plural = if hidden == 1 { "" } else { "s" };
             let left = format!("\u{2026} {hidden} more paragraph{plural}");
-            let text = right_align_pair(&left, "ctrl+o to expand", self.markdown_content_width());
+            let text = super::rows::right_align(
+                &left,
+                "ctrl+o to expand",
+                self.markdown_content_width(),
+                2,
+                super::rows::Overflow::KeepLeft,
+            );
             self.rows
                 .push(TranscriptRow::new(text, dim_style()).with_fold(FoldVis::WhenCollapsed));
         }
@@ -402,6 +481,7 @@ impl Transcript {
             background: None,
             hrule: true,
             chrome: None,
+            searchable: true,
         });
         self.push_blank();
     }
@@ -430,36 +510,32 @@ impl Transcript {
 
     fn push_approval_panel(&mut self, line: Line<'static>, failed: bool) {
         self.mark_append_dirty();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
+        // Approval decisions have no duration: the header's elapsed field is
+        // empty, and the decision moves to the footer state label.
         self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
             expanded: true,
             title: "APPROVAL",
             meta: "decision".to_string(),
-            right: vec![
-                (
-                    if failed { "■" } else { "◆" }.to_string(),
-                    if failed { err_style() } else { ok_style() },
-                ),
-                (
-                    if failed {
-                        " DENIED      "
-                    } else {
-                        " APPROVED    "
-                    }
-                    .to_string(),
-                    if failed { err_style() } else { ok_style() }
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-            ],
+            elapsed: String::new(),
         }));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         let text = line_text(&line);
-        self.rows.push(TranscriptRow::chrome_with_text(
-            ChromeRow::Body { line, bg: None },
-            text,
-            panel_style(),
-        ));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.rows.push(
+            TranscriptRow::chrome_with_text(
+                ChromeRow::Body { line, bg: None },
+                text,
+                panel_style(),
+            )
+            .with_fold(FoldVis::WhenExpanded),
+        );
+        let base_style = if failed { err_style() } else { ok_style() };
+        self.push_block_footer(
+            if failed { "DENIED" } else { "APPROVED" },
+            base_style.add_modifier(ratatui::style::Modifier::BOLD),
+            Vec::new(),
+            None,
+            None,
+        );
     }
 
     /// Fallback (non-streamed) result render, used when no live exec cell was
@@ -526,12 +602,15 @@ impl Transcript {
         }
     }
 
-    /// Push a complete standard tool panel (Top/Header/Separator/body/Bottom)
-    /// to `self.rows`, with the body produced by the renderer registry under
-    /// failure isolation. When the body is fold-capped, the header is marked as
-    /// a collapsed preview so ctrl+o reveals the hidden lines. This is the
-    /// single dispatch path for SHELL/EDIT/generic panels; EXPLORE keeps its
-    /// grouped path.
+    /// Push a complete frameless tool block (header · hanging body · hairline
+    /// footer) to `self.rows`, with the body produced by the renderer registry
+    /// under failure isolation. Collapse is binary: the whole body folds
+    /// behind the header's disclosure and the footer stays. Compact by
+    /// default: every block arrives COLLAPSED (header + footer answer what
+    /// ran · outcome · cost) except a RUNNING block, which stays expanded so
+    /// its live tail is watchable and collapses on finalize unless the user
+    /// explicitly expanded it. This is the single dispatch path for
+    /// SHELL/EDIT/generic blocks; EXPLORE keeps its grouped path.
     fn append_tool_panel(
         &mut self,
         renderer: &dyn tool_render::ToolRenderer,
@@ -541,15 +620,26 @@ impl Transcript {
         started: Option<Instant>,
         outcome: ToolOutcome<'_>,
     ) {
-        self.push_tool_header(renderer, call, state, duration, started);
         let ctx = self.render_ctx();
-        let body = tool_render::render_body(renderer, &ctx, call, &outcome);
-        let foldable = body.iter().any(|row| row.fold != FoldVis::Always);
-        self.rows.extend(body);
-        if foldable {
-            self.mark_panel_preview();
+        let mut body = tool_render::render_body(renderer, &ctx, call, &outcome);
+        for row in &mut body {
+            row.fold = FoldVis::WhenExpanded;
         }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        // Compact by default: only a RUNNING block arrives expanded (its live
+        // tail is already flood-bounded). Finalized blocks arrive collapsed;
+        // an explicit user expand is reapplied by the rebuild path.
+        let expanded = matches!(outcome, ToolOutcome::Running { .. });
+        self.push_tool_header(renderer, call, state, duration, started, expanded);
+        self.rows.extend(body);
+        let extras = renderer.footer_extras(call, &outcome);
+        let diag = self.tool_diags.get(&call.id).cloned();
+        self.push_block_footer(
+            state.label(),
+            state.label_style(),
+            extras,
+            diag.as_ref(),
+            Some(&call.id),
+        );
     }
 
     /// Collect the rows of a standard tool panel without committing them, for
@@ -568,7 +658,7 @@ impl Transcript {
         })
     }
 
-    /// Build the standard panel header from the renderer's title/meta plus the
+    /// Build the standard block header from the renderer's title/meta plus the
     /// transcript-owned lifecycle state/duration.
     fn push_tool_header(
         &mut self,
@@ -577,32 +667,181 @@ impl Transcript {
         state: PanelState,
         duration: Option<std::time::Duration>,
         started: Option<Instant>,
+        expanded: bool,
     ) {
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
-        self.push_panel_header(PanelHeaderSpec {
-            title: renderer.title(),
-            meta: &meta,
-            plain_meta: &plain,
-            state,
-            duration,
-            started,
-        });
+        self.push_panel_header_with_expanded(
+            PanelHeaderSpec {
+                title: renderer.title(),
+                meta: &meta,
+                plain_meta: &plain,
+                state,
+                duration,
+                started,
+            },
+            expanded,
+        );
     }
 
-    /// Mark the most recent panel header as collapsed (preview) so foldable
-    /// output starts capped; toggling reveals the hidden lines.
-    fn mark_panel_preview(&mut self) {
-        let Some(index) = self
-            .rows
-            .iter()
-            .rposition(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Header { .. })))
-        else {
+    /// Push the always-visible block footer: the hairline rule, the footer row
+    /// (state label · `┊`-joined extras · right-bound diagnostics), and the
+    /// end-of-block marker. The footer never folds.
+    fn push_block_footer(
+        &mut self,
+        label: &str,
+        label_style: Style,
+        extras: Vec<FooterField>,
+        diag: Option<&ToolDiag>,
+        diag_call: Option<&str>,
+    ) {
+        self.rows.push(TranscriptRow::chrome(ChromeRow::FooterRule));
+        self.rows.push(block_footer_row(
+            label,
+            label_style,
+            extras,
+            diag,
+            diag_call,
+        ));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::BlockEnd));
+    }
+
+    /// Record per-call token diagnostics for a tool call's footer. The values
+    /// are preformatted, runtime-measured strings; blocks rendered after this
+    /// call carry them right-bound in the footer. Bounded: a finalized footer
+    /// bakes its own `right` string, so the map is only consulted at build
+    /// time; clearing it never disturbs a rendered footer. A single very long
+    /// session cannot grow it without bound.
+    pub(super) fn set_tool_diag(&mut self, call_id: &str, diag: ToolDiag) {
+        if self.tool_diags.len() >= 1024 {
+            self.tool_diags.clear();
+        }
+        self.tool_diags.insert(call_id.to_string(), diag);
+    }
+
+    /// Set the context-window cap (tokens) used to scale the `ctx` growth
+    /// delta, mirroring the session-bar meter's source.
+    pub(super) fn set_context_cap(&mut self, cap: Option<u64>) {
+        self.context_cap = cap;
+    }
+
+    /// The proposing turn's `↓received` diagnostic: the output tokens it
+    /// generated. This is the only field known when the tool footer is first
+    /// rendered; the input side is patched in later by the following turn.
+    fn proposing_turn_diag(usage: &ProviderUsage) -> ToolDiag {
+        ToolDiag {
+            received: Some(super::screen::compact_count(usage.output_tokens)),
+            ..ToolDiag::default()
+        }
+    }
+
+    /// Patch the input-side diagnostics (`↑/cache/ctx`) onto every tool call
+    /// awaiting them, from the following turn's usage that ingested the tool
+    /// results: `↑` fresh (non-cached) input it processed, `cache` its
+    /// prompt-cache reads (omitted when zero), and the signed `ctx` growth
+    /// against the proposing turn (omitted without a prior turn or cap).
+    /// `ProviderUsage` docs state cache reads are already counted in
+    /// `input_tokens`, so fresh input subtracts them out. Parallel/same-turn
+    /// tool calls share these numbers (the runtime cannot split finer). Must be
+    /// called before `last_turn_input_tokens` is advanced so `ctx` diffs against
+    /// the proposing turn. The stamped `↓received` is preserved.
+    fn apply_following_turn_usage(&mut self, usage: &ProviderUsage) {
+        let fresh_input = usage
+            .input_tokens
+            .saturating_sub(usage.cache_read_input_tokens);
+        let sent = Some(super::screen::compact_count(fresh_input));
+        let cache = (usage.cache_read_input_tokens > 0)
+            .then(|| super::screen::compact_count(usage.cache_read_input_tokens));
+        let ctx = self.context_growth_pct(usage.input_tokens);
+        let calls: Vec<String> = std::mem::take(&mut self.awaiting_input_calls);
+        for id in &calls {
+            if let Some(diag) = self.tool_diags.get_mut(id) {
+                diag.sent = sent.clone();
+                diag.cache = cache.clone();
+                diag.ctx = ctx.clone();
+            }
+            self.patch_footer_diag(id);
+        }
+    }
+
+    /// Rewrite the already-rendered footer row tagged with `call_id` to reflect
+    /// its current `tool_diags` entry (forward-attribution patch). Both the
+    /// baked `right` diagnostics string and the plain `text` mirror are updated;
+    /// a no-op if the footer was trimmed away or never rendered.
+    fn patch_footer_diag(&mut self, call_id: &str) {
+        let Some(diag) = self.tool_diags.get(call_id).cloned() else {
             return;
         };
-        self.mark_dirty_from(index);
-        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[index].chrome.as_mut() {
-            *expanded = false;
+        let right = diag.render().unwrap_or_default();
+        let Some(idx) = self.rows.iter().position(|row| {
+            matches!(
+                row.chrome.as_ref(),
+                Some(ChromeRow::Footer { diag_call: Some(id), .. }) if id == call_id
+            )
+        }) else {
+            return;
+        };
+        let Some(ChromeRow::Footer { left, .. }) = self.rows[idx].chrome.as_ref() else {
+            return;
+        };
+        let left_plain = line_text(left);
+        let text = if right.is_empty() {
+            left_plain
+        } else {
+            format!("{left_plain}  {right}")
+        };
+        self.mark_dirty_from(idx);
+        self.rows[idx].text = text;
+        if let Some(ChromeRow::Footer { right: baked, .. }) = self.rows[idx].chrome.as_mut() {
+            *baked = right;
+        }
+    }
+
+    /// Signed context-growth percentage: the following turn's `input_tokens`
+    /// minus the proposing turn's, as a fraction of the context cap (`"+0.9%"`).
+    /// `None` without a prior turn or a known cap — never a fabricated delta.
+    fn context_growth_pct(&self, input_tokens: u64) -> Option<String> {
+        let prev = self.last_turn_input_tokens?;
+        let cap = self.context_cap.filter(|&cap| cap > 0)?;
+        let delta = input_tokens as i64 - prev as i64;
+        let pct = delta as f64 / cap as f64 * 100.0;
+        Some(format!("{pct:+.1}%"))
+    }
+
+    /// Call ids of every in-flight tool block, so the tools-first event order
+    /// (a `ToolStarted` that precedes its turn's `ProviderTurnCompleted`) still
+    /// stamps the diagnostics onto the already-open footers.
+    fn active_call_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        if let Some(active) = &self.active_exec {
+            ids.push(active.call.id.clone());
+        }
+        if let Some(active) = &self.active_tool {
+            ids.push(active.call.id.clone());
+        }
+        if let Some(active) = &self.active_edit {
+            ids.push(active.call_id.clone());
+        }
+        ids.extend(self.active_explorations.iter().map(|a| a.call_id.clone()));
+        ids
+    }
+
+    /// Stamp the proposing turn's `↓received` diagnostic onto a newly-known
+    /// call and record it as awaiting the following turn's input-side numbers,
+    /// if the turn reported usage.
+    fn assign_turn_diag(&mut self, call_id: &str) {
+        if let Some(diag) = self.current_turn_diag.clone() {
+            self.set_tool_diag(call_id, diag);
+            self.mark_awaiting_input(call_id);
+        }
+    }
+
+    /// Record a proposing-turn tool call as awaiting the following turn's
+    /// input-side diagnostics (`↑/cache/ctx`). Deduplicated: `DiffPreview`,
+    /// `ToolStarted`, and the turn-completion stamp can all name the same call.
+    fn mark_awaiting_input(&mut self, call_id: &str) {
+        if !self.awaiting_input_calls.iter().any(|id| id == call_id) {
+            self.awaiting_input_calls.push(call_id.to_string());
         }
     }
 
@@ -626,22 +865,17 @@ impl Transcript {
                 .unwrap_or_else(|| "0.0s".to_string())
         };
         let plain = format!("{} {}", spec.state.plain_prefix(), spec.plain_meta);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Header {
                 expanded,
                 title: spec.title,
                 meta: spec.meta.to_string(),
-                right: vec![
-                    (spec.state.symbol().to_string(), spec.state.dot_style()),
-                    (spec.state.label().to_string(), spec.state.label_style()),
-                    (format!("     {elapsed:>10}  "), dim_style()),
-                ],
+                elapsed,
             },
             plain,
             tool_header_style(),
         ));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
     }
 
     fn push_panel_header(&mut self, spec: PanelHeaderSpec<'_>) {
@@ -724,6 +958,7 @@ impl Transcript {
             output: String::new(),
             body_start,
             started,
+            user_expanded: None,
         });
     }
 
@@ -744,12 +979,14 @@ impl Transcript {
             call,
             body_start,
             started,
+            user_expanded: None,
         });
     }
 
-    /// Push a complete EDIT panel whose body is the canonical block diff plus
-    /// the quiet `+added  −removed` footer (`EditOutput` design-system
-    /// component). Long diffs fold to a capped preview.
+    /// Push a complete EDIT block whose body is the canonical block diff
+    /// (`DiffBlock` rows verbatim) and whose footer carries the `+n −n` counts
+    /// and note as fields after the state label. The body folds whole behind
+    /// the header disclosure; the footer never folds.
     fn push_edit_panel(
         &mut self,
         call: &ToolCall,
@@ -762,39 +999,55 @@ impl Transcript {
         let renderer = tool_render::resolve(call);
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
-        self.push_panel_header(PanelHeaderSpec {
-            title: "EDIT",
-            meta: &meta,
-            plain_meta: &plain,
-            state,
-            duration,
-            started,
-        });
         let diff_rows = diff_table_rows(diff);
-        let cap = super::MAX_TOOL_OUTPUT_ROWS;
-        let foldable = diff_rows.len() > cap + 1;
-        if foldable {
-            let hidden = diff_rows.len() - cap;
-            for row in diff_rows.iter().take(cap).cloned() {
-                self.rows.push(row.with_fold(FoldVis::WhenCollapsed));
-            }
-            let left = format!("\u{2026} {hidden} more lines");
-            let hint = right_align_pair(&left, "ctrl+o to expand", self.wrap_width());
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::BodyRight {
-                        left: Line::from(Span::styled(left.clone(), dim_style())),
-                        right: "ctrl+o to expand".to_string(),
-                        right_style: dim_style(),
+        // EXCEPTION to compact-by-default: a pending EDIT preview exists to be
+        // reviewed, so it (and the running edit) arrives EXPANDED; it collapses
+        // once the edit is finalized (state Done/Error). An explicit user fold
+        // is reapplied by the rebuild path.
+        let expanded = matches!(state, PanelState::Preview | PanelState::Running);
+        self.push_panel_header_with_expanded(
+            PanelHeaderSpec {
+                title: "EDIT",
+                meta: &meta,
+                plain_meta: &plain,
+                state,
+                duration,
+                started,
+            },
+            expanded,
+        );
+        let body_from = self.rows.len();
+        if diff_rows.is_empty() && error.is_none() {
+            if diff.trim().is_empty() {
+                // A preview/edit whose diff is genuinely empty (e.g. the edit's
+                // old_string did not match the file) would otherwise render an
+                // empty frame -- header + bottom border, zero body rows --
+                // leaving nothing to review while the approval modal waits.
+                // Emit one honest dim placeholder instead of fabricating a diff.
+                let placeholder = "no preview available";
+                self.rows.push(TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: Line::from(Span::styled(placeholder, dim_style())),
                         bg: None,
                     },
-                    hint,
+                    placeholder.to_string(),
                     dim_style(),
-                )
-                .with_fold(FoldVis::WhenCollapsed),
-            );
-            for row in diff_rows {
-                self.rows.push(row.with_fold(FoldVis::WhenExpanded));
+                ));
+            } else {
+                // Non-empty preview text that does not parse into diff rows --
+                // e.g. "diff unavailable: preview too large" -- carries
+                // actionable meaning. Render it verbatim as dim body rows
+                // rather than hiding it behind the generic placeholder.
+                for line in diff.trim_end_matches('\n').split('\n') {
+                    self.rows.push(TranscriptRow::chrome_with_text(
+                        ChromeRow::Body {
+                            line: Line::from(Span::styled(line.to_string(), dim_style())),
+                            bg: None,
+                        },
+                        line.to_string(),
+                        dim_style(),
+                    ));
+                }
             }
         } else {
             self.rows.extend(diff_rows);
@@ -809,23 +1062,23 @@ impl Transcript {
                 err_style(),
             ));
         }
+        // The whole body (diff rows, placeholders, error line) folds as one
+        // unit behind the header disclosure.
+        for row in &mut self.rows[body_from..] {
+            if row.fold == FoldVis::Always {
+                row.fold = FoldVis::WhenExpanded;
+            }
+        }
         let (added, removed) = diff_counts(diff);
-        if added + removed > 0 {
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::default(),
-                    bg: None,
-                },
-                String::new(),
-                panel_style(),
-            ));
-            let note = diff.contains("--- /dev/null").then_some("new file");
-            self.rows.push(diff_footer_row(added, removed, note));
-        }
-        if foldable {
-            self.mark_panel_preview();
-        }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let note = diff.contains("--- /dev/null").then_some("new file");
+        let diag = self.tool_diags.get(&call.id).cloned();
+        self.push_block_footer(
+            state.label(),
+            state.label_style(),
+            edit_footer_extras(added, removed, note),
+            diag.as_ref(),
+            Some(&call.id),
+        );
     }
 
     /// Render the final task diff (issue #264) as a bordered panel: a `DIFF`
@@ -845,6 +1098,7 @@ impl Transcript {
             duration: None,
             started: None,
         });
+        let body_from = self.rows.len();
         for line in summary.iter().skip(1) {
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
@@ -856,11 +1110,17 @@ impl Transcript {
             ));
         }
         self.rows.extend(diff_table_rows(diff));
-        let (added, removed) = diff_counts(diff);
-        if added + removed > 0 {
-            self.rows.push(diff_footer_row(added, removed, None));
+        for row in &mut self.rows[body_from..] {
+            row.fold = FoldVis::WhenExpanded;
         }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let (added, removed) = diff_counts(diff);
+        self.push_block_footer(
+            PanelState::Done.label(),
+            PanelState::Done.label_style(),
+            edit_footer_extras(added, removed, None),
+            None,
+            None,
+        );
     }
 
     /// Open (or reopen) the EDIT panel for a pending mutation: `◇ PREVIEW`,
@@ -876,6 +1136,7 @@ impl Transcript {
             diff,
             body_start,
             started: None,
+            user_expanded: None,
         });
     }
 
@@ -906,7 +1167,7 @@ impl Transcript {
             this.push_edit_panel(call, &diff, state, duration, started, error);
         });
         let end = self.panel_end_from(active.body_start);
-        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+        if let Some(expanded) = active.user_expanded {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
         self.mark_dirty_from(active.body_start);
@@ -923,7 +1184,7 @@ impl Transcript {
             .position(|row| {
                 matches!(
                     row.chrome.as_ref(),
-                    Some(ChromeRow::Bottom | ChromeRow::RailEnd)
+                    Some(ChromeRow::BlockEnd | ChromeRow::RailEnd)
                 )
             })
             .map_or(start, |offset| start + offset + 1)
@@ -933,25 +1194,10 @@ impl Transcript {
         self.panel_end_from(active.body_start)
     }
 
-    /// The reveal state to carry across an in-place panel rebuild, but only when
-    /// the old panel was foldable (had capped output). Returning `None` lets a
-    /// freshly capped panel keep its built-in preview default instead of
-    /// inheriting an unrelated `expanded` flag.
-    fn panel_reveal_state_in(&self, start: usize, end: usize) -> Option<bool> {
-        if !self.rows[start..end]
-            .iter()
-            .any(|row| row.fold != FoldVis::Always)
-        {
-            return None;
-        }
-        self.rows[start..end]
-            .iter()
-            .find_map(|row| match row.chrome.as_ref() {
-                Some(ChromeRow::Header { expanded, .. }) => Some(*expanded),
-                _ => None,
-            })
-    }
-
+    /// Reapply an active block's recorded fold state (`user_expanded`) onto a
+    /// fresh in-place rebuild. Only an explicit user toggle survives across
+    /// running -> done / preview -> done; otherwise the fresh block keeps its
+    /// compact-by-default arrival state.
     fn preserve_panel_expanded(replacement: &mut [TranscriptRow], expanded: bool) {
         if let Some(row_expanded) =
             replacement
@@ -971,7 +1217,7 @@ impl Transcript {
         mut replacement: Vec<TranscriptRow>,
     ) {
         let end = self.active_tool_panel_end(active);
-        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+        if let Some(expanded) = active.user_expanded {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
         self.mark_dirty_from(active.body_start);
@@ -988,7 +1234,7 @@ impl Transcript {
         mut replacement: Vec<TranscriptRow>,
     ) {
         let end = self.active_exec_panel_end(active);
-        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+        if let Some(expanded) = active.user_expanded {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
         self.mark_dirty_from(active.body_start);
@@ -1196,17 +1442,10 @@ impl Transcript {
         }
     }
 
-    fn explore_header_right(state: PanelState, duration: Option<Duration>) -> Vec<(String, Style)> {
-        let elapsed = duration
+    fn explore_elapsed(duration: Option<Duration>) -> String {
+        duration
             .map(format_elapsed_compact)
-            .unwrap_or_else(|| "0.0s".to_string());
-        vec![
-            (state.symbol().to_string(), state.dot_style()),
-            (format!("{:<13}", state.label()), state.label_style()),
-            // Fixed-width elapsed so the live timer does not shift the header
-            // right edge as the compact label changes length (e.g. 9.9s -> 10s).
-            (format!("{elapsed:>8}  "), dim_style()),
-        ]
+            .unwrap_or_else(|| "0.0s".to_string())
     }
 
     fn current_explore_header_row(&self) -> Option<usize> {
@@ -1269,6 +1508,9 @@ impl Transcript {
             })
     }
 
+    /// Rewrite the open EXPLORE block's header (elapsed) and footer (state
+    /// label) in place. The header right edge carries only the elapsed time;
+    /// the state lives in the footer.
     fn set_explore_header(
         &mut self,
         call: &ToolCall,
@@ -1287,8 +1529,21 @@ impl Transcript {
             expanded,
             title: "EXPLORE",
             meta,
-            right: Self::explore_header_right(state, duration),
+            elapsed: Self::explore_elapsed(duration),
         });
+        let diag = self.tool_diags.get(&call.id).cloned();
+        if let Some(offset) = self.rows[header..]
+            .iter()
+            .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Footer { .. })))
+        {
+            self.rows[header + offset] = block_footer_row(
+                state.label(),
+                state.label_style(),
+                Vec::new(),
+                diag.as_ref(),
+                Some(&call.id),
+            );
+        }
     }
 
     fn update_explore_header_from_active(&mut self, call: &ToolCall) {
@@ -1314,13 +1569,22 @@ impl Transcript {
         }
     }
 
-    fn pop_trailing_explore_bottom(&mut self) {
-        if matches!(
+    /// Pop the open EXPLORE block's trailing footer (rule · footer · end
+    /// marker) so a new op row can be appended before the footer is re-pushed.
+    fn pop_trailing_explore_footer(&mut self) {
+        if !matches!(
             self.rows.last().and_then(|row| row.chrome.as_ref()),
-            Some(ChromeRow::Bottom)
+            Some(ChromeRow::BlockEnd)
         ) {
-            self.mark_dirty_from(self.rows.len().saturating_sub(1));
-            self.rows.pop();
+            return;
+        }
+        let rule = self.rows.len().saturating_sub(3);
+        if matches!(
+            self.rows.get(rule).and_then(|row| row.chrome.as_ref()),
+            Some(ChromeRow::FooterRule)
+        ) {
+            self.mark_dirty_from(rule);
+            self.rows.truncate(rule);
         }
     }
 
@@ -1335,21 +1599,30 @@ impl Transcript {
             },
         );
         if self.exploring_open {
-            self.pop_trailing_explore_bottom();
-            self.set_explore_header(call, panel_state(false, false), duration);
+            self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+            self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
                 title: "EXPLORE",
                 meta,
-                right: Self::explore_header_right(panel_state(false, false), duration),
+                elapsed: Self::explore_elapsed(duration),
             }));
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
-        self.rows.push(row);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.rows.push(row.with_fold(FoldVis::WhenExpanded));
+        let state = panel_state(false, false);
+        let diag = self.tool_diags.get(&call.id).cloned();
+        self.push_block_footer(
+            state.label(),
+            state.label_style(),
+            Vec::new(),
+            diag.as_ref(),
+            Some(&call.id),
+        );
+        if self.exploring_open {
+            self.set_explore_header(call, state, duration);
+        }
         self.exploring_open = true;
     }
 
@@ -1375,21 +1648,26 @@ impl Transcript {
         let meta = self.explore_meta(call);
         let body = self.explore_row(call, ToolOutcome::Running { streamed: "" });
         if self.exploring_open {
-            self.pop_trailing_explore_bottom();
+            self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+            self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
                 title: "EXPLORE",
                 meta,
-                right: Self::explore_header_right(PanelState::Running, Some(Duration::ZERO)),
+                elapsed: Self::explore_elapsed(Some(Duration::ZERO)),
             }));
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
         let row = self.rows.len();
-        self.rows.push(body);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.rows.push(body.with_fold(FoldVis::WhenExpanded));
+        self.push_block_footer(
+            PanelState::Running.label(),
+            PanelState::Running.label_style(),
+            Vec::new(),
+            None,
+            Some(&call.id),
+        );
         self.exploring_open = true;
         self.active_explorations.push(ActiveExploration {
             call_id: call.id.clone(),
@@ -1407,11 +1685,14 @@ impl Transcript {
         let Some(slot) = self.rows.get(row) else {
             return false;
         };
-        if !matches!(slot.chrome.as_ref(), Some(ChromeRow::Body { .. })) {
+        if !matches!(
+            slot.chrome.as_ref(),
+            Some(ChromeRow::Body { .. } | ChromeRow::BodyRight { .. })
+        ) {
             return false;
         }
         self.mark_dirty_from(row);
-        self.rows[row] = replacement;
+        self.rows[row] = replacement.with_fold(FoldVis::WhenExpanded);
         true
     }
 
@@ -1467,10 +1748,28 @@ impl Transcript {
                 self.provider_turn_started = Some(Instant::now());
                 self.thinking_header_row = None;
                 self.thinking_elapsed = None;
+                self.current_turn_diag = None;
             }
             UiEvent::ProviderTurnCompleted { usage, .. } => {
                 if let Some(usage) = usage {
                     self.set_thinking_telemetry(usage.reasoning_output_tokens);
+                    // Forward attribution. This turn's INPUT side ingested the
+                    // previous turn's tool results: patch their footers with
+                    // ↑/cache/ctx (ctx diffs against the still-current baseline),
+                    // then advance the baseline to this turn's input.
+                    self.apply_following_turn_usage(&usage);
+                    self.last_turn_input_tokens = Some(usage.input_tokens);
+                    // This turn's OUTPUT side is the ↓ for the tools IT proposes.
+                    let diag = Self::proposing_turn_diag(&usage);
+                    // Common order: this completes before its tools start, so
+                    // the stored ↓ is stamped on later `ToolStarted`s. Also cover
+                    // the tools-first order by stamping any open call now and
+                    // enrolling it to await the NEXT turn's input side.
+                    for id in self.active_call_ids() {
+                        self.set_tool_diag(&id, diag.clone());
+                        self.mark_awaiting_input(&id);
+                    }
+                    self.current_turn_diag = Some(diag);
                 }
             }
             UiEvent::CompactionApplied {
@@ -1544,22 +1843,35 @@ impl Transcript {
             }
             UiEvent::SessionStarted => {
                 self.finish_stream();
+                // A fresh session: drop measured diagnostics, pending footer
+                // patches, and the ctx baseline so a new conversation never
+                // inherits stale numbers.
+                self.tool_diags.clear();
+                self.current_turn_diag = None;
+                self.awaiting_input_calls.clear();
+                self.last_turn_input_tokens = None;
             }
             UiEvent::ToolProposed(_) => {
                 // Non-gated tools show only their result row; nothing to render.
                 self.finish_stream();
             }
-            UiEvent::ToolStarted(call) => match tool_render::resolve(&call).kind() {
-                ToolPanelKind::Explore => self.push_explored_start(&call),
-                ToolPanelKind::Shell => self.begin_exec(call),
-                ToolPanelKind::Generic => {
-                    // A mutation whose diff already arrived keeps its EDIT
-                    // panel: the preview flips to `● RUNNING` in place.
-                    if !self.rebuild_active_edit(&call, PanelState::Running, None, None, true) {
-                        self.begin_tool(call);
+            UiEvent::ToolStarted(call) => {
+                // Stamp the proposing turn's ↓ and enroll the call to await the
+                // following turn's input side, before dispatch, so the block's
+                // first footer build already carries ↓.
+                self.assign_turn_diag(&call.id);
+                match tool_render::resolve(&call).kind() {
+                    ToolPanelKind::Explore => self.push_explored_start(&call),
+                    ToolPanelKind::Shell => self.begin_exec(call),
+                    ToolPanelKind::Generic => {
+                        // A mutation whose diff already arrived keeps its EDIT
+                        // panel: the preview flips to `● RUNNING` in place.
+                        if !self.rebuild_active_edit(&call, PanelState::Running, None, None, true) {
+                            self.begin_tool(call);
+                        }
                     }
                 }
-            },
+            }
             UiEvent::ToolOutputDelta { call_id, chunk } => {
                 if self
                     .active_exec
@@ -1584,6 +1896,7 @@ impl Transcript {
                 self.record_approval(&call, ApprovalDecision::AllowAlways);
             }
             UiEvent::DiffPreview { call, diff } => {
+                self.assign_turn_diag(&call.id);
                 self.begin_edit_preview(&call, diff);
             }
             UiEvent::ToolDenied(call) => {
@@ -1714,6 +2027,13 @@ impl Transcript {
         self.thinking_header_row = self
             .thinking_header_row
             .and_then(|index| index.checked_sub(remove));
+        // Prompt-start anchors shift with the trimmed head; trimmed-away
+        // prompts are dropped.
+        self.user_prompt_starts = self
+            .user_prompt_starts
+            .iter()
+            .filter_map(|&index| index.checked_sub(remove))
+            .collect();
         self.exploring_open = self.trailing_explore_panel_open();
     }
 
@@ -1730,11 +2050,12 @@ impl Transcript {
             self.rows.get(index).and_then(|row| row.chrome.as_ref()),
             Some(
                 ChromeRow::Header { .. }
-                    | ChromeRow::Separator
                     | ChromeRow::Body { .. }
                     | ChromeRow::BodyRight { .. }
                     | ChromeRow::BodyRule { .. }
-                    | ChromeRow::Bottom
+                    | ChromeRow::FooterRule
+                    | ChromeRow::Footer { .. }
+                    | ChromeRow::BlockEnd
             )
         )
     }
@@ -1743,19 +2064,22 @@ impl Transcript {
         let Some(last) = self.rows.iter().rposition(|row| !is_separator_row(row)) else {
             return false;
         };
-        if !matches!(self.rows[last].chrome.as_ref(), Some(ChromeRow::Bottom)) {
+        if !matches!(self.rows[last].chrome.as_ref(), Some(ChromeRow::BlockEnd)) {
             return false;
         }
         for row in self.rows[..=last].iter().rev() {
             match row.chrome.as_ref() {
                 Some(ChromeRow::Header { title, .. }) => return *title == "EXPLORE",
-                Some(ChromeRow::Top) => return false,
+                Some(ChromeRow::BlockStart) => return false,
                 _ => {}
             }
         }
         false
     }
 
+    /// Test helper: toggle the newest foldable panel. Production ctrl+o goes
+    /// through [`Self::toggle_all_panels`].
+    #[cfg(test)]
     pub(super) fn toggle_latest_panel(&mut self) -> bool {
         let Some(header) = self.rows.iter().rposition(|row| {
             matches!(
@@ -1765,23 +2089,240 @@ impl Transcript {
         }) else {
             return false;
         };
-        // Only foldable panels (those with capped output) respond to ctrl+o;
-        // a panel with nothing hidden has no reveal state to toggle.
+        match self.panel_expanded_at(header) {
+            Some(expanded) => self.set_panel_expanded_at(header, !expanded),
+            None => false,
+        }
+    }
+
+    /// Whether the panel whose header row is `header` has any foldable body
+    /// (a row that hides when collapsed); a panel with nothing hidden cannot
+    /// toggle.
+    fn header_is_foldable(&self, header: usize) -> bool {
         let end = self.panel_end_from(header);
-        if !self.rows[header..end]
+        self.rows[header..end]
             .iter()
             .any(|row| row.fold != FoldVis::Always)
-        {
+    }
+
+    /// ctrl+o: expand every foldable panel (tool blocks AND thinking rails) if
+    /// ANY is currently collapsed, else collapse them all. Returns whether any
+    /// header changed; dirties from the first affected row via
+    /// [`Self::set_panel_expanded_at`].
+    pub(super) fn toggle_all_panels(&mut self) -> bool {
+        let headers: Vec<usize> = self
+            .panel_header_rows()
+            .into_iter()
+            .filter(|&header| self.header_is_foldable(header))
+            .collect();
+        if headers.is_empty() {
             return false;
         }
-        self.mark_dirty_from(header);
+        // Expand all if any foldable block is currently collapsed.
+        let expand = headers
+            .iter()
+            .any(|&header| self.panel_expanded_at(header) == Some(false));
+        let mut changed = false;
+        for header in headers {
+            if self.set_panel_expanded_at(header, expand) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Row indices of every panel header (EXPLORE/SHELL/EDIT/thinking rails):
+    /// the selectable scrollback entries for keyboard navigation. O(rows),
+    /// called per selection keypress, never per frame.
+    pub(super) fn panel_header_rows(&self) -> Vec<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Header { .. } | ChromeRow::RailHeader { .. })
+                )
+                .then_some(idx)
+            })
+            .collect()
+    }
+
+    /// Set the fold state of the panel whose header row is `header`. Returns
+    /// whether the state changed (false for non-headers, panels with nothing
+    /// hidden, or an already-matching state). An explicit set on an active
+    /// block's header is recorded as user intent so it survives finalize,
+    /// even when it is a no-op on the current row (e.g. re-affirming a running
+    /// block should stay expanded).
+    pub(super) fn set_panel_expanded_at(&mut self, header: usize, expand: bool) -> bool {
+        if header >= self.rows.len() {
+            return false;
+        }
+        if !matches!(
+            self.rows[header].chrome.as_ref(),
+            Some(ChromeRow::Header { .. } | ChromeRow::RailHeader { .. })
+        ) {
+            return false;
+        }
+        if !self.header_is_foldable(header) {
+            return false;
+        }
+        self.record_user_fold(header, expand);
         match self.rows[header].chrome.as_mut() {
-            Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. }) => {
-                *expanded = !*expanded;
+            Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. })
+                if *expanded != expand =>
+            {
+                *expanded = expand;
+                self.mark_dirty_from(header);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Current fold state of the panel header at `header`, if it is one.
+    pub(super) fn panel_expanded_at(&self, header: usize) -> Option<bool> {
+        match self.rows.get(header)?.chrome.as_ref() {
+            Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. }) => {
+                Some(*expanded)
+            }
+            _ => None,
+        }
+    }
+
+    /// Record an explicit user fold on an active block so it survives the
+    /// in-place rebuild at finalize. A block's header row is `body_start + 1`
+    /// (the row after its `BlockStart`); at most one exec/tool/edit is active.
+    fn record_user_fold(&mut self, header: usize, expanded: bool) {
+        if let Some(active) = self.active_exec.as_mut()
+            && active.body_start + 1 == header
+        {
+            active.user_expanded = Some(expanded);
+        }
+        if let Some(active) = self.active_tool.as_mut()
+            && active.body_start + 1 == header
+        {
+            active.user_expanded = Some(expanded);
+        }
+        if let Some(active) = self.active_edit.as_mut()
+            && active.body_start + 1 == header
+        {
+            active.user_expanded = Some(expanded);
+        }
+    }
+
+    /// The foldable header row whose visible physical-line span covers `line`
+    /// (a whole header row is the click target, not just the disclosure
+    /// glyph). Requires a warm wrap cache; `None` outside any header.
+    pub(super) fn header_row_at_visible_line(&self, line: usize) -> Option<usize> {
+        self.panel_header_rows().into_iter().find(|&header| {
+            let Some(start) = self.visible_line_of_row(header) else {
+                return false;
+            };
+            let span = self
+                .wrapped_cache
+                .rows
+                .get(header)
+                .map_or(1, |layout| layout.lines.len().max(1));
+            (start..start + span).contains(&line)
+        })
+    }
+
+    /// Case-insensitive substring search over the CANONICAL transcript
+    /// content -- the full body of every panel, whether it is currently
+    /// folded or expanded ("search what is said, not what is shown"). The
+    /// collapsed-preview rows (`FoldVis::WhenCollapsed`: the head/tail excerpt
+    /// plus the `... N more lines` affordance) are skipped so a collapsed
+    /// panel does not double-count its preview against its full body; the
+    /// fold affordance hints (`ctrl+o to expand`/`collapse`) are control
+    /// chrome (`searchable == false`) and are also skipped so a query never
+    /// matches hidden UI or auto-expands a panel for non-content text. Every
+    /// other row (`Always` + `WhenExpanded`) is real transcript text and is
+    /// searched even when a fold hides it. The cache is refreshed at its
+    /// current width first, so appends and fold changes since the last frame
+    /// are searched and stale lines are not. Returns matches in ascending
+    /// (row, sub-line) order, each identified by the logical row that owns it
+    /// so a jump can expand the enclosing fold before resolving a visible
+    /// line. O(total physical lines) per invocation -- run per
+    /// `/find`/`n`/`N` keypress, never per frame.
+    pub(super) fn search_matches(&mut self, query: &str) -> Vec<SearchMatch> {
+        let needle = query.to_lowercase();
+        let width = self.wrapped_cache.width;
+        if needle.is_empty() || width == 0 {
+            return Vec::new();
+        }
+        // Same cache-warming path rendering uses: dirty rows re-wrap, fold
+        // visibility re-resolves. Folded-away bodies are still rendered into
+        // the cache (only their visible-line accounting is suppressed), so
+        // their physical lines are here to search.
+        self.ensure_wrapped_cache(width);
+        let mut out = Vec::new();
+        for (row_idx, layout) in self.wrapped_cache.rows.iter().enumerate() {
+            let row = &self.rows[row_idx];
+            // Skip collapsed-preview excerpts (searched via the full body) and
+            // control chrome such as the `ctrl+o to expand`/`collapse` fold
+            // hints, which are UI, not transcript content.
+            if row.fold == FoldVis::WhenCollapsed || !row.searchable {
+                continue;
+            }
+            for (sub, line) in self.wrapped_cache.lines[layout.lines.clone()]
+                .iter()
+                .enumerate()
+            {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                if text.to_lowercase().contains(&needle) {
+                    out.push(SearchMatch { row: row_idx, sub });
+                }
+            }
+        }
+        out
+    }
+
+    /// Expand the fold enclosing logical `row` (when a collapsed panel hides
+    /// it) and return the visible physical-line index of the row's `sub`-th
+    /// wrapped line under the refreshed cache. The reveal is what makes a
+    /// `/find` jump into a collapsed panel land on a visible row instead of a
+    /// dead offset. `None` only when the row cannot be made visible (no
+    /// enclosing panel, or the cache does not cover it).
+    pub(super) fn reveal_and_locate(&mut self, row: usize, sub: usize) -> Option<usize> {
+        let hidden = self
+            .wrapped_cache
+            .rows
+            .get(row)
+            .is_some_and(|layout| !layout.visible);
+        if hidden
+            && let Some(header) = self
+                .panel_header_rows()
+                .into_iter()
+                .rev()
+                .find(|&header| header <= row)
+        {
+            self.set_panel_expanded_at(header, true);
+        }
+        // Re-warm after a possible expansion so the returned index matches the
+        // next frame's layout.
+        let width = self.wrapped_cache.width;
+        self.ensure_wrapped_cache(width);
+        Some(self.visible_line_of_row(row)? + sub)
+    }
+
+    /// Visible physical line index of logical `row` under the WARM wrap cache
+    /// (callers refresh via [`Self::visible_total`] first). `None` when the
+    /// row is folded away or the cache does not cover it yet.
+    pub(super) fn visible_line_of_row(&self, row: usize) -> Option<usize> {
+        let layout = self.wrapped_cache.rows.get(row)?;
+        if !layout.visible {
+            return None;
+        }
+        Some(if row == 0 {
+            0
+        } else {
+            self.wrapped_cache.rows[row - 1].visible_cum
+        })
     }
 
     #[cfg(test)]
@@ -1804,8 +2345,23 @@ impl Transcript {
     pub(super) fn commit_user(&mut self, text: &str) {
         self.mark_append_dirty();
         self.push_blank();
+        self.user_prompt_starts.push(self.rows.len());
         pane::push_user_rows(&mut self.rows, text);
         self.trim_history();
+    }
+
+    /// Visible line of the newest user prompt that begins strictly above the
+    /// viewport top -- the pager's sticky header anchor. Requires a warm wrap
+    /// cache (compose refreshes it every frame). Binary search over the
+    /// sorted anchors (prompt rows are always visible and line positions are
+    /// monotone in row order), so the per-frame cost is O(log prompts), never
+    /// a prompt walk.
+    pub(super) fn sticky_prompt_line(&self, top: usize) -> Option<usize> {
+        let above = self
+            .user_prompt_starts
+            .partition_point(|&row| self.visible_line_of_row(row).is_some_and(|line| line < top));
+        let row = *self.user_prompt_starts.get(above.checked_sub(1)?)?;
+        self.visible_line_of_row(row).filter(|&line| line < top)
     }
 
     fn ensure_wrapped_cache(&mut self, width: usize) {
@@ -1834,10 +2390,10 @@ impl Transcript {
             });
         for row in &self.rows[self.wrapped_cache.rows.len()..] {
             match row.chrome.as_ref() {
-                // A panel opens fully shown until its header sets the state;
-                // resetting at Top guards against a missing Bottom leaking a
-                // prior panel's collapsed state into the next one.
-                Some(ChromeRow::Top) => expanded = true,
+                // A block opens fully shown until its header sets the state;
+                // resetting at BlockStart guards against a missing BlockEnd
+                // leaking a prior block's collapsed state into the next one.
+                Some(ChromeRow::BlockStart) => expanded = true,
                 Some(
                     ChromeRow::Header { expanded: e, .. }
                     | ChromeRow::RailHeader { expanded: e, .. },
@@ -1857,7 +2413,7 @@ impl Transcript {
             }
             if matches!(
                 row.chrome.as_ref(),
-                Some(ChromeRow::Bottom | ChromeRow::RailEnd)
+                Some(ChromeRow::BlockEnd | ChromeRow::RailEnd)
             ) {
                 expanded = true;
             }
@@ -1874,6 +2430,114 @@ impl Transcript {
 
     pub(super) fn render(&mut self, width: u16) -> TranscriptRender {
         self.render_cached(width, false)
+    }
+
+    /// Refresh the streaming-preview memo for `width` (no-op when the stream
+    /// did not grow). Shared by the full render and the pager's windowed
+    /// render so both see the same transient stream rows.
+    fn refresh_streaming_memo(&mut self, width: usize) {
+        let Some(text) = self.streaming.as_ref() else {
+            return;
+        };
+        let fresh = self
+            .streaming_render
+            .as_ref()
+            .is_some_and(|memo| memo.len == text.len() && memo.width == width);
+        if !fresh {
+            let mut lines = Vec::new();
+            for row in &pane::streaming_assistant_rows(text, width) {
+                row.render_rows(width, &mut lines);
+            }
+            self.streaming_render = Some(StreamingRender {
+                len: text.len(),
+                width,
+                lines,
+            });
+        }
+    }
+
+    /// Number of transient streaming-preview lines at `width` (0 when idle).
+    fn streaming_lines(&self) -> usize {
+        if self.streaming.is_some() {
+            self.streaming_render
+                .as_ref()
+                .map_or(0, |memo| memo.lines.len())
+        } else {
+            0
+        }
+    }
+
+    /// Total visible physical lines (committed rows + streaming preview) at
+    /// `width`, refreshing the wrap cache. O(dirty suffix), O(1) once warm --
+    /// the pager calls this every frame regardless of transcript length.
+    pub(super) fn visible_total(&mut self, width: u16) -> usize {
+        let width = usize::from(width);
+        self.last_width = width
+            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+            .max(1);
+        self.ensure_wrapped_cache(width);
+        self.refresh_streaming_memo(width);
+        let committed = self
+            .wrapped_cache
+            .rows
+            .last()
+            .map_or(0, |layout| layout.visible_cum);
+        committed + self.streaming_lines()
+    }
+
+    /// Clone exactly the visible physical lines `[top .. top+rows)` out of the
+    /// wrap cache (plus the streaming preview when the window reaches it).
+    /// Callers must have the window clamped against [`Self::visible_total`]
+    /// for the same width. Cost: O(rows + log transcript), never O(transcript)
+    /// -- this is the pager's visible-range-only render (ADR-0029).
+    pub(super) fn render_window(
+        &mut self,
+        width: u16,
+        top: usize,
+        rows: usize,
+    ) -> Vec<Line<'static>> {
+        let total = self.visible_total(width);
+        let committed = total - self.streaming_lines();
+        let end = (top + rows).min(total);
+        if top >= end {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(end - top);
+        if top < committed {
+            // First cached row whose cumulative visible count exceeds `top`.
+            let mut idx = self
+                .wrapped_cache
+                .rows
+                .partition_point(|layout| layout.visible_cum <= top);
+            let mut pos = if idx == 0 {
+                0
+            } else {
+                self.wrapped_cache.rows[idx - 1].visible_cum
+            };
+            'rows: while idx < self.wrapped_cache.rows.len() {
+                let layout = &self.wrapped_cache.rows[idx];
+                if layout.visible {
+                    for line in &self.wrapped_cache.lines[layout.lines.clone()] {
+                        if pos >= end {
+                            break 'rows;
+                        }
+                        if pos >= top {
+                            out.push(line.clone());
+                        }
+                        pos += 1;
+                    }
+                }
+                idx += 1;
+            }
+        }
+        if end > committed
+            && let Some(memo) = self.streaming_render.as_ref()
+        {
+            let from = top.max(committed) - committed;
+            let until = end - committed;
+            out.extend(memo.lines[from..until].iter().cloned());
+        }
+        out
     }
 
     pub(super) fn render_incremental(&mut self, width: u16) -> TranscriptRender {
@@ -1928,25 +2592,11 @@ impl Transcript {
         // mutate retained row ranges. Its wrapped lines are memoized on
         // `(len, width)` so only frames where the stream actually grew pay the
         // markdown re-parse.
-        if let Some(text) = self.streaming.as_ref() {
-            let fresh = self
-                .streaming_render
-                .as_ref()
-                .is_some_and(|memo| memo.len == text.len() && memo.width == width);
-            if !fresh {
-                let mut lines = Vec::new();
-                for row in &pane::streaming_assistant_rows(text, width) {
-                    row.render_rows(width, &mut lines);
-                }
-                self.streaming_render = Some(StreamingRender {
-                    len: text.len(),
-                    width,
-                    lines,
-                });
-            }
-            if let Some(memo) = self.streaming_render.as_ref() {
-                out.extend(memo.lines.iter().cloned());
-            }
+        self.refresh_streaming_memo(width);
+        if self.streaming.is_some()
+            && let Some(memo) = self.streaming_render.as_ref()
+        {
+            out.extend(memo.lines.iter().cloned());
         }
         let total_lines = stable_prefix + out.len();
         TranscriptRender {

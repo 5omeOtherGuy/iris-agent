@@ -882,16 +882,24 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
 
 - Dirty-tree detection and unrelated-change safety
   ([#262](https://github.com/5omeOtherGuy/iris-agent/issues/262)) — gates the rest. Done.
+  Baseline + attribution ledger + choke-point gate: edit/write route a
+  pre-existing dirty target through per-file, per-task approval; bash is
+  detect-and-restore around a protected-set snapshot; non-git/`.jj` degrade with
+  an honest notice.
 - Task-scoped checkpoint/rollback
-  ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — in review. Op-log-shaped
+  ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — Done. Op-log-shaped
   git checkpoint chain under `refs/iris/checkpoints/<task-id>/` (plumbing only,
   temporary index), auto-checkpoint over the unsettled diff, rollback of ledger
   paths + user index, settlement GC (keep last N), crash-recovery reconciliation,
   30-day expiry, non-git content-snapshot fallback, and `/rollback`/`/accept`/
-  `/checkpoint` slash commands. Seam left for #264: net-diff over the chain with a
-  source-tree parameter.
+  `/checkpoint` slash commands.
 - Final diff summary as the task deliverable
-  ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)).
+  ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)) — Done.
+  Ledger-scoped net diff (one hunk set per file, pre-task baseline → current,
+  scoped to Iris-authored paths so user changes never appear), surfaced by the
+  `/diff` command and the accept-flow summary; fails closed on an unreadable
+  checkpoint rather than showing an empty diff; keeps a source-tree parameter for
+  a later worktree-apply review (#267/#271).
 - Verification loop (moved from Milestone 1): run the project's test/lint/build
   command, feed failures back, retry bounded; external-signal driven, not an
   LLM self-critique pass
@@ -905,7 +913,9 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   verification never settles the task, so a failed loop stays rollbackable
   (ADR-0028).
 - Worktree isolation slice — design ADR only
-  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267)). Settled
+  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267)). ADR-0029
+  proposed (PR [#274](https://github.com/5omeOtherGuy/iris-agent/pull/274)); the
+  implementation (#271) stays gated on its acceptance. Settled
   framing: worktree isolation is Tier 0 of the ADR-0028 guarantee model; apply
   is a settlement event that mutates the parent workspace through the #262
   choke point; the final diff engine (#264) doubles as the apply review
@@ -917,6 +927,28 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
 
 Later slices (not in #261):
 
+- **Done (2026-07-04, PR #305):** Task recovery ownership fix
+  ([#285](https://github.com/5omeOtherGuy/iris-agent/issues/285),
+  [ADR-0030](adr/0030-git-safety-task-ownership-lease-and-mutation-lock.md)) —
+  shipped first, alone: multi-process recovery could adopt a live foreign
+  task and entangle two agents' chains. Now a per-task flock lease + repo-scoped
+  mutation lock; `recover_and_expire()` split into `expire_stale` /
+  `recoverable_tasks` / `adopt_task`; recovery claims only lease-free tasks and
+  never adopts or lists a live foreign one; explicit selection when more than
+  one is recoverable.
+- **Done (2026-07-04):** Task identity epic
+  ([#286](https://github.com/5omeOtherGuy/iris-agent/issues/286),
+  [ADR-0031](adr/0031-task-identity-session-linkage-and-resumable-tasks.md);
+  depended on #285) — task records carry an opaque body + session links and the
+  session log gains `taskLifecycle` audit entries
+  ([#287](https://github.com/5omeOtherGuy/iris-agent/issues/287), PR #306); a
+  resume-task picker replaced multi-record auto-adopt
+  ([#288](https://github.com/5omeOtherGuy/iris-agent/issues/288), PR #308);
+  deterministic cwd-scoped find/read of prior sessions by task
+  ([#289](https://github.com/5omeOtherGuy/iris-agent/issues/289), PR #307).
+  Enforcement never reads the new metadata; the session log is never a
+  recovery input. Deferred to Milestone 4 (#216): subagent-backed session
+  summarization and model-generated task titles.
 - Per-hunk staging
   ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
 - Optional auto-commit behind explicit approval
@@ -928,12 +960,128 @@ Later slices (not in #261):
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user
-changes.
+changes. Proven end to end by `epic_261_acceptance_end_to_end` (fake-provider
+task over a scratch repo: a clean-file edit + a create leave a dirty tracked file
+and an untracked file byte-identical, the net diff is scoped to Iris's paths,
+rollback restores Iris's paths byte-identically, and `refs/iris/` is empty after
+settlement).
 
 Gate before Git automation: dirty-tree behavior, rollback semantics, and approval
 requirements must be specified before auto-commit, worktree, GitHub, or CI features
 are implemented. [Satisfied for the #261 slice by ADR-0028 (2026-07-03); still
 binding for auto-commit, worktree, GitHub, and CI slices.]
+
+## Milestone 6 — Alt-Screen Pager TUI
+
+**Status: shipped (2026-07-03, PRs [#291]–[#298]).** The rich TUI is a
+full-frame alternate-screen pager by default (`tui.altScreen = auto`): a
+viewport-pinned session bar, an Iris-owned scrollback pane with follow mode
+and in-app scrolling/search, and mouse/clipboard behavior that degrades
+honestly — with the inline renderer as the automatic fallback and `--plain`
+untouched. Remaining optional affordances (block fullscreen viewer, in-app
+text selection) are unscheduled follow-ups.
+
+**Goal:** make the rich TUI a full-frame alternate-screen pager — a
+viewport-pinned session bar, an Iris-owned scrollback pane with follow mode
+and in-app scrolling, and mouse/clipboard behavior that degrades honestly —
+while keeping the inline renderer as an automatic fallback.
+
+**Design is specified and accepted — do not re-derive it.**
+[ADR-0029](adr/0029-adopt-alt-screen-pager-tui.md) settles the screen-mode
+policy (`alt_screen = auto|always|never` + `--no-alt-screen`, multiplexer
+auto-degrade), the render backend (stock ratatui `Terminal` full frames from
+the existing `Screen` state), the fixed-region layout (session bar /
+scrollback pane / working indicator / composer), the focus model (Tab toggles
+panes; typing returns to the prompt; Esc is never nav), the mouse-capture
+runtime toggle, and the clipboard ladder (native → OSC 52 → tmux buffer).
+Binary-verified reference behavior: `.iris-reference/grok-pager-dossier.md`.
+
+Slices, in order (each landed green through the gate):
+
+- **Backend seam + screen-mode policy** — done ([#291]). Mode seam over
+  `TuiUi`/`TerminalSurface`; alt-screen enter/leave with panic-hook + Drop +
+  force-quit restore; `tui.altScreen` config + `--no-alt-screen` +
+  `IRIS_NO_ALT_SCREEN`; tmux control mode/Zellij/dumb/non-TTY degrade with
+  notices. Inline mode bit-for-bit unchanged.
+- **Full-frame pager render** — done ([#292]). Full frames through ratatui
+  `Terminal` in `?2026` sync blocks; session bar pinned, composer pinned;
+  resize = re-render; `TestBackend` golden-frame tests.
+- **Scroll state + follow mode** — done ([#293]). Offset-from-top scroll
+  state; PageUp/PageDown, Alt+Up/Down line scroll, Home/End;
+  follow-by-overscroll; dim `▾ N lines below` indicator; windowed
+  O(viewport) render over the wrap cache with a perf gate.
+- **Mouse + clipboard** — done ([#294]). SGR mouse capture + wheel scroll
+  (`tui.scrollSpeed`); Ctrl+T + `/mouse` toggle restores native select/copy
+  (`○ mouse off` statusline hint); clipboard ladder (native → OSC 52)
+  unchanged behind `/copy`; `alt_screen` default flipped to `auto`.
+- **Capability doctor** — done ([#295]). `/terminal-setup` reports terminal,
+  multiplexer, SSH, kitty keyboard protocol, OSC 52/tmux clipboard with exact
+  `set -g …` fix lines and the Ctrl+J newline fallback.
+- **Pager-only affordances** — scrollback focus (Tab) + entry
+  selection/folding done ([#296]); transcript search `/find` with n/N done
+  ([#297]); sticky user-prompt headers done ([#298]). Still optional, not
+  scheduled: block fullscreen viewer, in-app text selection (the mouse
+  toggle covers selection until then).
+
+[#291]: https://github.com/5omeOtherGuy/iris-agent/pull/291
+[#292]: https://github.com/5omeOtherGuy/iris-agent/pull/292
+[#293]: https://github.com/5omeOtherGuy/iris-agent/pull/293
+[#294]: https://github.com/5omeOtherGuy/iris-agent/pull/294
+[#295]: https://github.com/5omeOtherGuy/iris-agent/pull/295
+[#296]: https://github.com/5omeOtherGuy/iris-agent/pull/296
+[#297]: https://github.com/5omeOtherGuy/iris-agent/pull/297
+[#298]: https://github.com/5omeOtherGuy/iris-agent/pull/298
+
+Gate: the pager must never lose transcript content that inline mode would
+have kept (the retained `Screen` state is the source of truth); every slice
+keeps `--plain` and inline fallback working; no pane-rendering change ships
+without `TestBackend` frame assertions.
+
+## Milestone 7 — IDE-Grade Transcript
+
+**Goal:** code, markdown, and tool output render like an IDE — syntax-highlighted
+code blocks and clickable hyperlinks — without breaking the accessible plain
+path or the dual-backend render model.
+
+**Design is specified — do not re-derive it.**
+[ADR-0033](adr/0033-ratatui-native-adoption-boundary.md) settles the boundary:
+highlighting implements the existing `HighlightFn` seam in the markdown
+renderer; hyperlinks are spans-first (link targets as span metadata, OSC 8
+emitted at serialization — inline surface directly, pager via hit-testing or
+cell-splitting, decided in-slice); the plain text UI stays ANSI-free.
+
+Slices, in order:
+
+- **Syntax-highlighted code blocks** ([#324](https://github.com/5omeOtherGuy/iris-agent/issues/324)) —
+  `syntect` through `HighlightFn`; design-system palette, lazy-loaded syntax
+  sets, unknown languages and `--plain` render exactly as today.
+- **OSC 8 hyperlinks** ([#325](https://github.com/5omeOtherGuy/iris-agent/issues/325)) —
+  markdown links + workspace `file:line` refs clickable; wrapped links stay
+  clickable per physical row; no escape bytes in `Screen` state (unit-tested
+  invariant).
+
+Gate: `--plain` output stays byte-identical in both slices; no width or wrap
+regressions (wide-glyph tests); every pane-rendering change carries frame
+assertions.
+
+## Maintenance — TUI Consolidation Sweep
+
+Findings from the 2026-07-04 full-TUI review, sequenced as independent batches
+(each one worktree → gate → PR). Boundary rationale:
+[ADR-0033](adr/0033-ratatui-native-adoption-boundary.md).
+
+| Batch | Issue | Scope | Depends on |
+|-------|-------|-------|------------|
+| 1 | [#318](https://github.com/5omeOtherGuy/iris-agent/issues/318) | Remove dead `ModalKey::Tab` + reserved `ansi_aware` module | — |
+| 2 | [#319](https://github.com/5omeOtherGuy/iris-agent/issues/319) | Fold `markdown.rs` width/truncation into `textengine`; fix stale ADR-0006 Cargo.toml comment | #318 |
+| 3 | [#320](https://github.com/5omeOtherGuy/iris-agent/issues/320) | Consolidate list selection on `Selector`; one `fuzzy_match`; one right-align helper | #318 |
+| 4 | [#321](https://github.com/5omeOtherGuy/iris-agent/issues/321) | Centralize glyph literals in `symbols.rs` | — |
+| 5 | [#322](https://github.com/5omeOtherGuy/iris-agent/issues/322) | Shared terminal-capability detector (timeout-guarded tmux probe) | — |
+| 6 | [#323](https://github.com/5omeOtherGuy/iris-agent/issues/323) | CLI help/dispatch/palette text polish | — |
+
+Open design question: pager scrollbar vs text indicators
+([#326](https://github.com/5omeOtherGuy/iris-agent/issues/326)) — decision
+before code.
 
 ## Architecture work — Tier-Boundary Enforcement
 

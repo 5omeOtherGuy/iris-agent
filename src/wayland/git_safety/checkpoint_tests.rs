@@ -14,7 +14,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::checkpoint::{CheckpointChain, Mode};
-use super::{GitSafety, task_state};
+use super::settlement::TaskClass;
+use super::{GitSafety, RecoveryOutcome, lock, task_state};
+
+/// Extract the single-orphan auto-adopt notice from a [`RecoveryOutcome`],
+/// panicking on any other variant. Keeps the recovery tests that assert on the
+/// notice wording terse after the #288 enum change.
+fn expect_notice(outcome: RecoveryOutcome) -> String {
+    match outcome {
+        RecoveryOutcome::Notice(notice) => notice,
+        other => panic!("expected a recovery notice, got {other:?}"),
+    }
+}
 use crate::nexus::MutationGuard;
 
 // --- scratch repo helpers (mirrors tests.rs; kept local for cohesion) ----
@@ -361,9 +372,7 @@ fn crash_resume_reconciles_and_notifies() {
 
     // Session B: a fresh guard in the same repo reconciles on resume.
     let guard_b = GitSafety::new(&repo.path);
-    let notice = guard_b
-        .recover_and_expire()
-        .expect("unsettled task noticed");
+    let notice = expect_notice(guard_b.recover_and_expire());
     assert!(notice.contains("unsettled"), "notice: {notice}");
     assert!(
         task_ref_count(&repo.path, &task_id) > refs_before,
@@ -396,9 +405,8 @@ fn expired_task_auto_settles_accepted_and_gcs_refs() {
 
     // Resume sweep expires it: no notice, refs gone, record removed.
     let guard = GitSafety::new(&repo.path);
-    let notice = guard.recover_and_expire();
     assert!(
-        notice.is_none(),
+        matches!(guard.recover_and_expire(), RecoveryOutcome::None),
         "an expired task surfaces no recovery notice"
     );
     assert_eq!(
@@ -507,9 +515,7 @@ fn resume_rehydrates_task_and_rollback_restores() {
     // Session B: a fresh guard over the same repo/session dir reconciles and
     // rehydrates the unsettled task.
     let guard_b = GitSafety::new(&repo.path);
-    let notice = guard_b
-        .recover_and_expire()
-        .expect("unsettled task noticed");
+    let notice = expect_notice(guard_b.recover_and_expire());
     assert!(notice.contains("unsettled"), "notice: {notice}");
 
     let points = guard_b.restore_points();
@@ -556,9 +562,7 @@ fn recovery_checkpoint_is_full_snapshot_not_delete_bomb() {
 
     // Session B: reconcile (append a recovery checkpoint) + rehydrate.
     let guard_b = GitSafety::new(&repo.path);
-    guard_b
-        .recover_and_expire()
-        .expect("unsettled task noticed");
+    expect_notice(guard_b.recover_and_expire());
 
     // A recovery checkpoint was appended (the newest restore point past base).
     let points = guard_b.restore_points();
@@ -852,5 +856,815 @@ fn net_diff_fails_closed_on_unreadable_checkpoint() {
     assert!(
         guard.task_diff(None).is_err(),
         "a checkpoint read error must propagate, not become an empty diff"
+    );
+}
+
+// --- task-ownership lease + mutation lock (issue #285, ADR-0030) -----------
+//
+// Cross-process liveness is a real per-process `flock`, so these tests use real
+// child processes. A foreign live task holder is simulated with the `flock(1)`
+// utility (`--no-fork` so the spawned child *is* the lock-holding process and a
+// SIGKILL of `child.id()` releases the lease). Tests that need `flock` skip with
+// a note when it is absent, so CI never flakes on a missing binary; Linux CI has
+// util-linux `flock`.
+
+use std::time::{Duration, Instant};
+
+/// Whether the util-linux `flock(1)` binary (with `--no-fork`) is available.
+/// Gates the cross-process tests so a machine without it skips rather than fails.
+fn have_flock() -> bool {
+    Command::new("flock")
+        .arg("--help")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("--no-fork"))
+        .unwrap_or(false)
+}
+
+/// Spawn a foreign process that holds an exclusive `flock` on `lock_path` for the
+/// test's lifetime. `--no-fork` makes the returned child the actual lock holder
+/// (it execs `sleep`), so `child.kill()` (SIGKILL) releases the lock by closing
+/// the only fd -- exactly a process crash.
+fn spawn_foreign_holder(lock_path: &Path) -> std::process::Child {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let child = Command::new("flock")
+        .args([
+            "--no-fork",
+            "-x",
+            "-n",
+            lock_path.to_str().unwrap(),
+            "sleep",
+            "1000",
+        ])
+        .spawn()
+        .expect("spawn flock holder");
+    // Wait until the holder has actually acquired the lock before returning, so
+    // the test observes the leased state deterministically.
+    wait_until(Duration::from_secs(5), || !lock::is_lease_free(lock_path));
+    child
+}
+
+/// Poll `cond` until it is true or `timeout` elapses. Returns whether it became
+/// true. Cheap sleep between polls; used to await real cross-process lock state.
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cond()
+}
+
+/// Create one unsettled task record in `repo` (via the real guard path so the
+/// record carries production fields and the lease is released when the guard
+/// drops), writing a fresh file `rel` so it never trips dirty-file approval.
+/// Returns the new task id.
+fn create_unsettled_task(repo: &Path, rel: &str) -> String {
+    let git_dir = task_state::git_dir(repo).unwrap();
+    let before: std::collections::BTreeSet<String> = task_state::load_all(&git_dir)
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    {
+        let guard = GitSafety::new(repo);
+        guard.note_mutation();
+        iris_write(&guard, &repo.join(rel), b"iris content\n");
+    } // guard dropped: its lease fd closes, so the record is now lease-free
+    task_state::load_all(&git_dir)
+        .into_iter()
+        .map(|t| t.task_id)
+        .find(|id| !before.contains(id))
+        .expect("a new unsettled task record")
+}
+
+// Test 1 (#285): two live task records coexist; neither process adopts the
+// other, and `recoverable_tasks()` lists only the lease-free record. The first
+// record's lease is held by a foreign live process (`flock`), so it is a live
+// foreign task that must be skipped.
+#[test]
+fn recoverable_tasks_skips_live_foreign_lease() {
+    if !have_flock() {
+        eprintln!("skipping recoverable_tasks_skips_live_foreign_lease: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    let foreign = create_unsettled_task(&repo.path, "foreign.txt");
+    let mine = create_unsettled_task(&repo.path, "mine.txt");
+
+    // A foreign live process holds the first task's lease.
+    let mut holder = spawn_foreign_holder(&lock::lease_path(&git_dir, &foreign));
+
+    let guard = GitSafety::new(&repo.path);
+    let recoverable = guard.recoverable_tasks();
+
+    // Only the lease-free record is recoverable; the live foreign one is skipped.
+    let ids: Vec<&str> = recoverable.iter().map(|t| t.task_id.as_str()).collect();
+    assert!(
+        ids.contains(&mine.as_str()),
+        "the lease-free record is recoverable: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&foreign.as_str()),
+        "the live foreign (leased) record is never listed: {ids:?}"
+    );
+    // The recoverable record carries its workspace + a small age (fields the #288
+    // picker consumes).
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let rec = recoverable.iter().find(|t| t.task_id == mine).unwrap();
+    assert_eq!(rec.workspace, ws);
+    assert!(rec.age < Duration::from_secs(3600));
+    assert_eq!(rec.class, TaskClass::Recoverable);
+
+    // Adopting the foreign live task is refused (its lease is held).
+    assert!(
+        guard.adopt_task(&foreign).is_none(),
+        "a live foreign task is never adopted"
+    );
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
+// Test 2 (#285): a SIGKILL'd process releases its lease by construction, so its
+// task becomes recoverable and adoptable on the next startup.
+#[test]
+fn sigkilled_lease_becomes_recoverable() {
+    if !have_flock() {
+        eprintln!("skipping sigkilled_lease_becomes_recoverable: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let task_id = create_unsettled_task(&repo.path, "work.txt");
+    let lease = lock::lease_path(&git_dir, &task_id);
+
+    // A live process holds the lease: the task is skipped by recovery.
+    let mut holder = spawn_foreign_holder(&lease);
+    let guard = GitSafety::new(&repo.path);
+    assert!(
+        !guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id),
+        "while leased, the task is a live foreign task (skipped)"
+    );
+
+    // SIGKILL the holder: the OS closes its fd, releasing the lease.
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || lock::is_lease_free(&lease)),
+        "the crashed process's lease is released"
+    );
+
+    // Now the orphan is recoverable and adoptable.
+    assert!(
+        guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id),
+        "after the crash the task becomes recoverable"
+    );
+    let adopted = guard.adopt_task(&task_id).expect("the orphan is adoptable");
+    assert_eq!(adopted.task_id, task_id);
+    assert!(
+        guard.has_task(),
+        "the adopted task is now this process's active task"
+    );
+}
+
+// Test 3 (#285): a legacy record without lock metadata deserializes (serde
+// defaults), is surfaced as unknown, and is never auto-adopted.
+#[test]
+fn legacy_record_is_unknown_and_never_auto_adopted() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = git_dir.join("iris").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+
+    // A record in the pre-ADR-0030 shape: no `owner`/`lock_protocol` fields.
+    let task_id = "legacyabc123";
+    let now_ms = task_state::now_ms();
+    let legacy_json = format!(
+        r#"{{"task_id":"{task_id}","workspace":"{ws}","created_ms":{now_ms},"updated_ms":{now_ms},"expected":{{}},"tip_seq":0}}"#
+    );
+    fs::write(tasks_dir.join(format!("{task_id}.json")), legacy_json).unwrap();
+
+    // It deserializes and classifies as legacy/unknown.
+    let guard = GitSafety::new(&repo.path);
+    let recoverable = guard.recoverable_tasks();
+    let rec = recoverable
+        .iter()
+        .find(|t| t.task_id == task_id)
+        .expect("the legacy record deserializes and is surfaced");
+    assert_eq!(rec.class, TaskClass::Legacy, "no lock metadata => unknown");
+
+    // Recovery never auto-adopts it: it opens the picker (explicit selection),
+    // listing the legacy row, and no task becomes active (#288, ADR-0030).
+    let RecoveryOutcome::Picker(rows) = guard.recover_and_expire() else {
+        panic!("an unknown-legacy record requires explicit selection (picker)");
+    };
+    assert!(
+        rows.iter().any(|t| t.task_id == task_id),
+        "the picker lists the unknown-legacy task id"
+    );
+    assert!(
+        !guard.has_task(),
+        "a legacy record is never auto-adopted as the active task"
+    );
+}
+
+// #288 review fix: a LEASED record is never listed, even a legacy one. Another
+// process may have adopted a legacy record and hold its lease while the record
+// still reads lock_protocol=None, so `recoverable_tasks` must probe the lease
+// BEFORE classifying. flock is per open-file-description, so a same-process
+// probe on a different fd still observes the held lease -- no subprocess needed.
+#[test]
+fn leased_legacy_record_is_not_listed() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = git_dir.join("iris").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+    let task_id = "legacyleased01";
+    let now_ms = task_state::now_ms();
+    let legacy_json = format!(
+        r#"{{"task_id":"{task_id}","workspace":"{ws}","created_ms":{now_ms},"updated_ms":{now_ms},"expected":{{}},"tip_seq":0}}"#
+    );
+    fs::write(tasks_dir.join(format!("{task_id}.json")), legacy_json).unwrap();
+
+    let guard = GitSafety::new(&repo.path);
+    // Hold the record's lease in-process (simulating a live adopter).
+    let held = lock::try_exclusive(&lock::lease_path(&git_dir, task_id))
+        .unwrap()
+        .expect("lease acquired");
+    assert!(
+        !guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id),
+        "a leased (live) legacy record is never listed"
+    );
+
+    // Once the lease is free, the same legacy record surfaces as unknown.
+    drop(held);
+    assert!(
+        guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id && t.class == TaskClass::Legacy),
+        "a lease-free legacy record is surfaced as unknown"
+    );
+}
+
+// Test 4 (#285): settle vs adopt are serialized by the repo mutation lock. A
+// foreign process holds the mutation lock, so an `adopt_task` that must write
+// (append a recovery checkpoint) blocks until the lock is released -- proving no
+// torn interleave between a concurrent settle and adopt.
+#[test]
+fn adopt_serializes_on_mutation_lock() {
+    if !have_flock() {
+        eprintln!("skipping adopt_serializes_on_mutation_lock: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let file = repo.path.join("work.txt");
+    let task_id = create_unsettled_task(&repo.path, "work.txt");
+
+    // Diverge the disk so adopt must append a recovery checkpoint -- the write
+    // path that takes the mutation lock.
+    fs::write(&file, b"diverged on disk\n").unwrap();
+
+    // A foreign process holds the repo mutation lock.
+    let mut holder = spawn_foreign_holder(&lock::mutation_lock_path(&git_dir));
+
+    // Release the lock ~400ms from now, on another thread.
+    let hold = Duration::from_millis(400);
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        let _ = holder.kill();
+        let _ = holder.wait();
+    });
+
+    let guard = GitSafety::new(&repo.path);
+    let start = Instant::now();
+    let adopted = guard.adopt_task(&task_id);
+    let waited = start.elapsed();
+
+    killer.join().unwrap();
+
+    assert!(
+        adopted.is_some(),
+        "adopt still succeeds once the lock is free"
+    );
+    assert!(
+        waited >= Duration::from_millis(250),
+        "adopt blocked on the mutation lock until the foreign holder released it \
+         (waited {waited:?}); settle and adopt cannot interleave"
+    );
+}
+
+// Test 5 (#285): the recovery notice names the record actually adopted, not
+// some other scanned record. With one lease-free orphan plus one live foreign
+// (leased) task, recovery adopts the orphan and the notice names IT.
+#[test]
+fn recovery_notice_names_the_adopted_record() {
+    if !have_flock() {
+        eprintln!("skipping recovery_notice_names_the_adopted_record: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    let foreign = create_unsettled_task(&repo.path, "foreign.txt");
+    let orphan = create_unsettled_task(&repo.path, "orphan.txt");
+
+    // The foreign task is held live; only the orphan is adoptable.
+    let mut holder = spawn_foreign_holder(&lock::lease_path(&git_dir, &foreign));
+
+    let guard = GitSafety::new(&repo.path);
+    let notice = expect_notice(guard.recover_and_expire());
+
+    assert!(
+        notice.contains(&orphan),
+        "the notice names the adopted (orphan) record: {notice}"
+    );
+    assert!(
+        !notice.contains(&foreign),
+        "the notice never names the live foreign record: {notice}"
+    );
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
+// --- task metadata: opaque body + session join (issue #287, ADR-0031) ----
+
+// Issue #287 test (1), record level: a mutating turn stamps the turn's prompt
+// preview as the task's opaque `body`, and the current session id onto its
+// `sessions` join.
+#[test]
+fn note_mutation_stamps_turn_context_as_body_and_session() {
+    let repo = init_repo();
+    let guard = GitSafety::new(&repo.path);
+    guard.set_session_id("sessionaaaa".to_string());
+    guard.set_turn_context(Some("fix the parser bug".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &repo.path.join("committed.txt"), b"iris\n");
+
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let record = task_state::load_all(&git_dir)
+        .pop()
+        .expect("a task record was persisted");
+    assert_eq!(
+        record.body.as_deref(),
+        Some("fix the parser bug"),
+        "the opening turn's preview is captured as the opaque body"
+    );
+    assert_eq!(
+        record.sessions,
+        vec!["sessionaaaa".to_string()],
+        "the current session id is stamped onto the join at open"
+    );
+}
+
+// Issue #287 test (2): a follow-up turn joining an unsettled task never rewrites
+// the body; a follow-up AFTER settlement opens a fresh task capturing the new
+// turn's preview.
+#[test]
+fn follow_up_leaves_body_unchanged_then_new_task_after_settle() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    // Turn 1 opens the task with body "first turn".
+    guard.set_turn_context(Some("first turn".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"one\n");
+    assert_eq!(
+        task_state::load_all(&git_dir)
+            .pop()
+            .unwrap()
+            .body
+            .as_deref(),
+        Some("first turn")
+    );
+
+    // Turn 2 joins the SAME unsettled task: body must stay "first turn".
+    guard.set_turn_context(Some("second turn".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"two\n");
+    assert_eq!(
+        task_state::load_all(&git_dir)
+            .pop()
+            .unwrap()
+            .body
+            .as_deref(),
+        Some("first turn"),
+        "a follow-up turn joining an unsettled task never rewrites body"
+    );
+
+    // Settle, then a follow-up opens a fresh task capturing the new preview.
+    guard.accept().expect("a task was active to accept");
+    guard.set_turn_context(Some("third turn".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"three\n");
+    assert_eq!(
+        task_state::load_all(&git_dir)
+            .pop()
+            .unwrap()
+            .body
+            .as_deref(),
+        Some("third turn"),
+        "a post-settlement follow-up opens a new task with the new turn's body"
+    );
+}
+
+// Issue #287 (review fix): a passive session swap (/new, /resume) that joins
+// the SAME unsettled task appends the new session to the record's live join
+// (consecutive-deduped) without rewriting body -- the sessions vec is the
+// authoritative recovery-UX join (ADR-0031).
+#[test]
+fn session_swap_joining_unsettled_task_appends_new_session() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    // Session A opens the task.
+    guard.set_session_id("sessionaaaa".to_string());
+    guard.set_turn_context(Some("open in A".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"one\n");
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string()]
+    );
+
+    // Passive swap to session B (task stays unsettled); B mutates and joins.
+    guard.set_session_id("sessionbbbb".to_string());
+    guard.set_turn_context(Some("join in B".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"two\n");
+    let record = task_state::load_all(&git_dir).pop().unwrap();
+    assert_eq!(
+        record.sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "the joining session is appended to the live join, ordered after A"
+    );
+    assert_eq!(
+        record.body.as_deref(),
+        Some("open in A"),
+        "the swap-join never rewrites the body captured at open"
+    );
+
+    // A same-session follow-up is a no-op (consecutive-dedup).
+    guard.set_turn_context(Some("more in B".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &edited, b"three\n");
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "a same-session follow-up does not duplicate the session id"
+    );
+}
+
+// Issue #287 test (3): a second process rehydrating (adopting) the orphan
+// appends its own session id to the record's join -- ordered and
+// consecutive-deduped, written under the mutation lock.
+#[test]
+fn rehydrate_appends_session_id_ordered_and_deduped() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    // Session A opens the task, then crashes (never settles).
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_session_id("sessionaaaa".to_string());
+        guard.set_turn_context(Some("work".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &edited, b"iris\n");
+    }
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string()]
+    );
+
+    // Session B adopts and appends its session id (ordered after A's).
+    {
+        let guard_b = GitSafety::new(&repo.path);
+        guard_b.set_session_id("sessionbbbb".to_string());
+        expect_notice(guard_b.recover_and_expire());
+    }
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "the adopting session id is appended in order"
+    );
+
+    // Session C re-adopts with the SAME id as the last: consecutive-deduped, so
+    // the join does not grow.
+    {
+        let guard_c = GitSafety::new(&repo.path);
+        guard_c.set_session_id("sessionbbbb".to_string());
+        expect_notice(guard_c.recover_and_expire());
+    }
+    assert_eq!(
+        task_state::load_all(&git_dir).pop().unwrap().sessions,
+        vec!["sessionaaaa".to_string(), "sessionbbbb".to_string()],
+        "a consecutive duplicate session id is not appended"
+    );
+}
+
+// Issue #287 test (5): recovery consults ONLY the task record (+ lease), never
+// the session log. The crash-skew rows degrade per the display rule while
+// recovery is unaffected:
+//   - record present, no `TaskOpened` event  -> still recoverable (row 1).
+//   - `TaskOpened` present, no record         -> nothing recoverable (row 2).
+//   - record removed at settle, no `TaskSettled` yet -> nothing recoverable (row 3).
+#[test]
+fn recovery_consults_only_record_not_lifecycle_events() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    // Row 2 baseline: no record at all -> recovery finds nothing (a dangling
+    // audit event in a session log could never make a task recoverable, because
+    // git-safety never reads the log).
+    assert!(GitSafety::new(&repo.path).recoverable_tasks().is_empty());
+
+    // Row 1: a record exists (task opened, then a crash before any settle) with
+    // no matching TaskSettled -- recovery lists it from the record alone.
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_session_id("s1".to_string());
+        guard.set_turn_context(Some("body".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &repo.path.join("committed.txt"), b"x\n");
+    }
+    assert_eq!(task_state::load_all(&git_dir).len(), 1);
+    let guard_b = GitSafety::new(&repo.path);
+    assert_eq!(
+        guard_b.recoverable_tasks().len(),
+        1,
+        "the record alone drives recovery"
+    );
+
+    // Row 3: settlement removes the record; nothing is recoverable afterward,
+    // independent of whether a TaskSettled audit entry was ever appended.
+    guard_b.recover_and_expire();
+    guard_b.accept().expect("the adopted task settles");
+    assert!(
+        task_state::load_all(&git_dir).is_empty(),
+        "settlement removed the record"
+    );
+    assert!(
+        GitSafety::new(&repo.path).recoverable_tasks().is_empty(),
+        "no record -> nothing recoverable (display rule: settled or expired)"
+    );
+}
+
+// Issue #287 test (6): a legacy record written before body/sessions existed
+// deserializes to defaults (None / empty).
+#[test]
+fn legacy_record_without_body_or_sessions_deserializes_to_defaults() {
+    let json = r#"{
+        "task_id": "abc",
+        "workspace": "/w",
+        "created_ms": 1,
+        "updated_ms": 2,
+        "expected": {},
+        "tip_seq": 0
+    }"#;
+    let record: task_state::PersistedTask =
+        serde_json::from_str(json).expect("legacy record deserializes");
+    assert!(record.body.is_none(), "missing body defaults to None");
+    assert!(
+        record.sessions.is_empty(),
+        "missing sessions defaults to empty"
+    );
+}
+
+// Issue #287 test (7): expiry removes the record and its refs but never touches
+// the session log (a separate file git-safety has no handle to).
+#[test]
+fn expiry_removes_record_and_refs_but_leaves_session_log_untouched() {
+    let repo = init_repo();
+    let session_root = temp_dir();
+    let mut log = crate::session::SessionLog::create_in(&session_root.path, &repo.path).unwrap();
+    log.append_task_opened("audit-task", Some("audit body"))
+        .unwrap();
+    log.append_task_settled("audit-task", "accepted").unwrap();
+    let session_path = log.path().to_path_buf();
+    drop(log);
+    let session_before = fs::read(&session_path).unwrap();
+
+    // Open a task, then backdate its record beyond the 30-day expiry window.
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_turn_context(Some("body".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &repo.path.join("committed.txt"), b"iris\n");
+    }
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let mut record = task_state::load_all(&git_dir).pop().unwrap();
+    let task_id = record.task_id.clone();
+    record.updated_ms = task_state::now_ms() - (31 * 24 * 60 * 60 * 1000);
+    task_state::save(&git_dir, &record).unwrap();
+    assert!(
+        task_ref_count(&repo.path, &task_id) > 0,
+        "refs exist pre-expiry"
+    );
+
+    GitSafety::new(&repo.path).recover_and_expire();
+
+    assert!(
+        task_state::load_all(&git_dir).is_empty(),
+        "expiry removed the record"
+    );
+    assert_eq!(
+        task_ref_count(&repo.path, &task_id),
+        0,
+        "expiry destroyed the task refs"
+    );
+    assert_eq!(
+        fs::read(&session_path).unwrap(),
+        session_before,
+        "expiry left the session log byte-for-byte untouched"
+    );
+}
+
+// --- resume-task picker seam (issue #288, ADR-0031) ----------------------
+
+// #288 test: multiple recoverable records => recovery opens the picker listing
+// ALL lease-free rows; adopting the chosen task leaves the others untouched.
+#[test]
+fn multiple_recoverable_tasks_open_picker_and_adopt_only_chosen() {
+    let repo = init_repo();
+
+    let first = create_unsettled_task(&repo.path, "first.txt");
+    let second = create_unsettled_task(&repo.path, "second.txt");
+
+    // More than one lease-free orphan: recovery requires explicit selection, so
+    // it opens the picker rather than auto-adopting either.
+    let guard = GitSafety::new(&repo.path);
+    let RecoveryOutcome::Picker(rows) = guard.recover_and_expire() else {
+        panic!("more than one recoverable task requires the picker");
+    };
+    let ids: Vec<&str> = rows.iter().map(|r| r.task_id.as_str()).collect();
+    assert!(
+        ids.contains(&first.as_str()) && ids.contains(&second.as_str()),
+        "the picker lists all lease-free rows: {ids:?}"
+    );
+    assert!(
+        !guard.has_task(),
+        "opening the picker never auto-adopts a task"
+    );
+
+    // Adopt exactly the chosen task; the other record stays recoverable.
+    let adopted = guard.adopt(&second).expect("the chosen task adopts");
+    assert_eq!(adopted.task_id, second);
+    assert!(guard.has_task(), "the chosen task is now active");
+    let remaining: Vec<String> = GitSafety::new(&repo.path)
+        .recoverable_tasks()
+        .into_iter()
+        .map(|r| r.task_id)
+        .collect();
+    assert!(
+        remaining.contains(&first),
+        "the unchosen task is untouched and still recoverable: {remaining:?}"
+    );
+}
+
+// #288 test: a recoverable row surfaces the opaque body + linked-session join so
+// the picker can render a body preview and a session count.
+#[test]
+fn recoverable_task_row_surfaces_body_and_sessions() {
+    let repo = init_repo();
+
+    // Session A opens the task with a body and its session id, then crashes.
+    {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_session_id("sessionaaaa".to_string());
+        guard.set_turn_context(Some("fix the parser".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &repo.path.join("work.txt"), b"iris\n");
+    }
+
+    let rows = GitSafety::new(&repo.path).recoverable_tasks();
+    let row = rows.first().expect("one recoverable row");
+    assert_eq!(
+        row.body.as_deref(),
+        Some("fix the parser"),
+        "the row carries the opaque body for the picker preview"
+    );
+    assert_eq!(
+        row.sessions,
+        vec!["sessionaaaa".to_string()],
+        "the row carries the linked-session join"
+    );
+}
+
+// #288 test: adopt-then-settle round trip works post-restart. A crashed task is
+// adopted from the picker seam, then `/rollback`-equivalent settlement operates
+// on the rehydrated chain and undoes Iris's work.
+#[test]
+fn adopt_then_settle_round_trip_post_restart() {
+    let repo = init_repo();
+    let edited = repo.path.join("committed.txt");
+    let created = repo.path.join("iris_new.txt");
+
+    // Session A works, task stays unsettled (a crash).
+    let task_id = {
+        let guard = GitSafety::new(&repo.path);
+        guard.note_mutation();
+        iris_write(&guard, &edited, b"iris edit\n");
+        iris_write(&guard, &created, b"iris new\n");
+        let git_dir = task_state::git_dir(&repo.path).unwrap();
+        task_state::load_all(&git_dir).pop().unwrap().task_id
+    };
+
+    // Session B adopts the orphan explicitly (picker path), then rolls it back.
+    let guard_b = GitSafety::new(&repo.path);
+    let adopted = guard_b.adopt(&task_id).expect("the orphan adopts");
+    assert_eq!(adopted.task_id, task_id);
+    let outcome = guard_b.rollback(0).unwrap();
+    assert!(
+        outcome.summary.contains("rolled back"),
+        "settlement operates on the rehydrated chain: {}",
+        outcome.summary
+    );
+    assert_eq!(
+        fs::read(&edited).unwrap(),
+        b"base\n",
+        "the adopted chain rolls back Iris's edit"
+    );
+    assert!(
+        !created.exists(),
+        "the adopted chain removes Iris's new file"
+    );
+}
+
+// #288 test: a legacy record (no body / no sessions) is adoptable from the
+// picker seam and surfaces an unknown (None) body + empty session join.
+#[test]
+fn legacy_record_adopts_with_unknown_body_and_no_sessions() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = git_dir.join("iris").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+
+    // A pre-ADR-0030/0031 record: no lock metadata, body, or sessions.
+    let task_id = "legacyadopt01";
+    let now_ms = task_state::now_ms();
+    let legacy_json = format!(
+        r#"{{"task_id":"{task_id}","workspace":"{ws}","created_ms":{now_ms},"updated_ms":{now_ms},"expected":{{}},"tip_seq":0}}"#
+    );
+    fs::write(tasks_dir.join(format!("{task_id}.json")), legacy_json).unwrap();
+
+    let guard = GitSafety::new(&repo.path);
+    let row = guard
+        .recoverable_tasks()
+        .into_iter()
+        .find(|r| r.task_id == task_id)
+        .expect("the legacy row is surfaced");
+    assert!(row.body.is_none(), "legacy body is unknown (None)");
+    assert!(row.sessions.is_empty(), "legacy session join is empty");
+
+    let adopted = guard.adopt(task_id).expect("the legacy record adopts");
+    assert_eq!(adopted.task_id, task_id);
+    assert!(adopted.body.is_none(), "adopted legacy body stays unknown");
+    assert!(
+        adopted.sessions.is_empty(),
+        "adopted legacy record has zero linked sessions"
     );
 }

@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 use super::GitSafety;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
-    AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream, Tool,
-    ToolCall, ToolEnv, ToolFuture, ToolOutput, Tools,
+    AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream,
+    ReviewContext, Tool, ToolCall, ToolEnv, ToolFuture, ToolOutput, Tools,
 };
 use crate::tools::ToolState;
 use crate::wayland::Harness;
@@ -485,6 +485,9 @@ struct CountingFrontend {
     decision: Cell<ApprovalDecision>,
     reviews: Cell<usize>,
     events: RefCell<Vec<AgentEvent>>,
+    /// The review facts the last gated call carried, so a dirty-tree test can
+    /// assert Nexus threads the workspace-relative `dirty_paths` to the gate.
+    last_ctx: RefCell<Option<ReviewContext>>,
 }
 
 impl CountingFrontend {
@@ -493,6 +496,7 @@ impl CountingFrontend {
             decision: Cell::new(decision),
             reviews: Cell::new(0),
             events: RefCell::new(Vec::new()),
+            last_ctx: RefCell::new(None),
         }
     }
 }
@@ -510,8 +514,10 @@ impl ApprovalGate for CountingFrontend {
         _call: &'a ToolCall,
         _allow_always: bool,
         _allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         self.reviews.set(self.reviews.get() + 1);
+        *self.last_ctx.borrow_mut() = Some(ctx);
         let decision = self.decision.get();
         Box::pin(async move { Ok(decision) })
     }
@@ -571,6 +577,22 @@ fn dirty_write_prompts_despite_project_grant() -> Result<()> {
         frontend.reviews.get(),
         1,
         "a dirty-file write must prompt despite the project grant"
+    );
+    // The gate receives the dirty-tree facts (workspace-relative paths), not UI
+    // copy: Nexus threads them through `ReviewContext` (issue #262/ADR-0028).
+    let ctx = frontend
+        .last_ctx
+        .borrow()
+        .clone()
+        .expect("the gate received a review context");
+    assert_eq!(
+        ctx.dirty_paths,
+        vec!["committed.txt".to_string()],
+        "the dirty path is threaded to the gate"
+    );
+    assert!(
+        !ctx.destructive,
+        "a plain dirty-file write is not the destructive floor"
     );
     Ok(())
 }
@@ -733,6 +755,98 @@ fn ungated_mutating_tool_still_gates_dirty_file() -> Result<()> {
         frontend.reviews.get(),
         1,
         "a mutating-but-ungated tool must still route a baseline-dirty target through approval"
+    );
+    Ok(())
+}
+
+// Issue #287 test (1 Q&A + 4), Harness end-to-end: a mutating turn appends a
+// `TaskOpened` audit entry carrying the turn's prompt preview as body; settling
+// appends a matching `TaskSettled`; a pure Q&A turn opens no task and appends
+// nothing. Session-log read-back is proven to skip lifecycle entries in the
+// session-module unit test; here the focus is the Harness wiring.
+#[test]
+fn harness_records_task_lifecycle_and_qanda_opens_nothing() -> Result<()> {
+    let repo = init_repo();
+    let session_root = temp_dir();
+    let session = crate::session::SessionLog::create_in(&session_root.path, &repo.path).unwrap();
+    let session_id = session.id().to_string();
+    let session_path = session.path().to_path_buf();
+
+    let provider = FakeProvider::new(vec![
+        write_call("c1", "new.txt", "hi\n"),
+        AssistantTurn::text("created it"),
+        AssistantTurn::text("the answer is 42"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        Some(session),
+        None,
+    );
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    // A mutating turn opens a task; the harness records TaskOpened post-turn.
+    block_on(harness.submit_turn(
+        "create the new file",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    // Settling appends TaskSettled with a deterministic disposition.
+    assert!(
+        harness.accept_checkpoint().is_some(),
+        "there was an unsettled task to accept"
+    );
+    // A pure Q&A turn (text-only) opens no task, so nothing is appended.
+    block_on(harness.submit_turn(
+        "what is the answer",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    drop(harness);
+
+    let entries: Vec<serde_json::Value> = fs::read_to_string(&session_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let opened: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["type"] == "taskLifecycle" && e["event"] == "opened")
+        .collect();
+    assert_eq!(
+        opened.len(),
+        1,
+        "exactly one task opened this session (the Q&A turn opened none)"
+    );
+    assert_eq!(
+        opened[0]["body"], "create the new file",
+        "the opening turn's prompt preview is the recorded body"
+    );
+    let settled: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["type"] == "taskLifecycle" && e["event"] == "settled")
+        .collect();
+    assert_eq!(settled.len(), 1, "exactly one settle recorded");
+    assert_eq!(settled[0]["disposition"], "accepted");
+    assert_eq!(
+        opened[0]["taskId"], settled[0]["taskId"],
+        "the settle names the same task that opened"
+    );
+
+    // The session still opens cleanly (lifecycle entries are skipped, not fatal).
+    let store = crate::session::SessionStore::with_root(session_root.path.clone());
+    let meta = store.find(&session_id).unwrap().unwrap();
+    let stored = store.open(&meta).unwrap();
+    assert!(
+        stored
+            .messages
+            .iter()
+            .any(|m| m.content == "create the new file"),
+        "the user prompt is reconstructed"
     );
     Ok(())
 }

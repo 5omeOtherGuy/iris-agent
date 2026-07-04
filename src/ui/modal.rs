@@ -36,7 +36,6 @@ pub(crate) enum ModalKey {
     Left,
     Right,
     Enter,
-    Tab,
     Esc,
     CtrlC,
     CtrlA,
@@ -94,6 +93,16 @@ pub(crate) enum ModalAction {
     /// the safe inter-turn boundary (reloads messages, session log, and harness
     /// state). Emitted by the `/resume` picker on Enter.
     ResumeSession(String),
+    /// Adopt the recoverable task with this id at the safe inter-turn boundary
+    /// (#288, ADR-0031): rehydrate its checkpoint chain so settlement operates on
+    /// the real chain. Never implicitly resumes a session. Emitted by the
+    /// `/tasks` picker on Enter.
+    AdoptTask(String),
+    /// Show the deterministic linked-session detail for this task id in the
+    /// unified task modal (ADR-0031 session lookup). The loop fetches the
+    /// bounded, cwd-scoped extraction and re-opens the modal in its detail view.
+    /// Display-only audit; never affects adoption, recovery, or enforcement.
+    ViewTaskSessions(String),
     /// `/login` method chosen -> open the matching provider selector.
     ChooseLoginMethod(LoginMethod),
     /// Begin an OAuth/subscription login for this provider.
@@ -130,6 +139,7 @@ pub(crate) enum Modal {
     Settings(SettingsMenu),
     Trust(TrustMenu),
     Session(SessionPicker),
+    Tasks(TaskPicker),
     LoginMethod(MethodSelect),
     Providers(ProviderSelect),
     LoginDialog(LoginDialog),
@@ -145,6 +155,7 @@ impl Modal {
             Modal::Settings(menu) => menu.handle_key(key),
             Modal::Trust(menu) => menu.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
+            Modal::Tasks(picker) => picker.handle_key(key),
             Modal::LoginMethod(menu) => menu.handle_key(key),
             Modal::Providers(picker) => picker.handle_key(key),
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
@@ -174,6 +185,7 @@ impl Modal {
             Modal::Settings(menu) => menu.render(width),
             Modal::Trust(menu) => menu.render(width),
             Modal::Session(picker) => picker.render(width),
+            Modal::Tasks(picker) => picker.render(width),
             Modal::LoginMethod(menu) => menu.render(width),
             Modal::Providers(picker) => picker.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
@@ -228,7 +240,11 @@ fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'static>, bool)>
         };
         if let Some(enabled) = row.item.enabled {
             spans.push(Span::styled(
-                if enabled { "◉ " } else { "○ " },
+                if enabled {
+                    format!("{} ", crate::ui::symbols::ACTIVE)
+                } else {
+                    format!("{} ", crate::ui::symbols::EMPTY)
+                },
                 if enabled {
                     Style::default().fg(crate::ui::palette::ORANGE)
                 } else {
@@ -392,7 +408,10 @@ impl ModelPicker {
                 Style::default()
             };
             let marker = if qualified == self.current {
-                Span::styled("◉ ", Style::default().fg(crate::ui::palette::ORANGE))
+                Span::styled(
+                    format!("{} ", crate::ui::symbols::ACTIVE),
+                    Style::default().fg(crate::ui::palette::ORANGE),
+                )
             } else {
                 Span::raw("  ")
             };
@@ -1048,6 +1067,216 @@ impl SessionPicker {
             usize::from(width),
         )
     }
+}
+
+// --- unified task modal (/tasks) ---
+
+use crate::ui::task_view::{TaskCard, TaskKind};
+
+/// The linked-session detail sub-view of the task modal (ADR-0031 session
+/// lookup): bounded, cwd-scoped display lines for one task, fetched by the loop
+/// (the deterministic `sessions_for_task`/`extract_session` path) and shown in
+/// place of the list. Display-only audit; never an adoption/recovery input.
+#[derive(Debug, Clone)]
+struct TaskDetail {
+    task_short: String,
+    lines: Vec<String>,
+}
+
+/// The unified task surface (`/tasks`, ADR-0031): an optional non-selectable
+/// header for the ACTIVE (live, unsettled) task, then the selectable list of
+/// recoverable/legacy tasks. Enter adopts the selected recoverable task
+/// ([`ModalAction::AdoptTask`]) at the safe inter-turn boundary (never resuming
+/// a session); the right arrow requests the target task's linked-session detail
+/// ([`ModalAction::ViewTaskSessions`]); left/esc leaves the detail view. The
+/// active task is shown but never adoptable; settlement stays on the existing
+/// `/git` / `/accept` / `/rollback` / `/diff` paths (not duplicated here).
+/// Built disk-free by the orchestration layer; input order is preserved.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskPicker {
+    // Boxed so the (rarely constructed) task modal does not dominate the `Modal`
+    // enum's size; `has_recoverable` avoids retaining the whole card list just
+    // to know whether any adoptable row exists.
+    active: Option<Box<TaskCard>>,
+    has_recoverable: bool,
+    selector: Selector,
+    detail: Option<Box<TaskDetail>>,
+}
+
+impl TaskPicker {
+    /// Build the unified modal from the active card (if any) and the recoverable
+    /// cards. The startup/session-swap recovery path passes `active: None`.
+    pub(crate) fn new(active: Option<TaskCard>, recoverable: Vec<TaskCard>) -> Self {
+        let items: Vec<SelectorItem> = recoverable
+            .iter()
+            // Defensive: only adoptable (recoverable/legacy) cards become
+            // selectable rows, so an active task handed in by mistake can never
+            // be adopted (ADR-0031: the active task is shown, never adopted).
+            .filter(|card| card.is_adoptable())
+            .map(|card| {
+                let label = if matches!(card.kind, TaskKind::Legacy) {
+                    format!("{}  (legacy)", card.body_preview())
+                } else {
+                    card.body_preview()
+                };
+                SelectorItem::new(card.task_id.clone(), label)
+                    .detail(card.age_label())
+                    .trailing(card.session_summary())
+            })
+            .collect();
+        TaskPicker {
+            has_recoverable: !recoverable.is_empty(),
+            active: active.map(Box::new),
+            selector: Selector::new(items, true, false, MODEL_ROWS),
+            detail: None,
+        }
+    }
+
+    /// The task whose linked-session detail the right arrow targets: the selected
+    /// recoverable row if any, otherwise the active task (so an active-only
+    /// modal can still show its sessions). `None` when neither exists.
+    fn detail_target(&self) -> Option<String> {
+        self.selector
+            .selected_id()
+            .map(str::to_string)
+            .or_else(|| self.active.as_ref().map(|card| card.task_id.clone()))
+    }
+
+    /// Enter the linked-session detail view with the loop-fetched bounded lines.
+    pub(crate) fn show_detail(&mut self, task_id: &str, lines: Vec<String>) {
+        self.detail = Some(Box::new(TaskDetail {
+            task_short: task_id.chars().take(8).collect(),
+            lines,
+        }));
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        // Detail view: read-only. Left/backspace step back to the list; esc
+        // dismisses the whole modal (the modal-wide esc convention), matching
+        // the detail footer's "back / close" hints.
+        if self.detail.is_some() {
+            return match key {
+                ModalKey::Left | ModalKey::Backspace => {
+                    self.detail = None;
+                    ModalOutcome::Redraw
+                }
+                ModalKey::Esc => ModalOutcome::Close,
+                _ => ModalOutcome::Ignore,
+            };
+        }
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            // Adopt the selected recoverable task; an active-only modal has no
+            // selectable row, so Enter is a no-op there (the active task is not
+            // adoptable -- ADR-0031).
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some(id) => ModalOutcome::Emit(ModalAction::AdoptTask(id.to_string())),
+                None => ModalOutcome::Ignore,
+            },
+            // Inspect the target task's linked sessions (display-only detail).
+            ModalKey::Right => match self.detail_target() {
+                Some(id) => ModalOutcome::Emit(ModalAction::ViewTaskSessions(id)),
+                None => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc => ModalOutcome::Close,
+            ModalKey::CtrlC => {
+                if self.selector.clear_search() {
+                    ModalOutcome::Redraw
+                } else {
+                    ModalOutcome::Close
+                }
+            }
+            ModalKey::Backspace => {
+                if self.selector.backspace() {
+                    ModalOutcome::Redraw
+                } else {
+                    ModalOutcome::Ignore
+                }
+            }
+            ModalKey::Char(c) => {
+                self.selector.push_char(c);
+                ModalOutcome::Redraw
+            }
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        if let Some(detail) = &self.detail {
+            let rows: Vec<(Line<'static>, bool)> = detail
+                .lines
+                .iter()
+                .map(|line| (Line::from(Span::styled(line.clone(), dim())), false))
+                .collect();
+            return crate::ui::tui::overlay_box(
+                Some(&format!("Sessions \u{00b7} task {}", detail.task_short)),
+                rows,
+                Some("\u{2190} back \u{00b7} esc close"),
+                usize::from(width),
+            );
+        }
+        let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
+        if let Some(active) = &self.active {
+            rows.extend(active_header_rows(active));
+            if self.has_recoverable {
+                rows.push((Line::from(String::new()), false));
+            }
+        }
+        rows.extend(selector_rows(&self.selector, "No recoverable tasks"));
+        crate::ui::tui::overlay_box(
+            Some("Tasks"),
+            rows,
+            Some(self.footer_hint()),
+            usize::from(width),
+        )
+    }
+
+    /// Footer key hints, adapting to whether any recoverable row is selectable.
+    fn footer_hint(&self) -> &'static str {
+        if self.has_recoverable {
+            "\u{2191}\u{2193} move \u{00b7} type to filter \u{00b7} \u{21b5} adopt \u{00b7} \u{2192} sessions \u{00b7} esc cancel"
+        } else {
+            "\u{2192} sessions \u{00b7} esc close"
+        }
+    }
+}
+
+/// The non-selectable header rows for the active (live, unsettled) task: an
+/// identity line (`\u{25c7} <id8>  <body>`), a dim meta line (attribution counts,
+/// linked-session count, and age; each part shown only when known), and a dim
+/// hint pointing at the existing settlement paths (never duplicated here).
+fn active_header_rows(active: &TaskCard) -> Vec<(Line<'static>, bool)> {
+    let identity = Line::from(vec![
+        Span::styled(format!("{} ", crate::ui::symbols::PREVIEW), dim()),
+        Span::raw(active.short_id()),
+        Span::raw("  "),
+        Span::raw(active.body_preview()),
+    ]);
+    let mut meta_parts = vec!["active".to_string()];
+    if let Some(iris) = active.iris_files {
+        meta_parts.push(format!("{iris} iris"));
+    }
+    if let Some(user) = active.user_files {
+        meta_parts.push(format!("{user} yours"));
+    }
+    meta_parts.push(active.session_summary());
+    let age = active.age_label();
+    if !age.is_empty() {
+        meta_parts.push(age);
+    }
+    let meta = Line::from(Span::styled(meta_parts.join(" \u{00b7} "), dim()));
+    let hint = Line::from(Span::styled(
+        "settle: /git \u{00b7} /diff \u{00b7} /accept \u{00b7} /rollback".to_string(),
+        dim(),
+    ));
+    vec![(identity, false), (meta, false), (hint, false)]
 }
 
 // --- login method selector ---
@@ -2018,5 +2247,145 @@ mod tests {
             other => panic!("expected the filtered row, got {other:?}"),
         }
         assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    fn recoverable_cards() -> Vec<TaskCard> {
+        use crate::wayland::git_safety::RecoverableTask;
+        use std::time::Duration;
+        vec![
+            TaskCard::from_recoverable(&RecoverableTask::for_test(
+                "taskaaaa",
+                Duration::from_secs(300),
+                Some("fix the parser"),
+                &["s1", "s2"],
+            )),
+            TaskCard::from_recoverable(&RecoverableTask::for_test_legacy(
+                "taskbbbb",
+                Duration::from_secs(7200),
+            )),
+        ]
+    }
+
+    fn active_card() -> TaskCard {
+        use crate::wayland::git_safety::ActiveTaskDisplay;
+        use std::time::Duration;
+        TaskCard::active(
+            &ActiveTaskDisplay {
+                task_id: "activeee1".to_string(),
+                body: Some("refactor the loop".to_string()),
+                sessions: vec!["live-session".to_string()],
+            },
+            Some(Duration::from_secs(60)),
+            Some(2),
+            Some(1),
+        )
+    }
+
+    #[test]
+    fn task_picker_enter_emits_adopt_for_selected_id() {
+        let mut picker = TaskPicker::new(None, recoverable_cards());
+        // First row selected by default.
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskaaaa"),
+            other => panic!("expected AdoptTask, got {other:?}"),
+        }
+        // Down then Enter adopts the second task; only the chosen id is emitted.
+        picker.handle_key(ModalKey::Down);
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskbbbb"),
+            other => panic!("expected AdoptTask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_picker_search_filters_and_esc_closes() {
+        let mut picker = TaskPicker::new(None, recoverable_cards());
+        for c in "parser".chars() {
+            picker.handle_key(ModalKey::Char(c));
+        }
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskaaaa"),
+            other => panic!("expected the filtered row, got {other:?}"),
+        }
+        assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn right_arrow_requests_linked_session_detail_for_target() {
+        // A recoverable list: the right arrow targets the selected row.
+        let mut picker = TaskPicker::new(None, recoverable_cards());
+        match picker.handle_key(ModalKey::Right) {
+            ModalOutcome::Emit(ModalAction::ViewTaskSessions(id)) => assert_eq!(id, "taskaaaa"),
+            other => panic!("expected ViewTaskSessions, got {other:?}"),
+        }
+        // An active-only modal (no selectable rows): the right arrow targets the
+        // active task; Enter is a no-op (the active task is never adoptable).
+        let mut active_only = TaskPicker::new(Some(active_card()), Vec::new());
+        assert_eq!(
+            active_only.handle_key(ModalKey::Enter),
+            ModalOutcome::Ignore
+        );
+        match active_only.handle_key(ModalKey::Right) {
+            ModalOutcome::Emit(ModalAction::ViewTaskSessions(id)) => assert_eq!(id, "activeee1"),
+            other => panic!("expected ViewTaskSessions for the active task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detail_view_is_read_only_and_returns_to_the_list() {
+        let mut picker = TaskPicker::new(Some(active_card()), recoverable_cards());
+        picker.show_detail(
+            "taskaaaa",
+            vec!["session abc".to_string(), "  > hello".to_string()],
+        );
+        // In the detail view, adoption keys do nothing.
+        assert_eq!(picker.handle_key(ModalKey::Enter), ModalOutcome::Ignore);
+        assert_eq!(picker.handle_key(ModalKey::Down), ModalOutcome::Ignore);
+        // Left returns to the list without closing the modal.
+        assert_eq!(picker.handle_key(ModalKey::Left), ModalOutcome::Redraw);
+        // Back in the list, Enter adopts again.
+        match picker.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskaaaa"),
+            other => panic!("expected AdoptTask after leaving detail, got {other:?}"),
+        }
+        // Esc in the detail view dismisses the whole modal (matches the footer).
+        picker.show_detail("taskaaaa", vec!["session abc".to_string()]);
+        assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn active_header_renders_identity_meta_and_settlement_hint() {
+        let picker = TaskPicker::new(Some(active_card()), recoverable_cards());
+        let text: String = picker
+            .render(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("activeee"), "active id shown: {text}");
+        assert!(
+            text.contains("refactor the loop"),
+            "active body shown: {text}"
+        );
+        assert!(
+            text.contains("2 iris") && text.contains("1 yours"),
+            "counts: {text}"
+        );
+        assert!(text.contains("1 session"), "linked-session count: {text}");
+        assert!(
+            text.contains("/accept"),
+            "settlement hint points at existing paths: {text}"
+        );
+        // The recoverable list is shown below the active header.
+        assert!(
+            text.contains("fix the parser"),
+            "recoverable row shown: {text}"
+        );
+        assert!(text.contains("(legacy)"), "legacy marker shown: {text}");
     }
 }

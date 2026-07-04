@@ -1,4 +1,4 @@
-# ADR-0029: Git worktree isolation — Tier 0 of the ADR-0028 guarantee model, apply = settlement
+# ADR-0035: Git worktree isolation — Tier 0 of the ADR-0028 guarantee model, apply = settlement
 
 **Date**: 2026-07-03
 **Status**: proposed

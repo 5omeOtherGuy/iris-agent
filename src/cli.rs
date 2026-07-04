@@ -13,7 +13,7 @@ use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
 use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider, Message, Role};
-use crate::session::SessionLog;
+use crate::session::{self, SessionLog, SessionStore};
 use crate::ui::tui::TuiUi;
 use crate::ui::{Ui, UiBridge, UiEvent, slash};
 use crate::wayland::Harness;
@@ -516,6 +516,68 @@ pub(crate) fn session_info_lines<P: ChatProvider>(
     lines
 }
 
+/// Render the deterministic `/sessions <task-id>` lookup (ADR-0031): the
+/// sessions in `cwd`'s slug directory whose logs carry the task id, each
+/// followed by its deterministic extraction (user-message previews + task
+/// lifecycle events, in on-disk order). No summarization and no model call --
+/// display-only audit text. Opens the default session store; a store failure is
+/// reported as a line rather than surfaced as an error to the caller.
+pub(crate) fn sessions_for_task_lines(cwd: &std::path::Path, task_id: &str) -> Vec<String> {
+    match SessionStore::open_default() {
+        Ok(store) => sessions_for_task_report(&store, cwd, task_id),
+        Err(error) => vec![format!("session store unavailable: {error:#}")],
+    }
+}
+
+/// Format one `sessions_for_task` lookup against an explicit store, so the
+/// rendering is unit-tested without env/home state.
+fn sessions_for_task_report(
+    store: &SessionStore,
+    cwd: &std::path::Path,
+    task_id: &str,
+) -> Vec<String> {
+    let matches = match store.sessions_for_task(cwd, task_id) {
+        Ok(matches) => matches,
+        Err(error) => return vec![format!("could not scan sessions: {error:#}")],
+    };
+    if matches.is_empty() {
+        return vec![format!("no sessions found for task {task_id}")];
+    }
+    let mut lines = vec![format!("sessions for task {task_id}: {}", matches.len())];
+    for m in &matches {
+        lines.push(format!("session {}", m.id));
+        match session::extract_session(&m.path) {
+            Ok(extract) => {
+                for item in &extract.items {
+                    lines.push(render_extract_item(item));
+                }
+            }
+            Err(error) => lines.push(format!("  (could not read session: {error:#})")),
+        }
+    }
+    lines
+}
+
+/// One extraction item as a single display line: an indented user-message
+/// preview or a bracketed task lifecycle event. Bounded by construction (the
+/// extraction only ever holds previews, never full bodies).
+fn render_extract_item(item: &session::ExtractItem) -> String {
+    match item {
+        session::ExtractItem::UserPreview(preview) => format!("  > {preview}"),
+        session::ExtractItem::Lifecycle(ev) => match ev.event.as_str() {
+            "opened" => format!(
+                "  [task opened] {}",
+                ev.body.as_deref().unwrap_or("(no description)")
+            ),
+            "settled" => format!(
+                "  [task settled] {}",
+                ev.disposition.as_deref().unwrap_or("(unknown)")
+            ),
+            other => format!("  [task {other}]"),
+        },
+    }
+}
+
 /// Read-only `/model` view: current provider/model/reasoning + supported levels.
 fn current_selection_lines(selection: &ModelSelection) -> Vec<String> {
     let levels = model_capabilities::join_levels(model_capabilities::supported_levels(
@@ -544,12 +606,27 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &mut Option<ModelSwitch<'_, P>>,
     force_plain: bool,
+    tui_settings: Option<&crate::config::TuiSettings>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<crate::ui::modal::Modal>,
+    start_page: bool,
 ) -> Result<()> {
     if !prefers_text_ui(force_plain) {
-        match TuiUi::new() {
-            Ok(tui) => return run_tui(harness, tui, switch, swap, startup_modal),
+        // Screen-mode policy (ADR-0029): pager vs inline, resolved once per
+        // startup. Degradation/config notices land in the transcript as
+        // ordinary notices so honesty costs no new UI surface.
+        let alt_screen = tui_settings.and_then(|tui| tui.alt_screen.as_deref());
+        let resolution = crate::ui::screen_mode::resolve_for_startup(alt_screen);
+        match TuiUi::new(resolution.mode) {
+            Ok(mut tui) => {
+                if let Some(speed) = tui_settings.and_then(|tui| tui.scroll_speed) {
+                    tui.screen.scroll_speed = speed.clamp(1, 100);
+                }
+                for notice in resolution.notices {
+                    tui.screen.apply(crate::ui::UiEvent::Notice(notice));
+                }
+                return run_tui(harness, tui, switch, swap, startup_modal, start_page);
+            }
             Err(error) => {
                 if startup_modal.is_some() {
                     bail!(
@@ -599,9 +676,18 @@ fn run_tui<P: ChatProvider>(
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<crate::ui::modal::Modal>,
+    start_page: bool,
 ) -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    let result = crate::ui::tui_loop::run(harness, &runtime, tui, switch, swap, startup_modal);
+    let result = crate::ui::tui_loop::run(
+        harness,
+        &runtime,
+        tui,
+        switch,
+        swap,
+        startup_modal,
+        start_page,
+    );
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
 }
@@ -700,6 +786,28 @@ fn run_session_inner<P: ChatProvider>(
             for line in lines {
                 ui.emit(UiEvent::Notice(line))?;
             }
+            continue;
+        }
+        // Approval preset (ADR-0032). A real session control, meaningful in the
+        // non-TTY path too (e.g. `never` for a read-only/non-interactive
+        // posture), handled at this safe boundary and never sent to the model.
+        if prompt == "/approval" || prompt.starts_with("/approval ") {
+            let rest = prompt["/approval".len()..].trim();
+            let line = if rest.is_empty() {
+                format!(
+                    "approval mode: {} (use /approval strict|auto|never)",
+                    harness.approval_mode().as_token()
+                )
+            } else {
+                match crate::nexus::ApprovalMode::parse(rest) {
+                    Some(mode) => {
+                        harness.set_approval_mode(mode);
+                        format!("approval mode set to {}", mode.as_token())
+                    }
+                    None => format!("unknown approval mode `{rest}` (use strict|auto|never)"),
+                }
+            };
+            ui.emit(UiEvent::Notice(line))?;
             continue;
         }
         // The final task diff (issue #264): render the net diff on demand at this
@@ -838,6 +946,39 @@ mod tests {
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
         }
+    }
+
+    #[test]
+    fn sessions_for_task_report_lists_matches_with_deterministic_extraction() {
+        let dir = crate::tools::test_support::temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, std::path::Path::new("/proj")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("please fix the login bug"))
+            .unwrap();
+        log.append_task_opened("task-7", Some("please fix the login bug"))
+            .unwrap();
+        log.append(&Message::assistant("done")).unwrap();
+        log.append_task_settled("task-7", "accepted").unwrap();
+        drop(log);
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let lines = sessions_for_task_report(&store, std::path::Path::new("/proj"), "task-7");
+        assert_eq!(
+            lines,
+            vec![
+                "sessions for task task-7: 1".to_string(),
+                format!("session {id}"),
+                "  > please fix the login bug".to_string(),
+                "  [task opened] please fix the login bug".to_string(),
+                "  [task settled] accepted".to_string(),
+            ]
+        );
+
+        // Unknown task id renders a single not-found line, not an error.
+        assert_eq!(
+            sessions_for_task_report(&store, std::path::Path::new("/proj"), "nope"),
+            vec!["no sessions found for task nope".to_string()]
+        );
     }
 
     #[test]

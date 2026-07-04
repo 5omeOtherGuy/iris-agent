@@ -46,6 +46,9 @@ pub(crate) enum FocusTarget {
     Editor,
     /// The slash-command palette docked above the composer.
     Palette,
+    /// A SessionBar dropdown (directory tree / git console) at the pane top.
+    /// Precedence: Editor < Palette < SessionMenu < Modal.
+    SessionMenu,
     /// A modal/picker/dialog docked above the composer.
     Modal,
 }
@@ -163,14 +166,12 @@ impl Component for PaletteView<'_> {
             .map(|cmd| display_width(cmd.name))
             .max()
             .unwrap_or(0);
-        // Scrolled window over the matches, keeping the selection visible
-        // (same offset math as `Selector::scroll_offset`).
+        // Scrolled window over the matches, keeping the selection visible. The
+        // scroll arithmetic and the position row below are the shared
+        // `Selector` windowing helpers -- the palette clamps and filters by
+        // prefix, so it reuses the math without adopting the full Selector.
         let scrolled = self.matches.len() > PALETTE_WINDOW;
-        let offset = if self.selected < PALETTE_WINDOW {
-            0
-        } else {
-            self.selected - PALETTE_WINDOW + 1
-        };
+        let offset = crate::ui::selector::scroll_offset(self.selected, PALETTE_WINDOW);
         let mut rows: Vec<(Line<'static>, bool)> = self
             .matches
             .iter()
@@ -203,7 +204,7 @@ impl Component for PaletteView<'_> {
         if scrolled {
             rows.push((
                 Line::from(Span::styled(
-                    format!("({}/{})", self.selected + 1, self.matches.len()),
+                    crate::ui::selector::position_label(self.selected, self.matches.len()),
                     dim_style(),
                 )),
                 false,
@@ -331,7 +332,7 @@ mod tests {
         let lines = PaletteView::for_palette(&palette, "/").render(80);
         assert_eq!(lines.len(), PALETTE_WINDOW + 3);
         let rendered = lines.iter().map(&text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("/logout"), "{rendered}");
+        assert!(rendered.contains("/checkpoint"), "{rendered}");
         assert!(!rendered.contains("/exit "), "{rendered}");
         assert!(
             rendered.contains(&format!("({total}/{total})")),

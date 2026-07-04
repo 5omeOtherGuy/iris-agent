@@ -1,7 +1,7 @@
 # ADR-0006: Use stable Ratatui/Crossterm and selectively borrow Codex TUI patterns
 
 **Date**: 2026-06-17
-**Status**: accepted
+**Status**: accepted; terminal-lifecycle rule amended by [ADR-0029](0029-adopt-alt-screen-pager-tui.md) (the alt-screen pager mode uses ratatui `Terminal`; this ADR remains binding for the inline fallback mode); ratatui widget/ecosystem adoption boundary defined in [ADR-0033](0033-ratatui-native-adoption-boundary.md)
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context

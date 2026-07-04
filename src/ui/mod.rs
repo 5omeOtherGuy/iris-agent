@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::nexus::{
     AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ProviderUsage,
-    ToolCall, VerificationOutcome,
+    ReviewContext, ToolCall, VerificationOutcome,
 };
 
 /// Maximum characters of failing verification output carried into a notice, so
@@ -72,10 +72,14 @@ pub(crate) mod markdown;
 pub(crate) mod modal;
 pub(crate) mod palette;
 pub(crate) mod picker;
+pub(crate) mod screen_mode;
 pub(crate) mod selector;
 pub(crate) mod slash;
 pub(crate) mod steering;
 pub(crate) mod symbols;
+pub(crate) mod task_view;
+pub(crate) mod terminal_doctor;
+pub(crate) mod terminal_env;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
 
@@ -111,12 +115,15 @@ pub(crate) trait Ui {
     /// Block for the user's decision on a gated tool call. `allow_always` is the
     /// tool's allow-always capability; `allow_project` is whether a persistent
     /// per-project grant is on offer (never for a destructive call). When both
-    /// are false the front-end offers y/N only.
+    /// are false the front-end offers y/N only. `ctx` carries the structured
+    /// review facts (destructive floor, dirty-tree paths) the front-end renders
+    /// into its explanatory reason line.
     fn request_approval(
         &mut self,
         call: &ToolCall,
         allow_always: bool,
         allow_project: bool,
+        ctx: &ReviewContext,
     ) -> Result<ApprovalDecision>;
 
     /// Release any terminal state acquired for the session (e.g. bracketed
@@ -396,11 +403,12 @@ impl ApprovalGate for UiBridge<'_> {
         call: &'a ToolCall,
         allow_always: bool,
         allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         Box::pin(async move {
             self.ui
                 .borrow_mut()
-                .request_approval(call, allow_always, allow_project)
+                .request_approval(call, allow_always, allow_project, &ctx)
         })
         // The interactive production front-end is the raw-mode TUI
         // (`ui::tui::TuiUi`): it reads Ctrl-C at an approval as a key event,

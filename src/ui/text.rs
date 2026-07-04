@@ -3,8 +3,11 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Stderr, Stdin, Stdout, Write
 use anyhow::Result;
 
 use crate::approval::parse_decision;
-use crate::nexus::{ApprovalDecision, ToolCall};
-use crate::tool_display::{exploration_summary, fold, is_exploration_tool, run_target, summarize};
+use crate::nexus::{ApprovalDecision, ReviewContext, ToolCall};
+use crate::tool_display::{
+    APPROVAL_DESTRUCTIVE_NOTE, approval_dirty_note, approval_reason_lead, exploration_summary,
+    fold, is_exploration_tool, run_target, summarize,
+};
 use crate::ui::{TurnErrorKind, Ui, UiEvent};
 
 // Bracketed-paste control sequences. Enabling makes the terminal wrap pasted
@@ -72,7 +75,7 @@ fn truncate_plain(input: &str, max: usize) -> String {
 /// boundaries by display width. Wrapping by columns (not cluster count) keeps
 /// the fixed-width frame aligned for CJK/emoji content while staying
 /// byte-identical for ASCII (one cluster == one column).
-fn wrap_plain(input: &str, width: usize) -> Vec<String> {
+fn hard_wrap_frame_line(input: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     if visible_width(input) <= width {
         return vec![input.to_string()];
@@ -191,7 +194,7 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
             bar(&format!("{}┐", "─".repeat(top_fill)))
         )?;
         for line in body {
-            for physical in wrap_plain(line, WIDTH.saturating_sub(4)) {
+            for physical in hard_wrap_frame_line(line, WIDTH.saturating_sub(4)) {
                 writeln!(
                     self.out,
                     "{} {}{} {}",
@@ -571,20 +574,42 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
         call: &ToolCall,
         allow_always: bool,
         allow_project: bool,
+        ctx: &ReviewContext,
     ) -> Result<ApprovalDecision> {
         self.finish_assistant_stream()?;
         self.start_block()?;
         let summary = summarize(call);
+        // The explanatory reason line, printed once above the prompt: the muted
+        // base sentence, the danger-toned destructive clause, then the muted
+        // dirty-tree clause. Same deterministic Tier-3 copy the TUI renders.
+        let dirty_gate = !ctx.dirty_paths.is_empty();
+        let mut reason = approval_reason_lead(call);
+        if ctx.destructive {
+            reason.push(' ');
+            reason.push_str(APPROVAL_DESTRUCTIVE_NOTE);
+        }
+        if let Some(note) = approval_dirty_note(&ctx.dirty_paths, usize::MAX) {
+            reason.push(' ');
+            reason.push_str(&note);
+        }
+        writeln!(self.out, "{}", sgr(self.ansi, "2", &reason))?;
+        // In the dirty-tree context "always" means "all dirty files this task"
+        // (ADR-0028), and no per-project grant is offered.
+        let always_label = if dirty_gate {
+            "[a] all dirty files this task"
+        } else {
+            "[a] always this session"
+        };
         let prompt = match (allow_always, allow_project) {
             (true, true) => {
-                "[y] once  [a] always this session  [p] always for this project  [N] deny"
+                format!("[y] once  {always_label}  [p] always for this project  [N] deny")
             }
-            (true, false) => "[y] once  [a] always this session  [N] deny",
-            (false, true) => "[y] once  [p] always for this project  [N] deny",
-            (false, false) => "[y] once  [N] deny",
+            (true, false) => format!("[y] once  {always_label}  [N] deny"),
+            (false, true) => "[y] once  [p] always for this project  [N] deny".to_string(),
+            (false, false) => "[y] once  [N] deny".to_string(),
         };
         loop {
-            let options = sgr(self.ansi, "2", prompt);
+            let options = sgr(self.ansi, "2", &prompt);
             write!(self.out, "approve {summary}?  {options} \u{203a} ")?;
             self.out.flush()?;
 
@@ -702,7 +727,7 @@ mod tests {
 
         assert_eq!(ui.next_prompt()?.as_deref(), Some("hello\n"));
         assert_eq!(
-            ui.request_approval(&call("write"), true, false)?,
+            ui.request_approval(&call("write"), true, false, &ReviewContext::default())?,
             ApprovalDecision::Allow
         );
 
@@ -716,7 +741,7 @@ mod tests {
     fn approval_always_is_parsed() -> Result<()> {
         let mut ui = TextUi::new("a\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("write"), true, false)?,
+            ui.request_approval(&call("write"), true, false, &ReviewContext::default())?,
             ApprovalDecision::AllowAlways
         );
         Ok(())
@@ -727,7 +752,7 @@ mod tests {
         // allow_always=false: prompt omits the "always" choice and "a" is invalid.
         let mut ui = TextUi::new("a\ny\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("bash"), false, false)?,
+            ui.request_approval(&call("bash"), false, false, &ReviewContext::default())?,
             ApprovalDecision::Allow
         );
         let (_, out, _) = ui.into_parts();
@@ -741,11 +766,36 @@ mod tests {
     fn approval_project_grant_is_parsed_when_offered() -> Result<()> {
         let mut ui = TextUi::new("p\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("write"), false, true)?,
+            ui.request_approval(&call("write"), false, true, &ReviewContext::default())?,
             ApprovalDecision::AllowProject
         );
         let (_, out, _) = ui.into_parts();
         assert!(String::from_utf8(out)?.contains("always for this project"));
+        Ok(())
+    }
+
+    #[test]
+    fn approval_reason_line_and_dirty_relabel() -> Result<()> {
+        // The reason line carries the base sentence, the destructive clause, and
+        // the dirty-tree clause; the dirty gate relabels the `[a]` option.
+        let ctx = ReviewContext {
+            destructive: true,
+            dirty_paths: vec!["src/main.rs".to_string()],
+        };
+        let mut ui = TextUi::new("y\n".as_bytes(), Vec::new(), Vec::new());
+        ui.request_approval(&call("write"), true, false, &ctx)?;
+        let (_, out, _) = ui.into_parts();
+        let rendered = String::from_utf8(out)?;
+        assert!(
+            rendered.contains("Creates or overwrites note.txt."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Flagged destructive"), "{rendered}");
+        assert!(
+            rendered.contains("Touches uncommitted user changes: src/main.rs"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("all dirty files this task"), "{rendered}");
         Ok(())
     }
 
@@ -755,7 +805,7 @@ mod tests {
         // and re-prompts; it must never resolve to a project grant.
         let mut ui = TextUi::new("p\nn\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("bash"), false, false)?,
+            ui.request_approval(&call("bash"), false, false, &ReviewContext::default())?,
             ApprovalDecision::Deny
         );
         let (_, out, _) = ui.into_parts();
@@ -770,7 +820,7 @@ mod tests {
         let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
 
         assert_eq!(
-            ui.request_approval(&call("write"), true, false)?,
+            ui.request_approval(&call("write"), true, false, &ReviewContext::default())?,
             ApprovalDecision::Deny
         );
         Ok(())
@@ -781,7 +831,7 @@ mod tests {
         let mut ui = TextUi::new("huh?\ny\n".as_bytes(), Vec::new(), Vec::new());
 
         assert_eq!(
-            ui.request_approval(&call("write"), true, false)?,
+            ui.request_approval(&call("write"), true, false, &ReviewContext::default())?,
             ApprovalDecision::Allow
         );
 
@@ -800,7 +850,7 @@ mod tests {
         let input = format!("{PASTE_START}garbage1\ngarbage2{PASTE_END}\ny\n");
         let mut ui = TextUi::new(input.as_bytes(), Vec::new(), Vec::new());
         assert_eq!(
-            ui.request_approval(&call("write"), true, false)?,
+            ui.request_approval(&call("write"), true, false, &ReviewContext::default())?,
             ApprovalDecision::Allow
         );
         let (_, out, _) = ui.into_parts();
@@ -832,7 +882,7 @@ mod tests {
         assert_eq!(ui.next_prompt()?.as_deref(), Some("line1\nline2\nline3\n"));
         // The very next read is the approval answer, proving no paste line leaked.
         assert_eq!(
-            ui.request_approval(&call("write"), true, false)?,
+            ui.request_approval(&call("write"), true, false, &ReviewContext::default())?,
             ApprovalDecision::Allow
         );
         Ok(())
@@ -851,14 +901,14 @@ mod tests {
         // the body hard-wrap keeps every row within the field width (so the
         // fixed-width frame border stays aligned for non-ASCII content).
         assert_eq!(visible_width("\u{4e2d}\u{6587}"), 4);
-        let rows = wrap_plain("\u{4e2d}\u{6587}\u{5b57}\u{6570}", 4);
+        let rows = hard_wrap_frame_line("\u{4e2d}\u{6587}\u{5b57}\u{6570}", 4);
         assert!(rows.len() > 1, "CJK line should wrap: {rows:?}");
         for row in &rows {
             assert!(visible_width(row) <= 4, "row overran field width: {row:?}");
         }
         // ASCII parity: a line that fits is returned unchanged (color preserved).
         assert_eq!(
-            wrap_plain("\x1b[32mhi\x1b[0m", 8),
+            hard_wrap_frame_line("\x1b[32mhi\x1b[0m", 8),
             vec!["\x1b[32mhi\x1b[0m"]
         );
         // Title truncation is column-bounded.

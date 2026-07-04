@@ -25,7 +25,7 @@ use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, Role, SteeringSource,
     ToolEnv, VerificationOutcome, VerifyRun,
 };
-use crate::session::{SessionLog, estimate_tokens, message_token_estimate};
+use crate::session::{SessionLog, estimate_tokens, message_token_estimate, preview_line};
 use crate::tools::ToolState;
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
@@ -152,6 +152,12 @@ impl<P: ChatProvider> Harness<P> {
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
         let git_safety = git_safety::GitSafety::new(&workspace);
+        // Stamp the current session id onto the guard up front (ADR-0031), so a
+        // task adopted during startup recovery (before the first turn) records
+        // this session in its opaque `sessions` join.
+        if let Some(log) = session.as_ref() {
+            git_safety.set_session_id(log.id().to_string());
+        }
         Self {
             agent,
             workspace,
@@ -202,6 +208,18 @@ impl<P: ChatProvider> Harness<P> {
         Ok(notice)
     }
 
+    /// Change the session approval preset (ADR-0032) at the inter-turn
+    /// boundary. Tier 3 owns the `/approval` control and the status label; the
+    /// harness only forwards the mode to the bare agent, which enforces it.
+    pub(crate) fn set_approval_mode(&mut self, mode: crate::nexus::ApprovalMode) {
+        self.agent.set_approval_mode(mode);
+    }
+
+    /// The active approval preset, for rendering the status label.
+    pub(crate) fn approval_mode(&self) -> crate::nexus::ApprovalMode {
+        self.agent.approval_mode()
+    }
+
     /// Swap the active provider at a safe turn boundary, delegating to the bare
     /// agent (which re-plans the model-visible tool surface). Tier 3 owns the
     /// active selection, system prompt, and provider construction; the harness
@@ -231,6 +249,11 @@ impl<P: ChatProvider> Harness<P> {
         self.session = session;
         self.persisted = resumed;
         self.entry_ids = vec![None; resumed];
+        // Re-stamp the guard with the swapped-in session id (ADR-0031) so a task
+        // adopted or continued after the swap records the new session.
+        if let Some(log) = self.session.as_ref() {
+            self.git_safety.set_session_id(log.id().to_string());
+        }
         self.agent.reset_session(messages);
         // A session swap (`/new`, `/resume`) is a PASSIVE boundary: ADR-0028
         // forbids passive actions from settling a task (settlement is accept,
@@ -249,27 +272,76 @@ impl<P: ChatProvider> Harness<P> {
     }
 
     /// Settle the current task as accepted (`/accept`): freeze the ledger and GC
-    /// intermediate checkpoints. `None` when no task is active.
-    pub(crate) fn accept_checkpoint(&self) -> Option<String> {
-        self.git_safety.accept()
+    /// intermediate checkpoints. `None` when no task is active. On settlement,
+    /// append a `TaskSettled` audit entry to the transcript so the task<->session
+    /// join survives record deletion (ADR-0031, display only).
+    pub(crate) fn accept_checkpoint(&mut self) -> Option<String> {
+        let settled = self.git_safety.accept()?;
+        self.record_task_settled(&settled.task_id, "accepted");
+        Some(settled.summary)
     }
 
-    /// Record an explicit checkpoint and settle the task (`/checkpoint`).
-    pub(crate) fn save_checkpoint(&self) -> Option<String> {
-        self.git_safety.checkpoint_now()
+    /// Record an explicit checkpoint and settle the task (`/checkpoint`), then
+    /// append a `TaskSettled` audit entry (ADR-0031).
+    pub(crate) fn save_checkpoint(&mut self) -> Option<String> {
+        let settled = self.git_safety.checkpoint_now()?;
+        self.record_task_settled(&settled.task_id, "checkpointed");
+        Some(settled.summary)
     }
 
     /// Roll back Iris's own work to restore point `seq` (`/rollback <seq>`). Only
-    /// Iris-authored ledger paths and the user's index are affected.
-    pub(crate) fn rollback_checkpoint(&self, seq: u64) -> Result<git_safety::RollbackOutcome> {
-        self.git_safety.rollback(seq)
+    /// Iris-authored ledger paths and the user's index are affected. On a
+    /// settling rollback, append a `TaskSettled` audit entry (ADR-0031).
+    pub(crate) fn rollback_checkpoint(&mut self, seq: u64) -> Result<git_safety::RollbackOutcome> {
+        let outcome = self.git_safety.rollback(seq)?;
+        if let Some(task_id) = &outcome.settled_task_id {
+            self.record_task_settled(task_id, "rolledback");
+        }
+        Ok(outcome)
     }
 
     /// On resume / a new session in the same repo: reconcile a crashed task and
     /// expire stale ones, returning a one-line recovery notice for the event
-    /// stream (ADR-0028). `None` when nothing is unsettled.
-    pub(crate) fn recover_checkpoints(&self) -> Option<String> {
+    /// stream (ADR-0028). Returns a [`RecoveryOutcome`](git_safety::RecoveryOutcome)
+    /// so Tier 3 prints the single-orphan auto-adopt notice (unchanged UX) or
+    /// opens the resume-task picker for the >1/legacy case (#288, ADR-0031).
+    pub(crate) fn recover_checkpoints(&self) -> git_safety::RecoveryOutcome {
         self.git_safety.recover_and_expire()
+    }
+
+    /// The lease-free recoverable/legacy task records in this workspace, for the
+    /// `/tasks` resume-task picker (#288, ADR-0031). Live foreign (leased) tasks
+    /// are already excluded by the git-safety seam. `body`/`sessions` on each row
+    /// are opaque display payload -- the picker only renders them.
+    pub(crate) fn recoverable_tasks(&self) -> Vec<git_safety::RecoverableTask> {
+        self.git_safety.recoverable_tasks()
+    }
+
+    /// Adopt a recoverable task by id at the safe inter-turn boundary (#288,
+    /// ADR-0031): claim its lease, reconcile disk vs the op-log, and rehydrate
+    /// the checkpoint chain so a post-adoption `/rollback` / `/accept` /
+    /// `/checkpoint` operates on the real chain. Never implicitly resumes a
+    /// session -- the returned [`AdoptedTask`](git_safety::AdoptedTask) carries
+    /// the body + linked sessions so the caller can offer an explicit resume.
+    /// `None` when the record is gone or now leased.
+    pub(crate) fn adopt_task(&self, task_id: &str) -> Option<git_safety::AdoptedTask> {
+        self.git_safety.adopt(task_id)
+    }
+
+    /// Re-anchor the session in another worktree (the git dropdown's
+    /// open-session-there path, idle-only). Rebuilds the dirty-tree guard for
+    /// the new root so its baselines, task records, and gating apply there;
+    /// the caller changes the process working directory and then surfaces
+    /// [`Self::recover_checkpoints`] so arriving in a worktree announces what
+    /// Iris left unsettled.
+    pub(crate) fn reanchor_workspace(&mut self, path: &std::path::Path) {
+        self.workspace = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.git_safety = git_safety::GitSafety::new(&self.workspace);
+        // The rebuilt guard starts with no session id; re-stamp it (ADR-0031) so
+        // recovery in the new worktree records this session on any task it adopts.
+        if let Some(log) = self.session.as_ref() {
+            self.git_safety.set_session_id(log.id().to_string());
+        }
     }
 
     /// The current task's net diff (`/diff`, and the accept-flow summary): the
@@ -294,6 +366,29 @@ impl<P: ChatProvider> Harness<P> {
     /// session.
     pub(crate) fn session_path(&self) -> Option<&std::path::Path> {
         self.session.as_ref().map(SessionLog::path)
+    }
+
+    /// The workspace directory this harness is anchored to, used to scope the
+    /// deterministic session lookup (`/sessions`, ADR-0031) to this project's
+    /// cwd-slug directory.
+    pub(crate) fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
+    /// The active git-safety task's id, or `None` when no task is open. Lets the
+    /// `/sessions` route default to the current task when the user gives no id.
+    /// Display-only observation; never an enforcement or recovery input.
+    pub(crate) fn current_task_id(&self) -> Option<String> {
+        self.git_safety.current_task_id()
+    }
+
+    /// Read-only display payload of the active (unsettled) task, for the unified
+    /// task UI (`/tasks`, ADR-0031): id plus the opaque `body`/`sessions` copy.
+    /// `None` when no task is open. The UI pairs this with the git-status
+    /// snapshot (file counts, age) it already holds. Display-only; never an
+    /// enforcement or recovery input.
+    pub(crate) fn active_task(&self) -> Option<git_safety::ActiveTaskDisplay> {
+        self.git_safety.active_task_display()
     }
 
     /// The provider-visible conversation context, for read-only inspection
@@ -334,6 +429,31 @@ impl<P: ChatProvider> Harness<P> {
         Ok(())
     }
 
+    /// Append a `TaskOpened` audit entry to the transcript (ADR-0031). Best-effort
+    /// (no-op without an attached log), mirroring `record_selection_event`: the
+    /// entry chains onto the leaf but is not a transcript message, so
+    /// `persisted`/`entry_ids` stay untouched and the next message append still
+    /// chains correctly through it.
+    fn record_task_opened(&mut self, task_id: &str, body: Option<&str>) {
+        let Some(log) = self.session.as_mut() else {
+            return;
+        };
+        if let Err(error) = log.append_task_opened(task_id, body) {
+            tracing::warn!(error = %format!("{error:#}"), "failed to append task-opened lifecycle");
+        }
+    }
+
+    /// Append a `TaskSettled` audit entry to the transcript (ADR-0031).
+    /// Best-effort; same chain/cursor semantics as [`record_task_opened`].
+    fn record_task_settled(&mut self, task_id: &str, disposition: &str) {
+        let Some(log) = self.session.as_mut() else {
+            return;
+        };
+        if let Err(error) = log.append_task_settled(task_id, disposition) {
+            tracing::warn!(error = %format!("{error:#}"), "failed to append task-settled lifecycle");
+        }
+    }
+
     /// Run one turn against the owned execution env, then persist any new
     /// transcript messages. The env is injected into the bare loop (mirroring
     /// `AgentHarness` passing `env` into the run); persistence lives here, not
@@ -350,6 +470,17 @@ impl<P: ChatProvider> Harness<P> {
         // transcript is complete here (every tool call answered), so the
         // covered range never splits a pending tool-call/result pair.
         self.maybe_auto_compact(obs)?;
+        // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
+        // the current session id to the guard before the turn. The guard stamps
+        // them as opaque display payload onto any task this turn opens; a
+        // follow-up turn joining an unsettled task discards the preview (body is
+        // captured once). `prior_task` lets the post-turn poll observe a task
+        // opened this turn.
+        let prior_task = self.git_safety.current_task_id();
+        self.git_safety.set_turn_context(Some(preview_line(prompt)));
+        if let Some(id) = self.session_id().map(str::to_string) {
+            self.git_safety.set_session_id(id);
+        }
         let env = ToolEnv {
             workspace: &self.workspace,
             state: &self.state,
@@ -375,6 +506,17 @@ impl<P: ChatProvider> Harness<P> {
         // the transcript records the user prompt and any tool work. Best-effort:
         // a write failure is logged, never fatal to the session.
         self.persist_new_messages();
+        // If a task opened during this turn, record a `TaskOpened` audit entry
+        // (ADR-0031). A task never settles mid-turn (settlement is an explicit
+        // command), so a `current_task_id` that differs from `prior_task` and is
+        // non-`None` is a task this turn opened. Its captured body equals this
+        // turn's prompt preview (the guard took exactly that).
+        if let Some(task_id) = self.git_safety.current_task_id()
+            && prior_task.as_deref() != Some(task_id.as_str())
+        {
+            let body = preview_line(prompt);
+            self.record_task_opened(&task_id, Some(&body));
+        }
         // Post-change verification (issue #265): only after a turn that succeeded
         // and actually changed files, and not after a cancellation. The loop
         // never settles the task, so a failure leaves the tree inspectable and

@@ -19,11 +19,9 @@
 //! Nexus is untouched: this loop only consumes its `AgentObserver` /
 //! `ApprovalGate` seams via [`LoopBridge`].
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant as StdInstant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -35,10 +33,12 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource};
+use crate::git::status::GitStatusCache;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
 use crate::nexus::{
-    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ToolCall,
+    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ReviewContext,
+    ToolCall,
 };
 use crate::ui::UiEvent;
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
@@ -46,8 +46,13 @@ use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
 use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::steering::SteeringQueue;
-use crate::ui::tui::{FocusTarget, Screen, TuiUi};
+use crate::ui::tui::{
+    ApprovalPolicy, FocusTarget, GitMenu, MenuAction, MenuKey, MenuOutcome, Screen, SessionMenu,
+    StartAction, TreeMenu, TuiUi,
+};
 use crate::wayland::Harness;
+use crate::wayland::git_safety::RecoveryOutcome;
+use crate::wayland::git_safety::git as git_cmd;
 
 /// Spinner cadence. Input redraws are immediate (channel-driven), so this paces
 /// only the spinner animation, not input latency; a 100ms beat is a smooth,
@@ -66,9 +71,10 @@ const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 /// replay is already pending.
 const RESIZE_REDRAW_DEBOUNCE: Duration = Duration::from_millis(50);
 
-/// Footer git branch cache lifetime. The footer is presentation-only, so a
-/// branch can be a few seconds stale instead of shelling out on every loop.
-const FOOTER_BRANCH_TTL: Duration = Duration::from_secs(5);
+/// Debounced idle git-status poll interval: the session bar's git segment is
+/// refreshed in the background at most this often while idle (event triggers
+/// -- turn completion, tool terminal states, dropdown open -- refresh sooner).
+const GIT_POLL: Duration = Duration::from_secs(10);
 
 /// What a [`RenderScheduler`] decides to do for a pending render request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,8 +167,16 @@ pub(crate) fn run<P: ChatProvider>(
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<Modal>,
+    start_page: bool,
 ) -> Result<()> {
-    let result = runtime.block_on(session_loop(harness, &mut tui, switch, swap, startup_modal));
+    let result = runtime.block_on(session_loop(
+        harness,
+        &mut tui,
+        switch,
+        swap,
+        startup_modal,
+        start_page,
+    ));
     tui.shutdown();
     result
 }
@@ -186,6 +200,17 @@ enum IdleOutcome {
     CycleModel(bool),
     /// Shift+Tab: cycle the thinking/effort level.
     CycleEffort,
+    /// Start-page launcher: open the resume-session picker.
+    OpenResumePicker,
+    /// Start-page launcher: open the settings picker.
+    OpenSettings,
+    /// Toggle the git console dropdown (ctrl-g / click / `/git`).
+    ToggleGitMenu,
+    /// Toggle the directory tree dropdown (`@`-entry / click / `/tree`).
+    /// `true` = open directly in filter mode (the `@` file-reference idiom).
+    ToggleTreeMenu(bool),
+    /// A dropdown emitted a side effect for the loop to execute.
+    Menu(MenuAction),
 }
 
 /// Per-key outcome inside the idle phase.
@@ -199,6 +224,11 @@ enum IdleKey {
     OpenModelPicker,
     CycleModel(bool),
     CycleEffort,
+    OpenResumePicker,
+    OpenSettings,
+    ToggleGitMenu,
+    ToggleTreeMenu(bool),
+    Menu(MenuAction),
 }
 
 /// A gated tool waiting for the user's decision: the reply channel back into the
@@ -215,6 +245,9 @@ struct ApprovalRequest {
     call: ToolCall,
     allow_always: bool,
     allow_project: bool,
+    /// Structured review facts (destructive floor, dirty-tree paths) the screen
+    /// renders into the docked approval surface's reason line.
+    ctx: ReviewContext,
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -224,6 +257,7 @@ async fn session_loop<P: ChatProvider>(
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
     startup_modal: Option<Modal>,
+    start_page: bool,
 ) -> Result<()> {
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
@@ -239,17 +273,33 @@ async fn session_loop<P: ChatProvider>(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     tui.screen.apply(UiEvent::SessionStarted);
+    // The interactive loop gates every non-allowlisted tool through the
+    // approval prompt: the effective policy posture is `on-request`.
+    tui.screen.set_approval_policy(ApprovalPolicy::OnRequest);
+    // Async git-status snapshots for the session bar + dropdowns: kick the
+    // first capture at session start; last-known values paint until it lands.
+    let git_cache = GitStatusCache::default();
+    let mut git_generation = 0u64;
+    git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
+    // The start page (IrisMark + launcher) shows only for an interactive launch
+    // with no task and no resume target; a startup resume picker supersedes it.
+    if start_page && startup_modal.is_none() {
+        tui.screen.show_start_page();
+    }
     refresh_footer(tui, switch);
     // On startup, reconcile any crashed/unsettled Iris task in this repo and
-    // expire stale ones (issue #263, ADR-0028), surfacing the recovery notice.
-    if let Some(recovery) = harness.recover_checkpoints() {
-        apply_notices(tui, vec![recovery]);
-    }
+    // expire stale ones (issue #263, ADR-0028): print the single-orphan notice
+    // or open the resume-task picker for the >1/legacy case (#288, ADR-0031).
+    let recovery_picker_open = apply_recovery(harness.recover_checkpoints(), tui);
     // `iris resume` (no id) on a rich TTY opens the resume picker on start by
     // handing a pre-built modal here. Open it before the first draw and before
     // the blocking input reader starts, so the first key acts on a visible
-    // picker.
-    if let Some(modal) = startup_modal {
+    // picker. But the recovery task-picker (>1/legacy: explicit task selection
+    // required, #288/ADR-0031) takes priority -- do not overwrite it with the
+    // session-resume picker.
+    if let Some(modal) = startup_modal
+        && !recovery_picker_open
+    {
         tui.screen.open_modal(modal);
     }
     tui.draw()?;
@@ -265,6 +315,7 @@ async fn session_loop<P: ChatProvider>(
         // previous iteration (chord, picker, or modal) is reflected before the
         // next idle draw.
         refresh_footer(tui, switch);
+        sync_git_status(tui, &git_cache, &mut git_generation);
         // Run any open picker/dialog first: the startup resume picker, or one a
         // command/keybinding opened in the previous iteration. A `/resume`
         // selection returns the chosen session to swap to at this safe boundary.
@@ -285,8 +336,25 @@ async fn session_loop<P: ChatProvider>(
             tui.draw()?;
             continue;
         }
-        match idle_phase(tui, &mut input_rx, &mut tick).await? {
+        match idle_phase(
+            tui,
+            &mut input_rx,
+            &mut tick,
+            &git_cache,
+            &mut git_generation,
+        )
+        .await?
+        {
             IdleOutcome::Exit => break,
+            IdleOutcome::ToggleGitMenu => {
+                toggle_git_menu(&mut tui.screen, &git_cache);
+            }
+            IdleOutcome::ToggleTreeMenu(filter) => {
+                toggle_tree_menu(&mut tui.screen, &git_cache, filter);
+            }
+            IdleOutcome::Menu(action) => {
+                execute_menu_action(action, harness, tui, &git_cache);
+            }
             IdleOutcome::OpenModelPicker => {
                 if let Some(sw) = switch.as_mut() {
                     match picker::model_command("", harness, sw) {
@@ -307,6 +375,21 @@ async fn session_loop<P: ChatProvider>(
                     apply_notices(tui, lines);
                 }
             }
+            IdleOutcome::OpenResumePicker => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                match picker::open_resume(&cwd) {
+                    Some(modal) => tui.screen.open_modal(modal),
+                    None => apply_notices(
+                        tui,
+                        vec!["No prior sessions to resume for this directory.".to_string()],
+                    ),
+                }
+            }
+            IdleOutcome::OpenSettings => {
+                if let Some(sw) = switch.as_mut() {
+                    tui.screen.open_modal(picker::open_settings(sw));
+                }
+            }
             IdleOutcome::Submit(prompt) => {
                 let prompt = prompt.trim().to_string();
                 if prompt.is_empty() {
@@ -316,6 +399,19 @@ async fn session_loop<P: ChatProvider>(
                 // exits via the registry, never reaching the model.
                 if slash::is_exit(&prompt) {
                     break;
+                }
+                // The SessionBar dropdowns open at this safe boundary. Like
+                // every other slash command they are consumed silently -- the
+                // command text is never echoed into the transcript.
+                if prompt == "/git" || prompt == "/tree" {
+                    if prompt == "/git" {
+                        toggle_git_menu(&mut tui.screen, &git_cache);
+                    } else {
+                        toggle_tree_menu(&mut tui.screen, &git_cache, false);
+                    }
+                    refresh_footer(tui, switch);
+                    tui.draw()?;
+                    continue;
                 }
                 // Picker/model/reasoning/session commands are handled at this
                 // safe inter-turn boundary and never start a turn.
@@ -338,9 +434,14 @@ async fn session_loop<P: ChatProvider>(
                             &current_turn,
                             &prompt,
                             steering.as_ref(),
+                            &git_cache,
+                            &mut git_generation,
                         )
                         .await?;
                         tui.screen.end_turn();
+                        // Turn completion is a refresh trigger: the turn may
+                        // have mutated the tree or task state.
+                        git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
                         tui.draw()?;
                     }
                 }
@@ -399,12 +500,32 @@ fn perform_swap<P: ChatProvider>(
     };
     apply_notices(tui, vec![notice]);
     // A session swap is a safe boundary to reconcile a crashed/unsettled task in
-    // this repo and expire stale ones (issue #263, ADR-0028): surface the
-    // one-line recovery notice if anything is unsettled.
-    if let Some(recovery) = harness.recover_checkpoints() {
-        apply_notices(tui, vec![recovery]);
-    }
+    // this repo and expire stale ones (issue #263, ADR-0028): surface the notice
+    // or open the resume-task picker if more than one task needs attention.
+    apply_recovery(harness.recover_checkpoints(), tui);
     Ok(())
+}
+
+/// Apply a [`RecoveryOutcome`] at a safe boundary (#288, ADR-0031): nothing for
+/// `None`, the single-orphan auto-adopt notice for `Notice`, and the resume-task
+/// picker for `Picker` (the >1/legacy case that requires explicit selection).
+/// Returns whether it opened a recovery picker modal, so a caller that also has
+/// a pending startup modal can let the recovery picker win.
+fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) -> bool {
+    match outcome {
+        RecoveryOutcome::None => false,
+        RecoveryOutcome::Notice(notice) => {
+            apply_notices(tui, vec![notice]);
+            false
+        }
+        RecoveryOutcome::Picker(tasks) => match picker::tasks_modal(&tasks) {
+            Some(modal) => {
+                tui.screen.open_modal(modal);
+                true
+            }
+            None => false,
+        },
+    }
 }
 
 /// Request a coalesced render during an active turn: draw immediately when the
@@ -459,7 +580,7 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
 /// to a read-only display accessor on `Harness`.
 fn footer_cwd() -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let display = if let Some(home) = std::env::var_os("HOME")
+    if let Some(home) = std::env::var_os("HOME")
         && !home.is_empty()
         && let Ok(rel) = cwd.strip_prefix(std::path::Path::new(&home))
     {
@@ -470,62 +591,327 @@ fn footer_cwd() -> String {
         }
     } else {
         cwd.display().to_string()
+    }
+}
+
+/// Sync the last-known git snapshot from the async cache into the screen when
+/// a newer refresh landed. Returns whether the snapshot changed (redraw).
+fn sync_git_status(tui: &mut TuiUi, cache: &GitStatusCache, last_generation: &mut u64) -> bool {
+    let generation = cache.generation();
+    if generation == *last_generation {
+        return false;
+    }
+    *last_generation = generation;
+    tui.screen.set_footer_git(cache.latest());
+    true
+}
+
+/// Toggle the git console dropdown. Opening always kicks a fresh background
+/// refresh (paint last known meanwhile). Returns whether anything changed.
+fn toggle_git_menu(screen: &mut Screen, cache: &GitStatusCache) -> bool {
+    if matches!(screen.session_menu, Some(SessionMenu::Git(_))) {
+        screen.close_session_menu();
+        return true;
+    }
+    let Some(status) = screen.footer_git().cloned() else {
+        screen.apply(UiEvent::Notice(
+            "no git repository here — the git console needs a worktree".to_string(),
+        ));
+        return true;
     };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let main_root = status
+        .worktrees
+        .first()
+        .map(|wt| wt.path.clone())
+        .unwrap_or_else(|| cwd.clone());
+    let worktree_root = crate::config::Settings::load(&cwd)
+        .map(|settings| settings.worktree_root(&main_root))
+        .unwrap_or_else(|_| main_root.join("../wt"));
+    screen.open_session_menu(SessionMenu::Git(GitMenu::new(status, worktree_root)));
+    cache.request_refresh(cwd);
+    true
+}
 
-    match footer_branch(&cwd) {
-        Some(branch) => format!("{display} ({branch})"),
-        None => display,
+/// Toggle the directory tree dropdown (`filter` = open in filter mode).
+fn toggle_tree_menu(screen: &mut Screen, cache: &GitStatusCache, filter: bool) -> bool {
+    if matches!(screen.session_menu, Some(SessionMenu::Tree(_))) {
+        screen.close_session_menu();
+        return true;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    screen.open_session_menu(SessionMenu::Tree(TreeMenu::new(cwd.clone(), filter)));
+    cache.request_refresh(cwd);
+    true
+}
+
+/// Translate a crossterm key into the dropdowns' neutral [`MenuKey`].
+fn to_menu_key(code: KeyCode, ctrl: bool) -> Option<MenuKey> {
+    Some(match code {
+        KeyCode::Up => MenuKey::Up,
+        KeyCode::Down => MenuKey::Down,
+        KeyCode::Left => MenuKey::Left,
+        KeyCode::Right => MenuKey::Right,
+        KeyCode::Enter => MenuKey::Enter,
+        KeyCode::Esc => MenuKey::Esc,
+        KeyCode::Tab => MenuKey::Tab,
+        KeyCode::Backspace => MenuKey::Backspace,
+        KeyCode::Char('w') | KeyCode::Char('W') if ctrl => MenuKey::CtrlW,
+        KeyCode::Char(c) if !ctrl => MenuKey::Char(c),
+        _ => return None,
+    })
+}
+
+/// Fold a dropdown key outcome into the idle-phase key result.
+fn menu_outcome_key(screen: &mut Screen, outcome: MenuOutcome) -> IdleKey {
+    match outcome {
+        MenuOutcome::Ignore => IdleKey::Ignore,
+        MenuOutcome::Redraw => IdleKey::Continue,
+        MenuOutcome::Close => {
+            screen.close_session_menu();
+            IdleKey::Continue
+        }
+        MenuOutcome::Action(action) => IdleKey::Menu(action),
     }
 }
 
-#[derive(Default)]
-struct FooterBranchCache {
-    entries: HashMap<PathBuf, FooterBranchEntry>,
-}
-
-struct FooterBranchEntry {
-    branch: Option<String>,
-    observed_at: StdInstant,
-}
-
-fn footer_branch(cwd: &std::path::Path) -> Option<String> {
-    static CACHE: OnceLock<Mutex<FooterBranchCache>> = OnceLock::new();
-    let now = StdInstant::now();
-    let key = cwd.to_path_buf();
-    let cache = CACHE.get_or_init(|| Mutex::new(FooterBranchCache::default()));
-    if let Ok(guard) = cache.lock()
-        && let Some(entry) = guard.entries.get(&key)
-        && now.duration_since(entry.observed_at) < FOOTER_BRANCH_TTL
-    {
-        return entry.branch.clone();
-    }
-
-    let branch = read_footer_branch(cwd);
-    if let Ok(mut guard) = cache.lock() {
-        guard.entries.insert(
-            key,
-            FooterBranchEntry {
-                branch: branch.clone(),
-                observed_at: now,
-            },
-        );
-    }
-    branch
-}
-
-fn read_footer_branch(cwd: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .arg("branch")
-        .arg("--show-current")
-        .output()
-        .ok()?;
-    if !output.status.success() {
+/// Pager-mode mouse targets for the session bar and an open dropdown: a click
+/// on the cwd/git segment toggles its dropdown (performed here); a click on a
+/// dropdown row selects it, and a second click activates. `None` = not a
+/// session-bar click (fall through to wheel handling).
+fn session_bar_click(
+    screen: &mut Screen,
+    mouse: &ratatui::crossterm::event::MouseEvent,
+    cache: &GitStatusCache,
+) -> Option<IdleKey> {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    if !screen.pager_active || !screen.mouse_capture {
         return None;
     }
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!branch.is_empty()).then_some(branch)
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return None;
+    }
+    if mouse.row == 0 {
+        let width = ratatui::crossterm::terminal::size()
+            .map(|(width, _)| width)
+            .unwrap_or(80);
+        return match crate::ui::tui::session_bar_hit(screen, width, mouse.column) {
+            Some(crate::ui::tui::BarSegment::Cwd) => {
+                toggle_tree_menu(screen, cache, false);
+                Some(IdleKey::Continue)
+            }
+            Some(crate::ui::tui::BarSegment::Git) => {
+                toggle_git_menu(screen, cache);
+                Some(IdleKey::Continue)
+            }
+            None => Some(IdleKey::Ignore),
+        };
+    }
+    if screen.session_menu.is_some() {
+        let line = usize::from(mouse.row) - 1;
+        let readonly = screen.menu_readonly();
+        let outcome = screen
+            .session_menu
+            .as_mut()
+            .map(|menu| menu.click_line(line, readonly))
+            .unwrap_or(MenuOutcome::Ignore);
+        return Some(menu_outcome_key(screen, outcome));
+    }
+    None
+}
+
+/// Execute a dropdown side effect at the idle boundary. Mutating git/task
+/// state under a running turn is impossible by construction: dropdowns are
+/// read-only while a turn runs, and this runs only from the idle phase.
+fn execute_menu_action<P: ChatProvider>(
+    action: MenuAction,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    cache: &GitStatusCache,
+) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let checkout = |tui: &mut TuiUi, branch: &str| -> bool {
+        match git_cmd::git_stdout(&cwd, &["checkout", branch]) {
+            Ok(_) => {
+                apply_notices(
+                    tui,
+                    vec![format!("{} switched to {branch}", crate::ui::symbols::DONE)],
+                );
+                true
+            }
+            Err(_) => {
+                apply_notices(
+                    tui,
+                    vec![format!(
+                        "{} checkout blocked — conflicting changes",
+                        crate::ui::symbols::ERROR
+                    )],
+                );
+                false
+            }
+        }
+    };
+    match action {
+        MenuAction::Accept => {
+            let notice = match harness.accept_checkpoint() {
+                Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
+                None => "no unsettled Iris changes to accept".to_string(),
+            };
+            apply_notices(tui, vec![notice]);
+            tui.screen.close_session_menu();
+        }
+        MenuAction::AcceptThenCheckout { branch } => {
+            let notice = match harness.accept_checkpoint() {
+                Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
+                None => "no unsettled Iris changes to accept".to_string(),
+            };
+            apply_notices(tui, vec![notice]);
+            checkout(tui, &branch);
+            tui.screen.close_session_menu();
+        }
+        MenuAction::LoadRestorePoints => {
+            let points: Vec<(u64, String)> = harness
+                .checkpoint_restore_points()
+                .into_iter()
+                .map(|point| (point.seq, point.label))
+                .collect();
+            if points.is_empty() {
+                apply_notices(tui, vec!["no restore points for this task".to_string()]);
+                tui.screen.close_session_menu();
+            } else if let Some(SessionMenu::Git(menu)) = &mut tui.screen.session_menu {
+                menu.set_restore_points(points);
+            }
+        }
+        MenuAction::Rollback { seq } => {
+            match harness.rollback_checkpoint(seq) {
+                Ok(outcome) => {
+                    let mut lines =
+                        vec![format!("{} {}", crate::ui::symbols::DONE, outcome.summary)];
+                    lines.extend(outcome.preserved_notices);
+                    if let Some(warning) = outcome.index_warning {
+                        lines.push(format!("{} {warning}", crate::ui::symbols::REVIEW));
+                    }
+                    apply_notices(tui, lines);
+                }
+                Err(error) => {
+                    apply_notices(
+                        tui,
+                        vec![format!(
+                            "{} rollback failed: {error:#}",
+                            crate::ui::symbols::ERROR
+                        )],
+                    );
+                }
+            }
+            tui.screen.close_session_menu();
+        }
+        MenuAction::Checkout { branch } => {
+            checkout(tui, &branch);
+            tui.screen.close_session_menu();
+        }
+        MenuAction::StashCheckout { branch } => {
+            match git_cmd::git_stdout(&cwd, &["stash", "push"]) {
+                Ok(_) => {
+                    if checkout(tui, &branch) {
+                        apply_notices(
+                            tui,
+                            vec!["changes stashed — git stash pop to restore".to_string()],
+                        );
+                    }
+                }
+                Err(error) => {
+                    apply_notices(
+                        tui,
+                        vec![format!(
+                            "{} stash failed: {error:#}",
+                            crate::ui::symbols::ERROR
+                        )],
+                    );
+                }
+            }
+            tui.screen.close_session_menu();
+        }
+        MenuAction::CreateBranch { name, base } => {
+            match git_cmd::git_stdout(&cwd, &["checkout", "-b", &name, &base]) {
+                Ok(_) => {
+                    apply_notices(
+                        tui,
+                        vec![format!(
+                            "{} branch {name} created from {base}",
+                            crate::ui::symbols::DONE
+                        )],
+                    );
+                }
+                Err(error) => {
+                    apply_notices(
+                        tui,
+                        vec![format!(
+                            "{} could not create branch: {error:#}",
+                            crate::ui::symbols::ERROR
+                        )],
+                    );
+                }
+            }
+            tui.screen.close_session_menu();
+        }
+        MenuAction::CreateWorktree { name, base, path } => {
+            let path_arg = path.to_string_lossy().into_owned();
+            match git_cmd::git_stdout(&cwd, &["worktree", "add", &path_arg, "-b", &name, &base]) {
+                Ok(_) => {
+                    // Stay open: the in-dropdown confirm offers `↵ open
+                    // session there ┊ esc stay`.
+                    if let Some(SessionMenu::Git(menu)) = &mut tui.screen.session_menu {
+                        menu.worktree_ready(path);
+                    }
+                }
+                Err(error) => {
+                    apply_notices(
+                        tui,
+                        vec![format!(
+                            "{} could not create worktree: {error:#}",
+                            crate::ui::symbols::ERROR
+                        )],
+                    );
+                    tui.screen.close_session_menu();
+                }
+            }
+        }
+        MenuAction::OpenSessionAt { path, branch } => {
+            // Idle-only re-anchor: move the process cwd and the harness's
+            // workspace guard to the target worktree.
+            if let Err(error) = std::env::set_current_dir(&path) {
+                apply_notices(
+                    tui,
+                    vec![format!(
+                        "{} could not open {}: {error}",
+                        crate::ui::symbols::ERROR,
+                        path.display()
+                    )],
+                );
+                tui.screen.close_session_menu();
+                return;
+            }
+            harness.reanchor_workspace(&path);
+            let branch_label = branch.unwrap_or_else(|| "detached".to_string());
+            apply_notices(
+                tui,
+                vec![format!(
+                    "{} session moved to {} — {branch_label}",
+                    crate::ui::symbols::SEP,
+                    path.display()
+                )],
+            );
+            // Arriving in a worktree tells you what Iris left unsettled there.
+            apply_recovery(harness.recover_checkpoints(), tui);
+            tui.screen.close_session_menu();
+        }
+        MenuAction::InsertReference(path) => {
+            tui.screen.editor.insert_str(format!("@{path} "));
+            tui.screen.sync_palette();
+            tui.screen.close_session_menu();
+        }
+    }
+    cache.request_refresh(std::env::current_dir().unwrap_or_default());
 }
 
 /// Route a submitted `/` command to its picker/handler. Returns a
@@ -575,6 +961,32 @@ fn route_command<P: ChatProvider>(
             tui.screen.open_modal(picker::open_settings(sw));
             Ok(RouteOutcome::Consumed)
         }
+        "/approval" => {
+            // ADR-0032 session control. Changing the preset at this inter-turn
+            // boundary is safe: the harness forwards it to Nexus, which owns
+            // enforcement. The statusline posture is kept in lockstep so the
+            // label never claims a mode the runtime is not in.
+            tui.screen.commit_user(prompt);
+            let lines = if rest.is_empty() {
+                vec![format!(
+                    "approval mode: {} (use /approval strict|auto|never)",
+                    harness.approval_mode().as_token()
+                )]
+            } else {
+                match crate::nexus::ApprovalMode::parse(rest) {
+                    Some(mode) => {
+                        harness.set_approval_mode(mode);
+                        tui.screen.set_approval_policy(ApprovalPolicy::from(mode));
+                        vec![format!("approval mode set to {}", mode.as_token())]
+                    }
+                    None => vec![format!(
+                        "unknown approval mode `{rest}` (use strict|auto|never)"
+                    )],
+                }
+            };
+            apply_notices(tui, lines);
+            Ok(RouteOutcome::Consumed)
+        }
         "/trust" | "/permissions" if rest.is_empty() => {
             // Modal actions dispatch through picker::apply_action, which takes
             // the switch; keep the same guard as the other pickers.
@@ -597,6 +1009,22 @@ fn route_command<P: ChatProvider>(
             }
             Ok(RouteOutcome::Consumed)
         }
+        "/tasks" if rest.is_empty() => {
+            // Open the unified task surface (ADR-0031): the active (unsettled)
+            // task as a header plus this workspace's recoverable Iris tasks.
+            // Selection adopts a recoverable task at the inter-turn boundary;
+            // adoption never implicitly resumes a session. The active card is
+            // enriched with the git-status snapshot the session bar already holds.
+            tui.screen.commit_user(prompt);
+            match picker::build_tasks_modal(harness, tui.screen.footer_git()) {
+                Some(modal) => tui.screen.open_modal(modal),
+                None => apply_notices(
+                    tui,
+                    vec!["No active or recoverable Iris tasks in this workspace.".to_string()],
+                ),
+            }
+            Ok(RouteOutcome::Consumed)
+        }
         "/new" if rest.is_empty() => {
             // Start a fresh session at this safe boundary (new id, empty
             // transcript, fresh log) without restarting the process.
@@ -606,6 +1034,23 @@ fn route_command<P: ChatProvider>(
         "/session" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             apply_notices(tui, crate::cli::session_info_lines(harness, switch));
+            Ok(RouteOutcome::Consumed)
+        }
+        "/sessions" => {
+            // Deterministic session lookup by task id (ADR-0031): with no arg,
+            // default to the active task; else a usage line. No modal, no model
+            // call -- display-only audit text.
+            tui.screen.commit_user(prompt);
+            let task_id = if rest.is_empty() {
+                harness.current_task_id()
+            } else {
+                Some(rest.to_string())
+            };
+            let lines = match task_id {
+                Some(task_id) => crate::cli::sessions_for_task_lines(harness.workspace(), &task_id),
+                None => vec!["usage: /sessions <task-id>".to_string()],
+            };
+            apply_notices(tui, lines);
             Ok(RouteOutcome::Consumed)
         }
         "/copy" if rest.is_empty() => {
@@ -646,6 +1091,47 @@ fn route_command<P: ChatProvider>(
             if let Some(lines) = crate::cli::handle_model_command(prompt, harness, switch) {
                 apply_notices(tui, lines);
             }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/terminal-setup" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            let env = crate::ui::terminal_doctor::detect(
+                tui.keyboard_enhanced(),
+                tui.screen.pager_active,
+            );
+            apply_notices(tui, crate::ui::terminal_doctor::report(&env));
+            Ok(RouteOutcome::Consumed)
+        }
+        "/find" => {
+            // Deliberately NOT committed to the transcript: the command row
+            // would otherwise always match its own query. The indicator row
+            // carries the query while the search is active.
+            if !tui.screen.pager_active {
+                apply_notices(
+                    tui,
+                    vec!["transcript search is a pager-mode feature".to_string()],
+                );
+                return Ok(RouteOutcome::Consumed);
+            }
+            match tui.screen.start_search(rest) {
+                None => apply_notices(tui, vec!["search cleared".to_string()]),
+                Some(0) => apply_notices(tui, vec![format!("no matches for {rest:?}")]),
+                Some(_) => {}
+            }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/mouse" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            let notice = if tui.screen.pager_active {
+                if tui.screen.toggle_mouse() {
+                    "mouse reporting on \u{2014} wheel scrolls the transcript (Ctrl+T toggles)"
+                } else {
+                    "mouse reporting off \u{2014} terminal-native select/copy active (Ctrl+T re-enables)"
+                }
+            } else {
+                "mouse capture is a pager-mode feature; the inline renderer never captures the mouse"
+            };
+            apply_notices(tui, vec![notice.to_string()]);
             Ok(RouteOutcome::Consumed)
         }
         "/diff" if rest.is_empty() => {
@@ -727,11 +1213,14 @@ async fn idle_phase(
     tui: &mut TuiUi,
     input_rx: &mut UnboundedReceiver<Event>,
     tick: &mut tokio::time::Interval,
+    git_cache: &GitStatusCache,
+    git_generation: &mut u64,
 ) -> Result<IdleOutcome> {
     let mut last_resize_width = ratatui::crossterm::terminal::size()
         .ok()
         .map(|(width, _)| width);
     let mut pending_width_resize: Option<Instant> = None;
+    let mut next_git_poll = Instant::now() + GIT_POLL;
     loop {
         let resize_deadline =
             pending_width_resize.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
@@ -759,7 +1248,7 @@ async fn idle_phase(
                         }
                         _ => None,
                     };
-                    match handle_idle_event(&mut tui.screen, event) {
+                    match handle_idle_event(&mut tui.screen, event, git_cache) {
                         IdleKey::Continue => match resize_width_changed {
                             Some(true) => defer_width_resize = true,
                             Some(false) if pending_width_resize.is_some() || defer_width_resize => {
@@ -774,6 +1263,13 @@ async fn idle_phase(
                         IdleKey::OpenModelPicker => return Ok(IdleOutcome::OpenModelPicker),
                         IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
                         IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
+                        IdleKey::OpenResumePicker => return Ok(IdleOutcome::OpenResumePicker),
+                        IdleKey::OpenSettings => return Ok(IdleOutcome::OpenSettings),
+                        IdleKey::ToggleGitMenu => return Ok(IdleOutcome::ToggleGitMenu),
+                        IdleKey::ToggleTreeMenu(filter) => {
+                            return Ok(IdleOutcome::ToggleTreeMenu(filter));
+                        }
+                        IdleKey::Menu(action) => return Ok(IdleOutcome::Menu(action)),
                     }
                 }
                 if draw_now {
@@ -787,13 +1283,31 @@ async fn idle_phase(
                 pending_width_resize = None;
                 tui.draw()?;
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                // Idle animation: the start page's IrisMark sweep. `tick`
+                // reports false while no start page is shown (the spinner is
+                // idle here), under reduced motion, and while unfocused, so a
+                // plain idle session stays redraw-free.
+                if tui.screen.tick() {
+                    tui.draw()?;
+                }
+                // Debounced idle git poll; a landed refresh repaints the bar.
+                let now = Instant::now();
+                if now >= next_git_poll {
+                    next_git_poll = now + GIT_POLL;
+                    git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
+                }
+                if sync_git_status(tui, git_cache, git_generation) {
+                    tui.draw()?;
+                }
+            }
         }
     }
 }
 
 /// Drive one agent turn, staying responsive to input, agent events, approval
 /// requests, and the spinner tick. Returns when the turn future completes.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
@@ -802,6 +1316,8 @@ async fn run_turn<P: ChatProvider>(
     current_turn: &CurrentTurn,
     prompt: &str,
     steering: &SteeringQueue,
+    git_cache: &GitStatusCache,
+    git_generation: &mut u64,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = unbounded_channel::<UiEvent>();
     let (appr_tx, mut appr_rx) = unbounded_channel::<ApprovalRequest>();
@@ -851,6 +1367,16 @@ async fn run_turn<P: ChatProvider>(
                     break res;
                 }
                 Some(event) = event_rx.recv() => {
+                    // A tool call reaching a terminal state may have mutated
+                    // the tree: refresh the git snapshot in the background.
+                    if matches!(
+                        event,
+                        UiEvent::ToolResult { .. }
+                            | UiEvent::ToolError { .. }
+                            | UiEvent::ToolCancelled(_)
+                    ) {
+                        git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
+                    }
                     tui.screen.apply(event);
                     // A drained (injected) steering/follow-up message lowers the
                     // queued count; refresh it from the live queue before redraw.
@@ -858,7 +1384,7 @@ async fn run_turn<P: ChatProvider>(
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
-                    tui.screen.show_approval(&request.call, request.allow_always, request.allow_project);
+                    tui.screen.show_approval(&request.call, request.allow_always, request.allow_project, &request.ctx);
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,
@@ -888,8 +1414,13 @@ async fn run_turn<P: ChatProvider>(
                                 last_resize_width = Some(*width);
                                 sched.hold_until(Instant::now() + RESIZE_REDRAW_DEBOUNCE);
                             }
-                            if handle_running_event(&mut tui.screen, event, &mut pending, steering)
-                            {
+                            if handle_running_event(
+                                &mut tui.screen,
+                                event,
+                                &mut pending,
+                                steering,
+                                git_cache,
+                            ) {
                                 // Reflect any just-enqueued (or cleared) steering
                                 // input on the working indicator.
                                 tui.screen.set_queued(steering.len());
@@ -907,6 +1438,11 @@ async fn run_turn<P: ChatProvider>(
                 }
                 _ = tick.tick() => {
                     if tui.screen.tick() {
+                        request_render(&mut sched, tui)?;
+                    }
+                    // A landed git refresh repaints the bar (readout dropdowns
+                    // keep painting last-known values while the turn runs).
+                    if sync_git_status(tui, git_cache, git_generation) {
                         request_render(&mut sched, tui)?;
                     }
                 }
@@ -1045,6 +1581,49 @@ async fn dispatch_action<P: ChatProvider>(
             // performs the swap at the safe inter-turn boundary.
             tui.screen.close_modal();
             return Ok(Some(SessionSource::Resume(id)));
+        }
+        ModalAction::AdoptTask(id) => {
+            // Adopt the recoverable task at this safe inter-turn boundary (#288,
+            // ADR-0031): rehydrate its checkpoint chain so `/rollback` /
+            // `/accept` / `/checkpoint` operate on the real chain. Adoption never
+            // implicitly resumes a session; when exactly one session is linked we
+            // open an explicit "also resume" offer (a second, separate action).
+            tui.screen.close_modal();
+            match harness.adopt_task(&id) {
+                Some(adopted) => {
+                    let (lines, resume) = picker::adopt_notice(&adopted);
+                    apply_notices(tui, lines);
+                    if let Some(session_id) = resume {
+                        tui.screen.open_modal(picker::resume_offer(&session_id));
+                    }
+                }
+                None => apply_notices(
+                    tui,
+                    vec![format!(
+                        "could not adopt task {id}: it may have settled or been claimed by another process."
+                    )],
+                ),
+            }
+        }
+        ModalAction::ViewTaskSessions(id) => {
+            // Show the task's linked sessions in the modal's detail view
+            // (ADR-0031 session lookup): the deterministic, bounded, cwd-scoped
+            // extraction, read for display/audit only -- never a recovery input.
+            // Rebuild the task modal (so leaving the detail returns to the list)
+            // and attach the fetched lines.
+            let lines = crate::cli::sessions_for_task_lines(harness.workspace(), &id);
+            match picker::build_tasks_modal(harness, tui.screen.footer_git()) {
+                Some(Modal::Tasks(mut picker)) => {
+                    picker.show_detail(&id, lines);
+                    tui.screen.open_modal(Modal::Tasks(picker));
+                }
+                // The task vanished (settled/adopted elsewhere) between opening
+                // the modal and here: surface the detail as notices and close.
+                _ => {
+                    tui.screen.close_modal();
+                    apply_notices(tui, lines);
+                }
+            }
         }
         ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {
             Ok(auth) => match login::provider_select(method, &auth) {
@@ -1287,7 +1866,6 @@ fn to_modal_key(event: &Event) -> Option<ModalKey> {
         KeyCode::Left if !ctrl && !alt => ModalKey::Left,
         KeyCode::Right if !ctrl && !alt => ModalKey::Right,
         KeyCode::Enter => ModalKey::Enter,
-        KeyCode::Tab => ModalKey::Tab,
         KeyCode::Esc => ModalKey::Esc,
         KeyCode::Backspace => ModalKey::Backspace,
         KeyCode::Char('c') | KeyCode::Char('C') if ctrl => ModalKey::CtrlC,
@@ -1345,15 +1923,30 @@ fn insert_paste(screen: &mut Screen, text: &str) {
 
 /// Idle-phase key map: edits the `TextArea`, drives the slash palette, scrolls
 /// the transcript, submits, or exits. See the module docs for the binding list.
-fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
+fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCache) -> IdleKey {
     let key = match event {
         Event::Paste(text) => {
             insert_paste(screen, &text);
             screen.sync_palette();
             return IdleKey::Continue;
         }
-        // Mouse capture is disabled so the terminal owns scroll/select/copy of
-        // the native scrollback; no Mouse events arrive here.
+        // Pager mode captures the mouse: the wheel scrolls the Iris-owned
+        // scrollback. Inline mode never enables capture, so no Mouse events
+        // arrive there and the terminal owns scroll/select/copy natively.
+        // Clicks target the session bar's cwd/git segments and dropdown rows.
+        Event::Mouse(mouse) => {
+            if let Some(key) = session_bar_click(screen, &mouse, git_cache) {
+                return key;
+            }
+            if header_click(screen, &mouse) {
+                return IdleKey::Continue;
+            }
+            return if pager_wheel(screen, &mouse) {
+                IdleKey::Continue
+            } else {
+                IdleKey::Ignore
+            };
+        }
         Event::Resize(..) => return IdleKey::Continue,
         // Focus reports gate the spinner's tick redraws; a regain redraws once
         // so a pane switched back to is visually current.
@@ -1377,12 +1970,104 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
     let input = screen.editor_text();
 
-    // Explicit focus routing (Editor < Palette < Modal). Modals run in their own
-    // phase, so idle focus is only ever Editor or Palette here. Reuse the input
-    // snapshot already computed above instead of re-joining the editor buffer.
+    // Explicit focus routing (Editor < Palette < SessionMenu < Modal). Modals
+    // run in their own phase, so idle focus is Editor, Palette, or SessionMenu
+    // here. Reuse the input snapshot instead of re-joining the editor buffer.
     let focus = screen.focus_for(&input);
+
+    // SessionBar dropdown routing: while open, the dropdown owns keys (the
+    // list-state law: no free typing while a list has focus; input rows make
+    // printable keys text via the menu's own state machine). `esc` closes here
+    // and never reaches any other path.
+    if focus == FocusTarget::SessionMenu {
+        if ctrl && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G')) {
+            return IdleKey::ToggleGitMenu;
+        }
+        let Some(menu_key) = to_menu_key(key.code, ctrl) else {
+            return IdleKey::Ignore;
+        };
+        let readonly = screen.menu_readonly();
+        let outcome = screen
+            .session_menu
+            .as_mut()
+            .map(|menu| menu.handle_key(menu_key, readonly))
+            .unwrap_or(MenuOutcome::Ignore);
+        return menu_outcome_key(screen, outcome);
+    }
+
+    // Pager scroll keys act before editor routing (scrollback has implicit
+    // focus for the nav keys); typing/other keys fall through to the composer.
+    if pager_scroll_key(screen, key.code, ctrl, alt) {
+        return IdleKey::Continue;
+    }
+    // Tab focus toggle + focused-scrollback entry navigation (ADR-0029).
+    // Never on the start page (no transcript to focus) and never while the
+    // slash palette is open (Tab/arrows stay palette keys there).
+    if !screen.start_page_active()
+        && focus != FocusTarget::Palette
+        && scrollback_focus_key(screen, key.code, ctrl, alt)
+    {
+        return IdleKey::Continue;
+    }
+
+    // Start-page launcher routing: the listed ctrl-chords activate directly,
+    // and while the composer is empty ↑/↓/↵ drive the launcher selection. The
+    // composer stays live throughout — typing a task and submitting it starts
+    // the session (the palette keeps priority for `/` input).
+    if screen.start_page_active() && focus != FocusTarget::Palette {
+        if ctrl {
+            match key.code {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    screen.leave_start_page();
+                    return IdleKey::Continue;
+                }
+                // Only while the composer is empty: once the user is typing a
+                // task, ctrl-r stays the editor's redo.
+                KeyCode::Char('r') | KeyCode::Char('R') if screen.editor_is_empty() => {
+                    return IdleKey::OpenResumePicker;
+                }
+                KeyCode::Char(',') => return IdleKey::OpenSettings,
+                KeyCode::Char('q') | KeyCode::Char('Q') => return IdleKey::Exit,
+                _ => {}
+            }
+        }
+        if screen.editor_is_empty() && !ctrl && !alt {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(page) = screen.start_page.as_mut() {
+                        page.up();
+                    }
+                    return IdleKey::Continue;
+                }
+                KeyCode::Down => {
+                    if let Some(page) = screen.start_page.as_mut() {
+                        page.down();
+                    }
+                    return IdleKey::Continue;
+                }
+                KeyCode::Enter => {
+                    let action = screen
+                        .start_page
+                        .as_ref()
+                        .map(|page| page.selected_action());
+                    return match action {
+                        Some(StartAction::NewSession) => {
+                            screen.leave_start_page();
+                            IdleKey::Continue
+                        }
+                        Some(StartAction::ResumeSession) => IdleKey::OpenResumePicker,
+                        Some(StartAction::Settings) => IdleKey::OpenSettings,
+                        Some(StartAction::Quit) => IdleKey::Exit,
+                        None => IdleKey::Continue,
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
 
     // Global picker chords work regardless of editor contents (but not while the
     // slash palette is steering Up/Down/Enter): Ctrl+L opens the model picker,
@@ -1395,9 +2080,16 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
             KeyCode::Char('p') | KeyCode::Char('P') if ctrl => {
                 return IdleKey::CycleModel(!shift);
             }
-            KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
-                screen.toggle_latest_panel();
+            KeyCode::Char('t') | KeyCode::Char('T') if ctrl && screen.pager_active => {
+                screen.toggle_mouse();
                 return IdleKey::Continue;
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
+                screen.toggle_all_panels();
+                return IdleKey::Continue;
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') if ctrl => {
+                return IdleKey::ToggleGitMenu;
             }
             KeyCode::BackTab => return IdleKey::CycleEffort,
             _ => {}
@@ -1460,6 +2152,12 @@ fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
                 return IdleKey::Continue;
             }
             return IdleKey::Submit(text);
+        }
+        // `@` as the FIRST character of an empty composer is the file-reference
+        // idiom: it opens the directory tree directly in filter mode instead
+        // of typing.
+        KeyCode::Char('@') if !ctrl && !alt && screen.editor_is_empty() => {
+            return IdleKey::ToggleTreeMenu(true);
         }
         // Everything else is pure text editing, shared with the running phase so
         // the composer behaves identically whether or not a turn is in flight.
@@ -1584,11 +2282,129 @@ fn resolve_input_eof(
 /// While a tool is awaiting approval the composer is frozen and only the
 /// approval keys (plus Ctrl-C/-O) act, so a `y`/`n` can't be both an answer and
 /// typed text. Returns whether a redraw is needed.
+/// Tab focus toggle and focused-scrollback entry keys (ADR-0029): arrows
+/// select entries (falling back to line scroll with none), Left/Right
+/// fold/reveal, Enter toggles the fold. Typing a printable character returns
+/// focus to the prompt WITHOUT being consumed, so it lands in the composer;
+/// Esc is never a focus or nav key.
+fn scrollback_focus_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    if !screen.pager_active || ctrl || alt {
+        return false;
+    }
+    match code {
+        KeyCode::Tab => {
+            screen.toggle_scrollback_focus();
+            true
+        }
+        _ if !screen.scrollback_focus => false,
+        KeyCode::Up => {
+            screen.move_selection(-1);
+            true
+        }
+        KeyCode::Down => {
+            screen.move_selection(1);
+            true
+        }
+        KeyCode::Left => {
+            screen.set_selected_expanded(false);
+            true
+        }
+        KeyCode::Right => {
+            screen.set_selected_expanded(true);
+            true
+        }
+        KeyCode::Enter => {
+            screen.toggle_selected_entry();
+            true
+        }
+        // Search navigation while a `/find` is active: n = older, N = newer.
+        // Checked before the type-through fallthrough so the two letters
+        // navigate instead of stealing focus back to the prompt.
+        KeyCode::Char('n') if screen.search.is_some() => {
+            screen.search_step(-1);
+            true
+        }
+        KeyCode::Char('N') if screen.search.is_some() => {
+            screen.search_step(1);
+            true
+        }
+        // Typing always returns to the prompt; the key falls through and is
+        // handled by the composer (it types). Esc keeps its cancel/clear
+        // semantics untouched.
+        KeyCode::Char(_) | KeyCode::Backspace => {
+            screen.focus_prompt();
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Pager-mode wheel scrolling: ±`scroll_speed` lines per wheel tick. Only the
+/// wheel is consumed; clicks/drags are ignored (in-app selection is a later
+/// slice -- the Ctrl+T toggle restores terminal-native selection until then).
+/// Pager-mode disclosure click: a left-button-down on a foldable block's
+/// header row toggles THAT block. `None`/`false` = not a header click (fall
+/// through to wheel handling). Only fires under pager mouse capture.
+fn header_click(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    if !screen.pager_active || !screen.mouse_capture {
+        return false;
+    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    screen.toggle_header_at_screen_row(mouse.row)
+}
+
+fn pager_wheel(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
+    // Gate on capture INTENT too: after Ctrl+T / `/mouse` turns capture off,
+    // queued events (or events still arriving because the disable write
+    // failed) must not scroll a transcript whose UI says native selection is
+    // active.
+    if !screen.pager_active || !screen.mouse_capture {
+        return false;
+    }
+    let step = usize::from(screen.scroll_speed.max(1));
+    match mouse.kind {
+        ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+            screen.scroll.scroll_up(step);
+            true
+        }
+        ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+            screen.scroll.scroll_down(step);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Pager-mode scrollback navigation (ADR-0029). Consumes the key when it
+/// scrolled: PageUp/PageDown page, Alt+Up/Alt+Down scroll one line (Ctrl+J/K
+/// stay editor kill-ring keys), and Home/End jump to the ends -- but only
+/// while the composer is empty, so editing keeps its line-start/end keys.
+/// Inline mode (`pager_active == false`) never consumes anything.
+fn pager_scroll_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    if !screen.pager_active || ctrl {
+        return false;
+    }
+    match code {
+        KeyCode::PageUp => screen.scroll.page_up(),
+        KeyCode::PageDown => screen.scroll.page_down(),
+        KeyCode::Up if alt => screen.scroll.scroll_up(1),
+        KeyCode::Down if alt => screen.scroll.scroll_down(1),
+        KeyCode::Home if !alt && screen.editor_is_empty() => screen.scroll.jump_to_start(),
+        KeyCode::End if !alt && screen.editor_is_empty() => screen.scroll.follow_latest(),
+        _ => return false,
+    }
+    true
+}
+
 fn handle_running_event(
     screen: &mut Screen,
     event: Event,
     pending: &mut Option<PendingApproval>,
     steering: &SteeringQueue,
+    git_cache: &GitStatusCache,
 ) -> bool {
     match event {
         // Paste composes into the live editor (but not while an approval is
@@ -1597,8 +2413,21 @@ fn handle_running_event(
             insert_paste(screen, &text);
             true
         }
-        // Mouse capture is off; the terminal scrolls its own scrollback. Resize
-        // still triggers a redraw of the terminal surface.
+        // Pager mode: wheel scrolls the Iris-owned scrollback while a turn
+        // runs; clicks still target the session bar (dropdowns open as
+        // readouts -- click activation is a no-op under readonly).
+        Event::Mouse(mouse) => {
+            if pending.is_none()
+                && let Some(key) = session_bar_click(screen, &mouse, git_cache)
+            {
+                return !matches!(key, IdleKey::Ignore | IdleKey::Menu(_));
+            }
+            if header_click(screen, &mouse) {
+                return true;
+            }
+            pager_wheel(screen, &mouse)
+        }
+        // Resize still triggers a redraw of the terminal surface.
         Event::Resize(..) => true,
         // Focus reports pause/resume the spinner's tick redraws; a regain
         // redraws once to catch the frozen animation and elapsed time up.
@@ -1612,7 +2441,14 @@ fn handle_running_event(
             let alt = key.modifiers.contains(KeyModifiers::ALT);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-                screen.toggle_latest_panel();
+                screen.toggle_all_panels();
+                return true;
+            }
+            if ctrl
+                && screen.pager_active
+                && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+            {
+                screen.toggle_mouse();
                 return true;
             }
             if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
@@ -1624,6 +2460,37 @@ fn handle_running_event(
                     let _ = p.reply.send(ApprovalDecision::Deny);
                     screen.clear_approval();
                 }
+                return true;
+            }
+            // SessionBar dropdowns while a turn runs: readouts. `ctrl-g`
+            // toggles, navigation + esc stay live, every mutating key is a
+            // no-op inside the menu. Never while an approval is pending (the
+            // approval owns input then).
+            if pending.is_none() {
+                if ctrl && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G')) {
+                    toggle_git_menu(screen, git_cache);
+                    return true;
+                }
+                if screen.session_menu.is_some() {
+                    let Some(menu_key) = to_menu_key(key.code, ctrl) else {
+                        return false;
+                    };
+                    let outcome = screen
+                        .session_menu
+                        .as_mut()
+                        .map(|menu| menu.handle_key(menu_key, true))
+                        .unwrap_or(MenuOutcome::Ignore);
+                    return !matches!(
+                        menu_outcome_key(screen, outcome),
+                        IdleKey::Ignore | IdleKey::Menu(_)
+                    );
+                }
+            }
+            // Pager scroll keys stay live while a turn runs -- including while
+            // an approval is pending (scrolling history is exactly what a
+            // reviewer needs before deciding); they never collide with the
+            // y/a/p/n approval keys and never edit or steer.
+            if pager_scroll_key(screen, key.code, ctrl, alt) {
                 return true;
             }
             // While a tool is awaiting approval, the composer is frozen: only the
@@ -1650,6 +2517,11 @@ fn handle_running_event(
                     return true;
                 }
                 return false;
+            }
+            // Tab focus + entry selection stay available while a turn runs
+            // (after the approval block, so approval keys always win).
+            if scrollback_focus_key(screen, key.code, ctrl, alt) {
+                return true;
             }
             // No approval pending: the composer is live for steering. Enter
             // queues a steering message (injected before the next provider
@@ -1704,6 +2576,7 @@ impl ApprovalGate for LoopBridge {
         call: &'a ToolCall,
         allow_always: bool,
         allow_project: bool,
+        ctx: ReviewContext,
     ) -> ApprovalFuture<'a> {
         let appr_tx = self.appr_tx.clone();
         let call = call.clone();
@@ -1714,6 +2587,7 @@ impl ApprovalGate for LoopBridge {
                     call,
                     allow_always,
                     allow_project,
+                    ctx,
                     reply,
                 })
                 .is_err()
@@ -1732,6 +2606,22 @@ mod tests {
     use crate::nexus::SteeringSource;
     use crate::ui::tui::Screen;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    /// Test shims: the production handlers take the async git-status cache;
+    /// these keep the existing key-routing tests cache-free (an explicit item
+    /// shadows the glob import).
+    fn handle_idle_event(screen: &mut Screen, event: Event) -> IdleKey {
+        super::handle_idle_event(screen, event, &GitStatusCache::default())
+    }
+
+    fn handle_running_event(
+        screen: &mut Screen,
+        event: Event,
+        pending: &mut Option<PendingApproval>,
+        steering: &SteeringQueue,
+    ) -> bool {
+        super::handle_running_event(screen, event, pending, steering, &GitStatusCache::default())
+    }
 
     #[test]
     fn debug_snapshot_contents_carry_size_rendered_lines_and_messages() {
@@ -1842,6 +2732,261 @@ mod tests {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    /// A screen with a git snapshot on the footer (branch `main`).
+    fn git_screen() -> Screen {
+        let mut screen = Screen::new();
+        screen.set_footer_with_context("gpt-5.5".to_string(), None, None, "~/repo".to_string());
+        screen.set_footer_git(Some(crate::git::status::GitStatus {
+            branch: Some("main".to_string()),
+            recent_branches: vec![crate::git::status::BranchInfo {
+                name: "main".to_string(),
+                age: None,
+                worktree: None,
+            }],
+            ..Default::default()
+        }));
+        screen
+    }
+
+    #[test]
+    fn ctrl_g_routes_to_the_git_menu_toggle_and_toggle_opens_and_closes() {
+        let mut screen = git_screen();
+        let outcome = handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(outcome, IdleKey::ToggleGitMenu));
+
+        let cache = GitStatusCache::default();
+        assert!(toggle_git_menu(&mut screen, &cache));
+        assert!(matches!(screen.session_menu, Some(SessionMenu::Git(_))));
+        // Toggle again closes.
+        assert!(toggle_git_menu(&mut screen, &cache));
+        assert!(screen.session_menu.is_none());
+
+        // Without a git snapshot the toggle degrades to an honest notice.
+        let mut plain = Screen::new();
+        plain.set_footer_with_context("m".to_string(), None, None, "~/x".to_string());
+        assert!(toggle_git_menu(&mut plain, &cache));
+        assert!(plain.session_menu.is_none());
+    }
+
+    #[test]
+    fn at_as_first_character_of_an_empty_composer_opens_the_tree_filter() {
+        let mut screen = git_screen();
+        let outcome = handle_idle_event(&mut screen, key(KeyCode::Char('@')));
+        assert!(matches!(outcome, IdleKey::ToggleTreeMenu(true)));
+        assert!(screen.editor_is_empty(), "the @ is not typed");
+
+        // Mid-text `@` is plain typing (the file-reference idiom applies only
+        // to the first character of an empty composer).
+        screen.editor.insert_str("see ");
+        let outcome = handle_idle_event(&mut screen, key(KeyCode::Char('@')));
+        assert!(matches!(outcome, IdleKey::Continue));
+        assert_eq!(screen.editor_text(), "see @");
+    }
+
+    #[test]
+    fn open_dropdown_owns_keys_and_esc_closes_without_reaching_other_paths() {
+        let mut screen = git_screen();
+        let cache = GitStatusCache::default();
+        toggle_git_menu(&mut screen, &cache);
+        assert_eq!(screen.focus(), FocusTarget::SessionMenu);
+
+        // Typing a printable in list state is inert (no free typing) and never
+        // lands in the composer.
+        let outcome = handle_idle_event(&mut screen, key(KeyCode::Char('x')));
+        assert!(matches!(outcome, IdleKey::Ignore));
+        assert!(screen.editor_is_empty());
+
+        // Esc closes the dropdown (and is consumed here).
+        let outcome = handle_idle_event(&mut screen, key(KeyCode::Esc));
+        assert!(matches!(outcome, IdleKey::Continue));
+        assert!(screen.session_menu.is_none());
+    }
+
+    #[test]
+    fn running_turn_makes_the_dropdown_a_readout() {
+        let mut screen = git_screen();
+        screen.start_turn();
+        let steering = SteeringQueue::default();
+        let mut pending = None;
+
+        // ctrl-g still opens (as a readout).
+        assert!(handle_running_event(
+            &mut screen,
+            key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &mut pending,
+            &steering,
+        ));
+        assert!(screen.session_menu.is_some());
+        assert!(screen.menu_readonly());
+
+        // Enter (a mutating key) is a no-op readout-side.
+        assert!(!handle_running_event(
+            &mut screen,
+            key(KeyCode::Enter),
+            &mut pending,
+            &steering,
+        ));
+        assert!(screen.session_menu.is_some());
+
+        // Esc closes and never reaches the interrupt path (the turn's token is
+        // untouched -- only ctrl-c cancels).
+        assert!(handle_running_event(
+            &mut screen,
+            key(KeyCode::Esc),
+            &mut pending,
+            &steering,
+        ));
+        assert!(screen.session_menu.is_none());
+    }
+
+    #[test]
+    fn pager_wheel_scrolls_by_scroll_speed_and_gates_on_pager_mode() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        fn wheel(kind: MouseEventKind) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+        let mut screen = Screen::new();
+        // Inline mode never consumes mouse events.
+        assert!(!pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
+
+        screen.pager_active = true;
+        screen.scroll.sync(100, 20);
+        assert!(pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
+        assert!(!screen.scroll.is_following());
+        // Default step is 3 lines per tick (max_top 80 -> 77).
+        screen.scroll_speed = 5;
+        assert!(pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
+        // Clicks/drags are ignored until in-app selection lands.
+        assert!(!pager_wheel(
+            &mut screen,
+            &wheel(MouseEventKind::Down(MouseButton::Left))
+        ));
+        // Wheel-down past the bottom re-engages follow.
+        for _ in 0..100 {
+            let _ = pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollDown));
+        }
+        assert!(screen.scroll.is_following());
+        // Capture toggled off: queued/late wheel events are ignored.
+        screen.mouse_capture = false;
+        assert!(!pager_wheel(&mut screen, &wheel(MouseEventKind::ScrollUp)));
+        assert!(screen.scroll.is_following());
+    }
+
+    #[test]
+    fn ctrl_t_toggles_mouse_capture_only_in_pager_mode() {
+        let mut screen = Screen::new();
+        assert!(screen.mouse_capture);
+        // Inline mode: Ctrl+T falls through (not consumed as a toggle).
+        let outcome = handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(outcome, IdleKey::Ignore | IdleKey::Continue));
+        assert!(screen.mouse_capture, "inline mode never toggles capture");
+
+        screen.pager_active = true;
+        let outcome = handle_idle_event(
+            &mut screen,
+            key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(outcome, IdleKey::Continue));
+        assert!(!screen.mouse_capture);
+    }
+
+    #[test]
+    fn tab_toggles_scrollback_focus_and_typing_returns_to_prompt() {
+        let mut screen = Screen::new();
+        // Inline mode: Tab is not a focus key (editor keeps it).
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+
+        screen.pager_active = true;
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(screen.scrollback_focus);
+        // Arrows are consumed as selection/scroll while focused.
+        assert!(scrollback_focus_key(&mut screen, KeyCode::Up, false, false));
+        // Esc is never a focus/nav key: not consumed, focus unchanged.
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Esc,
+            false,
+            false
+        ));
+        assert!(screen.scrollback_focus);
+        // A printable character returns focus to the prompt WITHOUT being
+        // consumed, so it still types into the composer.
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('h'),
+            false,
+            false
+        ));
+        assert!(!screen.scrollback_focus);
+        // Tab toggles back out too.
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(!screen.scrollback_focus);
+    }
+
+    #[test]
+    fn pager_scroll_keys_gate_on_pager_mode_and_composer_state() {
+        let mut screen = Screen::new();
+        // Inline mode: nothing is consumed, editor keeps every key.
+        assert!(!pager_scroll_key(
+            &mut screen,
+            KeyCode::PageUp,
+            false,
+            false
+        ));
+        assert!(!pager_scroll_key(&mut screen, KeyCode::Home, false, false));
+
+        screen.pager_active = true;
+        screen.scroll.sync(100, 20);
+        // PageUp scrolls and disengages follow.
+        assert!(pager_scroll_key(&mut screen, KeyCode::PageUp, false, false));
+        assert!(!screen.scroll.is_following());
+        // Alt+Down line-scrolls; plain Down stays with the editor.
+        assert!(pager_scroll_key(&mut screen, KeyCode::Down, false, true));
+        assert!(!pager_scroll_key(&mut screen, KeyCode::Down, false, false));
+        // Ctrl chords never scroll (Ctrl+J/K stay editor kill-ring keys).
+        assert!(!pager_scroll_key(&mut screen, KeyCode::PageUp, true, false));
+        // Home/End scroll only while the composer is empty.
+        assert!(pager_scroll_key(&mut screen, KeyCode::Home, false, false));
+        screen.set_editor("draft");
+        assert!(!pager_scroll_key(&mut screen, KeyCode::Home, false, false));
+        assert!(!pager_scroll_key(&mut screen, KeyCode::End, false, false));
+        screen.clear_editor();
+        assert!(pager_scroll_key(&mut screen, KeyCode::End, false, false));
+        assert!(screen.scroll.is_following());
+    }
+
     fn key_mod(code: KeyCode, mods: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, mods))
     }
@@ -1853,6 +2998,115 @@ mod tests {
             name: "bash".to_string(),
             arguments: serde_json::json!({ "command": "echo hi" }),
         }
+    }
+
+    #[test]
+    fn start_page_launcher_navigates_wraps_and_activates() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+
+        // ↓ moves to Resume session; ↵ activates it (opens the resume picker).
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Down)),
+            IdleKey::Continue
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::OpenResumePicker
+        ));
+
+        // ↑ wraps from the top row to Quit; ↵ exits.
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::Exit
+        ));
+    }
+
+    #[test]
+    fn start_page_ctrl_chords_activate_directly() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::OpenResumePicker
+        ));
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char(','), KeyModifiers::CONTROL)
+            ),
+            IdleKey::OpenSettings
+        ));
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Exit
+        ));
+        // ctrl-n enters the (already fresh) session: launcher dismissed.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+        assert!(!screen.start_page_active());
+        // Off the start page, ctrl-r is the editor's redo again.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+    }
+
+    #[test]
+    fn start_page_ctrl_r_stays_redo_once_the_composer_has_text() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+        handle_idle_event(&mut screen, key(KeyCode::Char('x')));
+        // A non-empty composer keeps ctrl-r as the editor's redo binding.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+        assert!(screen.start_page_active(), "launcher stays visible");
+    }
+
+    #[test]
+    fn start_page_composer_stays_live_and_submit_starts_the_session() {
+        let mut screen = Screen::new();
+        screen.show_start_page();
+        // Typing goes to the composer, not the launcher.
+        for c in "fix the bug".chars() {
+            handle_idle_event(&mut screen, key(KeyCode::Char(c)));
+        }
+        assert_eq!(screen.editor_text(), "fix the bug");
+        // With a non-empty composer, ↑/↓/↵ belong to the editor/submit path.
+        match handle_idle_event(&mut screen, key(KeyCode::Enter)) {
+            IdleKey::Submit(text) => assert_eq!(text, "fix the bug"),
+            _ => panic!("expected submit"),
+        }
+        // Entering the session (turn start) replaces the launcher.
+        screen.start_turn();
+        assert!(!screen.start_page_active());
     }
 
     #[test]
@@ -1902,23 +3156,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_toggles_latest_panel_when_idle() {
+    fn ctrl_o_routes_to_toggle_all_when_idle() {
+        // ctrl+o drives toggle-all; the full direction/multi-block behavior is
+        // covered in ui::tui::tests::ctrl_o_toggle_all_expands_then_collapses.
         let mut screen = Screen::new();
-        // Long output caps to a preview, so the panel is foldable and ctrl+o
-        // reveals it.
-        let content = (0..20)
-            .map(|n| format!("line {n}"))
-            .collect::<Vec<_>>()
-            .join("\n");
         screen.apply(UiEvent::ToolResult {
             call: call(),
-            content,
+            content: (0..20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             exit_code: None,
             duration: None,
         });
-        // Capped output starts collapsed (preview).
+        // Compact by default: the finalized block arrives collapsed.
         assert!(screen.latest_panel_collapsed());
-
         assert!(matches!(
             handle_idle_event(
                 &mut screen,
@@ -1926,7 +3178,7 @@ mod tests {
             ),
             IdleKey::Continue
         ));
-        // ctrl+o reveals the full output.
+        // ctrl+o expanded it.
         assert!(!screen.latest_panel_collapsed());
     }
 
@@ -2407,7 +3659,8 @@ mod tests {
     fn to_modal_key_maps_navigation_and_chords() {
         assert_eq!(to_modal_key(&key(KeyCode::Up)), Some(ModalKey::Up));
         assert_eq!(to_modal_key(&key(KeyCode::Enter)), Some(ModalKey::Enter));
-        assert_eq!(to_modal_key(&key(KeyCode::Tab)), Some(ModalKey::Tab));
+        // Tab is not consumed by any modal; it maps to None so it falls through.
+        assert_eq!(to_modal_key(&key(KeyCode::Tab)), None);
         assert_eq!(
             to_modal_key(&key(KeyCode::Char('j'))),
             Some(ModalKey::Char('j'))
