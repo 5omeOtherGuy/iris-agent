@@ -1190,7 +1190,14 @@ fn write_debug_snapshot<P: ChatProvider>(
     let path = crate::config::debug_log_path()
         .context("cannot resolve the debug log path: HOME is not set")?;
     let (size, rendered) = tui.debug_render_lines()?;
-    let contents = debug_snapshot_contents(size.width, size.height, &rendered, harness.messages());
+    let frame_stats = tui.frame_stats_lines();
+    let contents = debug_snapshot_contents(
+        size.width,
+        size.height,
+        &rendered,
+        &frame_stats,
+        harness.messages(),
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1205,19 +1212,27 @@ fn debug_snapshot_contents(
     width: u16,
     height: u16,
     rendered: &[String],
+    frame_stats: &[String],
     messages: &[crate::nexus::Message],
 ) -> String {
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let mut out = Vec::with_capacity(rendered.len() + messages.len() + 8);
+    let mut out = Vec::with_capacity(rendered.len() + frame_stats.len() + messages.len() + 8);
     out.push(format!(
         "Iris {} debug snapshot at unix-ms {unix_ms}",
         env!("CARGO_PKG_VERSION")
     ));
     out.push(format!("Terminal: {width}x{height}"));
     out.push(format!("Total lines: {}", rendered.len()));
+    out.push(String::new());
+    out.push("=== Frame timing (compose vs flush) ===".to_string());
+    if frame_stats.is_empty() {
+        out.push("(no frames drawn yet)".to_string());
+    } else {
+        out.extend(frame_stats.iter().cloned());
+    }
     out.push(String::new());
     out.push("=== Rendered lines with visible widths ===".to_string());
     out.extend(rendered.iter().cloned());
@@ -2710,10 +2725,19 @@ mod tests {
             crate::nexus::Message::user("question"),
             crate::nexus::Message::assistant("answer"),
         ];
-        let contents = debug_snapshot_contents(80, 24, &rendered, &messages);
+        let frame_stats = vec![
+            "Frames sampled: 3 (ring holds last 512)".to_string(),
+            "  total   p50=1.000ms p99=2.000ms max=2.000ms".to_string(),
+        ];
+        let contents = debug_snapshot_contents(80, 24, &rendered, &frame_stats, &messages);
         assert!(contents.contains("Iris "), "{contents}");
         assert!(contents.contains("Terminal: 80x24"), "{contents}");
         assert!(contents.contains("Total lines: 2"), "{contents}");
+        assert!(
+            contents.contains("=== Frame timing (compose vs flush) ==="),
+            "{contents}"
+        );
+        assert!(contents.contains("Frames sampled: 3"), "{contents}");
         assert!(contents.contains("[0] (w=2) \"hi\""), "{contents}");
         assert!(
             contents.contains("=== Context messages (JSONL) ==="),
@@ -2727,6 +2751,16 @@ mod tests {
             contents.contains(r#"{"content":"answer","role":"assistant"}"#),
             "{contents}"
         );
+    }
+
+    #[test]
+    fn debug_snapshot_notes_when_no_frames_have_been_drawn() {
+        let contents = debug_snapshot_contents(80, 24, &[], &[], &[]);
+        assert!(
+            contents.contains("=== Frame timing (compose vs flush) ==="),
+            "{contents}"
+        );
+        assert!(contents.contains("(no frames drawn yet)"), "{contents}");
     }
 
     #[test]
