@@ -854,6 +854,44 @@ Potential scope:
   (`docs/benchmarks/issue-337-read-skim-tokens.md`): 52-72% token reduction
   on comment-heavy Rust/TypeScript/Python (>= 50% bars test-asserted), <10 ms
   overhead, every kept line and signature verbatim.]
+- `grep` per-file output guards
+  ([#338](https://github.com/5omeOtherGuy/iris-agent/issues/338)). [Shipped
+  (PR [#364](https://github.com/5omeOtherGuy/iris-agent/pull/364)): content
+  mode takes an opt-in `maxPerFile` cap that limits matches shown per file and
+  summarizes the rest with a `… N more matches in this file` count line
+  (`src/tools/grep.rs`). No silent drops: shown matches plus summed omitted
+  counts equal the exact total, and the header total plus every matched file
+  path always survive (both test-asserted). The cap defaults to unlimited, so
+  under-cap results stay byte-identical to prior output. Grouping (path printed
+  once per file, `> line│` markers) is asserted parity-or-better than the
+  ungrouped `path:line:content` form on every fixture, so the "group only if
+  smaller" guard is not shipped -- it would never fire. Benchmarked on a
+  committed corpus (`docs/benchmarks/issue-338-grep-output-tokens.md`): the
+  per-file cap cuts 88% (cap 5) on a high-match file and 72% (cap 20) on
+  long-line matches; grouping alone is a 3-27% reduction; <10 ms overhead.]
+- `find` truncation summaries and guarded grouping
+  ([#340](https://github.com/5omeOtherGuy/iris-agent/issues/340)). [Shipped
+  (PR [#363](https://github.com/5omeOtherGuy/iris-agent/pull/363)): a truncated
+  result (caps 2000 lines / 50 KB) now ends with an exact summary carrying the
+  total match count and the top directories by omitted-match count, replacing a
+  bare `[output truncated]` that forced a blind re-run (`src/tools/find.rs`).
+  No matches are dropped without a count. Directory grouping (`dir/ a.rs b.rs`)
+  is applied only when it is smaller than the flat listing: the runtime picks
+  the smaller of the two forms per result set, so a set that would not shrink
+  (one file per directory) passes through byte-identical to the historical flat
+  output. Benchmarked on a committed corpus
+  (`docs/benchmarks/issue-340-find-compaction.md`): grouping cuts 54% on a
+  concentrated `.rs` tree (>= 40% bar test-asserted); singletons stay flat at
+  0%.]
+- Opt-in `ls` output reduction
+  ([#339](https://github.com/5omeOtherGuy/iris-agent/issues/339)). [Open: not
+  yet started.]
+
+End-to-end measurement pending: the per-result reductions above (read skim,
+bash filtering, grep caps, find summaries) are asserted as minimum bars on
+committed corpora, but the tokens-per-task benchmark -- does the model still
+complete a realistic workflow from the reduced context -- is not yet run. It
+follows the first Git-Centered Workflow slice (see the sequencing note above).
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
 prompt tokens without reducing task success on at least one realistic workflow

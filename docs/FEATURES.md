@@ -165,9 +165,16 @@
   per-call timeout handling when requested, and nonzero-exit reporting. Iris no
   longer applies a default timeout to every bash call. [Implemented]
 - **`grep` tool** — search workspace file contents in-process via the ripgrep
-  library crates (no `rg` binary required). [Implemented]
+  library crates (no `rg` binary required). Content mode groups matches under
+  each file path and takes an opt-in `maxPerFile` cap that summarizes overflow
+  matches per file with an exact count line (shown plus omitted equals the
+  total; nothing dropped silently). Measured on a committed corpus
+  (`docs/benchmarks/issue-338-grep-output-tokens.md`). [Implemented]
 - **`find` tool** — find workspace files in-process via `ignore` + `globset`
-  (no `fd` binary required). [Implemented]
+  (no `fd` binary required). A truncated result ends with an exact total match
+  count and the top directories by omitted-match count; results group by
+  directory when that is smaller than the flat listing. Measured on a committed
+  corpus (`docs/benchmarks/issue-340-find-compaction.md`). [Implemented]
 - **`ls` tool** — list workspace directory entries, directories first, with an
   optional recursive tree and an optional `long` mode (type marker + human-
   readable size per entry). [Implemented]
