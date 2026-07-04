@@ -866,8 +866,8 @@ mod tests {
         screen.move_selection(1);
         assert_eq!(screen.selected_entry, Some(headers[1]));
 
-        // Reveal/fold the selected panel (tool panels start collapsed to the
-        // capped preview).
+        // Reveal/fold the selected block. These over-budget bodies arrive
+        // collapsed (the flood guard); collapsed = header + footer only.
         assert!(screen.set_selected_expanded(true));
         assert!(!screen.set_selected_expanded(true), "already revealed");
         assert!(screen.toggle_selected_entry(), "toggle folds back");

@@ -57,9 +57,10 @@ halves are never merged onto one line again:
 │    user text                                                                 │
 │    › assistant text                                                          │
 │    THINKING ▸ …                                                              │
-│    ┌ EXPLORE  src              ◆ DONE   0.0s ┐   (tool panel — bordered)      │
-│    │ …                                        │                              │
-│    └──────────────────────────────────────────┘                             │
+│    ▾ EXPLORE  src                       0.0s   (tool block — frameless)      │
+│       Read  src/lib.rs           142 lines                                   │
+│       ─────────────────────────────────────  (hairline footer rule)    │
+│       DONE                              ↑1.4k ↓38 ┊ cache 16.8k ┊ ctx +0.9%  │
 │    ●··· 0:13 ┊ ESC ┊ ↑177k ↓5.7k             (working indicator, inline)     │
 │    ── 7.6s ┊ ↑18.2k ↓846 ───────────────────  (turn divider)                │
 │                                                                              │
@@ -81,7 +82,7 @@ the terminal width.
 
 **Vertical rhythm.** Exactly **one blank line** (`--block-rhythm`, 1.5rem)
 separates every top-level block: user turn, assistant message, thinking block,
-plan, notice, each tool panel, the working indicator, and the turn divider. The
+plan, notice, each tool block, the working indicator, and the turn divider. The
 calm of the interface comes from **varying nothing else.** Never 0.5-line,
 never 2-line gaps; never a gap that depends on block type.
 
@@ -198,21 +199,17 @@ marker (see §7, §8).
 | Token | Value | Meaning |
 |---|---|---|
 | `--cell` | `1ch` | One character width — the grid unit. |
-| `--pane-indent` | `2ch` | Tool panels & composer indent from the pane edge. |
+| `--pane-indent` | `2ch` | Tool blocks & composer indent from the pane edge. |
 | `--marker-gap` | `2ch` | Assistant `›` marker → its text. |
-| `--panel-pad` | `4ch` | Tool-panel **body** left padding. |
-| `--panel-pad-y` | `0.5rem` | Compact vertical padding inside panels. |
+| body hang | `3ch` | Tool-block body/footer indent under the header (the spec's `2.5ch` snapped to the cell grid). |
 | `--block-rhythm` | `1.5rem` | The one blank line between top-level blocks. |
 | `--line` | `1.5em` | One line of vertical rhythm. |
 
-**Header/label rows** (panel headers, statusline) use `1.25ch`–`1.5ch`
-horizontal padding — tighter than the 4-cell body indent so the label column
-and the disclosure glyph sit close to the frame edge.
-
-**Golden rule:** inside a tool panel every row is exactly **one** of
-{ top border · header · separator · body · bottom border } and **all rows share
-one width**. Never merge two roles into one row; never let a body row be wider
-than the header.
+**Golden rule:** inside a tool block every row is exactly **one** of
+{ header · body · footer rule · footer } and **all rows share one width**. The
+column discipline is the design: left edges (disclosure · TOOL · body indent ·
+state label) and right edges (elapsed · op metas · diagnostics) form the two
+rails that make the transcript scan as a table without drawing one.
 
 ---
 
@@ -283,9 +280,10 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
 - **Flat by construction.** No z-layers in the transcript; `--radius: 0`
   everywhere (square corners are intrinsic to box-drawing). No decorative
   shadows, no faux-3D, no gradients, no textures, no images (except the hero).
-- **Depth is structural.** A bordered box-drawing panel sits "above" plain
-  unboxed transcript text, which recedes. The **1px frame in the `border` role
-  is the only elevation cue** in the transcript.
+- **Depth is structural.** Tool output is unboxed text like the rest of the
+  transcript; structure comes from the block grammar (header · hanging body ·
+  hairline footer) and its two alignment rails, not from a frame. The composer
+  keeps its frame — it is the only hard chrome on screen.
 - **The one permitted shadow** is a faint cast under a genuine overlay
   (`--overlay-shadow`), which is the real top layer. Overlays sit on a
   low-opacity black scrim; the pane is otherwise fully opaque. No blur, no glass.
@@ -331,7 +329,7 @@ hierarchy from weight/case/color/marker, **never a size jump**:
 | *Italic* | Slanted (JetBrains Mono italic). |
 | `Inline code` | Cyan interactive, monospace (already monospace — color is the cue). |
 | `[link](url)` | Link blue, **dotted** underline, 2px offset. |
-| Fenced ```` ``` ```` | `CodeBlock`: quiet **left rail**, muted `lang · file` caption, ink body, horizontal scroll. **Never boxed** (a box = tool panel). |
+| Fenced ```` ``` ```` | `CodeBlock`: quiet **left rail**, muted `lang · file` caption, ink body, horizontal scroll. **Never boxed**. |
 | List `-`/`*`/`+` | Muted `•` marker column, hanging indent. |
 | List `1.` | Muted right-aligned `1.` marker column. |
 | Blockquote `>` | Muted **left rail**, muted text. |
@@ -384,44 +382,62 @@ purely conversational turns). Compact elapsed + optional token telemetry with
 
 ---
 
-## 8 · Tool-panel grammar — the four families
+## 8 · Tool-block grammar — the frameless families
 
-The **tool panel** is Iris's primary structured-output primitive and — with the
-composer — the **only** thing that gets hard chrome: a single box-drawing frame
-(1px square border, `border` role) with a header row, an optional separator, and
-a body. There are **exactly four families.** Never invent a fifth; never render
-standalone `READ` / `GREP` / `LS` / `DIFF` panels.
+The **tool block** is Iris's primary structured-output primitive. It is
+**frameless**: no border, no background, no header/body separator — unboxed
+text, like the rest of the transcript. Every block is **header · body ·
+footer**, stacked, sharing one width at the 2-cell tool indent. The transcript
+families are **EXPLORE / SHELL / EDIT** (plus the docked APPROVAL review,
+§8.5). Never invent another; never render standalone `READ` / `GREP` / `LS`
+panels.
 
-### 8.1 Shared header grammar
+### 8.1 Shared block grammar
 ```
-▾  TOOL  meta                                        SYMBOL STATE   ELAPSED
+▾ TOOL  meta                                                        ELAPSED
+   <body — hangs 3 cells under the header, unmounts when collapsed>
+   ─────────────────────────────────────────────────────────────
+   STATE  [family extras]              ↑sent ↓recv ┊ cache <n> ┊ ctx <Δ%>
 ```
-- **Disclosure glyph** `▾`/`▸` (muted) — present when the panel is foldable.
-- **TOOL** — the family name, bold uppercase (`EXPLORE`/`SHELL`/`EDIT`/`APPROVAL`).
-- **meta** — muted context (`bash ┊ ~/iris-agent`, a path, `src`), truncates
-  with `…` before it can overflow.
-- **State** — a `StateSymbol` (glyph + label) from §5; `running` pulses.
-- **Elapsed** — right-aligned compact duration (`4.1s`, `0:13`); omitted for a
-  pending `preview`.
+**Header** — disclosure `▾`/`▸` (muted) · bold uppercase family label · muted
+meta (a path, scope, or the shell command), truncating with `…` · right edge
+carries **only the elapsed time** (omitted for a pending `preview`). No state
+symbol in the header.
 
-Header click (or `onToggle`) flips `expanded`. `ctrl+o` toggles the **latest**
-foldable panel. Collapsed = a capped preview + an elided-lines affordance
-(`… N lines hidden   ctrl+o to expand`).
+**Footer** — the block's last row, always visible, opened by a muted hairline
+rule from the body indent to the right rail. Left edge: the **state as label
+only** (`DONE` / `ERROR` / `PREVIEW` / `RUNNING` / `CANCELLED`), bold
+uppercase, colored by state — **no glyph**. After it, `┊`-joined family
+extras (EDIT counts + note, SHELL `EXIT <code>` + result meta). Right-bound:
+the optional token diagnostics cluster, all muted, honest (rendered only when
+measured). The `┊` law: only BETWEEN sibling fields, one space each side,
+never leading/trailing, never after the state label — fields are joined
+programmatically so a missing field can never leave a dangling `┊`.
+
+**Disclosure** — binary, whole-block. Expanded (`▾`, default) = header + body
++ footer; collapsed (`▸`) = header + footer, exactly two rows, body
+**unmounted** — no partial preview, no elision affordance. `ctrl+o` toggles
+the **latest** foldable block; state is per-block. Flood guard: a body past
+the physical-row budget **arrives collapsed** (the two rows still answer
+*what ran · on what · how long · outcome · cost*); running blocks stay
+expanded on a bounded live tail.
 
 ### 8.2 EXPLORE — read / grep / list / find
 The **single container** for every read-side op. Each op is **one row**:
 ```
-VERB   target [code][after]                                   meta(count)
+VERB  target [code][after]                                    meta(count)
 ```
 - `verb` (fixed 5-cell column, medium weight): `Read` · `Grep` · `List` · `Find`.
 - `target` ink path; `code` cyan (a grep pattern); `after` muted (` in src/…`).
-- `meta` muted right-aligned count (`142 lines`, `3 matches · 2 files`).
+- `meta` muted count, right-bound at the block's right rail (`142 lines`,
+  `3 matches · 2 files`).
 
-Never break a read op into its own panel — batch them here.
+Never break a read op into its own block — batch them here. The EXPLORE footer
+is state + diagnostics only (no family extras).
 
 ### 8.3 SHELL — command execution
-Body line types, in the recessive order below (the command is brightest, output
-recedes):
+Header meta is the command. Body line types, in the recessive order below (the
+command is brightest, output recedes):
 
 | `type` | Rendering |
 |---|---|
@@ -430,20 +446,20 @@ recedes):
 | `err` | **Danger** red (stderr). |
 | `note` | Muted aside. |
 
-A live command shows the inline **working indicator** in the body and **no
-result row yet**. A finished command ends with a hairline-ruled **exit row**:
-```
-◆ EXIT 0   ┊ 142 passed · 0 failed        (done — green ◆)
-■ EXIT 101 ┊ 1 error · compile failed      (error — red ■)
-```
-The exit row is symbol + `EXIT <code>` label + muted meta. Long output folds to
-a capped preview (§8.1).
+A live command streams a bounded tail in the body (with an honest
+`… N earlier lines hidden` marker) and has **no exit field yet**. A finished
+command reports its status in the **footer**: `EXIT <code>` (bold, uppercase,
+muted) then the honest result meta as a sibling field —
+`DONE  EXIT 0 ┊ 142 passed` / `ERROR  EXIT 101 ┊ cargo bench failed`. The
+footer state comes from the result (`exit 0` → done, else error); an unknown
+exit status is omitted, never guessed.
 
 ### 8.4 EDIT — mutation & diff preview
 **One canonical body:** the wrapped **block diff** (`DiffBlock`) for every file
-type (code, prose, config, markdown), plus an optional quiet `+add −del ┊ note`
-footer. Use `state="preview"` (`◇`, **no elapsed**) for a pending apply;
-`state="done"` (`◆`) once applied.
+type (code, prose, config, markdown). The footer carries the counts as ONE
+field (`+n` add-ink, `−n` del-ink, 1ch apart) plus a muted note (`new file`).
+Use `state="preview"` (**no elapsed**) for a pending apply; `state="done"`
+once applied.
 
 ### 8.5 APPROVAL — authorization review
 Compact. The **header carries the decision** (`▲ REVIEW` · `◆ APPROVED` · `■
@@ -690,8 +706,8 @@ starts the session with it.
 2. **One blank line** between every top-level block. No other gap value.
 3. **Shared measure.** Panels + composer share one width and a 2-cell indent;
    transcript text shares one column.
-4. **Panel rows** are each exactly one of {top·header·separator·body·bottom} and
-   all share one width; no row overflows the frame.
+4. **Block rows** are each exactly one of {header·body·footer rule·footer} and
+   all share one width; no row overflows the block's rails.
 5. **Four tool families only.** No standalone READ/GREP/LS/DIFF panels.
 6. **Chrome is for tools.** Conversation, thinking, plans, and notices are never
    boxed. Boxes are never used for prose.
@@ -711,7 +727,7 @@ starts the session with it.
 
 - ✗ A role card / bubble / avatar for user or assistant messages.
 - ✗ A colored left-border accent on active rows (use the `surface` fill).
-- ✗ Boxing a code block, a plan, or a notice (that reads as a tool panel).
+- ✗ Boxing a code block, a plan, a notice, or tool output — nothing in the transcript is boxed.
 - ✗ A braille spinner, a rainbow/percentage meter, or an animated progress bar.
 - ✗ A larger font, all-caps prose, or bold-for-emphasis to signal importance.
 - ✗ Emoji, gradients, rounded corners, drop shadows in the transcript, glass/blur.

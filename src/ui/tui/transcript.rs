@@ -13,7 +13,8 @@ use crate::ui::{TurnErrorKind, UiEvent};
 
 use super::pane;
 use super::panel::{
-    PanelHeaderSpec, PanelState, diff_counts, diff_footer_row, diff_table_rows, panel_state,
+    FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
+    edit_footer_extras, join_meta_fields, panel_state,
 };
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
 use super::text::ansi_spans;
@@ -33,36 +34,38 @@ const THINKING_LABEL: &str = "THINKING";
 /// available and is never rendered.
 const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
 
-/// Fixed-width label field for the header-right status cluster. Wide enough for
-/// the longest label across every panel family (` CANCELLED` = 10, ` APPROVED`
-/// = 9) with slack, so the glyph column never depends on the label text.
-const HEADER_LABEL_WIDTH: usize = 13;
-/// Fixed-width right-aligned elapsed field. Wide enough for the compact elapsed
-/// forms without shifting the header's right edge as the live timer changes
-/// length (e.g. `9.9s` -> `10s`); empty for panels with no duration.
-const HEADER_ELAPSED_WIDTH: usize = 8;
-
-/// The single header-right status cluster used by every panel family
-/// (EXPLORE / SHELL / EDIT / generic / APPROVAL). Geometry is fixed so the
-/// status glyph always lands in the same column regardless of panel type,
-/// label text, or elapsed length:
-///
-/// `symbol` + `label` left-aligned in a [`HEADER_LABEL_WIDTH`]-wide field +
-/// `elapsed` right-aligned in a [`HEADER_ELAPSED_WIDTH`]-wide field + a uniform
-/// 2-space right pad. Panels with no duration (APPROVAL) pass an empty
-/// `elapsed`, which still reserves the field so their glyph aligns too.
-fn header_right_cluster(
-    symbol: &str,
-    symbol_style: Style,
+/// The always-visible footer row of a frameless block: the state label as the
+/// row's actor (no `┊` between it and what follows — a 2-space layout gap
+/// separates), then `┊`-joined family extras, then the right-bound dim
+/// diagnostics cluster.
+fn block_footer_row(
     label: &str,
     label_style: Style,
-    elapsed: &str,
-) -> Vec<(String, Style)> {
-    vec![
-        (symbol.to_string(), symbol_style),
-        (format!("{label:<HEADER_LABEL_WIDTH$}"), label_style),
-        (format!("{elapsed:>HEADER_ELAPSED_WIDTH$}  "), dim_style()),
-    ]
+    extras: Vec<FooterField>,
+    diag: Option<&ToolDiag>,
+) -> TranscriptRow {
+    let (extra_spans, extra_plain) = join_meta_fields(extras);
+    let mut spans = vec![Span::styled(label.to_string(), label_style)];
+    let mut plain = label.to_string();
+    if !extra_plain.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.extend(extra_spans);
+        plain.push_str("  ");
+        plain.push_str(&extra_plain);
+    }
+    let right = diag.and_then(ToolDiag::render).unwrap_or_default();
+    if !right.is_empty() {
+        plain.push_str("  ");
+        plain.push_str(&right);
+    }
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Footer {
+            left: Line::from(spans),
+            right,
+        },
+        plain,
+        label_style,
+    )
 }
 
 /// One reasoning-trace row on the muted left rail: the dim `┊ ` rail prefix plus
@@ -248,6 +251,11 @@ pub(super) struct Transcript {
     /// each `commit_user`), maintained incrementally so the pager's sticky
     /// prompt header is an O(prompts-above-view) lookup, never a row scan.
     user_prompt_starts: Vec<usize>,
+    /// Per-tool-call token diagnostics (`↑sent ↓received ┊ cache ┊ ctx`),
+    /// keyed by call id and rendered right-bound in the block footer. Numbers
+    /// are honest: entries exist only when a source measured them, so most
+    /// footers carry no diagnostics today.
+    tool_diags: std::collections::HashMap<String, ToolDiag>,
 }
 
 impl Transcript {
@@ -479,31 +487,31 @@ impl Transcript {
 
     fn push_approval_panel(&mut self, line: Line<'static>, failed: bool) {
         self.mark_append_dirty();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
-        // Approval decisions have no duration; the shared cluster reserves an
-        // empty elapsed field so the glyph lands in the same column as every
-        // other panel family.
-        let base_style = if failed { err_style() } else { ok_style() };
+        self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
+        // Approval decisions have no duration: the header's elapsed field is
+        // empty, and the decision moves to the footer state label.
         self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
             expanded: true,
             title: "APPROVAL",
             meta: "decision".to_string(),
-            right: header_right_cluster(
-                if failed { "■" } else { "◆" },
-                base_style,
-                if failed { " DENIED" } else { " APPROVED" },
-                base_style.add_modifier(ratatui::style::Modifier::BOLD),
-                "",
-            ),
+            elapsed: String::new(),
         }));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         let text = line_text(&line);
-        self.rows.push(TranscriptRow::chrome_with_text(
-            ChromeRow::Body { line, bg: None },
-            text,
-            panel_style(),
-        ));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.rows.push(
+            TranscriptRow::chrome_with_text(
+                ChromeRow::Body { line, bg: None },
+                text,
+                panel_style(),
+            )
+            .with_fold(FoldVis::WhenExpanded),
+        );
+        let base_style = if failed { err_style() } else { ok_style() };
+        self.push_block_footer(
+            if failed { "DENIED" } else { "APPROVED" },
+            base_style.add_modifier(ratatui::style::Modifier::BOLD),
+            Vec::new(),
+            None,
+        );
     }
 
     /// Fallback (non-streamed) result render, used when no live exec cell was
@@ -570,12 +578,14 @@ impl Transcript {
         }
     }
 
-    /// Push a complete standard tool panel (Top/Header/Separator/body/Bottom)
-    /// to `self.rows`, with the body produced by the renderer registry under
-    /// failure isolation. When the body is fold-capped, the header is marked as
-    /// a collapsed preview so ctrl+o reveals the hidden lines. This is the
-    /// single dispatch path for SHELL/EDIT/generic panels; EXPLORE keeps its
-    /// grouped path.
+    /// Push a complete frameless tool block (header · hanging body · hairline
+    /// footer) to `self.rows`, with the body produced by the renderer registry
+    /// under failure isolation. Collapse is binary: the whole body folds
+    /// behind the header's disclosure and the footer stays. Blocks arrive
+    /// expanded, except that an over-budget body arrives collapsed (the flood
+    /// guard: header + footer still answer what ran · outcome · cost, and
+    /// ctrl+o reveals the full output). This is the single dispatch path for
+    /// SHELL/EDIT/generic blocks; EXPLORE keeps its grouped path.
     fn append_tool_panel(
         &mut self,
         renderer: &dyn tool_render::ToolRenderer,
@@ -585,15 +595,29 @@ impl Transcript {
         started: Option<Instant>,
         outcome: ToolOutcome<'_>,
     ) {
-        self.push_tool_header(renderer, call, state, duration, started);
         let ctx = self.render_ctx();
-        let body = tool_render::render_body(renderer, &ctx, call, &outcome);
-        let foldable = body.iter().any(|row| row.fold != FoldVis::Always);
-        self.rows.extend(body);
-        if foldable {
-            self.mark_panel_preview();
+        let mut body = tool_render::render_body(renderer, &ctx, call, &outcome);
+        for row in &mut body {
+            row.fold = FoldVis::WhenExpanded;
         }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        // Physical-row estimate at the current wrap width, so a single very
+        // long line counts as the rows it will actually occupy. The wrap width
+        // is one cell narrower than the true body content width, so the
+        // estimate errs toward folding — never toward flooding.
+        let width = self.wrap_width();
+        let physical: usize = body
+            .iter()
+            .map(|row| super::wrap::wrapped_row_estimate(&row.text, width))
+            .sum();
+        // Running blocks stay expanded (the live tail is already bounded);
+        // an explicit user collapse survives via the rebuild's reveal state.
+        let expanded = matches!(outcome, ToolOutcome::Running { .. })
+            || physical <= super::MAX_TOOL_OUTPUT_ROWS;
+        self.push_tool_header(renderer, call, state, duration, started, expanded);
+        self.rows.extend(body);
+        let extras = renderer.footer_extras(call, &outcome);
+        let diag = self.tool_diags.get(&call.id).cloned();
+        self.push_block_footer(state.label(), state.label_style(), extras, diag.as_ref());
     }
 
     /// Collect the rows of a standard tool panel without committing them, for
@@ -612,7 +636,7 @@ impl Transcript {
         })
     }
 
-    /// Build the standard panel header from the renderer's title/meta plus the
+    /// Build the standard block header from the renderer's title/meta plus the
     /// transcript-owned lifecycle state/duration.
     fn push_tool_header(
         &mut self,
@@ -621,33 +645,49 @@ impl Transcript {
         state: PanelState,
         duration: Option<std::time::Duration>,
         started: Option<Instant>,
+        expanded: bool,
     ) {
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
-        self.push_panel_header(PanelHeaderSpec {
-            title: renderer.title(),
-            meta: &meta,
-            plain_meta: &plain,
-            state,
-            duration,
-            started,
-        });
+        self.push_panel_header_with_expanded(
+            PanelHeaderSpec {
+                title: renderer.title(),
+                meta: &meta,
+                plain_meta: &plain,
+                state,
+                duration,
+                started,
+            },
+            expanded,
+        );
     }
 
-    /// Mark the most recent panel header as collapsed (preview) so foldable
-    /// output starts capped; toggling reveals the hidden lines.
-    fn mark_panel_preview(&mut self) {
-        let Some(index) = self
-            .rows
-            .iter()
-            .rposition(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Header { .. })))
-        else {
-            return;
-        };
-        self.mark_dirty_from(index);
-        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[index].chrome.as_mut() {
-            *expanded = false;
-        }
+    /// Push the always-visible block footer: the hairline rule, the footer row
+    /// (state label · `┊`-joined extras · right-bound diagnostics), and the
+    /// end-of-block marker. The footer never folds.
+    fn push_block_footer(
+        &mut self,
+        label: &str,
+        label_style: Style,
+        extras: Vec<FooterField>,
+        diag: Option<&ToolDiag>,
+    ) {
+        self.rows.push(TranscriptRow::chrome(ChromeRow::FooterRule));
+        self.rows
+            .push(block_footer_row(label, label_style, extras, diag));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::BlockEnd));
+    }
+
+    /// Record per-call token diagnostics for a tool call's footer. The values
+    /// are preformatted, runtime-measured strings; blocks rendered after this
+    /// call carry them right-bound in the footer. The seam for a future usage
+    /// source — nothing in the runtime measures per-call tokens yet.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "diag contract seam; no runtime source yet")
+    )]
+    pub(super) fn set_tool_diag(&mut self, call_id: &str, diag: ToolDiag) {
+        self.tool_diags.insert(call_id.to_string(), diag);
     }
 
     fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
@@ -670,24 +710,17 @@ impl Transcript {
                 .unwrap_or_else(|| "0.0s".to_string())
         };
         let plain = format!("{} {}", spec.state.plain_prefix(), spec.plain_meta);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Header {
                 expanded,
                 title: spec.title,
                 meta: spec.meta.to_string(),
-                right: header_right_cluster(
-                    spec.state.symbol(),
-                    spec.state.dot_style(),
-                    spec.state.label(),
-                    spec.state.label_style(),
-                    &elapsed,
-                ),
+                elapsed,
             },
             plain,
             tool_header_style(),
         ));
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
     }
 
     fn push_panel_header(&mut self, spec: PanelHeaderSpec<'_>) {
@@ -793,9 +826,10 @@ impl Transcript {
         });
     }
 
-    /// Push a complete EDIT panel whose body is the canonical block diff plus
-    /// the quiet `+added  −removed` footer (`EditOutput` design-system
-    /// component). Long diffs fold to a capped preview.
+    /// Push a complete EDIT block whose body is the canonical block diff
+    /// (`DiffBlock` rows verbatim) and whose footer carries the `+n −n` counts
+    /// and note as fields after the state label. The body folds whole behind
+    /// the header disclosure; the footer never folds.
     fn push_edit_panel(
         &mut self,
         call: &ToolCall,
@@ -808,41 +842,23 @@ impl Transcript {
         let renderer = tool_render::resolve(call);
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
-        self.push_panel_header(PanelHeaderSpec {
-            title: "EDIT",
-            meta: &meta,
-            plain_meta: &plain,
-            state,
-            duration,
-            started,
-        });
         let diff_rows = diff_table_rows(diff);
-        let cap = super::MAX_TOOL_OUTPUT_ROWS;
-        let foldable = diff_rows.len() > cap + 1;
-        if foldable {
-            let hidden = diff_rows.len() - cap;
-            for row in diff_rows.iter().take(cap).cloned() {
-                self.rows.push(row.with_fold(FoldVis::WhenCollapsed));
-            }
-            let left = format!("\u{2026} {hidden} more lines");
-            let hint = right_align_pair(&left, "ctrl+o to expand", self.wrap_width());
-            self.rows.push(
-                TranscriptRow::chrome_with_text(
-                    ChromeRow::BodyRight {
-                        left: Line::from(Span::styled(left.clone(), dim_style())),
-                        right: "ctrl+o to expand".to_string(),
-                        right_style: dim_style(),
-                        bg: None,
-                    },
-                    hint,
-                    dim_style(),
-                )
-                .with_fold(FoldVis::WhenCollapsed),
-            );
-            for row in diff_rows {
-                self.rows.push(row.with_fold(FoldVis::WhenExpanded));
-            }
-        } else if diff_rows.is_empty() && error.is_none() {
+        // Flood guard: an over-budget diff arrives collapsed; ctrl+o reveals
+        // the full DiffBlock body.
+        let expanded = diff_rows.len() <= super::MAX_TOOL_OUTPUT_ROWS;
+        self.push_panel_header_with_expanded(
+            PanelHeaderSpec {
+                title: "EDIT",
+                meta: &meta,
+                plain_meta: &plain,
+                state,
+                duration,
+                started,
+            },
+            expanded,
+        );
+        let body_from = self.rows.len();
+        if diff_rows.is_empty() && error.is_none() {
             if diff.trim().is_empty() {
                 // A preview/edit whose diff is genuinely empty (e.g. the edit's
                 // old_string did not match the file) would otherwise render an
@@ -887,23 +903,22 @@ impl Transcript {
                 err_style(),
             ));
         }
+        // The whole body (diff rows, placeholders, error line) folds as one
+        // unit behind the header disclosure.
+        for row in &mut self.rows[body_from..] {
+            if row.fold == FoldVis::Always {
+                row.fold = FoldVis::WhenExpanded;
+            }
+        }
         let (added, removed) = diff_counts(diff);
-        if added + removed > 0 {
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::default(),
-                    bg: None,
-                },
-                String::new(),
-                panel_style(),
-            ));
-            let note = diff.contains("--- /dev/null").then_some("new file");
-            self.rows.push(diff_footer_row(added, removed, note));
-        }
-        if foldable {
-            self.mark_panel_preview();
-        }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let note = diff.contains("--- /dev/null").then_some("new file");
+        let diag = self.tool_diags.get(&call.id).cloned();
+        self.push_block_footer(
+            state.label(),
+            state.label_style(),
+            edit_footer_extras(added, removed, note),
+            diag.as_ref(),
+        );
     }
 
     /// Render the final task diff (issue #264) as a bordered panel: a `DIFF`
@@ -923,6 +938,7 @@ impl Transcript {
             duration: None,
             started: None,
         });
+        let body_from = self.rows.len();
         for line in summary.iter().skip(1) {
             self.rows.push(TranscriptRow::chrome_with_text(
                 ChromeRow::Body {
@@ -934,11 +950,16 @@ impl Transcript {
             ));
         }
         self.rows.extend(diff_table_rows(diff));
-        let (added, removed) = diff_counts(diff);
-        if added + removed > 0 {
-            self.rows.push(diff_footer_row(added, removed, None));
+        for row in &mut self.rows[body_from..] {
+            row.fold = FoldVis::WhenExpanded;
         }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        let (added, removed) = diff_counts(diff);
+        self.push_block_footer(
+            PanelState::Done.label(),
+            PanelState::Done.label_style(),
+            edit_footer_extras(added, removed, None),
+            None,
+        );
     }
 
     /// Open (or reopen) the EDIT panel for a pending mutation: `◇ PREVIEW`,
@@ -1001,7 +1022,7 @@ impl Transcript {
             .position(|row| {
                 matches!(
                     row.chrome.as_ref(),
-                    Some(ChromeRow::Bottom | ChromeRow::RailEnd)
+                    Some(ChromeRow::BlockEnd | ChromeRow::RailEnd)
                 )
             })
             .map_or(start, |offset| start + offset + 1)
@@ -1011,10 +1032,11 @@ impl Transcript {
         self.panel_end_from(active.body_start)
     }
 
-    /// The reveal state to carry across an in-place panel rebuild, but only when
-    /// the old panel was foldable (had capped output). Returning `None` lets a
-    /// freshly capped panel keep its built-in preview default instead of
-    /// inheriting an unrelated `expanded` flag.
+    /// The fold state to carry across an in-place block rebuild. Only an
+    /// explicit COLLAPSE survives: a collapsed block stays collapsed through
+    /// lifecycle rewrites, while an expanded one lets the fresh block apply
+    /// its own arrival default (e.g. a finalized over-budget body arriving
+    /// collapsed as the flood guard).
     fn panel_reveal_state_in(&self, start: usize, end: usize) -> Option<bool> {
         if !self.rows[start..end]
             .iter()
@@ -1028,6 +1050,7 @@ impl Transcript {
                 Some(ChromeRow::Header { expanded, .. }) => Some(*expanded),
                 _ => None,
             })
+            .filter(|expanded| !expanded)
     }
 
     fn preserve_panel_expanded(replacement: &mut [TranscriptRow], expanded: bool) {
@@ -1274,17 +1297,10 @@ impl Transcript {
         }
     }
 
-    fn explore_header_right(state: PanelState, duration: Option<Duration>) -> Vec<(String, Style)> {
-        let elapsed = duration
+    fn explore_elapsed(duration: Option<Duration>) -> String {
+        duration
             .map(format_elapsed_compact)
-            .unwrap_or_else(|| "0.0s".to_string());
-        header_right_cluster(
-            state.symbol(),
-            state.dot_style(),
-            state.label(),
-            state.label_style(),
-            &elapsed,
-        )
+            .unwrap_or_else(|| "0.0s".to_string())
     }
 
     fn current_explore_header_row(&self) -> Option<usize> {
@@ -1347,6 +1363,9 @@ impl Transcript {
             })
     }
 
+    /// Rewrite the open EXPLORE block's header (elapsed) and footer (state
+    /// label) in place. The header right edge carries only the elapsed time;
+    /// the state lives in the footer.
     fn set_explore_header(
         &mut self,
         call: &ToolCall,
@@ -1365,8 +1384,20 @@ impl Transcript {
             expanded,
             title: "EXPLORE",
             meta,
-            right: Self::explore_header_right(state, duration),
+            elapsed: Self::explore_elapsed(duration),
         });
+        let diag = self.tool_diags.get(&call.id).cloned();
+        if let Some(offset) = self.rows[header..]
+            .iter()
+            .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Footer { .. })))
+        {
+            self.rows[header + offset] = block_footer_row(
+                state.label(),
+                state.label_style(),
+                Vec::new(),
+                diag.as_ref(),
+            );
+        }
     }
 
     fn update_explore_header_from_active(&mut self, call: &ToolCall) {
@@ -1392,13 +1423,22 @@ impl Transcript {
         }
     }
 
-    fn pop_trailing_explore_bottom(&mut self) {
-        if matches!(
+    /// Pop the open EXPLORE block's trailing footer (rule · footer · end
+    /// marker) so a new op row can be appended before the footer is re-pushed.
+    fn pop_trailing_explore_footer(&mut self) {
+        if !matches!(
             self.rows.last().and_then(|row| row.chrome.as_ref()),
-            Some(ChromeRow::Bottom)
+            Some(ChromeRow::BlockEnd)
         ) {
-            self.mark_dirty_from(self.rows.len().saturating_sub(1));
-            self.rows.pop();
+            return;
+        }
+        let rule = self.rows.len().saturating_sub(3);
+        if matches!(
+            self.rows.get(rule).and_then(|row| row.chrome.as_ref()),
+            Some(ChromeRow::FooterRule)
+        ) {
+            self.mark_dirty_from(rule);
+            self.rows.truncate(rule);
         }
     }
 
@@ -1413,21 +1453,29 @@ impl Transcript {
             },
         );
         if self.exploring_open {
-            self.pop_trailing_explore_bottom();
-            self.set_explore_header(call, panel_state(false, false), duration);
+            self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+            self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
                 title: "EXPLORE",
                 meta,
-                right: Self::explore_header_right(panel_state(false, false), duration),
+                elapsed: Self::explore_elapsed(duration),
             }));
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
-        self.rows.push(row);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.rows.push(row.with_fold(FoldVis::WhenExpanded));
+        let state = panel_state(false, false);
+        let diag = self.tool_diags.get(&call.id).cloned();
+        self.push_block_footer(
+            state.label(),
+            state.label_style(),
+            Vec::new(),
+            diag.as_ref(),
+        );
+        if self.exploring_open {
+            self.set_explore_header(call, state, duration);
+        }
         self.exploring_open = true;
     }
 
@@ -1453,21 +1501,25 @@ impl Transcript {
         let meta = self.explore_meta(call);
         let body = self.explore_row(call, ToolOutcome::Running { streamed: "" });
         if self.exploring_open {
-            self.pop_trailing_explore_bottom();
+            self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+            self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
                 title: "EXPLORE",
                 meta,
-                right: Self::explore_header_right(PanelState::Running, Some(Duration::ZERO)),
+                elapsed: Self::explore_elapsed(Some(Duration::ZERO)),
             }));
-            self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         }
         let row = self.rows.len();
-        self.rows.push(body);
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Bottom));
+        self.rows.push(body.with_fold(FoldVis::WhenExpanded));
+        self.push_block_footer(
+            PanelState::Running.label(),
+            PanelState::Running.label_style(),
+            Vec::new(),
+            None,
+        );
         self.exploring_open = true;
         self.active_explorations.push(ActiveExploration {
             call_id: call.id.clone(),
@@ -1485,11 +1537,14 @@ impl Transcript {
         let Some(slot) = self.rows.get(row) else {
             return false;
         };
-        if !matches!(slot.chrome.as_ref(), Some(ChromeRow::Body { .. })) {
+        if !matches!(
+            slot.chrome.as_ref(),
+            Some(ChromeRow::Body { .. } | ChromeRow::BodyRight { .. })
+        ) {
             return false;
         }
         self.mark_dirty_from(row);
-        self.rows[row] = replacement;
+        self.rows[row] = replacement.with_fold(FoldVis::WhenExpanded);
         true
     }
 
@@ -1815,11 +1870,12 @@ impl Transcript {
             self.rows.get(index).and_then(|row| row.chrome.as_ref()),
             Some(
                 ChromeRow::Header { .. }
-                    | ChromeRow::Separator
                     | ChromeRow::Body { .. }
                     | ChromeRow::BodyRight { .. }
                     | ChromeRow::BodyRule { .. }
-                    | ChromeRow::Bottom
+                    | ChromeRow::FooterRule
+                    | ChromeRow::Footer { .. }
+                    | ChromeRow::BlockEnd
             )
         )
     }
@@ -1828,13 +1884,13 @@ impl Transcript {
         let Some(last) = self.rows.iter().rposition(|row| !is_separator_row(row)) else {
             return false;
         };
-        if !matches!(self.rows[last].chrome.as_ref(), Some(ChromeRow::Bottom)) {
+        if !matches!(self.rows[last].chrome.as_ref(), Some(ChromeRow::BlockEnd)) {
             return false;
         }
         for row in self.rows[..=last].iter().rev() {
             match row.chrome.as_ref() {
                 Some(ChromeRow::Header { title, .. }) => return *title == "EXPLORE",
-                Some(ChromeRow::Top) => return false,
+                Some(ChromeRow::BlockStart) => return false,
                 _ => {}
             }
         }
@@ -2090,10 +2146,10 @@ impl Transcript {
             });
         for row in &self.rows[self.wrapped_cache.rows.len()..] {
             match row.chrome.as_ref() {
-                // A panel opens fully shown until its header sets the state;
-                // resetting at Top guards against a missing Bottom leaking a
-                // prior panel's collapsed state into the next one.
-                Some(ChromeRow::Top) => expanded = true,
+                // A block opens fully shown until its header sets the state;
+                // resetting at BlockStart guards against a missing BlockEnd
+                // leaking a prior block's collapsed state into the next one.
+                Some(ChromeRow::BlockStart) => expanded = true,
                 Some(
                     ChromeRow::Header { expanded: e, .. }
                     | ChromeRow::RailHeader { expanded: e, .. },
@@ -2113,7 +2169,7 @@ impl Transcript {
             }
             if matches!(
                 row.chrome.as_ref(),
-                Some(ChromeRow::Bottom | ChromeRow::RailEnd)
+                Some(ChromeRow::BlockEnd | ChromeRow::RailEnd)
             ) {
                 expanded = true;
             }

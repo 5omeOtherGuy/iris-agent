@@ -107,11 +107,11 @@ const MAX_STREAMING_MARKDOWN_BYTES: usize = 64 * 1024;
 /// The model still receives the full output; only the terminal preview is
 /// bounded, and the omitted logical-line count is reported.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
-const PANEL_BODY_LEFT_PADDING: usize = 4;
-const PANEL_BODY_RIGHT_PADDING: usize = 2;
-const PANEL_BODY_BORDER_WIDTH: usize = 2;
-const PANEL_BODY_CHROME_WIDTH: usize =
-    PANEL_BODY_BORDER_WIDTH + PANEL_BODY_LEFT_PADDING + PANEL_BODY_RIGHT_PADDING;
+/// Frameless body hang: the block body indents under the header so it aligns
+/// under the TOOL label, past the disclosure glyph (the spec's `2.5ch` hang
+/// snapped to the terminal cell grid).
+const PANEL_BODY_INDENT: usize = 3;
+const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_INDENT;
 
 // Color roles live in `crate::ui::palette` (the single source of truth). They
 // are imported here under their long-standing names so the whole `tui` module
@@ -484,7 +484,7 @@ impl Drop for TuiUi {
 
 #[cfg(test)]
 mod tests {
-    use super::panel::{inset_rule_line, panel_body_line, panel_header_line, panel_rule_line};
+    use super::panel::{footer_rule_line, inset_rule_line, panel_body_line, panel_header_line};
     use super::*;
     use crate::nexus::{ApprovalDecision, ReviewContext, ToolCall};
     use crate::ui::UiEvent;
@@ -1283,10 +1283,11 @@ mod tests {
     }
 
     #[test]
-    fn single_over_budget_line_stays_within_row_cap() {
-        // A single very long line must not blow past the physical-row cap: it is
-        // clamped (with an ellipsis) to its slice budget instead of wrapping to
-        // dozens of rows. Checked at narrow and normal widths.
+    fn single_over_budget_line_arrives_collapsed_and_reveals_whole() {
+        // A single very long line would wrap to dozens of physical rows; the
+        // flood guard folds the block on arrival (header + footer only) and
+        // ctrl+o reveals the full, unelided output. Checked at narrow and
+        // normal widths.
         for width in [20u16, 80u16] {
             let mut screen = Screen::new();
             let _ = screen.wrapped_lines(width);
@@ -1296,16 +1297,17 @@ mod tests {
                 exit_code: None,
                 duration: None,
             });
+            assert!(screen.latest_panel_collapsed(), "width {width}");
             let texts: Vec<String> = screen.wrapped_lines(width).iter().map(line_text).collect();
             let output_rows = texts.iter().filter(|t| t.contains('x')).count();
-            assert!(
-                (1..=MAX_TOOL_OUTPUT_ROWS).contains(&output_rows),
-                "width {width}: {output_rows} rows out of 1..={MAX_TOOL_OUTPUT_ROWS}: {texts:?}"
+            assert_eq!(
+                output_rows, 0,
+                "width {width}: collapsed body must be unmounted: {texts:?}"
             );
-            assert!(
-                !texts.iter().any(|t| t.contains("+0 lines")),
-                "width {width}: spurious +0 marker: {texts:?}"
-            );
+            assert!(screen.toggle_latest_panel(), "width {width}");
+            let texts: Vec<String> = screen.wrapped_lines(width).iter().map(line_text).collect();
+            let revealed: usize = texts.iter().map(|t| t.matches('x').count()).sum();
+            assert_eq!(revealed, 2000, "width {width}: full output on reveal");
         }
     }
 
@@ -1358,13 +1360,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_caps_by_physical_rows_even_under_logical_line_limit() {
+    fn over_budget_output_arrives_collapsed_by_physical_rows() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80); // prime last_width
-        // 8 logical lines, each ~400 columns => ~6 wrapped rows each => ~48
-        // physical rows if uncapped. Each line alone exceeds the head/tail
-        // budgets, but the head always keeps at least the first line, so one
-        // line survives and the rest (7) are reported as omitted.
+        // 8 logical lines, each ~400 columns => ~6 wrapped rows each => far
+        // past the physical-row budget even though the logical count is at the
+        // limit: the flood guard folds the block on arrival.
         let long = "x".repeat(400);
         let content = std::iter::repeat_n(long, 8).collect::<Vec<_>>().join("\n");
         screen.apply(UiEvent::ToolResult {
@@ -1373,33 +1374,19 @@ mod tests {
             exit_code: None,
             duration: None,
         });
+        assert!(screen.latest_panel_collapsed());
         let lines = screen.wrapped_lines(80);
         let output_rows = lines.iter().filter(|l| line_text(l).contains('x')).count();
-        assert!(
-            output_rows <= MAX_TOOL_OUTPUT_ROWS,
-            "output not row-capped: {output_rows} physical rows"
-        );
-        // The visibility guarantee: even when the first line alone exceeds the
-        // head budget, it is still shown (never collapsed to only a marker).
-        assert!(
-            output_rows >= 1,
-            "first line must always survive: {lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| line_text(l).contains("7 lines hidden")),
-            "expected an accurate '… +7 lines' omitted-line indicator: {lines:?}",
-        );
+        assert_eq!(output_rows, 0, "collapsed body must be unmounted");
     }
 
     #[test]
-    fn tool_output_keeps_head_and_tail_with_middle_elided() {
+    fn over_budget_output_reveals_whole_without_elision() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80); // prime last_width
-        // 20 short lines exceed the compact row budget, so a head slice and a
-        // tail slice survive with a `… +N lines` marker between (Codex parity:
-        // the final/summary line stays visible).
+        // 20 short lines exceed the compact row budget: the block arrives
+        // collapsed to exactly header + footer, and ctrl+o reveals EVERY line
+        // — binary disclosure, no partial preview, no elision row.
         let content = (0..20)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1410,21 +1397,24 @@ mod tests {
             exit_code: None,
             duration: None,
         });
+        assert!(screen.latest_panel_collapsed());
         let texts: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
-        // First output line shown under the head gutter; last line shown in tail.
-        assert!(texts.iter().any(|t| t.contains("line 0")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("line 19")), "{texts:?}");
-        // The middle is elided with an accurate count, and the block stays
-        // within the physical-row budget (+ marker).
         assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("…") && t.contains("lines hidden")),
-            "{texts:?}"
+            !texts.iter().any(|t| t.contains("line 0")),
+            "collapsed body must be unmounted: {texts:?}"
         );
-        // Truncated: far fewer than the 20 input lines survive (the cap is 8).
-        let shown = texts.iter().filter(|t| t.contains("line ")).count();
-        assert!(shown <= MAX_TOOL_OUTPUT_ROWS, "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("lines hidden")),
+            "no elision affordance in the frameless design: {texts:?}"
+        );
+        assert!(screen.toggle_latest_panel());
+        let texts: Vec<String> = screen.wrapped_lines(80).iter().map(line_text).collect();
+        for i in 0..20 {
+            assert!(
+                texts.iter().any(|t| t.contains(&format!("line {i}"))),
+                "revealed body must carry every line: {texts:?}"
+            );
+        }
     }
 
     #[test]
@@ -1565,8 +1555,11 @@ mod tests {
         assert!(rendered.contains("APPROVAL"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(rendered.contains("┊ approved this time"), "{rendered}");
-        assert!(rendered.contains("┌"), "{rendered}");
-        assert!(rendered.contains("└"), "{rendered}");
+        // The decision is the footer state label; no frame anywhere.
+        assert!(rendered.contains("APPROVED"), "{rendered}");
+        for frame in ['┌', '┐', '└', '┘', '│'] {
+            assert!(!rendered.contains(frame), "{rendered}");
+        }
 
         let lines = screen.wrapped_lines(80);
         let line = line_matching(&lines, |line| {
@@ -1709,7 +1702,9 @@ mod tests {
     }
 
     #[test]
-    fn diff_preview_appends_added_removed_footer_tinted_to_diff_inks() {
+    fn diff_preview_footer_carries_counts_after_state_label() {
+        // EDIT's `+1 −1` counts join the block footer as ONE field after the
+        // state label, tinted to the diff inks (unicode minus, never ASCII).
         let mut screen = Screen::new();
         screen.apply(UiEvent::DiffPreview {
             call: call("edit"),
@@ -1719,22 +1714,27 @@ mod tests {
             .transcript
             .rows
             .iter()
-            .find(|row| row.text.contains("+1") && row.text.contains("\u{2212}1"))
-            .expect("added/removed footer row");
-        let Some(ChromeRow::Body { line, .. }) = footer.chrome.as_ref() else {
-            panic!("footer is a body row");
+            .find(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Footer { .. })))
+            .expect("block footer row");
+        assert!(
+            footer.text.starts_with("PREVIEW  +1 \u{2212}1"),
+            "state label then counts field: {}",
+            footer.text
+        );
+        let Some(ChromeRow::Footer { left, .. }) = footer.chrome.as_ref() else {
+            unreachable!();
         };
         assert!(
-            line.spans
+            left.spans
                 .iter()
                 .any(|s| s.content.contains("+1") && s.style.fg == ok_style().fg),
-            "additions tinted to the add ink: {line:?}"
+            "additions tinted to the add ink: {left:?}"
         );
         assert!(
-            line.spans
+            left.spans
                 .iter()
                 .any(|s| s.content.contains("\u{2212}1") && s.style.fg == err_style().fg),
-            "removals tinted to the del ink: {line:?}"
+            "removals tinted to the del ink: {left:?}"
         );
     }
 
@@ -2865,7 +2865,7 @@ mod tests {
         screen.apply(UiEvent::ToolStarted(call.clone()));
         let running = rendered_text(&mut screen, 100, 12);
         assert!(running.contains("EDIT"), "{running}");
-        assert!(running.contains("● RUNNING"), "{running}");
+        assert!(running.contains("RUNNING"), "{running}");
         assert!(running.contains("running…"), "{running}");
 
         screen.apply(UiEvent::ToolResult {
@@ -2875,7 +2875,7 @@ mod tests {
             duration: Some(Duration::from_millis(3)),
         });
         let done = rendered_text(&mut screen, 100, 12);
-        assert!(done.contains("◆ DONE"), "{done}");
+        assert!(done.contains("DONE"), "{done}");
         assert!(
             done.contains("Successfully replaced 1 occurrence."),
             "{done}"
@@ -2884,7 +2884,9 @@ mod tests {
     }
 
     #[test]
-    fn completed_panel_headers_use_success_dot_not_running_accent() {
+    fn shell_header_right_edge_carries_only_the_elapsed_time() {
+        // The frameless header has no state cluster: the right edge is the
+        // elapsed time alone, and the state lives in the footer.
         let mut transcript = Transcript::default();
         transcript.push_shell_header(
             PanelState::Done,
@@ -2892,20 +2894,25 @@ mod tests {
             None,
             "echo hi",
         );
-        let dot_style = transcript
+        let elapsed = transcript
             .rows
             .iter()
             .find_map(|row| match row.chrome.as_ref() {
                 Some(ChromeRow::Header {
                     title: "SHELL",
-                    right,
+                    elapsed,
                     ..
-                }) => Some(right[0].1),
+                }) => Some(elapsed.clone()),
                 _ => None,
             })
-            .expect("shell header dot style");
-
-        assert_eq!(dot_style.fg, ok_style().fg);
+            .expect("shell header elapsed");
+        assert_eq!(elapsed, "1.0s");
+        let rendered = transcript.rows[1].render(80);
+        let text = line_text(&rendered[0]);
+        assert!(text.trim_end().ends_with("1.0s"), "{text}");
+        for state_glyph in ["◆", "■", "◇", "DONE"] {
+            assert!(!text.contains(state_glyph), "{text}");
+        }
     }
 
     #[test]
@@ -2923,7 +2930,7 @@ mod tests {
         });
 
         let rendered = rendered_text(&mut screen, 100, 16);
-        assert!(rendered.contains("◆ DONE"), "{rendered}");
+        assert!(rendered.contains("DONE"), "{rendered}");
         assert!(
             rendered.contains("Successfully replaced 1 occurrence."),
             "{rendered}"
@@ -2952,7 +2959,7 @@ mod tests {
 
         let rendered = rendered_text(&mut screen, 100, 18);
         assert!(rendered.contains("SHELL"), "{rendered}");
-        assert!(rendered.contains("◆ DONE"), "{rendered}");
+        assert!(rendered.contains("DONE"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(rendered.contains("hi"), "{rendered}");
         assert!(rendered.contains("┊ interleaved note"), "{rendered}");
@@ -2986,13 +2993,13 @@ mod tests {
             .iter()
             .position(|row| row.text.contains("error: not found"))
             .expect("error body");
-        let bottom = rows
+        let end = rows
             .iter()
-            .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)))
-            .expect("bottom border");
+            .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::BlockEnd)))
+            .expect("block end");
         assert!(
-            header < error && error < bottom,
-            "error must stay inside panel"
+            header < error && error < end,
+            "error must stay inside the block"
         );
     }
 
@@ -3041,10 +3048,10 @@ mod tests {
         let rows = &screen.transcript.rows;
         assert_eq!(
             rows.iter()
-                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Top)))
+                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::BlockStart)))
                 .count(),
             1,
-            "started explorations should share one panel"
+            "started explorations should share one block"
         );
         assert_eq!(
             rows.iter()
@@ -3061,35 +3068,36 @@ mod tests {
         );
         assert_eq!(
             rows.iter()
-                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Separator)))
+                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::FooterRule)))
                 .count(),
             1,
-            "started explorations should share one separator"
+            "started explorations should share one footer rule"
         );
         assert_eq!(
             rows.iter()
-                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Bottom)))
+                .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::BlockEnd)))
                 .count(),
             1,
-            "started explorations should share one bottom border"
+            "started explorations should share one end marker"
         );
+        // The aggregate state lives in the footer, label only.
         let state = rows
             .iter()
             .find_map(|row| match row.chrome.as_ref() {
-                Some(ChromeRow::Header { title, right, .. }) if *title == "EXPLORE" => Some(
-                    right
-                        .iter()
-                        .map(|(text, _)| text.as_str())
-                        .collect::<String>(),
-                ),
+                Some(ChromeRow::Footer { .. }) => Some(row.text.clone()),
                 _ => None,
             })
-            .expect("explore header state");
+            .expect("explore footer state");
         assert!(state.contains("ERROR"), "{state:?}");
         assert!(!state.contains("RUNNING"), "{state:?}");
         let body_texts: Vec<&str> = rows
             .iter()
-            .filter(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Body { .. })))
+            .filter(|row| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Body { .. } | ChromeRow::BodyRight { .. })
+                )
+            })
             .map(|row| row.text.as_str())
             .collect();
         assert_eq!(body_texts.len(), 2, "{body_texts:?}");
@@ -3122,51 +3130,165 @@ mod tests {
             duration: None,
         });
         let rendered = rendered_text(&mut screen, 100, 22);
-        // Verb column + target, with a right-aligned real count per op.
+        // Verb column + target, with a right-bound real count per op.
         assert!(
-            rendered.contains("Read   src/context/engine.rs"),
+            rendered.contains("Read  src/context/engine.rs"),
             "{rendered}"
         );
         assert!(rendered.contains("3 lines"), "{rendered}");
         assert!(
-            rendered.contains("Grep   \"fn emit\" in src/context"),
+            rendered.contains("Grep  \"fn emit\" in src/context"),
             "{rendered}"
-        );
-        assert!(
-            rendered.contains("│    Read   src/context/engine.rs"),
-            "EXPLORE body should use the framed-output inset: {rendered}"
-        );
-        assert!(
-            rendered.contains("│    Grep   \"fn emit\" in src/context"),
-            "EXPLORE body should use the framed-output inset: {rendered}"
         );
         assert!(rendered.contains("3 matches · 2 files"), "{rendered}");
 
+        // The right rail: op metas and the header's elapsed share one right
+        // edge; the ops hang at the body indent under the TOOL label.
         let lines = screen.wrapped_lines(100);
         let header_line = line_text(line_matching(&lines, |line| {
-            let text = line_text(line);
-            text.contains("EXPLORE") && text.contains("DONE")
+            line_text(line).contains("EXPLORE")
         }));
-        let done_col = header_line
-            .find("DONE")
-            .map(|idx| display_width(&header_line[..idx]))
-            .expect("DONE header label");
         let read_line = line_text(line_matching(&lines, |line| {
-            line_text(line).contains("Read   src/context/engine.rs")
+            line_text(line).contains("Read  src/context/engine.rs")
         }));
         let grep_line = line_text(line_matching(&lines, |line| {
-            line_text(line).contains("Grep   \"fn emit\" in src/context")
+            line_text(line).contains("Grep  \"fn emit\" in src/context")
         }));
-        let lines_col = read_line
-            .find("lines")
-            .map(|idx| display_width(&read_line[..idx]))
-            .expect("lines unit");
-        let files_col = grep_line
-            .find("files")
-            .map(|idx| display_width(&grep_line[..idx]))
-            .expect("files unit");
-        assert_eq!(lines_col, done_col, "{read_line:?} vs {header_line:?}");
-        assert_eq!(files_col, done_col, "{grep_line:?} vs {header_line:?}");
+        assert!(read_line.starts_with("     Read"), "{read_line:?}");
+        assert!(grep_line.starts_with("     Grep"), "{grep_line:?}");
+        let rail = display_width(header_line.trim_end());
+        assert_eq!(display_width(read_line.trim_end()), rail, "{read_line:?}");
+        assert_eq!(display_width(grep_line.trim_end()), rail, "{grep_line:?}");
+    }
+
+    #[test]
+    fn shell_block_reproduces_the_frameless_mockup() {
+        // DESIGN spec §2, SHELL — success: header (▾ SHELL  <command> … elapsed),
+        // hanging body, hairline rule, footer `DONE  EXIT 0 ┊ <meta>` with the
+        // right-bound diagnostics cluster. Exact rows, exact rails.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        let call = call_args("bash", json!({ "command": "cargo test -p context" }));
+        screen.transcript.set_tool_diag(
+            &call.id,
+            super::panel::ToolDiag {
+                sent: Some("612".to_string()),
+                received: Some("1.0k".to_string()),
+                cache: Some("17.9k".to_string()),
+                ctx: Some("+0.5%".to_string()),
+            },
+        );
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "   Compiling context v0.4.1\ntest result: ok. 142 passed; 0 failed"
+                .to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(3200)),
+        });
+        let texts: Vec<String> = screen
+            .wrapped_lines(90)
+            .iter()
+            .map(line_text)
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        // Right rail: header elapsed and footer diagnostics end at one column.
+        let rail = 88; // width 90 − 2ch outer padding
+        let header = &texts[0];
+        assert!(
+            header.starts_with("  ▾ SHELL  cargo test -p context"),
+            "{header:?}"
+        );
+        assert!(header.trim_end().ends_with("3.2s"), "{header:?}");
+        assert_eq!(display_width(header.trim_end()), rail, "{header:?}");
+        // Body hangs at 2ch + 3ch, under the TOOL label.
+        assert_eq!(texts[1], "     $ cargo test -p context");
+        assert_eq!(texts[2], "        Compiling context v0.4.1");
+        assert_eq!(texts[3], "     test result: ok. 142 passed; 0 failed");
+        // Hairline rule from the body indent to the block's right edge.
+        assert!(texts[4].starts_with("     ─"), "{:?}", texts[4]);
+        assert_eq!(display_width(&texts[4]), rail, "{:?}", texts[4]);
+        // Footer: state label (no glyph), EXIT + meta fields, diagnostics
+        // right-bound at the shared rail.
+        let footer = &texts[5];
+        assert!(
+            footer.starts_with("     DONE  EXIT 0 ┊ 142 passed · 0 failed"),
+            "{footer:?}"
+        );
+        assert!(
+            footer
+                .trim_end()
+                .ends_with("↑612 ↓1.0k ┊ cache 17.9k ┊ ctx +0.5%"),
+            "{footer:?}"
+        );
+        assert_eq!(display_width(footer.trim_end()), rail, "{footer:?}");
+        assert_eq!(texts.len(), 6, "{texts:?}");
+    }
+
+    #[test]
+    fn narrow_footer_keeps_state_label_and_drops_diagnostics() {
+        // The state label and extras always win the footer row; the optional
+        // diagnostics cluster is dropped when it does not fit.
+        let footer = ChromeRow::Footer {
+            left: Line::from(Span::styled("DONE  EXIT 0", ok_style())),
+            right: "↑612 ↓1.0k ┊ cache 17.9k ┊ ctx +0.5%".to_string(),
+        };
+        let text = line_text(&footer.render(30));
+        assert!(text.contains("DONE  EXIT 0"), "{text:?}");
+        assert!(!text.contains("cache"), "{text:?}");
+        let wide = line_text(&footer.render(90));
+        assert!(wide.contains("DONE  EXIT 0"), "{wide:?}");
+        assert!(wide.trim_end().ends_with("ctx +0.5%"), "{wide:?}");
+    }
+
+    #[test]
+    fn explore_footer_carries_measured_diagnostics() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        let call = call_args("read", json!({ "path": "src/context/engine.rs" }));
+        screen.transcript.set_tool_diag(
+            &call.id,
+            super::panel::ToolDiag {
+                sent: Some("1.4k".to_string()),
+                received: Some("38".to_string()),
+                cache: Some("16.8k".to_string()),
+                ctx: Some("+0.9%".to_string()),
+            },
+        );
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "line\nline\nline".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(10)),
+        });
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("DONE")
+        }));
+        assert!(
+            footer
+                .trim_end()
+                .ends_with("↑1.4k ↓38 ┊ cache 16.8k ┊ ctx +0.9%"),
+            "{footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_omits_diagnostics_cluster_when_no_diag_was_measured() {
+        // Numbers are honest: without a measured diag entry the footer right
+        // edge is empty — no fabricated tokens, no dangling `┊`.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(100)),
+        });
+        let lines = screen.wrapped_lines(80);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+        assert!(!footer.contains('↑'), "{footer}");
+        assert!(footer.trim_end().ends_with("EXIT 0"), "{footer}");
     }
 
     #[test]
@@ -3180,8 +3302,13 @@ mod tests {
             duration: Some(Duration::from_millis(4100)),
         });
         let rendered = rendered_text(&mut screen, 90, 14);
-        assert!(rendered.contains("◆ EXIT 0"), "{rendered}");
-        assert!(rendered.contains("┊ 142 passed · 0 failed"), "{rendered}");
+        // The exit status is a footer field after the state label: no glyph,
+        // `┊` only between sibling fields.
+        assert!(
+            rendered.contains("DONE  EXIT 0 ┊ 142 passed · 0 failed"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("◆"), "{rendered}");
     }
 
     #[test]
@@ -3207,11 +3334,11 @@ mod tests {
             exit_code: None,
             duration: Some(Duration::from_millis(400)),
         });
-        // Applied: the same single EDIT panel, ◆ DONE, diff + footer.
+        // Applied: the same single EDIT block, DONE, diff + footer counts.
         let done = rendered_text(&mut screen, 100, 24);
-        assert!(done.contains("◆ DONE"), "{done}");
+        assert!(done.contains("DONE"), "{done}");
         assert!(done.contains("self.budget.justify(ctx)?;"), "{done}");
-        assert!(done.contains("+1  −1"), "{done}");
+        assert!(done.contains("DONE  +1 −1"), "{done}");
         assert_eq!(done.matches("EDIT").count(), 1, "one EDIT panel: {done}");
         assert!(!done.contains("PREVIEW"), "{done}");
         assert!(
@@ -3220,25 +3347,11 @@ mod tests {
         );
     }
 
-    /// Display-width column of the first panel-status glyph in a rendered
-    /// header line (the shared cluster's leading symbol: one of ◆/■/◇/●/▲).
-    fn status_glyph_col(line: &Line<'static>) -> usize {
-        let text = line_text(line);
-        let glyphs = ['◆', '■', '◇', '●', '▲'];
-        let byte_idx = text
-            .char_indices()
-            .find(|(_, c)| glyphs.contains(c))
-            .map(|(idx, _)| idx)
-            .expect("status glyph in header");
-        display_width(&text[..byte_idx])
-    }
-
     #[test]
-    fn panel_header_status_glyph_shares_one_column_across_families() {
-        // BUG 1 regression: EXPLORE, SHELL, EDIT, and APPROVAL headers each
-        // built their own header-right cluster, so the status glyph wandered by
-        // panel type and label width. The unified builder must land the glyph
-        // in one column regardless of family.
+    fn footer_state_label_shares_one_column_across_families() {
+        // The frameless footer is the state's only home: EXPLORE, SHELL, EDIT,
+        // and APPROVAL footers all start the label at the shared body indent,
+        // with no state glyph anywhere in the block.
         let mut screen = Screen::new();
         // EXPLORE (grouped explore path).
         screen.apply(UiEvent::ToolResult {
@@ -3266,16 +3379,26 @@ mod tests {
         )));
 
         let lines = screen.wrapped_lines(99);
-        let col = |needle: &str| {
-            status_glyph_col(line_matching(&lines, |l| line_text(l).contains(needle)))
-        };
-        let explore = col("EXPLORE");
-        let shell = col("SHELL");
-        let edit = col("EDIT");
-        let approval = col("APPROVAL");
-        assert_eq!(explore, shell, "EXPLORE vs SHELL glyph column");
-        assert_eq!(explore, edit, "EXPLORE vs EDIT glyph column");
-        assert_eq!(explore, approval, "EXPLORE vs APPROVAL glyph column");
+        let labels = ["DONE", "PREVIEW", "APPROVED"];
+        let mut columns = Vec::new();
+        for line in lines.iter() {
+            let text = line_text(line);
+            for glyph in ['◆', '■', '◇', '▲'] {
+                assert!(!text.contains(glyph), "no state glyphs anywhere: {text:?}");
+            }
+            if let Some(label) = labels
+                .iter()
+                .find(|label| text.trim_start().starts_with(**label))
+            {
+                let idx = text.find(label).expect("label index");
+                columns.push(display_width(&text[..idx]));
+            }
+        }
+        assert!(columns.len() >= 4, "expected a footer per family");
+        assert!(
+            columns.iter().all(|col| *col == columns[0]),
+            "footer state labels share one column: {columns:?}"
+        );
     }
 
     #[test]
@@ -3433,7 +3556,7 @@ mod tests {
         assert_eq!(explore_headers, 1);
         assert!(matches!(
             rows.last().and_then(|row| row.chrome.as_ref()),
-            Some(ChromeRow::Bottom)
+            Some(ChromeRow::BlockEnd)
         ));
     }
 
@@ -3471,8 +3594,7 @@ mod tests {
         let rendered = rendered_text(&mut screen, 110, 24);
 
         assert!(rendered.contains("SHELL"));
-        assert!(rendered.contains("bash"));
-        assert!(rendered.contains("◆ DONE"));
+        assert!(rendered.contains("DONE"));
         assert!(rendered.contains("$ pnpm test --filter user.auth"));
         assert!(rendered.contains("PASS    test/auth.service.test.ts"));
         assert!(rendered.contains("EDIT"));
@@ -3568,7 +3690,7 @@ mod tests {
         let call = call_args("bash", json!({ "command": "seq" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
 
-        // Stream enough lines that the live tail caps and becomes foldable.
+        // Stream enough lines that the live tail drops earlier output.
         let chunk = std::iter::once("FIRSTLINE".to_string())
             .chain((2..=20).map(|n| format!("line {n}")))
             .collect::<Vec<_>>()
@@ -3579,27 +3701,30 @@ mod tests {
             chunk,
         });
 
-        // Default preview: collapsed marker, expand hint, earliest line hidden.
-        let preview = transcript_text(&mut screen, 80);
-        assert!(preview.contains("▸"), "{preview}");
-        assert!(preview.contains("ctrl+o to expand"), "{preview}");
-        assert!(!preview.contains("FIRSTLINE"), "{preview}");
+        // The live cell shows the bounded tail with an honest earlier-lines
+        // marker; the earliest line is out of the tail. The running block
+        // stays expanded.
+        let live = transcript_text(&mut screen, 80);
+        assert!(live.contains("▾"), "{live}");
+        assert!(live.contains("earlier lines hidden"), "{live}");
+        assert!(!live.contains("FIRSTLINE"), "{live}");
 
-        // Reveal; expansion must survive a later delta and the final result.
+        // Collapse by hand; the fold must survive a later delta.
         assert!(screen.toggle_latest_panel());
-        let revealed = transcript_text(&mut screen, 80);
-        assert!(revealed.contains("▾"), "{revealed}");
-        assert!(revealed.contains("ctrl+o to collapse"), "{revealed}");
-        assert!(revealed.contains("FIRSTLINE"), "{revealed}");
+        let collapsed = transcript_text(&mut screen, 80);
+        assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(!collapsed.contains("$ seq"), "{collapsed}");
 
         screen.apply(UiEvent::ToolOutputDelta {
             call_id: call.id.clone(),
             chunk: "line 21\n".to_string(),
         });
         let after_delta = transcript_text(&mut screen, 80);
-        assert!(after_delta.contains("▾"), "{after_delta}");
-        assert!(after_delta.contains("FIRSTLINE"), "{after_delta}");
+        assert!(after_delta.contains("▸"), "{after_delta}");
 
+        // The finalized result replaces the live cell; the explicit collapse
+        // is preserved, and expanding reveals the FULL output (the live tail's
+        // dropped head is back).
         screen.apply(UiEvent::ToolResult {
             call,
             content: std::iter::once("FIRSTLINE".to_string())
@@ -3610,19 +3735,18 @@ mod tests {
             duration: None,
         });
         let after_result = transcript_text(&mut screen, 80);
-        assert!(after_result.contains("▾"), "{after_result}");
-        assert!(
-            after_result.contains("ctrl+o to collapse"),
-            "{after_result}"
-        );
-        assert!(after_result.contains("FIRSTLINE"), "{after_result}");
+        assert!(after_result.contains("▸"), "{after_result}");
+        assert!(!after_result.contains("FIRSTLINE"), "{after_result}");
+        assert!(screen.toggle_latest_panel());
+        let revealed = transcript_text(&mut screen, 80);
+        assert!(revealed.contains("FIRSTLINE"), "{revealed}");
+        assert!(revealed.contains("line 21"), "{revealed}");
     }
 
     #[test]
-    fn ctrl_o_reveals_and_recollapses_capped_tool_output() {
+    fn ctrl_o_reveals_and_recollapses_over_budget_tool_output() {
         let mut screen = Screen::new();
-        let _ = screen.wrapped_lines(80); // prime last_width so hints fit the body
-        // HEAD/TAIL capping hides the middle, so the unique marker sits there.
+        let _ = screen.wrapped_lines(80); // prime last_width
         let content = (1..=20)
             .map(|n| {
                 if n == 10 {
@@ -3640,26 +3764,23 @@ mod tests {
             duration: None,
         });
 
-        // Default preview: collapsed marker, expand hint, middle line hidden.
+        // Over-budget: arrives collapsed to header + footer, body unmounted.
         let preview = transcript_text(&mut screen, 80);
         assert!(preview.contains("▸"), "{preview}");
-        assert!(preview.contains("ctrl+o to expand"), "{preview}");
         assert!(!preview.contains("MIDDLELINE"), "{preview}");
+        assert!(!preview.contains("ctrl+o"), "{preview}");
 
-        // Expand reveals the hidden line and switches the hint.
+        // Expand reveals the whole body — including the middle.
         assert!(screen.toggle_latest_panel());
         let revealed = transcript_text(&mut screen, 80);
         assert!(revealed.contains("▾"), "{revealed}");
         assert!(revealed.contains("MIDDLELINE"), "{revealed}");
-        assert!(revealed.contains("ctrl+o to collapse"), "{revealed}");
-        assert!(!revealed.contains("ctrl+o to expand"), "{revealed}");
 
-        // Collapse again restores the capped preview.
+        // Collapse again unmounts the body.
         assert!(screen.toggle_latest_panel());
         let recollapsed = transcript_text(&mut screen, 80);
         assert!(recollapsed.contains("▸"), "{recollapsed}");
         assert!(!recollapsed.contains("MIDDLELINE"), "{recollapsed}");
-        assert!(recollapsed.contains("ctrl+o to expand"), "{recollapsed}");
     }
 
     #[test]
@@ -3765,14 +3886,15 @@ mod tests {
                 !matches!(
                     row.chrome.as_ref(),
                     Some(
-                        ChromeRow::Top
-                            | ChromeRow::Bottom
-                            | ChromeRow::Separator
+                        ChromeRow::BlockStart
+                            | ChromeRow::BlockEnd
+                            | ChromeRow::FooterRule
+                            | ChromeRow::Footer { .. }
                             | ChromeRow::Header { .. }
                             | ChromeRow::Body { .. }
                     )
                 ),
-                "reasoning must not use box chrome: {:?}",
+                "reasoning must not use tool-block chrome: {:?}",
                 row.text
             );
         }
@@ -3881,7 +4003,10 @@ mod tests {
     }
 
     #[test]
-    fn hidden_output_affordance_includes_count_and_ctrl_o_hint() {
+    fn collapsed_block_is_exactly_header_and_footer() {
+        // Over-budget output folds on arrival: no body, no elision affordance,
+        // no `ctrl+o` chrome — the collapsed block is header + rule + footer
+        // and still answers what ran · outcome · cost.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         let content = (0..20)
@@ -3894,17 +4019,31 @@ mod tests {
             exit_code: None,
             duration: None,
         });
-        let lines = screen.wrapped_lines(80);
-        let fold = line_matching(&lines, |line| line_text(line).contains("hidden"));
-        let text = line_text(fold);
-        assert!(text.contains("…"), "{text}");
-        assert!(text.contains("lines hidden"), "{text}");
-        assert!(text.contains("ctrl+o"), "{text}");
-        assert!(display_width(&text) <= 80, "{text}");
+        let texts: Vec<String> = screen
+            .wrapped_lines(80)
+            .iter()
+            .map(line_text)
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        assert_eq!(texts.len(), 3, "header + rule + footer: {texts:?}");
+        assert!(
+            texts[0].contains("▸") && texts[0].contains("SHELL"),
+            "{texts:?}"
+        );
+        assert!(texts[1].trim().chars().all(|c| c == '─'), "{texts:?}");
+        assert!(texts[2].contains("DONE"), "{texts:?}");
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("ctrl+o") || t.contains("hidden")),
+            "{texts:?}"
+        );
     }
 
     #[test]
-    fn hidden_shell_output_keeps_expand_hint_on_hidden_affordance_when_finished() {
+    fn collapsed_shell_block_footer_still_reports_exit_status() {
+        // Collapsing hides the body only: the footer (state · EXIT · meta)
+        // stays visible, so the outcome is never hidden.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         let content = (0..20)
@@ -3917,35 +4056,25 @@ mod tests {
             exit_code: Some(0),
             duration: None,
         });
+        assert!(screen.latest_panel_collapsed());
         let lines = screen.wrapped_lines(80);
-        let hidden = line_text(line_matching(&lines, |line| {
-            line_text(line).contains("lines hidden")
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
         }));
-
-        assert!(hidden.contains("ctrl+o to expand"), "{hidden}");
-        assert!(display_width(&hidden) <= 80, "{hidden}");
+        assert!(footer.contains("DONE  EXIT 0"), "{footer}");
         assert!(
-            !lines.iter().any(|line| line_text(line).contains("EXIT 0")),
-            "collapsed preview must hide the result row: {:?}",
+            !lines.iter().any(|line| line_text(line).contains("line 5")),
+            "collapsed body must be unmounted: {:?}",
             lines.iter().map(line_text).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn tiny_panel_rows_are_width_safe_with_visible_border_glyphs() {
+    fn tiny_block_rows_are_width_safe() {
         for width in 1..=5 {
             let rows = vec![
-                panel_rule_line(width, '┌', '┐'),
-                panel_header_line(
-                    width,
-                    true,
-                    "SHELL",
-                    "bash",
-                    &[
-                        ("◆".to_string(), prompt_style()),
-                        (" DONE".to_string(), panel_style()),
-                    ],
-                ),
+                panel_header_line(width, true, "SHELL", "bash", "1.0s"),
+                footer_rule_line(width),
                 panel_body_line(
                     width,
                     Line::from(Span::styled("body".to_string(), panel_style())),
@@ -3955,14 +4084,6 @@ mod tests {
             for row in rows {
                 let text = line_text(&row);
                 assert!(display_width(&text) <= width, "width {width}: {row:?}");
-                assert!(
-                    text.contains('┌')
-                        || text.contains('┐')
-                        || text.contains('│')
-                        || text.contains('└')
-                        || text.contains('┘'),
-                    "width {width}: a tiny panel row should show the clearest possible border glyph: {text:?}"
-                );
             }
         }
     }
@@ -3987,31 +4108,33 @@ mod tests {
                 transcript.rows.first().and_then(|row| row.chrome.as_ref()),
                 Some(
                     ChromeRow::Header { .. }
-                        | ChromeRow::Separator
                         | ChromeRow::Body { .. }
                         | ChromeRow::BodyRight { .. }
                         | ChromeRow::BodyRule { .. }
-                        | ChromeRow::Bottom
+                        | ChromeRow::FooterRule
+                        | ChromeRow::Footer { .. }
+                        | ChromeRow::BlockEnd
                 )
             ),
-            "trim left an orphan panel row at the start"
+            "trim left an orphan block row at the start"
         );
         let mut in_panel = false;
         for row in &transcript.rows {
             match row.chrome.as_ref() {
-                Some(ChromeRow::Top) => {
-                    assert!(!in_panel, "nested panel start");
+                Some(ChromeRow::BlockStart) => {
+                    assert!(!in_panel, "nested block start");
                     in_panel = true;
                 }
                 Some(
                     ChromeRow::Header { .. }
-                    | ChromeRow::Separator
                     | ChromeRow::Body { .. }
                     | ChromeRow::BodyRight { .. }
-                    | ChromeRow::BodyRule { .. },
-                ) => assert!(in_panel, "orphan panel interior: {:?}", row.text),
-                Some(ChromeRow::Bottom) => {
-                    assert!(in_panel, "orphan panel bottom");
+                    | ChromeRow::BodyRule { .. }
+                    | ChromeRow::FooterRule
+                    | ChromeRow::Footer { .. },
+                ) => assert!(in_panel, "orphan block interior: {:?}", row.text),
+                Some(ChromeRow::BlockEnd) => {
+                    assert!(in_panel, "orphan block end");
                     in_panel = false;
                 }
                 // The reasoning rail is chromeless (not a box panel): its header
@@ -4125,15 +4248,18 @@ mod tests {
         });
         let rendered = rendered_text(&mut screen, 100, 22);
 
-        assert!(rendered.contains("┌"));
         assert!(rendered.contains("EXPLORE"));
         assert!(!rendered.contains("READ"), "{rendered}");
         assert!(!rendered.contains("GREP"), "{rendered}");
         assert!(rendered.contains("src/tool_display.rs"));
-        assert!(rendered.contains("Read   src/tool_display.rs"));
-        assert!(rendered.contains("Grep   \"DiffPreview\" in src/ui"));
+        assert!(rendered.contains("Read  src/tool_display.rs"));
+        assert!(rendered.contains("Grep  \"DiffPreview\" in src/ui"));
         assert!(rendered.contains("src/ui"));
-        assert!(rendered.contains("└"));
+        // Frameless: a hairline footer rule, no box-drawing frame.
+        assert!(rendered.contains("─"), "{rendered}");
+        for frame in ['┌', '┐', '└', '┘', '│'] {
+            assert!(!rendered.contains(frame), "{rendered}");
+        }
     }
 
     #[test]
@@ -4800,9 +4926,15 @@ mod tests {
         });
 
         let rendered = rendered_text(&mut screen, 80, 12);
-        assert!(rendered.contains("│    $ cargo test"), "{rendered}");
-        assert!(rendered.contains("│    test result"), "{rendered}");
-        assert!(rendered.contains("\u{25c6} EXIT 0"), "{rendered}");
+        // Body hangs at the block indent (2ch pane indent + 3ch hang), no frame.
+        assert!(rendered.contains("     $ cargo test"), "{rendered}");
+        assert!(rendered.contains("     test result"), "{rendered}");
+        // The exit status closes the block as a footer field, glyph-free.
+        assert!(
+            rendered.contains("DONE  EXIT 0 ┊ 142 passed · 0 failed"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("\u{25c6}"), "{rendered}");
     }
 
     #[test]
