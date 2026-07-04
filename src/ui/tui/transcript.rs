@@ -43,6 +43,7 @@ fn block_footer_row(
     label_style: Style,
     extras: Vec<FooterField>,
     diag: Option<&ToolDiag>,
+    diag_call: Option<&str>,
 ) -> TranscriptRow {
     let (extra_spans, extra_plain) = join_meta_fields(extras);
     let mut spans = vec![Span::styled(label.to_string(), label_style)];
@@ -62,6 +63,7 @@ fn block_footer_row(
         ChromeRow::Footer {
             left: Line::from(spans),
             right,
+            diag_call: diag_call.map(str::to_string),
         },
         plain,
         label_style,
@@ -259,16 +261,24 @@ pub(super) struct Transcript {
     /// prompt header is an O(prompts-above-view) lookup, never a row scan.
     user_prompt_starts: Vec<usize>,
     /// Per-tool-call token diagnostics (`↑sent ↓received ┊ cache ┊ ctx`),
-    /// keyed by call id and rendered right-bound in the block footer. Numbers
-    /// are honest: entries exist only when the runtime measured them.
+    /// keyed by call id and rendered right-bound in the block footer. Forward
+    /// attribution: `↓received` is stamped from the proposing turn; `↑sent`,
+    /// `cache`, and `ctx` are patched in later from the following turn that
+    /// ingests the tool results. Numbers are honest: fields exist only when the
+    /// runtime measured them.
     tool_diags: std::collections::HashMap<String, ToolDiag>,
-    /// Diagnostics for the in-flight provider turn, built from its reported
-    /// usage on `ProviderTurnCompleted` and stamped onto every tool call that
-    /// turn proposes. `None` until the turn reports usage; reset each turn start.
+    /// The proposing turn's `↓received` diagnostic (output tokens it generated),
+    /// stamped onto every tool call that turn proposes. Holds only the output
+    /// side; the input side (`↑/cache/ctx`) comes from the following turn.
+    /// `None` until the turn reports usage; reset each turn start.
     current_turn_diag: Option<ToolDiag>,
-    /// `input_tokens` of the previous completed provider turn, so the next
-    /// turn's `ctx` field can report signed context growth. `None` before the
-    /// first completed turn (no prior turn to diff against).
+    /// Call ids proposed by the current proposing turn, awaiting the following
+    /// turn's input-side numbers (`↑/cache/ctx`). Drained and patched onto the
+    /// rendered footers when the next `ProviderTurnCompleted` usage arrives.
+    awaiting_input_calls: Vec<String>,
+    /// `input_tokens` of the previous completed provider turn, so the following
+    /// turn's `ctx` field can report signed context growth against it. `None`
+    /// before the first completed turn (no prior turn to diff against).
     last_turn_input_tokens: Option<u64>,
     /// Context-window cap in tokens (same source as the session-bar meter),
     /// used to scale the `ctx` growth delta into a percentage. `None` when the
@@ -529,6 +539,7 @@ impl Transcript {
             base_style.add_modifier(ratatui::style::Modifier::BOLD),
             Vec::new(),
             None,
+            None,
         );
     }
 
@@ -627,7 +638,13 @@ impl Transcript {
         self.rows.extend(body);
         let extras = renderer.footer_extras(call, &outcome);
         let diag = self.tool_diags.get(&call.id).cloned();
-        self.push_block_footer(state.label(), state.label_style(), extras, diag.as_ref());
+        self.push_block_footer(
+            state.label(),
+            state.label_style(),
+            extras,
+            diag.as_ref(),
+            Some(&call.id),
+        );
     }
 
     /// Collect the rows of a standard tool panel without committing them, for
@@ -681,10 +698,16 @@ impl Transcript {
         label_style: Style,
         extras: Vec<FooterField>,
         diag: Option<&ToolDiag>,
+        diag_call: Option<&str>,
     ) {
         self.rows.push(TranscriptRow::chrome(ChromeRow::FooterRule));
-        self.rows
-            .push(block_footer_row(label, label_style, extras, diag));
+        self.rows.push(block_footer_row(
+            label,
+            label_style,
+            extras,
+            diag,
+            diag_call,
+        ));
         self.rows.push(TranscriptRow::chrome(ChromeRow::BlockEnd));
     }
 
@@ -707,31 +730,81 @@ impl Transcript {
         self.context_cap = cap;
     }
 
-    /// Build the proposing turn's footer diagnostics from its reported usage:
-    /// `↑` fresh (non-cached) input processed this turn, `↓` tokens generated
-    /// this turn, `cache` prompt-cache reads (omitted when zero), and the
-    /// signed `ctx` growth delta against the previous turn (omitted without a
-    /// prior turn or cap). `ProviderUsage` docs state cache reads are already
-    /// counted in `input_tokens`, so fresh input subtracts them out; the finest
-    /// honest granularity is the turn, so when one turn proposes several tool
-    /// calls they share these numbers (the runtime cannot split finer).
-    fn build_turn_diag(&self, usage: &ProviderUsage) -> ToolDiag {
-        let fresh_input = usage
-            .input_tokens
-            .saturating_sub(usage.cache_read_input_tokens);
-        let cache = (usage.cache_read_input_tokens > 0)
-            .then(|| super::screen::compact_count(usage.cache_read_input_tokens));
+    /// The proposing turn's `↓received` diagnostic: the output tokens it
+    /// generated. This is the only field known when the tool footer is first
+    /// rendered; the input side is patched in later by the following turn.
+    fn proposing_turn_diag(usage: &ProviderUsage) -> ToolDiag {
         ToolDiag {
-            sent: Some(super::screen::compact_count(fresh_input)),
             received: Some(super::screen::compact_count(usage.output_tokens)),
-            cache,
-            ctx: self.context_growth_pct(usage.input_tokens),
+            ..ToolDiag::default()
         }
     }
 
-    /// Signed context-growth percentage: this turn's `input_tokens` minus the
-    /// previous turn's, as a fraction of the context cap (`"+0.9%"`). `None`
-    /// without a prior turn or a known cap — never a fabricated delta.
+    /// Patch the input-side diagnostics (`↑/cache/ctx`) onto every tool call
+    /// awaiting them, from the following turn's usage that ingested the tool
+    /// results: `↑` fresh (non-cached) input it processed, `cache` its
+    /// prompt-cache reads (omitted when zero), and the signed `ctx` growth
+    /// against the proposing turn (omitted without a prior turn or cap).
+    /// `ProviderUsage` docs state cache reads are already counted in
+    /// `input_tokens`, so fresh input subtracts them out. Parallel/same-turn
+    /// tool calls share these numbers (the runtime cannot split finer). Must be
+    /// called before `last_turn_input_tokens` is advanced so `ctx` diffs against
+    /// the proposing turn. The stamped `↓received` is preserved.
+    fn apply_following_turn_usage(&mut self, usage: &ProviderUsage) {
+        let fresh_input = usage
+            .input_tokens
+            .saturating_sub(usage.cache_read_input_tokens);
+        let sent = Some(super::screen::compact_count(fresh_input));
+        let cache = (usage.cache_read_input_tokens > 0)
+            .then(|| super::screen::compact_count(usage.cache_read_input_tokens));
+        let ctx = self.context_growth_pct(usage.input_tokens);
+        let calls: Vec<String> = std::mem::take(&mut self.awaiting_input_calls);
+        for id in &calls {
+            if let Some(diag) = self.tool_diags.get_mut(id) {
+                diag.sent = sent.clone();
+                diag.cache = cache.clone();
+                diag.ctx = ctx.clone();
+            }
+            self.patch_footer_diag(id);
+        }
+    }
+
+    /// Rewrite the already-rendered footer row tagged with `call_id` to reflect
+    /// its current `tool_diags` entry (forward-attribution patch). Both the
+    /// baked `right` diagnostics string and the plain `text` mirror are updated;
+    /// a no-op if the footer was trimmed away or never rendered.
+    fn patch_footer_diag(&mut self, call_id: &str) {
+        let Some(diag) = self.tool_diags.get(call_id).cloned() else {
+            return;
+        };
+        let right = diag.render().unwrap_or_default();
+        let Some(idx) = self.rows.iter().position(|row| {
+            matches!(
+                row.chrome.as_ref(),
+                Some(ChromeRow::Footer { diag_call: Some(id), .. }) if id == call_id
+            )
+        }) else {
+            return;
+        };
+        let Some(ChromeRow::Footer { left, .. }) = self.rows[idx].chrome.as_ref() else {
+            return;
+        };
+        let left_plain = line_text(left);
+        let text = if right.is_empty() {
+            left_plain
+        } else {
+            format!("{left_plain}  {right}")
+        };
+        self.mark_dirty_from(idx);
+        self.rows[idx].text = text;
+        if let Some(ChromeRow::Footer { right: baked, .. }) = self.rows[idx].chrome.as_mut() {
+            *baked = right;
+        }
+    }
+
+    /// Signed context-growth percentage: the following turn's `input_tokens`
+    /// minus the proposing turn's, as a fraction of the context cap (`"+0.9%"`).
+    /// `None` without a prior turn or a known cap — never a fabricated delta.
     fn context_growth_pct(&self, input_tokens: u64) -> Option<String> {
         let prev = self.last_turn_input_tokens?;
         let cap = self.context_cap.filter(|&cap| cap > 0)?;
@@ -758,11 +831,22 @@ impl Transcript {
         ids
     }
 
-    /// Stamp the current turn's diagnostics onto a newly-known call, if the
-    /// turn reported usage.
+    /// Stamp the proposing turn's `↓received` diagnostic onto a newly-known
+    /// call and record it as awaiting the following turn's input-side numbers,
+    /// if the turn reported usage.
     fn assign_turn_diag(&mut self, call_id: &str) {
         if let Some(diag) = self.current_turn_diag.clone() {
             self.set_tool_diag(call_id, diag);
+            self.mark_awaiting_input(call_id);
+        }
+    }
+
+    /// Record a proposing-turn tool call as awaiting the following turn's
+    /// input-side diagnostics (`↑/cache/ctx`). Deduplicated: `DiffPreview`,
+    /// `ToolStarted`, and the turn-completion stamp can all name the same call.
+    fn mark_awaiting_input(&mut self, call_id: &str) {
+        if !self.awaiting_input_calls.iter().any(|id| id == call_id) {
+            self.awaiting_input_calls.push(call_id.to_string());
         }
     }
 
@@ -998,6 +1082,7 @@ impl Transcript {
             state.label_style(),
             edit_footer_extras(added, removed, note),
             diag.as_ref(),
+            Some(&call.id),
         );
     }
 
@@ -1038,6 +1123,7 @@ impl Transcript {
             PanelState::Done.label(),
             PanelState::Done.label_style(),
             edit_footer_extras(added, removed, None),
+            None,
             None,
         );
     }
@@ -1460,6 +1546,7 @@ impl Transcript {
                 state.label_style(),
                 Vec::new(),
                 diag.as_ref(),
+                Some(&call.id),
             );
         }
     }
@@ -1536,6 +1623,7 @@ impl Transcript {
             state.label_style(),
             Vec::new(),
             diag.as_ref(),
+            Some(&call.id),
         );
         if self.exploring_open {
             self.set_explore_header(call, state, duration);
@@ -1583,6 +1671,7 @@ impl Transcript {
             PanelState::Running.label_style(),
             Vec::new(),
             None,
+            Some(&call.id),
         );
         self.exploring_open = true;
         self.active_explorations.push(ActiveExploration {
@@ -1669,14 +1758,21 @@ impl Transcript {
             UiEvent::ProviderTurnCompleted { usage, .. } => {
                 if let Some(usage) = usage {
                     self.set_thinking_telemetry(usage.reasoning_output_tokens);
-                    let diag = self.build_turn_diag(&usage);
-                    // Compute the ctx delta first, then advance the baseline.
+                    // Forward attribution. This turn's INPUT side ingested the
+                    // previous turn's tool results: patch their footers with
+                    // ↑/cache/ctx (ctx diffs against the still-current baseline),
+                    // then advance the baseline to this turn's input.
+                    self.apply_following_turn_usage(&usage);
                     self.last_turn_input_tokens = Some(usage.input_tokens);
+                    // This turn's OUTPUT side is the ↓ for the tools IT proposes.
+                    let diag = Self::proposing_turn_diag(&usage);
                     // Common order: this completes before its tools start, so
-                    // the stored diag is stamped on later `ToolStarted`s. Also
-                    // cover the tools-first order by stamping any open call now.
+                    // the stored ↓ is stamped on later `ToolStarted`s. Also cover
+                    // the tools-first order by stamping any open call now and
+                    // enrolling it to await the NEXT turn's input side.
                     for id in self.active_call_ids() {
                         self.set_tool_diag(&id, diag.clone());
+                        self.mark_awaiting_input(&id);
                     }
                     self.current_turn_diag = Some(diag);
                 }
@@ -1752,10 +1848,12 @@ impl Transcript {
             }
             UiEvent::SessionStarted => {
                 self.finish_stream();
-                // A fresh session: drop measured diagnostics and the ctx
-                // baseline so a new conversation never inherits stale numbers.
+                // A fresh session: drop measured diagnostics, pending footer
+                // patches, and the ctx baseline so a new conversation never
+                // inherits stale numbers.
                 self.tool_diags.clear();
                 self.current_turn_diag = None;
+                self.awaiting_input_calls.clear();
                 self.last_turn_input_tokens = None;
             }
             UiEvent::ToolProposed(_) => {
@@ -1763,8 +1861,9 @@ impl Transcript {
                 self.finish_stream();
             }
             UiEvent::ToolStarted(call) => {
-                // Stamp the proposing turn's diagnostics before dispatch so the
-                // block's first footer build already carries them.
+                // Stamp the proposing turn's ↓ and enroll the call to await the
+                // following turn's input side, before dispatch, so the block's
+                // first footer build already carries ↓.
                 self.assign_turn_diag(&call.id);
                 match tool_render::resolve(&call).kind() {
                     ToolPanelKind::Explore => self.push_explored_start(&call),

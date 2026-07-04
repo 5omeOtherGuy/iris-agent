@@ -501,8 +501,12 @@ mod tests {
     }
 
     fn call_args(name: &str, arguments: serde_json::Value) -> ToolCall {
+        call_args_id("call_1", name, arguments)
+    }
+
+    fn call_args_id(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
-            id: "call_1".to_string(),
+            id: id.to_string(),
             thought_signature: None,
             name: name.to_string(),
             arguments,
@@ -3249,6 +3253,7 @@ mod tests {
         let footer = ChromeRow::Footer {
             left: Line::from(Span::styled("DONE  EXIT 0", ok_style())),
             right: "↑612 ↓1.0k ┊ cache 17.9k ┊ ctx +0.5%".to_string(),
+            diag_call: None,
         };
         let text = line_text(&footer.render(30));
         assert!(text.contains("DONE  EXIT 0"), "{text:?}");
@@ -3331,16 +3336,16 @@ mod tests {
 
     #[test]
     fn shell_footer_carries_measured_turn_diagnostics() {
-        // End-to-end: a provider turn reports usage, then proposes a bash tool;
-        // the tool's footer carries that turn's cost right-bound. No prior turn
-        // and no context cap => no ctx field.
+        // Forward attribution, end-to-end: the proposing turn reports ↓output
+        // and proposes a bash tool; the FOLLOWING turn that ingests the tool
+        // result supplies the ↑/cache. No context cap => no ctx field.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(90);
+        // Proposing turn: output 164 => ↓164.
         screen.apply(UiEvent::ProviderTurnStarted {
-            turn_id: "turn".to_string(),
+            turn_id: "t1".to_string(),
         });
-        // input 19_300 with 17_200 cache reads => 2_100 fresh input processed.
-        screen.apply(turn_usage(19_300, 164, 17_200));
+        screen.apply(turn_usage(4_000, 164, 0));
         let call = call_args("bash", json!({ "command": "cargo test" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
         screen.apply(UiEvent::ToolResult {
@@ -3349,6 +3354,12 @@ mod tests {
             exit_code: Some(0),
             duration: Some(Duration::from_millis(120)),
         });
+        // Following turn ingests the result: input 19_300 with 17_200 cache
+        // reads => 2_100 fresh input processed (↑2.1k), cache 17.2k.
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(19_300, 200, 17_200));
         let lines = screen.wrapped_lines(90);
         let footer = line_text(line_matching(&lines, |line| {
             line_text(line).contains("EXIT 0")
@@ -3362,14 +3373,15 @@ mod tests {
 
     #[test]
     fn shell_footer_sent_excludes_cache_reads() {
-        // When the whole prompt is served from cache (input == cache_read),
-        // the fresh input processed this turn is zero: render an honest `↑0`.
+        // When the following turn's whole prompt is served from cache
+        // (input == cache_read), the fresh input it processed is zero: render
+        // an honest `↑0`.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(90);
         screen.apply(UiEvent::ProviderTurnStarted {
-            turn_id: "turn".to_string(),
+            turn_id: "t1".to_string(),
         });
-        screen.apply(turn_usage(18_200, 90, 18_200));
+        screen.apply(turn_usage(4_000, 90, 0));
         let call = call_args("bash", json!({ "command": "cargo test" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
         screen.apply(UiEvent::ToolResult {
@@ -3378,6 +3390,10 @@ mod tests {
             exit_code: Some(0),
             duration: Some(Duration::from_millis(120)),
         });
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(18_200, 120, 18_200));
         let lines = screen.wrapped_lines(90);
         let footer = line_text(line_matching(&lines, |line| {
             line_text(line).contains("EXIT 0")
@@ -3419,13 +3435,14 @@ mod tests {
 
     #[test]
     fn shell_footer_omits_cache_field_when_cache_read_is_zero() {
-        // cache_read = 0 is noise, not signal: no `cache` field, no dangling ┊.
+        // cache_read = 0 on the following turn is noise, not signal: no `cache`
+        // field, no dangling ┊.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(90);
         screen.apply(UiEvent::ProviderTurnStarted {
-            turn_id: "turn".to_string(),
+            turn_id: "t1".to_string(),
         });
-        screen.apply(turn_usage(800, 40, 0));
+        screen.apply(turn_usage(500, 40, 0));
         let call = call_args("bash", json!({ "command": "true" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
         screen.apply(UiEvent::ToolResult {
@@ -3434,6 +3451,10 @@ mod tests {
             exit_code: Some(0),
             duration: Some(Duration::from_millis(5)),
         });
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(800, 60, 0));
         let lines = screen.wrapped_lines(90);
         let footer = line_text(line_matching(&lines, |line| {
             line_text(line).contains("EXIT 0")
@@ -3448,9 +3469,82 @@ mod tests {
 
     #[test]
     fn shell_footer_reports_signed_context_growth_against_cap() {
-        // Two sequential turns: the second turn's ctx field is the signed
-        // input-token growth as a percentage of the known context cap.
-        // 90_000 - 87_000 = 3_000 of a 300k cap => +1.0%.
+        // ctx is measured on the FOLLOWING turn: the signed input-token growth
+        // from the proposing turn to the ingesting turn, as a percentage of the
+        // known context cap. Proposing input 87_000, following input 90_000 =>
+        // 3_000 of a 300k cap => +1.0%.
+        let mut screen = Screen::new();
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            None,
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+        let _ = screen.wrapped_lines(90);
+        // Proposing turn.
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(turn_usage(87_000, 120, 0));
+        let call = call_args("bash", json!({ "command": "ls" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: String::new(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(5)),
+        });
+        // Following turn ingests the result and grows the context.
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(90_000, 140, 0));
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+        assert!(footer.contains("ctx +1.0%"), "{footer:?}");
+    }
+
+    #[test]
+    fn explore_footer_carries_measured_turn_diagnostics() {
+        // The EXPLORE in-place footer rewrite must not drop the ↓ stamped by
+        // the proposing turn, and the following turn must patch ↑/cache onto it.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(turn_usage(3_000, 38, 0));
+        let call = call_args("read", json!({ "path": "src/context/engine.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "line\nline\nline".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(10)),
+        });
+        // Following turn ingests the read: input 18_200 with 16_800 cache reads
+        // => 1_400 fresh input processed.
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(18_200, 120, 16_800));
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("DONE")
+        }));
+        assert!(
+            footer.trim_end().ends_with("↑1.4k ↓38 ┊ cache 16.8k"),
+            "{footer:?}"
+        );
+    }
+
+    #[test]
+    fn shell_footer_shows_only_received_before_following_turn() {
+        // Forward attribution: immediately after the tool result (and with no
+        // following provider turn yet), the footer carries only ↓ from the
+        // proposing turn's output — no ↑/cache/ctx are invented.
         let mut screen = Screen::new();
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
@@ -3462,53 +3556,116 @@ mod tests {
         screen.apply(UiEvent::ProviderTurnStarted {
             turn_id: "t1".to_string(),
         });
-        screen.apply(turn_usage(87_000, 100, 0));
-        screen.apply(UiEvent::ProviderTurnStarted {
-            turn_id: "t2".to_string(),
-        });
-        screen.apply(turn_usage(90_000, 120, 0));
-        let call = call_args("bash", json!({ "command": "ls" }));
+        screen.apply(turn_usage(9_000, 164, 1_000));
+        let call = call_args("bash", json!({ "command": "cargo test" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
         screen.apply(UiEvent::ToolResult {
             call,
-            content: String::new(),
+            content: "ok".to_string(),
             exit_code: Some(0),
-            duration: Some(Duration::from_millis(5)),
+            duration: Some(Duration::from_millis(120)),
         });
         let lines = screen.wrapped_lines(90);
         let footer = line_text(line_matching(&lines, |line| {
             line_text(line).contains("EXIT 0")
         }));
-        assert!(footer.contains("ctx +1.0%"), "{footer:?}");
+        // ↓ present, from the PROPOSING turn's output; no input-side fields yet.
+        assert!(footer.trim_end().ends_with("↓164"), "{footer:?}");
+        assert!(!footer.contains('↑'), "{footer:?}");
+        assert!(!footer.contains("cache"), "{footer:?}");
+        assert!(!footer.contains("ctx"), "{footer:?}");
     }
 
     #[test]
-    fn explore_footer_carries_measured_turn_diagnostics() {
-        // The EXPLORE in-place footer rewrite must not drop the diag stamped by
-        // the proposing turn.
+    fn shell_footer_following_turn_patches_input_side_without_touching_received() {
+        // The following turn patches ↑/cache/ctx onto the already-rendered
+        // footer; the proposing turn's ↓ is preserved (the following turn's own
+        // output must NOT overwrite it).
         let mut screen = Screen::new();
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            None,
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
         let _ = screen.wrapped_lines(90);
+        // Proposing turn: input 87_000, output 164 => ↓164.
         screen.apply(UiEvent::ProviderTurnStarted {
-            turn_id: "turn".to_string(),
+            turn_id: "t1".to_string(),
         });
-        // input 18_200 with 16_800 cache reads => 1_400 fresh input processed.
-        screen.apply(turn_usage(18_200, 38, 16_800));
-        let call = call_args("read", json!({ "path": "src/context/engine.rs" }));
+        screen.apply(turn_usage(87_000, 164, 0));
+        let call = call_args("bash", json!({ "command": "cargo test" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
         screen.apply(UiEvent::ToolResult {
             call,
-            content: "line\nline\nline".to_string(),
-            exit_code: None,
-            duration: Some(Duration::from_millis(10)),
+            content: "ok".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(120)),
         });
+        // Following turn: input 90_000 with 16_800 cache reads, output 999.
+        // ↑ = 90_000 - 16_800 = 73_200 => 73.2k; cache 16.8k;
+        // ctx = (90_000 - 87_000) / 300_000 => +1.0%. ↓ stays 164 (not 999).
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(90_000, 999, 16_800));
         let lines = screen.wrapped_lines(90);
         let footer = line_text(line_matching(&lines, |line| {
-            line_text(line).contains("DONE")
+            line_text(line).contains("EXIT 0")
         }));
         assert!(
-            footer.trim_end().ends_with("↑1.4k ↓38 ┊ cache 16.8k"),
+            footer
+                .trim_end()
+                .ends_with("↑73.2k ↓164 ┊ cache 16.8k ┊ ctx +1.0%"),
             "{footer:?}"
         );
+        assert!(!footer.contains("999"), "{footer:?}");
+    }
+
+    #[test]
+    fn parallel_tools_share_following_turn_input_side_numbers() {
+        // Two tool calls proposed by the same turn share one following turn's
+        // ↑/cache numbers; no per-call split is invented.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(turn_usage(1_000, 50, 0));
+        let call_a = call_args_id("call_a", "bash", json!({ "command": "echo a" }));
+        let call_b = call_args_id("call_b", "bash", json!({ "command": "echo b" }));
+        screen.apply(UiEvent::ToolStarted(call_a.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call: call_a,
+            content: "a".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(5)),
+        });
+        screen.apply(UiEvent::ToolStarted(call_b.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call: call_b,
+            content: "b".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(5)),
+        });
+        // Following turn: input 2_000 with 500 cache reads => ↑1.5k, cache 500.
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(2_000, 77, 500));
+        let lines = screen.wrapped_lines(90);
+        let footers: Vec<String> = lines
+            .iter()
+            .map(line_text)
+            .filter(|text| text.contains("EXIT 0"))
+            .collect();
+        assert_eq!(footers.len(), 2, "{footers:?}");
+        for footer in &footers {
+            assert!(
+                footer.trim_end().ends_with("↑1.5k ↓50 ┊ cache 500"),
+                "{footer:?}"
+            );
+        }
     }
 
     #[test]

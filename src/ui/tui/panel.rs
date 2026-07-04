@@ -476,13 +476,15 @@ pub(super) fn join_meta_fields(fields: Vec<FooterField>) -> (Vec<Span<'static>>,
 }
 
 /// Token diagnostics for the block footer, right-bound:
-/// `↑<sent> ↓<received> ┊ cache <n> ┊ ctx <Δ%>`. Measured on the proposing
-/// provider turn (the finest honest granularity): `↑` fresh non-cached input
-/// processed that turn, `↓` tokens it generated, `cache` prompt-cache reads,
-/// `ctx` context growth vs the previous turn. Tool calls proposed by the same
-/// turn share these numbers. All fields are optional, preformatted strings
-/// (`"1.4k"`, `"+0.9%"`); a field is rendered only when the runtime measured
-/// it — never a fabricated per-call split.
+/// `↑<sent> ↓<received> ┊ cache <n> ┊ ctx <Δ%>`. Forward-attributed and
+/// round-level (the finest honest granularity): `↓received` is the output the
+/// *proposing* turn generated (known immediately); `↑sent` (fresh non-cached
+/// input), `cache` (prompt-cache reads), and `ctx` (context growth vs the
+/// proposing turn) come from the *following* turn that ingests the tool
+/// results, patched onto the footer when that turn's usage arrives. Tool calls
+/// proposed by the same turn share the input-side numbers. All fields are
+/// optional, preformatted strings (`"1.4k"`, `"+0.9%"`); a field is rendered
+/// only when the runtime measured it — never a fabricated per-call split.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ToolDiag {
     pub(crate) sent: Option<String>,
