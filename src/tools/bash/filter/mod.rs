@@ -187,6 +187,18 @@ mod tests {
     }
 
     #[test]
+    fn filter_that_empties_nonempty_output_yields_raw() {
+        // The git-status filter strips hint lines and has no on_empty; an
+        // output consisting only of hint lines would be emptied entirely.
+        // The empty-guard must fall back to raw (passthrough) instead.
+        let hints = "  (use \"git add <file>...\" to update what will be committed)\n";
+        assert!(
+            filter_output("git status", hints, true).is_none(),
+            "a filter emptying non-empty output must yield raw output"
+        );
+    }
+
+    #[test]
     fn panicking_filter_yields_raw() {
         assert_eq!(run_guarded(|| panic!("boom"), "test"), None);
         assert_eq!(
