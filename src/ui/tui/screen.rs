@@ -167,11 +167,20 @@ fn reduced_motion() -> bool {
 pub(crate) enum ApprovalPolicy {
     /// Gated tools are auto-approved (the print gate's `--approve` posture).
     /// Not constructed by the interactive loop today; kept so the statusline
-    /// vocabulary covers every runtime posture.
+    /// vocabulary covers every runtime posture. Distinct from `Auto`: this is
+    /// blanket approval, not the ADR-0032 preset's floor-guarded auto policy.
     #[allow(dead_code)]
     AlwaysApprove,
-    /// Gated tools prompt for a decision — the interactive loop's posture.
+    /// `on-request` (strict): gated tools prompt for a decision — the default
+    /// interactive posture. Maps to [`nexus::ApprovalMode::Strict`].
     OnRequest,
+    /// `auto` preset (ADR-0032): Nexus auto-runs calls it can prove safe and
+    /// prompts for the rest. NOT the same as `always-approve`. Maps to
+    /// [`nexus::ApprovalMode::Auto`].
+    Auto,
+    /// `never-ask` preset (ADR-0032): gated tools never prompt; an unresolved
+    /// call is denied. Maps to [`nexus::ApprovalMode::NeverAsk`].
+    NeverAsk,
     /// Gated tools are denied. Reserved posture; not constructed yet.
     #[allow(dead_code)]
     ReadOnly,
@@ -180,12 +189,24 @@ pub(crate) enum ApprovalPolicy {
     Off,
 }
 
+impl From<crate::nexus::ApprovalMode> for ApprovalPolicy {
+    fn from(mode: crate::nexus::ApprovalMode) -> Self {
+        match mode {
+            crate::nexus::ApprovalMode::Strict => Self::OnRequest,
+            crate::nexus::ApprovalMode::Auto => Self::Auto,
+            crate::nexus::ApprovalMode::NeverAsk => Self::NeverAsk,
+        }
+    }
+}
+
 impl ApprovalPolicy {
     /// State glyph from the symbol vocabulary (`◆`/`▲`/`■`/`○`).
     fn symbol(self) -> &'static str {
         match self {
             Self::AlwaysApprove => crate::ui::symbols::DONE,
+            Self::Auto => crate::ui::symbols::ACTIVE,
             Self::OnRequest => crate::ui::symbols::REVIEW,
+            Self::NeverAsk => crate::ui::symbols::CANCELLED,
             Self::ReadOnly => crate::ui::symbols::ERROR,
             Self::Off => crate::ui::symbols::EMPTY,
         }
@@ -194,7 +215,9 @@ impl ApprovalPolicy {
     fn label(self) -> &'static str {
         match self {
             Self::AlwaysApprove => "always-approve",
+            Self::Auto => "auto",
             Self::OnRequest => "on-request",
+            Self::NeverAsk => "never-ask",
             Self::ReadOnly => "read-only",
             Self::Off => "off",
         }
@@ -203,8 +226,9 @@ impl ApprovalPolicy {
     /// Symbol color role: green done / orange review / red error / dim empty.
     fn symbol_style(self) -> Style {
         match self {
-            Self::AlwaysApprove => Style::default().fg(crate::ui::palette::GREEN),
+            Self::AlwaysApprove | Self::Auto => Style::default().fg(crate::ui::palette::GREEN),
             Self::OnRequest => prompt_style(),
+            Self::NeverAsk => dim_style(),
             Self::ReadOnly => Style::default().fg(crate::ui::palette::RED),
             Self::Off => dim_style(),
         }
@@ -2545,7 +2569,9 @@ mod tests {
         let mut screen = footer_screen("~/repo");
         for (policy, expected) in [
             (ApprovalPolicy::AlwaysApprove, "◆ always-approve"),
+            (ApprovalPolicy::Auto, "◉ auto"),
             (ApprovalPolicy::OnRequest, "▲ on-request"),
+            (ApprovalPolicy::NeverAsk, "□ never-ask"),
             (ApprovalPolicy::ReadOnly, "■ read-only"),
             (ApprovalPolicy::Off, "○ off"),
         ] {
@@ -2558,6 +2584,35 @@ mod tests {
             assert!(!status.contains("~/repo"), "{status:?}");
             assert!(!status.contains("CTX"), "{status:?}");
         }
+    }
+
+    #[test]
+    fn auto_policy_label_is_distinct_from_always_approve() {
+        // ADR-0032: the `auto` preset must never be shown as `always-approve`.
+        // Different label AND different glyph so neither color nor text confuses
+        // a floor-guarded auto policy with blanket approval.
+        assert_ne!(
+            ApprovalPolicy::Auto.label(),
+            ApprovalPolicy::AlwaysApprove.label()
+        );
+        assert_eq!(ApprovalPolicy::Auto.label(), "auto");
+        assert_ne!(
+            ApprovalPolicy::Auto.symbol(),
+            ApprovalPolicy::AlwaysApprove.symbol()
+        );
+        // The nexus preset maps onto the distinct statusline posture.
+        assert_eq!(
+            ApprovalPolicy::from(crate::nexus::ApprovalMode::Auto),
+            ApprovalPolicy::Auto
+        );
+        assert_eq!(
+            ApprovalPolicy::from(crate::nexus::ApprovalMode::NeverAsk),
+            ApprovalPolicy::NeverAsk
+        );
+        assert_eq!(
+            ApprovalPolicy::from(crate::nexus::ApprovalMode::Strict),
+            ApprovalPolicy::OnRequest
+        );
     }
 
     #[test]

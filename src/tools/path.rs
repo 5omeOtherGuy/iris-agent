@@ -85,6 +85,41 @@ pub(super) fn resolve_for_write(root: &Path, requested: &str) -> Result<PathBuf>
     Ok(candidate)
 }
 
+/// Whether `requested` resolves strictly inside `root`, ALWAYS enforced --
+/// independent of the `IRIS_SECURITY_OPT_IN` execution-time confinement.
+///
+/// The auto-approval preset (ADR-0032) uses this to keep an outside-workspace
+/// target on the prompt path even where runtime path confinement is opt-out:
+/// auto is a fresh silent-execution decision, so it fails closed regardless of
+/// the confinement toggle. An unresolvable workspace root, a lexical escape, or
+/// an existing ancestor that canonicalizes outside `root` (a symlink out) all
+/// report `false`.
+pub(crate) fn is_inside_workspace(root: &Path, requested: &str) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let candidate = lexical_normalize(&join_request(&root, requested));
+    if !candidate.starts_with(&root) {
+        return false;
+    }
+    // Reject a symlinked existing ancestor that escapes the workspace. The
+    // deepest existing ancestor is the one the write would actually resolve
+    // through; canonicalizing it collapses any symlink hop.
+    let mut ancestor = candidate.as_path();
+    loop {
+        if ancestor.exists() {
+            return matches!(ancestor.canonicalize(), Ok(canonical) if canonical.starts_with(&root));
+        }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return false,
+        }
+    }
+}
+
 pub(super) fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)

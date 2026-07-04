@@ -961,6 +961,32 @@ fn route_command<P: ChatProvider>(
             tui.screen.open_modal(picker::open_settings(sw));
             Ok(RouteOutcome::Consumed)
         }
+        "/approval" => {
+            // ADR-0032 session control. Changing the preset at this inter-turn
+            // boundary is safe: the harness forwards it to Nexus, which owns
+            // enforcement. The statusline posture is kept in lockstep so the
+            // label never claims a mode the runtime is not in.
+            tui.screen.commit_user(prompt);
+            let lines = if rest.is_empty() {
+                vec![format!(
+                    "approval mode: {} (use /approval strict|auto|never)",
+                    harness.approval_mode().as_token()
+                )]
+            } else {
+                match crate::nexus::ApprovalMode::parse(rest) {
+                    Some(mode) => {
+                        harness.set_approval_mode(mode);
+                        tui.screen.set_approval_policy(ApprovalPolicy::from(mode));
+                        vec![format!("approval mode set to {}", mode.as_token())]
+                    }
+                    None => vec![format!(
+                        "unknown approval mode `{rest}` (use strict|auto|never)"
+                    )],
+                }
+            };
+            apply_notices(tui, lines);
+            Ok(RouteOutcome::Consumed)
+        }
         "/trust" | "/permissions" if rest.is_empty() => {
             // Modal actions dispatch through picker::apply_action, which takes
             // the switch; keep the same guard as the other pickers.
