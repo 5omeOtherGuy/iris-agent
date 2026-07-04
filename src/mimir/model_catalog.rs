@@ -340,6 +340,7 @@ mod tests {
             }),
             verify: None,
             tui: None,
+            worktree_root: None,
         }
     }
 

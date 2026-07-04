@@ -50,3 +50,16 @@ pub(crate) const REMOVED: &str = "\u{2212}";
 /// `┊` — soft metadata separator (working indicator, turn divider, workspace
 /// label, reasoning left rail). Not an ASCII pipe.
 pub(crate) const SEP: &str = "\u{250a}";
+
+/// `⇡` — commits ahead of the last-fetched upstream (git dropdown status
+/// line). One job only; `↑` remains input-token telemetry.
+pub(crate) const AHEAD: &str = "\u{21e1}";
+
+/// `⇣` — commits behind the last-fetched upstream. One job only; `↓` remains
+/// output-token telemetry.
+pub(crate) const BEHIND: &str = "\u{21e3}";
+
+/// `±` — uncommitted modification relative to committed state: diff modified
+/// rows, the session-bar dirty count, and user-attributed dirty files. One
+/// meaning everywhere.
+pub(crate) const DIRTY: &str = "\u{b1}";

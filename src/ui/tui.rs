@@ -47,6 +47,7 @@ mod pane;
 mod panel;
 mod rows;
 mod screen;
+mod session_menu;
 mod shell_command;
 mod startup;
 mod text;
@@ -61,12 +62,14 @@ use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
 pub(crate) use screen::{ApprovalPolicy, Screen};
+pub(crate) use screen::{BarSegment, session_bar_hit};
 use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
 use screen::{
     composer_statusline, editor_visual_rows, fresh_editor, render_document,
     render_document_with_chrome_tail, session_bar, working_indicator_line,
 };
+pub(crate) use session_menu::{GitMenu, MenuAction, MenuKey, MenuOutcome, SessionMenu, TreeMenu};
 pub(crate) use startup::StartAction;
 #[cfg(test)]
 use transcript::Transcript;
@@ -1959,8 +1962,12 @@ mod tests {
         screen.set_footer(
             "sonnet 3.5".to_string(),
             Some("high".to_string()),
-            "~/workspace/user-auth (feat/rate-limit)".to_string(),
+            "~/workspace/user-auth".to_string(),
         );
+        screen.set_footer_git(Some(crate::git::status::GitStatus {
+            branch: Some("feat/rate-limit".to_string()),
+            ..Default::default()
+        }));
         let rendered = rendered_text(&mut screen, 180, 12);
 
         // Runtime status is the composer's bottom statusline, with the
@@ -2129,8 +2136,12 @@ mod tests {
         screen.set_footer(
             "gpt-5.5".to_string(),
             Some("xhigh".to_string()),
-            "~/demo (main)".to_string(),
+            "~/demo".to_string(),
         );
+        screen.set_footer_git(Some(crate::git::status::GitStatus {
+            branch: Some("main".to_string()),
+            ..Default::default()
+        }));
         screen.apply(UiEvent::SessionStarted);
         screen.show_start_page();
 
@@ -2322,8 +2333,12 @@ mod tests {
         screen.set_footer(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            "~/repo (feat/pin-rail)".to_string(),
+            "~/repo".to_string(),
         );
+        screen.set_footer_git(Some(crate::git::status::GitStatus {
+            branch: Some("feat/pin-rail".to_string()),
+            ..Default::default()
+        }));
         for i in 0..40 {
             screen.apply(UiEvent::AssistantText(format!("line {i}")));
         }
@@ -2473,8 +2488,12 @@ mod tests {
         screen.set_footer(
             "gpt-5.5".to_string(),
             None,
-            "~/projects/very/deeply/nested/path/iris-agent (main)".to_string(),
+            "~/projects/very/deeply/nested/path/iris-agent".to_string(),
         );
+        screen.set_footer_git(Some(crate::git::status::GitStatus {
+            branch: Some("main".to_string()),
+            ..Default::default()
+        }));
         let label = session_bar(&screen, 50)
             .map(|line| line_text(&line))
             .expect("session bar");
@@ -2490,7 +2509,7 @@ mod tests {
         screen.set_footer(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            "~/projects/iris (main)".to_string(),
+            "~/projects/iris".to_string(),
         );
         for box_width in 6u16..=200 {
             let Some(line) = composer_statusline(&screen, box_width) else {
@@ -3517,8 +3536,12 @@ mod tests {
         screen.set_footer(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            "~/repo (branch)".to_string(),
+            "~/repo".to_string(),
         );
+        screen.set_footer_git(Some(crate::git::status::GitStatus {
+            branch: Some("branch".to_string()),
+            ..Default::default()
+        }));
         let rendered = rendered_text(&mut screen, 100, 10);
 
         assert!(
@@ -4392,7 +4415,7 @@ mod tests {
         screen.set_footer(
             "opus-4.8".to_string(),
             Some("xhigh".to_string()),
-            "~/repo (branch)".to_string(),
+            "~/repo".to_string(),
         );
         screen.start_turn();
         screen.apply(UiEvent::ProviderTurnCompleted {
@@ -4421,7 +4444,7 @@ mod tests {
         screen.set_footer(
             "opus-4.8".to_string(),
             Some("high".to_string()),
-            "~/repo (branch)".to_string(),
+            "~/repo".to_string(),
         );
         let refreshed = rendered_text(&mut screen, 120, 12);
         assert!(refreshed.contains("◉ CODE ─ OPUS-4.8 HIGH"), "{refreshed}");
@@ -4496,7 +4519,7 @@ mod tests {
         screen.set_footer(
             "opus-4.8".to_string(),
             Some("high".to_string()),
-            "~/repo (branch)".to_string(),
+            "~/repo".to_string(),
         );
         screen.start_turn();
         let call = call_args("bash", json!({ "command": "echo hi" }));

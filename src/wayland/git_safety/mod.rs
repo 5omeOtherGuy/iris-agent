@@ -30,7 +30,7 @@
 
 mod baseline;
 mod checkpoint;
-mod git;
+pub(crate) mod git;
 mod ledger;
 mod net_diff;
 mod settlement;
@@ -390,6 +390,51 @@ fn detect_mode(workspace: &Path) -> Mode {
                 .to_string(),
         )
     }
+}
+
+/// Read-only view of one persisted (unsettled) Iris task, for the session-bar
+/// git status snapshot (issue: SessionBar disclosures). Sourced from the
+/// durable `<git-dir>/iris/tasks/*.json` records so it can be read from any
+/// thread and for any worktree without touching live [`GitSafety`] state.
+#[derive(Debug, Clone)]
+pub(crate) struct UnsettledTaskView {
+    pub(crate) task_id: String,
+    /// Time since the record was last updated.
+    pub(crate) age: std::time::Duration,
+    /// Ledger paths with the op-log's expected on-disk content hash (`None` =
+    /// the path should be absent). A path whose current hash matches is an
+    /// Iris-unsettled change; a diverged path is user-attributed (the same
+    /// certainty rule as rollback's TOCTOU reconciliation).
+    pub(crate) expected: Vec<(PathBuf, Option<String>)>,
+}
+
+/// Load the unsettled-task records for `workspace` (read-only; no rehydration,
+/// no expiry side effects). Empty when the directory is not a git worktree or
+/// holds no unsettled task. Task records are per-worktree by construction
+/// (linked worktrees resolve to `.git/worktrees/<name>`), so probing each
+/// worktree path yields that worktree's own tasks.
+pub(crate) fn unsettled_tasks(workspace: &Path) -> Vec<UnsettledTaskView> {
+    let Some(git_dir) = task_state::git_dir(workspace) else {
+        return Vec::new();
+    };
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace_str = canonical.to_string_lossy().into_owned();
+    let now = task_state::now_ms();
+    task_state::load_all(&git_dir)
+        .into_iter()
+        .filter(|task| task.workspace == workspace_str)
+        .map(|task| UnsettledTaskView {
+            age: std::time::Duration::from_millis(now.saturating_sub(task.updated_ms)),
+            expected: task
+                .expected
+                .iter()
+                .map(|(path, hash)| (PathBuf::from(path), hash.clone()))
+                .collect(),
+            task_id: task.task_id,
+        })
+        .collect()
 }
 
 /// Attribution scan body (runs on a background thread): re-capture status and

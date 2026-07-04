@@ -16,6 +16,7 @@ mod approval;
 mod cli;
 mod config;
 mod errors;
+mod git;
 mod handles;
 mod mimir;
 mod nexus;

@@ -272,6 +272,17 @@ impl<P: ChatProvider> Harness<P> {
         self.git_safety.recover_and_expire()
     }
 
+    /// Re-anchor the session in another worktree (the git dropdown's
+    /// open-session-there path, idle-only). Rebuilds the dirty-tree guard for
+    /// the new root so its baselines, task records, and gating apply there;
+    /// the caller changes the process working directory and then surfaces
+    /// [`Self::recover_checkpoints`] so arriving in a worktree announces what
+    /// Iris left unsettled.
+    pub(crate) fn reanchor_workspace(&mut self, path: &std::path::Path) {
+        self.workspace = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.git_safety = git_safety::GitSafety::new(&self.workspace);
+    }
+
     /// The current task's net diff (`/diff`, and the accept-flow summary): the
     /// change from each Iris-authored ledger path's pre-task state to its
     /// current bytes, one hunk set per file (issue #264). Empty when no task is

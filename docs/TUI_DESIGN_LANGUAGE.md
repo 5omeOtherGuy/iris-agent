@@ -240,6 +240,10 @@ DIFF / TELEMETRY
   ↑  input tokens                           ↓  output / generated tokens
   ┊  soft metadata separator (NOT ASCII |)  ─  rule / frame line / statusline separator
 
+GIT / TASK (session bar + git console)
+  ⇡  commits ahead of upstream              ⇣  commits behind upstream
+  ±  uncommitted modification               [WT]  linked-worktree text tag (a label, not a glyph)
+
 METER
   ●●●○○○○○○○  context meter — 10-dot LED strip (filled muted · edge orange · empty dim)
 
@@ -250,6 +254,24 @@ FRAME (box-drawing, square corners ONLY)
 **Punctuation law:** use the ellipsis `…` (never `...`); use the Unicode minus
 `−` for removals (never ASCII `-`); use `┊` as the soft separator (never ASCII
 `|`). A glyph is added only when it carries meaning — do not decorate.
+
+**Git/task senses (exact, one job each):**
+
+- `⇡` / `⇣` — ahead/behind the **last-fetched** upstream, git console only.
+  `↑`/`↓` remain token telemetry ONLY; never reuse them for sync state.
+- `±` — uncommitted modification relative to committed state: diff modified
+  rows, the session-bar dirty count, and user-attributed dirty files. One
+  meaning everywhere.
+- `◇` — pending / not yet settled ("exists, awaiting acceptance"): tool
+  previews AND unsettled Iris task changes (ADR-0028). One meaning.
+- `▲` conflicts / `■` detached — the existing warning/error roles paired with
+  a label (`▲2`, `■ detached @ 46b104`), never color alone.
+- `WT` — a boxed **text tag**, not a glyph, marking a linked worktree.
+  Staged/untracked counts are **words** (`1 staged · 3 untracked`); `+`/`○`
+  keep their single jobs.
+- TAB inside a create input toggles the creation **target** (branch ⇄
+  worktree). Distinct from the SlashMenu's tab-to-accept, which is a
+  completion context; a target toggle never completes text.
 
 The only raster/vector brand asset is the hero banner (`assets/hero-*.svg`),
 itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
@@ -460,14 +482,65 @@ background fill, no color bar.
 ────────────────────────────────────────────────────────────────────
 ```
 
-- **Left:** `<cwd> ┊ git <branch>` — cwd in body ink, `┊` and `git <branch>`
-  dim. Paths middle-ellipsize (never break; the project name survives). In a
-  worktree, the worktree path is the cwd.
+- **Left:** `<cwd> ┊ git <branch> [state cluster]` — cwd in body ink, `┊` and
+  `git <branch>` dim. Paths middle-ellipsize (never break; the project name
+  survives). In a worktree, the worktree path is the cwd and a dim `[WT]` tag
+  follows the cluster.
+- **State cluster** (mutually exclusive base states, precedence order):
+  1. unmerged `▲N` (orange) — overrides everything until resolved;
+  2. task-partitioned `±N ◇M` — `±N` orange = user-attributed dirty files,
+     `◇M` dim = Iris-unsettled ledger files; either half omitted at zero;
+  3. plain dirty `±N` (orange) — one number, no task;
+  4. clean — no glyph. Silence is the signal.
+  Detached HEAD renders `■ detached @ <short-sha>` in place of the branch. No
+  `⇡⇣` at rest — sync is git-console detail.
 - **Right, right-aligned:** `CTX <used>/<cap>` + the 10-dot LED meter. `CTX`
   and `/<cap>` dim; `<used>` body ink. Unknown context window: `CTX <used>`
   with no meter.
-- **Narrow widths, drop in order:** meter → `/<cap>` → branch →
-  middle-truncate the cwd harder. Minimum form: cwd alone.
+- **Narrow widths, drop in order:** meter → `/<cap>` → counts (`±2 ◇3` →
+  `±`) → `WT` tag → whole git segment → middle-truncate the cwd harder.
+  Minimum form: cwd alone.
+
+#### 9.1.1 SessionBar disclosures — the directory tree & the git console
+
+Two momentary dropdowns share one slot under the bar: the **directory tree**
+(from the cwd; `/tree`, or `@` as the first character of an empty composer —
+opens straight into filter mode) and the **git console** (from the git
+segment; `ctrl-g` or `/git`). They are **top chrome, not overlays**: rows
+render between the bar and its soft hairline (which becomes the closing rule),
+pushing the transcript down — plain `bg`, no box, no shadow, no scrim. At most
+one is open; opening one closes the other; a docked modal or approval closes
+both. A dim `▾ ` prefixes the open dropdown's segment only while it is open.
+Height caps at 16 rows or ⅓ of the pane.
+
+- **Focus:** `Editor < Palette < SessionMenu < Modal`. While open the dropdown
+  owns keys; `esc` closes it and never reaches the turn-interrupt path. The
+  **list-state law**: while a LIST has focus there is no free typing —
+  single-letter commands (`a r n w s /`) are legal only there; any INPUT row
+  (filter, create) makes printable keys text, always.
+- **While a turn runs** dropdowns open as READOUTS: rows dim, every mutating
+  key is a no-op, and the footer reads `● agent running ┊ read-only — actions
+  return when idle ┊ esc`.
+- **Git console** = the settlement surface for ADR-0028 tasks: a dim status
+  line (`main → origin/main ┊ ±2 yours · 1 staged · 3 untracked ┊ ⇡2 ┊ stash
+  1 ┊ 3h ago`), a TASK group (`a accept ┊ r roll back` — `r` swaps in the
+  restore-point sublist from `restore_points()`), a SWITCH list (≤8 recent
+  branches, `[WT]` rows redirect to "open session there"), and a WORKTREES
+  board with `◇ unsettled · <age>` badges. Switching with dirt confirms first
+  (settle / stash / carry); conflicts disable switching. `n`/`w` create a
+  branch/worktree from the selected base — TAB toggles the target, validation
+  gates `↵`, and the resolved worktree path (config `worktreeRoot`, default
+  `../wt`) is always visible before create. Settlement goes through the
+  existing `GitSafety` API only.
+- **Directory tree**: breadcrumb (parents dim, clickable re-root up), 2-cell
+  indent per level, `▾`/`▸` disclosure on dirs — no box-drawing tree guides.
+  Attribution metas from the task partition: `◇ iris` dim, `± yours` orange,
+  `◉ open` for the composer-referenced file. `↵` on a file inserts
+  `@<relative-path>` into the composer; `/` filters flat (parent path as dim
+  meta). Data: `git ls-files --cached --others --exclude-standard`, plain
+  readdir outside a repo; 500 visible rows, then a dim `… N more` row.
+- These are **disclosures, not sidebars**: invariant #1 stands — nothing
+  persistent, nothing beside the transcript.
 
 ### 9.2 The composer
 

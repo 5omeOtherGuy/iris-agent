@@ -126,6 +126,16 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/git",
+        description: "Open the git console (switch, worktrees, settle the task)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/tree",
+        description: "Open the directory tree (↵ references a file in the composer)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/diff",
         description: "Show the current task's net diff (Iris's own changes)",
         action: SlashAction::Submit,

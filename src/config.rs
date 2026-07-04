@@ -105,6 +105,12 @@ pub(crate) struct Settings {
     /// Terminal-UI behavior (ADR-0029 screen-mode policy). Display-only
     /// preferences: no security-sensitive capability lives here.
     pub(crate) tui: Option<TuiSettings>,
+    /// Where the git dropdown's `w` (new worktree) gesture creates worktrees,
+    /// relative to the main worktree root when not absolute. Absent ->
+    /// `../wt`. Project-tunable: it only picks a local directory for a
+    /// user-confirmed `git worktree add` (the resolved path is always shown
+    /// before create), granting no new capability.
+    pub(crate) worktree_root: Option<String>,
 }
 
 /// Terminal-UI settings block (`"tui": { ... }` in settings.json).
@@ -248,6 +254,21 @@ impl Settings {
             // redirect, so a project may set it; project value wins, else
             // global.
             tui: project.tui.or(self.tui),
+            // A local worktree location preference; project value wins.
+            worktree_root: project.worktree_root.or(self.worktree_root),
+        }
+    }
+
+    /// Where new worktrees are created: the configured `worktreeRoot` (absolute
+    /// or relative to `main_root`), defaulting to `../wt` beside the main
+    /// worktree root.
+    pub(crate) fn worktree_root(&self, main_root: &Path) -> PathBuf {
+        let raw = self.worktree_root.as_deref().unwrap_or("../wt");
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            main_root.join(path)
         }
     }
 
