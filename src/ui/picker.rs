@@ -345,6 +345,9 @@ fn settings_snapshot<P>(switch: &ModelSwitch<'_, P>) -> settings_menu::Snapshot 
             .filter(|c| !c.is_empty()),
         verify_max_attempts: settings.verification().map(|v| v.max_attempts).unwrap_or(3),
         worktree_root: settings.worktree_root.clone(),
+        theme: tui
+            .and_then(|t| t.theme.clone())
+            .unwrap_or_else(|| crate::ui::theme::default().id().to_string()),
     }
 }
 
@@ -373,6 +376,11 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::VerifyCommand => config::save_verify_command(value),
         Field::VerifyMaxAttempts => config::save_verify_max_attempts(value.unwrap_or("3").parse()?),
         Field::WorktreeRoot => config::save_worktree_root(value),
+        Field::Theme => {
+            let id = value.unwrap_or("terminal");
+            crate::ui::theme::set_active(id);
+            config::save_theme(id)
+        }
     }
 }
 
