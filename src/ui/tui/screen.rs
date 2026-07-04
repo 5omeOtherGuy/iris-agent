@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui_textarea::{TextArea, WrapMode};
 
+use crate::git::status::GitStatus;
 #[cfg(test)]
 use crate::mimir::model_catalog;
 use crate::nexus::{ApprovalDecision, ProviderUsage, ReviewContext, ToolCall};
@@ -22,6 +23,7 @@ use crate::ui::terminal_surface::CURSOR_MARKER;
 
 use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
+use super::session_menu::{MAX_DROPDOWN_ROWS, SessionMenu};
 use super::startup::StartPage;
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::transcript::{Transcript, TranscriptRender};
@@ -219,6 +221,11 @@ struct Footer {
     context: Option<String>,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
+    /// Last-known git status snapshot for the session bar's git segment and
+    /// the dropdowns (`None` = not a git repo / not yet captured). Painted
+    /// last-known; the loop refreshes it from the async [`crate::git::status`]
+    /// cache.
+    git: Option<GitStatus>,
     /// Latest provider-reported usage, if the provider surfaced it. Cleared at
     /// turn start so the working indicator's per-turn token readout resets.
     usage: Option<ProviderUsage>,
@@ -574,6 +581,11 @@ pub(crate) struct Screen {
     /// The start page (IrisMark + launcher), shown before the first session
     /// activity when Iris launched interactively with no task/resume target.
     pub(crate) start_page: Option<StartPage>,
+    /// The open SessionBar dropdown (directory tree or git console), if any.
+    /// One shared slot: opening one closes the other; a docked modal or
+    /// approval closes it. Renders between the session-bar row and its soft
+    /// hairline, pushing the transcript down.
+    pub(crate) session_menu: Option<SessionMenu>,
     /// The session bar as last rendered `(width, lines)`, so the document
     /// stable-prefix hint stays accurate: the transcript's stable prefix only
     /// extends below the bar when the bar itself did not change.
@@ -642,6 +654,7 @@ impl Screen {
             terminal_focused: true,
             approval_policy: ApprovalPolicy::OnRequest,
             start_page: None,
+            session_menu: None,
             last_session_bar: None,
             scroll: super::pager::ScrollState::default(),
             pager_active: false,
@@ -844,9 +857,43 @@ impl Screen {
 
     // --- modal/picker ---
 
-    /// Open a picker/dialog above the editor until it closes.
+    /// Open a picker/dialog above the editor until it closes. A docked modal
+    /// takes precedence over a SessionBar dropdown: opening one closes it.
     pub(crate) fn open_modal(&mut self, modal: Modal) {
+        self.session_menu = None;
         self.modal = Some(modal);
+    }
+
+    // --- session-bar dropdowns ---
+
+    /// Open a SessionBar dropdown. Exclusive slot: an already-open dropdown
+    /// (either kind) is replaced.
+    pub(crate) fn open_session_menu(&mut self, menu: SessionMenu) {
+        self.session_menu = Some(menu);
+    }
+
+    pub(crate) fn close_session_menu(&mut self) {
+        self.session_menu = None;
+    }
+
+    /// Whether a turn is running, i.e. an open dropdown is a readout.
+    pub(crate) fn menu_readonly(&self) -> bool {
+        self.spinner.active
+    }
+
+    /// Update the last-known git snapshot (and an open git dropdown's copy).
+    pub(crate) fn set_footer_git(&mut self, git: Option<GitStatus>) {
+        if let (Some(SessionMenu::Git(menu)), Some(status)) = (&mut self.session_menu, &git) {
+            menu.set_status(status.clone());
+        }
+        if let Some(footer) = &mut self.footer {
+            footer.git = git;
+        }
+    }
+
+    /// The last-known git snapshot, if any.
+    pub(crate) fn footer_git(&self) -> Option<&GitStatus> {
+        self.footer.as_ref().and_then(|footer| footer.git.as_ref())
     }
 
     /// Close the active picker and restore the editor.
@@ -867,6 +914,8 @@ impl Screen {
     pub(crate) fn focus_for(&self, input: &str) -> FocusTarget {
         if self.modal.is_some() {
             FocusTarget::Modal
+        } else if self.session_menu.is_some() {
+            FocusTarget::SessionMenu
         } else if self.palette.is_active(input) {
             FocusTarget::Palette
         } else {
@@ -879,7 +928,10 @@ impl Screen {
     /// is awaiting approval. Drives whether a hardware-cursor (IME) marker is
     /// emitted at the editor cursor.
     fn composer_focused(&self) -> bool {
-        !self.spinner.active && self.modal.is_none() && self.approval_hint.is_none()
+        !self.spinner.active
+            && self.modal.is_none()
+            && self.approval_hint.is_none()
+            && self.session_menu.is_none()
     }
 
     // --- transcript ---
@@ -1029,11 +1081,15 @@ impl Screen {
         let context_used_tokens = same_context
             .then(|| prev.and_then(|footer| footer.context_used_tokens))
             .flatten();
+        // The git snapshot is orthogonal to the model/context identity: always
+        // carried across a footer rebuild (the loop refreshes it separately).
+        let git = self.footer.as_mut().and_then(|footer| footer.git.take());
         self.footer = Some(Footer {
             model,
             effort,
             context,
             cwd,
+            git,
             usage,
             context_used_tokens,
         });
@@ -1097,6 +1153,8 @@ impl Screen {
         ctx: &ReviewContext,
     ) {
         let shell = call.name == "bash";
+        // A docked approval takes the input surface: close any dropdown.
+        self.session_menu = None;
         self.approval_hint = Some(ApprovalHint {
             tool: call.name.clone(),
             target: run_target(call),
@@ -1219,7 +1277,7 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     // beneath it. The stable-prefix hint covers the bar only while the bar
     // itself is unchanged at this width; a bar change (context meter movement,
     // branch switch) resets the hint so the diff never reuses a stale bar row.
-    let bar = session_bar_lines(screen, width);
+    let bar = session_bar_lines(screen, width, height);
     let bar_rows = bar.len();
     let bar_stable = screen
         .last_session_bar
@@ -1461,7 +1519,7 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
 pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> {
     let footer = screen.footer.as_ref()?;
     let width = usize::from(width).max(1);
-    let (cwd, branch) = split_cwd_branch(&strip_ansi_for_text(&footer.cwd));
+    let cwd = strip_ansi_for_text(&footer.cwd);
     if cwd.is_empty() {
         return None;
     }
@@ -1499,31 +1557,55 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
         ctx_spans(false, false),
     ];
 
-    let branch_suffix = branch
+    let git_open = matches!(screen.session_menu, Some(SessionMenu::Git(_)));
+    let tree_open = matches!(screen.session_menu, Some(SessionMenu::Tree(_)));
+    // Git segment candidates, fullest first (level 0 = full state cluster,
+    // 1 = counts reduced to `±`, 2 = no counts, 3 = base `git <branch>` only).
+    let git_levels: Vec<Vec<Span<'static>>> = footer
+        .git
         .as_ref()
-        .map(|branch| format!(" {} git {branch}", crate::ui::symbols::SEP))
+        .map(|status| {
+            (0..4u8)
+                .map(|level| git_segment_spans(status, level, git_open))
+                .collect()
+        })
         .unwrap_or_default();
+
     // A middle-truncated cwd keeps at least `…/<project>`-ish room before a
     // lower-priority segment is dropped instead.
     const CWD_MIN: usize = 12;
 
-    // Drop order: meter → `/<cap>` → branch → hard cwd truncation.
-    for (right, with_branch) in right_candidates
-        .iter()
-        .map(|right| (Some(right), true))
-        .chain([(right_candidates.last(), false), (None, false)])
-    {
+    // Drop order: meter → `/<cap>` → counts (`±2 ◇3` → `±`) → `WT` tag →
+    // whole git segment → hard cwd truncation. Minimum form: cwd alone.
+    let mut candidates: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+    if git_levels.is_empty() {
+        candidates.extend([(Some(0), None), (Some(1), None), (Some(2), None)]);
+    } else {
+        candidates.extend([
+            (Some(0), Some(0)),
+            (Some(1), Some(0)),
+            (Some(2), Some(0)),
+            (Some(2), Some(1)),
+            (Some(2), Some(2)),
+            (Some(2), Some(3)),
+            (Some(2), None),
+        ]);
+    }
+    candidates.push((None, None));
+    let tree_prefix = tree_open.then(|| Span::styled("▾ ".to_string(), dim_style()));
+    let prefix_w = if tree_open { 2 } else { 0 };
+    for (right_idx, git_idx) in candidates {
+        let right = right_idx.map(|index| &right_candidates[index]);
+        let git_spans: Vec<Span<'static>> = git_idx
+            .map(|index| git_levels[index].clone())
+            .unwrap_or_default();
         let right_w = right.map(|spans| spans_width(spans)).unwrap_or(0);
-        let suffix = if with_branch {
-            branch_suffix.as_str()
-        } else {
-            ""
-        };
         let gap = if right_w > 0 { 2 } else { 0 };
         let avail_cwd = width
             .saturating_sub(right_w)
             .saturating_sub(gap)
-            .saturating_sub(display_width(suffix));
+            .saturating_sub(spans_width(&git_spans))
+            .saturating_sub(prefix_w);
         if right.is_some() && avail_cwd < CWD_MIN.min(display_width(&cwd)) {
             continue;
         }
@@ -1534,10 +1616,12 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
         if shown_cwd.is_empty() {
             continue;
         }
-        let mut spans = vec![Span::styled(shown_cwd.clone(), Style::default())];
-        if !suffix.is_empty() {
-            spans.push(Span::styled(suffix.to_string(), dim_style()));
+        let mut spans = Vec::new();
+        if let Some(prefix) = tree_prefix.clone() {
+            spans.push(prefix);
         }
+        spans.push(Span::styled(shown_cwd.clone(), Style::default()));
+        spans.extend(git_spans);
         if let Some(right) = right {
             let left_w = spans_width(&spans);
             let fill = width.saturating_sub(left_w).saturating_sub(right_w);
@@ -1555,22 +1639,155 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     (!shown.is_empty()).then(|| Line::from(Span::styled(shown, Style::default())))
 }
 
-/// The session bar block: the bar row plus its soft hairline (a dim `─`
-/// repeat, visibly lighter than the composer's border-weight top edge),
-/// inset to the shared pane measure. Empty when there is no footer yet.
-pub(super) fn session_bar_lines(screen: &Screen, width: u16) -> Vec<Line<'static>> {
+/// The session-bar git segment (` ┊ git <branch> [state cluster]`) at a drop
+/// level: 0 = full, 1 = counts reduced to the `±` half, 2 = no counts,
+/// 3 = base only. Mutually exclusive base states in precedence order:
+/// unmerged `▲N` (overrides everything) → task-partitioned `±N ◇M` (either
+/// half omitted at zero) → plain dirty `±N` → clean (no glyph — silence is
+/// the signal). `▾ ` prefixes the segment only while the git dropdown is open.
+fn git_segment_spans(status: &GitStatus, level: u8, open: bool) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!(" {} ", crate::ui::symbols::SEP),
+        dim_style(),
+    )];
+    if open {
+        spans.push(Span::styled("▾ ".to_string(), dim_style()));
+    }
+    spans.push(Span::styled("git ".to_string(), dim_style()));
+    match (&status.branch, &status.detached_at) {
+        (Some(branch), _) => spans.push(Span::styled(branch.clone(), dim_style())),
+        (None, at) => {
+            let sha = at
+                .as_deref()
+                .and_then(|a| a.split_whitespace().next())
+                .unwrap_or("?")
+                .to_string();
+            spans.push(Span::styled(
+                format!("{} ", crate::ui::symbols::ERROR),
+                err_style(),
+            ));
+            spans.push(Span::styled(format!("detached @ {sha}"), dim_style()));
+        }
+    }
+    if level <= 1 {
+        if status.unmerged > 0 {
+            spans.push(Span::styled(
+                format!(" {}{}", crate::ui::symbols::REVIEW, status.unmerged),
+                prompt_style(),
+            ));
+        } else if status.task.is_some() {
+            if status.user_dirty > 0 {
+                spans.push(Span::styled(
+                    format!(" {}{}", crate::ui::symbols::DIRTY, status.user_dirty),
+                    prompt_style(),
+                ));
+            }
+            if level == 0 && status.iris_unsettled > 0 {
+                spans.push(Span::styled(
+                    format!(" {}{}", crate::ui::symbols::PREVIEW, status.iris_unsettled),
+                    dim_style(),
+                ));
+            }
+        } else if status.total_uncommitted > 0 {
+            spans.push(Span::styled(
+                format!(" {}{}", crate::ui::symbols::DIRTY, status.total_uncommitted),
+                prompt_style(),
+            ));
+        }
+    }
+    if level <= 2 && status.is_linked_worktree {
+        spans.push(Span::styled(" [WT]".to_string(), dim_style()));
+    }
+    spans
+}
+
+/// Which half of the session bar a click at display column `x` hits: the cwd
+/// (tree dropdown target) or the git segment (git dropdown target). `None`
+/// for the right-side context readout / empty fill.
+pub(crate) fn session_bar_hit(screen: &Screen, width: u16, x: u16) -> Option<BarSegment> {
+    let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
+    let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let bar = session_bar(screen, content_width)?;
+    let x = usize::from(x.checked_sub(inset)?);
+    let text = line_text(&bar);
+    let sep = format!(" {} git", crate::ui::symbols::SEP);
+    let git_at = text.find(&sep).map(|at| display_width(&text[..at]));
+    let left_end = match git_at {
+        Some(at) => at,
+        None => display_width(text.trim_end()),
+    };
+    if x < left_end {
+        return Some(BarSegment::Cwd);
+    }
+    if let Some(at) = git_at {
+        // The git segment runs to the start of the right-side fill (two or
+        // more spaces) or the end of the text.
+        let seg_text = &text[text.find(&sep).unwrap_or(0)..];
+        let seg_len = seg_text
+            .find("  ")
+            .map_or(display_width(seg_text.trim_end()), |end| {
+                display_width(&seg_text[..end])
+            });
+        if x < at + seg_len {
+            return Some(BarSegment::Git);
+        }
+    }
+    None
+}
+
+/// A session-bar mouse target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarSegment {
+    Cwd,
+    Git,
+}
+
+/// The session bar block: the bar row, an open dropdown's rows (the tree or
+/// git console renders BETWEEN the bar and the hairline, pushing the
+/// transcript down), and the soft hairline (a dim `─` repeat, visibly lighter
+/// than the composer's border-weight top edge) which becomes the dropdown's
+/// closing rule. Inset to the shared pane measure. Empty when there is no
+/// footer yet. `height` caps the dropdown at [`MAX_DROPDOWN_ROWS`] or ⅓ of
+/// the pane, whichever is smaller.
+pub(super) fn session_bar_lines(screen: &Screen, width: u16, height: u16) -> Vec<Line<'static>> {
     let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
     let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
     let Some(mut bar) = session_bar(screen, content_width) else {
         return Vec::new();
     };
     pad_line_left(&mut bar, usize::from(inset));
+    let mut lines = vec![bar];
+    if let Some(menu) = &screen.session_menu {
+        let max_rows = MAX_DROPDOWN_ROWS.min(usize::from(height) / 3).max(3);
+        let referenced = referenced_paths(&screen.editor_text());
+        for mut line in menu.render_lines(
+            usize::from(content_width),
+            max_rows,
+            screen.menu_readonly(),
+            screen.footer_git(),
+            &referenced,
+        ) {
+            pad_line_left(&mut line, usize::from(inset));
+            lines.push(line);
+        }
+    }
     let mut rule = Line::from(Span::styled(
         "─".repeat(usize::from(content_width)),
         dim_style(),
     ));
     pad_line_left(&mut rule, usize::from(inset));
-    vec![bar, rule]
+    lines.push(rule);
+    lines
+}
+
+/// `@path` tokens in the composer text: the tree dropdown's `◉ open` markers.
+fn referenced_paths(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix('@'))
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Assemble one statusline candidate at `width`, or `None` if its segments do
@@ -1644,15 +1861,6 @@ fn label_eq_ignore_case(a: Option<&str>, b: Option<&str>) -> bool {
     }
 }
 
-fn split_cwd_branch(cwd: &str) -> (String, Option<String>) {
-    if let Some((left, right)) = cwd.rsplit_once(" (")
-        && let Some(branch) = right.strip_suffix(')')
-    {
-        return (left.to_string(), Some(branch.to_string()));
-    }
-    (cwd.to_string(), None)
-}
-
 #[derive(Clone, Copy)]
 struct ChromeHeights {
     menu: u16,
@@ -1720,7 +1928,9 @@ pub(super) fn render_editor_chrome(
             FocusTarget::Palette => Some(
                 PaletteView::for_palette(&screen.palette, &input_text).render(menu_inner_width),
             ),
-            FocusTarget::Editor => None,
+            // A SessionMenu renders at the pane top (session bar), never in
+            // the docked menu region above the composer.
+            FocusTarget::Editor | FocusTarget::SessionMenu => None,
         }
     };
     let menu_wanted = menu_lines
@@ -1926,9 +2136,29 @@ mod tests {
         screen
     }
 
+    /// A snapshot on branch `main`, optionally dirty/partitioned.
+    fn git_status(branch: &str) -> crate::git::status::GitStatus {
+        crate::git::status::GitStatus {
+            branch: Some(branch.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn git_screen(cwd: &str, status: crate::git::status::GitStatus) -> Screen {
+        let mut screen = footer_screen(cwd);
+        screen.set_footer_git(Some(status));
+        screen
+    }
+
+    fn bar_text(screen: &Screen, width: u16) -> String {
+        session_bar(screen, width)
+            .map(|l| line_text(&l))
+            .expect("bar")
+    }
+
     #[test]
     fn session_bar_shows_location_left_and_context_right() {
-        let mut screen = footer_screen("~/repo (main)");
+        let mut screen = git_screen("~/repo", git_status("main"));
         screen.apply(crate::ui::UiEvent::ProviderTurnCompleted {
             turn_id: "turn_1".to_string(),
             response_id: None,
@@ -1958,41 +2188,58 @@ mod tests {
     }
 
     #[test]
-    fn session_bar_drops_meter_then_cap_then_branch_then_truncates() {
-        let screen = footer_screen("~/repo (main)");
+    fn session_bar_drops_meter_then_cap_then_counts_then_segment_then_truncates() {
+        let screen = git_screen(
+            "~/repo",
+            crate::git::status::GitStatus {
+                user_dirty: 2,
+                iris_unsettled: 3,
+                total_uncommitted: 5,
+                is_linked_worktree: true,
+                task: Some(crate::git::status::TaskSummary {
+                    task_id: "t".to_string(),
+                    age: Duration::from_secs(60),
+                }),
+                ..git_status("main")
+            },
+        );
         // Wide: everything fits.
-        let full = session_bar(&screen, 60)
-            .map(|l| line_text(&l))
-            .expect("bar");
-        assert!(full.contains("┊ git main"), "{full:?}");
+        let full = bar_text(&screen, 70);
+        assert!(full.contains("┊ git main ±2 ◇3 [WT]"), "{full:?}");
         assert!(full.contains("CTX 0/300k ○○○○○○○○○○"), "{full:?}");
 
         // 1) The meter drops first.
-        let no_meter = session_bar(&screen, 34)
-            .map(|l| line_text(&l))
-            .expect("bar");
+        let no_meter = bar_text(&screen, 45);
         assert!(no_meter.contains("CTX 0/300k"), "{no_meter:?}");
         assert!(!no_meter.contains('○'), "{no_meter:?}");
-        assert!(no_meter.contains("┊ git main"), "{no_meter:?}");
+        assert!(no_meter.contains("┊ git main ±2 ◇3"), "{no_meter:?}");
 
         // 2) Then the `/<cap>` suffix.
-        let no_cap = session_bar(&screen, 25)
-            .map(|l| line_text(&l))
-            .expect("bar");
+        let no_cap = bar_text(&screen, 38);
         assert!(no_cap.contains("CTX 0"), "{no_cap:?}");
         assert!(!no_cap.contains("/300k"), "{no_cap:?}");
-        assert!(no_cap.contains("┊ git main"), "{no_cap:?}");
+        assert!(no_cap.contains("┊ git main ±2"), "{no_cap:?}");
 
-        // 3) Then the branch.
-        let no_branch = session_bar(&screen, 16)
-            .map(|l| line_text(&l))
-            .expect("bar");
-        assert!(no_branch.contains("~/repo"), "{no_branch:?}");
-        assert!(!no_branch.contains("git"), "{no_branch:?}");
-        assert!(no_branch.contains("CTX 0"), "{no_branch:?}");
+        // 3) Counts reduce (`±2 ◇3` → `±2`), then drop entirely.
+        let reduced = bar_text(&screen, 34);
+        assert!(reduced.contains("±2"), "{reduced:?}");
+        assert!(!reduced.contains('◇'), "{reduced:?}");
+        let no_counts = bar_text(&screen, 31);
+        assert!(no_counts.contains("git main"), "{no_counts:?}");
+        assert!(!no_counts.contains('±'), "{no_counts:?}");
+        assert!(no_counts.contains("[WT]"), "{no_counts:?}");
 
-        // 4) Minimum form: the cwd alone.
-        let minimum = session_bar(&screen, 7).map(|l| line_text(&l)).expect("bar");
+        // 4) Then the WT tag, then the whole git segment.
+        let no_wt = bar_text(&screen, 26);
+        assert!(no_wt.contains("git main"), "{no_wt:?}");
+        assert!(!no_wt.contains("[WT]"), "{no_wt:?}");
+        let no_git = bar_text(&screen, 16);
+        assert!(no_git.contains("~/repo"), "{no_git:?}");
+        assert!(!no_git.contains("git"), "{no_git:?}");
+        assert!(no_git.contains("CTX 0"), "{no_git:?}");
+
+        // 5) Minimum form: the cwd alone.
+        let minimum = bar_text(&screen, 7);
         assert!(minimum.contains("~/repo"), "{minimum:?}");
         assert!(!minimum.contains("CTX"), "{minimum:?}");
 
@@ -2006,6 +2253,155 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn git_segment_state_cluster_per_state() {
+        // Clean: no glyph — silence is the signal.
+        let clean = git_screen("~/repo", git_status("main"));
+        let bar = bar_text(&clean, 80);
+        assert!(bar.contains("┊ git main"), "{bar:?}");
+        assert!(
+            !bar.contains('±') && !bar.contains('◇') && !bar.contains('▲'),
+            "{bar:?}"
+        );
+
+        // Dirty, no task: one number.
+        let dirty = git_screen(
+            "~/repo",
+            crate::git::status::GitStatus {
+                total_uncommitted: 5,
+                user_dirty: 5,
+                ..git_status("main")
+            },
+        );
+        assert!(
+            bar_text(&dirty, 80).contains("git main ±5"),
+            "{:?}",
+            bar_text(&dirty, 80)
+        );
+
+        // Unmerged overrides ±/◇ until resolved.
+        let conflicted = git_screen(
+            "~/repo",
+            crate::git::status::GitStatus {
+                unmerged: 2,
+                total_uncommitted: 4,
+                user_dirty: 4,
+                ..git_status("main")
+            },
+        );
+        let bar = bar_text(&conflicted, 80);
+        assert!(bar.contains("git main ▲2"), "{bar:?}");
+        assert!(!bar.contains('±'), "{bar:?}");
+
+        // Detached: `■ detached @ <short-sha>`, dirty count still appends.
+        let detached = git_screen(
+            "~/repo",
+            crate::git::status::GitStatus {
+                branch: None,
+                detached_at: Some("46b104 fix: pulse".to_string()),
+                total_uncommitted: 1,
+                user_dirty: 1,
+                ..Default::default()
+            },
+        );
+        let bar = bar_text(&detached, 80);
+        assert!(bar.contains("git ■ detached @ 46b104 ±1"), "{bar:?}");
+
+        // Non-repo: no git segment at all.
+        let plain = footer_screen("~/repo");
+        assert!(!bar_text(&plain, 80).contains("git"));
+    }
+
+    #[test]
+    fn session_bar_marks_open_dropdown_with_disclosure_prefix() {
+        use crate::ui::tui::session_menu::{GitMenu, SessionMenu, TreeMenu};
+        let mut screen = git_screen("~/repo", git_status("main"));
+        // Git dropdown open: `▾ ` prefixes the git segment only.
+        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+            git_status("main"),
+            std::path::PathBuf::from("/wt"),
+        )));
+        let bar = bar_text(&screen, 80);
+        assert!(bar.contains("┊ ▾ git main"), "{bar:?}");
+        assert!(!bar.starts_with("▾"), "{bar:?}");
+        // Tree dropdown open (exclusive slot: replaces the git dropdown): the
+        // cwd gets the prefix instead.
+        screen.open_session_menu(SessionMenu::Tree(TreeMenu::new(
+            std::env::temp_dir(),
+            false,
+        )));
+        let bar = bar_text(&screen, 80);
+        assert!(bar.starts_with("▾ ~/repo"), "{bar:?}");
+        assert!(!bar.contains("▾ git"), "{bar:?}");
+    }
+
+    #[test]
+    fn dropdown_renders_between_bar_and_hairline_and_resets_stable_prefix() {
+        use super::{render_document_with_hints, session_bar_lines};
+        use crate::ui::tui::session_menu::{GitMenu, SessionMenu};
+        use ratatui::layout::Size;
+
+        let mut screen = git_screen("~/repo", git_status("main"));
+        screen.commit_user("hello");
+        let size = Size::new(80, 24);
+        let _ = render_document_with_hints(&mut screen, size);
+        let closed_rows = session_bar_lines(&screen, 80, 24).len();
+        assert_eq!(closed_rows, 2, "bar + hairline when closed");
+
+        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+            git_status("main"),
+            std::path::PathBuf::from("/wt"),
+        )));
+        let lines = session_bar_lines(&screen, 80, 24);
+        assert!(lines.len() > 2, "dropdown rows inserted");
+        // The soft hairline stays the closing rule (last row).
+        let last = line_text(lines.last().unwrap());
+        assert!(last.trim_start().starts_with('─'), "{last:?}");
+        // Height cap: ⅓ of the pane or 16 rows.
+        assert!(lines.len() <= 2 + 8, "{}", lines.len());
+        // Opening the dropdown changes the bar block → stable prefix resets.
+        let rendered = render_document_with_hints(&mut screen, size);
+        assert_eq!(rendered.stable_prefix, 0);
+    }
+
+    #[test]
+    fn modal_and_approval_close_the_dropdown_and_focus_ranks_it() {
+        use crate::ui::tui::session_menu::{GitMenu, SessionMenu};
+        let mut screen = git_screen("~/repo", git_status("main"));
+        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+            git_status("main"),
+            std::path::PathBuf::from("/wt"),
+        )));
+        assert_eq!(screen.focus(), crate::ui::tui::FocusTarget::SessionMenu);
+        // SessionMenu outranks the palette…
+        screen.set_editor("/mo");
+        assert_eq!(screen.focus(), crate::ui::tui::FocusTarget::SessionMenu);
+        screen.set_editor("");
+        // …and a modal outranks (and closes) the dropdown.
+        screen.open_modal(crate::ui::modal::Modal::LoginDialog(
+            crate::ui::modal::LoginDialog::new("p", false),
+        ));
+        assert!(screen.session_menu.is_none());
+        assert_eq!(screen.focus(), crate::ui::tui::FocusTarget::Modal);
+    }
+
+    #[test]
+    fn session_bar_hit_maps_cwd_and_git_segments() {
+        use super::{BarSegment, session_bar_hit};
+        let screen = git_screen("~/repo", git_status("main"));
+        // Column inside the cwd (past the 2-cell inset).
+        assert_eq!(session_bar_hit(&screen, 80, 4), Some(BarSegment::Cwd));
+        // Column inside `git main`.
+        let bar = bar_text(&screen, 76);
+        let git_col = bar.find("git").map(|at| display_width(&bar[..at])).unwrap();
+        assert_eq!(
+            session_bar_hit(&screen, 80, git_col as u16 + 3),
+            Some(BarSegment::Git)
+        );
+        // The right-side context readout is neither target.
+        assert_eq!(session_bar_hit(&screen, 80, 74), None);
     }
 
     #[test]
@@ -2085,13 +2481,9 @@ mod tests {
             "stable prefix must cover the unchanged session bar: {}",
             unchanged.stable_prefix
         );
-        // A bar change (new branch) resets the hint so no stale bar row is reused.
-        screen.set_footer_with_context(
-            "gpt-5.5".to_string(),
-            Some("high".to_string()),
-            Some("300k".to_string()),
-            "~/repo (feat/x)".to_string(),
-        );
+        // A bar change (branch switch) resets the hint so no stale bar row is
+        // reused.
+        screen.set_footer_git(Some(git_status("feat/x")));
         let changed = render_document_with_hints(&mut screen, size);
         assert_eq!(changed.stable_prefix, 0, "bar change must reset the hint");
     }

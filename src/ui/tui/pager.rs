@@ -376,7 +376,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     let width = size.width.max(1);
     let height = usize::from(size.height.max(1));
 
-    let bar = session_bar_lines(screen, width);
+    let bar = session_bar_lines(screen, width, size.height.max(1));
     let bar_rows = bar.len().min(height);
 
     // Bottom-pinned tail: blank-padded working indicator + composer chrome

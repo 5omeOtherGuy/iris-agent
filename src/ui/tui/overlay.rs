@@ -46,6 +46,9 @@ pub(crate) enum FocusTarget {
     Editor,
     /// The slash-command palette docked above the composer.
     Palette,
+    /// A SessionBar dropdown (directory tree / git console) at the pane top.
+    /// Precedence: Editor < Palette < SessionMenu < Modal.
+    SessionMenu,
     /// A modal/picker/dialog docked above the composer.
     Modal,
 }
@@ -331,7 +334,7 @@ mod tests {
         let lines = PaletteView::for_palette(&palette, "/").render(80);
         assert_eq!(lines.len(), PALETTE_WINDOW + 3);
         let rendered = lines.iter().map(&text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("/logout"), "{rendered}");
+        assert!(rendered.contains("/checkpoint"), "{rendered}");
         assert!(!rendered.contains("/exit "), "{rendered}");
         assert!(
             rendered.contains(&format!("({total}/{total})")),

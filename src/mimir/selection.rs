@@ -493,6 +493,7 @@ mod tests {
             open_ai_compatible: None,
             verify: None,
             tui: None,
+            worktree_root: None,
         }
     }
 

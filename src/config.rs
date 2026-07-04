@@ -105,6 +105,12 @@ pub(crate) struct Settings {
     /// Terminal-UI behavior (ADR-0029 screen-mode policy). Display-only
     /// preferences: no security-sensitive capability lives here.
     pub(crate) tui: Option<TuiSettings>,
+    /// Where the git dropdown's `w` (new worktree) gesture creates worktrees,
+    /// relative to the main worktree root when not absolute. Absent ->
+    /// `../wt`. Project-tunable: it only picks a local directory for a
+    /// user-confirmed `git worktree add` (the resolved path is always shown
+    /// before create), granting no new capability.
+    pub(crate) worktree_root: Option<String>,
 }
 
 /// Terminal-UI settings block (`"tui": { ... }` in settings.json).
@@ -248,7 +254,25 @@ impl Settings {
             // redirect, so a project may set it; project value wins, else
             // global.
             tui: project.tui.or(self.tui),
+            // A local worktree location preference; project value wins.
+            worktree_root: project.worktree_root.or(self.worktree_root),
         }
+    }
+
+    /// Where new worktrees are created: the configured `worktreeRoot` (absolute
+    /// or relative to `main_root`), defaulting to `../wt` beside the main
+    /// worktree root.
+    pub(crate) fn worktree_root(&self, main_root: &Path) -> PathBuf {
+        let raw = self.worktree_root.as_deref().unwrap_or("../wt");
+        let path = Path::new(raw);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            main_root.join(path)
+        };
+        // Resolve `.`/`..` lexically so the previewed and created worktree path
+        // is clean (`/repos/wt/x`, not `/repos/main/../wt/x`).
+        crate::tools::path::lexical_normalize(&joined)
     }
 
     /// The `tui` settings block, if configured.
@@ -461,6 +485,25 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn worktree_root_default_is_normalized_beside_the_main_root() {
+        let settings = Settings::default();
+        // Default `../wt` resolves lexically, without a `..` component.
+        assert_eq!(
+            settings.worktree_root(Path::new("/repos/main")),
+            PathBuf::from("/repos/wt")
+        );
+        // An absolute override is used as-is (still normalized).
+        let abs = Settings {
+            worktree_root: Some("/srv/trees/./x".to_string()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            abs.worktree_root(Path::new("/repos/main")),
+            PathBuf::from("/srv/trees/x")
+        );
+    }
 
     #[test]
     fn iris_flag_value_matches_the_opt_in_convention() {
