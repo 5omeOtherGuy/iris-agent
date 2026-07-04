@@ -33,6 +33,38 @@ const THINKING_LABEL: &str = "THINKING";
 /// available and is never rendered.
 const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
 
+/// Fixed-width label field for the header-right status cluster. Wide enough for
+/// the longest label across every panel family (` CANCELLED` = 10, ` APPROVED`
+/// = 9) with slack, so the glyph column never depends on the label text.
+const HEADER_LABEL_WIDTH: usize = 13;
+/// Fixed-width right-aligned elapsed field. Wide enough for the compact elapsed
+/// forms without shifting the header's right edge as the live timer changes
+/// length (e.g. `9.9s` -> `10s`); empty for panels with no duration.
+const HEADER_ELAPSED_WIDTH: usize = 8;
+
+/// The single header-right status cluster used by every panel family
+/// (EXPLORE / SHELL / EDIT / generic / APPROVAL). Geometry is fixed so the
+/// status glyph always lands in the same column regardless of panel type,
+/// label text, or elapsed length:
+///
+/// `symbol` + `label` left-aligned in a [`HEADER_LABEL_WIDTH`]-wide field +
+/// `elapsed` right-aligned in a [`HEADER_ELAPSED_WIDTH`]-wide field + a uniform
+/// 2-space right pad. Panels with no duration (APPROVAL) pass an empty
+/// `elapsed`, which still reserves the field so their glyph aligns too.
+fn header_right_cluster(
+    symbol: &str,
+    symbol_style: Style,
+    label: &str,
+    label_style: Style,
+    elapsed: &str,
+) -> Vec<(String, Style)> {
+    vec![
+        (symbol.to_string(), symbol_style),
+        (format!("{label:<HEADER_LABEL_WIDTH$}"), label_style),
+        (format!("{elapsed:>HEADER_ELAPSED_WIDTH$}  "), dim_style()),
+    ]
+}
+
 /// One reasoning-trace row on the muted left rail: the dim `┊ ` rail prefix plus
 /// the line, word-wrapped with the rail carried onto continuation rows, and
 /// hidden until the block is expanded. A plain (chromeless) row — reasoning gets
@@ -435,26 +467,21 @@ impl Transcript {
     fn push_approval_panel(&mut self, line: Line<'static>, failed: bool) {
         self.mark_append_dirty();
         self.rows.push(TranscriptRow::chrome(ChromeRow::Top));
+        // Approval decisions have no duration; the shared cluster reserves an
+        // empty elapsed field so the glyph lands in the same column as every
+        // other panel family.
+        let base_style = if failed { err_style() } else { ok_style() };
         self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
             expanded: true,
             title: "APPROVAL",
             meta: "decision".to_string(),
-            right: vec![
-                (
-                    if failed { "■" } else { "◆" }.to_string(),
-                    if failed { err_style() } else { ok_style() },
-                ),
-                (
-                    if failed {
-                        " DENIED      "
-                    } else {
-                        " APPROVED    "
-                    }
-                    .to_string(),
-                    if failed { err_style() } else { ok_style() }
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-            ],
+            right: header_right_cluster(
+                if failed { "■" } else { "◆" },
+                base_style,
+                if failed { " DENIED" } else { " APPROVED" },
+                base_style.add_modifier(ratatui::style::Modifier::BOLD),
+                "",
+            ),
         }));
         self.rows.push(TranscriptRow::chrome(ChromeRow::Separator));
         let text = line_text(&line);
@@ -636,11 +663,13 @@ impl Transcript {
                 expanded,
                 title: spec.title,
                 meta: spec.meta.to_string(),
-                right: vec![
-                    (spec.state.symbol().to_string(), spec.state.dot_style()),
-                    (spec.state.label().to_string(), spec.state.label_style()),
-                    (format!("     {elapsed:>10}  "), dim_style()),
-                ],
+                right: header_right_cluster(
+                    spec.state.symbol(),
+                    spec.state.dot_style(),
+                    spec.state.label(),
+                    spec.state.label_style(),
+                    &elapsed,
+                ),
             },
             plain,
             tool_header_style(),
@@ -799,6 +828,38 @@ impl Transcript {
             );
             for row in diff_rows {
                 self.rows.push(row.with_fold(FoldVis::WhenExpanded));
+            }
+        } else if diff_rows.is_empty() && error.is_none() {
+            if diff.trim().is_empty() {
+                // A preview/edit whose diff is genuinely empty (e.g. the edit's
+                // old_string did not match the file) would otherwise render an
+                // empty frame -- header + bottom border, zero body rows --
+                // leaving nothing to review while the approval modal waits.
+                // Emit one honest dim placeholder instead of fabricating a diff.
+                let placeholder = "no preview available";
+                self.rows.push(TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: Line::from(Span::styled(placeholder, dim_style())),
+                        bg: None,
+                    },
+                    placeholder.to_string(),
+                    dim_style(),
+                ));
+            } else {
+                // Non-empty preview text that does not parse into diff rows --
+                // e.g. "diff unavailable: preview too large" -- carries
+                // actionable meaning. Render it verbatim as dim body rows
+                // rather than hiding it behind the generic placeholder.
+                for line in diff.trim_end_matches('\n').split('\n') {
+                    self.rows.push(TranscriptRow::chrome_with_text(
+                        ChromeRow::Body {
+                            line: Line::from(Span::styled(line.to_string(), dim_style())),
+                            bg: None,
+                        },
+                        line.to_string(),
+                        dim_style(),
+                    ));
+                }
             }
         } else {
             self.rows.extend(diff_rows);
@@ -1204,13 +1265,13 @@ impl Transcript {
         let elapsed = duration
             .map(format_elapsed_compact)
             .unwrap_or_else(|| "0.0s".to_string());
-        vec![
-            (state.symbol().to_string(), state.dot_style()),
-            (format!("{:<13}", state.label()), state.label_style()),
-            // Fixed-width elapsed so the live timer does not shift the header
-            // right edge as the compact label changes length (e.g. 9.9s -> 10s).
-            (format!("{elapsed:>8}  "), dim_style()),
-        ]
+        header_right_cluster(
+            state.symbol(),
+            state.dot_style(),
+            state.label(),
+            state.label_style(),
+            &elapsed,
+        )
     }
 
     fn current_explore_header_row(&self) -> Option<usize> {

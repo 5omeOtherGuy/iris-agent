@@ -3201,6 +3201,99 @@ mod tests {
         );
     }
 
+    /// Display-width column of the first panel-status glyph in a rendered
+    /// header line (the shared cluster's leading symbol: one of ◆/■/◇/●/▲).
+    fn status_glyph_col(line: &Line<'static>) -> usize {
+        let text = line_text(line);
+        let glyphs = ['◆', '■', '◇', '●', '▲'];
+        let byte_idx = text
+            .char_indices()
+            .find(|(_, c)| glyphs.contains(c))
+            .map(|(idx, _)| idx)
+            .expect("status glyph in header");
+        display_width(&text[..byte_idx])
+    }
+
+    #[test]
+    fn panel_header_status_glyph_shares_one_column_across_families() {
+        // BUG 1 regression: EXPLORE, SHELL, EDIT, and APPROVAL headers each
+        // built their own header-right cluster, so the status glyph wandered by
+        // panel type and label width. The unified builder must land the glyph
+        // in one column regardless of family.
+        let mut screen = Screen::new();
+        // EXPLORE (grouped explore path).
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("read", json!({ "path": "src/a.rs" })),
+            content: "ignored".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(0)),
+        });
+        // SHELL (generic panel path).
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(0)),
+        });
+        // EDIT (preview path).
+        screen.apply(UiEvent::DiffPreview {
+            call: call_args("edit", json!({ "file_path": "src/b.rs" })),
+            diff: "--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        });
+        // APPROVAL (approval panel path).
+        screen.apply(UiEvent::ToolAutoApproved(call_args(
+            "bash",
+            json!({ "command": "ls" }),
+        )));
+
+        let lines = screen.wrapped_lines(99);
+        let col = |needle: &str| {
+            status_glyph_col(line_matching(&lines, |l| line_text(l).contains(needle)))
+        };
+        let explore = col("EXPLORE");
+        let shell = col("SHELL");
+        let edit = col("EDIT");
+        let approval = col("APPROVAL");
+        assert_eq!(explore, shell, "EXPLORE vs SHELL glyph column");
+        assert_eq!(explore, edit, "EXPLORE vs EDIT glyph column");
+        assert_eq!(explore, approval, "EXPLORE vs APPROVAL glyph column");
+    }
+
+    #[test]
+    fn edit_preview_with_empty_diff_renders_placeholder_row() {
+        // BUG 2 regression: an EDIT preview whose diff is empty (e.g. the
+        // old_string did not match) rendered an empty frame with nothing to
+        // review. It must show one honest dim placeholder body row instead.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call_args("edit", json!({ "file_path": "src/main.rs" })),
+            diff: String::new(),
+        });
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(rendered.contains("PREVIEW"), "{rendered}");
+        assert!(rendered.contains("no preview available"), "{rendered}");
+    }
+
+    #[test]
+    fn edit_preview_with_unavailable_message_renders_its_own_text() {
+        // Regression: a non-empty preview that does not parse into diff rows
+        // (e.g. "diff unavailable: preview too large") carries actionable text
+        // and must be rendered verbatim, not replaced by the generic
+        // "no preview available" placeholder.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call_args("edit", json!({ "file_path": "src/main.rs" })),
+            diff: "diff unavailable: preview too large".to_string(),
+        });
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(rendered.contains("PREVIEW"), "{rendered}");
+        assert!(
+            rendered.contains("diff unavailable: preview too large"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("no preview available"), "{rendered}");
+    }
+
     #[test]
     fn compaction_event_renders_quiet_info_notice() {
         let mut screen = Screen::new();
