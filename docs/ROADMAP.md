@@ -429,7 +429,9 @@ advantage and a generic fallback, never as the only path. `apply_patch` (V4A) fo
 Codex routes is the first/reference instance. Requires a tool registry that can
 vary the advertised tool set by active provider/model (plugs into the Milestone 4
 routing work); result shape, path safety, and approval gates stay centralized in
-Nexus regardless of which variant runs.
+Nexus regardless of which variant runs. Design decisions for the edit surfaces
+(shared mutation core, per-surface tolerance layers, conditional feedback,
+failure-class telemetry) are recorded in ADR-0038.
 
 The planner seam exists ([#60](https://github.com/5omeOtherGuy/iris-agent/issues/60)):
 `ProviderCapabilities` (reported by each provider) drives `Tools::plan_surface`,

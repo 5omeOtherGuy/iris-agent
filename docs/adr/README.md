@@ -38,6 +38,7 @@
 | [0035](0035-git-worktree-isolation-and-apply-as-settlement.md) | Git worktree isolation — Tier 0 of the ADR-0028 guarantee model, apply = settlement | proposed | 2026-07-03 |
 | [0036](0036-tools-are-token-efficient-by-design.md) | Tools are token-efficient by design | accepted | 2026-07-04 |
 | [0037](0037-native-output-filtering-for-bash-pass-through.md) | Native output filtering for bash pass-through commands | proposed | 2026-07-04 |
+| [0038](0038-per-model-edit-surfaces-share-one-mutation-core.md) | Per-model edit surfaces share one mutation core | proposed | 2026-07-04 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.
