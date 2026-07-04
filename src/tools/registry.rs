@@ -186,20 +186,32 @@ impl Tool for BashTool {
             let cancel_for_task = cancel.clone();
             let mut handle = tokio::task::spawn_blocking(move || {
                 let sink = ChannelSink { tx: chunk_tx };
-                let mut guard = bash_state.lock().unwrap_or_else(|e| e.into_inner());
+                // Poisoning means a previous bash run panicked mid-mutation, so
+                // the session/job registry may be half-updated. Surface it as a
+                // tool error rather than recovering onto inconsistent state.
+                let mut guard = bash_state.lock().map_err(|_| {
+                    anyhow!("bash state poisoned by a previous panic; restart the session")
+                })?;
                 bash::execute(&root, &args, &mut guard, &cancel_for_task, Some(&sink))
             });
 
             // Keep polling the executor while the command runs: forward each
             // streamed chunk as it arrives, and finish when the blocking task
-            // joins.
+            // joins. Once the sender drops, `recv` yields `None`; disable that
+            // select branch (`chunks_open`) so the loop stops polling the closed
+            // receiver -- otherwise it busy-spins on the current-thread runtime
+            // in the window before the join handle is ready.
+            let mut chunks_open = true;
             let result = loop {
                 tokio::select! {
-                    chunk = chunk_rx.recv() => {
-                        if let Some(chunk) = chunk
-                            && let Some(sink) = env.output_sink
-                        {
-                            sink.emit_chunk(&chunk);
+                    chunk = chunk_rx.recv(), if chunks_open => {
+                        match chunk {
+                            Some(chunk) => {
+                                if let Some(sink) = env.output_sink {
+                                    sink.emit_chunk(&chunk);
+                                }
+                            }
+                            None => chunks_open = false,
                         }
                     }
                     joined = &mut handle => {
@@ -667,6 +679,32 @@ mod tests {
             tool_elapsed >= std::time::Duration::from_millis(900),
             "command returned before its sleep completed ({tool_elapsed:?})"
         );
+    }
+
+    #[test]
+    fn bash_execute_completes_promptly_with_no_output() {
+        // A command that emits nothing drops the chunk sender almost immediately,
+        // so `chunk_rx.recv()` yields `None` before the join handle is ready. The
+        // select loop must disable that branch (`chunks_open`) and fall through to
+        // the join instead of busy-spinning on the closed receiver on the
+        // current-thread runtime. Guard with a timeout: a spinning loop still
+        // eventually joins, but the command itself is instant, so a generous
+        // bound catches a hang without being flaky on the happy path.
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&root, &state, None);
+        let args = json!({ "command": "true" });
+
+        current_thread_runtime().block_on(async {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                BashTool.execute(&args, &env, CancellationToken::new()),
+            )
+            .await
+            .expect("no-output bash command hung (loop spun on the closed channel)");
+            result.expect("bash tool should succeed");
+        });
     }
 
     #[test]
