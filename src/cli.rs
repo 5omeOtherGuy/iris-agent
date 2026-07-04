@@ -131,6 +131,11 @@ pub(crate) struct LoadedSource {
     pub(crate) session_id: SessionIdGuard,
     pub(crate) session_log: Option<SessionLog>,
     pub(crate) messages: Vec<Message>,
+    /// Durable ids parallel to `messages` (`Some` = coverable on-disk entry,
+    /// `None` = summary position or id-less legacy entry). Empty for a fresh
+    /// session. Carried into `swap_session` so a resumed prefix stays
+    /// compactable (#375).
+    pub(crate) entry_ids: Vec<Option<String>>,
     pub(crate) resumed: usize,
 }
 

@@ -449,6 +449,7 @@ fn load_session_source(
                 session_id: cli::SessionIdGuard::swap(cell.clone(), id),
                 session_log,
                 messages: Vec::new(),
+                entry_ids: Vec::new(),
                 resumed: 0,
             })
         }
@@ -459,6 +460,7 @@ fn load_session_source(
             })?;
             let stored = store.open(&meta)?;
             let resumed = stored.messages.len();
+            let entry_ids = stored.entry_ids;
             let session_log = match session::SessionLog::resume(&meta.path) {
                 Ok(log) => Some(log),
                 Err(error) => {
@@ -470,6 +472,7 @@ fn load_session_source(
                 session_id: cli::SessionIdGuard::swap(cell.clone(), meta.id.clone()),
                 session_log,
                 messages: stored.messages,
+                entry_ids,
                 resumed,
             })
         }

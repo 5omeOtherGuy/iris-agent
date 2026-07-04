@@ -404,11 +404,13 @@ impl SessionStore {
     pub(crate) fn open(&self, meta: &SessionMeta) -> Result<StoredSession> {
         let RebuiltContext {
             messages,
+            entry_ids,
             context_tokens,
         } = read_messages(&meta.path)?;
         Ok(StoredSession {
             meta: meta.clone(),
             messages,
+            entry_ids,
             context_tokens,
         })
     }
@@ -690,6 +692,11 @@ pub(crate) struct SessionMeta {
 pub(crate) struct StoredSession {
     pub(crate) meta: SessionMeta,
     pub(crate) messages: Vec<Message>,
+    /// Durable message ids parallel to `messages`: `Some(id)` for a coverable
+    /// on-disk entry, `None` for a summary position or an id-less legacy entry.
+    /// Resume carries these into the harness so the loaded prefix stays
+    /// compactable instead of being discarded as id-less (#375).
+    pub(crate) entry_ids: Vec<Option<String>>,
     /// Estimated token total of the rebuilt provider-visible context, summed
     /// from the persisted per-message [`estimate_tokens`] (recomputed from
     /// content for legacy entries). Deterministic from the on-disk transcript,
@@ -1032,9 +1039,14 @@ fn rebuild_with_compactions(
         let context_tokens = entries
             .iter()
             .fold(0u64, |acc, e| acc.saturating_add(e.tokens));
+        // No compaction: every entry stays verbatim, so its durable id carries
+        // through 1:1 (legacy id-less entries stay `None`). Parallel to
+        // `messages` so a resumed session can compact the loaded prefix.
+        let entry_ids = entries.iter().map(|e| e.id.clone()).collect();
         let messages = entries.into_iter().map(|e| e.message).collect();
         return Ok(RebuiltContext {
             messages,
+            entry_ids,
             context_tokens,
         });
     }
@@ -1083,6 +1095,14 @@ fn rebuild_with_compactions(
     }
 
     let mut messages = Vec::new();
+    // Parallel to `messages`: `None` at each summary position (a compaction
+    // entry, never itself re-coverable) and the verbatim entry's durable id
+    // otherwise. This mirrors the live `compact_range` layout
+    // (`wayland::Harness::compact_range`), so a resumed session ends with the
+    // identical `entry_ids` shape it would have had if it had compacted
+    // in-process -- the resumed prefix stays coverable and summaries still stop
+    // `plan_compaction` (no summary-of-summaries).
+    let mut entry_ids: Vec<Option<String>> = Vec::new();
     let mut context_tokens = 0u64;
     for (i, entry) in entries.into_iter().enumerate() {
         if let Some((summary, summary_tokens)) = summary_at[i].take() {
@@ -1092,16 +1112,19 @@ fn rebuild_with_compactions(
             // provider/local summarizer later changes how the text is produced,
             // not how storage or rebuild work.
             messages.push(Message::user(&summary));
+            entry_ids.push(None);
             // saturating: see the empty-compactions path above.
             context_tokens = context_tokens.saturating_add(summary_tokens);
         }
         if !covered[i] {
             context_tokens = context_tokens.saturating_add(entry.tokens);
             messages.push(entry.message);
+            entry_ids.push(entry.id);
         }
     }
     Ok(RebuiltContext {
         messages,
+        entry_ids,
         context_tokens,
     })
 }
@@ -1111,6 +1134,11 @@ fn rebuild_with_compactions(
 /// matches the messages it summed.
 struct RebuiltContext {
     messages: Vec<Message>,
+    /// Durable message ids parallel to `messages` (`entry_ids.len() ==
+    /// messages.len()`): `Some(id)` for a verbatim, coverable entry, `None` for
+    /// a summary position or a genuinely id-less legacy entry. Threaded to the
+    /// resume path so the loaded prefix stays compactable (#375).
+    entry_ids: Vec<Option<String>>,
     context_tokens: u64,
 }
 

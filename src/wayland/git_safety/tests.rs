@@ -432,7 +432,7 @@ fn session_swap_drops_approvals_without_settling() {
     );
 
     // A passive session swap (`/new`).
-    harness.swap_session(None, Vec::new(), 0);
+    harness.swap_session(None, Vec::new(), Vec::new(), 0);
 
     assert!(
         harness.git_safety.has_task(),

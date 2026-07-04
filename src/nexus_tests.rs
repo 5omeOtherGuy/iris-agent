@@ -5054,6 +5054,76 @@ fn manual_compact_covers_older_turns_and_keeps_recent_tail() -> Result<()> {
     Ok(())
 }
 
+/// Regression (#375): resuming an id-bearing session must carry the durable
+/// message ids into the harness, so the resumed prefix is compactable. Before
+/// the fix `swap_session` set `entry_ids = vec![None; resumed]`, so
+/// `plan_compaction` could never start on the resumed bulk and `/compact`
+/// (`compact_now`) no-oped -- a near-budget resumed session could never reclaim
+/// headroom. Here the whole context is the resumed prefix; with real ids the
+/// summary covers it and the context shrinks.
+#[test]
+fn resumed_session_prefix_is_compactable() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(4_000); // ~1k tokens per assistant reply
+
+    // Persist an id-bearing session, then read it back so its durable ids come
+    // from the real rebuild path (every entry `Some(id)`).
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let path = log.path().to_path_buf();
+    log.append(&Message::user("first prompt"))?;
+    log.append(&Message::assistant(&long))?;
+    log.append(&Message::user("second prompt"))?;
+    log.append(&Message::assistant(&long))?;
+    log.append(&Message::user("third prompt"))?;
+    log.append(&Message::assistant("tail answer"))?;
+    drop(log);
+
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present in store");
+    let stored = store.open(&meta)?;
+    let resumed = stored.messages.len();
+    assert!(
+        stored.entry_ids.iter().all(Option::is_some),
+        "an id-bearing session must read back real ids: {:?}",
+        stored.entry_ids
+    );
+
+    // Resume in-session (`/resume`) into a harness with auto-compaction off so
+    // only manual `/compact` exercises the resumed prefix.
+    let agent = Agent::new(FakeProvider::new(vec![]), crate::tools::built_in_tools());
+    let mut harness = Harness::new(agent, dir.path.clone(), ToolState::new(), None, None);
+    let resume_log = SessionLog::resume(&path)?;
+    harness.swap_session(Some(resume_log), stored.messages, stored.entry_ids, resumed);
+
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let before = harness.context_token_estimate();
+    block_on(harness.compact_now(&frontend, &CancellationToken::new()))?;
+    let after = harness.context_token_estimate();
+
+    assert!(
+        after < before,
+        "compaction must reclaim headroom from the resumed prefix ({before} -> {after})"
+    );
+    let messages = harness.messages();
+    assert!(
+        messages[0].content.starts_with("[auto-compacted summary"),
+        "the resumed prefix must collapse into a summary, got: {}",
+        messages[0].content
+    );
+    assert!(
+        messages.iter().any(|m| m.content == "tail answer"),
+        "the recent tail must stay verbatim"
+    );
+    assert!(
+        !messages.iter().any(|m| m.content == "first prompt"),
+        "the covered resumed turns must not remain verbatim"
+    );
+    Ok(())
+}
+
 #[test]
 fn manual_compact_on_in_memory_session_reports_why() -> Result<()> {
     let dir = crate::tools::test_support::temp_dir();
@@ -5899,7 +5969,8 @@ fn swap_session_switches_log_resets_context_and_cursor() -> Result<()> {
         Message::user("resumed prompt"),
         Message::assistant("resumed answer"),
     ];
-    harness.swap_session(Some(log_b), preload, 2);
+    let preload_ids = vec![Some("m0".to_string()), Some("m1".to_string())];
+    harness.swap_session(Some(log_b), preload, preload_ids, 2);
 
     // The agent context is now the resumed messages, not the pre-swap turn.
     let after_swap = harness.agent.messages();
