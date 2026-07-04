@@ -121,6 +121,17 @@ struct RowLayout {
     expanded_after: bool,
 }
 
+/// One `/find` match in the canonical transcript content, located by the
+/// logical row that owns it (`row`) and the physical sub-line offset within
+/// that row's wrapped lines (`sub`). Row-relative rather than an absolute
+/// visible-line index because expanding a fold to reveal the match shifts
+/// every visible line after it -- the visible index is resolved only after
+/// the reveal, via [`Transcript::reveal_and_locate`].
+pub(super) struct SearchMatch {
+    pub(super) row: usize,
+    pub(super) sub: usize,
+}
+
 #[derive(Default)]
 struct WrappedTranscriptCache {
     width: usize,
@@ -1854,41 +1865,79 @@ impl Transcript {
         }
     }
 
-    /// Case-insensitive substring search over the VISIBLE physical lines of
-    /// the wrap cache (folded-away content is not searched: a match the
-    /// pager cannot scroll to would be a dead jump). The cache is refreshed
-    /// at its current width first, so appends and fold changes since the last
-    /// frame are searched and stale lines are not. Returns ascending
-    /// visible-line indices. O(total visible lines) per invocation -- run per
+    /// Case-insensitive substring search over the CANONICAL transcript
+    /// content -- the full body of every panel, whether it is currently
+    /// folded or expanded ("search what is said, not what is shown"). The
+    /// collapsed-preview rows (`FoldVis::WhenCollapsed`: the head/tail excerpt
+    /// plus the `... N more lines` affordance) are skipped so a collapsed
+    /// panel does not double-count its preview against its full body; every
+    /// other row (`Always` + `WhenExpanded`) is real transcript text and is
+    /// searched even when a fold hides it. The cache is refreshed at its
+    /// current width first, so appends and fold changes since the last frame
+    /// are searched and stale lines are not. Returns matches in ascending
+    /// (row, sub-line) order, each identified by the logical row that owns it
+    /// so a jump can expand the enclosing fold before resolving a visible
+    /// line. O(total physical lines) per invocation -- run per
     /// `/find`/`n`/`N` keypress, never per frame.
-    pub(super) fn search_visible_lines(&mut self, query: &str) -> Vec<usize> {
+    pub(super) fn search_matches(&mut self, query: &str) -> Vec<SearchMatch> {
         let needle = query.to_lowercase();
         let width = self.wrapped_cache.width;
         if needle.is_empty() || width == 0 {
             return Vec::new();
         }
         // Same cache-warming path rendering uses: dirty rows re-wrap, fold
-        // visibility re-resolves.
+        // visibility re-resolves. Folded-away bodies are still rendered into
+        // the cache (only their visible-line accounting is suppressed), so
+        // their physical lines are here to search.
         self.ensure_wrapped_cache(width);
         let mut out = Vec::new();
-        let mut pos = 0usize;
-        for layout in &self.wrapped_cache.rows {
-            if !layout.visible {
+        for (row_idx, layout) in self.wrapped_cache.rows.iter().enumerate() {
+            if self.rows[row_idx].fold == FoldVis::WhenCollapsed {
                 continue;
             }
-            for line in &self.wrapped_cache.lines[layout.lines.clone()] {
+            for (sub, line) in self.wrapped_cache.lines[layout.lines.clone()]
+                .iter()
+                .enumerate()
+            {
                 let text: String = line
                     .spans
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect();
                 if text.to_lowercase().contains(&needle) {
-                    out.push(pos);
+                    out.push(SearchMatch { row: row_idx, sub });
                 }
-                pos += 1;
             }
         }
         out
+    }
+
+    /// Expand the fold enclosing logical `row` (when a collapsed panel hides
+    /// it) and return the visible physical-line index of the row's `sub`-th
+    /// wrapped line under the refreshed cache. The reveal is what makes a
+    /// `/find` jump into a collapsed panel land on a visible row instead of a
+    /// dead offset. `None` only when the row cannot be made visible (no
+    /// enclosing panel, or the cache does not cover it).
+    pub(super) fn reveal_and_locate(&mut self, row: usize, sub: usize) -> Option<usize> {
+        let hidden = self
+            .wrapped_cache
+            .rows
+            .get(row)
+            .is_some_and(|layout| !layout.visible);
+        if hidden
+            && let Some(header) = self
+                .panel_header_rows()
+                .into_iter()
+                .rev()
+                .find(|&header| header <= row)
+        {
+            self.set_panel_expanded_at(header, true);
+        }
+        // Re-warm after a possible expansion so the returned index matches the
+        // next frame's layout.
+        let width = self.wrapped_cache.width;
+        self.ensure_wrapped_cache(width);
+        Some(self.visible_line_of_row(row)? + sub)
     }
 
     /// Visible physical line index of logical `row` under the WARM wrap cache

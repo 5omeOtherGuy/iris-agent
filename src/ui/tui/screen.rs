@@ -615,8 +615,13 @@ pub(crate) struct SearchState {
     /// 1-based position of the current match, for the `k/N` indicator.
     pub(crate) position: usize,
     pub(crate) total: usize,
-    /// Visible-line index of the current match at the last jump.
+    /// Visible-line index of the current match at the last jump, resolved
+    /// after any fold reveal so the highlight lands on a rendered row.
     pub(crate) line: Option<usize>,
+    /// Identity of the current match as a `(row, sub-line)` pair, so `n`/`N`
+    /// re-anchor on the same match across transcript mutations and fold
+    /// reveals (which renumber visible lines).
+    anchor: Option<(usize, usize)>,
 }
 
 impl Screen {
@@ -663,6 +668,7 @@ impl Screen {
             position: 0,
             total: 0,
             line: None,
+            anchor: None,
         });
         self.scrollback_focus = true;
         self.search_step(0);
@@ -673,29 +679,42 @@ impl Screen {
     /// (re)select the newest match. Matches are recomputed against the current
     /// transcript; the jump target is queued for the next pager compose.
     pub(crate) fn search_step(&mut self, direction: isize) -> bool {
-        let Some(state) = self.search.as_mut() else {
+        let Some(state) = self.search.as_ref() else {
             return false;
         };
-        let matches = self.transcript.search_visible_lines(&state.query);
-        state.total = matches.len();
+        let query = state.query.clone();
+        let prev = state.anchor;
+        let matches = self.transcript.search_matches(&query);
+        let total = matches.len();
         if matches.is_empty() {
+            let state = self.search.as_mut().expect("search active");
+            state.total = 0;
             state.position = 0;
             state.line = None;
+            state.anchor = None;
             return false;
         }
-        // Re-anchor on the previous line where possible, else the newest match.
-        let anchor = state
-            .line
-            .and_then(|line| matches.iter().position(|&m| m >= line))
+        // Re-anchor on the previous match where possible, else the newest.
+        // Matches are sorted ascending by (row, sub), so this is stable across
+        // appends and fold reveals that renumber visible lines.
+        let anchor = prev
+            .and_then(|key| matches.iter().position(|m| (m.row, m.sub) >= key))
             .unwrap_or(matches.len() - 1);
         let index = match direction {
             0 => matches.len() - 1,
             d if d < 0 => anchor.saturating_sub(1),
             _ => (anchor + 1).min(matches.len() - 1),
         };
+        let (row, sub) = (matches[index].row, matches[index].sub);
+        // Reveal the fold if the match is hidden, then resolve its visible line
+        // against the refreshed layout so the jump lands on a rendered row.
+        let line = self.transcript.reveal_and_locate(row, sub);
+        let state = self.search.as_mut().expect("search active");
+        state.total = total;
         state.position = index + 1;
-        state.line = Some(matches[index]);
-        self.reveal_line = state.line;
+        state.anchor = Some((row, sub));
+        state.line = line;
+        self.reveal_line = line;
         true
     }
 

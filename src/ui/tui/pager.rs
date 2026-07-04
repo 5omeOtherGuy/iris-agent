@@ -150,12 +150,22 @@ impl ScrollState {
     /// viewport (selection keep-visible). A reveal that lands at the bottom
     /// re-engages follow; one that scrolls up disengages it.
     pub(in crate::ui) fn reveal(&mut self, line: usize) {
+        self.reveal_with_bottom_margin(line, 0);
+    }
+
+    /// Like [`Self::reveal`], but keeps `bottom_margin` rows clear below the
+    /// target. A `/find` jump reserves the one row the centered search
+    /// indicator overwrites (`body[view_rows - 1]`), so a match revealed near
+    /// the tail lands ABOVE the indicator and keeps its highlight instead of
+    /// being covered by it.
+    pub(in crate::ui) fn reveal_with_bottom_margin(&mut self, line: usize, bottom_margin: usize) {
         let top = self.top();
+        let view = self.view_rows.saturating_sub(bottom_margin);
         if line < top {
             self.top_offset = line;
             self.follow = false;
-        } else if self.view_rows > 0 && line >= top + self.view_rows {
-            self.top_offset = (line + 1 - self.view_rows).min(self.max_top);
+        } else if view > 0 && line >= top + view {
+            self.top_offset = (line + 1 - view).min(self.max_top);
             self.follow = self.top_offset >= self.max_top;
         }
     }
@@ -377,9 +387,13 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         screen.scroll.reveal(line);
     }
     // One-shot reveal queued by a search jump (`/find`, n/N): scroll the
-    // match into view without pinning the view there afterwards.
+    // match into view without pinning the view there afterwards. Reserve the
+    // bottom row the search indicator occupies so a tail-adjacent match is not
+    // hidden behind it.
     if let Some(line) = screen.reveal_line.take() {
-        screen.scroll.reveal(line.min(total.saturating_sub(1)));
+        screen
+            .scroll
+            .reveal_with_bottom_margin(line.min(total.saturating_sub(1)), 1);
     }
     let top = screen.scroll.top();
 
@@ -916,6 +930,86 @@ mod tests {
         let composed = compose_frame(&mut screen, Size::new(80, 24));
         let all = frame_rows(&composed.lines, 80, 24).join("\n");
         assert!(!all.contains("find"), "indicator cleared: {all}");
+    }
+
+    #[test]
+    fn find_matches_and_reveals_folded_panel_content() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        // A plain, always-visible match ABOVE the panel (oldest match).
+        screen.apply(UiEvent::Notice("needle visible".to_string()));
+        // A tool panel whose 40-line body collapses to a capped preview: the
+        // full body (and most matches) is folded away.
+        let long_output: String = (0..40).map(|i| format!("needle body {i}\n")).collect();
+        screen.apply(UiEvent::ToolResult {
+            call: tool_call(0),
+            content: long_output,
+            exit_code: Some(0),
+            duration: None,
+        });
+        let _ = compose_frame(&mut screen, Size::new(80, 24));
+        assert!(
+            screen.transcript.latest_panel_collapsed(),
+            "the tool panel starts collapsed"
+        );
+
+        // A match hidden inside the collapsed body is found. "needle body 20"
+        // is a single middle line -- searched despite being folded away, and
+        // NOT double-counted against the collapsed head/tail preview.
+        let total = screen
+            .start_search("needle body 20")
+            .expect("search active");
+        assert_eq!(total, 1, "exactly one hidden body line matches");
+        let line = screen.search.as_ref().unwrap().line;
+        assert!(
+            line.is_some(),
+            "the folded match resolves to a visible line"
+        );
+        assert!(
+            !screen.transcript.latest_panel_collapsed(),
+            "jumping into the fold expands the panel so the match is visible"
+        );
+        assert!(
+            line.unwrap() < screen.transcript_visible_total(80),
+            "the revealed match sits within the visible transcript"
+        );
+
+        // Count includes every hidden match: the plain notice plus all 40 body
+        // lines (preview duplicates excluded), never the head/tail preview.
+        let total = screen.start_search("needle").expect("search active");
+        assert_eq!(total, 41, "1 visible notice + 40 folded body lines");
+        let state = screen.search.as_ref().unwrap();
+        assert_eq!(state.position, 41, "starts at the newest (deepest) match");
+
+        // n walks older across folded then unfolded matches, clamping at the
+        // oldest (the plain notice).
+        for _ in 0..60 {
+            let _ = screen.search_step(-1);
+        }
+        assert_eq!(screen.search.as_ref().unwrap().position, 1);
+        let composed = compose_frame(&mut screen, Size::new(80, 24));
+        let body = frame_rows(&composed.lines, 80, 24)[2..].join("\n");
+        assert!(
+            body.contains("needle visible"),
+            "oldest match is the visible notice: {body}"
+        );
+        // N walks newer back into the folded body, clamping at the newest.
+        for _ in 0..60 {
+            let _ = screen.search_step(1);
+        }
+        assert_eq!(screen.search.as_ref().unwrap().position, 41);
+        let composed = compose_frame(&mut screen, Size::new(80, 24));
+        assert!(
+            composed.lines.iter().any(|line| line
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))),
+            "current folded match carries the surface highlight"
+        );
+
+        // Empty query still clears the search.
+        assert!(screen.start_search("   ").is_none());
+        assert!(screen.search.is_none());
     }
 
     #[test]
