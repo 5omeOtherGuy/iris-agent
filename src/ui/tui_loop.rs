@@ -510,7 +510,12 @@ fn perform_swap<P: ChatProvider>(
     }
     loaded.session_id.commit();
     let resumed = loaded.resumed;
-    harness.swap_session(loaded.session_log, loaded.messages, resumed);
+    harness.swap_session(
+        loaded.session_log,
+        loaded.messages,
+        loaded.entry_ids,
+        resumed,
+    );
     tui.reset_screen();
     tui.screen.apply(UiEvent::SessionStarted);
     let notice = match source {

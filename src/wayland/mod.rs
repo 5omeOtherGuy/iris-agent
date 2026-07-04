@@ -288,14 +288,21 @@ impl<P: ChatProvider> Harness<P> {
         &mut self,
         session: Option<SessionLog>,
         messages: Vec<Message>,
+        entry_ids: Vec<Option<String>>,
         resumed: usize,
     ) {
+        debug_assert!(entry_ids.len() == resumed);
         self.output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
         self.session = session;
         self.persisted = resumed;
-        self.entry_ids = vec![None; resumed];
+        // Carry the resumed messages' durable ids (parallel to `messages`, #375)
+        // instead of discarding them as id-less, so a near-budget resumed prefix
+        // is compactable by auto-compaction and `/compact`. Summary positions
+        // arrive as `None` (mirroring live `compact_range`), so
+        // `plan_compaction` still stops at them (no summary-of-summaries).
+        self.entry_ids = entry_ids;
         // Re-stamp the guard with the swapped-in session id (ADR-0031) so a task
         // adopted or continued after the swap records the new session.
         if let Some(log) = self.session.as_ref() {
