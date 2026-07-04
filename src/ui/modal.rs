@@ -241,7 +241,11 @@ fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'static>, bool)>
         };
         if let Some(enabled) = row.item.enabled {
             spans.push(Span::styled(
-                if enabled { "◉ " } else { "○ " },
+                if enabled {
+                    format!("{} ", crate::ui::symbols::ACTIVE)
+                } else {
+                    format!("{} ", crate::ui::symbols::EMPTY)
+                },
                 if enabled {
                     Style::default().fg(crate::ui::palette::ORANGE)
                 } else {
@@ -405,7 +409,10 @@ impl ModelPicker {
                 Style::default()
             };
             let marker = if qualified == self.current {
-                Span::styled("◉ ", Style::default().fg(crate::ui::palette::ORANGE))
+                Span::styled(
+                    format!("{} ", crate::ui::symbols::ACTIVE),
+                    Style::default().fg(crate::ui::palette::ORANGE),
+                )
             } else {
                 Span::raw("  ")
             };

@@ -7,6 +7,12 @@
 //! (every colored state is paired with one of these symbols *and* a label). Box
 //! -drawing frame characters (`┌ ┐ └ ┘ │ ─ ├ ┤`) are structural and stay inline
 //! in the panel renderers; only the state/marker vocabulary is centralized here.
+//!
+//! Boundary: single glyphs shared across renderers live here and call sites
+//! reference the constants. Composed frame/animation strings (e.g.
+//! `WORKING_FRAMES` in `src/ui/tui.rs`) are compositions, not vocabulary, and
+//! stay local; single-call-site decorations that appear in exactly one file
+//! (e.g. the `◉`/`○` radio marks in `src/ui/modal.rs`) may also stay local.
 
 /// `›` — the assistant transcript marker. Never a state dot.
 pub(crate) const ASSISTANT: &str = "\u{203a}";
