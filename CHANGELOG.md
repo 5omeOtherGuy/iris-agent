@@ -83,6 +83,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override and `iris update` a loopback-only `IRIS_UPDATE_RELEASES_API_URL`
   override for local validation. Prebuilt/crates.io installs still become usable
   only after the operator cuts the first public release.
+- Made model and reasoning switching token-efficient (ADR-0041): switches now
+  classify as reasoning-only (silent; the request prefix is unchanged), model
+  change, or provider change, and a model/provider switch carrying a large
+  context appends an advisory with the estimated tokens the new model will
+  re-read uncached and `/compact` as the way to shrink first. Foreign-origin
+  reasoning rows are no longer replayed to any provider after a switch (the
+  Anthropic lane previously downgraded them to text and the OpenAI-compatible
+  lane replayed them as assistant content, re-billing the old model's
+  chain-of-thought on every request); they stay persisted and display-visible.
+- Added provider-backed compaction summaries and a manual `/compact` command.
+  Compaction (auto and manual) now defaults to asking the active model for a
+  structured handoff summary (goal, state, key facts, next steps) that reuses
+  the cached context prefix; failures, empty answers, or non-shrinking
+  summaries fall back to the deterministic bounded excerpts, and Ctrl-C skips
+  compaction. `/compact` works in the TUI (turn-style spinner and cancel) and
+  the text path, keeps a small recent tail, reports the token shrink, and
+  needs no budget. New project-tunable setting: `compactionSummarizer`
+  (`provider` default, `excerpts` for the deterministic stand-in).
 
 - Added session shortcuts and pickers (issue #201): `iris -c`/`--continue`
   resumes the newest session for the current directory, `iris resume` opens the

@@ -41,6 +41,7 @@
 | [0038](0038-per-model-edit-surfaces-share-one-mutation-core.md) | Per-model edit surfaces share one mutation core | proposed | 2026-07-04 |
 | [0039](0039-freeform-tool-input-deltas-are-display-only.md) | Freeform tool-input deltas are display-only | proposed | 2026-07-04 |
 | [0040](0040-classified-tool-errors-carry-machine-readable-metadata.md) | Classified tool errors carry machine-readable metadata | accepted | 2026-07-04 |
+| [0041](0041-token-efficient-model-switching-and-provider-summaries.md) | Token-efficient model switching and provider-backed compaction summaries | accepted | 2026-07-02 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.
