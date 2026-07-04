@@ -1,0 +1,22 @@
+total 288
+drwxrwxr-x 7 someotherguy someotherguy  4096 Jul  5 01:24 .
+drwxrwxr-x 7 someotherguy someotherguy  4096 Jul  5 01:24 ..
+drwxrwxr-x 3 someotherguy someotherguy  4096 Jul  5 01:24 bash
+-rw-rw-r-- 1 someotherguy someotherguy  5216 Jul  5 01:24 bench_support.rs
+-rw-rw-r-- 1 someotherguy someotherguy 25138 Jul  5 01:24 edit.rs
+drwxrwxr-x 2 someotherguy someotherguy  4096 Jul  5 01:24 find_corpus
+-rw-rw-r-- 1 someotherguy someotherguy 26165 Jul  5 01:24 find.rs
+drwxrwxr-x 2 someotherguy someotherguy  4096 Jul  5 01:24 grep_corpus
+-rw-rw-r-- 1 someotherguy someotherguy 48693 Jul  5 01:24 grep.rs
+drwxrwxr-x 2 someotherguy someotherguy  4096 Jul  5 01:24 ls_corpus
+-rw-rw-r-- 1 someotherguy someotherguy 12758 Jul  5 01:24 ls.rs
+-rw-rw-r-- 1 someotherguy someotherguy 12719 Jul  5 01:24 mod.rs
+-rw-rw-r-- 1 someotherguy someotherguy  6678 Jul  5 01:24 observe.rs
+-rw-rw-r-- 1 someotherguy someotherguy  5170 Jul  5 01:24 path.rs
+-rw-rw-r-- 1 someotherguy someotherguy  6064 Jul  5 01:24 read_output.rs
+-rw-rw-r-- 1 someotherguy someotherguy 18099 Jul  5 01:24 read.rs
+-rw-rw-r-- 1 someotherguy someotherguy 29029 Jul  5 01:24 registry.rs
+drwxrwxr-x 3 someotherguy someotherguy  4096 Jul  5 01:24 skim
+-rw-rw-r-- 1 someotherguy someotherguy  9385 Jul  5 01:24 skim.rs
+-rw-rw-r-- 1 someotherguy someotherguy 16376 Jul  5 01:24 text.rs
+-rw-rw-r-- 1 someotherguy someotherguy  9251 Jul  5 01:24 write.rs
