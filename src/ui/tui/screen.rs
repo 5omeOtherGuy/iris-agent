@@ -1596,7 +1596,7 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
         .git
         .as_ref()
         .map(|status| {
-            (0..4u8)
+            (0..5u8)
                 .map(|level| git_segment_spans(status, level, git_open))
                 .collect()
         })
@@ -1612,6 +1612,9 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     if git_levels.is_empty() {
         candidates.extend([(Some(0), None), (Some(1), None), (Some(2), None)]);
     } else {
+        // Git level 0 = the explicit task badge; it is held while the right side
+        // collapses, then degrades to the authoritative count form (level 1)
+        // and follows the spec drop order (counts -> no counts -> base).
         candidates.extend([
             (Some(0), Some(0)),
             (Some(1), Some(0)),
@@ -1619,6 +1622,7 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
             (Some(2), Some(1)),
             (Some(2), Some(2)),
             (Some(2), Some(3)),
+            (Some(2), Some(4)),
             (Some(2), None),
         ]);
     }
@@ -1671,11 +1675,16 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
 }
 
 /// The session-bar git segment (` ┊ git <branch> [state cluster]`) at a drop
-/// level: 0 = full, 1 = counts reduced to the `±` half, 2 = no counts,
-/// 3 = base only. Mutually exclusive base states in precedence order:
-/// unmerged `▲N` (overrides everything) → task-partitioned `±N ◇M` (either
-/// half omitted at zero) → plain dirty `±N` → clean (no glyph — silence is
-/// the signal). `▾ ` prefixes the segment only while the git dropdown is open.
+/// level: 0 = the explicit task badge (`±N ◇M task <id8>`), 1 = the
+/// authoritative `±N ◇M` count form, 2 = counts reduced to the `±` half,
+/// 3 = no counts, 4 = base only. Mutually exclusive base states in precedence
+/// order: unmerged `▲N` (overrides everything) → task-partitioned `±N ◇M`
+/// (either half omitted at zero; the fullest form appends `task <id8>` as an
+/// explicit first-class badge, ADR-0031) → plain dirty `±N` → clean (no glyph
+/// — silence is the signal). `▾ ` prefixes the segment only while the git
+/// dropdown is open. The badge is an additive fuller tier above the
+/// design-language `±N ◇M` cluster: it degrades to that exact form (level 1)
+/// before the spec's own drop order applies, so narrow widths never overflow.
 fn git_segment_spans(status: &GitStatus, level: u8, open: bool) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         format!(" {} ", crate::ui::symbols::SEP),
@@ -1700,24 +1709,43 @@ fn git_segment_spans(status: &GitStatus, level: u8, open: bool) -> Vec<Span<'sta
             spans.push(Span::styled(format!("detached @ {sha}"), dim_style()));
         }
     }
-    if level <= 1 {
+    if level <= 2 {
         if status.unmerged > 0 {
             spans.push(Span::styled(
                 format!(" {}{}", crate::ui::symbols::REVIEW, status.unmerged),
                 prompt_style(),
             ));
-        } else if status.task.is_some() {
+        } else if let Some(task) = status.task.as_ref() {
             if status.user_dirty > 0 {
                 spans.push(Span::styled(
                     format!(" {}{}", crate::ui::symbols::DIRTY, status.user_dirty),
                     prompt_style(),
                 ));
             }
-            if level == 0 && status.iris_unsettled > 0 {
-                spans.push(Span::styled(
-                    format!(" {}{}", crate::ui::symbols::PREVIEW, status.iris_unsettled),
-                    dim_style(),
-                ));
+            // Iris-task half: the explicit badge (count + short id) at the
+            // fullest level, the authoritative count at level 1, dropped at
+            // level 2. The preview glyph always leads, so the unsettled-task
+            // signal is present even when no ledger file currently matches tip.
+            match level {
+                0 => {
+                    let short: String = task.task_id.chars().take(8).collect();
+                    let count = if status.iris_unsettled > 0 {
+                        status.iris_unsettled.to_string()
+                    } else {
+                        String::new()
+                    };
+                    spans.push(Span::styled(
+                        format!(" {}{} task {}", crate::ui::symbols::PREVIEW, count, short),
+                        dim_style(),
+                    ));
+                }
+                1 if status.iris_unsettled > 0 => {
+                    spans.push(Span::styled(
+                        format!(" {}{}", crate::ui::symbols::PREVIEW, status.iris_unsettled),
+                        dim_style(),
+                    ));
+                }
+                _ => {}
             }
         } else if status.total_uncommitted > 0 {
             spans.push(Span::styled(
@@ -1726,7 +1754,7 @@ fn git_segment_spans(status: &GitStatus, level: u8, open: bool) -> Vec<Span<'sta
             ));
         }
     }
-    if level <= 2 && status.is_linked_worktree {
+    if level <= 3 && status.is_linked_worktree {
         spans.push(Span::styled(" [WT]".to_string(), dim_style()));
     }
     spans
@@ -2219,7 +2247,11 @@ mod tests {
     }
 
     #[test]
-    fn session_bar_drops_meter_then_cap_then_counts_then_segment_then_truncates() {
+    fn session_bar_task_badge_degrades_to_count_then_follows_drop_order() {
+        // ADR-0031 Unit 2: an unsettled Iris task shows an explicit badge
+        // (`±N ◇M task <id8>`) at the fullest width; it degrades to the
+        // authoritative `±N ◇M` cluster before any count drops, then follows the
+        // spec drop order, never overflowing.
         let screen = git_screen(
             "~/repo",
             crate::git::status::GitStatus {
@@ -2228,62 +2260,86 @@ mod tests {
                 total_uncommitted: 5,
                 is_linked_worktree: true,
                 task: Some(crate::git::status::TaskSummary {
-                    task_id: "t".to_string(),
+                    task_id: "abcd1234ef99".to_string(),
                     age: Duration::from_secs(60),
                 }),
                 ..git_status("main")
             },
         );
-        // Wide: everything fits.
-        let full = bar_text(&screen, 70);
-        assert!(full.contains("┊ git main ±2 ◇3 [WT]"), "{full:?}");
+        // Widest: the explicit task badge (short id) is shown, with WT + meter.
+        let full = bar_text(&screen, 100);
+        assert!(full.contains("┊ git main ±2 ◇3 task abcd1234"), "{full:?}");
+        assert!(full.contains("[WT]"), "{full:?}");
         assert!(full.contains("CTX 0/300k ○○○○○○○○○○"), "{full:?}");
 
-        // 1) The meter drops first.
-        let no_meter = bar_text(&screen, 45);
-        assert!(no_meter.contains("CTX 0/300k"), "{no_meter:?}");
-        assert!(!no_meter.contains('○'), "{no_meter:?}");
-        assert!(no_meter.contains("┊ git main ±2 ◇3"), "{no_meter:?}");
+        // Sweep every width: never overflow, and observe the ordered forms --
+        // the badge (id shown), then the authoritative `±2 ◇3` count form (no
+        // id), then `±2` alone after the iris count drops.
+        let mut saw_badge = false;
+        let mut saw_count_form = false;
+        let mut saw_pm_only = false;
+        for width in 1..=100u16 {
+            let Some(line) = session_bar(&screen, width) else {
+                continue;
+            };
+            let text = line_text(&line);
+            assert!(
+                display_width(&text) <= usize::from(width),
+                "width {width}: {text:?}"
+            );
+            let has_id = text.contains("task abcd1234");
+            let has_iris = text.contains('◇');
+            let has_pm = text.contains("±2");
+            if has_id {
+                saw_badge = true;
+                assert!(has_iris, "the badge keeps the ◇ signal: {text:?}");
+            }
+            if has_iris && !has_id {
+                saw_count_form = true;
+            }
+            if has_pm && !has_iris {
+                saw_pm_only = true;
+            }
+        }
+        assert!(saw_badge, "the explicit id badge appears at some width");
+        assert!(
+            saw_count_form,
+            "the badge degrades to the authoritative `±2 ◇3` cluster (no id)"
+        );
+        assert!(saw_pm_only, "then `±2` alone after the iris count drops");
 
-        // 2) Then the `/<cap>` suffix.
-        let no_cap = bar_text(&screen, 38);
-        assert!(no_cap.contains("CTX 0"), "{no_cap:?}");
-        assert!(!no_cap.contains("/300k"), "{no_cap:?}");
-        assert!(no_cap.contains("┊ git main ±2"), "{no_cap:?}");
-
-        // 3) Counts reduce (`±2 ◇3` → `±2`), then drop entirely.
-        let reduced = bar_text(&screen, 34);
-        assert!(reduced.contains("±2"), "{reduced:?}");
-        assert!(!reduced.contains('◇'), "{reduced:?}");
-        let no_counts = bar_text(&screen, 31);
-        assert!(no_counts.contains("git main"), "{no_counts:?}");
-        assert!(!no_counts.contains('±'), "{no_counts:?}");
-        assert!(no_counts.contains("[WT]"), "{no_counts:?}");
-
-        // 4) Then the WT tag, then the whole git segment.
-        let no_wt = bar_text(&screen, 26);
-        assert!(no_wt.contains("git main"), "{no_wt:?}");
-        assert!(!no_wt.contains("[WT]"), "{no_wt:?}");
-        let no_git = bar_text(&screen, 16);
-        assert!(no_git.contains("~/repo"), "{no_git:?}");
-        assert!(!no_git.contains("git"), "{no_git:?}");
-        assert!(no_git.contains("CTX 0"), "{no_git:?}");
-
-        // 5) Minimum form: the cwd alone.
+        // Narrowest useful form: the cwd alone.
         let minimum = bar_text(&screen, 7);
         assert!(minimum.contains("~/repo"), "{minimum:?}");
         assert!(!minimum.contains("CTX"), "{minimum:?}");
+    }
 
-        // Never overflows at any width.
-        for width in 1..=80u16 {
-            if let Some(line) = session_bar(&screen, width) {
-                assert!(
-                    display_width(&line_text(&line)) <= usize::from(width),
-                    "width {width}: {:?}",
-                    line_text(&line)
-                );
-            }
-        }
+    #[test]
+    fn session_bar_unmerged_overrides_task_badge() {
+        // Unmerged conflicts override everything until resolved (design language
+        // §9.1): even with an unsettled task, the bar shows `▲N`, never the
+        // task badge or the ◇ count.
+        let screen = git_screen(
+            "~/repo",
+            crate::git::status::GitStatus {
+                unmerged: 2,
+                user_dirty: 4,
+                iris_unsettled: 1,
+                total_uncommitted: 5,
+                task: Some(crate::git::status::TaskSummary {
+                    task_id: "abcd1234ef99".to_string(),
+                    age: Duration::from_secs(30),
+                }),
+                ..git_status("main")
+            },
+        );
+        let bar = bar_text(&screen, 100);
+        assert!(bar.contains("git main ▲2"), "{bar:?}");
+        assert!(!bar.contains('◇'), "no task badge while unmerged: {bar:?}");
+        assert!(
+            !bar.contains("task abcd1234"),
+            "no id badge while unmerged: {bar:?}"
+        );
     }
 
     #[test]

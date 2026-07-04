@@ -984,15 +984,17 @@ fn route_command<P: ChatProvider>(
             Ok(RouteOutcome::Consumed)
         }
         "/tasks" if rest.is_empty() => {
-            // Open the resume-task picker over this workspace's recoverable Iris
-            // tasks (#288, ADR-0031). Selection adopts at the inter-turn
-            // boundary; adoption never implicitly resumes a session.
+            // Open the unified task surface (ADR-0031): the active (unsettled)
+            // task as a header plus this workspace's recoverable Iris tasks.
+            // Selection adopts a recoverable task at the inter-turn boundary;
+            // adoption never implicitly resumes a session. The active card is
+            // enriched with the git-status snapshot the session bar already holds.
             tui.screen.commit_user(prompt);
-            match picker::open_tasks(harness) {
+            match picker::build_tasks_modal(harness, tui.screen.footer_git()) {
                 Some(modal) => tui.screen.open_modal(modal),
                 None => apply_notices(
                     tui,
-                    vec!["No recoverable Iris tasks in this workspace.".to_string()],
+                    vec!["No active or recoverable Iris tasks in this workspace.".to_string()],
                 ),
             }
             Ok(RouteOutcome::Consumed)
@@ -1575,6 +1577,26 @@ async fn dispatch_action<P: ChatProvider>(
                         "could not adopt task {id}: it may have settled or been claimed by another process."
                     )],
                 ),
+            }
+        }
+        ModalAction::ViewTaskSessions(id) => {
+            // Show the task's linked sessions in the modal's detail view
+            // (ADR-0031 session lookup): the deterministic, bounded, cwd-scoped
+            // extraction, read for display/audit only -- never a recovery input.
+            // Rebuild the task modal (so leaving the detail returns to the list)
+            // and attach the fetched lines.
+            let lines = crate::cli::sessions_for_task_lines(harness.workspace(), &id);
+            match picker::build_tasks_modal(harness, tui.screen.footer_git()) {
+                Some(Modal::Tasks(mut picker)) => {
+                    picker.show_detail(&id, lines);
+                    tui.screen.open_modal(Modal::Tasks(picker));
+                }
+                // The task vanished (settled/adopted elsewhere) between opening
+                // the modal and here: surface the detail as notices and close.
+                _ => {
+                    tui.screen.close_modal();
+                    apply_notices(tui, lines);
+                }
             }
         }
         ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {

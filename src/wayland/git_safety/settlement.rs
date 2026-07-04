@@ -57,6 +57,16 @@ pub(crate) struct RecoverableTask {
     pub(crate) class: TaskClass,
 }
 
+impl RecoverableTask {
+    /// Whether this record predates the lease protocol (ADR-0030): an unknown
+    /// record adoptable only by explicit selection, marked as legacy in the UI.
+    /// Display-only classification; recovery policy uses the private [`TaskClass`]
+    /// directly and never this bool.
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self.class, TaskClass::Legacy)
+    }
+}
+
 #[cfg(test)]
 impl RecoverableTask {
     /// Construct a recoverable row for Tier-3 unit tests (`ui::picker`) without a
@@ -76,6 +86,19 @@ impl RecoverableTask {
             body: body.map(str::to_string),
             sessions: sessions.iter().map(|s| s.to_string()).collect(),
             class: TaskClass::Recoverable,
+        }
+    }
+
+    /// Construct a legacy row (no recorded body, `Legacy` class) for Tier-3 unit
+    /// tests that need the legacy marker without naming the private [`TaskClass`].
+    pub(crate) fn for_test_legacy(task_id: &str, age: Duration) -> Self {
+        RecoverableTask {
+            task_id: task_id.to_string(),
+            workspace: "/proj".to_string(),
+            age,
+            body: None,
+            sessions: Vec::new(),
+            class: TaskClass::Legacy,
         }
     }
 }

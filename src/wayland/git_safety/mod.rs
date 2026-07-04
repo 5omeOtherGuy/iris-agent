@@ -329,6 +329,21 @@ impl GitSafety {
             .map(|task| task.task_id.clone())
     }
 
+    /// Read-only display payload of the ACTIVE (live, unsettled) task, for the
+    /// unified task UI (ADR-0031): its id plus the opaque `body`/`sessions`
+    /// copy, mapped exactly as the recovery DTOs surface them. `None` when no
+    /// task is open. Display-only observation -- no enforcement path reads it,
+    /// and reading it never mutates task state.
+    pub(crate) fn active_task_display(&self) -> Option<ActiveTaskDisplay> {
+        let state = self.state.lock().unwrap();
+        let task = state.task.as_ref()?;
+        Some(ActiveTaskDisplay {
+            task_id: task.task_id.clone(),
+            body: task.body.clone(),
+            sessions: task.sessions.clone(),
+        })
+    }
+
     /// Number of ledger entries recorded in the current task (test-only).
     #[cfg(test)]
     pub(crate) fn ledger_len(&self) -> usize {
@@ -488,6 +503,17 @@ fn detect_mode(workspace: &Path) -> Mode {
                 .to_string(),
         )
     }
+}
+
+/// Read-only display payload of the active (live, unsettled) task, surfaced to
+/// the unified task UI (ADR-0031). Mirrors [`AdoptedTask`](settlement::AdoptedTask):
+/// opaque `body`/`sessions` display copy only, so the private [`Task`] never
+/// leaks past the harness. No enforcement or recovery path reads these fields.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveTaskDisplay {
+    pub(crate) task_id: String,
+    pub(crate) body: Option<String>,
+    pub(crate) sessions: Vec<String>,
 }
 
 /// Read-only view of one persisted (unsettled) Iris task, for the session-bar

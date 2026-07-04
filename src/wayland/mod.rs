@@ -370,6 +370,15 @@ impl<P: ChatProvider> Harness<P> {
         self.git_safety.current_task_id()
     }
 
+    /// Read-only display payload of the active (unsettled) task, for the unified
+    /// task UI (`/tasks`, ADR-0031): id plus the opaque `body`/`sessions` copy.
+    /// `None` when no task is open. The UI pairs this with the git-status
+    /// snapshot (file counts, age) it already holds. Display-only; never an
+    /// enforcement or recovery input.
+    pub(crate) fn active_task(&self) -> Option<git_safety::ActiveTaskDisplay> {
+        self.git_safety.active_task_display()
+    }
+
     /// The provider-visible conversation context, for read-only inspection
     /// (`/copy`, `/session`, `/debug`). Same view the persistence cursor walks.
     pub(crate) fn messages(&self) -> &[Message] {
