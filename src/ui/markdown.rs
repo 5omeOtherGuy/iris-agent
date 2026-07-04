@@ -27,7 +27,9 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ui::hyperlink;
-use crate::ui::textengine::{cluster_advance, display_width, truncate_to_width};
+use crate::ui::textengine::{
+    ZwjShaping, cluster_advance, display_width, normalize_zwj_with, truncate_to_width, zwj_shaping,
+};
 
 /// Indent applied per Markdown nesting level (list depth / blockquote).
 const INDENT: &str = "  ";
@@ -155,6 +157,18 @@ pub(crate) fn render_markdown_themed(
     theme: &MarkdownTheme,
     width: usize,
 ) -> Vec<Line<'static>> {
+    render_markdown_shaped(text, theme, width, zwj_shaping())
+}
+
+/// Shaping-parametrized core of [`render_markdown_themed`], split out so the ZWJ
+/// substitution wiring is testable with an explicit verdict instead of the
+/// process-wide global (issue #351).
+fn render_markdown_shaped(
+    text: &str,
+    theme: &MarkdownTheme,
+    width: usize,
+    shaping: ZwjShaping,
+) -> Vec<Line<'static>> {
     let mut renderer = Renderer::new(theme, width.max(1));
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
@@ -163,8 +177,11 @@ pub(crate) fn render_markdown_themed(
     // cannot be re-interpreted as genuine markers downstream (forgery ->
     // escape injection). Only markers this renderer constructs afterwards,
     // from sanitized URIs, are trusted.
-    let text = hyperlink::strip_foreign_markers(text);
-    for event in Parser::new_ext(&text, options) {
+    let stripped = hyperlink::strip_foreign_markers(text);
+    // Width-stabilize ZWJ emoji clusters when the startup probe found the
+    // terminal does not shape them (issue #351); a borrowed no-op otherwise.
+    let source = normalize_zwj_with(shaping, &stripped);
+    for event in Parser::new_ext(&source, options) {
         renderer.event(event);
     }
     renderer.finish()
@@ -1179,6 +1196,42 @@ mod tests {
                 display_width(&text_of(line)) <= DEFAULT_RENDER_WIDTH,
                 "table line exceeds width: {:?}",
                 text_of(line)
+            );
+        }
+    }
+
+    #[test]
+    fn render_substitutes_zwj_emoji_only_when_terminal_is_unshaped() {
+        // A ZWJ family cluster in markdown prose. On a non-shaping terminal the
+        // renderer collapses it to a single face (width-stable); a shaping or
+        // unknown terminal keeps it verbatim.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let man = "\u{1f468}";
+        let md = format!("a {family} b");
+        let theme = MarkdownTheme::default();
+
+        let unshaped = render_markdown_shaped(
+            &md,
+            &theme,
+            DEFAULT_RENDER_WIDTH,
+            ZwjShaping::Unshaped { actual: 6 },
+        );
+        let joined: String = unshaped.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains(man),
+            "expected substituted face: {joined:?}"
+        );
+        assert!(
+            !joined.contains(family),
+            "ZWJ cluster not substituted: {joined:?}"
+        );
+
+        for shaping in [ZwjShaping::Shaped, ZwjShaping::Unknown] {
+            let out = render_markdown_shaped(&md, &theme, DEFAULT_RENDER_WIDTH, shaping);
+            let joined: String = out.iter().map(text_of).collect::<Vec<_>>().join("\n");
+            assert!(
+                joined.contains(family),
+                "cluster changed for {shaping:?}: {joined:?}"
             );
         }
     }

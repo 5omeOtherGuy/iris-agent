@@ -12,6 +12,7 @@
 
 use crate::ui::symbols::{CANCELLED, DONE, REVIEW};
 use crate::ui::terminal_env::{TerminalEnv, tmux_probe};
+use crate::ui::textengine::{ZwjShaping, zwj_shaping};
 
 /// Environment snapshot the report is built from.
 #[derive(Debug, Default)]
@@ -32,6 +33,9 @@ pub(crate) struct DoctorEnv {
     pub(crate) tmux_set_clipboard: Option<String>,
     /// `tmux show -gv allow-passthrough` (tmux >= 3.3), likewise.
     pub(crate) tmux_allow_passthrough: Option<String>,
+    /// Runtime ZWJ emoji shaping verdict recorded by the startup probe
+    /// (issue #351). Reflects the live startup measurement, not a re-probe.
+    pub(crate) zwj_shaping: ZwjShaping,
 }
 
 /// Build the full report as transcript notice lines.
@@ -144,6 +148,26 @@ pub(crate) fn report(env: &DoctorEnv) -> Vec<String> {
         ));
     }
 
+    // Emoji ZWJ shaping (issue #351): whether the terminal's font joins ZWJ
+    // emoji sequences at the modeled 2-column width. Measured once at startup;
+    // on a non-shaping terminal Iris substitutes a single glyph in its own
+    // transcript, but cannot fix wide-emoji misalignment in other programs.
+    match env.zwj_shaping {
+        ZwjShaping::Shaped => {
+            lines.push(format!("{DONE} emoji ZWJ shaping: supported"));
+        }
+        ZwjShaping::Unshaped { .. } => {
+            lines.push(format!(
+                "{REVIEW} emoji ZWJ shaping: not shaped by this terminal (Iris substitutes a single glyph; wide emoji may still misalign in other programs)"
+            ));
+        }
+        ZwjShaping::Unknown => {
+            lines.push(format!(
+                "{REVIEW} emoji ZWJ shaping: unknown (probe unavailable, timed out, or skipped under a multiplexer)"
+            ));
+        }
+    }
+
     // OSC 8 hyperlinks: emitted unconditionally (terminals ignore unknown OSC
     // safely), so this is informational rather than a pass/fail probe. Widely
     // supported: kitty, WezTerm, iTerm2, foot, Ghostty, and VTE terminals
@@ -189,6 +213,10 @@ pub(crate) fn detect(kitty_keyboard: bool, pager_active: bool) -> DoctorEnv {
             None
         },
         term: shared.term,
+        // Live startup verdict from the rich-TTY probe (set-once global), not a
+        // re-probe -- mirrors how `kitty_keyboard`/`pager_active` reflect the
+        // negotiated session state.
+        zwj_shaping: zwj_shaping(),
     }
 }
 
@@ -252,6 +280,37 @@ mod tests {
         assert!(all.contains("set -g extended-keys on"));
         assert!(all.contains("set -as terminal-features ',xterm*:extkeys'"));
         assert!(all.contains("use Ctrl+J to insert a newline"));
+    }
+
+    #[test]
+    fn reports_zwj_shaping_for_all_three_probe_states() {
+        let supported = DoctorEnv {
+            zwj_shaping: ZwjShaping::Shaped,
+            ..plain()
+        };
+        assert!(
+            report(&supported)
+                .join("\n")
+                .contains("emoji ZWJ shaping: supported")
+        );
+
+        let unshaped = DoctorEnv {
+            zwj_shaping: ZwjShaping::Unshaped { actual: 6 },
+            ..plain()
+        };
+        let all = report(&unshaped).join("\n");
+        assert!(all.contains("not shaped by this terminal"), "{all}");
+        assert!(all.contains("substitutes a single glyph"), "{all}");
+
+        let unknown = DoctorEnv {
+            zwj_shaping: ZwjShaping::Unknown,
+            ..plain()
+        };
+        assert!(
+            report(&unknown)
+                .join("\n")
+                .contains("emoji ZWJ shaping: unknown (probe unavailable, timed out, or skipped under a multiplexer)")
+        );
     }
 
     #[test]
