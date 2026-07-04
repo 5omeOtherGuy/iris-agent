@@ -828,8 +828,18 @@ Potential scope:
   `raw: true` tool-param bypass, exit codes/footers untouched. Benchmarked on a
   committed corpus (`docs/benchmarks/adr-0037-bash-filter-tokens.md`): 68-89%
   token reduction on noisy classes, <10 ms overhead, zero loss of failure
-  detail (test-asserted). Deferred to PR 2: structured Rust filters for cargo
-  test/build, git status/diff/log, npm/pnpm test.]
+  detail (test-asserted). PR 2 shipped (completes #336): structured Rust
+  filters in `src/tools/bash/filter/structured/` for cargo test (per-binary
+  pass summaries; failures verbatim), cargo build/check/clippy (clean run ->
+  `ok`; diagnostics verbatim), git status (branch + tracking + per-file
+  state, hints dropped), git log (compact per-commit lines + `N commits`
+  summary), git diff (per-file stats; source hunks verbatim; only lockfile
+  churn elided), and npm/pnpm test (jest/vitest summary blocks; failure
+  blocks verbatim). Dispatched ahead of the TOML registry at the same seam,
+  all guards unchanged; a structured filter that cannot parse its output
+  declines to raw. Superseded interim TOML filters retired. Corpus-asserted
+  bars: cargo test pass >= 85%, git log >= 60%, git status >= 40%, git diff
+  lockfile churn >= 30%, npm/vitest pass >= 60%.]
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
 prompt tokens without reducing task success on at least one realistic workflow

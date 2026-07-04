@@ -1,0 +1,4 @@
+   Compiling gamma v0.1.0 (/tmp/fixgen336/ws/crates/gamma)
+   Compiling beta v0.1.0 (/tmp/fixgen336/ws/crates/beta)
+   Compiling alpha v0.1.0 (/tmp/fixgen336/ws/crates/alpha)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s

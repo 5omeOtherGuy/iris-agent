@@ -1,4 +1,4 @@
-# iris-authored (interim declarative filter; structured Rust filter is PR 2 of #336)
+# iris-authored (npm/pnpm/yarn install; not superseded by the #336 PR-2 structured filters)
 [filters.npm-install]
 description = "Compact npm/pnpm/yarn install output — strip deprecation/progress noise, keep the install summary, audit result, and errors"
 match_command = "^(npm|pnpm|yarn|bun)\\s+(install|i|ci|add|update|up)\\b"

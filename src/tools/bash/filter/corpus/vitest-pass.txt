@@ -1,0 +1,9 @@
+
+ RUN  v4.1.9 /tmp/fixgen336/js
+
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  18:08:42
+   Duration  256ms (transform 33ms, setup 0ms, import 59ms, tests 5ms, environment 0ms)
+

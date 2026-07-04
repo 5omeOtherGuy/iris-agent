@@ -1,12 +1,14 @@
 //! Benchmark and quality-loss corpus for the output filter (ADR-0037).
 //!
 //! Fixtures under `corpus/` are captured outputs of real command runs (cargo,
-//! git, jest via npm, npm install, shellcheck). Three test classes enforce the
-//! ADR-0036 acceptance bar:
-//! - noisy classes (test runs, install logs) must lose >= 60% of estimated
-//!   tokens;
-//! - failure samples must keep error messages, file:line references, and
-//!   failing test names verbatim (zero quality loss);
+//! git, jest/vitest via npm, npm install, shellcheck). Three test classes
+//! enforce the ADR-0036 acceptance bar:
+//! - noisy classes must hit their minimum reduction bars (60% default;
+//!   per-class bars from #336 PR 2: cargo test pass >= 85, git log >= 60,
+//!   git status >= 40, git diff lockfile churn >= 30, npm test pass >= 60);
+//! - failure samples must keep error messages, file:line references,
+//!   failing test names, and non-lockfile diff hunks verbatim (zero quality
+//!   loss);
 //! - per-sample filter overhead must stay under 10 ms.
 //!
 //! `corpus_benchmark_report` prints the per-class table behind the committed
@@ -33,8 +35,8 @@ struct Sample {
     min_reduction: Option<u32>,
     /// Content that must survive filtering verbatim.
     must_contain: &'static [&'static str],
-    /// True when no PR-1 filter covers the class (structured filters are
-    /// PR 2): the output must pass through untouched.
+    /// True when no filter deliberately covers the class: the output must
+    /// pass through untouched (honesty proof for the report).
     expect_passthrough: bool,
 }
 
@@ -45,8 +47,25 @@ fn samples() -> Vec<Sample> {
             command: "cargo test",
             raw: include_str!("corpus/cargo-test-pass.txt"),
             exit_ok: true,
-            min_reduction: Some(60),
-            must_contain: &["test result: ok. 48 passed; 0 failed"],
+            min_reduction: Some(85),
+            must_contain: &[
+                "unittests src/lib.rs (passcrate): ok. 48 passed",
+                "cargo test: ok. 48 passed",
+            ],
+            expect_passthrough: false,
+        },
+        Sample {
+            class: "cargo test (pass, workspace)",
+            command: "cargo test",
+            raw: include_str!("corpus/cargo-test-multi-pass.txt"),
+            exit_ok: true,
+            min_reduction: Some(85),
+            must_contain: &[
+                "unittests src/lib.rs (alpha): ok. 2 passed",
+                "unittests src/lib.rs (beta): ok. 2 passed",
+                "unittests src/lib.rs (gamma): ok. 2 passed",
+                "cargo test: ok. 6 passed (6 suites",
+            ],
             expect_passthrough: false,
         },
         Sample {
@@ -82,6 +101,27 @@ fn samples() -> Vec<Sample> {
             expect_passthrough: false,
         },
         Sample {
+            class: "cargo build (pass)",
+            command: "cargo build",
+            raw: include_str!("corpus/cargo-build-pass.txt"),
+            exit_ok: true,
+            min_reduction: Some(60),
+            must_contain: &["ok"],
+            expect_passthrough: false,
+        },
+        Sample {
+            class: "cargo check (warnings)",
+            command: "cargo check",
+            raw: include_str!("corpus/cargo-check-warn.txt"),
+            exit_ok: true,
+            min_reduction: None,
+            must_contain: &[
+                "warning: unused variable: `unused`",
+                "--> crates/beta/src/lib.rs:1:41",
+            ],
+            expect_passthrough: false,
+        },
+        Sample {
             class: "git status",
             command: "git status",
             raw: include_str!("corpus/git-status.txt"),
@@ -89,30 +129,62 @@ fn samples() -> Vec<Sample> {
             min_reduction: None,
             must_contain: &[
                 "On branch feat/bash-output-filtering",
-                "modified:   src/tools/bash/mod.rs",
+                "modified: src/tools/bash/mod.rs",
                 "src/tools/bash/filter/",
             ],
             expect_passthrough: false,
         },
         Sample {
-            class: "git diff",
+            class: "git diff (source-heavy)",
             command: "git diff HEAD~2 HEAD~1",
             raw: include_str!("corpus/git-diff.txt"),
             exit_ok: true,
+            // Only lockfile churn may be reduced; source hunks are signal
+            // and stay verbatim, so no bar on a source-heavy diff.
             min_reduction: None,
-            must_contain: &[],
-            // Diff hunks are the signal; declarative stripping cannot reduce
-            // them safely. Structured summarizing is PR 2 of #336.
-            expect_passthrough: true,
+            must_contain: &[
+                "Cargo.lock +57/-3 (lockfile, hunks omitted)",
+                "diff --git a/src/ui/highlight.rs b/src/ui/highlight.rs",
+                "@@ -0,0 +1,313 @@",
+                "+//! Syntax highlighter for fenced Markdown code blocks (Tier 3).",
+            ],
+            expect_passthrough: false,
+        },
+        Sample {
+            class: "git diff (lockfile churn)",
+            command: "git diff",
+            raw: include_str!("corpus/git-diff-lockfile.txt"),
+            exit_ok: true,
+            min_reduction: Some(30),
+            must_contain: &[
+                "package-lock.json +14/-0 (lockfile, hunks omitted)",
+                "-module.exports = function pad5(s) { return leftPad(s, 5); };",
+                "+module.exports = function pad5(s) { return leftPad(String(s), 5); };",
+                "+    \"inherits\": \"^2.0.4\",",
+            ],
+            expect_passthrough: false,
         },
         Sample {
             class: "git log",
             command: "git log -n 12",
             raw: include_str!("corpus/git-log.txt"),
             exit_ok: true,
+            min_reduction: Some(60),
+            must_contain: &[
+                "c8e2dbba docs(adr): token-efficient tools by design (0036) and native bash output filtering (0037) (#342)",
+                "12 commits by dangerouslyskippermissions on 2026-07-04",
+            ],
+            expect_passthrough: false,
+        },
+        Sample {
+            class: "git log --oneline",
+            command: "git log --oneline -n 12",
+            raw: include_str!("corpus/git-log-oneline.txt"),
+            exit_ok: true,
             min_reduction: None,
             must_contain: &[],
-            // Structured summarizing is PR 2 of #336.
+            // Already compact and not default-format: the structured filter
+            // declines and the output passes through untouched.
             expect_passthrough: true,
         },
         Sample {
@@ -139,6 +211,31 @@ fn samples() -> Vec<Sample> {
                 "at Object.toBe (src/api.test.js:2:47)",
                 "at Object.toBe (src/api.test.js:3:55)",
                 "Tests:       2 failed, 3 passed, 5 total",
+            ],
+            expect_passthrough: false,
+        },
+        Sample {
+            class: "vitest (pass)",
+            command: "npx vitest run",
+            raw: include_str!("corpus/vitest-pass.txt"),
+            exit_ok: true,
+            min_reduction: Some(60),
+            must_contain: &["Test Files  1 passed (1)", "Tests  3 passed (3)"],
+            expect_passthrough: false,
+        },
+        Sample {
+            class: "vitest (fail)",
+            command: "npx vitest run",
+            raw: include_str!("corpus/vitest-fail.txt"),
+            exit_ok: false,
+            min_reduction: None,
+            must_contain: &[
+                "FAIL  sum.test.mjs > sum > adds negatives",
+                "AssertionError: expected -5 to be -6 // Object.is equality",
+                "sum.test.mjs:6:52",
+                "AssertionError: expected 'Hello' to be 'HELLO' // Object.is equality",
+                "sum.test.mjs:9:50",
+                "Tests  2 failed | 1 passed (3)",
             ],
             expect_passthrough: false,
         },
@@ -202,7 +299,7 @@ fn corpus_uncovered_classes_pass_through_untouched() {
         }
         assert!(
             filter_output(sample.command, sample.raw, sample.exit_ok).is_none(),
-            "[{}] expected passthrough (no PR-1 filter for this class)",
+            "[{}] expected passthrough (class deliberately uncovered)",
             sample.class,
         );
     }
