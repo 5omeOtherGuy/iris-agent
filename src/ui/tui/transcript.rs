@@ -19,7 +19,7 @@ use super::panel::{
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
 use super::text::ansi_spans;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
-use super::wrap::{display_width, line_text};
+use super::wrap::line_text;
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TRANSCRIPT_ROWS,
     TEXT_COLUMN_X_PADDING, dim_style, err_style, format_elapsed_compact, ok_style, panel_style,
@@ -93,17 +93,6 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
         chrome: None,
         searchable: true,
     }
-}
-
-/// Pad `left` so `right` hugs the right edge of a `width`-column field; drops
-/// `right` when the field is too narrow rather than overflowing.
-fn right_align_pair(left: &str, right: &str, width: usize) -> String {
-    let left_w = display_width(left);
-    let right_w = display_width(right);
-    if left_w + 2 + right_w > width {
-        return left.to_string();
-    }
-    format!("{left}{}{right}", " ".repeat(width - left_w - right_w))
 }
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
@@ -416,7 +405,13 @@ impl Transcript {
         if foldable {
             let plural = if hidden == 1 { "" } else { "s" };
             let left = format!("\u{2026} {hidden} more paragraph{plural}");
-            let text = right_align_pair(&left, "ctrl+o to expand", self.markdown_content_width());
+            let text = super::rows::right_align(
+                &left,
+                "ctrl+o to expand",
+                self.markdown_content_width(),
+                2,
+                super::rows::Overflow::KeepLeft,
+            );
             self.rows
                 .push(TranscriptRow::new(text, dim_style()).with_fold(FoldVis::WhenCollapsed));
         }

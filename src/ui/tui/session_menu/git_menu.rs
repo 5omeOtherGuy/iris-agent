@@ -19,7 +19,7 @@ use super::super::wrap::truncate_line;
 use super::super::{dim_style, err_style, prompt_style};
 use super::{
     MenuAction, MenuKey, MenuOutcome, cap_block, dim_lines, footer_hints, fuzzy_match, group_label,
-    home_rel, input_row, internal_rule, match_count, menu_row, readonly_footer,
+    home_rel, input_row, internal_rule, match_count, menu_row, readonly_footer, step_wrapped,
 };
 
 /// Visible branch rows in the SWITCH group.
@@ -203,8 +203,7 @@ impl GitMenu {
         if rows == 0 {
             return MenuOutcome::Ignore;
         }
-        let current = self.selected.min(rows - 1) as isize;
-        self.selected = (current + delta).rem_euclid(rows as isize) as usize;
+        self.selected = step_wrapped(self.selected, rows, delta);
         MenuOutcome::Redraw
     }
 
@@ -389,7 +388,7 @@ impl GitMenu {
             }
             MenuKey::Up | MenuKey::Down if !points.is_empty() => {
                 let delta: isize = if key == MenuKey::Up { -1 } else { 1 };
-                let next = (selected as isize + delta).rem_euclid(points.len() as isize) as usize;
+                let next = step_wrapped(selected, points.len(), delta);
                 self.mode = Mode::Rollback {
                     points,
                     selected: next,
@@ -490,8 +489,7 @@ impl GitMenu {
                 let matches = self.filter_matches(&input);
                 if !matches.is_empty() {
                     let delta: isize = if key == MenuKey::Up { -1 } else { 1 };
-                    selected =
-                        (selected as isize + delta).rem_euclid(matches.len() as isize) as usize;
+                    selected = step_wrapped(selected, matches.len(), delta);
                 }
             }
             MenuKey::Enter => {

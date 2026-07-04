@@ -19,7 +19,7 @@ use super::super::wrap::truncate_line;
 use super::super::{dim_style, prompt_style};
 use super::{
     MenuAction, MenuKey, MenuOutcome, cap_block, dim_lines, footer_hints, fuzzy_match, home_rel,
-    input_row, internal_rule, match_count, menu_row, readonly_footer,
+    input_row, internal_rule, match_count, menu_row, readonly_footer, step_wrapped,
 };
 
 /// Hard cap on visible rows (a dim `… N more` row follows).
@@ -310,8 +310,7 @@ impl TreeMenu {
         if rows.is_empty() {
             return MenuOutcome::Ignore;
         }
-        let current = self.selected.min(rows.len() - 1) as isize;
-        self.selected = (current + delta).rem_euclid(rows.len() as isize) as usize;
+        self.selected = step_wrapped(self.selected, rows.len(), delta);
         MenuOutcome::Redraw
     }
 
@@ -389,7 +388,7 @@ impl TreeMenu {
                 let count = self.filter_matches(&input).len();
                 if count > 0 {
                     let delta: isize = if key == MenuKey::Up { -1 } else { 1 };
-                    selected = (selected as isize + delta).rem_euclid(count as isize) as usize;
+                    selected = step_wrapped(selected, count, delta);
                 }
             }
             MenuKey::Enter => {
