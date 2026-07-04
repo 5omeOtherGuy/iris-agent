@@ -113,6 +113,9 @@ struct ActiveExec {
     output: String,
     body_start: usize,
     started: Instant,
+    /// Explicit user fold intent (ctrl+o/selection/click), preserved across
+    /// in-place rebuilds so a finalized block honors the user, not its default.
+    user_expanded: Option<bool>,
 }
 
 struct ActiveExploration {
@@ -129,6 +132,8 @@ struct ActiveTool {
     call: ToolCall,
     body_start: usize,
     started: Instant,
+    /// Explicit user fold intent; see [`ActiveExec::user_expanded`].
+    user_expanded: Option<bool>,
 }
 
 /// The open EDIT panel for a mutation whose diff arrived via `DiffPreview`.
@@ -139,6 +144,8 @@ struct ActiveEdit {
     diff: String,
     body_start: usize,
     started: Option<Instant>,
+    /// Explicit user fold intent; see [`ActiveExec::user_expanded`].
+    user_expanded: Option<bool>,
 }
 
 /// Cached layout for one logical row: the physical-line range it wraps to plus
@@ -253,9 +260,20 @@ pub(super) struct Transcript {
     user_prompt_starts: Vec<usize>,
     /// Per-tool-call token diagnostics (`↑sent ↓received ┊ cache ┊ ctx`),
     /// keyed by call id and rendered right-bound in the block footer. Numbers
-    /// are honest: entries exist only when a source measured them, so most
-    /// footers carry no diagnostics today.
+    /// are honest: entries exist only when the runtime measured them.
     tool_diags: std::collections::HashMap<String, ToolDiag>,
+    /// Diagnostics for the in-flight provider turn, built from its reported
+    /// usage on `ProviderTurnCompleted` and stamped onto every tool call that
+    /// turn proposes. `None` until the turn reports usage; reset each turn start.
+    current_turn_diag: Option<ToolDiag>,
+    /// `input_tokens` of the previous completed provider turn, so the next
+    /// turn's `ctx` field can report signed context growth. `None` before the
+    /// first completed turn (no prior turn to diff against).
+    last_turn_input_tokens: Option<u64>,
+    /// Context-window cap in tokens (same source as the session-bar meter),
+    /// used to scale the `ctx` growth delta into a percentage. `None` when the
+    /// model's window is unknown, in which case `ctx` is omitted.
+    context_cap: Option<u64>,
 }
 
 impl Transcript {
@@ -581,10 +599,11 @@ impl Transcript {
     /// Push a complete frameless tool block (header · hanging body · hairline
     /// footer) to `self.rows`, with the body produced by the renderer registry
     /// under failure isolation. Collapse is binary: the whole body folds
-    /// behind the header's disclosure and the footer stays. Blocks arrive
-    /// expanded, except that an over-budget body arrives collapsed (the flood
-    /// guard: header + footer still answer what ran · outcome · cost, and
-    /// ctrl+o reveals the full output). This is the single dispatch path for
+    /// behind the header's disclosure and the footer stays. Compact by
+    /// default: every block arrives COLLAPSED (header + footer answer what
+    /// ran · outcome · cost) except a RUNNING block, which stays expanded so
+    /// its live tail is watchable and collapses on finalize unless the user
+    /// explicitly expanded it. This is the single dispatch path for
     /// SHELL/EDIT/generic blocks; EXPLORE keeps its grouped path.
     fn append_tool_panel(
         &mut self,
@@ -600,19 +619,10 @@ impl Transcript {
         for row in &mut body {
             row.fold = FoldVis::WhenExpanded;
         }
-        // Physical-row estimate at the current wrap width, so a single very
-        // long line counts as the rows it will actually occupy. The wrap width
-        // is one cell narrower than the true body content width, so the
-        // estimate errs toward folding — never toward flooding.
-        let width = self.wrap_width();
-        let physical: usize = body
-            .iter()
-            .map(|row| super::wrap::wrapped_row_estimate(&row.text, width))
-            .sum();
-        // Running blocks stay expanded (the live tail is already bounded);
-        // an explicit user collapse survives via the rebuild's reveal state.
-        let expanded = matches!(outcome, ToolOutcome::Running { .. })
-            || physical <= super::MAX_TOOL_OUTPUT_ROWS;
+        // Compact by default: only a RUNNING block arrives expanded (its live
+        // tail is already flood-bounded). Finalized blocks arrive collapsed;
+        // an explicit user expand is reapplied by the rebuild path.
+        let expanded = matches!(outcome, ToolOutcome::Running { .. });
         self.push_tool_header(renderer, call, state, duration, started, expanded);
         self.rows.extend(body);
         let extras = renderer.footer_extras(call, &outcome);
@@ -680,14 +690,80 @@ impl Transcript {
 
     /// Record per-call token diagnostics for a tool call's footer. The values
     /// are preformatted, runtime-measured strings; blocks rendered after this
-    /// call carry them right-bound in the footer. The seam for a future usage
-    /// source — nothing in the runtime measures per-call tokens yet.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "diag contract seam; no runtime source yet")
-    )]
+    /// call carry them right-bound in the footer. Bounded: a finalized footer
+    /// bakes its own `right` string, so the map is only consulted at build
+    /// time; clearing it never disturbs a rendered footer. A single very long
+    /// session cannot grow it without bound.
     pub(super) fn set_tool_diag(&mut self, call_id: &str, diag: ToolDiag) {
+        if self.tool_diags.len() >= 1024 {
+            self.tool_diags.clear();
+        }
         self.tool_diags.insert(call_id.to_string(), diag);
+    }
+
+    /// Set the context-window cap (tokens) used to scale the `ctx` growth
+    /// delta, mirroring the session-bar meter's source.
+    pub(super) fn set_context_cap(&mut self, cap: Option<u64>) {
+        self.context_cap = cap;
+    }
+
+    /// Build the proposing turn's footer diagnostics from its reported usage:
+    /// `↑` fresh (non-cached) input processed this turn, `↓` tokens generated
+    /// this turn, `cache` prompt-cache reads (omitted when zero), and the
+    /// signed `ctx` growth delta against the previous turn (omitted without a
+    /// prior turn or cap). `ProviderUsage` docs state cache reads are already
+    /// counted in `input_tokens`, so fresh input subtracts them out; the finest
+    /// honest granularity is the turn, so when one turn proposes several tool
+    /// calls they share these numbers (the runtime cannot split finer).
+    fn build_turn_diag(&self, usage: &ProviderUsage) -> ToolDiag {
+        let fresh_input = usage
+            .input_tokens
+            .saturating_sub(usage.cache_read_input_tokens);
+        let cache = (usage.cache_read_input_tokens > 0)
+            .then(|| super::screen::compact_count(usage.cache_read_input_tokens));
+        ToolDiag {
+            sent: Some(super::screen::compact_count(fresh_input)),
+            received: Some(super::screen::compact_count(usage.output_tokens)),
+            cache,
+            ctx: self.context_growth_pct(usage.input_tokens),
+        }
+    }
+
+    /// Signed context-growth percentage: this turn's `input_tokens` minus the
+    /// previous turn's, as a fraction of the context cap (`"+0.9%"`). `None`
+    /// without a prior turn or a known cap — never a fabricated delta.
+    fn context_growth_pct(&self, input_tokens: u64) -> Option<String> {
+        let prev = self.last_turn_input_tokens?;
+        let cap = self.context_cap.filter(|&cap| cap > 0)?;
+        let delta = input_tokens as i64 - prev as i64;
+        let pct = delta as f64 / cap as f64 * 100.0;
+        Some(format!("{pct:+.1}%"))
+    }
+
+    /// Call ids of every in-flight tool block, so the tools-first event order
+    /// (a `ToolStarted` that precedes its turn's `ProviderTurnCompleted`) still
+    /// stamps the diagnostics onto the already-open footers.
+    fn active_call_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        if let Some(active) = &self.active_exec {
+            ids.push(active.call.id.clone());
+        }
+        if let Some(active) = &self.active_tool {
+            ids.push(active.call.id.clone());
+        }
+        if let Some(active) = &self.active_edit {
+            ids.push(active.call_id.clone());
+        }
+        ids.extend(self.active_explorations.iter().map(|a| a.call_id.clone()));
+        ids
+    }
+
+    /// Stamp the current turn's diagnostics onto a newly-known call, if the
+    /// turn reported usage.
+    fn assign_turn_diag(&mut self, call_id: &str) {
+        if let Some(diag) = self.current_turn_diag.clone() {
+            self.set_tool_diag(call_id, diag);
+        }
     }
 
     fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
@@ -803,6 +879,7 @@ impl Transcript {
             output: String::new(),
             body_start,
             started,
+            user_expanded: None,
         });
     }
 
@@ -823,6 +900,7 @@ impl Transcript {
             call,
             body_start,
             started,
+            user_expanded: None,
         });
     }
 
@@ -843,9 +921,11 @@ impl Transcript {
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
         let diff_rows = diff_table_rows(diff);
-        // Flood guard: an over-budget diff arrives collapsed; ctrl+o reveals
-        // the full DiffBlock body.
-        let expanded = diff_rows.len() <= super::MAX_TOOL_OUTPUT_ROWS;
+        // EXCEPTION to compact-by-default: a pending EDIT preview exists to be
+        // reviewed, so it (and the running edit) arrives EXPANDED; it collapses
+        // once the edit is finalized (state Done/Error). An explicit user fold
+        // is reapplied by the rebuild path.
+        let expanded = matches!(state, PanelState::Preview | PanelState::Running);
         self.push_panel_header_with_expanded(
             PanelHeaderSpec {
                 title: "EDIT",
@@ -975,6 +1055,7 @@ impl Transcript {
             diff,
             body_start,
             started: None,
+            user_expanded: None,
         });
     }
 
@@ -1005,7 +1086,7 @@ impl Transcript {
             this.push_edit_panel(call, &diff, state, duration, started, error);
         });
         let end = self.panel_end_from(active.body_start);
-        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+        if let Some(expanded) = active.user_expanded {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
         self.mark_dirty_from(active.body_start);
@@ -1032,27 +1113,10 @@ impl Transcript {
         self.panel_end_from(active.body_start)
     }
 
-    /// The fold state to carry across an in-place block rebuild. Only an
-    /// explicit COLLAPSE survives: a collapsed block stays collapsed through
-    /// lifecycle rewrites, while an expanded one lets the fresh block apply
-    /// its own arrival default (e.g. a finalized over-budget body arriving
-    /// collapsed as the flood guard).
-    fn panel_reveal_state_in(&self, start: usize, end: usize) -> Option<bool> {
-        if !self.rows[start..end]
-            .iter()
-            .any(|row| row.fold != FoldVis::Always)
-        {
-            return None;
-        }
-        self.rows[start..end]
-            .iter()
-            .find_map(|row| match row.chrome.as_ref() {
-                Some(ChromeRow::Header { expanded, .. }) => Some(*expanded),
-                _ => None,
-            })
-            .filter(|expanded| !expanded)
-    }
-
+    /// Reapply an active block's recorded fold state (`user_expanded`) onto a
+    /// fresh in-place rebuild. Only an explicit user toggle survives across
+    /// running -> done / preview -> done; otherwise the fresh block keeps its
+    /// compact-by-default arrival state.
     fn preserve_panel_expanded(replacement: &mut [TranscriptRow], expanded: bool) {
         if let Some(row_expanded) =
             replacement
@@ -1072,7 +1136,7 @@ impl Transcript {
         mut replacement: Vec<TranscriptRow>,
     ) {
         let end = self.active_tool_panel_end(active);
-        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+        if let Some(expanded) = active.user_expanded {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
         self.mark_dirty_from(active.body_start);
@@ -1089,7 +1153,7 @@ impl Transcript {
         mut replacement: Vec<TranscriptRow>,
     ) {
         let end = self.active_exec_panel_end(active);
-        if let Some(expanded) = self.panel_reveal_state_in(active.body_start, end) {
+        if let Some(expanded) = active.user_expanded {
             Self::preserve_panel_expanded(&mut replacement, expanded);
         }
         self.mark_dirty_from(active.body_start);
@@ -1600,10 +1664,21 @@ impl Transcript {
                 self.provider_turn_started = Some(Instant::now());
                 self.thinking_header_row = None;
                 self.thinking_elapsed = None;
+                self.current_turn_diag = None;
             }
             UiEvent::ProviderTurnCompleted { usage, .. } => {
                 if let Some(usage) = usage {
                     self.set_thinking_telemetry(usage.reasoning_output_tokens);
+                    let diag = self.build_turn_diag(&usage);
+                    // Compute the ctx delta first, then advance the baseline.
+                    self.last_turn_input_tokens = Some(usage.input_tokens);
+                    // Common order: this completes before its tools start, so
+                    // the stored diag is stamped on later `ToolStarted`s. Also
+                    // cover the tools-first order by stamping any open call now.
+                    for id in self.active_call_ids() {
+                        self.set_tool_diag(&id, diag.clone());
+                    }
+                    self.current_turn_diag = Some(diag);
                 }
             }
             UiEvent::CompactionApplied {
@@ -1677,22 +1752,32 @@ impl Transcript {
             }
             UiEvent::SessionStarted => {
                 self.finish_stream();
+                // A fresh session: drop measured diagnostics and the ctx
+                // baseline so a new conversation never inherits stale numbers.
+                self.tool_diags.clear();
+                self.current_turn_diag = None;
+                self.last_turn_input_tokens = None;
             }
             UiEvent::ToolProposed(_) => {
                 // Non-gated tools show only their result row; nothing to render.
                 self.finish_stream();
             }
-            UiEvent::ToolStarted(call) => match tool_render::resolve(&call).kind() {
-                ToolPanelKind::Explore => self.push_explored_start(&call),
-                ToolPanelKind::Shell => self.begin_exec(call),
-                ToolPanelKind::Generic => {
-                    // A mutation whose diff already arrived keeps its EDIT
-                    // panel: the preview flips to `● RUNNING` in place.
-                    if !self.rebuild_active_edit(&call, PanelState::Running, None, None, true) {
-                        self.begin_tool(call);
+            UiEvent::ToolStarted(call) => {
+                // Stamp the proposing turn's diagnostics before dispatch so the
+                // block's first footer build already carries them.
+                self.assign_turn_diag(&call.id);
+                match tool_render::resolve(&call).kind() {
+                    ToolPanelKind::Explore => self.push_explored_start(&call),
+                    ToolPanelKind::Shell => self.begin_exec(call),
+                    ToolPanelKind::Generic => {
+                        // A mutation whose diff already arrived keeps its EDIT
+                        // panel: the preview flips to `● RUNNING` in place.
+                        if !self.rebuild_active_edit(&call, PanelState::Running, None, None, true) {
+                            self.begin_tool(call);
+                        }
                     }
                 }
-            },
+            }
             UiEvent::ToolOutputDelta { call_id, chunk } => {
                 if self
                     .active_exec
@@ -1717,6 +1802,7 @@ impl Transcript {
                 self.record_approval(&call, ApprovalDecision::AllowAlways);
             }
             UiEvent::DiffPreview { call, diff } => {
+                self.assign_turn_diag(&call.id);
                 self.begin_edit_preview(&call, diff);
             }
             UiEvent::ToolDenied(call) => {
@@ -1897,6 +1983,9 @@ impl Transcript {
         false
     }
 
+    /// Test helper: toggle the newest foldable panel. Production ctrl+o goes
+    /// through [`Self::toggle_all_panels`].
+    #[cfg(test)]
     pub(super) fn toggle_latest_panel(&mut self) -> bool {
         let Some(header) = self.rows.iter().rposition(|row| {
             matches!(
@@ -1906,23 +1995,46 @@ impl Transcript {
         }) else {
             return false;
         };
-        // Only foldable panels (those with capped output) respond to ctrl+o;
-        // a panel with nothing hidden has no reveal state to toggle.
+        match self.panel_expanded_at(header) {
+            Some(expanded) => self.set_panel_expanded_at(header, !expanded),
+            None => false,
+        }
+    }
+
+    /// Whether the panel whose header row is `header` has any foldable body
+    /// (a row that hides when collapsed); a panel with nothing hidden cannot
+    /// toggle.
+    fn header_is_foldable(&self, header: usize) -> bool {
         let end = self.panel_end_from(header);
-        if !self.rows[header..end]
+        self.rows[header..end]
             .iter()
             .any(|row| row.fold != FoldVis::Always)
-        {
+    }
+
+    /// ctrl+o: expand every foldable panel (tool blocks AND thinking rails) if
+    /// ANY is currently collapsed, else collapse them all. Returns whether any
+    /// header changed; dirties from the first affected row via
+    /// [`Self::set_panel_expanded_at`].
+    pub(super) fn toggle_all_panels(&mut self) -> bool {
+        let headers: Vec<usize> = self
+            .panel_header_rows()
+            .into_iter()
+            .filter(|&header| self.header_is_foldable(header))
+            .collect();
+        if headers.is_empty() {
             return false;
         }
-        self.mark_dirty_from(header);
-        match self.rows[header].chrome.as_mut() {
-            Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. }) => {
-                *expanded = !*expanded;
-                true
+        // Expand all if any foldable block is currently collapsed.
+        let expand = headers
+            .iter()
+            .any(|&header| self.panel_expanded_at(header) == Some(false));
+        let mut changed = false;
+        for header in headers {
+            if self.set_panel_expanded_at(header, expand) {
+                changed = true;
             }
-            _ => false,
         }
+        changed
     }
 
     /// Row indices of every panel header (EXPLORE/SHELL/EDIT/thinking rails):
@@ -1944,7 +2056,10 @@ impl Transcript {
 
     /// Set the fold state of the panel whose header row is `header`. Returns
     /// whether the state changed (false for non-headers, panels with nothing
-    /// hidden, or an already-matching state).
+    /// hidden, or an already-matching state). An explicit set on an active
+    /// block's header is recorded as user intent so it survives finalize,
+    /// even when it is a no-op on the current row (e.g. re-affirming a running
+    /// block should stay expanded).
     pub(super) fn set_panel_expanded_at(&mut self, header: usize, expand: bool) -> bool {
         if header >= self.rows.len() {
             return false;
@@ -1955,13 +2070,10 @@ impl Transcript {
         ) {
             return false;
         }
-        let end = self.panel_end_from(header);
-        if !self.rows[header..end]
-            .iter()
-            .any(|row| row.fold != FoldVis::Always)
-        {
+        if !self.header_is_foldable(header) {
             return false;
         }
+        self.record_user_fold(header, expand);
         match self.rows[header].chrome.as_mut() {
             Some(ChromeRow::Header { expanded, .. } | ChromeRow::RailHeader { expanded, .. })
                 if *expanded != expand =>
@@ -1982,6 +2094,44 @@ impl Transcript {
             }
             _ => None,
         }
+    }
+
+    /// Record an explicit user fold on an active block so it survives the
+    /// in-place rebuild at finalize. A block's header row is `body_start + 1`
+    /// (the row after its `BlockStart`); at most one exec/tool/edit is active.
+    fn record_user_fold(&mut self, header: usize, expanded: bool) {
+        if let Some(active) = self.active_exec.as_mut()
+            && active.body_start + 1 == header
+        {
+            active.user_expanded = Some(expanded);
+        }
+        if let Some(active) = self.active_tool.as_mut()
+            && active.body_start + 1 == header
+        {
+            active.user_expanded = Some(expanded);
+        }
+        if let Some(active) = self.active_edit.as_mut()
+            && active.body_start + 1 == header
+        {
+            active.user_expanded = Some(expanded);
+        }
+    }
+
+    /// The foldable header row whose visible physical-line span covers `line`
+    /// (a whole header row is the click target, not just the disclosure
+    /// glyph). Requires a warm wrap cache; `None` outside any header.
+    pub(super) fn header_row_at_visible_line(&self, line: usize) -> Option<usize> {
+        self.panel_header_rows().into_iter().find(|&header| {
+            let Some(start) = self.visible_line_of_row(header) else {
+                return false;
+            };
+            let span = self
+                .wrapped_cache
+                .rows
+                .get(header)
+                .map_or(1, |layout| layout.lines.len().max(1));
+            (start..start + span).contains(&line)
+        })
     }
 
     /// Case-insensitive substring search over the CANONICAL transcript

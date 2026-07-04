@@ -1084,6 +1084,10 @@ impl Screen {
         // The git snapshot is orthogonal to the model/context identity: always
         // carried across a footer rebuild (the loop refreshes it separately).
         let git = self.footer.as_mut().and_then(|footer| footer.git.take());
+        // Mirror the meter's context cap into the transcript so tool-footer
+        // diagnostics can scale their `ctx` growth delta against it.
+        self.transcript
+            .set_context_cap(context.as_deref().and_then(parse_context_window));
         self.footer = Some(Footer {
             model,
             effort,
@@ -1176,8 +1180,35 @@ impl Screen {
         self.approval_hint = None;
     }
 
+    /// ctrl+o: expand every foldable panel if any is collapsed, else collapse
+    /// them all. Returns whether anything changed.
+    pub(crate) fn toggle_all_panels(&mut self) -> bool {
+        self.transcript.toggle_all_panels()
+    }
+
+    #[cfg(test)]
     pub(crate) fn toggle_latest_panel(&mut self) -> bool {
         self.transcript.toggle_latest_panel()
+    }
+
+    /// Map a pager-mode screen row to the foldable header under it and toggle
+    /// that one block. Returns whether a header toggled (false for clicks
+    /// outside any header row). Frame layout: session-bar rows, then the
+    /// transcript window at the current scroll top, so the clicked visible line
+    /// is `scroll.top() + (row - bar_rows)`.
+    pub(crate) fn toggle_header_at_screen_row(&mut self, screen_row: u16) -> bool {
+        let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+        let bar_rows = session_bar_lines(self, width, height).len();
+        let row = usize::from(screen_row);
+        if row < bar_rows {
+            return false;
+        }
+        let line = self.scroll.top() + (row - bar_rows);
+        let Some(header) = self.transcript.header_row_at_visible_line(line) else {
+            return false;
+        };
+        let expanded = self.transcript.panel_expanded_at(header).unwrap_or(false);
+        self.transcript.set_panel_expanded_at(header, !expanded)
     }
 
     #[cfg(test)]

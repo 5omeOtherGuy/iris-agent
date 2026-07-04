@@ -116,7 +116,7 @@ impl ScrollState {
     }
 
     /// The viewport-top line index for the current frame.
-    fn top(&self) -> usize {
+    pub(super) fn top(&self) -> usize {
         if self.follow {
             self.max_top()
         } else {

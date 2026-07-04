@@ -112,6 +112,10 @@ const MAX_TOOL_OUTPUT_ROWS: usize = 8;
 /// snapped to the terminal cell grid).
 const PANEL_BODY_INDENT: usize = 3;
 const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_INDENT;
+/// Footer hang: the hairline rule and state-label row sit one cell left of the
+/// body (the spec's `2.5ch` hang rounded DOWN), while their right edge stays on
+/// the block's right rail.
+const PANEL_FOOTER_INDENT: usize = 2;
 
 // Color roles live in `crate::ui::palette` (the single source of truth). They
 // are imported here under their long-standing names so the whole `tui` module
@@ -1206,6 +1210,8 @@ mod tests {
             exit_code: None,
             duration: None,
         });
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let lines = screen.wrapped_lines(80);
         let output = line_matching(&lines, |line| line_text(line).contains("red plain"));
         assert!(line_text(output).contains("red plain"), "{output:?}");
@@ -1340,6 +1346,8 @@ mod tests {
             exit_code: None,
             duration: None,
         });
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         // Narrow width forces the styled row across multiple physical lines.
         let lines = screen.wrapped_lines(10);
         let red: String = lines
@@ -1906,6 +1914,8 @@ mod tests {
             duration: None,
         });
         screen.end_turn();
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
 
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
@@ -2874,6 +2884,8 @@ mod tests {
             exit_code: None,
             duration: Some(Duration::from_millis(3)),
         });
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let done = rendered_text(&mut screen, 100, 12);
         assert!(done.contains("DONE"), "{done}");
         assert!(
@@ -2929,6 +2941,8 @@ mod tests {
             duration: Some(Duration::from_millis(3)),
         });
 
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 100, 16);
         assert!(rendered.contains("DONE"), "{rendered}");
         assert!(
@@ -2957,6 +2971,8 @@ mod tests {
             duration: Some(Duration::from_millis(3)),
         });
 
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 100, 18);
         assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(rendered.contains("DONE"), "{rendered}");
@@ -3185,6 +3201,8 @@ mod tests {
             exit_code: Some(0),
             duration: Some(Duration::from_millis(3200)),
         });
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let texts: Vec<String> = screen
             .wrapped_lines(90)
             .iter()
@@ -3204,14 +3222,14 @@ mod tests {
         assert_eq!(texts[1], "     $ cargo test -p context");
         assert_eq!(texts[2], "        Compiling context v0.4.1");
         assert_eq!(texts[3], "     test result: ok. 142 passed; 0 failed");
-        // Hairline rule from the body indent to the block's right edge.
-        assert!(texts[4].starts_with("     ─"), "{:?}", texts[4]);
+        // Hairline rule from the footer indent to the block's right edge.
+        assert!(texts[4].starts_with("    ─"), "{:?}", texts[4]);
         assert_eq!(display_width(&texts[4]), rail, "{:?}", texts[4]);
         // Footer: state label (no glyph), EXIT + meta fields, diagnostics
         // right-bound at the shared rail.
         let footer = &texts[5];
         assert!(
-            footer.starts_with("     DONE  EXIT 0 ┊ 142 passed · 0 failed"),
+            footer.starts_with("    DONE  EXIT 0 ┊ 142 passed · 0 failed"),
             "{footer:?}"
         );
         assert!(
@@ -3291,6 +3309,208 @@ mod tests {
         assert!(footer.trim_end().ends_with("EXIT 0"), "{footer}");
     }
 
+    /// A completed provider turn carrying the given token accounting, with no
+    /// prior turn (so no ctx delta). Cache reads default to zero.
+    fn turn_usage(input: u64, output: u64, cache_read: u64) -> UiEvent {
+        UiEvent::ProviderTurnCompleted {
+            turn_id: "turn".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_input_tokens: cache_read,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: input + output,
+                cache_creation: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn shell_footer_carries_measured_turn_diagnostics() {
+        // End-to-end: a provider turn reports usage, then proposes a bash tool;
+        // the tool's footer carries that turn's cost right-bound. No prior turn
+        // and no context cap => no ctx field.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn".to_string(),
+        });
+        // input 19_300 with 17_200 cache reads => 2_100 fresh input processed.
+        screen.apply(turn_usage(19_300, 164, 17_200));
+        let call = call_args("bash", json!({ "command": "cargo test" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "ok".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(120)),
+        });
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+        assert!(
+            footer.trim_end().ends_with("↑2.1k ↓164 ┊ cache 17.2k"),
+            "{footer:?}"
+        );
+        assert!(!footer.contains("ctx"), "{footer:?}");
+    }
+
+    #[test]
+    fn shell_footer_sent_excludes_cache_reads() {
+        // When the whole prompt is served from cache (input == cache_read),
+        // the fresh input processed this turn is zero: render an honest `↑0`.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn".to_string(),
+        });
+        screen.apply(turn_usage(18_200, 90, 18_200));
+        let call = call_args("bash", json!({ "command": "cargo test" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "ok".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(120)),
+        });
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+        assert!(
+            footer.trim_end().ends_with("↑0 ↓90 ┊ cache 18.2k"),
+            "{footer:?}"
+        );
+    }
+
+    #[test]
+    fn shell_footer_has_no_cluster_without_turn_usage() {
+        // A turn that reports no usage measures nothing: the footer stays clean.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn".to_string(),
+        });
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn".to_string(),
+            response_id: None,
+            usage: None,
+        });
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(10)),
+        });
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+        assert!(!footer.contains('↑'), "{footer:?}");
+        assert!(footer.trim_end().ends_with("EXIT 0"), "{footer:?}");
+    }
+
+    #[test]
+    fn shell_footer_omits_cache_field_when_cache_read_is_zero() {
+        // cache_read = 0 is noise, not signal: no `cache` field, no dangling ┊.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn".to_string(),
+        });
+        screen.apply(turn_usage(800, 40, 0));
+        let call = call_args("bash", json!({ "command": "true" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: String::new(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(5)),
+        });
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+        assert!(footer.trim_end().ends_with("↑800 ↓40"), "{footer:?}");
+        assert!(!footer.contains("cache"), "{footer:?}");
+        assert!(
+            !footer.contains('┊') || footer.contains("EXIT"),
+            "{footer:?}"
+        );
+    }
+
+    #[test]
+    fn shell_footer_reports_signed_context_growth_against_cap() {
+        // Two sequential turns: the second turn's ctx field is the signed
+        // input-token growth as a percentage of the known context cap.
+        // 90_000 - 87_000 = 3_000 of a 300k cap => +1.0%.
+        let mut screen = Screen::new();
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            None,
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(turn_usage(87_000, 100, 0));
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t2".to_string(),
+        });
+        screen.apply(turn_usage(90_000, 120, 0));
+        let call = call_args("bash", json!({ "command": "ls" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: String::new(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(5)),
+        });
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("EXIT 0")
+        }));
+        assert!(footer.contains("ctx +1.0%"), "{footer:?}");
+    }
+
+    #[test]
+    fn explore_footer_carries_measured_turn_diagnostics() {
+        // The EXPLORE in-place footer rewrite must not drop the diag stamped by
+        // the proposing turn.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn".to_string(),
+        });
+        // input 18_200 with 16_800 cache reads => 1_400 fresh input processed.
+        screen.apply(turn_usage(18_200, 38, 16_800));
+        let call = call_args("read", json!({ "path": "src/context/engine.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "line\nline\nline".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(10)),
+        });
+        let lines = screen.wrapped_lines(90);
+        let footer = line_text(line_matching(&lines, |line| {
+            line_text(line).contains("DONE")
+        }));
+        assert!(
+            footer.trim_end().ends_with("↑1.4k ↓38 ┊ cache 16.8k"),
+            "{footer:?}"
+        );
+    }
+
     #[test]
     fn shell_exit_row_summarizes_test_results() {
         let mut screen = Screen::new();
@@ -3335,6 +3555,8 @@ mod tests {
             duration: Some(Duration::from_millis(400)),
         });
         // Applied: the same single EDIT block, DONE, diff + footer counts.
+        // Compact by default: the applied block collapses, so expand to inspect.
+        screen.toggle_all_panels();
         let done = rendered_text(&mut screen, 100, 24);
         assert!(done.contains("DONE"), "{done}");
         assert!(done.contains("self.budget.justify(ctx)?;"), "{done}");
@@ -3591,6 +3813,9 @@ mod tests {
             ),
             diff: "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
         });
+        // Compact by default: expand the finalized SHELL block to inspect it
+        // (the EDIT preview already arrives expanded).
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 110, 24);
 
         assert!(rendered.contains("SHELL"));
@@ -4041,6 +4266,209 @@ mod tests {
     }
 
     #[test]
+    fn small_finalized_block_arrives_collapsed() {
+        // Compact by default: even a body that would fit uncapped arrives
+        // collapsed once the block is finalized.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        assert!(screen.latest_panel_collapsed());
+    }
+
+    #[test]
+    fn running_block_is_expanded_and_collapses_on_finalize() {
+        // A running block stays expanded so its live tail is watchable, then
+        // collapses on finalize (no explicit user expand).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = screen.wrapped_lines(80);
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "hi\n".to_string(),
+        });
+        assert!(!screen.latest_panel_collapsed(), "running stays expanded");
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        assert!(screen.latest_panel_collapsed(), "finalize collapses");
+    }
+
+    #[test]
+    fn user_expanded_running_block_stays_expanded_after_finalize() {
+        // An explicit user expand on a running block is recorded as intent and
+        // survives the in-place finalize rebuild (even though it is a no-op on
+        // the row, since running already arrives expanded).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = screen.wrapped_lines(80);
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "hi\n".to_string(),
+        });
+        let header = *screen
+            .transcript
+            .panel_header_rows()
+            .last()
+            .expect("running header");
+        screen.transcript.set_panel_expanded_at(header, true);
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "user expand survives finalize"
+        );
+    }
+
+    #[test]
+    fn edit_preview_arrives_expanded_and_collapses_when_applied() {
+        // EXCEPTION to compact-by-default: a pending EDIT preview arrives
+        // expanded for review, then collapses once the edit is applied.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
+        let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
+        let diff = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        screen.apply(UiEvent::DiffPreview {
+            call: call.clone(),
+            diff: diff.to_string(),
+        });
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "pending preview arrives expanded"
+        );
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "Successfully replaced 1 occurrence.".to_string(),
+            exit_code: None,
+            duration: None,
+        });
+        assert!(
+            screen.latest_panel_collapsed(),
+            "applied edit block collapses"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_toggle_all_expands_then_collapses() {
+        // With a mix of collapsed and expanded foldable blocks (tool blocks +
+        // a thinking rail), toggle-all expands ALL when any is collapsed, then
+        // collapses ALL on the next press.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "one" })),
+            content: "first body".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "two" })),
+            content: "second body".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "First thought.\n\nSecond thought.\n\nThird thought.".to_string(),
+            redacted: false,
+        });
+        let headers = screen.transcript.panel_header_rows();
+        assert_eq!(headers.len(), 3, "three foldable blocks arrive collapsed");
+        assert!(
+            headers
+                .iter()
+                .all(|&h| screen.transcript.panel_expanded_at(h) == Some(false)),
+            "all arrive collapsed"
+        );
+        // Mixed state: expand one so not all are collapsed.
+        screen.transcript.set_panel_expanded_at(headers[0], true);
+
+        // First toggle-all: any collapsed -> expand all (rail included).
+        assert!(screen.toggle_all_panels());
+        assert!(
+            screen
+                .transcript
+                .panel_header_rows()
+                .iter()
+                .all(|&h| screen.transcript.panel_expanded_at(h) == Some(true)),
+            "first press expands all"
+        );
+        // Second toggle-all: none collapsed -> collapse all.
+        assert!(screen.toggle_all_panels());
+        assert!(
+            screen
+                .transcript
+                .panel_header_rows()
+                .iter()
+                .all(|&h| screen.transcript.panel_expanded_at(h) == Some(false)),
+            "second press collapses all"
+        );
+    }
+
+    #[test]
+    fn header_click_toggles_only_the_clicked_block() {
+        // A left-button-down on a block's header row toggles THAT block; a
+        // click on a body row is a no-op. The whole header row is the target.
+        use super::pager::compose_frame;
+        let mut screen = Screen::new();
+        screen.pager_active = true;
+        screen.mouse_capture = true;
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            content: "body line one\nbody line two".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        let size = Size::new(80, 30);
+        // Collapsed on arrival: click the header row to expand.
+        let frame = compose_frame(&mut screen, size);
+        let header_row = frame
+            .lines
+            .iter()
+            .position(|line| line_text(line).contains("SHELL"))
+            .expect("header rendered");
+        assert!(screen.latest_panel_collapsed());
+        assert!(
+            screen.toggle_header_at_screen_row(header_row as u16),
+            "header click toggles the block"
+        );
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "header click expanded the block"
+        );
+        // Body is now visible: a click on a body row does nothing.
+        let frame = compose_frame(&mut screen, size);
+        let body_row = frame
+            .lines
+            .iter()
+            .position(|line| line_text(line).contains("body line one"))
+            .expect("body rendered");
+        assert!(
+            !screen.toggle_header_at_screen_row(body_row as u16),
+            "body click is a no-op"
+        );
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "body click left the block expanded"
+        );
+    }
+
+    #[test]
     fn collapsed_shell_block_footer_still_reports_exit_status() {
         // Collapsing hides the body only: the footer (state · EXIT · meta)
         // stays visible, so the outcome is never hidden.
@@ -4271,6 +4699,8 @@ mod tests {
             exit_code: None,
             duration: Some(Duration::from_millis(3)),
         });
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 100, 12);
 
         assert!(rendered.contains("EDIT"), "{rendered}");
@@ -4903,6 +5333,8 @@ mod tests {
             duration: Some(Duration::from_millis(50)),
         });
 
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(rendered.contains("ERROR"), "{rendered}");
@@ -4925,6 +5357,8 @@ mod tests {
             duration: Some(Duration::from_millis(120)),
         });
 
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 80, 12);
         // Body hangs at the block indent (2ch pane indent + 3ch hang), no frame.
         assert!(rendered.contains("     $ cargo test"), "{rendered}");
@@ -4964,6 +5398,8 @@ mod tests {
             message: "patch failed".to_string(),
         });
 
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("EDIT"), "{rendered}");
         assert!(rendered.contains("ERROR"), "{rendered}");
@@ -4996,6 +5432,8 @@ mod tests {
             chunk: "partial line\n".to_string(),
         });
         screen.apply(UiEvent::ToolCancelled(call.clone()));
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 80, 14);
         assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(rendered.contains("CANCELLED"), "{rendered}");
@@ -5028,6 +5466,8 @@ mod tests {
             duration: Some(std::time::Duration::from_millis(10)),
         });
         screen.end_turn();
+        // Compact by default: expand the finalized block to inspect its body.
+        screen.toggle_all_panels();
         surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
 
         let everything = strip_ansi(&surface.state().previous_lines.join("\n"));

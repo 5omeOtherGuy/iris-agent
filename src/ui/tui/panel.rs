@@ -14,8 +14,8 @@ use super::wrap::{
     take_spans_to_width, truncate_line,
 };
 use super::{
-    BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_INDENT, TEXT_COLUMN_X_PADDING, dim_style,
-    err_style, ok_style, panel_style, prompt_style,
+    BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT,
+    TEXT_COLUMN_X_PADDING, dim_style, err_style, ok_style, panel_style, prompt_style,
 };
 use crate::ui::{is_diff_file_header, symbols};
 
@@ -35,6 +35,12 @@ fn panel_width(width: usize) -> usize {
 
 pub(super) fn panel_body_content_width(width: usize) -> usize {
     panel_width(width).saturating_sub(PANEL_BODY_INDENT).max(1)
+}
+
+pub(super) fn panel_footer_content_width(width: usize) -> usize {
+    panel_width(width)
+        .saturating_sub(PANEL_FOOTER_INDENT)
+        .max(1)
 }
 
 /// The frameless block header (`FramelessHeader`):
@@ -91,16 +97,30 @@ pub(super) fn panel_header_line(
     line
 }
 
-/// The hairline rule that opens every block footer: starts at the body indent
-/// and runs to the block's right edge. The one rule the frameless design keeps.
+/// The hairline rule that opens every block footer: starts at the footer indent
+/// (one cell left of the body) and runs to the block's right edge. The one rule
+/// the frameless design keeps.
 pub(super) fn footer_rule_line(width: usize) -> Line<'static> {
     let outer = panel_outer_padding(width);
-    let indent = PANEL_BODY_INDENT.min(panel_width(width));
+    let indent = PANEL_FOOTER_INDENT.min(panel_width(width));
     let rule_width = panel_width(width).saturating_sub(indent).max(1);
     let mut line = Line::from(vec![
         Span::raw(" ".repeat(outer + indent)),
         Span::styled("─".repeat(rule_width), dim_style()),
     ]);
+    truncate_line(&mut line, width.max(1));
+    line
+}
+
+/// A footer content row (state label + extras): sits at the footer indent, one
+/// cell left of the body, its right edge on the block's right rail.
+pub(super) fn panel_footer_line(width: usize, mut line: Line<'static>) -> Line<'static> {
+    let footer_width = panel_footer_content_width(width);
+    truncate_line(&mut line, footer_width);
+    let outer = panel_outer_padding(width);
+    let mut spans = vec![Span::raw(" ".repeat(outer + PANEL_FOOTER_INDENT))];
+    spans.extend(line.spans);
+    let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     line
 }
@@ -455,10 +475,14 @@ pub(super) fn join_meta_fields(fields: Vec<FooterField>) -> (Vec<Span<'static>>,
     (spans, plain)
 }
 
-/// Per-tool-call token diagnostics for the block footer, right-bound:
-/// `↑<sent> ↓<received> ┊ cache <n> ┊ ctx <Δ%>`. All fields are optional,
-/// preformatted strings (`"1.4k"`, `"+0.9%"`); numbers are honest — a field is
-/// rendered only when the runtime measured it.
+/// Token diagnostics for the block footer, right-bound:
+/// `↑<sent> ↓<received> ┊ cache <n> ┊ ctx <Δ%>`. Measured on the proposing
+/// provider turn (the finest honest granularity): `↑` fresh non-cached input
+/// processed that turn, `↓` tokens it generated, `cache` prompt-cache reads,
+/// `ctx` context growth vs the previous turn. Tool calls proposed by the same
+/// turn share these numbers. All fields are optional, preformatted strings
+/// (`"1.4k"`, `"+0.9%"`); a field is rendered only when the runtime measured
+/// it — never a fabricated per-call split.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ToolDiag {
     pub(crate) sent: Option<String>,
@@ -715,10 +739,10 @@ mod tests {
     }
 
     #[test]
-    fn footer_rule_is_a_hairline_from_the_body_indent_to_the_right_edge() {
+    fn footer_rule_is_a_hairline_from_the_footer_indent_to_the_right_edge() {
         let line = footer_rule_line(80);
         let text = line_text(&line);
-        assert!(text.starts_with("     ─"), "{text:?}");
+        assert!(text.starts_with("    ─"), "{text:?}");
         assert_eq!(display_width(&text), 78, "{text:?}");
         assert!(text.trim_start().chars().all(|c| c == '─'), "{text:?}");
     }

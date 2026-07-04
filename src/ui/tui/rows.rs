@@ -6,7 +6,8 @@ use ratatui::text::{Line, Span};
 use super::component::Component;
 use super::panel::{
     apply_width_bg, footer_rule_line, inset_rule_line, panel_body_content_width, panel_body_line,
-    panel_body_lines, panel_header_line, rail_header_line,
+    panel_body_lines, panel_footer_content_width, panel_footer_line, panel_header_line,
+    rail_header_line,
 };
 use super::wrap::{
     display_width, line_text, pad_line_left, pad_line_right, push_wrapped_line,
@@ -280,7 +281,7 @@ impl ChromeRow {
             // when the optional diagnostics cluster does not fit, it is
             // dropped rather than displacing the left side.
             ChromeRow::Footer { left, right } => {
-                let content_width = panel_body_content_width(width);
+                let content_width = panel_footer_content_width(width);
                 let left_w = display_width(&line_text(left));
                 let right_w = display_width(right);
                 let line = if right.is_empty() || left_w + 1 + right_w > content_width {
@@ -288,7 +289,7 @@ impl ChromeRow {
                 } else {
                     right_aligned_line(left.clone(), right, dim_style(), content_width)
                 };
-                panel_body_line(width, line, None)
+                panel_footer_line(width, line)
             }
             ChromeRow::Body { line, bg } => panel_body_line(width, line.clone(), *bg),
             ChromeRow::BodyRight {

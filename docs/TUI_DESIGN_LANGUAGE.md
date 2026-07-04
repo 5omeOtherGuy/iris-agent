@@ -414,13 +414,19 @@ measured). The `┊` law: only BETWEEN sibling fields, one space each side,
 never leading/trailing, never after the state label — fields are joined
 programmatically so a missing field can never leave a dangling `┊`.
 
-**Disclosure** — binary, whole-block. Expanded (`▾`, default) = header + body
-+ footer; collapsed (`▸`) = header + footer, exactly two rows, body
-**unmounted** — no partial preview, no elision affordance. `ctrl+o` toggles
-the **latest** foldable block; state is per-block. Flood guard: a body past
-the physical-row budget **arrives collapsed** (the two rows still answer
-*what ran · on what · how long · outcome · cost*); running blocks stay
-expanded on a bounded live tail.
+**Disclosure** — binary, whole-block. Expanded (`▾`) = header + body +
+footer; collapsed (`▸`) = header + footer, exactly two rows, body
+**unmounted** — no partial preview, no elision affordance. **Compact by
+default**: every foldable block **arrives collapsed** regardless of body
+size (the two rows still answer *what ran · on what · how long · outcome ·
+cost*). Two exceptions: a **running** block stays expanded on its bounded
+live tail (it collapses when it finalizes unless the user explicitly
+expanded it), and a **pending EDIT preview** (`◇ PREVIEW`) arrives expanded
+for review (it collapses once applied). `ctrl+o` toggles **all** foldable
+blocks at once — tool blocks and thinking rails: if any is collapsed it
+expands them all, otherwise it collapses them all. A **click on a block's
+header row** toggles that one block. State is per-block; an explicit user
+expand/collapse survives the block's in-place rebuilds.
 
 ### 8.2 EXPLORE — read / grep / list / find
 The **single container** for every read-side op. Each op is **one row**:

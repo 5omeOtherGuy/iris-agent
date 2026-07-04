@@ -1815,6 +1815,9 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
             if let Some(key) = session_bar_click(screen, &mouse, git_cache) {
                 return key;
             }
+            if header_click(screen, &mouse) {
+                return IdleKey::Continue;
+            }
             return if pager_wheel(screen, &mouse) {
                 IdleKey::Continue
             } else {
@@ -1959,7 +1962,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
                 return IdleKey::Continue;
             }
             KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
-                screen.toggle_latest_panel();
+                screen.toggle_all_panels();
                 return IdleKey::Continue;
             }
             KeyCode::Char('g') | KeyCode::Char('G') if ctrl => {
@@ -2216,6 +2219,20 @@ fn scrollback_focus_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: boo
 /// Pager-mode wheel scrolling: ±`scroll_speed` lines per wheel tick. Only the
 /// wheel is consumed; clicks/drags are ignored (in-app selection is a later
 /// slice -- the Ctrl+T toggle restores terminal-native selection until then).
+/// Pager-mode disclosure click: a left-button-down on a foldable block's
+/// header row toggles THAT block. `None`/`false` = not a header click (fall
+/// through to wheel handling). Only fires under pager mouse capture.
+fn header_click(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    if !screen.pager_active || !screen.mouse_capture {
+        return false;
+    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    screen.toggle_header_at_screen_row(mouse.row)
+}
+
 fn pager_wheel(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
     // Gate on capture INTENT too: after Ctrl+T / `/mouse` turns capture off,
     // queued events (or events still arriving because the disable write
@@ -2282,6 +2299,9 @@ fn handle_running_event(
             {
                 return !matches!(key, IdleKey::Ignore | IdleKey::Menu(_));
             }
+            if header_click(screen, &mouse) {
+                return true;
+            }
             pager_wheel(screen, &mouse)
         }
         // Resize still triggers a redraw of the terminal surface.
@@ -2298,7 +2318,7 @@ fn handle_running_event(
             let alt = key.modifiers.contains(KeyModifiers::ALT);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-                screen.toggle_latest_panel();
+                screen.toggle_all_panels();
                 return true;
             }
             if ctrl
@@ -3013,23 +3033,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_toggles_latest_panel_when_idle() {
+    fn ctrl_o_routes_to_toggle_all_when_idle() {
+        // ctrl+o drives toggle-all; the full direction/multi-block behavior is
+        // covered in ui::tui::tests::ctrl_o_toggle_all_expands_then_collapses.
         let mut screen = Screen::new();
-        // Long output caps to a preview, so the panel is foldable and ctrl+o
-        // reveals it.
-        let content = (0..20)
-            .map(|n| format!("line {n}"))
-            .collect::<Vec<_>>()
-            .join("\n");
         screen.apply(UiEvent::ToolResult {
             call: call(),
-            content,
+            content: (0..20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             exit_code: None,
             duration: None,
         });
-        // Capped output starts collapsed (preview).
+        // Compact by default: the finalized block arrives collapsed.
         assert!(screen.latest_panel_collapsed());
-
         assert!(matches!(
             handle_idle_event(
                 &mut screen,
@@ -3037,7 +3055,7 @@ mod tests {
             ),
             IdleKey::Continue
         ));
-        // ctrl+o reveals the full output.
+        // ctrl+o expanded it.
         assert!(!screen.latest_panel_collapsed());
     }
 
