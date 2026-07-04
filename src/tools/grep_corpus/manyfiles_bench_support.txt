@@ -42,21 +42,6 @@ pub(crate) fn assert_min_reduction(class: &str, before: &str, after: &str, min_p
     );
 }
 
-/// Assert the reduced form is never larger than the baseline (parity-or-better).
-/// Used where the reduction's contract is "at least as small as the raw form"
-/// rather than a fixed percentage bar (e.g. grep grouping vs. the ungrouped
-/// `path:line:content` baseline). Ratios only; absolute counts are estimates.
-pub(crate) fn assert_parity_or_better(class: &str, baseline: &str, reduced: &str) {
-    let pct = reduction_pct(baseline, reduced);
-    assert!(
-        pct >= 0.0,
-        "[{class}] reduced output is {}% larger than the baseline ({} vs {} est tokens)",
-        -pct as i64,
-        est_tokens(reduced),
-        est_tokens(baseline),
-    );
-}
-
 /// Assert that every needle survives reduction verbatim. Needles encode the
 /// quality-loss contract: error messages, `file:line` references, failing
 /// test names, summaries a competent engineer would have read.
