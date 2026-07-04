@@ -127,7 +127,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/find",
-        description: "Search the transcript (n/N navigate; /find clears)",
+        description: "Search the transcript (n/N navigate; /find clears) (pager mode)",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -137,7 +137,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/mouse",
-        description: "Toggle mouse capture (off = terminal-native select/copy)",
+        description: "Toggle mouse capture (off = terminal-native select/copy) (pager mode)",
         action: SlashAction::Submit,
     },
     SlashCommand {
