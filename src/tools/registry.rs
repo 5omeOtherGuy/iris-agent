@@ -93,7 +93,7 @@ fn run_off_thread(
         let root = root?;
         match tokio::task::spawn_blocking(move || body(&root, &args)).await {
             Ok(result) => result,
-            Err(join_err) => Err(anyhow!("{} tool task failed: {}", label, join_err)),
+            Err(_join_err) => Err(anyhow!("{} tool task failed: {}", label, _join_err)),
         }
     })
 }
@@ -656,13 +656,13 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 start.elapsed()
             };
-            let (tool_result, timer_elapsed) = tokio::join!(tool, timer);
+            let (tool_result, _timer_elapsed) = tokio::join!(tool, timer);
             let tool_elapsed = start.elapsed();
 
             tool_result.expect("bash tool should succeed");
             assert!(
-                timer_elapsed < std::time::Duration::from_millis(500),
-                "timer was starved by bash: fired at {timer_elapsed:?} (executor blocked)"
+                _timer_elapsed < std::time::Duration::from_millis(500),
+                "timer was starved by bash: fired at {_timer_elapsed:?} (executor blocked)"
             );
             assert!(
                 tool_elapsed >= std::time::Duration::from_millis(900),
