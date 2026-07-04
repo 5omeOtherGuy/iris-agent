@@ -625,7 +625,12 @@ fn parse_task_lifecycle(value: &Value) -> Option<(String, TaskLifecycleEvent)> {
     }
     let task_id = value.get("taskId").and_then(Value::as_str)?.to_string();
     let event = value.get("event").and_then(Value::as_str)?.to_string();
-    let body = value.get("body").and_then(Value::as_str).map(String::from);
+    // Bound the body to a single-line preview at the read boundary. It is
+    // normally already a `preview_line` captured at task open (#287), but a
+    // malformed / legacy / hand-edited entry could carry a full prompt; the
+    // extraction and `/sessions` rendering must stay bounded (ADR-0031), never
+    // a full-body dump.
+    let body = value.get("body").and_then(Value::as_str).map(preview_line);
     let disposition = value
         .get("disposition")
         .and_then(Value::as_str)
@@ -2063,6 +2068,46 @@ mod tests {
         assert!(
             !preview.contains(&huge),
             "the full body must never appear in the extraction"
+        );
+    }
+
+    // Issue #289 (review fix): a huge/legacy `taskLifecycle` body is bounded to a
+    // preview at the read boundary, so neither `sessions_for_task` nor
+    // `extract_session` (and thus `/sessions`) can surface a full-body dump.
+    #[test]
+    fn lifecycle_body_is_bounded_at_read() {
+        let dir = temp_dir();
+        let huge = "x".repeat(10_000);
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append_task_opened("task-huge", Some(&huge)).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Via sessions_for_task: the event body is a bounded preview.
+        let store = SessionStore::with_root(dir.path.clone());
+        let matches = store
+            .sessions_for_task(Path::new("/w"), "task-huge")
+            .unwrap();
+        let body = matches[0].events[0].body.as_deref().unwrap();
+        assert!(
+            body.chars().count() <= PREVIEW_CHARS + 1,
+            "lookup lifecycle body must be bounded, got {} chars",
+            body.chars().count()
+        );
+        assert!(
+            !body.contains(&huge),
+            "the full lifecycle body never appears"
+        );
+
+        // Via extract_session: the lifecycle item body is likewise bounded.
+        let extract = extract_session(&path).unwrap();
+        let dumped_full = extract.items.iter().any(|item| match item {
+            ExtractItem::Lifecycle(ev) => ev.body.as_deref() == Some(huge.as_str()),
+            _ => false,
+        });
+        assert!(
+            !dumped_full,
+            "extraction never emits the full lifecycle body"
         );
     }
 
