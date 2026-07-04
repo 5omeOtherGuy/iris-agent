@@ -649,7 +649,12 @@ fn push_table_row(
 }
 
 /// Fallback for tables too narrow for a stable box: pipe-joined rows wrapped to
-/// `width` so even the fallback never overflows the available columns.
+/// `width` via [`wrap_table_cell`], which owns the width contract. Because it is
+/// borderless (no rigid box to keep aligned), it PRESERVES an unsplittable
+/// cluster wider than `width` on its own line rather than dropping it -- unlike
+/// the bordered [`push_table_row`], which defensively truncates such a glyph to
+/// hold the box together. So every emitted line fits `width` except one holding
+/// a single oversized cluster, which sits at its natural (minimum-viable) width.
 fn render_table_fallback(
     table: &TableState,
     body_style: Style,
@@ -719,7 +724,14 @@ fn pad_for(text_width: usize, col: usize, align: Alignment) -> (usize, usize) {
 /// Word-wrap a table cell to `width` display columns, hard-breaking words that
 /// are themselves wider than the column. Splits on whitespace (cell content is
 /// re-flowed) and keeps grapheme clusters whole, so a wide/emoji glyph is never
-/// split across a column boundary. Always returns at least one line.
+/// split across a column boundary.
+///
+/// Contract: always returns at least one line and never an empty line (except
+/// the single line returned for genuinely empty input). Each line's display
+/// width is `<= width`, EXCEPT a line holding one unsplittable cluster wider
+/// than `width` (a CJK/emoji glyph in a 1-column slot): it is emitted alone at
+/// its natural width -- the minimum viable width. This mirrors [`fit_columns`]
+/// flooring each column at 1: an atomic unit cannot shrink below its own size.
 fn wrap_table_cell(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -737,7 +749,12 @@ fn wrap_table_cell(text: &str, width: usize) -> Vec<String> {
             let mut chunk_w = 0;
             for cluster in word.graphemes(true) {
                 let cw = cluster_advance(cluster);
-                if chunk_w + cw > width {
+                // Break only before a cluster that overflows a NON-EMPTY chunk.
+                // If the chunk is empty this cluster is itself wider than
+                // `width` (an unsplittable wide/emoji glyph): it takes its own
+                // row at its natural width -- never an empty row, never an
+                // infinite loop (cluster_advance is >= 1).
+                if chunk_w + cw > width && !chunk.is_empty() {
                     lines.push(std::mem::take(&mut chunk));
                     chunk_w = 0;
                 }
@@ -1148,6 +1165,67 @@ mod tests {
         assert!(
             !joined.contains('\u{250c}'),
             "narrow table should not draw a box: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_table_cell_oversized_cluster_never_empty_or_split() {
+        // A single grapheme cluster wider than the column (CJK "\u{5bbd}" = 2
+        // cols, ZWJ family emoji = 2 cols) cannot be split. wrap_table_cell must
+        // place it on its own row -- never an empty row, never infinite-looping
+        // -- and never widen a row past the minimum viable width (the widest
+        // unsplittable cluster). Mirrors fit_columns flooring each column at 1:
+        // an atomic unit cannot shrink below its own size.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        for cell in ["\u{5bbd}", "\u{5bbd}\u{5bbd}", family] {
+            let rows = wrap_table_cell(cell, 1);
+            assert!(!rows.is_empty(), "no rows for {cell:?}");
+            let cluster_max = cell.graphemes(true).map(cluster_advance).max().unwrap_or(1);
+            for row in &rows {
+                assert!(!row.is_empty(), "empty row emitted for {cell:?}: {rows:?}");
+                assert!(
+                    display_width(row) <= 1usize.max(cluster_max),
+                    "row exceeds minimum viable width for {cell:?}: {rows:?}"
+                );
+            }
+            // Every cluster survives intact (never split across rows, never dropped).
+            let joined: String = rows.concat();
+            assert_eq!(joined, cell.replace(' ', ""), "cluster corrupted: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_fallback_table_with_wide_cluster_respects_width_contract() {
+        // A 1-column table too narrow for a box (width 1) whose cells hold an
+        // unsplittable width-2 cluster forces the render_table_fallback path.
+        // The fallback is borderless, so its documented contract is to PRESERVE
+        // the glyph on its own line (widen to the minimum viable width) rather
+        // than emit an empty row or drop content: no line is empty and no line
+        // exceeds the width floored to the widest unsplittable cluster.
+        let wide = "\u{5bbd}";
+        let md = format!("| {wide} |\n| - |\n| {wide} |");
+        let width = 1;
+        let lines = render_markdown_themed(&md, &MarkdownTheme::default(), width);
+        let text_lines: Vec<String> = lines.iter().map(text_of).collect();
+        let cluster_w = display_width(wide);
+        assert!(
+            text_lines.iter().any(|l| l.contains(wide)),
+            "wide cluster dropped from fallback: {text_lines:?}"
+        );
+        assert!(
+            !text_lines.iter().any(String::is_empty),
+            "fallback emitted an empty row: {text_lines:?}"
+        );
+        for l in &text_lines {
+            assert!(
+                display_width(l) <= width.max(cluster_w),
+                "fallback line exceeds minimum-viable width contract: {l:?}"
+            );
+        }
+        // No box border in the fallback.
+        assert!(
+            !text_lines.iter().any(|l| l.contains('\u{250c}')),
+            "unexpected box: {text_lines:?}"
         );
     }
 
