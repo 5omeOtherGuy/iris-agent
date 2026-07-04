@@ -12,6 +12,8 @@ extend-exclude = [
   "src/tools/grep_corpus/",
   # Captured real find listings used as find-compaction benchmark fixtures.
   "src/tools/find_corpus/",
+  # Captured real `ls -la` listings used as ls token-efficiency fixtures.
+  "src/tools/ls_corpus/",
 ]
 [default.extend-identifiers]
 # Repository owner / handle.
