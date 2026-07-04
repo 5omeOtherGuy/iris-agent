@@ -382,9 +382,20 @@ standalone `READ` / `GREP` / `LS` / `DIFF` panels.
 - **Elapsed** — right-aligned compact duration (`4.1s`, `0:13`); omitted for a
   pending `preview`.
 
-Header click (or `onToggle`) flips `expanded`. `ctrl+o` toggles the **latest**
-foldable panel. Collapsed = a capped preview + an elided-lines affordance
+`ctrl+o` toggles the **latest** foldable panel; in scrollback focus (Tab) the
+selected panel folds via Left/Right/Enter. Mouse clicks never fold — in-app
+click interaction is deliberately not implemented (only the wheel is
+consumed). Collapsed = a capped preview + an elided-lines affordance
 (`… N lines hidden   ctrl+o to expand`).
+
+The status glyph column is fixed across all four families: label field 13
+cells, elapsed right-aligned in 8, two-cell right pad — `◆`/`■`/`◇`/`●`
+always land in the same column.
+
+`/find` searches canonical transcript content — folded panel bodies included,
+collapsed head/tail previews and fold affordance rows excluded. Jumping to a
+match inside a folded panel expands it; the newest match stays clear of the
+find indicator row.
 
 ### 8.2 EXPLORE — read / grep / list / find
 The **single container** for every read-side op. Each op is **one row**:

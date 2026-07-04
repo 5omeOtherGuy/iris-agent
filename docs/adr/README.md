@@ -30,6 +30,8 @@
 | [0027](0027-repurpose-trust-store-as-per-cwd-project-permission-policy.md) | Repurpose the trust store as a per-cwd project permission policy | proposed | 2026-07-02 |
 | [0028](0028-git-workflow-dirty-tree-safety-and-task-checkpointing.md) | Git workflow — dirty-tree safety, task checkpointing, and rollback semantics | accepted | 2026-07-03 |
 | [0029](0029-adopt-alt-screen-pager-tui.md) | Adopt an alt-screen pager TUI with an Iris-owned scrollback pane | accepted | 2026-07-03 |
+| [0032](0032-run-blocking-tool-bodies-off-the-ui-executor.md) | Run blocking tool bodies off the UI executor with channel-bridged streaming | accepted | 2026-07-04 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
-ADR-0019 to preserve existing file names and cross-references.
+ADR-0019 to preserve existing file names and cross-references. ADR-0030 and
+ADR-0031 are reserved by an open PR (#290) and will land with it.
