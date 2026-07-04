@@ -89,7 +89,7 @@ impl Default for MarkdownTheme {
             italic: Style::default().add_modifier(Modifier::ITALIC),
             strikethrough: Style::default().add_modifier(Modifier::CROSSED_OUT),
             quote: dim,
-            inline_code: Style::default().fg(crate::ui::palette::CYAN),
+            inline_code: Style::default().fg(crate::ui::palette::cyan()),
             code_block: dim,
             link: Style::default(),
             link_url: dim,

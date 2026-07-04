@@ -84,11 +84,11 @@ pub(crate) fn overlay_box(
         let used = display_width(&line_text(&line));
         if selected {
             for span in &mut line.spans {
-                span.style = span.style.bg(crate::ui::palette::SURFACE);
+                span.style = span.style.bg(crate::ui::palette::surface());
             }
         }
         let pad_style = if selected {
-            Style::default().bg(crate::ui::palette::SURFACE)
+            Style::default().bg(crate::ui::palette::surface())
         } else {
             Style::default()
         };
@@ -263,7 +263,7 @@ mod tests {
             selected
                 .spans
                 .iter()
-                .any(|s| s.style.bg == Some(crate::ui::palette::SURFACE)),
+                .any(|s| s.style.bg == Some(crate::ui::palette::surface())),
             "selected row should carry the surface fill: {selected:?}"
         );
         assert!(
@@ -286,7 +286,7 @@ mod tests {
             other
                 .spans
                 .iter()
-                .all(|s| s.style.bg != Some(crate::ui::palette::SURFACE)),
+                .all(|s| s.style.bg != Some(crate::ui::palette::surface())),
             "unselected rows are unfilled: {other:?}"
         );
     }

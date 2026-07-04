@@ -282,7 +282,7 @@ pub(crate) fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'stat
                     format!("{} ", crate::ui::symbols::EMPTY)
                 },
                 if enabled {
-                    Style::default().fg(crate::ui::palette::ORANGE)
+                    Style::default().fg(crate::ui::palette::orange())
                 } else {
                     dim()
                 },
@@ -446,7 +446,7 @@ impl ModelPicker {
             let marker = if qualified == self.current {
                 Span::styled(
                     format!("{} ", crate::ui::symbols::ACTIVE),
-                    Style::default().fg(crate::ui::palette::ORANGE),
+                    Style::default().fg(crate::ui::palette::orange()),
                 )
             } else {
                 Span::raw("  ")
@@ -1709,7 +1709,7 @@ mod tests {
             .find(|line| {
                 line.spans
                     .iter()
-                    .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))
+                    .any(|span| span.style.bg == Some(crate::ui::palette::surface()))
             })
             .expect("a surface-filled selected row");
 

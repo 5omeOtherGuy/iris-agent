@@ -671,7 +671,7 @@ impl TreeMenu {
             for span in &mut spans {
                 span.style = span
                     .style
-                    .patch(ratatui::style::Style::default().bg(crate::ui::palette::SURFACE));
+                    .patch(ratatui::style::Style::default().bg(crate::ui::palette::surface()));
             }
             if let Some(name) = spans.get_mut(1) {
                 name.style = name.style.add_modifier(ratatui::style::Modifier::BOLD);

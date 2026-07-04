@@ -199,7 +199,7 @@ pub(super) fn menu_row(
     }
     spans.extend(meta);
     if selected {
-        let fill = Style::default().bg(palette::SURFACE);
+        let fill = Style::default().bg(palette::surface());
         for span in &mut spans {
             span.style = span.style.patch(fill);
         }
@@ -304,7 +304,7 @@ pub(super) fn input_row(
         spans.push(Span::raw(" ".repeat(pad)));
     }
     spans.extend(hint);
-    let fill = Style::default().bg(palette::SURFACE);
+    let fill = Style::default().bg(palette::surface());
     for span in &mut spans {
         span.style = span.style.patch(fill);
     }
@@ -415,7 +415,7 @@ mod tests {
         assert!(
             row.spans
                 .iter()
-                .all(|span| span.style.bg == Some(palette::SURFACE)),
+                .all(|span| span.style.bg == Some(palette::surface())),
             "selected row carries the surface fill"
         );
         assert!(display_width(&text) <= 40);

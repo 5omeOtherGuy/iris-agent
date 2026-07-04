@@ -26,6 +26,7 @@ pub(crate) trait Theme: Sync {
     /// Stable identifier used in config and the `/theme` picker (e.g. `"gruvbox"`).
     fn id(&self) -> &'static str;
     /// Human-readable name for the picker (e.g. `"Gruvbox Dark"`).
+    #[allow(dead_code)] // reserved for the theme picker label
     fn name(&self) -> &'static str;
 
     /// `border` — panel & composer frames.

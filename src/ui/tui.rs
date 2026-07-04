@@ -117,11 +117,11 @@ const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_INDENT;
 /// the block's right rail.
 const PANEL_FOOTER_INDENT: usize = 2;
 
-// Color roles live in `crate::ui::palette` (the single source of truth). They
-// are imported here under their long-standing names so the whole `tui` module
-// tree keeps referencing them as `BORDER`, `ORANGE`, … (and its child modules
-// as `super::BORDER`).
-use crate::ui::palette::{BORDER, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, ORANGE, RED};
+// Color roles live in `crate::ui::palette` (the single source of truth). The
+// themed accessors are imported here so the whole `tui` module tree resolves
+// them as `border()`, `orange()`, … (and its child modules as
+// `super::border()`), reading the active theme at render time (ADR-0041).
+use crate::ui::palette::{border, diff_add_bg, diff_del_bg, green, orange, red};
 
 const X_PADDING: usize = 2;
 const BOX_X_PADDING: usize = X_PADDING;
@@ -152,16 +152,16 @@ const BRAILLE_SPINNER_FRAMES: &[&str] = &[
 ];
 
 fn ok_style() -> Style {
-    Style::default().fg(GREEN)
+    Style::default().fg(green())
 }
 fn err_style() -> Style {
-    Style::default().fg(RED)
+    Style::default().fg(red())
 }
 fn dim_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 fn prompt_style() -> Style {
-    Style::default().fg(ORANGE)
+    Style::default().fg(orange())
 }
 fn tool_header_style() -> Style {
     Style::default()
@@ -208,7 +208,7 @@ fn turn_divider_line(
 }
 
 fn border_style() -> Style {
-    Style::default().fg(BORDER)
+    Style::default().fg(border())
 }
 
 fn panel_style() -> Style {
@@ -1700,21 +1700,15 @@ mod tests {
             .expect("removal row");
         assert_eq!(add.style, ok_style());
         assert_eq!(remove.style, err_style());
-        assert_ne!(add.style.fg, Some(DIFF_ADD_BG));
-        assert_ne!(remove.style.fg, Some(DIFF_DEL_BG));
+        assert_ne!(add.style.fg, Some(diff_add_bg()));
+        assert_ne!(remove.style.fg, Some(diff_del_bg()));
         assert!(matches!(
             add.chrome.as_ref(),
-            Some(ChromeRow::Body {
-                bg: Some(DIFF_ADD_BG),
-                ..
-            })
+            Some(ChromeRow::Body { bg, .. }) if *bg == Some(diff_add_bg())
         ));
         assert!(matches!(
             remove.chrome.as_ref(),
-            Some(ChromeRow::Body {
-                bg: Some(DIFF_DEL_BG),
-                ..
-            })
+            Some(ChromeRow::Body { bg, .. }) if *bg == Some(diff_del_bg())
         ));
     }
 
@@ -5585,7 +5579,7 @@ mod tests {
         assert!(
             exit.spans
                 .iter()
-                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE)),
+                .any(|span| span.style.bg == Some(crate::ui::palette::surface())),
             "selected slash row should use the surface fill: {exit:?}"
         );
         assert!(
@@ -5611,7 +5605,7 @@ mod tests {
             model
                 .spans
                 .iter()
-                .all(|span| span.style.bg != Some(crate::ui::palette::SURFACE)),
+                .all(|span| span.style.bg != Some(crate::ui::palette::surface())),
             "unselected rows are unfilled: {model:?}"
         );
     }

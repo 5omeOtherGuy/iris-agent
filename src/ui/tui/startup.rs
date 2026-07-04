@@ -212,7 +212,7 @@ impl StartPage {
             Span::styled(hint.to_string(), dim_style()),
         ];
         if selected {
-            let fill = Style::default().bg(palette::SURFACE);
+            let fill = Style::default().bg(palette::surface());
             for span in &mut spans {
                 span.style = span.style.patch(fill);
             }
@@ -356,7 +356,7 @@ mod tests {
                 .spans
                 .iter()
                 .filter(|span| !span.content.trim().is_empty() || span.style.bg.is_some())
-                .all(|span| span.style.bg == Some(palette::SURFACE)),
+                .all(|span| span.style.bg == Some(palette::surface())),
             "selected row carries the surface fill: {selected:?}"
         );
         assert!(
@@ -390,8 +390,8 @@ mod tests {
             lit.nth(cell).map(|span| span.style).expect("cell")
         };
         assert!(cell_style(3).add_modifier.contains(Modifier::BOLD));
-        assert_eq!(cell_style(3).fg, Some(palette::ORANGE));
-        assert_eq!(cell_style(2).fg, Some(palette::ORANGE));
+        assert_eq!(cell_style(3).fg, Some(palette::orange()));
+        assert_eq!(cell_style(2).fg, Some(palette::orange()));
         assert!(!cell_style(2).add_modifier.contains(Modifier::BOLD));
         assert_eq!(cell_style(1).fg, Some(Color::DarkGray));
     }
