@@ -221,7 +221,7 @@ fn explore_op_row(width: usize, call: &ToolCall, outcome: &ToolOutcome) -> Trans
             let code = format!("\"{pattern}\"");
             spans.push(Span::styled(
                 code.clone(),
-                Style::default().fg(palette::CYAN),
+                Style::default().fg(palette::cyan()),
             ));
             plain.push_str(&code);
             let scope = path.unwrap_or_default();

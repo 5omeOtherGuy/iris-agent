@@ -14,8 +14,8 @@ use super::wrap::{
     take_spans_to_width, truncate_line,
 };
 use super::{
-    BOX_X_PADDING, DIFF_ADD_BG, DIFF_DEL_BG, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT,
-    TEXT_COLUMN_X_PADDING, dim_style, err_style, ok_style, panel_style, prompt_style,
+    BOX_X_PADDING, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT, TEXT_COLUMN_X_PADDING, diff_add_bg,
+    diff_del_bg, dim_style, err_style, ok_style, panel_style, prompt_style,
 };
 use crate::ui::{is_diff_file_header, symbols};
 
@@ -351,7 +351,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                         removed[0],
                         old_spans,
                         err_style(),
-                        Some(DIFF_DEL_BG),
+                        Some(diff_del_bg()),
                     ));
                     old_line += 1;
                     out.push(diff_span_row(
@@ -361,7 +361,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                         added[0],
                         new_spans,
                         ok_style(),
-                        Some(DIFF_ADD_BG),
+                        Some(diff_add_bg()),
                     ));
                     new_line += 1;
                 } else {
@@ -372,7 +372,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                             symbols::REMOVED,
                             code,
                             err_style(),
-                            Some(DIFF_DEL_BG),
+                            Some(diff_del_bg()),
                         ));
                         old_line += 1;
                     }
@@ -383,7 +383,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                             symbols::ADDED,
                             code,
                             ok_style(),
-                            Some(DIFF_ADD_BG),
+                            Some(diff_add_bg()),
                         ));
                         new_line += 1;
                     }
@@ -396,7 +396,7 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
                     symbols::ADDED,
                     code,
                     ok_style(),
-                    Some(DIFF_ADD_BG),
+                    Some(diff_add_bg()),
                 ));
                 new_line += 1;
                 i += 1;

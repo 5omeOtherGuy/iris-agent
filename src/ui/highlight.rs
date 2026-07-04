@@ -146,33 +146,33 @@ fn scope_name_style(scope: &str) -> Option<Style> {
         // Comments are the one muted role: gray + dim so code reads first.
         return Some(
             Style::default()
-                .fg(palette::BORDER)
+                .fg(palette::border())
                 .add_modifier(Modifier::DIM),
         );
     }
     if scope.starts_with("string") || scope.starts_with("constant.character") {
-        return Some(Style::default().fg(palette::GREEN));
+        return Some(Style::default().fg(palette::green()));
     }
     if scope.starts_with("constant") {
         // Numeric / language literals (numbers, true/false/nil).
-        return Some(Style::default().fg(palette::RED));
+        return Some(Style::default().fg(palette::red()));
     }
     if scope.starts_with("keyword") || scope.starts_with("storage") {
         // Keywords and storage keywords (`fn`, `let`, `struct`, `class`).
-        return Some(Style::default().fg(palette::ORANGE));
+        return Some(Style::default().fg(palette::orange()));
     }
     if scope.starts_with("entity.name.function")
         || scope.starts_with("support.function")
         || scope.starts_with("variable.function")
     {
-        return Some(Style::default().fg(palette::CYAN));
+        return Some(Style::default().fg(palette::cyan()));
     }
     if scope.starts_with("entity.name")
         || scope.starts_with("support.type")
         || scope.starts_with("support.class")
     {
         // Type / class / trait names.
-        return Some(Style::default().fg(palette::CYAN));
+        return Some(Style::default().fg(palette::cyan()));
     }
     None
 }
@@ -250,7 +250,7 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("hello"))
             .expect("comment span");
-        assert_eq!(comment.style.fg, Some(palette::BORDER));
+        assert_eq!(comment.style.fg, Some(palette::border()));
         assert!(comment.style.add_modifier.contains(Modifier::DIM));
     }
 

@@ -440,7 +440,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         && line - top < body.len()
     {
         for span in &mut body[line - top].spans {
-            span.style = span.style.bg(crate::ui::palette::SURFACE);
+            span.style = span.style.bg(crate::ui::palette::surface());
         }
     }
     // Current search match: surface fill on the whole match line.
@@ -449,7 +449,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         && line - top < body.len()
     {
         for span in &mut body[line - top].spans {
-            span.style = span.style.bg(crate::ui::palette::SURFACE);
+            span.style = span.style.bg(crate::ui::palette::surface());
         }
     }
     // Sticky user-prompt header (grok `sticky_headers`): when the newest
@@ -940,7 +940,7 @@ mod tests {
         let highlighted = composed.lines.iter().any(|line| {
             line.spans
                 .iter()
-                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))
+                .any(|span| span.style.bg == Some(crate::ui::palette::surface()))
         });
         assert!(
             highlighted,
@@ -1009,7 +1009,7 @@ mod tests {
             composed.lines.iter().any(|line| line
                 .spans
                 .iter()
-                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))),
+                .any(|span| span.style.bg == Some(crate::ui::palette::surface()))),
             "current match carries the surface fill"
         );
 
@@ -1092,7 +1092,7 @@ mod tests {
             composed.lines.iter().any(|line| line
                 .spans
                 .iter()
-                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))),
+                .any(|span| span.style.bg == Some(crate::ui::palette::surface()))),
             "current folded match carries the surface highlight"
         );
 
@@ -1210,7 +1210,7 @@ mod tests {
             .position(|line| {
                 line.spans
                     .iter()
-                    .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE))
+                    .any(|span| span.style.bg == Some(crate::ui::palette::surface()))
             })
             .expect("match highlighted");
         assert!(
@@ -1303,7 +1303,7 @@ mod tests {
             frame[2]
                 .spans
                 .iter()
-                .any(|span| span.style.bg == Some(crate::ui::palette::SURFACE)),
+                .any(|span| span.style.bg == Some(crate::ui::palette::surface())),
             "match at the top keeps its highlight"
         );
     }

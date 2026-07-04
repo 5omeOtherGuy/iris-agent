@@ -229,10 +229,10 @@ impl ApprovalPolicy {
     /// Symbol color role: green done / orange review / red error / dim empty.
     fn symbol_style(self) -> Style {
         match self {
-            Self::AlwaysApprove | Self::Auto => Style::default().fg(crate::ui::palette::GREEN),
+            Self::AlwaysApprove | Self::Auto => Style::default().fg(crate::ui::palette::green()),
             Self::OnRequest => prompt_style(),
             Self::NeverAsk => dim_style(),
-            Self::ReadOnly => Style::default().fg(crate::ui::palette::RED),
+            Self::ReadOnly => Style::default().fg(crate::ui::palette::red()),
             Self::Off => dim_style(),
         }
     }
