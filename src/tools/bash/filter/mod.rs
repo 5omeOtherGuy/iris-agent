@@ -220,18 +220,30 @@ mod tests {
 
     #[test]
     fn failing_command_emptied_yields_raw_not_on_empty() {
-        // cargo-test has on_empty = "ok (...)"; on a non-zero exit whose lines
-        // are all stripped, the on_empty success message must be suppressed
-        // and the raw output returned instead (ADR-0036 failure-is-complete).
-        let chatter = "   Compiling foo v0.1.0 (/home/user/foo)\n";
+        // npm-install has on_empty = "ok (...)"; on a non-zero exit whose
+        // lines are all stripped, the on_empty success message must be
+        // suppressed and the raw output returned instead (ADR-0036
+        // failure-is-complete). (cargo test moved to a structured filter in
+        // PR 2 of #336; npm-install is the remaining on_empty TOML filter.)
+        let noise = "npm warn deprecated inflight@1.0.6: leaks memory\n";
         assert!(
-            filter_output("cargo test", chatter, false).is_none(),
+            filter_output("npm install", noise, false).is_none(),
             "failed command emptied by the filter must yield raw, not on_empty"
         );
         // Success path unchanged: the same emptied output renders on_empty.
-        let ok = filter_output("cargo test", chatter, true)
+        let ok = filter_output("npm install", noise, true)
             .expect("success emptied output should render on_empty");
-        assert_eq!(ok.text, "ok (cargo test: no summary output)");
+        assert_eq!(ok.text, "ok (installed; log was all noise)");
+    }
+
+    #[test]
+    fn structured_class_chatter_only_output_passes_through_raw() {
+        // With the TOML cargo-test filter retired, pure-chatter cargo test
+        // output is unparsable for the structured filter and passes through
+        // raw on both exit paths (never an invented success message).
+        let chatter = "   Compiling foo v0.1.0 (/home/user/foo)\n";
+        assert!(filter_output("cargo test", chatter, false).is_none());
+        assert!(filter_output("cargo test", chatter, true).is_none());
     }
 
     #[test]
