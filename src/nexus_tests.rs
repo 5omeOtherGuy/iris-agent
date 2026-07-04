@@ -973,6 +973,45 @@ fn read_tool_returns_missing_file_error() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn unclassified_tool_error_wire_shape_is_byte_identical() {
+    // An unclassified error carries no `metadata` key: the wire bytes stay
+    // exactly `{ "ok": false, "error": ... }` (ADR-0040 opt-in guarantee).
+    let error = anyhow!("plain failure text");
+    let wire = ToolResultContract::tool_error(error).into_wire_json();
+
+    assert_eq!(wire, r#"{"error":"plain failure text","ok":false}"#);
+    assert!(!wire.contains("metadata"));
+}
+
+#[test]
+fn classified_tool_error_emits_metadata_beside_error() {
+    // A classified error keeps the `error` string and adds a compact
+    // `metadata` object carrying `class` plus any fields.
+    let error = ClassifiedError::new("not-found", "could not find the text")
+        .with("occurrences", json!(0))
+        .into();
+    let wire = ToolResultContract::tool_error(error).into_wire_value();
+
+    assert_eq!(wire["ok"], json!(false));
+    assert_eq!(wire["error"], json!("could not find the text"));
+    assert_eq!(wire["metadata"]["class"], json!("not-found"));
+    assert_eq!(wire["metadata"]["occurrences"], json!(0));
+}
+
+#[test]
+fn denied_and_cancelled_wire_shapes_are_unchanged() {
+    // ADR-0040 must not perturb the pre-existing denial/cancel envelopes.
+    assert_eq!(
+        ToolResultContract::denied().into_wire_json(),
+        r#"{"denied":true,"error":"tool call denied by user","ok":false}"#
+    );
+    assert_eq!(
+        ToolResultContract::cancelled().into_wire_json(),
+        r#"{"cancelled":true,"error":"tool call cancelled by user","ok":false}"#
+    );
+}
+
 fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
     AssistantTurn {
         text: None,
@@ -1732,7 +1771,129 @@ fn edit_without_prior_read_is_rejected_end_to_end() -> Result<()> {
     let seen = harness.agent.provider.seen.borrow();
     let result = seen[1].last().unwrap();
     assert!(result.content.contains("\"ok\":false"));
+    // Prose stays exactly as informative; the `stale-file` class is additive
+    // (ADR-0040) and travels beside the unchanged `error` string.
     assert!(result.content.contains("has not been read this session"));
+    assert!(result.content.contains("\"class\":\"stale-file\""));
+    assert!(result.content.contains("\"reason\":\"unread\""));
+    Ok(())
+}
+
+#[test]
+fn edit_not_found_failure_carries_class_metadata_end_to_end() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "original")?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+        Ok(single_call_turn(
+            "edit",
+            json!({
+                "file_path": "note.txt",
+                "old_string": "does-not-exist",
+                "new_string": "changed"
+            }),
+        )),
+        Ok(AssistantTurn::text("understood")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    run_text_session(
+        &mut harness,
+        "go\ny\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let result = seen[2].last().unwrap();
+    assert!(result.content.contains("\"ok\":false"));
+    assert!(result.content.contains("could not find the text"));
+    assert!(result.content.contains("\"class\":\"not-found\""));
+    Ok(())
+}
+
+#[test]
+fn edit_not_unique_failure_carries_class_metadata_end_to_end() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("dup.txt"), "dup\ndup\n")?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("read", json!({ "path": "dup.txt" }))),
+        Ok(single_call_turn(
+            "edit",
+            json!({
+                "file_path": "dup.txt",
+                "old_string": "dup",
+                "new_string": "x"
+            }),
+        )),
+        Ok(AssistantTurn::text("understood")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+
+    run_text_session(
+        &mut harness,
+        "go\ny\n/exit\n".as_bytes(),
+        &mut output,
+        &mut errors,
+    )?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let result = seen[2].last().unwrap();
+    assert!(result.content.contains("\"ok\":false"));
+    assert!(result.content.contains("found 2 occurrences"));
+    assert!(result.content.contains("\"class\":\"not-unique\""));
+    // Compact machine-readable field beside the class (ADR-0036/0040).
+    assert!(result.content.contains("\"occurrences\":2"));
+    Ok(())
+}
+
+#[test]
+fn classified_edit_failure_metadata_is_persisted_to_transcript() -> Result<()> {
+    // ADR-0040 metadata rides the existing persistence path: the JSONL
+    // tool-result row for a classified failure carries the `class`.
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "original")?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+        Ok(single_call_turn(
+            "edit",
+            json!({
+                "file_path": "note.txt",
+                "old_string": "does-not-exist",
+                "new_string": "changed"
+            }),
+        )),
+        Ok(AssistantTurn::text("understood")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    // `y` approves the edit; the guarded edit then fails with not-found.
+    run_text_session(&mut harness, b"go\ny\n/exit\n", &mut out, &mut err)?;
+
+    let persisted = fs::read_to_string(&log_path)?;
+    let tool_row = persisted
+        .lines()
+        .find(|line| line.contains("\"role\":\"tool\"") && line.contains("could not find the text"))
+        .expect("classified edit failure persisted as a tool row");
+    // The tool-result content is a JSON string inside the JSONL row, so the
+    // metadata object's quotes are escaped (`\"class\":\"not-found\"`).
+    assert!(tool_row.contains("class") && tool_row.contains("not-found"));
     Ok(())
 }
 

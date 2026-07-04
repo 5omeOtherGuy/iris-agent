@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::nexus::ClassifiedError;
+
 use super::path::resolve_existing;
 use super::text::{
     READ_TOOL_MAX_BYTES, WRITE_TOOL_MAX_BYTES, atomic_write, detect_line_ending, normalize_to_lf,
@@ -238,11 +240,11 @@ fn locate_matches(
     let (norm_hay, map) = normalize_for_fuzzy(haystack);
     let (norm_needle, _) = normalize_for_fuzzy(needle);
     if norm_needle.is_empty() {
-        bail!("{}", not_found_message(path, haystack, needle));
+        return Err(not_found_error(path, haystack, needle));
     }
     let fuzzy = find_all(&norm_hay, &norm_needle);
     if fuzzy.is_empty() {
-        bail!("{}", not_found_message(path, haystack, needle));
+        return Err(not_found_error(path, haystack, needle));
     }
     let ranges = fuzzy
         .into_iter()
@@ -267,14 +269,24 @@ fn select(
     }
     match ranges.len() {
         1 => Ok(ranges),
-        n => bail!(
-            "found {n} occurrences of the text in {path}; pass replace_all=true to replace all of \
-             them, or add surrounding context to old_string so it uniquely identifies one location"
-        ),
+        n => Err(ClassifiedError::new(
+            "not-unique",
+            format!(
+                "found {n} occurrences of the text in {path}; pass replace_all=true to replace \
+                 all of them, or add surrounding context to old_string so it uniquely identifies \
+                 one location"
+            ),
+        )
+        .with("occurrences", json!(n))
+        .into()),
     }
 }
 
-fn not_found_message(path: &str, haystack: &str, needle: &str) -> String {
+/// The `not-found` failure: the human-readable guidance stays exactly as
+/// informative as before, including the closest-candidate region so the model
+/// can re-anchor without re-reading the whole file (ADR-0036); the `not-found`
+/// class rides as additive machine-readable metadata (ADR-0040).
+fn not_found_error(path: &str, haystack: &str, needle: &str) -> anyhow::Error {
     let mut message = format!(
         "could not find the text in {path}. old_string must match the file's current contents \
          (line endings and Unicode spaces/quotes/dashes are normalized and trailing whitespace is \
@@ -289,7 +301,7 @@ fn not_found_message(path: &str, haystack: &str, needle: &str) -> String {
             "\nClosest matching region (around line {line}):\n{region}"
         ));
     }
-    message
+    ClassifiedError::new("not-found", message).into()
 }
 
 /// A compact, line-numbered snippet of the content spanning the byte range

@@ -561,6 +561,60 @@ pub(crate) trait MutationGuard {
 /// context (like `exitCode`/`durationMs`). Not a git concept -- a content hash.
 pub(crate) const WRITE_CONFIRM_HASH_KEY: &str = "__iris_after_hash";
 
+/// A tool error that carries optional machine-readable classification beside
+/// its human-readable message (ADR-0040, extending ADR-0021). Tools opt in by
+/// returning it through their existing `anyhow::Result`; Nexus downcasts it in
+/// the tool-error wire arm and emits a compact `metadata` object next to the
+/// unchanged `error` string. Tools with nothing structured to report keep plain
+/// `bail!` and their wire output stays byte-identical.
+///
+/// Keep `class` short and `fields` compact (ADR-0036): the payload is model
+/// context, so carry only classification a consumer can act on, never large or
+/// sensitive detail.
+#[derive(Debug, Clone)]
+pub(crate) struct ClassifiedError {
+    class: String,
+    message: String,
+    fields: serde_json::Map<String, Value>,
+}
+
+impl ClassifiedError {
+    /// A classified error with a stable `class` token and its human-readable
+    /// message. The message stays as informative as an unclassified `bail!`;
+    /// the class is additive.
+    pub(crate) fn new(class: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            class: class.into(),
+            message: message.into(),
+            fields: serde_json::Map::new(),
+        }
+    }
+
+    /// Attach one compact classification field, builder-style.
+    pub(crate) fn with(mut self, key: &str, value: Value) -> Self {
+        self.fields.insert(key.to_string(), value);
+        self
+    }
+
+    /// The model-facing `metadata` object: `{ "class": ..., ...fields }`.
+    fn to_metadata(&self) -> serde_json::Map<String, Value> {
+        let mut obj = serde_json::Map::new();
+        obj.insert("class".to_string(), Value::String(self.class.clone()));
+        for (key, value) in &self.fields {
+            obj.insert(key.clone(), value.clone());
+        }
+        obj
+    }
+}
+
+impl std::fmt::Display for ClassifiedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedError {}
+
 /// optional structured metadata. Tier-1 result contract (the analogue of pi's
 /// `AgentToolResult`); tools with nothing structured to report use
 /// [`ToolOutput::text`] and the metadata is omitted from the wire.
@@ -2083,7 +2137,22 @@ impl ToolResultContract {
                 }
                 Value::Object(obj)
             }
-            Self::ToolError(error) => json!({ "ok": false, "error": error.to_string() }),
+            Self::ToolError(error) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("ok".to_string(), Value::Bool(false));
+                obj.insert("error".to_string(), Value::String(error.to_string()));
+                // Opt-in machine-readable classification: only present when the
+                // tool returned a `ClassifiedError`. Unclassified errors stay
+                // byte-identical to `{ "ok": false, "error": ... }`. This mirrors
+                // the Denied/Cancelled precedent of adding a flag beside `error`.
+                if let Some(classified) = error.downcast_ref::<ClassifiedError>() {
+                    obj.insert(
+                        "metadata".to_string(),
+                        Value::Object(classified.to_metadata()),
+                    );
+                }
+                Value::Object(obj)
+            }
             Self::Denied => json!({
                 "ok": false,
                 "error": "tool call denied by user",
