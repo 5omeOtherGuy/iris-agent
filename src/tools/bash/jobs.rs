@@ -159,6 +159,7 @@ impl Jobs {
                 shared,
                 pgid,
                 label,
+                command: command.to_string(),
                 read_cursor: 0,
             },
         );
@@ -182,6 +183,11 @@ impl Jobs {
         for seq in finished.into_iter().take(cutoff) {
             self.map.remove(&format!("job-{seq}"));
         }
+    }
+
+    /// The command a live job was started with (for filter dispatch).
+    pub(crate) fn command_of(&self, id: &str) -> Option<String> {
+        self.map.get(id).map(|job| job.command.clone())
     }
 
     /// Return output produced since the previous poll plus liveness/exit state.
@@ -299,6 +305,9 @@ struct Job {
     shared: Arc<Shared>,
     pgid: i32,
     label: Option<String>,
+    /// The command the job runs; used to dispatch the output filter
+    /// (ADR-0037) when the job is finalized.
+    command: String,
     /// Absolute byte offset of the next unread output byte.
     read_cursor: u64,
 }

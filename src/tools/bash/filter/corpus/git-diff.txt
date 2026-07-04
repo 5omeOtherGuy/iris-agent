@@ -1,0 +1,645 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 641b789..30fd1c2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -78,13 +78,31 @@ version = "0.22.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+ 
++[[package]]
++name = "bincode"
++version = "1.3.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
++dependencies = [
++ "serde",
++]
++
+ [[package]]
+ name = "bit-set"
+ version = "0.5.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0700ddab506f33b20a03b13996eccd309a48e5ff77d0d95926aa0210fb4e95f1"
+ dependencies = [
+- "bit-vec",
++ "bit-vec 0.6.3",
++]
++
++[[package]]
++name = "bit-set"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
++dependencies = [
++ "bit-vec 0.8.0",
+ ]
+ 
+ [[package]]
+@@ -93,6 +111,12 @@ version = "0.6.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
+ 
++[[package]]
++name = "bit-vec"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
++
+ [[package]]
+ name = "bitflags"
+ version = "1.3.2"
+@@ -527,10 +551,21 @@ version = "0.11.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b95f7c0680e4142284cf8b22c14a476e87d61b004a3a0861872b32ef7ead40a2"
+ dependencies = [
+- "bit-set",
++ "bit-set 0.5.3",
+  "regex",
+ ]
+ 
++[[package]]
++name = "fancy-regex"
++version = "0.16.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f"
++dependencies = [
++ "bit-set 0.8.0",
++ "regex-automata",
++ "regex-syntax",
++]
++
+ [[package]]
+ name = "fast-srgb8"
+ version = "1.0.0"
+@@ -1215,6 +1250,7 @@ dependencies = [
+  "serde_json",
+  "sha2 0.11.0",
+  "similar",
++ "syntect",
+  "tar",
+  "thiserror 2.0.18",
+  "tokio",
+@@ -2451,6 +2487,24 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
++[[package]]
++name = "syntect"
++version = "5.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "656b45c05d95a5704399aeef6bd0ddec7b2b3531b7c9e900abbf7c4d2190c925"
++dependencies = [
++ "bincode",
++ "fancy-regex 0.16.2",
++ "flate2",
++ "fnv",
++ "once_cell",
++ "regex-syntax",
++ "serde",
++ "serde_derive",
++ "thiserror 2.0.18",
++ "walkdir",
++]
++
+ [[package]]
+ name = "tar"
+ version = "0.4.46"
+@@ -2527,7 +2581,7 @@ dependencies = [
+  "anyhow",
+  "base64",
+  "bitflags 2.13.0",
+- "fancy-regex",
++ "fancy-regex 0.11.0",
+  "filedescriptor",
+  "finl_unicode",
+  "fixedbitset",
+diff --git a/Cargo.toml b/Cargo.toml
+index e7c3358..b81e1ae 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -43,6 +43,13 @@ ansi-to-tui = "8.0.1"
+ # a markdown tokenizer, which is an error-prone parser path the reuse ladder
+ # forbids. default-features off drops the unused HTML push/CLI features.
+ pulldown-cmark = { version = "0.13", default-features = false }
++# Syntax highlighting for fenced code blocks via the markdown `HighlightFn` seam
++# (ADR-0033, #324). default-features off drops the onig C dependency; we enable
++# `regex-fancy` (pure-Rust fancy-regex) and `default-syntaxes` (the bundled
++# Sublime syntax dump + parsing). We deliberately do NOT enable `default-themes`,
++# `html`, `plist-load`, or `yaml-load`: scopes are mapped to the Iris palette in
++# `src/ui/highlight.rs`, so no stock theme/plist machinery is pulled in.
++syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+ # Multiline editor widget (undo/redo, kill-ring/yank, word-nav) over the same
+ # ratatui buffer. default-features off drops its crossterm/termion/termwiz input
+ # backends and the regex search feature: Iris drives edits from its own keymap
+diff --git a/deny.toml b/deny.toml
+index 97e0686..7fecebd 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -9,7 +9,12 @@
+ version = 2
+ # RUSTSEC security advisories. Fail on vulnerable or yanked crates.
+ yanked = "deny"
+-ignore = []
++# RUSTSEC-2025-0141: bincode 1.x is unmaintained (advisory, not a
++# vulnerability). Pulled in only by syntect's `default-syntaxes` packdump
++# loader; the sole input it deserializes is the syntax dump embedded in our
++# own binary at build time -- never attacker-controlled data. Remove the
++# ignore when syntect moves off bincode 1 upstream.
++ignore = ["RUSTSEC-2025-0141"]
+ 
+ [bans]
+ # Warn (do not fail) on duplicate versions of the same crate; tighten to "deny"
+diff --git a/src/ui/highlight.rs b/src/ui/highlight.rs
+new file mode 100644
+index 0000000..7f12a33
+--- /dev/null
++++ b/src/ui/highlight.rs
+@@ -0,0 +1,313 @@
++//! Syntax highlighter for fenced Markdown code blocks (Tier 3).
++//!
++//! Implements the `HighlightFn` seam in [`crate::ui::markdown`] (#324, boundary
++//! ADR-0033): a fenced block's language tag is mapped to a `syntect` syntax, the
++//! code is parsed into scoped tokens, and each token's scope is mapped to a
++//! fixed slice of the Iris design-system palette ([`crate::ui::palette`]). This
++//! is a deliberately small scope->color mapping, not a stock theme dump: it
++//! covers keywords, strings, comments, types, functions, and literals, and
++//! emits no background colors (the transcript surface owns the background).
++//!
++//! # Why an in-repo mapper instead of `syntect-tui`
++//!
++//! Per the reuse ladder, we considered `syntect-tui` for the syntect->ratatui
++//! `Style` mapping and rejected it: it is a low-maturity, low-traffic crate not
++//! verified against ratatui 0.30, and it exists to translate a full syntect
++//! `Theme` into `ratatui::Style`. We never build a syntect `Theme` (we map raw
++//! scopes to the palette directly), so its surface does not fit; the mapping we
++//! do need is ~1 match arm and trivial to own. syntect itself is the load-bearing
++//! dependency (regex-driven syntax parsing); the style glue is not worth a dep.
++//!
++//! The syntax set is loaded lazily once via a `OnceLock` (syntax dumps are ~1MB
++//! to deserialize) and reused for every subsequent block; the one-time load time
++//! is measured and emitted at `tracing::debug`.
++
++use std::rc::Rc;
++use std::sync::OnceLock;
++
++use ratatui::style::{Modifier, Style};
++use ratatui::text::{Line, Span};
++use syntect::easy::ScopeRegionIterator;
++use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
++use syntect::util::LinesWithEndings;
++
++use crate::ui::markdown::HighlightFn;
++use crate::ui::palette;
++
++/// Lazily-loaded default syntax set (newline mode, to pair with
++/// [`LinesWithEndings`]). The bundled Sublime syntax dump is ~1MB to
++/// deserialize, so we load it once on first use and reuse it thereafter;
++/// the load time is measured and logged at `debug`.
++fn syntax_set() -> &'static SyntaxSet {
++    static SET: OnceLock<SyntaxSet> = OnceLock::new();
++    SET.get_or_init(|| {
++        let start = std::time::Instant::now();
++        let set = SyntaxSet::load_defaults_newlines();
++        tracing::debug!(
++            elapsed_ms = start.elapsed().as_secs_f64() * 1000.0,
++            syntaxes = set.syntaxes().len(),
++            "loaded syntect syntax set"
++        );
++        set
++    })
++}
++
++/// Highlight `code` for language tag `lang`, returning one styled [`Line`] per
++/// source line. Returns `None` when `lang` is absent or does not resolve to a
++/// known syntax, so the caller falls back to today's dim rendering. Spans carry
++/// only a foreground color (no background); the caller composes the theme base
++/// (e.g. the thinking dim+italic) on top.
++pub(crate) fn highlight(code: &str, lang: Option<&str>) -> Option<Vec<Line<'static>>> {
++    // Fence info strings may carry attributes after the language (e.g.
++    // "rust ignore", "python title=x"); only the first token names the syntax.
++    let lang = lang?.split_whitespace().next()?;
++    let syntax_set = syntax_set();
++    // `find_syntax_by_token` matches names, aliases, and file extensions
++    // (e.g. "rust"/"rs", "python"/"py"), so it covers the tags models emit.
++    let syntax = syntax_set.find_syntax_by_token(lang)?;
++
++    let mut state = ParseState::new(syntax);
++    let mut stack = ScopeStack::new();
++    let mut lines: Vec<Line<'static>> = Vec::new();
++
++    for line in LinesWithEndings::from(code) {
++        // A malformed/oversized line should degrade to the dim fallback rather
++        // than render a partial block, so bail the whole block on parse error.
++        let ops = state.parse_line(line, syntax_set).ok()?;
++        let mut spans: Vec<Span<'static>> = Vec::new();
++        for (text, op) in ScopeRegionIterator::new(&ops, line) {
++            stack.apply(op).ok()?;
++            // The last region of each line carries the trailing '\n' (newline
++            // mode); strip it so it never enters a `Line`.
++            let text = text.strip_suffix('\n').unwrap_or(text);
++            if text.is_empty() {
++                continue;
++            }
++            let style = scope_style(&stack);
++            spans.push(Span::styled(text.to_string(), style));
++        }
++        lines.push(Line::from(spans));
++    }
++
++    Some(lines)
++}
++
++/// Build the `HighlightFn` the Markdown renderer injects at the fenced-code
++/// seam. `base` is the theme's base style (e.g. the thinking dim+italic) and
++/// `fallback` is the dim code-block style used when a language is unknown.
++///
++/// On a hit, the palette color is patched *onto* `base` so the thinking variant
++/// stays dimmed and the normal variant renders the raw color. On a miss, the
++/// block is emitted exactly as today's dim path: one span per line at
++/// `fallback`, split on `\n` with no trailing empty line (the renderer strips
++/// the block's final newline before calling us).
++pub(crate) fn code_highlighter(base: Style, fallback: Style) -> HighlightFn {
++    Rc::new(
++        move |code: &str, lang: Option<&str>| match highlight(code, lang) {
++            Some(lines) => lines
++                .into_iter()
++                .map(|line| {
++                    let spans = line
++                        .spans
++                        .into_iter()
++                        .map(|span| Span::styled(span.content, base.patch(span.style)))
++                        .collect::<Vec<_>>();
++                    Line::from(spans)
++                })
++                .collect(),
++            None => code
++                .split('\n')
++                .map(|l| Line::from(Span::styled(l.to_string(), fallback)))
++                .collect(),
++        },
++    )
++}
++
++/// Map a token's scope stack to a palette foreground color. The most specific
++/// (top-of-stack) scope wins; unrecognized scopes get the default style so
++/// punctuation and identifiers read as plain foreground text. Colors bind to the
++/// ANSI-named palette roles so highlighting inherits the user's terminal theme.
++fn scope_style(stack: &ScopeStack) -> Style {
++    for scope in stack.as_slice().iter().rev() {
++        if let Some(style) = scope_name_style(&scope.build_string()) {
++            return style;
++        }
++    }
++    Style::default()
++}
++
++/// Fixed scope-atom -> palette mapping. Keyed on the leading dotted atoms of a
++/// TextMate/Sublime scope name. Intentionally coarse: a handful of roles reads as
++/// a muted IDE theme without chasing full theme fidelity.
++fn scope_name_style(scope: &str) -> Option<Style> {
++    // Order matters: check the more specific `constant`/`entity` prefixes before
++    // falling through to their broader atoms.
++    if scope.starts_with("comment") {
++        // Comments are the one muted role: gray + dim so code reads first.
++        return Some(
++            Style::default()
++                .fg(palette::BORDER)
++                .add_modifier(Modifier::DIM),
++        );
++    }
++    if scope.starts_with("string") || scope.starts_with("constant.character") {
++        return Some(Style::default().fg(palette::GREEN));
++    }
++    if scope.starts_with("constant") {
++        // Numeric / language literals (numbers, true/false/nil).
++        return Some(Style::default().fg(palette::RED));
++    }
++    if scope.starts_with("keyword") || scope.starts_with("storage") {
++        // Keywords and storage keywords (`fn`, `let`, `struct`, `class`).
++        return Some(Style::default().fg(palette::ORANGE));
++    }
++    if scope.starts_with("entity.name.function")
++        || scope.starts_with("support.function")
++        || scope.starts_with("variable.function")
++    {
++        return Some(Style::default().fg(palette::CYAN));
++    }
++    if scope.starts_with("entity.name")
++        || scope.starts_with("support.type")
++        || scope.starts_with("support.class")
++    {
++        // Type / class / trait names.
++        return Some(Style::default().fg(palette::CYAN));
++    }
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn fence_info_attributes_after_language_still_resolve() {
++        // Models emit fences like ```rust ignore or ```python title=x; only the
++        // first token names the syntax.
++        let lines = highlight("let x = 1;\n", Some("rust ignore")).expect("resolves");
++        assert!(distinct_colors(&lines).len() > 1, "expected styled spans");
++        assert!(
++            highlight("code\n", Some("  ")).is_none(),
++            "blank info -> fallback"
++        );
++    }
++
++    fn distinct_colors(
++        lines: &[Line<'static>],
++    ) -> std::collections::HashSet<Option<ratatui::style::Color>> {
++        lines
++            .iter()
++            .flat_map(|l| l.spans.iter())
++            .map(|s| s.style.fg)
++            .collect()
++    }
++
++    #[test]
++    fn known_language_produces_multiple_styles() {
++        let code = "fn main() {\n    let x = 42; // note\n}";
++        let lines = highlight(code, Some("rust")).expect("rust is a known syntax");
++        assert_eq!(lines.len(), 3, "one styled line per source line");
++        // A keyword, a number, a comment, and plain text must not collapse to a
++        // single color: an IDE-grade block has several distinct roles.
++        assert!(
++            distinct_colors(&lines).len() > 1,
++            "expected multiple distinct span colors, got {:?}",
++            distinct_colors(&lines)
++        );
++    }
++
++    #[test]
++    fn language_alias_and_extension_resolve() {
++        // `find_syntax_by_token` must resolve both the name and the extension.
++        assert!(highlight("x = 1\n", Some("python")).is_some());
++        assert!(highlight("x = 1\n", Some("py")).is_some());
++        assert!(highlight("let x = 1;\n", Some("rs")).is_some());
++    }
++
++    #[test]
++    fn unknown_language_returns_none() {
++        assert!(highlight("some text", Some("definitely-not-a-language")).is_none());
++    }
++
++    #[test]
++    fn absent_language_returns_none() {
++        assert!(highlight("plain code", None).is_none());
++    }
++
++    #[test]
++    fn empty_code_is_some_and_empty() {
++        // A known language with no body must not panic and yields no lines.
++        let lines = highlight("", Some("rust")).expect("known syntax");
++        assert!(lines.is_empty(), "empty code should produce no lines");
++    }
++
++    #[test]
++    fn comment_is_dim_gray() {
++        let lines = highlight("// hello\n", Some("rust")).expect("rust");
++        let comment = lines[0]
++            .spans
++            .iter()
++            .find(|s| s.content.contains("hello"))
++            .expect("comment span");
++        assert_eq!(comment.style.fg, Some(palette::BORDER));
++        assert!(comment.style.add_modifier.contains(Modifier::DIM));
++    }
++
++    #[test]
++    fn code_highlighter_dims_hit_spans_for_thinking_base() {
++        // The thinking variant patches its dim+italic base onto every colored
++        // span so highlighted code stays visually muted.
++        let base = Style::default()
++            .add_modifier(Modifier::DIM)
++            .add_modifier(Modifier::ITALIC);
++        let hl = code_highlighter(base, base);
++        let lines = hl("let x = 1;", Some("rust"));
++        assert!(!lines.is_empty());
++        for span in lines.iter().flat_map(|l| l.spans.iter()) {
++            assert!(
++                span.style.add_modifier.contains(Modifier::DIM)
++                    && span.style.add_modifier.contains(Modifier::ITALIC),
++                "thinking base not composed onto highlighted span: {span:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn code_highlighter_falls_back_to_dim_for_unknown_language() {
++        // Unknown language must render exactly as today: one span per line at
++        // the fallback (dim) style, no trailing empty line.
++        let fallback = Style::default().add_modifier(Modifier::DIM);
++        let hl = code_highlighter(Style::default(), fallback);
++        let lines = hl("line one\nline two", Some("no-such-lang"));
++        assert_eq!(lines.len(), 2);
++        assert_eq!(lines[0].spans.len(), 1);
++        assert_eq!(lines[0].spans[0].content.as_ref(), "line one");
++        assert_eq!(lines[0].spans[0].style, fallback);
++        assert_eq!(lines[1].spans[0].content.as_ref(), "line two");
++    }
++
++    #[test]
++    fn lazy_syntax_set_reuses_same_instance() {
++        // OnceLock semantics: first call initializes, second returns the same
++        // pointer (no reload).
++        let first = syntax_set() as *const SyntaxSet;
++        let second = syntax_set() as *const SyntaxSet;
++        assert_eq!(first, second, "syntax set must be loaded once and reused");
++    }
++
++    #[test]
++    fn wide_glyph_code_is_preserved_and_width_measurable() {
++        // A CJK glyph inside highlighted code must survive as an intact cluster;
++        // the wrap-safety width test lives in the wrap module where the
++        // span-aware wrapper is in scope.
++        let code = "let s = \"\u{4e2d}\u{6587}\";\n";
++        let lines = highlight(code, Some("rust")).expect("rust");
++        let joined: String = lines
++            .iter()
++            .flat_map(|l| l.spans.iter())
++            .map(|s| s.content.as_ref())
++            .collect();
++        assert!(joined.contains('\u{4e2d}') && joined.contains('\u{6587}'));
++    }
++}
+diff --git a/src/ui/markdown.rs b/src/ui/markdown.rs
+index a7262c2..36771c9 100644
+--- a/src/ui/markdown.rs
++++ b/src/ui/markdown.rs
+@@ -105,6 +105,21 @@ impl MarkdownTheme {
+             ..Self::default()
+         }
+     }
++
++    /// Inject the `syntect`-backed fenced-code highlighter (#324). Only the TUI
++    /// span path calls this; the plain / non-TTY renderer never constructs a
++    /// highlighting theme, so its output stays byte-identical (highlighting is
++    /// gated at the TUI construction site, not inside the shared renderer). The
++    /// highlighter composes this theme's `base` onto hit spans (so the thinking
++    /// variant stays dimmed) and falls back to the dim `code_block` style for
++    /// unknown languages.
++    pub(crate) fn with_code_highlighting(mut self) -> Self {
++        self.highlight_code = Some(crate::ui::highlight::code_highlighter(
++            self.base,
++            self.base.patch(self.code_block),
++        ));
++        self
++    }
+ }
+ 
+ /// Render Markdown `text` into styled transcript lines with the default theme at
+@@ -1279,6 +1294,52 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn syntect_highlighting_colors_rust_and_falls_back_for_unknown_lang() {
++        let theme = MarkdownTheme::default().with_code_highlighting();
++
++        // Known language: a rust block must render with more than one distinct
++        // span style (keyword vs literal vs plain), proving highlighting ran.
++        let rust = "```rust\nfn main() { let x = 42; }\n```";
++        let hl = render_markdown_themed(rust, &theme, DEFAULT_RENDER_WIDTH);
++        let code_line = hl
++            .iter()
++            .find(|l| text_of(l).contains("let x"))
++            .expect("rust code line");
++        let colors: std::collections::HashSet<_> =
++            code_line.spans.iter().map(|s| s.style.fg).collect();
++        assert!(
++            colors.len() > 1,
++            "rust block not highlighted (single color): {colors:?}"
++        );
++
++        // Unknown language: must render exactly as the dim fallback does today.
++        // The fallback path splits the prefix into its own span, so compare at
++        // the rendered level (per-line text) rather than span structure.
++        let unknown = "```no-such-lang\nfn main() {}\n```";
++        let with_hl = render_markdown_themed(unknown, &theme, DEFAULT_RENDER_WIDTH);
++        let without_hl =
++            render_markdown_themed(unknown, &MarkdownTheme::default(), DEFAULT_RENDER_WIDTH);
++        let texts = |lines: &[Line<'static>]| lines.iter().map(text_of).collect::<Vec<_>>();
++        assert_eq!(
++            texts(&with_hl),
++            texts(&without_hl),
++            "unknown-language block text must match the dim fallback exactly"
++        );
++        // Every unknown-lang span stays dim with no color leaked in, in both.
++        for lines in [&with_hl, &without_hl] {
++            for line in lines.iter().filter(|l| text_of(l).contains("fn main")) {
++                assert!(
++                    line.spans
++                        .iter()
++                        .all(|s| s.style.fg.is_none()
++                            && s.style.add_modifier.contains(Modifier::DIM)),
++                    "unknown-lang code not dim/uncolored: {line:?}"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn default_theme_matches_legacy_inline_code_color() {
+         // Guards the theme refactor against drift from historical hardcoded styles.
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 5f7bc92..5adbe77 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -67,6 +67,7 @@ fn truncate_tail(text: &str, max: usize) -> String {
+ }
+ 
+ pub(crate) mod clipboard;
++pub(crate) mod highlight;
+ pub(crate) mod login;
+ pub(crate) mod markdown;
+ pub(crate) mod modal;
+diff --git a/src/ui/tui/pane.rs b/src/ui/tui/pane.rs
+index 37e7ef4..1975a15 100644
+--- a/src/ui/tui/pane.rs
++++ b/src/ui/tui/pane.rs
+@@ -34,7 +34,7 @@ fn content_width(frame_width: usize) -> usize {
+ }
+ 
+ pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, text: &str) {
+-    let theme = MarkdownTheme::default();
++    let theme = MarkdownTheme::default().with_code_highlighting();
+     let lines = render_markdown_themed(text, &theme, markdown_width(width));
+     push_assistant_markdown_lines(rows, lines);
+ }
+@@ -44,7 +44,7 @@ pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, t
+ /// after committed history, then commits them once on `AssistantTextEnd`.
+ pub(super) fn streaming_assistant_rows(text: &str, width: usize) -> Vec<TranscriptRow> {
+     let text = streaming_markdown_preview(text);
+-    let theme = MarkdownTheme::default();
++    let theme = MarkdownTheme::default().with_code_highlighting();
+     // `width` is the full frame here; reduce to the assistant content column
+     // so table layout matches the width these rows are rendered into.
+     let mut rows = Vec::new();
+diff --git a/src/ui/tui/transcript.rs b/src/ui/tui/transcript.rs
+index db95e85..a9ba5b7 100644
+--- a/src/ui/tui/transcript.rs
++++ b/src/ui/tui/transcript.rs
+@@ -360,7 +360,7 @@ impl Transcript {
+                 dim_style(),
+             ))]]
+         } else {
+-            let theme = MarkdownTheme::thinking();
++            let theme = MarkdownTheme::thinking().with_code_highlighting();
+             let width = self.markdown_content_width();
+             let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
+             let mut current: Vec<Line<'static>> = Vec::new();
+diff --git a/src/ui/tui/wrap.rs b/src/ui/tui/wrap.rs
+index 4b59a59..dcb5c7b 100644
+--- a/src/ui/tui/wrap.rs
++++ b/src/ui/tui/wrap.rs
+@@ -346,7 +346,43 @@ fn continuation_remainder<'a>(text: &'a str, first: &str) -> &'a str {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{continuation_remainder, display_width, wrap_to_width};
++    use super::{
++        continuation_remainder, display_width, line_text, push_wrapped_line, wrap_to_width,
++    };
++    use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
++
++    #[test]
++    fn highlighted_wide_glyph_code_wraps_within_display_width() {
++        // A CJK string literal (each glyph 2 columns) inside a highlighted rust
++        // block must wrap by display width, never char count: highlighting runs
++        // before span wrap, so the span-aware wrapper still sees intact clusters
++        // and no physical row exceeds the target width.
++        let md = "```rust\nlet s = \"\u{4e2d}\u{6587}\u{4e2d}\u{6587}\u{4e2d}\u{6587}\";\n```";
++        let theme = MarkdownTheme::default().with_code_highlighting();
++        let lines = render_markdown_themed(md, &theme, 80);
++        let code: Vec<_> = lines
++            .iter()
++            .filter(|l| line_text(l).contains('\u{4e2d}'))
++            .collect();
++        assert_eq!(code.len(), 1, "expected one highlighted code line");
++        // Prove it was actually highlighted (a colored span), not the dim fallback.
++        assert!(
++            code[0].spans.iter().any(|s| s.style.fg.is_some()),
++            "code line was not highlighted"
++        );
++        let width = 10;
++        let mut out = Vec::new();
++        for line in &code {
++            push_wrapped_line(line, width, Some("    "), &mut out);
++        }
++        for row in &out {
++            assert!(
++                display_width(&line_text(row)) <= width,
++                "wrapped highlighted row exceeds width {width}: {:?}",
++                line_text(row)
++            );
++        }
++    }
+ 
+     #[test]
+     fn wrap_breaks_long_line_at_spaces_and_hard_breaks_long_words() {

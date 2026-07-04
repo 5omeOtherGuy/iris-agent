@@ -1,0 +1,9 @@
+   Compiling failcrate v0.1.0 (/tmp/fixgen/failcrate)
+error[E0425]: cannot find value `missing_var` in this scope
+ --> src/lib.rs:6:31
+  |
+6 |     format!("hello {name}") + missing_var
+  |                               ^^^^^^^^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `failcrate` (lib) due to 1 previous error
