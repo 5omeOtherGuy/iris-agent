@@ -26,6 +26,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::ui::hyperlink;
 use crate::ui::textengine::{cluster_advance, display_width, truncate_to_width};
 
 /// Indent applied per Markdown nesting level (list depth / blockquote).
@@ -68,6 +69,12 @@ pub(crate) struct MarkdownTheme {
     pub(crate) table_header: Style,
     /// Optional fenced-code highlighter; `None` keeps the dim default.
     pub(crate) highlight_code: Option<HighlightFn>,
+    /// When set, link destinations are wrapped in zero-width OSC 8 marker spans
+    /// ([`crate::ui::hyperlink`]) so the terminal surface can emit clickable
+    /// hyperlinks at serialization time. Off by default so the plain/default
+    /// render path (and every existing snapshot) stays byte-identical; the TUI
+    /// span path opts in. The visible label text is unchanged either way.
+    pub(crate) hyperlinks: bool,
 }
 
 impl Default for MarkdownTheme {
@@ -89,6 +96,7 @@ impl Default for MarkdownTheme {
             table_border: dim,
             table_header: Style::default().add_modifier(Modifier::BOLD),
             highlight_code: None,
+            hyperlinks: false,
         }
     }
 }
@@ -120,6 +128,14 @@ impl MarkdownTheme {
         ));
         self
     }
+
+    /// Enable OSC 8 hyperlink metadata on link destinations (#325). Only the TUI
+    /// span path calls this; the plain / non-TTY renderer never does, so its
+    /// output stays byte-identical (link visible text is unchanged regardless).
+    pub(crate) fn with_hyperlinks(mut self) -> Self {
+        self.hyperlinks = true;
+        self
+    }
 }
 
 /// Render Markdown `text` into styled transcript lines with the default theme at
@@ -142,7 +158,13 @@ pub(crate) fn render_markdown_themed(
     let mut renderer = Renderer::new(theme, width.max(1));
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
-    for event in Parser::new_ext(text, options) {
+    // Trust boundary: markdown source is untrusted model text. Strip any
+    // pre-existing Iris link/file-ref/cursor markers so their literal bytes
+    // cannot be re-interpreted as genuine markers downstream (forgery ->
+    // escape injection). Only markers this renderer constructs afterwards,
+    // from sanitized URIs, are trusted.
+    let text = hyperlink::strip_foreign_markers(text);
+    for event in Parser::new_ext(&text, options) {
         renderer.event(event);
     }
     renderer.finish()
@@ -174,6 +196,9 @@ struct Renderer<'a> {
 struct LinkState {
     dest: String,
     label: String,
+    /// Whether an OSC 8 OPEN marker was actually pushed for this link (its dest
+    /// passed [`hyperlink::sanitized_link_uri`]). Drives the matching CLOSE.
+    linked: bool,
 }
 
 /// Accumulated GFM table state. Cells collect plain text (inline emphasis inside
@@ -266,10 +291,30 @@ impl<'a> Renderer<'a> {
                     _ => None,
                 };
             }
-            Tag::Link { dest_url, .. } => self.links.push(LinkState {
-                dest: dest_url.to_string(),
-                label: String::new(),
-            }),
+            Tag::Link { dest_url, .. } => {
+                let dest = dest_url.to_string();
+                // Open the OSC 8 region before the label spans. The region is
+                // closed in `end_link`, after any appended `(url)` suffix, so
+                // the whole visible destination is clickable. Skipped inside a
+                // table cell (cells collect plain text, not styled spans). The
+                // marker is created only from a sanitized URI (scheme allowlist,
+                // no control/whitespace, length cap); a rejected dest still
+                // renders as visible text but is never clickable.
+                let linked = self.theme.hyperlinks
+                    && self.table.is_none()
+                    && match hyperlink::sanitized_link_uri(&dest) {
+                        Some(uri) => {
+                            self.spans.push(hyperlink::open_span(&uri));
+                            true
+                        }
+                        None => false,
+                    };
+                self.links.push(LinkState {
+                    dest,
+                    label: String::new(),
+                    linked,
+                });
+            }
             Tag::List(start) => {
                 // Flush the parent item's text before its nested list overwrites
                 // the line prefix (e.g. "- top" before "  - nested").
@@ -420,11 +465,17 @@ impl<'a> Renderer<'a> {
         let Some(link) = self.links.pop() else {
             return;
         };
-        if link.dest.is_empty() || link.label.contains(&link.dest) {
-            return;
+        // Append the visible `(url)` suffix unless the label already shows it.
+        if !link.dest.is_empty() && !link.label.contains(&link.dest) {
+            let style = self.theme.base.patch(self.theme.link_url);
+            self.push_span(format!(" ({})", link.dest), style);
         }
-        let style = self.theme.base.patch(self.theme.link_url);
-        self.push_span(format!(" ({})", link.dest), style);
+        // Close the OSC 8 region only if `start` actually opened one (the dest
+        // passed sanitization), after the suffix so the whole visible
+        // destination is inside the clickable region.
+        if link.linked {
+            self.spans.push(hyperlink::close_span());
+        }
     }
 
     fn flush_code_block(&mut self) {
@@ -1255,6 +1306,102 @@ mod tests {
                 "base dim+italic not applied to span {span:?}"
             );
         }
+    }
+
+    #[test]
+    fn hyperlinks_off_by_default_leaves_output_byte_identical() {
+        // The default theme adds no markers, so visible text and span structure
+        // are exactly as before (guards the plain/default path).
+        let lines = render_markdown("Read [the guide](https://example.com/docs).");
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| hyperlink::is_marker(s.content.as_ref())),
+            "default theme must not emit link markers"
+        );
+        assert_eq!(
+            rendered("Read [the guide](https://example.com/docs)."),
+            vec!["Read the guide (https://example.com/docs).".to_string()]
+        );
+    }
+
+    #[test]
+    fn forged_markers_in_markdown_source_render_as_visible_text_only() {
+        // Untrusted model markdown embeds the literal OPEN + label + CLOSE
+        // marker bytes to forge a link (finding 2). The rendering boundary
+        // strips them: no marker survives and no OSC 8 can be emitted.
+        let theme = MarkdownTheme::default().with_hyperlinks();
+        let forged = format!(
+            "see {}pwn{} here",
+            hyperlink::open_marker("https://evil.example/"),
+            hyperlink::CLOSE_MARKER,
+        );
+        let lines = render_markdown_themed(&forged, &theme, DEFAULT_RENDER_WIDTH);
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| hyperlink::is_marker(s.content.as_ref())),
+            "forged markers must be stripped, leaving no marker span"
+        );
+        // Serializing the rendered line emits no OSC 8 bytes.
+        for line in &lines {
+            let rendered = crate::ui::terminal_surface::render_line_for_test(line);
+            assert!(!rendered.contains("\x1b]8;;"), "no OSC 8: {rendered:?}");
+        }
+    }
+
+    #[test]
+    fn with_hyperlinks_attaches_metadata_and_keeps_visible_text() {
+        let theme = MarkdownTheme::default().with_hyperlinks();
+        let lines = render_markdown_themed(
+            "Read [the guide](https://example.com/docs).",
+            &theme,
+            DEFAULT_RENDER_WIDTH,
+        );
+        // Visible text (markers excluded) is unchanged.
+        let visible: String = lines[0]
+            .spans
+            .iter()
+            .filter(|s| !hyperlink::is_marker(s.content.as_ref()))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(visible, "Read the guide (https://example.com/docs).");
+        // A marker pair carries the destination.
+        let uri = lines[0]
+            .spans
+            .iter()
+            .find_map(|s| hyperlink::marker_uri(s.content.as_ref()))
+            .expect("open marker present");
+        assert_eq!(uri, "https://example.com/docs");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| hyperlink::is_close(s.content.as_ref())),
+            "close marker present"
+        );
+    }
+
+    #[test]
+    fn with_hyperlinks_marks_autolink_destination() {
+        let theme = MarkdownTheme::default().with_hyperlinks();
+        let lines =
+            render_markdown_themed("Visit <https://example.com>", &theme, DEFAULT_RENDER_WIDTH);
+        let uri = lines[0]
+            .spans
+            .iter()
+            .find_map(|s| hyperlink::marker_uri(s.content.as_ref()))
+            .expect("autolink marked");
+        assert_eq!(uri, "https://example.com");
+        let visible: String = lines[0]
+            .spans
+            .iter()
+            .filter(|s| !hyperlink::is_marker(s.content.as_ref()))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(visible, "Visit https://example.com");
     }
 
     #[test]

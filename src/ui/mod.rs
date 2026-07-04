@@ -68,6 +68,7 @@ fn truncate_tail(text: &str, max: usize) -> String {
 
 pub(crate) mod clipboard;
 pub(crate) mod highlight;
+pub(crate) mod hyperlink;
 pub(crate) mod login;
 pub(crate) mod markdown;
 pub(crate) mod modal;

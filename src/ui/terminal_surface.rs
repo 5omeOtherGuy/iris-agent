@@ -824,6 +824,14 @@ struct RenderedLine {
     cursor_col: Option<usize>,
 }
 
+/// Test-only: serialize a single line exactly as the inline surface would
+/// (OSC 8 emission included) and return the byte string. Lets sibling modules'
+/// tests assert what actually reaches the terminal.
+#[cfg(test)]
+pub(crate) fn render_line_for_test(line: &Line<'static>) -> String {
+    render_line(line, usize::MAX).text
+}
+
 fn render_line(line: &Line<'static>, _max_width: usize) -> RenderedLine {
     // Autowrap is disabled while we write. We do NOT clip here: over-width lines
     // are caught and reported by `render_lines` instead of being silently hidden.
@@ -833,16 +841,55 @@ fn render_line(line: &Line<'static>, _max_width: usize) -> RenderedLine {
     let mut out = String::new();
     let mut used = 0usize;
     let mut cursor_col: Option<usize> = None;
+    // Whether an OSC 8 hyperlink is currently open on this physical row. The
+    // wrap layer re-opens a link at the start of every row it spans, so closing
+    // any dangling link at end-of-line keeps each row's OSC 8 pair complete and
+    // the diff/replay model line-atomic (a terminal never sees a link that
+    // "leaks" across the CRLF between two Iris rows).
+    let mut link_open = false;
     for span in &line.spans {
-        if span.content.as_ref() == CURSOR_MARKER {
+        let content = span.content.as_ref();
+        if content == CURSOR_MARKER {
             cursor_col = Some(used);
+            continue;
+        }
+        // Web-link markers travel as structured zero-width spans and are
+        // converted to real OSC 8 escapes here, at byte-serialization time --
+        // they never enter width accounting (`used` is untouched) or the diff
+        // source of truth as escape noise. The URI is re-validated against the
+        // same allowlist used at creation ([`sanitized_link_uri`]): this is the
+        // OSC-creation choke point, so an unsanitized or forged URI never
+        // reaches the terminal as an escape sequence -- it is simply stripped.
+        if let Some(uri) = crate::ui::hyperlink::marker_uri(content) {
+            if let Some(safe) = crate::ui::hyperlink::sanitized_link_uri(uri) {
+                out.push_str(&crate::ui::hyperlink::osc8_open(&safe));
+                link_open = true;
+            }
+            continue;
+        }
+        // File-reference markers are a distinct kind that inline mode never
+        // emits as OSC 8 (terminals would open `file://` natively, bypassing the
+        // pager's file-ref notice boundary). Strip them: zero-width, no escape.
+        if crate::ui::hyperlink::fileref_uri(content).is_some() {
+            continue;
+        }
+        if crate::ui::hyperlink::is_close(content) {
+            // Only close a link that was actually opened as OSC 8; a close that
+            // follows a stripped file-ref marker emits nothing.
+            if link_open {
+                out.push_str(crate::ui::hyperlink::OSC8_CLOSE);
+                link_open = false;
+            }
             continue;
         }
         let style = line.style.patch(span.style);
         out.push_str("\x1b[0m");
         out.push_str(&style_sgr(style));
-        out.push_str(span.content.as_ref());
-        used += UnicodeWidthStr::width(span.content.as_ref());
+        out.push_str(content);
+        used += UnicodeWidthStr::width(content);
+    }
+    if link_open {
+        out.push_str(crate::ui::hyperlink::OSC8_CLOSE);
     }
     out.push_str("\x1b[0m");
     RenderedLine {
@@ -1018,6 +1065,122 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn link_markers_serialize_to_a_complete_osc8_pair_without_affecting_width() {
+        use crate::ui::hyperlink;
+        let plain = Line::from("click");
+        let linked = Line::from(hyperlink::link_spans(
+            "https://x.dev",
+            vec![Span::raw("click")],
+        ));
+
+        let bare = render_line(&plain, 80);
+        let with_link = render_line(&linked, 80);
+
+        // The marked span measures identically to its bare visible text
+        // (no-escapes-in-width-math invariant).
+        assert_eq!(with_link.width, bare.width);
+        assert_eq!(with_link.width, 5);
+        // A complete OSC 8 open/close pair wraps the label.
+        assert!(
+            with_link.text.contains("\x1b]8;;https://x.dev\x1b\\"),
+            "{:?}",
+            with_link.text
+        );
+        assert!(
+            with_link.text.contains("\x1b]8;;\x1b\\"),
+            "{:?}",
+            with_link.text
+        );
+        assert!(strip_ansi(&with_link.text).contains("click"));
+    }
+
+    #[test]
+    fn render_line_never_emits_osc8_for_an_unsanitized_web_marker() {
+        use crate::ui::hyperlink;
+        // A marker whose URI carries an escape-injection payload (as could only
+        // arise from a forged marker) is stripped, not emitted -- render_line
+        // re-validates the URI against the creation-time allowlist. Also covers
+        // a disallowed scheme.
+        for uri in [
+            "https://x.dev/\x1b]0;pwned\x07",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+        ] {
+            let line = Line::from(hyperlink::link_spans(uri, vec![Span::raw("label")]));
+            let rendered = render_line(&line, 80);
+            assert!(
+                !rendered.text.contains("\x1b]8;;"),
+                "no OSC 8 bytes for {uri:?}: {:?}",
+                rendered.text
+            );
+            assert!(strip_ansi(&rendered.text).contains("label"));
+        }
+    }
+
+    #[test]
+    fn render_line_strips_file_ref_markers_without_emitting_osc8() {
+        use crate::ui::hyperlink;
+        // A file-ref marker is a distinct kind: inline mode strips it (a terminal
+        // must never natively open the `file://` target), while a real web link
+        // in the same line still serializes OSC 8.
+        let line = Line::from(vec![
+            hyperlink::fileref_open_span("file:///repo/src/main.rs#L7"),
+            Span::raw("src/main.rs:7"),
+            hyperlink::close_span(),
+            Span::raw(" and "),
+            hyperlink::open_span("https://x.dev"),
+            Span::raw("web"),
+            hyperlink::close_span(),
+        ]);
+        let rendered = render_line(&line, 80);
+        assert!(
+            !rendered.text.contains("file://"),
+            "file-ref must not reach the terminal: {:?}",
+            rendered.text
+        );
+        assert_eq!(
+            rendered.text.matches("\x1b]8;;https://x.dev\x1b\\").count(),
+            1,
+            "the web link still serializes: {:?}",
+            rendered.text
+        );
+        let visible = strip_ansi(&rendered.text);
+        assert!(visible.contains("src/main.rs:7") && visible.contains("web"));
+    }
+
+    #[test]
+    fn wrapped_link_emits_a_complete_osc8_pair_on_each_physical_row() {
+        use crate::ui::hyperlink;
+        // Two physical rows, each carrying the SAME link: the wrap layer closes
+        // the link at the end of row one and re-opens it on row two, so every
+        // emitted line holds a self-contained OSC 8 pair (line-atomic).
+        let row1 = Line::from(hyperlink::link_spans(
+            "https://x.dev",
+            vec![Span::raw("clicka")],
+        ));
+        let row2 = Line::from(hyperlink::link_spans(
+            "https://x.dev",
+            vec![Span::raw("ble")],
+        ));
+
+        for row in [&row1, &row2] {
+            let rendered = render_line(row, 80);
+            let opens = rendered.text.matches("\x1b]8;;https://x.dev\x1b\\").count();
+            let closes = rendered.text.matches("\x1b]8;;\x1b\\").count();
+            assert_eq!(
+                opens, 1,
+                "each row opens the link once: {:?}",
+                rendered.text
+            );
+            assert_eq!(
+                closes, 1,
+                "each row closes the link once: {:?}",
+                rendered.text
+            );
+        }
     }
 
     #[test]

@@ -471,7 +471,22 @@ pub(super) fn render_body(
 /// an optional leading prefix span.
 fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
     let mut spans = vec![Span::styled(prefix, dim_style())];
-    spans.extend(ansi_spans(line, dim_style()));
+    // Linkify conservative workspace `file:line` references in tool output so
+    // they become clickable OSC 8 targets. Applied per parsed ANSI span (styling
+    // preserved); a reference split across ANSI style runs is left untouched.
+    // The workspace root is only resolved when a line actually holds a match.
+    let mut root: Option<std::path::PathBuf> = None;
+    for span in ansi_spans(line, dim_style()) {
+        let content = span.content.as_ref();
+        if crate::ui::hyperlink::find_file_refs(content).is_empty() {
+            spans.push(span);
+            continue;
+        }
+        let root = root.get_or_insert_with(|| std::env::current_dir().unwrap_or_default());
+        spans.extend(crate::ui::hyperlink::linkify_file_refs(
+            content, span.style, root,
+        ));
+    }
     Line::from(spans)
 }
 
@@ -1074,6 +1089,129 @@ mod tests {
         assert!(
             !rows.iter().any(|r| r.text.contains("ctrl+o")),
             "body rows must not carry fold affordance hints"
+        );
+    }
+
+    #[test]
+    fn tool_output_file_line_ref_becomes_a_clickable_marker() {
+        use crate::ui::hyperlink;
+        let args = json!({ "command": "cargo build" });
+        let renderer = resolve(&call("bash", args.clone()));
+        let ctx = RenderCtx { width: 80 };
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", args),
+            &ToolOutcome::Done {
+                content: "error at src/main.rs:10 here",
+                exit_code: Some(1),
+            },
+        );
+        // A rendered body row carries an OSC 8 marker whose target resolves the
+        // ref, and the visible (marker-free) text is unchanged.
+        let render = |rows: &[TranscriptRow]| -> Vec<Line<'static>> {
+            let mut out = Vec::new();
+            for row in rows {
+                row.render_rows(80, &mut out);
+            }
+            out
+        };
+        let lines = render(&rows);
+        // File refs are a distinct *file-ref* marker kind (finding 3), never a
+        // web-link marker -- so inline serialization emits no OSC 8, but the
+        // pager still resolves the click to the file-ref notice.
+        let uri = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find_map(|s| hyperlink::fileref_uri(s.content.as_ref()))
+            .expect("file:line ref linkified");
+        assert!(uri.starts_with("file://"), "uri: {uri}");
+        assert!(uri.ends_with("/src/main.rs#L10"), "uri: {uri}");
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|s| hyperlink::marker_uri(s.content.as_ref()).is_some()),
+            "file refs must not be web-link markers"
+        );
+        // Inline serialization of every row emits no OSC 8 for the file ref.
+        for line in &lines {
+            let bytes = crate::ui::terminal_surface::render_line_for_test(line);
+            assert!(
+                !bytes.contains("\x1b]8;;"),
+                "file ref must not become OSC 8 inline: {bytes:?}"
+            );
+        }
+        // The pager path resolves the click to the (file://) notice target.
+        let regions = hyperlink::extract_and_strip_lines(&mut lines.clone());
+        assert!(
+            regions
+                .iter()
+                .any(|r| !hyperlink::is_web_url(&r.uri) && r.uri.ends_with("/src/main.rs#L10")),
+            "pager resolves the file ref to a notice target: {regions:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.text.contains("src/main.rs:10")),
+            "visible file:line text preserved"
+        );
+        // A line with no ref stays marker-free (no false positives, e.g. a
+        // bare `ratio 3:4`).
+        let plain = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "echo hi" })),
+            &ToolOutcome::Done {
+                content: "just some output with a ratio 3:4",
+                exit_code: Some(0),
+            },
+        );
+        assert!(
+            !render(&plain)
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|s| hyperlink::is_marker(s.content.as_ref())),
+            "non-reference output must not be linkified"
+        );
+    }
+
+    #[test]
+    fn forged_markers_in_tool_output_are_neutralized() {
+        // The tool-output span path runs every span content through
+        // `clean_text` (which strips APC), so a forged marker in tool output
+        // cannot survive to be re-interpreted (finding 2). We prove the
+        // existing machinery already strips it rather than double-stripping.
+        use crate::ui::hyperlink;
+        let renderer = resolve(&call("bash", json!({ "command": "echo" })));
+        let ctx = RenderCtx { width: 80 };
+        let forged = format!(
+            "pre{}pwn{}post",
+            hyperlink::open_marker("https://evil.example/"),
+            hyperlink::CLOSE_MARKER,
+        );
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "echo" })),
+            &ToolOutcome::Done {
+                content: &forged,
+                exit_code: Some(0),
+            },
+        );
+        let mut lines = Vec::new();
+        for row in &rows {
+            row.render_rows(80, &mut lines);
+        }
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|s| hyperlink::is_marker(s.content.as_ref())),
+            "forged tool-output markers must be stripped by clean_text"
+        );
+        for line in &lines {
+            let bytes = crate::ui::terminal_surface::render_line_for_test(line);
+            assert!(!bytes.contains("\x1b]8;;"), "no OSC 8: {bytes:?}");
+        }
+        assert!(
+            hyperlink::extract_and_strip_lines(&mut lines).is_empty(),
+            "no LinkRegion from forged tool output"
         );
     }
 

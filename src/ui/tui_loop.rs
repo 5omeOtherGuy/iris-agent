@@ -1941,6 +1941,9 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
             if header_click(screen, &mouse) {
                 return IdleKey::Continue;
             }
+            if pager_link_click(screen, &mouse) {
+                return IdleKey::Continue;
+            }
             return if pager_wheel(screen, &mouse) {
                 IdleKey::Continue
             } else {
@@ -2356,6 +2359,34 @@ fn header_click(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEve
     screen.toggle_header_at_screen_row(mouse.row)
 }
 
+/// Pager-mode hyperlink click: a left-button-down over a rendered OSC 8 link
+/// region opens the target. Web URLs launch the browser via the existing
+/// `open_in_browser` seam; workspace `file:line` references surface a notice
+/// (opening an editor is out of scope for this slice). `false` = not a link
+/// click (fall through to header/wheel handling). Only fires under pager mouse
+/// capture.
+fn pager_link_click(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    if !screen.pager_active || !screen.mouse_capture {
+        return false;
+    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let Some(uri) = screen
+        .pager_link_at(mouse.row, mouse.column)
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+    if crate::ui::hyperlink::is_web_url(&uri) {
+        crate::ui::login::open_in_browser(&uri);
+    } else {
+        screen.apply(crate::ui::UiEvent::Notice(format!("link: {uri}")));
+    }
+    true
+}
+
 fn pager_wheel(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
     // Gate on capture INTENT too: after Ctrl+T / `/mouse` turns capture off,
     // queued events (or events still arriving because the disable write
@@ -2423,6 +2454,9 @@ fn handle_running_event(
                 return !matches!(key, IdleKey::Ignore | IdleKey::Menu(_));
             }
             if header_click(screen, &mouse) {
+                return true;
+            }
+            if pager_link_click(screen, &mouse) {
                 return true;
             }
             pager_wheel(screen, &mouse)

@@ -873,6 +873,28 @@ mod tests {
     }
 
     #[test]
+    fn plain_assistant_link_output_is_byte_identical_and_escape_free() -> Result<()> {
+        // The non-TTY plain UI is excluded from OSC 8 hyperlinks by its ANSI-free
+        // contract: a markdown link renders as the raw text verbatim, with no
+        // escape bytes and no link markers.
+        let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
+        let text = "See [the guide](https://example.com/docs) now";
+        ui.emit(UiEvent::AssistantText(text.to_string()))?;
+        let (_, out, _) = ui.into_parts();
+        let out = String::from_utf8(out)?;
+        assert_eq!(out, format!("assistant> {text}\n"));
+        // No OSC 8, no ESC, no APC link markers.
+        assert!(!out.contains('\x1b'), "plain output must be escape-free");
+        assert!(!out.contains("]8;"), "no OSC 8 in plain output");
+        assert!(
+            !out.contains(crate::ui::hyperlink::CLOSE_MARKER)
+                && crate::ui::hyperlink::marker_uri(&out).is_none(),
+            "no link markers in plain output"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pasted_block_is_one_prompt_without_leak() -> Result<()> {
         // A bracketed paste of three lines must become one prompt; nothing may
         // spill into the following approval read.

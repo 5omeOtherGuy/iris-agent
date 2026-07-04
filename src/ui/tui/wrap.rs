@@ -3,12 +3,48 @@
 //! the unified [`crate::ui::textengine`] so there is a single grapheme-aware
 //! source of truth (this module no longer measures width itself).
 
+use std::rc::Rc;
+
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{MAX_TOOL_OUTPUT_LINE_CHARS, PANEL_BODY_CHROME_WIDTH, dim_style};
+use crate::ui::hyperlink;
 use crate::ui::textengine::cluster_advance;
+
+/// One visible character with its style and the OPEN marker (if any) it falls
+/// under. Both link and file-ref markers are folded into this per-char
+/// annotation as their full marker bytes, so the word-wise wrappers wrap clean
+/// visible text (markers never enter width math) yet can re-emit the exact same
+/// marker pair -- preserving its kind -- on every physical row.
+type LinkCell = (char, Style, Option<Rc<str>>);
+
+/// Flatten a line's spans into [`LinkCell`]s, dropping the zero-width marker
+/// spans and tagging every enclosed visible char with the active OPEN marker.
+fn link_cells(line: &Line<'static>) -> Vec<LinkCell> {
+    let mut cells = Vec::new();
+    let mut current: Option<Rc<str>> = None;
+    for span in &line.spans {
+        let content = span.content.as_ref();
+        if hyperlink::open_marker_uri(content).is_some() {
+            current = Some(Rc::from(content));
+            continue;
+        }
+        if hyperlink::is_close(content) {
+            current = None;
+            continue;
+        }
+        for ch in content.chars() {
+            cells.push((ch, span.style, current.clone()));
+        }
+    }
+    cells
+}
+
+fn link_eq(a: &Option<Rc<str>>, b: &Option<Rc<str>>) -> bool {
+    a.as_deref() == b.as_deref()
+}
 // Re-exported so existing `super::wrap::{display_width, ...}` imports keep
 // resolving while the implementations live in the engine.
 pub(crate) use crate::ui::textengine::wrap_to_width;
@@ -58,6 +94,7 @@ pub(super) fn pad_line_right(line: &mut Line<'static>, padding: usize) {
 pub(super) fn line_text(line: &Line<'_>) -> String {
     line.spans
         .iter()
+        .filter(|span| !hyperlink::is_marker(span.content.as_ref()))
         .map(|span| span.content.as_ref())
         .collect()
 }
@@ -67,8 +104,14 @@ pub(super) fn truncate_line(line: &mut Line<'static>, max: usize) {
     let mut used = 0;
     let mut spans = Vec::new();
     for span in std::mem::take(&mut line.spans) {
+        // Zero-width link markers are kept regardless of the width budget so a
+        // truncated link still serializes a complete OSC 8 pair.
+        if hyperlink::is_marker(span.content.as_ref()) {
+            spans.push(span);
+            continue;
+        }
         if used >= max {
-            break;
+            continue;
         }
         let content = truncate_to_width(span.content.as_ref(), max - used);
         used += display_width(&content);
@@ -82,6 +125,7 @@ pub(super) fn truncate_line(line: &mut Line<'static>, max: usize) {
 pub(super) fn spans_width(spans: &[Span<'static>]) -> usize {
     spans
         .iter()
+        .filter(|span| !hyperlink::is_marker(span.content.as_ref()))
         .map(|span| display_width(span.content.as_ref()))
         .sum()
 }
@@ -90,8 +134,12 @@ pub(super) fn take_spans_to_width(spans: Vec<Span<'static>>, max: usize) -> Vec<
     let mut used = 0usize;
     let mut out = Vec::new();
     for span in spans {
+        if hyperlink::is_marker(span.content.as_ref()) {
+            out.push(span);
+            continue;
+        }
         if used >= max {
-            break;
+            continue;
         }
         let content = truncate_to_width(span.content.as_ref(), max - used);
         used += display_width(&content);
@@ -105,6 +153,7 @@ pub(super) fn take_spans_to_width(spans: Vec<Span<'static>>, max: usize) -> Vec<
 fn push_span_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
     if let Some(last) = spans.last_mut()
         && last.style == style
+        && !hyperlink::is_marker(last.content.as_ref())
     {
         last.content.to_mut().push(ch);
         return;
@@ -115,6 +164,7 @@ fn push_span_char(spans: &mut Vec<Span<'static>>, ch: char, style: Style) {
 fn push_span_str(spans: &mut Vec<Span<'static>>, cluster: &str, style: Style) {
     if let Some(last) = spans.last_mut()
         && last.style == style
+        && !hyperlink::is_marker(last.content.as_ref())
     {
         last.content.to_mut().push_str(cluster);
         return;
@@ -133,11 +183,30 @@ pub(super) fn push_wrapped_line(
     let width = width.max(1);
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0;
+    // The OPEN marker currently active (its full bytes), carried across physical
+    // rows so a marked run that wraps re-opens on each new row (and closes at the
+    // end of the row it leaves), keeping every emitted row's marker pair
+    // complete and preserving the marker kind (link vs file-ref).
+    let mut open_marker: Option<Rc<str>> = None;
 
     for span in &line.spans {
-        for cluster in span.content.graphemes(true) {
+        let content = span.content.as_ref();
+        if hyperlink::open_marker_uri(content).is_some() {
+            open_marker = Some(Rc::from(content));
+            spans.push(Span::raw(content.to_string()));
+            continue;
+        }
+        if hyperlink::is_close(content) {
+            open_marker = None;
+            spans.push(hyperlink::close_span());
+            continue;
+        }
+        for cluster in content.graphemes(true) {
             let cw = cluster_advance(cluster);
             if cur_w > 0 && cur_w + cw > width {
+                if open_marker.is_some() {
+                    spans.push(hyperlink::close_span());
+                }
                 out.push(Line::from(std::mem::take(&mut spans)));
                 cur_w = 0;
                 if let Some(prefix) = continuation_prefix {
@@ -146,6 +215,9 @@ pub(super) fn push_wrapped_line(
                         cur_w = display_width(&prefix);
                         spans.push(Span::styled(prefix, dim_style()));
                     }
+                }
+                if let Some(marker) = &open_marker {
+                    spans.push(Span::raw((**marker).to_string()));
                 }
             }
             push_span_str(&mut spans, cluster, span.style);
@@ -156,19 +228,34 @@ pub(super) fn push_wrapped_line(
     out.push(Line::from(spans));
 }
 
-fn styled_physical_row(
-    cells: &[(char, Style)],
-    cursor: &mut usize,
-    physical: &str,
-) -> Line<'static> {
+fn styled_physical_row(cells: &[LinkCell], cursor: &mut usize, physical: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur_link: Option<Rc<str>> = None;
     for rc in physical.chars() {
         while *cursor < cells.len() && cells[*cursor].0 != rc {
             *cursor += 1;
         }
-        let style = cells.get(*cursor).map_or(Style::default(), |(_, st)| *st);
+        let (style, link) = cells
+            .get(*cursor)
+            .map(|(_, style, link)| (*style, link.clone()))
+            .unwrap_or((Style::default(), None));
+        // Emit an OSC 8 marker transition when the link target changes. A row
+        // that starts inside a link opens it here; the trailing close below
+        // makes the row self-contained so a wrapped link re-opens per row.
+        if !link_eq(&link, &cur_link) {
+            if cur_link.is_some() {
+                spans.push(hyperlink::close_span());
+            }
+            if let Some(marker) = &link {
+                spans.push(Span::raw((**marker).to_string()));
+            }
+            cur_link = link;
+        }
         push_span_char(&mut spans, rc, style);
         *cursor += 1;
+    }
+    if cur_link.is_some() {
+        spans.push(hyperlink::close_span());
     }
     Line::from(spans)
 }
@@ -179,16 +266,12 @@ pub(super) fn push_wrapped_line_wordwise_with_prefix(
     continuation_prefix: &'static str,
     out: &mut Vec<Line<'static>>,
 ) {
-    let cells: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
-        .collect();
+    let cells = link_cells(line);
     if cells.is_empty() {
         out.push(Line::default());
         return;
     }
-    let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+    let text: String = cells.iter().map(|(ch, _, _)| *ch).collect();
     let width = width.max(1);
 
     if text.starts_with(continuation_prefix) {
@@ -201,7 +284,7 @@ pub(super) fn push_wrapped_line_wordwise_with_prefix(
             return;
         }
 
-        let content_text: String = content_cells.iter().map(|(ch, _)| *ch).collect();
+        let content_text: String = content_cells.iter().map(|(ch, _, _)| *ch).collect();
         let mut cursor = 0usize;
         for physical in wrap_to_width(&content_text, content_width) {
             let mut line = styled_physical_row(content_cells, &mut cursor, &physical);
@@ -230,7 +313,7 @@ pub(super) fn push_wrapped_line_wordwise_with_prefix(
     let continuation_width = width
         .saturating_sub(display_width(continuation_prefix))
         .max(1);
-    let remainder: String = cells[cursor..].iter().map(|(ch, _)| *ch).collect();
+    let remainder: String = cells[cursor..].iter().map(|(ch, _, _)| *ch).collect();
     for physical in wrap_to_width(&remainder, continuation_width) {
         if physical.is_empty() {
             continue;
@@ -255,16 +338,12 @@ pub(super) fn push_wrapped_line_wordwise(
     width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
-    let cells: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
-        .collect();
+    let cells = link_cells(line);
     if cells.is_empty() {
         out.push(Line::default());
         return;
     }
-    let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+    let text: String = cells.iter().map(|(ch, _, _)| *ch).collect();
     let mut cursor = 0;
     for physical in wrap_to_width(&text, width.max(1)) {
         out.push(styled_physical_row(&cells, &mut cursor, &physical));
@@ -347,9 +426,113 @@ fn continuation_remainder<'a>(text: &'a str, first: &str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::{
-        continuation_remainder, display_width, line_text, push_wrapped_line, wrap_to_width,
+        continuation_remainder, display_width, line_text, push_wrapped_line,
+        push_wrapped_line_wordwise, push_wrapped_line_wordwise_with_prefix, wrap_to_width,
     };
+    use crate::ui::hyperlink;
     use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
+    use ratatui::text::{Line, Span};
+
+    /// The visible text of a line, markers excluded (mirrors `line_text`).
+    fn visible(line: &Line<'static>) -> String {
+        line_text(line)
+    }
+
+    /// Count of OSC 8 OPEN and CLOSE markers on a wrapped physical row.
+    fn marker_counts(line: &Line<'static>) -> (usize, usize) {
+        let opens = line
+            .spans
+            .iter()
+            .filter(|s| hyperlink::marker_uri(s.content.as_ref()).is_some())
+            .count();
+        let closes = line
+            .spans
+            .iter()
+            .filter(|s| hyperlink::is_close(s.content.as_ref()))
+            .count();
+        (opens, closes)
+    }
+
+    #[test]
+    fn markers_are_zero_width_in_wrap_math() {
+        // A line whose only difference is an embedded link marker pair must wrap
+        // to the SAME physical rows (same visible text) as the bare line: the
+        // no-escapes-in-width-math invariant.
+        let bare = Line::from("alpha beta gamma delta");
+        let linked = Line::from(hyperlink::link_spans(
+            "https://x.dev",
+            vec![Span::raw("alpha beta gamma delta")],
+        ));
+        for width in [6usize, 11, 22] {
+            let mut bare_rows = Vec::new();
+            let mut linked_rows = Vec::new();
+            push_wrapped_line_wordwise(&bare, width, &mut bare_rows);
+            push_wrapped_line_wordwise(&linked, width, &mut linked_rows);
+            let bare_text: Vec<String> = bare_rows.iter().map(visible).collect();
+            let linked_text: Vec<String> = linked_rows.iter().map(visible).collect();
+            assert_eq!(
+                bare_text, linked_text,
+                "width {width}: visible text diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn wordwise_wrap_reopens_a_link_across_physical_rows() {
+        // A link whose label wraps must re-open on each physical row so every
+        // row carries a self-contained OSC 8 marker pair.
+        let line = Line::from(hyperlink::link_spans(
+            "https://x.dev",
+            vec![Span::raw("alpha beta gamma")],
+        ));
+        let mut rows = Vec::new();
+        push_wrapped_line_wordwise(&line, 6, &mut rows);
+        assert!(rows.len() >= 2, "expected the link label to wrap: {rows:?}");
+        for row in &rows {
+            let (opens, closes) = marker_counts(row);
+            assert_eq!(opens, 1, "row missing single open marker: {row:?}");
+            assert_eq!(closes, 1, "row missing single close marker: {row:?}");
+        }
+    }
+
+    #[test]
+    fn wordwise_prefix_wrap_reopens_a_link_across_rows() {
+        // The markdown assistant path uses the prefixed word-wise wrapper.
+        let prefix = "  ";
+        let mut spans = vec![Span::raw(prefix)];
+        spans.extend(hyperlink::link_spans(
+            "https://x.dev",
+            vec![Span::raw("alpha beta gamma")],
+        ));
+        let line = Line::from(spans);
+        let mut rows = Vec::new();
+        push_wrapped_line_wordwise_with_prefix(&line, 8, prefix, &mut rows);
+        assert!(rows.len() >= 2, "expected wrap: {rows:?}");
+        for row in &rows {
+            let (opens, closes) = marker_counts(row);
+            assert_eq!(opens, 1, "row missing open marker: {row:?}");
+            assert_eq!(closes, 1, "row missing close marker: {row:?}");
+        }
+    }
+
+    #[test]
+    fn span_preserving_wrap_reopens_a_link_across_rows() {
+        let line = Line::from(hyperlink::link_spans(
+            "https://x.dev",
+            vec![Span::raw("abcdefghij")],
+        ));
+        let mut rows = Vec::new();
+        push_wrapped_line(&line, 4, None, &mut rows);
+        assert!(rows.len() >= 2, "expected hard-break wrap: {rows:?}");
+        for row in &rows {
+            let (opens, closes) = marker_counts(row);
+            assert_eq!(opens, 1, "row missing open marker: {row:?}");
+            assert_eq!(closes, 1, "row missing close marker: {row:?}");
+        }
+        // Reassembling the visible text across rows rebuilds the label.
+        let joined: String = rows.iter().map(visible).collect();
+        assert_eq!(joined, "abcdefghij");
+    }
 
     #[test]
     fn highlighted_wide_glyph_code_wraps_within_display_width() {
