@@ -22,6 +22,9 @@
 //! 8 entirely). Emitting clickable links is a deferred UI feature; the engine
 //! only *preserves* them.
 
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -63,6 +66,92 @@ pub(crate) fn visible_width(text: &str) -> usize {
         return display_width(text);
     }
     display_width(&clean_text(text))
+}
+
+// ---------------------------------------------------------------------------
+// ZWJ emoji shaping (issue #351)
+// ---------------------------------------------------------------------------
+
+/// Runtime verdict of the startup ZWJ-shaping probe ([`crate::ui::zwj_probe`]):
+/// whether the terminal's font stack actually joins ZWJ emoji sequences (a
+/// family cluster drawn as one 2-column glyph) or draws them as separate
+/// component glyphs, widening the cluster past the 2-column model `unicode-width`
+/// reports. There is no terminfo capability for this -- it is a font/shaping
+/// property -- so it can only be measured at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ZwjShaping {
+    /// The cluster rendered at the modeled width (2 columns): the font shapes
+    /// ZWJ sequences. No substitution. Default so an unset verdict (plain path,
+    /// tests) never changes output.
+    #[default]
+    Shaped,
+    /// The cluster rendered wider than modeled (`actual` columns): the font does
+    /// not shape ZWJ sequences, so transcript rendering substitutes a single
+    /// glyph.
+    Unshaped { actual: u16 },
+    /// The probe could not answer (timed out or returned garbage). Fails toward
+    /// no behavior change: treated like `Shaped` for substitution.
+    Unknown,
+}
+
+/// Process-wide shaping verdict, set once at startup by the rich-TTY probe.
+/// Threading a flag through every transcript render call site (the markdown and
+/// tool-output span paths both have many callers) would be far more invasive
+/// than this set-once-at-startup global, so the `OnceLock` is the deliberate
+/// choice (issue #351). Unset on the `--plain`/non-TTY path and in tests, where
+/// it defaults to [`ZwjShaping::Shaped`] (no substitution, unchanged output).
+/// Gating logic is kept injectable via [`normalize_zwj_with`] so tests never
+/// mutate this global (which would contaminate parallel tests).
+static ZWJ_SHAPING: OnceLock<ZwjShaping> = OnceLock::new();
+
+/// Record the startup probe verdict. Idempotent set-once: a later call (e.g. an
+/// in-process session swap) is ignored, keeping the first probe authoritative.
+pub(crate) fn set_zwj_shaping(state: ZwjShaping) {
+    let _ = ZWJ_SHAPING.set(state);
+}
+
+/// The recorded shaping verdict, defaulting to [`ZwjShaping::Shaped`] when no
+/// probe ran (plain/non-TTY path, tests): no substitution, output unchanged.
+pub(crate) fn zwj_shaping() -> ZwjShaping {
+    ZWJ_SHAPING.get().copied().unwrap_or_default()
+}
+
+/// Width-stabilize ZWJ emoji clusters for a given shaping verdict. Applied at the
+/// untrusted-text entry points that feed transcript layout (markdown source and
+/// tool-output spans). Only [`ZwjShaping::Unshaped`] substitutes;
+/// [`ZwjShaping::Shaped`] and [`ZwjShaping::Unknown`] borrow the input unchanged.
+///
+/// The verdict is passed in (rather than read from [`zwj_shaping`] internally) so
+/// the entry-point wiring is testable with an explicit verdict; production
+/// callers pass `zwj_shaping()`. Mutating the set-once global in tests would
+/// contaminate parallel tests, so it is never done.
+pub(crate) fn normalize_zwj_with(shaping: ZwjShaping, text: &str) -> Cow<'_, str> {
+    match shaping {
+        ZwjShaping::Unshaped { .. } => substitute_zwj(text),
+        ZwjShaping::Shaped | ZwjShaping::Unknown => Cow::Borrowed(text),
+    }
+}
+
+/// Replace every grapheme cluster containing U+200D (ZERO WIDTH JOINER) with its
+/// first scalar. The first scalar of a ZWJ emoji sequence is a standalone
+/// width-2 emoji (e.g. a family cluster collapses to one face), so the result is
+/// width-stable at the 2-column model and never wider than modeled. Text with no
+/// ZWJ is borrowed unchanged.
+fn substitute_zwj(text: &str) -> Cow<'_, str> {
+    if !text.contains('\u{200d}') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for cluster in text.graphemes(true) {
+        if cluster.contains('\u{200d}') {
+            if let Some(first) = cluster.chars().next() {
+                out.push(first);
+            }
+        } else {
+            out.push_str(cluster);
+        }
+    }
+    Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +453,48 @@ mod tests {
         assert_eq!(display_width("😀"), 2);
         assert_eq!(display_width("👨\u{200d}👩\u{200d}👧"), 2); // ZWJ family
         assert_eq!(display_width("🇺🇸"), 2); // flag
+    }
+
+    const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"; // MAN ZWJ WOMAN ZWJ GIRL
+    const MAN: &str = "\u{1f468}";
+
+    #[test]
+    fn substitute_zwj_collapses_family_to_first_face() {
+        // The family cluster collapses to the single leading face (width 2).
+        let out = normalize_zwj_with(ZwjShaping::Unshaped { actual: 6 }, FAMILY);
+        assert_eq!(out, MAN);
+        assert_eq!(display_width(&out), 2);
+    }
+
+    #[test]
+    fn substitute_zwj_handles_multiple_clusters_and_surrounding_text() {
+        let input = format!("a {FAMILY} b {FAMILY}");
+        let out = normalize_zwj_with(ZwjShaping::Unshaped { actual: 6 }, &input);
+        assert_eq!(out, format!("a {MAN} b {MAN}"));
+    }
+
+    #[test]
+    fn substitute_zwj_takes_first_scalar_for_zwj_in_non_emoji_context() {
+        // A ZWJ between letters attaches to the preceding cluster (GB9); that
+        // cluster is collapsed to its first scalar, the following letter stays.
+        let out = normalize_zwj_with(ZwjShaping::Unshaped { actual: 6 }, "a\u{200d}b");
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn normalize_zwj_borrows_unchanged_without_zwj_or_when_shaped() {
+        // No ZWJ: borrowed unchanged even when the terminal does not shape.
+        assert!(matches!(
+            normalize_zwj_with(ZwjShaping::Unshaped { actual: 6 }, "plain text"),
+            Cow::Borrowed("plain text")
+        ));
+        // Shaped / Unknown never substitute, even with a ZWJ cluster present.
+        assert_eq!(normalize_zwj_with(ZwjShaping::Shaped, FAMILY), FAMILY);
+        assert_eq!(normalize_zwj_with(ZwjShaping::Unknown, FAMILY), FAMILY);
+        assert!(matches!(
+            normalize_zwj_with(ZwjShaping::Shaped, FAMILY),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

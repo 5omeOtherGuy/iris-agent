@@ -219,6 +219,22 @@ mod tests {
     }
 
     #[test]
+    fn failing_command_emptied_yields_raw_not_on_empty() {
+        // cargo-test has on_empty = "ok (...)"; on a non-zero exit whose lines
+        // are all stripped, the on_empty success message must be suppressed
+        // and the raw output returned instead (ADR-0036 failure-is-complete).
+        let chatter = "   Compiling foo v0.1.0 (/home/user/foo)\n";
+        assert!(
+            filter_output("cargo test", chatter, false).is_none(),
+            "failed command emptied by the filter must yield raw, not on_empty"
+        );
+        // Success path unchanged: the same emptied output renders on_empty.
+        let ok = filter_output("cargo test", chatter, true)
+            .expect("success emptied output should render on_empty");
+        assert_eq!(ok.text, "ok (cargo test: no summary output)");
+    }
+
+    #[test]
     fn panicking_filter_yields_raw() {
         assert_eq!(run_guarded(|| -> String { panic!("boom") }, "test"), None);
         assert_eq!(

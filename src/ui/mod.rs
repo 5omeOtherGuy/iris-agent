@@ -84,6 +84,7 @@ pub(crate) mod terminal_doctor;
 pub(crate) mod terminal_env;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
+pub(crate) mod zwj_probe;
 
 /// True when `lines[i]` begins a unified-diff file header: a `--- ` line
 /// immediately followed by a `+++ ` line and a `@@` hunk. The `@@` guard keeps
