@@ -71,6 +71,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/tasks",
+        description: "Open the task surface (active + recoverable tasks; adopt/inspect)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/sessions",
         description: "List sessions that worked a task id (deterministic lookup)",
         action: SlashAction::Submit,
@@ -281,6 +286,20 @@ mod tests {
         assert_eq!(se[2].name, "/settings");
         assert!(matches("/zzz").is_empty());
         assert!(matches("hello").is_empty());
+    }
+
+    #[test]
+    fn tasks_command_is_registered_and_submits() {
+        // Regression: `/tasks` has a real handler in `route_command` (the
+        // ADR-0031 task surface); it must be in the registry so the palette
+        // makes it discoverable, like every other backed command.
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.name == "/tasks")
+            .expect("/tasks must be registered");
+        assert_eq!(cmd.action, SlashAction::Submit);
+        // `/task` (and the full `/tasks`) narrow to it in the palette.
+        assert_eq!(matches("/task")[0].name, "/tasks");
     }
 
     #[test]
