@@ -1,7 +1,8 @@
 # ADR-0037: Native output filtering for bash pass-through commands
 
 **Date**: 2026-07-04
-**Status**: proposed
+**Status**: accepted; implemented in PRs #352 and #355 (measured in
+`docs/benchmarks/adr-0037-bash-filter-tokens.md`)
 **Deciders**: iris-agent maintainers
 
 ## Context
