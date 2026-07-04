@@ -19,6 +19,10 @@
 //! Quality guards baked into the engine (not left to filter authors):
 //! - short-circuit success messages are disabled on non-zero exit;
 //! - the error-guard regex exempts error/failure lines from stage 4;
+//! - the lossy size-reduction stages (5-7) and the success-flavored `on_empty`
+//!   message (8) are disabled on non-zero exit, so a failed command's
+//!   diagnostics survive verbatim (ADR-0036 "failure is complete"); the bash
+//!   tool's `truncate_tail` stays the final safety backstop;
 //! - compile errors in a definition drop that filter (never a panic).
 
 use std::collections::BTreeMap;
@@ -292,8 +296,10 @@ fn truncate_chars(s: &str, max_len: usize) -> String {
 
 /// Apply a compiled filter to captured output. Pure `&str -> String`.
 ///
-/// `exit_ok` gates the short-circuit stage: success summaries are only allowed
-/// to replace the output when the command actually exited 0.
+/// `exit_ok` gates every reduction that could drop failure detail: the
+/// short-circuit stage, the lossy size caps (truncate/head/tail/max_lines),
+/// and the success-flavored `on_empty` message are all applied only when the
+/// command actually exited 0.
 pub(super) fn apply_filter(filter: &CompiledFilter, output: &str, exit_ok: bool) -> String {
     let mut lines: Vec<String> = output.lines().map(String::from).collect();
 
@@ -342,48 +348,57 @@ pub(super) fn apply_filter(filter: &CompiledFilter, output: &str, exit_ok: bool)
         LineFilter::None => {}
     }
 
-    // 5. truncate_lines_at
-    if let Some(max_chars) = filter.truncate_lines_at {
-        lines = lines
-            .into_iter()
-            .map(|line| truncate_chars(&line, max_chars))
-            .collect();
-    }
-
-    // 6. head + tail
-    let total = lines.len();
-    if let (Some(head), Some(tail)) = (filter.head_lines, filter.tail_lines) {
-        if total > head + tail {
-            let mut result = lines[..head].to_vec();
-            result.push(format!("... ({} lines omitted)", total - head - tail));
-            result.extend_from_slice(&lines[total - tail..]);
-            lines = result;
+    // Stages 5-7 are lossy size reduction: they drop or clip lines. ADR-0036
+    // "failure is complete" -- skip them on non-zero exit so diagnostics past
+    // the caps survive verbatim. The bash tool's `truncate_tail` (mod.rs)
+    // remains the final safety backstop for both paths.
+    if exit_ok {
+        // 5. truncate_lines_at
+        if let Some(max_chars) = filter.truncate_lines_at {
+            lines = lines
+                .into_iter()
+                .map(|line| truncate_chars(&line, max_chars))
+                .collect();
         }
-    } else if let Some(head) = filter.head_lines
-        && total > head
-    {
-        lines.truncate(head);
-        lines.push(format!("... ({} lines omitted)", total - head));
-    } else if let Some(tail) = filter.tail_lines
-        && total > tail
-    {
-        let omitted = total - tail;
-        lines = lines[omitted..].to_vec();
-        lines.insert(0, format!("... ({omitted} lines omitted)"));
+
+        // 6. head + tail
+        let total = lines.len();
+        if let (Some(head), Some(tail)) = (filter.head_lines, filter.tail_lines) {
+            if total > head + tail {
+                let mut result = lines[..head].to_vec();
+                result.push(format!("... ({} lines omitted)", total - head - tail));
+                result.extend_from_slice(&lines[total - tail..]);
+                lines = result;
+            }
+        } else if let Some(head) = filter.head_lines
+            && total > head
+        {
+            lines.truncate(head);
+            lines.push(format!("... ({} lines omitted)", total - head));
+        } else if let Some(tail) = filter.tail_lines
+            && total > tail
+        {
+            let omitted = total - tail;
+            lines = lines[omitted..].to_vec();
+            lines.insert(0, format!("... ({omitted} lines omitted)"));
+        }
+
+        // 7. max_lines -- absolute cap applied after head/tail
+        if let Some(max) = filter.max_lines
+            && lines.len() > max
+        {
+            let dropped = lines.len() - max;
+            lines.truncate(max);
+            lines.push(format!("... ({dropped} lines truncated)"));
+        }
     }
 
-    // 7. max_lines -- absolute cap applied after head/tail
-    if let Some(max) = filter.max_lines
-        && lines.len() > max
-    {
-        let dropped = lines.len() - max;
-        lines.truncate(max);
-        lines.push(format!("... ({dropped} lines truncated)"));
-    }
-
-    // 8. on_empty
+    // 8. on_empty -- success-flavored message; only when the command exited 0.
+    //    For a failed command emptied by the pipeline, return the empty result
+    //    so mod.rs falls back to raw output instead of rendering "ok".
     let result = lines.join("\n");
-    if result.trim().is_empty()
+    if exit_ok
+        && result.trim().is_empty()
         && let Some(msg) = &filter.on_empty
     {
         return msg.clone();
@@ -626,6 +641,62 @@ keep_lines_matching = ["keep"]
 on_empty = "nothing left"
 "#;
         assert_eq!(apply(toml, "keep this\nnoise"), "keep this");
+    }
+
+    #[test]
+    fn size_caps_skip_lossy_stages_on_failure() {
+        // ADR-0036 "failure is complete": the lossy size-reduction stages
+        // (truncate_lines_at, head/tail, max_lines) must not run for a failed
+        // command, or diagnostics past the cap are lost.
+        let toml = r#"
+schema_version = 1
+[filters.f]
+match_command = "^cmd"
+truncate_lines_at = 4
+max_lines = 2
+"#;
+        let f = first_filter(toml);
+        let input = "aaaaaaaa\nbbbbbbbb\ncccccccc\nerror: boom past the cap";
+        let out = apply_filter(&f, input, false);
+        // Nothing dropped, nothing truncated: full output survives verbatim.
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn size_caps_apply_on_success() {
+        // Success path unchanged: caps still reduce output when exit_ok.
+        let toml = r#"
+schema_version = 1
+[filters.f]
+match_command = "^cmd"
+truncate_lines_at = 4
+max_lines = 2
+"#;
+        let f = first_filter(toml);
+        let input = "aaaaaaaa\nbbbbbbbb\ncccccccc\ndddddddd";
+        let out = apply_filter(&f, input, true);
+        assert_eq!(out, "a...\nb...\n... (2 lines truncated)");
+    }
+
+    #[test]
+    fn on_empty_skipped_on_failure() {
+        // A failed command whose output is stripped to empty must NOT render
+        // the success-flavored on_empty message; the engine returns the empty
+        // result so mod.rs falls back to raw output.
+        let toml = r#"
+schema_version = 1
+[filters.f]
+match_command = "^cmd"
+strip_lines_matching = ["^noise"]
+on_empty = "ok (nothing left)"
+"#;
+        let f = first_filter(toml);
+        assert_eq!(apply_filter(&f, "noise a\nnoise b", false), "");
+        // Success path unchanged: on_empty still fires when exit_ok.
+        assert_eq!(
+            apply_filter(&f, "noise a\nnoise b", true),
+            "ok (nothing left)"
+        );
     }
 
     #[test]
