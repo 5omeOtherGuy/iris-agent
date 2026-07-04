@@ -8,6 +8,7 @@
 
 use crate::cli::{self, ModelSwitch};
 use crate::config;
+use crate::git::status::GitStatus;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, CatalogModel, ExactMatch};
@@ -16,10 +17,11 @@ use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
     EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
-    SettingsMenu, TaskPicker, TaskRow, TrustMenu,
+    SettingsMenu, TaskPicker, TrustMenu,
 };
+use crate::ui::task_view::TaskCard;
 use crate::wayland::Harness;
-use crate::wayland::git_safety::{AdoptedTask, RecoverableTask};
+use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask, RecoverableTask};
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -177,51 +179,57 @@ pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<Se
         .collect()
 }
 
-/// Build the `/tasks` resume-task picker from the harness's recoverable-task
-/// records (#288, ADR-0031), or `None` when nothing is recoverable in this
+/// Build the unified `/tasks` surface from the harness (ADR-0031): the active
+/// (live, unsettled) task as a non-selectable header, plus the recoverable/legacy
+/// tasks as selectable rows. The active card is enriched with the git-status
+/// snapshot's attribution counts + age when the snapshot's task id matches.
+/// `None` when there is neither an active nor a recoverable task in this
 /// workspace. Live foreign (leased) tasks are already excluded by the git-safety
-/// seam. Pure row-building is split into [`task_rows`] so it is unit-tested
-/// without a repo.
-pub(crate) fn open_tasks<P: ChatProvider>(harness: &Harness<P>) -> Option<Modal> {
-    tasks_modal(&harness.recoverable_tasks())
+/// seam.
+pub(crate) fn build_tasks_modal<P: ChatProvider>(
+    harness: &Harness<P>,
+    git: Option<&GitStatus>,
+) -> Option<Modal> {
+    let recoverable = harness.recoverable_tasks();
+    let active = harness
+        .active_task()
+        .map(|display| active_card(&display, git));
+    if active.is_none() && recoverable.is_empty() {
+        return None;
+    }
+    let cards: Vec<TaskCard> = recoverable.iter().map(TaskCard::from_recoverable).collect();
+    Some(Modal::Tasks(TaskPicker::new(active, cards)))
 }
 
-/// Wrap already-fetched recoverable-task rows into the picker modal, or `None`
-/// when there are none. Shared by [`open_tasks`] (the `/tasks` command) and the
-/// startup/swap recovery sites, which already hold the rows.
+/// Project the active task, enriched from the git-status snapshot's attribution
+/// split (iris/user file counts) and age -- but only when the snapshot's task id
+/// matches this active task, so a stale snapshot never mislabels the header
+/// (ADR-0031 counts stay honest). Otherwise the counts/age are left unknown.
+fn active_card(display: &ActiveTaskDisplay, git: Option<&GitStatus>) -> TaskCard {
+    let matched = git
+        .and_then(|status| status.task.as_ref().map(|task| (status, task)))
+        .filter(|(_, task)| task.task_id == display.task_id);
+    match matched {
+        Some((status, task)) => TaskCard::active(
+            display,
+            Some(task.age),
+            Some(status.iris_unsettled),
+            Some(status.user_dirty),
+        ),
+        None => TaskCard::active(display, None, None, None),
+    }
+}
+
+/// Wrap already-fetched recoverable-task rows into the unified modal (no active
+/// header), or `None` when there are none. Used by the startup/session-swap
+/// recovery sites, which already hold the rows and never have an active task
+/// (recovery runs before this process opens one).
 pub(crate) fn tasks_modal(tasks: &[RecoverableTask]) -> Option<Modal> {
     if tasks.is_empty() {
         return None;
     }
-    Some(Modal::Tasks(TaskPicker::new(task_rows(tasks))))
-}
-
-/// Turn recoverable-task records into display rows (id, body preview, relative
-/// age, linked-session count), preserving input order. The body preview is the
-/// opaque `body` payload (already `preview_line`-shaped at capture, ADR-0031);
-/// a record with no recorded body renders `"(no description recorded)"`. Pure,
-/// so the picker construction is unit-tested without a repo.
-pub(crate) fn task_rows(tasks: &[RecoverableTask]) -> Vec<TaskRow> {
-    tasks
-        .iter()
-        .map(|task| TaskRow {
-            task_id: task.task_id.clone(),
-            preview: task_preview(task.body.as_deref()),
-            // Reuse the session picker's relative-age formatter: the record's age
-            // is a Duration, so measure it as a delta from an epoch of zero.
-            age: session::relative_age(task.age.as_millis(), 0),
-            sessions: task.sessions.len(),
-        })
-        .collect()
-}
-
-/// The body-preview cell for a task row: the opaque body, or the legacy
-/// placeholder when no body was recorded (or it is blank).
-fn task_preview(body: Option<&str>) -> String {
-    match body.map(str::trim) {
-        Some(text) if !text.is_empty() => text.to_string(),
-        _ => "(no description recorded)".to_string(),
-    }
+    let cards: Vec<TaskCard> = tasks.iter().map(TaskCard::from_recoverable).collect();
+    Some(Modal::Tasks(TaskPicker::new(None, cards)))
 }
 
 /// Decide the adoption UX for an adopted task (#288, ADR-0031): the notice lines
@@ -232,7 +240,7 @@ fn task_preview(body: Option<&str>) -> String {
 /// is unit-tested without the loop.
 pub(crate) fn adopt_notice(adopted: &AdoptedTask) -> (Vec<String>, Option<String>) {
     let short = short_id(&adopted.task_id);
-    let body = task_preview(adopted.body.as_deref());
+    let body = crate::ui::task_view::body_preview(adopted.body.as_deref());
     let mut lines = vec![format!("Adopted task {short}: {body}")];
     let resume = match adopted.sessions.as_slice() {
         [] => {
@@ -675,44 +683,8 @@ mod tests {
         }
     }
 
-    // --- resume-task picker rows + adoption offer (#288, ADR-0031) ---
-
-    use std::time::Duration;
-
-    fn recoverable(
-        id: &str,
-        body: Option<&str>,
-        sessions: &[&str],
-        age: Duration,
-    ) -> RecoverableTask {
-        RecoverableTask::for_test(id, age, body, sessions)
-    }
-
-    #[test]
-    fn task_rows_render_body_preview_age_and_session_count() {
-        let tasks = vec![
-            recoverable(
-                "taskaaaa1111",
-                Some("fix the parser"),
-                &["s1", "s2"],
-                Duration::from_secs(3600),
-            ),
-            // A legacy row with no recorded body renders the placeholder.
-            recoverable("taskbbbb2222", None, &[], Duration::from_secs(120)),
-        ];
-        let rows = task_rows(&tasks);
-        assert_eq!(rows.len(), 2, "input order preserved");
-        assert_eq!(rows[0].task_id, "taskaaaa1111");
-        assert_eq!(rows[0].preview, "fix the parser");
-        assert_eq!(rows[0].age, "1h ago");
-        assert_eq!(rows[0].sessions, 2);
-        assert_eq!(
-            rows[1].preview, "(no description recorded)",
-            "a legacy row with no body shows the placeholder"
-        );
-        assert_eq!(rows[1].age, "2m ago");
-        assert_eq!(rows[1].sessions, 0);
-    }
+    // --- adoption offer (#288, ADR-0031); row/projection rendering is covered
+    // by the `ui::task_view` unit tests. ---
 
     fn adopted(id: &str, body: Option<&str>, sessions: &[&str]) -> AdoptedTask {
         AdoptedTask {
@@ -749,5 +721,51 @@ mod tests {
             resume.is_none(),
             "multiple linked sessions are never guessed between"
         );
+    }
+
+    #[test]
+    fn active_card_enriches_counts_only_on_matching_snapshot_id() {
+        use crate::git::status::{GitStatus, TaskSummary};
+        use std::time::Duration;
+        let display = ActiveTaskDisplay {
+            task_id: "activetask01".to_string(),
+            body: Some("do the thing".to_string()),
+            sessions: vec!["s1".to_string()],
+        };
+        // Matching snapshot id: counts + age come from the git status snapshot.
+        let matching = GitStatus {
+            iris_unsettled: 3,
+            user_dirty: 2,
+            task: Some(TaskSummary {
+                task_id: "activetask01".to_string(),
+                age: Duration::from_secs(120),
+            }),
+            ..Default::default()
+        };
+        let card = active_card(&display, Some(&matching));
+        assert_eq!(card.iris_files, Some(3));
+        assert_eq!(card.user_files, Some(2));
+        assert_eq!(card.age_label(), "2m ago");
+
+        // Stale snapshot (different task id): counts/age left unknown so the
+        // header never mislabels a different task's numbers as this task's.
+        let stale = GitStatus {
+            iris_unsettled: 9,
+            user_dirty: 9,
+            task: Some(TaskSummary {
+                task_id: "someothertask".to_string(),
+                age: Duration::from_secs(1),
+            }),
+            ..Default::default()
+        };
+        let card = active_card(&display, Some(&stale));
+        assert_eq!(card.iris_files, None);
+        assert_eq!(card.user_files, None);
+        assert_eq!(card.age_label(), "");
+
+        // No snapshot at all: also unknown, never fabricated.
+        let card = active_card(&display, None);
+        assert_eq!(card.iris_files, None);
+        assert_eq!(card.user_files, None);
     }
 }
