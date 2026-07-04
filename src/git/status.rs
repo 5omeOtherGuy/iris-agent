@@ -16,7 +16,7 @@
 //! No network, ever: `⇡`/`⇣` are computed against the last-fetched upstream.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -403,11 +403,21 @@ pub(crate) struct GitStatusCache {
 struct CacheInner {
     latest: Mutex<Option<GitStatus>>,
     generation: AtomicU64,
-    refreshing: AtomicBool,
-    /// Workspace of a refresh requested while another was in flight; the
-    /// worker drains it before finishing, so a request after a checkout /
+    /// Refresh coordination, guarded as one unit so the "finish" and "park a
+    /// follow-up request" decisions are atomic: no reentrant locking and no
+    /// window where a request lands after the worker decides to stop but
+    /// before it clears `running`.
+    refresh: Mutex<RefreshState>,
+}
+
+#[derive(Default)]
+struct RefreshState {
+    /// A worker thread is currently capturing.
+    running: bool,
+    /// Workspace of a refresh requested while a worker was in flight; the
+    /// worker drains it before it stops, so a request after a checkout or
     /// re-anchor is never lost to a stale in-flight capture.
-    pending: Mutex<Option<PathBuf>>,
+    pending: Option<PathBuf>,
 }
 
 impl GitStatusCache {
@@ -427,9 +437,15 @@ impl GitStatusCache {
     /// and the worker drains it before finishing, so a request issued after a
     /// checkout or re-anchor is never dropped in favor of a stale capture.
     pub(crate) fn request_refresh(&self, workspace: PathBuf) {
-        if self.inner.refreshing.swap(true, Ordering::AcqRel) {
-            *self.inner.pending.lock().unwrap() = Some(workspace);
-            return;
+        {
+            let mut state = self.inner.refresh.lock().unwrap();
+            if state.running {
+                // A worker is capturing; park this workspace (latest wins) and
+                // let that worker drain it before it stops.
+                state.pending = Some(workspace);
+                return;
+            }
+            state.running = true;
         }
         let inner = Arc::clone(&self.inner);
         std::thread::spawn(move || {
@@ -438,24 +454,18 @@ impl GitStatusCache {
                 let status = capture(&workspace);
                 *inner.latest.lock().unwrap() = status;
                 inner.generation.fetch_add(1, Ordering::AcqRel);
-                // Drain a request parked while this capture ran; only clear
-                // the refreshing flag once nothing is pending, so no request
-                // is lost between the drain check and the flag store.
-                match inner.pending.lock().unwrap().take() {
-                    Some(next) => workspace = next,
+                // Under the coordination lock, either drain a parked request or
+                // clear `running`. Doing both under one lock closes the race: a
+                // request either parked before this (drained here) or arrives
+                // after `running` is false (starts a fresh worker).
+                let mut state = inner.refresh.lock().unwrap();
+                match state.pending.take() {
+                    Some(next) => {
+                        drop(state);
+                        workspace = next;
+                    }
                     None => {
-                        inner.refreshing.store(false, Ordering::Release);
-                        // Close the drain/flag gap: a request parked between
-                        // the drain and the flag store re-arms this worker.
-                        if inner.pending.lock().unwrap().is_some()
-                            && !inner.refreshing.swap(true, Ordering::AcqRel)
-                        {
-                            if let Some(next) = inner.pending.lock().unwrap().take() {
-                                workspace = next;
-                                continue;
-                            }
-                            inner.refreshing.store(false, Ordering::Release);
-                        }
+                        state.running = false;
                         break;
                     }
                 }
@@ -647,5 +657,52 @@ mod tests {
 
         // Non-repo directory yields no snapshot.
         assert!(capture(dir.path.as_path()).is_none());
+    }
+
+    /// Concurrency guard: many overlapping `request_refresh` calls from several
+    /// threads must never deadlock the coordination lock, and every worker must
+    /// terminate (leaving `running` clear). Regression test for a reentrant
+    /// re-lock in the drain path that froze the whole UI within seconds.
+    #[test]
+    fn concurrent_request_refresh_never_deadlocks() {
+        let dir = temp_dir();
+        let cache = GitStatusCache::default();
+        let workspace = dir.path.clone();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let workspace = workspace.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        cache.request_refresh(workspace.clone());
+                    }
+                })
+            })
+            .collect();
+        for handle in threads {
+            handle.join().unwrap();
+        }
+        // Let any in-flight worker finish, then the coordination state must be
+        // idle (no worker stuck holding the lock) and a fresh request still
+        // advances the generation.
+        let before = cache.generation();
+        for _ in 0..50 {
+            if !cache.inner.refresh.lock().unwrap().running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !cache.inner.refresh.lock().unwrap().running,
+            "a worker is stuck running -- coordination deadlock"
+        );
+        cache.request_refresh(workspace);
+        for _ in 0..50 {
+            if cache.generation() > before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(cache.generation() > before, "refresh did not advance");
     }
 }

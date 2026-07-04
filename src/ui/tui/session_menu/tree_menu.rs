@@ -19,7 +19,7 @@ use super::super::wrap::truncate_line;
 use super::super::{dim_style, prompt_style};
 use super::{
     MenuAction, MenuKey, MenuOutcome, cap_block, dim_lines, footer_hints, fuzzy_match, home_rel,
-    input_row, internal_rule, menu_row, readonly_footer,
+    input_row, internal_rule, match_count, menu_row, readonly_footer,
 };
 
 /// Hard cap on visible rows (a dim `… N more` row follows).
@@ -605,8 +605,8 @@ impl TreeMenu {
                 } else {
                     let hint = vec![Span::styled(
                         format!(
-                            "{} matches {} ↵ top {} esc",
-                            matches.len(),
+                            "{} {} ↵ top {} esc",
+                            match_count(matches.len()),
                             symbols::SEP,
                             symbols::SEP
                         ),

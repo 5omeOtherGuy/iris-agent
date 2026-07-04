@@ -19,7 +19,7 @@ use super::super::wrap::truncate_line;
 use super::super::{dim_style, err_style, prompt_style};
 use super::{
     MenuAction, MenuKey, MenuOutcome, cap_block, dim_lines, footer_hints, fuzzy_match, group_label,
-    home_rel, input_row, internal_rule, menu_row, readonly_footer,
+    home_rel, input_row, internal_rule, match_count, menu_row, readonly_footer,
 };
 
 /// Visible branch rows in the SWITCH group.
@@ -526,7 +526,13 @@ impl GitMenu {
     fn key_worktree_ready(&mut self, path: PathBuf, key: MenuKey) -> MenuOutcome {
         match key {
             MenuKey::Enter => MenuOutcome::Action(MenuAction::OpenSessionAt { path, branch: None }),
-            MenuKey::Esc => MenuOutcome::Close,
+            // "esc stay": dismiss the ready confirmation but stay in the
+            // console (return to the list), mirroring the confirm dialogs'
+            // `esc cancel`. A full close is `esc` again from the list.
+            MenuKey::Esc => {
+                self.mode = Mode::List;
+                MenuOutcome::Redraw
+            }
             _ => {
                 self.mode = Mode::WorktreeReady { path };
                 MenuOutcome::Ignore
@@ -921,7 +927,8 @@ impl GitMenu {
                 let count = self.filter_matches(input).len();
                 let hint = vec![Span::styled(
                     format!(
-                        "{count} matches {} ↵ top {} esc",
+                        "{} {} ↵ top {} esc",
+                        match_count(count),
                         symbols::SEP,
                         symbols::SEP
                     ),
@@ -1379,7 +1386,10 @@ mod tests {
             m.handle_key(MenuKey::Char(c), false);
         }
         let text = lines_text(&m.render_lines(80, 16, false));
-        assert!(text.contains("1 matches"), "{text}");
+        assert!(
+            text.contains("1 match") && !text.contains("1 matches"),
+            "{text}"
+        );
         let out = m.handle_key(MenuKey::Enter, false);
         assert_eq!(
             out,
@@ -1417,6 +1427,14 @@ mod tests {
         m.worktree_ready(PathBuf::from("/wt/feat-new"));
         let text = lines_text(&m.render_lines(90, 16, false));
         assert!(text.contains("◆ worktree ready at"), "{text}");
+
+        // `esc stay` returns to the list (console stays open), it does not
+        // close the whole console.
+        let mut stayed = menu(base_status());
+        stayed.worktree_ready(PathBuf::from("/wt/feat-new"));
+        assert_eq!(stayed.handle_key(MenuKey::Esc, false), MenuOutcome::Redraw);
+        assert!(matches!(stayed.mode, Mode::List));
+
         let out = m.handle_key(MenuKey::Enter, false);
         assert_eq!(
             out,

@@ -396,9 +396,10 @@ async fn session_loop<P: ChatProvider>(
                 if slash::is_exit(&prompt) {
                     break;
                 }
-                // The SessionBar dropdowns open at this safe boundary.
+                // The SessionBar dropdowns open at this safe boundary. Like
+                // every other slash command they are consumed silently -- the
+                // command text is never echoed into the transcript.
                 if prompt == "/git" || prompt == "/tree" {
-                    tui.screen.commit_user(&prompt);
                     if prompt == "/git" {
                         toggle_git_menu(&mut tui.screen, &git_cache);
                     } else {

@@ -265,11 +265,14 @@ impl Settings {
     pub(crate) fn worktree_root(&self, main_root: &Path) -> PathBuf {
         let raw = self.worktree_root.as_deref().unwrap_or("../wt");
         let path = Path::new(raw);
-        if path.is_absolute() {
+        let joined = if path.is_absolute() {
             path.to_path_buf()
         } else {
             main_root.join(path)
-        }
+        };
+        // Resolve `.`/`..` lexically so the previewed and created worktree path
+        // is clean (`/repos/wt/x`, not `/repos/main/../wt/x`).
+        crate::tools::path::lexical_normalize(&joined)
     }
 
     /// The `tui` settings block, if configured.
@@ -482,6 +485,25 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn worktree_root_default_is_normalized_beside_the_main_root() {
+        let settings = Settings::default();
+        // Default `../wt` resolves lexically, without a `..` component.
+        assert_eq!(
+            settings.worktree_root(Path::new("/repos/main")),
+            PathBuf::from("/repos/wt")
+        );
+        // An absolute override is used as-is (still normalized).
+        let abs = Settings {
+            worktree_root: Some("/srv/trees/./x".to_string()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            abs.worktree_root(Path::new("/repos/main")),
+            PathBuf::from("/srv/trees/x")
+        );
+    }
 
     #[test]
     fn iris_flag_value_matches_the_opt_in_convention() {

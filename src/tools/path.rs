@@ -33,7 +33,7 @@ fn join_request(root: &Path, requested: &str) -> PathBuf {
 }
 
 /// Lexically normalize `.` and `..` without touching the filesystem.
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

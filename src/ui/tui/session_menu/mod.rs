@@ -259,6 +259,16 @@ pub(super) fn readonly_footer(width: usize) -> Line<'static> {
     line
 }
 
+/// A filter match count with a correctly pluralized noun (`1 match`,
+/// `3 matches`).
+pub(super) fn match_count(count: usize) -> String {
+    if count == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{count} matches")
+    }
+}
+
 /// Apply the readout dimming to already-rendered rows (readonly mode, and the
 /// dimmed list behind a confirm/create footer).
 pub(super) fn dim_lines(lines: &mut [Line<'static>]) {
