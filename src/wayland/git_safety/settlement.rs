@@ -426,7 +426,8 @@ impl GitSafety {
             // claim creates and takes it (lease-free), so legacy expiry still
             // works. Holding the claimed lease through teardown also blocks a
             // concurrent adopt of this orphan mid-delete.
-            let lease = match lock::try_exclusive(&lock::lease_path(git_dir, &task.task_id)) {
+            let lease = match lock::try_exclusive_settled(&lock::lease_path(git_dir, &task.task_id))
+            {
                 Ok(Some(guard)) => guard,
                 _ => continue,
             };
@@ -514,7 +515,7 @@ impl GitSafety {
             .find(|task| task.task_id == task_id && task.workspace == workspace)?;
         // Claim the lease for the task's lifetime. If a live process holds it,
         // this is a foreign live task -- do not adopt.
-        let lease = match lock::try_exclusive(&lock::lease_path(&git_dir, task_id)) {
+        let lease = match lock::try_exclusive_settled(&lock::lease_path(&git_dir, task_id)) {
             Ok(Some(guard)) => guard,
             _ => return None,
         };
