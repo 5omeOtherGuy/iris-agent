@@ -291,7 +291,11 @@ impl<P: ChatProvider> Harness<P> {
         entry_ids: Vec<Option<String>>,
         resumed: usize,
     ) {
-        debug_assert!(entry_ids.len() == resumed);
+        // The loaded messages, their ids, and the persisted count must all
+        // describe the same prefix: `entry_ids` is parallel to `messages`, and
+        // every resumed message is already on disk (`persisted == resumed`).
+        debug_assert_eq!(messages.len(), resumed);
+        debug_assert_eq!(entry_ids.len(), messages.len());
         self.output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
