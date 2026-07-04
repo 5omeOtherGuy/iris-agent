@@ -514,17 +514,20 @@ fn approval_panel_lines(hint: &ApprovalHint, width: usize) -> Vec<Line<'static>>
     out
 }
 
-/// Build a styled, empty editor for the bordered composer panel: dim
-/// placeholder and a reversed block cursor the widget draws itself (no hardware
-/// cursor needed). The surrounding border and hint row are painted by
-/// `render_editor_chrome`.
+/// Shown when the composer has no text yet. Painted by hand
+/// (`paint_composer_placeholder`), not through `ratatui-textarea`'s own
+/// placeholder feature — see that function for why.
+const COMPOSER_PLACEHOLDER: &str = "Give Iris a task...";
+
+/// Build a styled, empty editor for the bordered composer panel: a reversed
+/// block cursor the widget draws itself (no hardware cursor needed). The
+/// placeholder text is painted separately (`paint_composer_placeholder`), and
+/// the surrounding border and hint row are painted by `render_editor_chrome`.
 pub(super) fn fresh_editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
     editor.set_cursor_line_style(Style::default());
     editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
-    editor.set_placeholder_style(dim_style());
-    editor.set_placeholder_text("Give Iris a task...");
     editor
 }
 
@@ -1950,10 +1953,10 @@ fn chrome_heights(
 }
 
 fn composer_text_x_offset(box_width: u16) -> u16 {
-    // `ratatui-textarea` paints the empty-editor cursor one cell before the
-    // placeholder, so anchor the widget one cell left of the transcript text
-    // column; the visible `Give Iris...` indicator then starts with messages.
-    u16::try_from(TEXT_COLUMN_X_PADDING.saturating_sub(1))
+    // Anchor the input at the same column as transcript text, so the
+    // placeholder (and the first character typed) starts flush with
+    // messages.
+    u16::try_from(TEXT_COLUMN_X_PADDING)
         .unwrap_or(u16::MAX)
         .min(box_width.saturating_sub(1))
 }
@@ -2059,9 +2062,19 @@ pub(super) fn render_editor_chrome(
     };
     // Cell of the editor's hardware-cursor (IME) marker, in buffer coordinates.
     // Only emitted when the composer owns input focus (no turn/modal/approval),
-    // located by the reversed block cursor `ratatui-textarea` draws for us.
+    // located by the reversed block cursor drawn for us (by `ratatui-textarea`
+    // for real text, or `paint_composer_placeholder` for the empty state).
     let mut cursor_cell: Option<(u16, u16)> = None;
-    (&screen.editor).render(text_area, &mut buf);
+    if screen.editor.is_empty() {
+        // `ratatui-textarea`'s own empty-editor placeholder draws the cursor
+        // as a blank cell one column before the placeholder text, leaving it
+        // one column left of the `G` it should sit on. Painting the
+        // placeholder by hand puts the cursor on the placeholder's first
+        // character instead, exactly where the first typed character lands.
+        paint_composer_placeholder(&mut buf, text_area);
+    } else {
+        (&screen.editor).render(text_area, &mut buf);
+    }
     if screen.composer_focused() {
         cursor_cell = find_reversed_cell(&buf, text_area);
     }
@@ -2096,6 +2109,27 @@ pub(super) fn render_editor_chrome(
         }
     }
     buffer_to_lines(&buf, cursor_cell)
+}
+
+/// Paint the empty-composer placeholder into the text area by hand, cursor
+/// and all, instead of going through `ratatui-textarea`'s own empty-editor
+/// placeholder rendering: that draws the block cursor as its own blank cell
+/// immediately before the placeholder text, so the cursor sits one column
+/// left of the `G` rather than on it. Reversing the placeholder's first
+/// character directly puts the cursor exactly where the first typed
+/// character will land.
+fn paint_composer_placeholder(buf: &mut Buffer, text_area: Rect) {
+    if text_area.width == 0 || text_area.height == 0 {
+        return;
+    }
+    let mut chars = COMPOSER_PLACEHOLDER.chars();
+    let first = chars.next().map(|c| c.to_string()).unwrap_or_default();
+    let rest: String = chars.collect();
+    let line = Line::from(vec![
+        Span::styled(first, dim_style().add_modifier(Modifier::REVERSED)),
+        Span::styled(rest, dim_style()),
+    ]);
+    buf.set_line(text_area.x, text_area.y, &line, text_area.width);
 }
 
 /// Find the reversed block cursor `ratatui-textarea` draws, scanning only the
