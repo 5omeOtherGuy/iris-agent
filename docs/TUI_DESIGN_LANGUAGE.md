@@ -428,6 +428,11 @@ expands them all, otherwise it collapses them all. A **click on a block's
 header row** toggles that one block. State is per-block; an explicit user
 expand/collapse survives the block's in-place rebuilds.
 
+`/find` searches canonical transcript content — the body of a collapsed block
+is searched even though it is unmounted from the view. Jumping to a match
+inside a collapsed block expands it; the newest match stays clear of the find
+indicator row.
+
 ### 8.2 EXPLORE — read / grep / list / find
 The **single container** for every read-side op. Each op is **one row**:
 ```

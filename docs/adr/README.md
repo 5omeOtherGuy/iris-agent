@@ -34,6 +34,7 @@
 | [0031](0031-task-identity-session-linkage-and-resumable-tasks.md) | Task identity — opaque body, session linkage, and explicit task resumption | accepted | 2026-07-03 |
 | [0032](0032-approval-presets-auto-and-safety-floors.md) | Approval presets, auto mode, and non-bypassable safety floors | accepted | 2026-07-04 |
 | [0033](0033-ratatui-native-adoption-boundary.md) | Define the ratatui-native adoption boundary for the TUI | accepted | 2026-07-04 |
+| [0034](0034-run-blocking-tool-bodies-off-the-ui-executor.md) | Run blocking tool bodies off the UI executor with channel-bridged streaming | accepted | 2026-07-04 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.
