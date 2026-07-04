@@ -79,6 +79,7 @@ pub(crate) mod steering;
 pub(crate) mod symbols;
 pub(crate) mod task_view;
 pub(crate) mod terminal_doctor;
+pub(crate) mod terminal_env;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
 

@@ -11,6 +11,7 @@
 //! line, fix lines indented beneath the finding they repair.
 
 use crate::ui::symbols::{CANCELLED, DONE, REVIEW};
+use crate::ui::terminal_env::{TerminalEnv, tmux_probe};
 
 /// Environment snapshot the report is built from.
 #[derive(Debug, Default)]
@@ -150,21 +151,20 @@ pub(crate) fn report(env: &DoctorEnv) -> Vec<String> {
 /// from the live TUI (they reflect what was actually negotiated at startup,
 /// not a re-probe).
 pub(crate) fn detect(kitty_keyboard: bool, pager_active: bool) -> DoctorEnv {
-    let term = std::env::var("TERM").ok().filter(|value| !value.is_empty());
-    let tmux = std::env::var_os("TMUX").is_some();
+    // Shared snapshot: env read once, one timeout-guarded control-mode probe.
+    // Doctor-specific facts (TERM_PROGRAM, SSH, clipboard probes) stay here.
+    let shared = TerminalEnv::detect();
+    let tmux = shared.tmux;
+    let gnu_screen = shared.gnu_screen();
+    let tmux_control_mode = shared.tmux_control_mode_for_doctor();
     DoctorEnv {
         term_program: std::env::var("TERM_PROGRAM")
             .ok()
             .filter(|value| !value.is_empty()),
         tmux,
-        tmux_control_mode: tmux
-            && tmux_probe(&["display-message", "-p", "#{client_control_mode}"])
-                .is_some_and(|value| value != "0"),
-        zellij: std::env::var_os("ZELLIJ").is_some(),
-        gnu_screen: term
-            .as_deref()
-            .is_some_and(|term| term.starts_with("screen"))
-            && !tmux,
+        tmux_control_mode,
+        zellij: shared.zellij,
+        gnu_screen,
         ssh: ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
             .iter()
             .any(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty())),
@@ -180,28 +180,8 @@ pub(crate) fn detect(kitty_keyboard: bool, pager_active: bool) -> DoctorEnv {
         } else {
             None
         },
-        term,
+        term: shared.term,
     }
-}
-
-/// Best-effort tmux query with a hard timeout; `None` on any failure. The
-/// probe runs on a helper thread so a wedged tmux server can never block the
-/// TUI event loop; on timeout the thread is abandoned (it exits when the
-/// child does) and the capability reports as unknown.
-fn tmux_probe(args: &[&str]) -> Option<String> {
-    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = std::process::Command::new("tmux").args(&args).output();
-        let _ = tx.send(result);
-    });
-    let output = rx.recv_timeout(PROBE_TIMEOUT).ok()?.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]
