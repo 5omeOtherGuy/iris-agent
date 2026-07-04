@@ -1008,6 +1008,23 @@ fn route_command<P: ChatProvider>(
             apply_notices(tui, crate::cli::session_info_lines(harness, switch));
             Ok(RouteOutcome::Consumed)
         }
+        "/sessions" => {
+            // Deterministic session lookup by task id (ADR-0031): with no arg,
+            // default to the active task; else a usage line. No modal, no model
+            // call -- display-only audit text.
+            tui.screen.commit_user(prompt);
+            let task_id = if rest.is_empty() {
+                harness.current_task_id()
+            } else {
+                Some(rest.to_string())
+            };
+            let lines = match task_id {
+                Some(task_id) => crate::cli::sessions_for_task_lines(harness.workspace(), &task_id),
+                None => vec!["usage: /sessions <task-id>".to_string()],
+            };
+            apply_notices(tui, lines);
+            Ok(RouteOutcome::Consumed)
+        }
         "/copy" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             apply_notices(tui, crate::cli::copy_command_lines(harness));
