@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 
+mod filter;
 mod jobs;
 mod sandbox;
 mod session;
@@ -37,7 +38,7 @@ const BASH_DRAIN_TIMEOUT_SECS: u64 = 5;
 // streams. This stays a memory-safety rail and is intentionally unchanged.
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). No timeout by default; set `timeout` (seconds) to bound a call. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
+pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output from known-noisy commands (build/test runners, installers, linters) is filtered to keep errors, failures, and summaries; pass `raw: true` to get the unfiltered output for one call. Output is truncated to last 2000 lines or 50KB (whichever is hit first). No timeout by default; set `timeout` (seconds) to bound a call. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -47,7 +48,8 @@ pub(super) fn parameters() -> Value {
             "timeout": { "type": "integer", "description": "Timeout in seconds (optional; no timeout when unset)" },
             "session": { "type": "string", "description": "Persistent shell session id; state (cd/env/vars) persists across calls with the same id" },
             "job": { "type": "string", "description": "Background job id for poll/finalize/cancel" },
-            "action": { "type": "string", "enum": ["run", "reset", "close", "start", "poll", "finalize", "cancel", "list"], "description": "Action (default run): run/reset/close a session, or start/poll/finalize/cancel/list background jobs" }
+            "action": { "type": "string", "enum": ["run", "reset", "close", "start", "poll", "finalize", "cancel", "list"], "description": "Action (default run): run/reset/close a session, or start/poll/finalize/cancel/list background jobs" },
+            "raw": { "type": "boolean", "description": "Bypass output filtering for this call and return the full raw output" }
         }
     })
 }
@@ -85,6 +87,7 @@ pub(super) fn execute(
         session,
         job,
         action,
+        raw,
     } = parsed;
     // Exit code + wall-clock duration for the command-running arms (one-shot and
     // persistent session); `None` for the management arms (reset/close/jobs),
@@ -95,13 +98,22 @@ pub(super) fn execute(
         "run" => match session {
             Some(id) => {
                 let (text, code, duration) =
-                    run_session(root, &id, command, timeout, state, cancel)?;
+                    run_session(root, &id, command, timeout, raw, state, cancel)?;
                 exec = Some((code, duration));
                 text
             }
             None => {
                 let command = command.context("bash tool arguments must include command")?;
-                let run = bash(root, &BashInput { command, timeout }, cancel, sink)?;
+                let run = bash(
+                    root,
+                    &BashInput {
+                        command,
+                        timeout,
+                        raw,
+                    },
+                    cancel,
+                    sink,
+                )?;
                 exec = Some((run.exit_code, run.duration));
                 run.text
             }
@@ -134,7 +146,25 @@ pub(super) fn execute(
             // No default wait: unset (or 0) blocks until the job completes
             // (cancellation-aware); a positive value bounds the wait.
             let wait = timeout.filter(|&secs| secs > 0).map(Duration::from_secs);
-            render_job(id, state.jobs.finalize(id, wait, cancel)?)
+            // Capture the job's command before finalize removes the entry so
+            // the output filter (ADR-0037) can dispatch on it.
+            let job_command = state.jobs.command_of(id);
+            let mut update = state.jobs.finalize(id, wait, cancel)?;
+            let mut filter_notice = None;
+            if update.finished
+                && let Some(cmd) = job_command
+            {
+                let exit_ok = update.exit_code == Some(0);
+                let (filtered, notice) =
+                    filter_for_display(&cmd, std::mem::take(&mut update.output), exit_ok, raw);
+                update.output = filtered;
+                filter_notice = notice;
+            }
+            let text = render_job(id, update);
+            match filter_notice {
+                Some(notice) => format!("[{notice}]\n{text}"),
+                None => text,
+            }
         }
         "cancel" => {
             let id = job.as_deref().context("bash cancel requires 'job'")?;
@@ -163,6 +193,7 @@ fn run_session(
     id: &str,
     command: Option<String>,
     timeout: Option<u64>,
+    raw: bool,
     state: &mut BashState,
     cancel: &CancellationToken,
 ) -> Result<(String, Option<i32>, Duration)> {
@@ -181,10 +212,49 @@ fn run_session(
     // here; live deltas for this path are the named follow-up. Upgrade path =
     // stream only the marker-safe prefix of the session buffer.
     let start = Instant::now();
-    let outcome = state.sessions.run(root, id, &command, timeout, cancel)?;
+    let mut outcome = state.sessions.run(root, id, &command, timeout, cancel)?;
     let duration = start.elapsed();
     let exit_code = outcome.exit_code;
-    Ok((render_session(outcome, timeout_secs), exit_code, duration))
+    // Filter the captured output (ADR-0037) before the shared render path;
+    // truncation, notices, and the exit/timeout footers are applied after and
+    // are never altered by filtering.
+    let exit_ok = !outcome.cancelled && !outcome.timed_out && outcome.exit_code == Some(0);
+    let (filtered, filter_notice) =
+        filter_for_display(&command, std::mem::take(&mut outcome.output), exit_ok, raw);
+    outcome.output = filtered;
+    let mut text = render_session(outcome, timeout_secs);
+    if let Some(notice) = filter_notice {
+        text = format!("[{notice}]\n{text}");
+    }
+    Ok((text, exit_code, duration))
+}
+
+/// Apply the ADR-0037 output filter for display. Returns the (possibly
+/// reduced) output plus a provenance notice for the caller to prepend. `raw`
+/// bypasses filtering for one call; every quality guard (fail-safe on filter
+/// error/panic, empty-result guard, no-op detection) returns the input
+/// unchanged with no notice.
+fn filter_for_display(
+    command: &str,
+    output: String,
+    exit_ok: bool,
+    raw: bool,
+) -> (String, Option<String>) {
+    if raw {
+        return (output, None);
+    }
+    match filter::filter_output(command, &output, exit_ok) {
+        Some(filtered) => {
+            let notice = format!(
+                "output filtered ({}): {} -> {} line(s); rerun with raw=true for full output",
+                filtered.name,
+                output.lines().count(),
+                filtered.text.lines().count(),
+            );
+            (filtered.text, Some(notice))
+        }
+        None => (output, None),
+    }
 }
 
 /// Format a background-job update: bounded output, drop/sandbox notices, status.
@@ -286,6 +356,9 @@ struct BashInput {
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
+    /// Bypass output filtering (ADR-0037) for this call.
+    #[serde(default)]
+    raw: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,6 +373,9 @@ struct BashArgs {
     job: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    /// Bypass output filtering (ADR-0037) for this call.
+    #[serde(default)]
+    raw: bool,
 }
 
 /// One-shot `bash` result: rendered output plus the command's exit code and
@@ -462,7 +538,18 @@ fn bash(
         combined.push_str(&stderr_text);
     }
 
+    // Filter the captured output (ADR-0037) after capture, before the
+    // truncate-tail backstop. Exit codes, timeout/cancel footers, and the
+    // notices below are appended afterwards and never altered by filtering.
+    let exit_ok = !cancelled && !timed_out && status.is_some_and(|s| s.success());
+    let (combined, filter_notice) =
+        filter_for_display(&input.command, combined, exit_ok, input.raw);
+
     let mut out = render_output(&combined);
+
+    if let Some(notice) = filter_notice {
+        out = format!("[{notice}]\n{out}");
+    }
 
     if capture_truncated {
         out = format!(
@@ -655,6 +742,7 @@ mod tests {
             &BashInput {
                 command: "printf 'one\\ntwo\\n'".into(),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             Some(&sink),
@@ -676,6 +764,7 @@ mod tests {
             &BashInput {
                 command: "echo hi".into(),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -758,6 +847,7 @@ mod tests {
             &BashInput {
                 command: "echo hello".into(),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -779,6 +869,7 @@ mod tests {
             &BashInput {
                 command: "echo ok".into(),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -799,6 +890,7 @@ mod tests {
             &BashInput {
                 command: "sleep 30".into(),
                 timeout: Some(1),
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -826,6 +918,7 @@ mod tests {
             &BashInput {
                 command: "sleep 30 & echo started; wait".into(),
                 timeout: Some(1),
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -852,6 +945,7 @@ mod tests {
             &BashInput {
                 command: "sleep 30 & echo done".into(),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -877,6 +971,7 @@ mod tests {
             &BashInput {
                 command: "set -o pipefail; echo ok | cat".into(),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -919,6 +1014,7 @@ mod tests {
             &BashInput {
                 command: format!("echo escaped > {}", outside.display()),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -1093,6 +1189,7 @@ mod tests {
             &BashInput {
                 command: "head -c 20000000 /dev/zero".into(),
                 timeout: Some(30),
+                raw: false,
             },
             &CancellationToken::new(),
             None,
@@ -1120,6 +1217,164 @@ mod tests {
         );
     }
 
+    /// A command whose last segment dispatches the `shellcheck` filter but
+    /// whose output comes from a local shell function -- deterministic
+    /// end-to-end filtering without shellcheck installed.
+    const FILTERED_CMD: &str =
+        "shellcheck() { printf 'In x line 1:\\n\\nfoo\\n'; }; shellcheck x.sh";
+
+    #[test]
+    fn bash_filters_matching_output_and_reports_provenance() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        let out = execute(
+            &root,
+            &json!({ "command": FILTERED_CMD }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.content
+                .contains("output filtered (shellcheck): 3 -> 2 line(s)"),
+            "missing provenance notice: {}",
+            out.content
+        );
+        assert!(out.content.contains("In x line 1:\nfoo"), "{}", out.content);
+        // Exit code metadata is untouched by filtering.
+        assert_eq!(out.metadata.get("exitCode"), Some(&json!(0)));
+    }
+
+    #[test]
+    fn bash_raw_true_bypasses_filtering() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        let out = execute(
+            &root,
+            &json!({ "command": FILTERED_CMD, "raw": true }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !out.content.contains("output filtered"),
+            "raw:true must bypass filtering: {}",
+            out.content
+        );
+        // The blank line the filter would strip is still present.
+        assert!(
+            out.content.contains("In x line 1:\n\nfoo"),
+            "raw output altered: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn bash_filtering_preserves_error_lines_and_exit_footer() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        // Last segment dispatches the cargo-test filter; the function emits
+        // compiler noise plus an error line and fails with 101.
+        let cmd = "cargo() { echo '   Compiling foo v0.1.0'; echo 'error[E0308]: mismatched types'; return 101; }; cargo test";
+        let out = execute(
+            &root,
+            &json!({ "command": cmd }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.content.contains("error[E0308]: mismatched types"),
+            "error line lost: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("Compiling foo"),
+            "noise not stripped: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Command exited with code 101"),
+            "exit footer lost: {}",
+            out.content
+        );
+        assert_eq!(out.metadata.get("exitCode"), Some(&json!(101)));
+    }
+
+    #[test]
+    fn session_run_applies_output_filter() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        let out = execute(
+            &root,
+            &json!({ "command": FILTERED_CMD, "session": "s1", "timeout": 10 }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.content.contains("output filtered (shellcheck)"),
+            "session path missing filter: {}",
+            out.content
+        );
+        // raw bypass works on the session path too.
+        let raw = execute(
+            &root,
+            &json!({ "command": FILTERED_CMD, "session": "s1", "timeout": 10, "raw": true }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(!raw.content.contains("output filtered"), "{}", raw.content);
+    }
+
+    #[test]
+    fn job_finalize_applies_output_filter() {
+        use serde_json::json;
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        execute(
+            &root,
+            &json!({ "action": "start", "command": FILTERED_CMD }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        let fin = execute(
+            &root,
+            &json!({ "action": "finalize", "job": "job-0", "timeout": 10 }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            fin.content.contains("output filtered (shellcheck)"),
+            "finalized job missing filter: {}",
+            fin.content
+        );
+        assert!(
+            fin.content.contains("job 'job-0' finished (exit code 0)"),
+            "job status altered: {}",
+            fin.content
+        );
+    }
+
     #[test]
     fn bash_reports_nonzero_exit() {
         let dir = temp_dir();
@@ -1129,6 +1384,7 @@ mod tests {
             &BashInput {
                 command: "exit 3".into(),
                 timeout: None,
+                raw: false,
             },
             &CancellationToken::new(),
             None,

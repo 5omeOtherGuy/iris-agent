@@ -1,0 +1,18 @@
+
+> jestproj@1.0.0 test
+> jest --verbose
+
+PASS src/api.test.js
+  ✓ fetches user (4 ms)
+  ✓ handles missing user (1 ms)
+
+PASS src/utils.test.js
+  ✓ parses config (2 ms)
+  ✓ merges defaults (1 ms)
+  ✓ keeps left precedence (1 ms)
+
+Test Suites: 2 passed, 2 total
+Tests:       5 passed, 5 total
+Snapshots:   0 total
+Time:        0.452 s, estimated 1 s
+Ran all test suites.

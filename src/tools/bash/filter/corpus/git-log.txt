@@ -1,0 +1,79 @@
+commit c8e2dbba9106ea208a97f5aad6789817b7b646b4
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 16:39:13 2026 +0200
+
+    docs(adr): token-efficient tools by design (0036) and native bash output filtering (0037) (#342)
+
+commit 3081fc1b623adb5e87c66810753c454aea57cc34
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 16:26:23 2026 +0200
+
+    feat(tui): syntax-highlighted code blocks (IDE-grade transcript, slice 1) (#334)
+    
+    * feat(tui): syntax-highlighted code blocks via syntect through the HighlightFn seam
+    
+    * chore(deps): ignore RUSTSEC-2025-0141 (bincode via syntect packdump, trusted embedded input)
+
+commit f78a25c3f485151d05652ad21de19b1f1888d452
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 16:24:12 2026 +0200
+
+    fix(tui): table-cell wrap overflow contract and tmux probe lifetime deadline (#335)
+
+commit 74842539d9951cd0e7130bf3cd960ccd67247924
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 16:18:29 2026 +0200
+
+    docs: ADR-0029 git worktree isolation (Tier 0, apply = settlement) (#274)
+    
+    * docs: add ADR-0029 worktree isolation design (Tier 0, apply = settlement)
+    
+    * docs: harden ADR-0029 apply base-drift precondition and guarded deletion
+
+commit d6cf2fae9b2d3e1566ba5112036c2f43a3d5acb6
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 16:05:57 2026 +0200
+
+    docs: record ADR-0032 blocking-tool executor decision and fix stale TUI fold/search claims (#303)
+
+commit d97f8696d96ad74ee3d20a2504fb740a3e5c1793
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 15:44:26 2026 +0200
+
+    refactor(tui): consolidate list-selection on shared Selector primitives (#333)
+
+commit f02471a87f0ebe0b82af1b5339a3eff2580d93b3
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 15:43:56 2026 +0200
+
+    refactor(tui): fold markdown width/truncation into textengine; fix stale ADR-0006 Cargo.toml comment (#332)
+
+commit 8658a24309d8925a4c91d8a857076f672d35a6d5
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 15:40:29 2026 +0200
+
+    refactor(ui): extract shared terminal-capability detector with timeout-guarded tmux probe (#331)
+
+commit 6259f45aa6c18694f231045d83ccf109f025aea2
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 15:37:25 2026 +0200
+
+    refactor(tui): centralize glyph literals in symbols.rs (#330)
+
+commit f4d24770a334e125e7b339d8afcd5f96936b82ef
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 15:28:50 2026 +0200
+
+    docs: add ADR-0033 ratatui-native adoption boundary; roadmap milestone 7 + TUI sweep (#329)
+
+commit 423087e0845d7031d2adb438caacb68a1459fbd5
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 15:28:22 2026 +0200
+
+    fix(cli): remove redundant login arms, document --plain, mark pager-only palette commands (#328)
+
+commit ac85ff8825d2a9222f92129d46bee706109883d2
+Author: dangerouslyskippermissions <simon.gies@pm.me>
+Date:   Sat Jul 4 15:27:44 2026 +0200
+
+    refactor(tui): remove dead ModalKey::Tab and reserved ansi_aware module (#327)

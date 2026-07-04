@@ -1,0 +1,90 @@
+# iris-authored (interim declarative filter; structured Rust filter is PR 2 of #336)
+[filters.npm-install]
+description = "Compact npm/pnpm/yarn install output — strip deprecation/progress noise, keep the install summary, audit result, and errors"
+match_command = "^(npm|pnpm|yarn|bun)\\s+(install|i|ci|add|update|up)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^npm (warn|WARN) deprecated",
+  "^npm (warn|WARN) (skipping|old lockfile|cleanup|using --force|reify|EBADENGINE)",
+  "^npm notice",
+  "^Progress: resolved",
+  "^\\[\\d+/\\d+\\]",
+  "^(⠁|⠂|⠄|⡀|⢀|⠠|⠐|⠈)",
+  "^Packages: \\+",
+  "^[.┌├└│─┐┘┤┬┴┼]+$",
+  "^Resolving: total",
+  "^downloading ",
+  "^reused \\d+ packages",
+]
+match_output = [
+  { pattern = "up to date, audited \\d+ packages? in", message = "ok (up to date)", unless = "(?i)\\berror\\b|npm ERR|\\bfail|[1-9]\\d* vulnerabilit" },
+]
+on_empty = "ok (installed; log was all noise)"
+
+[[tests.npm-install]]
+name = "up-to-date install short-circuits"
+input = """
+up to date, audited 1373 packages in 2s
+
+221 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+"""
+expected = "ok (up to date)"
+
+[[tests.npm-install]]
+name = "fresh install keeps summary, drops deprecation noise"
+input = """
+npm warn deprecated inflight@1.0.6: This module is not supported, and leaks memory.
+npm warn deprecated glob@7.2.3: Glob versions prior to v9 are no longer supported
+npm warn deprecated rimraf@3.0.2: Rimraf versions prior to v4 are no longer supported
+
+added 1372 packages, and audited 1373 packages in 25s
+
+221 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+"""
+expected = """
+added 1372 packages, and audited 1373 packages in 25s
+221 packages are looking for funding
+  run `npm fund` for details
+found 0 vulnerabilities
+"""
+
+[[tests.npm-install]]
+name = "vulnerabilities block the up-to-date short-circuit"
+input = """
+up to date, audited 1373 packages in 2s
+
+3 vulnerabilities (2 moderate, 1 high)
+
+To address all issues, run:
+  npm audit fix
+"""
+expected = """
+up to date, audited 1373 packages in 2s
+3 vulnerabilities (2 moderate, 1 high)
+To address all issues, run:
+  npm audit fix
+"""
+
+[[tests.npm-install]]
+name = "install errors pass through"
+input = """
+npm error code ERESOLVE
+npm error ERESOLVE unable to resolve dependency tree
+npm error
+npm error While resolving: myapp@1.0.0
+npm error Found: react@17.0.2
+"""
+expected = """
+npm error code ERESOLVE
+npm error ERESOLVE unable to resolve dependency tree
+npm error
+npm error While resolving: myapp@1.0.0
+npm error Found: react@17.0.2
+"""

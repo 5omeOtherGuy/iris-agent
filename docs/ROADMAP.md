@@ -813,6 +813,23 @@ Potential scope:
   branch-aware compaction, rollback, a manual TUI/CLI `/compact` command, and
   background/offloaded compaction.]
 - Comparison against naive transcript-passing.
+- Native bash output filtering
+  ([#336](https://github.com/5omeOtherGuy/iris-agent/issues/336),
+  [ADR-0037](adr/0037-native-output-filtering-for-bash-pass-through.md)). [PR 1
+  shipped: a declarative eight-stage filter pipeline in
+  `src/tools/bash/filter/` applied after capture and before `truncate_tail`,
+  across one-shot runs, persistent sessions, and finalized background jobs.
+  Filter definitions are embedded TOML data files (63 vendored from RTK,
+  Apache-2.0, with attribution; cargo/npm/git-status filters Iris-authored),
+  dispatched on the parsed program+subcommand of the last top-level command
+  segment. Quality guards: fail-safe raw fallback on filter error/panic or
+  emptied output, short-circuit success messages disabled on non-zero exit and
+  gated by `unless` error-guards, error/failure lines exempt from stripping,
+  `raw: true` tool-param bypass, exit codes/footers untouched. Benchmarked on a
+  committed corpus (`docs/benchmarks/adr-0037-bash-filter-tokens.md`): 68-89%
+  token reduction on noisy classes, <10 ms overhead, zero loss of failure
+  detail (test-asserted). Deferred to PR 2: structured Rust filters for cargo
+  test/build, git status/diff/log, npm/pnpm test.]
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
 prompt tokens without reducing task success on at least one realistic workflow

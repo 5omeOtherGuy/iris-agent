@@ -1,0 +1,41 @@
+
+> jestproj@1.0.0 test
+> jest
+
+PASS src/utils.test.js
+FAIL src/api.test.js
+  ● fetches user
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 404
+    Received: 200
+
+    [0m [90m 1 |[39m [36mconst[39m status [33m=[39m () [33m=>[39m [35m200[39m[33m;[39m
+    [31m[1m>[22m[39m[90m 2 |[39m test([32m'fetches user'[39m[33m,[39m () [33m=>[39m { expect(status())[33m.[39mtoBe([35m404[39m)[33m;[39m })[33m;[39m
+     [90m   |[39m                                               [31m[1m^[22m[39m
+     [90m 3 |[39m test([32m'handles missing user'[39m[33m,[39m () [33m=>[39m { expect(status())[33m.[39mtoBe([35m404[39m)[33m;[39m })[33m;[39m
+     [90m 4 |[39m[0m
+
+      at Object.toBe (src/api.test.js:2:47)
+
+  ● handles missing user
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 404
+    Received: 200
+
+    [0m [90m 1 |[39m [36mconst[39m status [33m=[39m () [33m=>[39m [35m200[39m[33m;[39m
+     [90m 2 |[39m test([32m'fetches user'[39m[33m,[39m () [33m=>[39m { expect(status())[33m.[39mtoBe([35m404[39m)[33m;[39m })[33m;[39m
+    [31m[1m>[22m[39m[90m 3 |[39m test([32m'handles missing user'[39m[33m,[39m () [33m=>[39m { expect(status())[33m.[39mtoBe([35m404[39m)[33m;[39m })[33m;[39m
+     [90m   |[39m                                                       [31m[1m^[22m[39m
+     [90m 4 |[39m[0m
+
+      at Object.toBe (src/api.test.js:3:55)
+
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       2 failed, 3 passed, 5 total
+Snapshots:   0 total
+Time:        0.648 s, estimated 1 s
+Ran all test suites.

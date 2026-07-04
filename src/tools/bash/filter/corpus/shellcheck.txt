@@ -1,0 +1,55 @@
+
+In /tmp/fixgen/sh/deploy.sh line 5:
+for f in $(ls *.conf); do
+         ^----------^ SC2045 (error): Iterating over ls output is fragile. Use globs.
+              ^-- SC2035 (info): Use ./*glob* or -- *glob* so names with dashes won't become options.
+
+
+In /tmp/fixgen/sh/deploy.sh line 6:
+  cp $f /etc/app/
+     ^-- SC2086 (info): Double quote to prevent globbing and word splitting.
+
+Did you mean: 
+  cp "$f" /etc/app/
+
+
+In /tmp/fixgen/sh/deploy.sh line 9:
+echo Deploying to $target
+                  ^-----^ SC2086 (info): Double quote to prevent globbing and word splitting.
+
+Did you mean: 
+echo Deploying to "$target"
+
+
+In /tmp/fixgen/sh/deploy.sh line 10:
+cd /var/app
+^---------^ SC2164 (warning): Use 'cd ... || exit' or 'cd ... || return' in case cd fails.
+
+Did you mean: 
+cd /var/app || exit
+
+
+In /tmp/fixgen/sh/deploy.sh line 11:
+result=`systemctl restart app`
+       ^---------------------^ SC2006 (style): Use $(...) notation instead of legacy backticks `...`.
+
+Did you mean: 
+result=$(systemctl restart app)
+
+
+In /tmp/fixgen/sh/deploy.sh line 12:
+echo $result
+     ^-----^ SC2086 (info): Double quote to prevent globbing and word splitting.
+
+Did you mean: 
+echo "$result"
+
+
+In /tmp/fixgen/sh/deploy.sh line 13:
+exit $?
+     ^-- SC2320 (warning): This $? refers to echo/printf, not a previous command. Assign to variable to avoid it being overwritten.
+
+For more information:
+  https://www.shellcheck.net/wiki/SC2045 -- Iterating over ls output is fragi...
+  https://www.shellcheck.net/wiki/SC2164 -- Use 'cd ... || exit' or 'cd ... |...
+  https://www.shellcheck.net/wiki/SC2320 -- This $? refers to echo/printf, no...

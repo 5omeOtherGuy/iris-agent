@@ -1,5 +1,12 @@
 # typos spell-checker config. https://github.com/crate-ci/typos
 # Allow project-specific tokens that are not misspellings.
+[files]
+# Not prose: vendored RTK filter data (upstream wording preserved verbatim)
+# and captured real command outputs used as benchmark fixtures.
+extend-exclude = [
+  "src/tools/bash/filter/data/",
+  "src/tools/bash/filter/corpus/",
+]
 [default.extend-identifiers]
 # Repository owner / handle.
 "5omeOtherGuy" = "5omeOtherGuy"

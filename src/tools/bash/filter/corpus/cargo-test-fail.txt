@@ -1,0 +1,35 @@
+   Compiling failcrate v0.1.0 (/tmp/fixgen/failcrate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running unittests src/lib.rs (target/debug/deps/failcrate-bf6344cb8e4ab6f2)
+
+running 4 tests
+test tests::adds ... ok
+test tests::broken_math ... FAILED
+test tests::broken_greeting ... FAILED
+test tests::greets ... ok
+
+failures:
+
+---- tests::broken_math stdout ----
+
+thread 'tests::broken_math' (40699) panicked at src/lib.rs:25:9:
+assertion `left == right` failed: two plus two should make five
+  left: 4
+ right: 5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::broken_greeting stdout ----
+
+thread 'tests::broken_greeting' (40698) panicked at src/lib.rs:30:9:
+assertion `left == right` failed
+  left: "hello iris"
+ right: "goodbye iris"
+
+
+failures:
+    tests::broken_greeting
+    tests::broken_math
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
