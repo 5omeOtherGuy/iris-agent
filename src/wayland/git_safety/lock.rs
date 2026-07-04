@@ -25,6 +25,23 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long a non-blocking lease probe/claim keeps re-checking a lock that
+/// reports contention before it trusts the "held" answer (ADR-0030).
+///
+/// `flock` is per open-file-description, so `fork()` duplicates a lease fd into a
+/// child, which keeps the lease held until the child `exec`s and its `O_CLOEXEC`
+/// fds close. A process that both owns a lease and spawns a subprocess (git, a
+/// shell tool) therefore has a brief window where an *unrelated* child pins the
+/// lease fd, during which a single `LOCK_NB` probe would wrongly read a
+/// lease-free orphan as "held" -- misclassifying it as a live foreign task and
+/// skipping recovery. Re-probing across this window distinguishes that transient
+/// pin (which clears at the child's `exec`) from a genuinely live owner (which
+/// holds its lease continuously and still reads held after the window). The
+/// window only adds latency to the rare recovery-time "held" case; it never
+/// changes the classification, so a live foreign task is still never adopted.
+const LEASE_PROBE_SETTLE: Duration = Duration::from_millis(250);
 
 /// The `lock_protocol` value stamped on every record this build writes. A record
 /// whose `lock_protocol` is `None` predates the lease protocol (legacy) and is
@@ -116,13 +133,37 @@ pub(super) fn exclusive_blocking(path: &Path) -> io::Result<FlockGuard> {
     }
 }
 
-/// Whether `path`'s lock is currently free (no live process holds it). Acquires
-/// the lock non-blocking and immediately releases it, so it is a probe, not a
-/// claim -- the caller re-acquires and holds the lease in [`try_exclusive`] when
-/// it actually adopts. A probe IO error is treated as "not free" (the safe
-/// direction: never adopt a task we cannot prove is orphaned).
+/// Take the exclusive lock without blocking, but re-probe across the
+/// [`LEASE_PROBE_SETTLE`] window before reporting contention, so a transient
+/// `fork()`+`exec()` fd-inheritance pin from an unrelated child does not read a
+/// genuinely orphaned lease as held. `Ok(Some)` = acquired (lease-free);
+/// `Ok(None)` = a live owner still holds it after the settle window; `Err` = a
+/// real IO/lock error. Used by the recovery classification/claim paths
+/// (`is_lease_free`, `adopt_task`, `expire_stale`); the plain single-shot
+/// [`try_exclusive`] stays the primitive for a brand-new (always-free) lease.
+pub(super) fn try_exclusive_settled(path: &Path) -> io::Result<Option<FlockGuard>> {
+    let deadline = Instant::now() + LEASE_PROBE_SETTLE;
+    loop {
+        match try_exclusive(path)? {
+            Some(guard) => return Ok(Some(guard)),
+            None => {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// Whether `path`'s lock is currently free (no live process holds it). Probes
+/// via [`try_exclusive_settled`] (riding out a transient fork-window pin) and
+/// immediately releases, so it is a probe, not a claim -- the caller re-acquires
+/// and holds the lease in [`try_exclusive_settled`] when it actually adopts. A
+/// probe IO error is treated as "not free" (the safe direction: never adopt a
+/// task we cannot prove is orphaned).
 pub(super) fn is_lease_free(path: &Path) -> bool {
-    matches!(try_exclusive(path), Ok(Some(_)))
+    matches!(try_exclusive_settled(path), Ok(Some(_)))
 }
 
 /// Run `f` while holding the repo mutation lock, so concurrent processes

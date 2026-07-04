@@ -888,11 +888,19 @@ fn spawn_foreign_holder(lock_path: &Path) -> std::process::Child {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
+    // `-w 5` (block up to 5s) rather than `-n`: the whole test binary shares one
+    // fd table, so a concurrent test's `Command::spawn` can dup this lock's fd
+    // across the fork->exec window and briefly pin it. A non-blocking `flock -n`
+    // would then lose the race and exit without ever holding the lock, leaving a
+    // dead "holder" and a spuriously lease-free record. Blocking past the
+    // transient pin (which clears when the unrelated child execs) makes the
+    // holder reliably acquire; the 5s cap keeps a genuinely stuck lock bounded.
     let child = Command::new("flock")
         .args([
             "--no-fork",
             "-x",
-            "-n",
+            "-w",
+            "5",
             lock_path.to_str().unwrap(),
             "sleep",
             "1000",
@@ -1160,16 +1168,25 @@ fn adopt_serializes_on_mutation_lock() {
     // A foreign process holds the repo mutation lock.
     let mut holder = spawn_foreign_holder(&lock::mutation_lock_path(&git_dir));
 
-    // Release the lock ~400ms from now, on another thread.
-    let hold = Duration::from_millis(400);
+    let guard = GitSafety::new(&repo.path);
+    // Anchor the release to the SAME `start` the wait assertion reads. The killer
+    // previously slept a fixed 400ms from its own scheduling: under a loaded
+    // parallel runner it could begin (and finish) that countdown before this
+    // thread reached `adopt_task`, so `waited` (measured from `start`) fell below
+    // the threshold even though adopt did block on the lock. Pinning the release
+    // to `start + hold` makes `waited` independent of scheduling skew -- adopt
+    // cannot return until the mutation lock frees at `release_at`.
+    let start = Instant::now();
+    let release_at = start + Duration::from_millis(400);
     let killer = std::thread::spawn(move || {
-        std::thread::sleep(hold);
+        let now = Instant::now();
+        if release_at > now {
+            std::thread::sleep(release_at - now);
+        }
         let _ = holder.kill();
         let _ = holder.wait();
     });
 
-    let guard = GitSafety::new(&repo.path);
-    let start = Instant::now();
     let adopted = guard.adopt_task(&task_id);
     let waited = start.elapsed();
 
@@ -1184,6 +1201,61 @@ fn adopt_serializes_on_mutation_lock() {
         "adopt blocked on the mutation lock until the foreign holder released it \
          (waited {waited:?}); settle and adopt cannot interleave"
     );
+}
+
+// Regression (#349): the settled lease probe rides out a transient hold but
+// still skips a lease held throughout. Recovery classifies an orphan by a
+// non-blocking `flock` probe, and `flock` is inherited across `fork()`, so an
+// unrelated child that dups a lease fd pins it until it `exec`s -- which under
+// the parallel test runner intermittently made a lease-free orphan read as a
+// live foreign task. `try_exclusive_settled` re-probes across a short window to
+// tell that transient pin (clears at `exec`) from a genuine live owner (held
+// continuously). Both directions are asserted so the fix never adopts a task
+// another process still owns.
+#[test]
+fn settled_lease_probe_rides_out_transient_hold_but_skips_live() {
+    if !have_flock() {
+        eprintln!("skipping settled_lease_probe_...: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    // Transient hold: a foreign holder releases well within the settle window,
+    // so the settled claim acquires once the lock frees.
+    let transient = lock::lease_path(&git_dir, "transientlease");
+    let mut holder = spawn_foreign_holder(&transient);
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        let _ = holder.kill();
+        let _ = holder.wait();
+    });
+    let acquired = lock::try_exclusive_settled(&transient).unwrap();
+    killer.join().unwrap();
+    assert!(
+        acquired.is_some(),
+        "the settled probe rides out a hold that clears within the window"
+    );
+    drop(acquired);
+
+    // Live hold: a foreign holder keeps the lease past the settle window, so the
+    // settled claim re-probes then still reports contention -- a live foreign
+    // task is never adopted.
+    let live = lock::lease_path(&git_dir, "livelease");
+    let mut holder = spawn_foreign_holder(&live);
+    let start = Instant::now();
+    let claim = lock::try_exclusive_settled(&live).unwrap();
+    let waited = start.elapsed();
+    assert!(
+        claim.is_none(),
+        "a lease held throughout the settle window is still skipped"
+    );
+    assert!(
+        waited >= Duration::from_millis(100),
+        "the claim re-probed across the settle window before bailing (waited {waited:?})"
+    );
+    holder.kill().unwrap();
+    holder.wait().unwrap();
 }
 
 // Test 5 (#285): the recovery notice names the record actually adopted, not
