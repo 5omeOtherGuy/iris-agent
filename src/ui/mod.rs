@@ -85,6 +85,10 @@ pub(crate) mod terminal_doctor;
 pub(crate) mod terminal_env;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
+// Draft (ADR-0041): trait + palettes + registry land first; call sites still
+// read `palette::` constants until the migration task wires `theme::active()`.
+#[allow(dead_code)]
+pub(crate) mod theme;
 pub(crate) mod zwj_probe;
 
 /// True when `lines[i]` begins a unified-diff file header: a `--- ` line
