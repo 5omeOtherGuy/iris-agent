@@ -1327,7 +1327,24 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     }
     let width = size.width.max(1);
     let height = size.height.max(1);
-    let transcript = if incremental {
+    // The session bar (bar + soft hairline) is reserved ahead of the
+    // transcript, so its stability must be decided BEFORE choosing the
+    // transcript render mode: when the bar changed (context meter movement,
+    // branch switch), `stable_prefix` resets to 0 and the surface will not
+    // replay any reused rows -- an incremental transcript suffix would then
+    // silently drop the unchanged transcript prefix from the frame. A bar-only
+    // change therefore forces a full transcript render (same cache, so the
+    // next frame's incremental baseline stays correct).
+    let bar = session_bar_lines(screen, width, height);
+    let bar_rows = bar.len();
+    let bar_stable = screen
+        .last_session_bar
+        .as_ref()
+        .is_some_and(|(prev_width, prev)| *prev_width == width && *prev == bar);
+    if !bar_stable {
+        screen.last_session_bar = Some((width, bar.clone()));
+    }
+    let transcript = if incremental && bar_stable {
         screen.wrapped_lines_incremental(width)
     } else {
         screen.wrapped_lines(width)
@@ -1343,34 +1360,28 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
         block
     };
     let chrome = render_editor_chrome(screen, width, height);
-    // The session bar (bar + soft hairline) is reserved ahead of the
-    // transcript: it occupies the top pane rows and the transcript flows
-    // beneath it. The stable-prefix hint covers the bar only while the bar
-    // itself is unchanged at this width; a bar change (context meter movement,
-    // branch switch) resets the hint so the diff never reuses a stale bar row.
-    let bar = session_bar_lines(screen, width, height);
-    let bar_rows = bar.len();
-    let bar_stable = screen
-        .last_session_bar
-        .as_ref()
-        .is_some_and(|(prev_width, prev)| *prev_width == width && *prev == bar);
-    if !bar_stable {
-        screen.last_session_bar = Some((width, bar.clone()));
-    }
-    // Full-pane takeover: while the transcript is shorter than the pane, blank
-    // filler rows sit BETWEEN the transcript and the bottom-pinned tail, so the
-    // conversation reads top-down from the first pane row while the working
-    // indicator and composer always occupy the bottom rows (Claude Code-style).
-    // The filler lives in the volatile tail: it shrinks as the transcript
-    // grows, the document holds exactly the viewport height until content
-    // overflows, and no blank row ever scrolls into native scrollback. On the
-    // start page the filler carries the centered IrisMark + launcher instead of
-    // blanks.
+    // Inline (ADR-0006) is a scrollback-append surface: the transcript flows
+    // into the terminal's own scrollback and only a COMPACT volatile tail
+    // (bar + working indicator + composer) is repainted. The document is
+    // therefore content-height, not viewport-height -- there is no blank body
+    // padding the transcript out to the bottom of the pane, and no pager-shaped
+    // full-height frame is ever appended into native scrollback (issue #353;
+    // ADR-0029 keeps inline as the honest fallback).
+    //
+    // The one exception is the start page: with an empty transcript the
+    // launcher is centered in the pane, so its filler DOES span the viewport
+    // (the IrisMark + menu block, vertically centered). This is pre-session
+    // chrome only; entering a session (`start_turn`, `leave_start_page`,
+    // resume adoption) clears `start_page`, collapsing the tail to compact.
     let tail_rows = chrome.len() + working_block.len();
-    let filler_rows = usize::from(height)
-        .saturating_sub(tail_rows)
-        .saturating_sub(transcript.total_lines)
-        .saturating_sub(bar_rows);
+    let filler_rows = if screen.start_page.is_some() {
+        usize::from(height)
+            .saturating_sub(tail_rows)
+            .saturating_sub(transcript.total_lines)
+            .saturating_sub(bar_rows)
+    } else {
+        0
+    };
     let volatile_tail = tail_rows + filler_rows;
     // The transcript is the scrolling base, moved into the document and never
     // cloned. The bottom-pinned tail -- viewport filler, working indicator,
@@ -1394,7 +1405,17 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     } else {
         0
     };
-    let mut document = bar;
+    // Reused leading rows are EXCLUDED from the emitted document and replayed
+    // from the previous frame via `stable_prefix` -- exactly how the transcript
+    // omits its own stable prefix (`transcript.lines` is already the changed
+    // suffix). The session bar is the other stable leading block: when it is
+    // unchanged AND the incremental surface will honor the hint, emitting the
+    // bar here too would append it a SECOND time on top of the reused copy,
+    // duplicating the bar in the surface document and scrolling a stale bar into
+    // native scrollback (issue #353). The non-incremental render keeps the full
+    // bar because that path does not honor `stable_prefix`.
+    let reuse_bar = incremental && bar_stable;
+    let mut document = if reuse_bar { Vec::new() } else { bar };
     document.extend(transcript.lines);
     tail.render_into(usize::from(width), &mut document);
     // Locate-and-strip any focus cursor marker before the document reaches the

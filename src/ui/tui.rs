@@ -2074,7 +2074,10 @@ mod tests {
     }
 
     #[test]
-    fn short_session_composer_chrome_pins_to_viewport_bottom() {
+    fn short_session_composer_chrome_is_compact_after_transcript() {
+        // Inline (ADR-0006) is scrollback-append with a COMPACT tail: a short
+        // session renders a content-height document (transcript then composer
+        // chrome), NOT a viewport-height frame with a blank body (issue #353).
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextEnd("Short answer.".to_string()));
 
@@ -2086,7 +2089,11 @@ mod tests {
             .position(|line| line.contains("Give Iris a task..."))
             .expect("composer input");
 
-        assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+        // Content-height, not padded to the viewport.
+        assert!(
+            lines.len() < usize::from(height),
+            "inline document must be compact, not viewport-height: {texts:?}"
+        );
         // Below the input: the internal-rule and statusline rows (blank before
         // a footer exists) and the one intentional soft bottom row.
         assert_eq!(
@@ -2098,10 +2105,10 @@ mod tests {
     }
 
     #[test]
-    fn short_transcript_is_top_anchored_with_filler_above_bottom_chrome() {
-        // Full-pane takeover: the conversation reads top-down from the first
-        // pane row, blank filler sits between the transcript and the composer,
-        // and the composer occupies the bottom rows of the pane.
+    fn short_transcript_is_top_anchored_with_compact_tail_no_filler() {
+        // The conversation reads top-down from the first pane row and the
+        // composer chrome follows immediately -- no blank filler body padding
+        // the transcript out to the bottom of the pane (issue #353).
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextEnd("Short answer.".to_string()));
 
@@ -2109,7 +2116,10 @@ mod tests {
         let lines = rendered_lines(&mut screen, 100, height);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
 
-        assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+        assert!(
+            lines.len() < usize::from(height),
+            "compact document must be shorter than the viewport: {texts:?}"
+        );
         assert!(
             texts[0].contains("Short answer."),
             "transcript must start on the first pane row: {texts:?}"
@@ -2118,19 +2128,21 @@ mod tests {
             .iter()
             .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
             .expect("composer hairline");
-        // Everything between the transcript and the composer hairline is blank
-        // filler (the transcript block ends with its own single blank row).
+        // The transcript block ends with its own single blank row; the composer
+        // hairline follows right after it -- no run of filler blanks.
         assert!(
-            texts[1..hairline].iter().all(|line| line.trim().is_empty()),
-            "filler between transcript and composer must be blank: {texts:?}"
+            hairline <= 2,
+            "composer chrome must sit right after the transcript, no filler body: {texts:?}"
         );
-        assert!(hairline > 2, "filler rows expected on a short session");
     }
 
     #[test]
-    fn empty_launch_document_fills_viewport_with_composer_at_bottom() {
-        // At launch (empty transcript) the rendered document already spans the
-        // whole pane: filler on top, composer chrome pinned to the bottom rows.
+    fn empty_launch_document_is_compact_not_full_viewport() {
+        // At launch (empty transcript, no start page) the inline document is the
+        // compact composer chrome only -- it does NOT span the whole pane with a
+        // blank filler body (issue #353). The centered launcher full-pane layout
+        // is reserved for the start page (see
+        // `start_page_shows_centered_launcher_inside_the_shared_chrome`).
         let mut screen = Screen::new();
         screen.apply(UiEvent::SessionStarted);
 
@@ -2138,7 +2150,10 @@ mod tests {
         let lines = rendered_lines(&mut screen, 80, height);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
 
-        assert_eq!(lines.len(), usize::from(height), "{texts:?}");
+        assert!(
+            lines.len() < usize::from(height),
+            "launch document must be compact, not viewport-height: {texts:?}"
+        );
         let input_idx = texts
             .iter()
             .position(|line| line.contains("Give Iris a task..."))
@@ -2148,10 +2163,150 @@ mod tests {
             .iter()
             .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
             .expect("composer hairline");
-        assert!(
-            texts[..hairline].iter().all(|line| line.trim().is_empty()),
-            "launch filler above the composer must be blank: {texts:?}"
+        // The composer hairline is the first row (no filler above it).
+        assert_eq!(
+            hairline, 0,
+            "no filler body above the launch composer: {texts:?}"
         );
+    }
+
+    #[test]
+    fn inline_after_session_start_renders_one_bar_no_menu_no_blank_body() {
+        // Regression for issue #353. Drive the incremental terminal surface from
+        // cold exactly like production (TuiUi owns one surface for the whole
+        // session): start page -> dismiss -> `/session`-style notices. The
+        // reconstructed surface document must be compact -- exactly one session
+        // bar, no leftover launcher menu, and no full-height blank body between
+        // the transcript and the composer -- and no second bar may be duplicated
+        // into the surface (the prefix-doubling that scrolled a stale bar into
+        // native scrollback).
+        let size = Size::new(80, 40);
+        let mut screen = Screen::new();
+        let mut surface = TerminalSurface::new(Vec::new());
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            "~/repo".to_string(),
+        );
+        screen.apply(UiEvent::SessionStarted);
+        screen.show_start_page();
+        render_perf_cycle(&mut screen, &mut surface, size).expect("start-page frame");
+        // New session selected / first prompt submitted -> start page dismissed.
+        screen.leave_start_page();
+        render_perf_cycle(&mut screen, &mut surface, size).expect("dismiss frame");
+        for i in 0..3 {
+            screen.apply(UiEvent::Notice(format!("session notice {i}")));
+            render_perf_cycle(&mut screen, &mut surface, size).expect("notice frame");
+        }
+
+        // The surface document is the reconstructed full frame (reused stable
+        // prefix + rendered suffix): this is what actually reaches the terminal.
+        let texts: Vec<String> = surface
+            .state()
+            .previous_lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect();
+
+        // No launcher menu rows survive session start.
+        for label in ["New session", "Resume session", "Settings", "Quit"] {
+            assert!(
+                !texts.iter().any(|line| line.contains(label)),
+                "start-page menu leaked after session start ({label}): {texts:?}"
+            );
+        }
+        // Exactly one session-bar row (cwd + context meter) -- no duplicate.
+        let bar_rows = texts
+            .iter()
+            .filter(|line| line.contains("~/repo") && line.contains("CTX"))
+            .count();
+        assert_eq!(bar_rows, 1, "exactly one session bar: {texts:?}");
+        // Compact: shorter than the viewport, not padded to full height.
+        assert!(
+            texts.len() < usize::from(size.height),
+            "inline document must be compact after session start: {texts:?}"
+        );
+        // No run of more than two consecutive blank rows between the transcript
+        // and the composer input (i.e. no full-height blank filler body).
+        let input_idx = texts
+            .iter()
+            .position(|line| line.contains("Give Iris a task..."))
+            .expect("composer input");
+        let mut consecutive_blank = 0;
+        let mut max_blank = 0;
+        for line in &texts[..input_idx] {
+            if line.trim().is_empty() {
+                consecutive_blank += 1;
+                max_blank = max_blank.max(consecutive_blank);
+            } else {
+                consecutive_blank = 0;
+            }
+        }
+        assert!(
+            max_blank <= 2,
+            "no full-height blank body between transcript and composer: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn bar_only_change_keeps_retained_transcript_rows() {
+        // Regression for the review finding on issue #353: when ONLY the
+        // session bar changes (context meter tick, branch switch) between
+        // incremental renders, `stable_prefix` resets to 0 and the surface
+        // replays nothing -- so the document must carry the FULL transcript
+        // again, not just the incremental suffix, or retained rows silently
+        // vanish from the frame.
+        let size = Size::new(80, 40);
+        let mut screen = Screen::new();
+        let mut surface = TerminalSurface::new(Vec::new());
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            "~/repo".to_string(),
+        );
+        screen.apply(UiEvent::SessionStarted);
+        for i in 0..4 {
+            screen.apply(UiEvent::Notice(format!("retained notice {i}")));
+            render_perf_cycle(&mut screen, &mut surface, size).expect("notice frame");
+        }
+        // Bar-only change: the context meter moves, no transcript change.
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 90_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 90_000,
+                cache_creation: None,
+            }),
+        });
+        render_perf_cycle(&mut screen, &mut surface, size).expect("bar-change frame");
+
+        let texts: Vec<String> = surface
+            .state()
+            .previous_lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect();
+        // Every retained transcript row is still in the reconstructed frame.
+        for i in 0..4 {
+            let needle = format!("retained notice {i}");
+            assert!(
+                texts.iter().any(|line| line.contains(&needle)),
+                "transcript row dropped on bar-only change ({needle}): {texts:?}"
+            );
+        }
+        // Still exactly one (updated) session bar.
+        let bar_rows = texts
+            .iter()
+            .filter(|line| line.contains("~/repo") && line.contains("CTX"))
+            .count();
+        assert_eq!(bar_rows, 1, "exactly one session bar: {texts:?}");
     }
 
     #[test]
@@ -2236,15 +2391,20 @@ mod tests {
     }
 
     #[test]
-    fn transcript_growth_keeps_composer_pinned_without_scrolling_filler() -> std::io::Result<()> {
-        // While the padded document fits the pane, transcript growth shrinks
-        // the filler in place: the document stays exactly viewport-height and
-        // no blank filler row is ever pushed into native scrollback.
+    fn transcript_growth_keeps_a_compact_content_height_document() -> std::io::Result<()> {
+        // Inline is scrollback-append (ADR-0006): the document is content-height
+        // and GROWS as the transcript grows -- it is never padded out to the
+        // viewport with a blank filler body (issue #353). An empty launch is
+        // just the compact composer chrome, well short of the viewport.
         let size = Size::new(60, 16);
         let mut screen = Screen::new();
         let mut surface = TerminalSurface::new(Vec::new());
         render_perf_cycle(&mut screen, &mut surface, size)?;
-        assert_eq!(surface.state().previous_lines.len(), 16);
+        let empty_len = surface.state().previous_lines.len();
+        assert!(
+            empty_len < 16,
+            "empty launch must be compact, not viewport-height: {empty_len}"
+        );
 
         for i in 0..2 {
             screen.commit_user(&format!("prompt {i}"));
@@ -2252,17 +2412,34 @@ mod tests {
             render_perf_cycle(&mut screen, &mut surface, size)?;
         }
 
-        assert_eq!(
-            surface.state().previous_lines.len(),
-            16,
-            "padded document must hold the viewport height while content fits"
-        );
         assert!(
-            !surface.state().scrolled,
-            "filler shrinkage must not scroll rows into native scrollback"
+            surface.state().previous_lines.len() > empty_len,
+            "the compact document must grow with the transcript"
         );
+        // No blank filler body between the transcript and the composer: the
+        // composer hairline follows the transcript with at most the single
+        // blank row each transcript block ends with (no viewport padding run).
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
-        let first = replay.lines().next().unwrap_or_default();
+        let rows: Vec<&str> = replay.lines().collect();
+        let hairline = rows
+            .iter()
+            .position(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
+            .expect("composer hairline");
+        let mut consecutive_blank = 0;
+        let mut max_blank = 0;
+        for line in &rows[..hairline] {
+            if line.trim().is_empty() {
+                consecutive_blank += 1;
+                max_blank = max_blank.max(consecutive_blank);
+            } else {
+                consecutive_blank = 0;
+            }
+        }
+        assert!(
+            max_blank <= 2,
+            "no full-height blank filler body between transcript and composer: {replay:?}"
+        );
+        let first = rows.first().copied().unwrap_or_default();
         assert!(
             first.contains("prompt 0"),
             "transcript must stay anchored to the first pane row: {replay:?}"
