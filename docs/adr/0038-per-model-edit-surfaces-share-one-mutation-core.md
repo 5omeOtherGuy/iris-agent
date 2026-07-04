@@ -73,10 +73,15 @@ core.
   exists; its capability case is independent of familiarity.
 - **`apply_patch` build strategy.** Port the codex-apply-patch core (V4A
   grammar parser, fuzzy context seek, apply + unified-diff reporting, inline
-  tests) with Apache-2.0 attribution. Batch parsing only at first; the
-  streaming parser and shell-heredoc invocation detection are out of scope
-  until a need is demonstrated. On the wire it is a freeform/custom tool on
-  the Responses API, mapped by the Mimir adapter.
+  tests) with Apache-2.0 attribution. The port includes the streaming parser:
+  the V4A grammar implementation lives in it and the batch API is a thin
+  wrapper — they are one parser. Iris drives it batch-style for execution;
+  the incremental interface feeds the display-only live preview (ADR-0039).
+  Shell-heredoc invocation detection stays out of scope until a need is
+  demonstrated. On the wire it is a freeform/custom tool on the Responses
+  API, mapped by that Mimir adapter only (chat-completions does not carry
+  custom tools); the projection registry keeps it invisible on all other
+  routes.
 
 ## Alternatives Considered
 
