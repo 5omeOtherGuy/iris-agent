@@ -1,4 +1,4 @@
-//! Theme trait — the single indirection point for Iris' color roles (ADR-0041).
+//! Theme trait — the single indirection point for Iris' color roles (ADR-0042).
 //!
 //! Iris is terminal-relative by default: [`TerminalTheme`] returns the ANSI-slot
 //! roles from [`super::palette`], so the UI inherits the user's own light/dark

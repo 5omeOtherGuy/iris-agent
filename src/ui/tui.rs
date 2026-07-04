@@ -120,7 +120,7 @@ const PANEL_FOOTER_INDENT: usize = 2;
 // Color roles live in `crate::ui::palette` (the single source of truth). The
 // themed accessors are imported here so the whole `tui` module tree resolves
 // them as `border()`, `orange()`, … (and its child modules as
-// `super::border()`), reading the active theme at render time (ADR-0041).
+// `super::border()`), reading the active theme at render time (ADR-0042).
 use crate::ui::palette::{border, diff_add_bg, diff_del_bg, green, orange, red};
 
 const X_PADDING: usize = 2;

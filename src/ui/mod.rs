@@ -85,7 +85,7 @@ pub(crate) mod terminal_doctor;
 pub(crate) mod terminal_env;
 pub(crate) mod terminal_surface;
 pub(crate) mod textengine;
-// ADR-0041: theme trait + palettes + registry, consumed by the `palette`
+// ADR-0042: theme trait + palettes + registry, consumed by the `palette`
 // accessors which delegate to `theme::active()`.
 pub(crate) mod theme;
 pub(crate) mod zwj_probe;
