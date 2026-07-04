@@ -32,6 +32,7 @@ mod baseline;
 mod checkpoint;
 mod git;
 mod ledger;
+mod lock;
 mod net_diff;
 mod settlement;
 mod snapshot;
@@ -135,6 +136,12 @@ struct Task {
     git_dir: Option<PathBuf>,
     /// When this task first opened (epoch millis), for the expiry sweep.
     created_ms: u64,
+    /// The per-task advisory `flock` lease, held for the task's lifetime
+    /// (ADR-0030). Kept only to be dropped at settlement -- closing the fd
+    /// releases the lease, so recovery in another process sees the task as
+    /// orphaned. `None` in degraded mode or when the lease could not be
+    /// acquired (a logged, best-effort degrade).
+    _lease: Option<lock::FlockGuard>,
 }
 
 impl Task {
@@ -143,6 +150,7 @@ impl Task {
         baseline: Baseline,
         chain: CheckpointChain,
         git_dir: Option<PathBuf>,
+        lease: Option<lock::FlockGuard>,
     ) -> Self {
         Self {
             degraded: false,
@@ -157,6 +165,7 @@ impl Task {
             chain: Chain::Git(chain),
             git_dir,
             created_ms: task_state::now_ms(),
+            _lease: lease,
         }
     }
 
@@ -179,6 +188,7 @@ impl Task {
             chain: Chain::Fallback(FallbackStore::default()),
             git_dir: None,
             created_ms: task_state::now_ms(),
+            _lease: None,
         }
     }
 }
@@ -316,6 +326,9 @@ impl GitSafety {
                 // committed content as the pre-task image (best-effort) and open
                 // a restore point over the running diff. A file with no committed
                 // predecessor is treated as a create (base rollback deletes it).
+                // As in `after_exec`, these per-task ref writes are single-writer
+                // under the held lease and need no mutation lock; the shared
+                // record write in `persist_task` is the serialized one.
                 if !touched.is_empty()
                     && let Chain::Git(chain) = &mut task.chain
                 {
@@ -365,8 +378,12 @@ impl GitSafety {
             expected,
             tip_seq,
             baseline_index: task.baseline.index.clone(),
+            owner: Some(lock::process_owner()),
+            lock_protocol: Some(lock::LOCK_PROTOCOL.to_string()),
         };
-        if let Err(error) = task_state::save(git_dir, &record) {
+        // Serialize the record write against concurrent processes (ADR-0030).
+        if let Err(error) = lock::with_mutation_lock(git_dir, || task_state::save(git_dir, &record))
+        {
             tracing::warn!(error = %format!("{error:#}"), "failed to persist task recovery record");
         }
     }
@@ -454,8 +471,22 @@ impl MutationGuard for GitSafety {
                         )
                     });
                     let git_dir = task_state::git_dir(&self.workspace);
+                    // Acquire the per-task lease for the task's lifetime: it
+                    // proves this process owns and is live on the task, so
+                    // recovery in another process skips it (ADR-0030). A brand-new
+                    // random id is always lease-free; a lock-file IO error is a
+                    // logged, best-effort degrade (the turn still proceeds).
+                    let lease = git_dir.as_ref().and_then(|dir| {
+                        match lock::try_exclusive(&lock::lease_path(dir, &task_id)) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                tracing::warn!(error = %error, "could not acquire task lease; recovery liveness unprotected this task");
+                                None
+                            }
+                        }
+                    });
                     let chain = CheckpointChain::new(self.workspace.clone(), task_id.clone());
-                    let task = Task::active(task_id, baseline, chain, git_dir);
+                    let task = Task::active(task_id, baseline, chain, git_dir, lease);
                     self.persist_task(&task);
                     state.task = Some(task);
                     summary
@@ -608,6 +639,15 @@ impl MutationGuard for GitSafety {
             // A confirmed set of Iris changes opens a new checkpoint over the
             // running (unsettled) diff: snapshot the current ledger-path content
             // into the chain as one restore point (ADR-0028 auto-checkpoint).
+            //
+            // The `refs/iris/checkpoints/<task-id>/` writes below are NOT wrapped
+            // in the repo mutation lock: this task's refs are single-writer by
+            // construction -- only the process holding this task's advisory lease
+            // writes them, and recovery/expiry/adoption in another process must
+            // first claim that lease (ADR-0030), so no other process can read or
+            // write these refs concurrently. The shared write that DOES race
+            // across processes -- the record file in the shared tasks dir -- is
+            // serialized inside `persist_task`.
             if !iris_changes.is_empty() {
                 let turn = task.turn;
                 let label = checkpoint_label(&iris_changes);

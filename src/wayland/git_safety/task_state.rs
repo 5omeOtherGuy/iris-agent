@@ -52,6 +52,17 @@ pub(super) struct PersistedTask {
     /// staging untouched rather than failing).
     #[serde(default)]
     pub(super) baseline_index: String,
+    /// Opaque id of the process that last wrote this record (ADR-0030). Purely
+    /// informational -- liveness/ownership is proven by the per-task `flock`
+    /// lease, not this field. `#[serde(default)]` so a legacy record (written
+    /// before the lease protocol) deserializes to `None`.
+    #[serde(default)]
+    pub(super) owner: Option<String>,
+    /// The lock protocol this record was written under (e.g. `"flock-v1"`).
+    /// `None` marks a legacy record that predates the lease protocol: recovery
+    /// classifies it as "unknown" and never auto-adopts it (ADR-0030).
+    #[serde(default)]
+    pub(super) lock_protocol: Option<String>,
 }
 
 impl PersistedTask {
@@ -135,9 +146,13 @@ pub(super) fn save(git_dir: &Path, task: &PersistedTask) -> Result<()> {
     Ok(())
 }
 
-/// Delete a task record (settlement teardown). No-op when already gone.
+/// Delete a task record and its lease lock-file (settlement teardown). No-op
+/// when already gone. Removing the lease file prevents `.lock` accumulation; it
+/// is safe because settlement drops the owning `Task` (releasing this process's
+/// lease) before this runs, and task ids never repeat.
 pub(super) fn remove(git_dir: &Path, task_id: &str) {
     let _ = std::fs::remove_file(record_path(git_dir, task_id));
+    let _ = std::fs::remove_file(super::lock::lease_path(git_dir, task_id));
 }
 
 /// Load every persisted (unsettled) task record in the repo. A record exists

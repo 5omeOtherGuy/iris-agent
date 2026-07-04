@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::checkpoint::{CheckpointChain, Mode};
-use super::{GitSafety, task_state};
+use super::settlement::TaskClass;
+use super::{GitSafety, lock, task_state};
 use crate::nexus::MutationGuard;
 
 // --- scratch repo helpers (mirrors tests.rs; kept local for cohesion) ----
@@ -853,4 +854,314 @@ fn net_diff_fails_closed_on_unreadable_checkpoint() {
         guard.task_diff(None).is_err(),
         "a checkpoint read error must propagate, not become an empty diff"
     );
+}
+
+// --- task-ownership lease + mutation lock (issue #285, ADR-0030) -----------
+//
+// Cross-process liveness is a real per-process `flock`, so these tests use real
+// child processes. A foreign live task holder is simulated with the `flock(1)`
+// utility (`--no-fork` so the spawned child *is* the lock-holding process and a
+// SIGKILL of `child.id()` releases the lease). Tests that need `flock` skip with
+// a note when it is absent, so CI never flakes on a missing binary; Linux CI has
+// util-linux `flock`.
+
+use std::time::{Duration, Instant};
+
+/// Whether the util-linux `flock(1)` binary (with `--no-fork`) is available.
+/// Gates the cross-process tests so a machine without it skips rather than fails.
+fn have_flock() -> bool {
+    Command::new("flock")
+        .arg("--help")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("--no-fork"))
+        .unwrap_or(false)
+}
+
+/// Spawn a foreign process that holds an exclusive `flock` on `lock_path` for the
+/// test's lifetime. `--no-fork` makes the returned child the actual lock holder
+/// (it execs `sleep`), so `child.kill()` (SIGKILL) releases the lock by closing
+/// the only fd -- exactly a process crash.
+fn spawn_foreign_holder(lock_path: &Path) -> std::process::Child {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let child = Command::new("flock")
+        .args([
+            "--no-fork",
+            "-x",
+            "-n",
+            lock_path.to_str().unwrap(),
+            "sleep",
+            "1000",
+        ])
+        .spawn()
+        .expect("spawn flock holder");
+    // Wait until the holder has actually acquired the lock before returning, so
+    // the test observes the leased state deterministically.
+    wait_until(Duration::from_secs(5), || !lock::is_lease_free(lock_path));
+    child
+}
+
+/// Poll `cond` until it is true or `timeout` elapses. Returns whether it became
+/// true. Cheap sleep between polls; used to await real cross-process lock state.
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cond()
+}
+
+/// Create one unsettled task record in `repo` (via the real guard path so the
+/// record carries production fields and the lease is released when the guard
+/// drops), writing a fresh file `rel` so it never trips dirty-file approval.
+/// Returns the new task id.
+fn create_unsettled_task(repo: &Path, rel: &str) -> String {
+    let git_dir = task_state::git_dir(repo).unwrap();
+    let before: std::collections::BTreeSet<String> = task_state::load_all(&git_dir)
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    {
+        let guard = GitSafety::new(repo);
+        guard.note_mutation();
+        iris_write(&guard, &repo.join(rel), b"iris content\n");
+    } // guard dropped: its lease fd closes, so the record is now lease-free
+    task_state::load_all(&git_dir)
+        .into_iter()
+        .map(|t| t.task_id)
+        .find(|id| !before.contains(id))
+        .expect("a new unsettled task record")
+}
+
+// Test 1 (#285): two live task records coexist; neither process adopts the
+// other, and `recoverable_tasks()` lists only the lease-free record. The first
+// record's lease is held by a foreign live process (`flock`), so it is a live
+// foreign task that must be skipped.
+#[test]
+fn recoverable_tasks_skips_live_foreign_lease() {
+    if !have_flock() {
+        eprintln!("skipping recoverable_tasks_skips_live_foreign_lease: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    let foreign = create_unsettled_task(&repo.path, "foreign.txt");
+    let mine = create_unsettled_task(&repo.path, "mine.txt");
+
+    // A foreign live process holds the first task's lease.
+    let mut holder = spawn_foreign_holder(&lock::lease_path(&git_dir, &foreign));
+
+    let guard = GitSafety::new(&repo.path);
+    let recoverable = guard.recoverable_tasks();
+
+    // Only the lease-free record is recoverable; the live foreign one is skipped.
+    let ids: Vec<&str> = recoverable.iter().map(|t| t.task_id.as_str()).collect();
+    assert!(
+        ids.contains(&mine.as_str()),
+        "the lease-free record is recoverable: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&foreign.as_str()),
+        "the live foreign (leased) record is never listed: {ids:?}"
+    );
+    // The recoverable record carries its workspace + a small age (fields the #288
+    // picker consumes).
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let rec = recoverable.iter().find(|t| t.task_id == mine).unwrap();
+    assert_eq!(rec.workspace, ws);
+    assert!(rec.age < Duration::from_secs(3600));
+    assert_eq!(rec.class, TaskClass::Recoverable);
+
+    // Adopting the foreign live task is refused (its lease is held).
+    assert!(
+        guard.adopt_task(&foreign).is_none(),
+        "a live foreign task is never adopted"
+    );
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
+// Test 2 (#285): a SIGKILL'd process releases its lease by construction, so its
+// task becomes recoverable and adoptable on the next startup.
+#[test]
+fn sigkilled_lease_becomes_recoverable() {
+    if !have_flock() {
+        eprintln!("skipping sigkilled_lease_becomes_recoverable: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let task_id = create_unsettled_task(&repo.path, "work.txt");
+    let lease = lock::lease_path(&git_dir, &task_id);
+
+    // A live process holds the lease: the task is skipped by recovery.
+    let mut holder = spawn_foreign_holder(&lease);
+    let guard = GitSafety::new(&repo.path);
+    assert!(
+        !guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id),
+        "while leased, the task is a live foreign task (skipped)"
+    );
+
+    // SIGKILL the holder: the OS closes its fd, releasing the lease.
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || lock::is_lease_free(&lease)),
+        "the crashed process's lease is released"
+    );
+
+    // Now the orphan is recoverable and adoptable.
+    assert!(
+        guard
+            .recoverable_tasks()
+            .iter()
+            .any(|t| t.task_id == task_id),
+        "after the crash the task becomes recoverable"
+    );
+    let adopted = guard.adopt_task(&task_id).expect("the orphan is adoptable");
+    assert_eq!(adopted.task_id, task_id);
+    assert!(
+        guard.has_task(),
+        "the adopted task is now this process's active task"
+    );
+}
+
+// Test 3 (#285): a legacy record without lock metadata deserializes (serde
+// defaults), is surfaced as unknown, and is never auto-adopted.
+#[test]
+fn legacy_record_is_unknown_and_never_auto_adopted() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let ws = repo
+        .path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = git_dir.join("iris").join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+
+    // A record in the pre-ADR-0030 shape: no `owner`/`lock_protocol` fields.
+    let task_id = "legacyabc123";
+    let now_ms = task_state::now_ms();
+    let legacy_json = format!(
+        r#"{{"task_id":"{task_id}","workspace":"{ws}","created_ms":{now_ms},"updated_ms":{now_ms},"expected":{{}},"tip_seq":0}}"#
+    );
+    fs::write(tasks_dir.join(format!("{task_id}.json")), legacy_json).unwrap();
+
+    // It deserializes and classifies as legacy/unknown.
+    let guard = GitSafety::new(&repo.path);
+    let recoverable = guard.recoverable_tasks();
+    let rec = recoverable
+        .iter()
+        .find(|t| t.task_id == task_id)
+        .expect("the legacy record deserializes and is surfaced");
+    assert_eq!(rec.class, TaskClass::Legacy, "no lock metadata => unknown");
+
+    // Recovery never auto-adopts it: the notice lists it, no task becomes active.
+    let notice = guard.recover_and_expire().expect("a notice surfaces");
+    assert!(
+        notice.contains(task_id) && notice.contains("unknown"),
+        "the notice lists the unknown-legacy task id: {notice}"
+    );
+    assert!(
+        !guard.has_task(),
+        "a legacy record is never auto-adopted as the active task"
+    );
+}
+
+// Test 4 (#285): settle vs adopt are serialized by the repo mutation lock. A
+// foreign process holds the mutation lock, so an `adopt_task` that must write
+// (append a recovery checkpoint) blocks until the lock is released -- proving no
+// torn interleave between a concurrent settle and adopt.
+#[test]
+fn adopt_serializes_on_mutation_lock() {
+    if !have_flock() {
+        eprintln!("skipping adopt_serializes_on_mutation_lock: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let file = repo.path.join("work.txt");
+    let task_id = create_unsettled_task(&repo.path, "work.txt");
+
+    // Diverge the disk so adopt must append a recovery checkpoint -- the write
+    // path that takes the mutation lock.
+    fs::write(&file, b"diverged on disk\n").unwrap();
+
+    // A foreign process holds the repo mutation lock.
+    let mut holder = spawn_foreign_holder(&lock::mutation_lock_path(&git_dir));
+
+    // Release the lock ~400ms from now, on another thread.
+    let hold = Duration::from_millis(400);
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        let _ = holder.kill();
+        let _ = holder.wait();
+    });
+
+    let guard = GitSafety::new(&repo.path);
+    let start = Instant::now();
+    let adopted = guard.adopt_task(&task_id);
+    let waited = start.elapsed();
+
+    killer.join().unwrap();
+
+    assert!(
+        adopted.is_some(),
+        "adopt still succeeds once the lock is free"
+    );
+    assert!(
+        waited >= Duration::from_millis(250),
+        "adopt blocked on the mutation lock until the foreign holder released it \
+         (waited {waited:?}); settle and adopt cannot interleave"
+    );
+}
+
+// Test 5 (#285): the recovery notice names the record actually adopted, not
+// some other scanned record. With one lease-free orphan plus one live foreign
+// (leased) task, recovery adopts the orphan and the notice names IT.
+#[test]
+fn recovery_notice_names_the_adopted_record() {
+    if !have_flock() {
+        eprintln!("skipping recovery_notice_names_the_adopted_record: flock(1) unavailable");
+        return;
+    }
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    let foreign = create_unsettled_task(&repo.path, "foreign.txt");
+    let orphan = create_unsettled_task(&repo.path, "orphan.txt");
+
+    // The foreign task is held live; only the orphan is adoptable.
+    let mut holder = spawn_foreign_holder(&lock::lease_path(&git_dir, &foreign));
+
+    let guard = GitSafety::new(&repo.path);
+    let notice = guard.recover_and_expire().expect("the orphan is recovered");
+
+    assert!(
+        notice.contains(&orphan),
+        "the notice names the adopted (orphan) record: {notice}"
+    );
+    assert!(
+        !notice.contains(&foreign),
+        "the notice never names the live foreign record: {notice}"
+    );
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
 }
