@@ -12,6 +12,8 @@
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::ui::terminal_env::TerminalEnv;
+
 /// Configured alt-screen policy (`tui.altScreen` in settings.json).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AltScreenConfig {
@@ -70,10 +72,11 @@ impl Resolution {
     }
 }
 
-/// Snapshot of the terminal environment the policy consults. Kept as plain
-/// data so [`resolve`] stays pure and table-testable.
+/// Inputs the pure mode resolver consults. Kept as plain data so [`resolve`]
+/// stays table-testable; the multiplexer/dumb-terminal facts come from the
+/// shared [`TerminalEnv`] detector, `stdout_tty` is local to the render path.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TerminalEnv {
+pub(crate) struct ScreenEnv {
     pub(crate) stdout_tty: bool,
     pub(crate) term_dumb: bool,
     pub(crate) tmux_control_mode: bool,
@@ -81,11 +84,7 @@ pub(crate) struct TerminalEnv {
 }
 
 /// Pure mode resolution. `no_alt_screen` carries the CLI flag / env opt-out.
-pub(crate) fn resolve(
-    config: AltScreenConfig,
-    no_alt_screen: bool,
-    env: &TerminalEnv,
-) -> Resolution {
+pub(crate) fn resolve(config: AltScreenConfig, no_alt_screen: bool, env: &ScreenEnv) -> Resolution {
     if no_alt_screen || config == AltScreenConfig::Never {
         return Resolution::inline();
     }
@@ -170,29 +169,15 @@ pub(crate) fn resolve_for_startup(alt_screen_setting: Option<&str>) -> Resolutio
     resolution
 }
 
-fn detect_environment() -> TerminalEnv {
-    let tmux = std::env::var_os("TMUX").is_some();
-    TerminalEnv {
+fn detect_environment() -> ScreenEnv {
+    // One shared snapshot (env read once, one timeout-guarded control-mode
+    // probe); `stdout_tty` stays local to the render path.
+    let shared = TerminalEnv::detect();
+    ScreenEnv {
         stdout_tty: std::io::stdout().is_terminal(),
-        term_dumb: std::env::var("TERM").is_ok_and(|term| term == "dumb"),
-        tmux_control_mode: tmux && tmux_control_mode_probe(),
-        zellij: std::env::var_os("ZELLIJ").is_some(),
-    }
-}
-
-/// Best-effort tmux control-mode probe. Only called when `$TMUX` is set, so
-/// the `tmux` binary exists in any healthy environment. A failed or
-/// unparsable probe reports control mode (-> inline): detection must fail
-/// toward the inline fallback, never toward a broken alt screen.
-fn tmux_control_mode_probe() -> bool {
-    match std::process::Command::new("tmux")
-        .args(["display-message", "-p", "#{client_control_mode}"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim() != "0"
-        }
-        _ => true,
+        term_dumb: shared.term_is_dumb(),
+        tmux_control_mode: shared.tmux_control_mode_for_screen(),
+        zellij: shared.zellij,
     }
 }
 
@@ -200,8 +185,8 @@ fn tmux_control_mode_probe() -> bool {
 mod tests {
     use super::*;
 
-    fn plain_tty() -> TerminalEnv {
-        TerminalEnv {
+    fn plain_tty() -> ScreenEnv {
+        ScreenEnv {
             stdout_tty: true,
             term_dumb: false,
             tmux_control_mode: false,
@@ -228,24 +213,24 @@ mod tests {
     fn resolution_table_covers_flag_config_and_environment() {
         use AltScreenConfig::*;
         use ScreenMode::*;
-        let control = TerminalEnv {
+        let control = ScreenEnv {
             tmux_control_mode: true,
             ..plain_tty()
         };
-        let zellij = TerminalEnv {
+        let zellij = ScreenEnv {
             zellij: true,
             ..plain_tty()
         };
-        let dumb = TerminalEnv {
+        let dumb = ScreenEnv {
             term_dumb: true,
             ..plain_tty()
         };
-        let no_tty = TerminalEnv {
+        let no_tty = ScreenEnv {
             stdout_tty: false,
             ..plain_tty()
         };
         // (config, no_alt_screen, env, expected mode, expects notice)
-        let table: &[(AltScreenConfig, bool, &TerminalEnv, ScreenMode, bool)] = &[
+        let table: &[(AltScreenConfig, bool, &ScreenEnv, ScreenMode, bool)] = &[
             // The opt-out flag wins over everything, silently.
             (Always, true, &plain_tty(), Inline, false),
             (Auto, true, &plain_tty(), Inline, false),
