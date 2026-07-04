@@ -125,6 +125,30 @@ mod tests {
     use crate::tools::test_support::{root_of, temp_dir};
 
     #[test]
+    fn write_success_payload_has_no_file_content() {
+        // Model-facing success is O(one line): a byte count + path, never the
+        // written body (ADR-0036 success is cheap).
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let out = execute(
+            &root,
+            &json!({ "path": "s.txt", "content": "secret-file-body-xyz" }),
+            &mut ObservedFiles::new(),
+        )
+        .unwrap();
+        assert!(
+            out.content.starts_with("Successfully wrote"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("secret-file-body-xyz"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
     fn write_creates_parent_dirs_and_read_roundtrips() {
         let dir = temp_dir();
         let root = root_of(&dir);
