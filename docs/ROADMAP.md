@@ -840,6 +840,20 @@ Potential scope:
   declines to raw. Superseded interim TOML filters retired. Corpus-asserted
   bars: cargo test pass >= 85%, git log >= 60%, git status >= 40%, git diff
   lockfile churn >= 30%, npm/vitest pass >= 60%.]
+- Opt-in `read` skim mode
+  ([#337](https://github.com/5omeOtherGuy/iris-agent/issues/337)). [Shipped
+  (PR [#359](https://github.com/5omeOtherGuy/iris-agent/pull/359)): `skim:
+  true` strips comments, docstrings, and blank lines per detected language
+  (`src/tools/skim.rs`, extension-keyed rules table) for exploration reads;
+  kept lines render with their original line numbers so offsets and follow-up
+  full reads stay coherent. Never the default; data formats and unknown
+  extensions pass through byte-identical; never-worse and emptied-non-empty
+  guards fall back to the full rendering. A skim read records no file
+  observation, so `edit`/`write` still require a full read first (ADR-0007).
+  Benchmarked on a committed corpus
+  (`docs/benchmarks/issue-337-read-skim-tokens.md`): 52-72% token reduction
+  on comment-heavy Rust/TypeScript/Python (>= 50% bars test-asserted), <10 ms
+  overhead, every kept line and signature verbatim.]
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
 prompt tokens without reducing task success on at least one realistic workflow
