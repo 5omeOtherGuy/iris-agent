@@ -346,7 +346,43 @@ fn continuation_remainder<'a>(text: &'a str, first: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{continuation_remainder, display_width, wrap_to_width};
+    use super::{
+        continuation_remainder, display_width, line_text, push_wrapped_line, wrap_to_width,
+    };
+    use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
+
+    #[test]
+    fn highlighted_wide_glyph_code_wraps_within_display_width() {
+        // A CJK string literal (each glyph 2 columns) inside a highlighted rust
+        // block must wrap by display width, never char count: highlighting runs
+        // before span wrap, so the span-aware wrapper still sees intact clusters
+        // and no physical row exceeds the target width.
+        let md = "```rust\nlet s = \"\u{4e2d}\u{6587}\u{4e2d}\u{6587}\u{4e2d}\u{6587}\";\n```";
+        let theme = MarkdownTheme::default().with_code_highlighting();
+        let lines = render_markdown_themed(md, &theme, 80);
+        let code: Vec<_> = lines
+            .iter()
+            .filter(|l| line_text(l).contains('\u{4e2d}'))
+            .collect();
+        assert_eq!(code.len(), 1, "expected one highlighted code line");
+        // Prove it was actually highlighted (a colored span), not the dim fallback.
+        assert!(
+            code[0].spans.iter().any(|s| s.style.fg.is_some()),
+            "code line was not highlighted"
+        );
+        let width = 10;
+        let mut out = Vec::new();
+        for line in &code {
+            push_wrapped_line(line, width, Some("    "), &mut out);
+        }
+        for row in &out {
+            assert!(
+                display_width(&line_text(row)) <= width,
+                "wrapped highlighted row exceeds width {width}: {:?}",
+                line_text(row)
+            );
+        }
+    }
 
     #[test]
     fn wrap_breaks_long_line_at_spaces_and_hard_breaks_long_words() {

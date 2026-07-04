@@ -43,6 +43,13 @@ ansi-to-tui = "8.0.1"
 # a markdown tokenizer, which is an error-prone parser path the reuse ladder
 # forbids. default-features off drops the unused HTML push/CLI features.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Syntax highlighting for fenced code blocks via the markdown `HighlightFn` seam
+# (ADR-0033, #324). default-features off drops the onig C dependency; we enable
+# `regex-fancy` (pure-Rust fancy-regex) and `default-syntaxes` (the bundled
+# Sublime syntax dump + parsing). We deliberately do NOT enable `default-themes`,
+# `html`, `plist-load`, or `yaml-load`: scopes are mapped to the Iris palette in
+# `src/ui/highlight.rs`, so no stock theme/plist machinery is pulled in.
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 # Multiline editor widget (undo/redo, kill-ring/yank, word-nav) over the same
 # ratatui buffer. default-features off drops its crossterm/termion/termwiz input
 # backends and the regex search feature: Iris drives edits from its own keymap

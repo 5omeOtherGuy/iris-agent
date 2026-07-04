@@ -371,7 +371,7 @@ impl Transcript {
                 dim_style(),
             ))]]
         } else {
-            let theme = MarkdownTheme::thinking();
+            let theme = MarkdownTheme::thinking().with_code_highlighting();
             let width = self.markdown_content_width();
             let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
             let mut current: Vec<Line<'static>> = Vec::new();
