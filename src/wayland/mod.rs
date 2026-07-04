@@ -208,6 +208,18 @@ impl<P: ChatProvider> Harness<P> {
         Ok(notice)
     }
 
+    /// Change the session approval preset (ADR-0032) at the inter-turn
+    /// boundary. Tier 3 owns the `/approval` control and the status label; the
+    /// harness only forwards the mode to the bare agent, which enforces it.
+    pub(crate) fn set_approval_mode(&mut self, mode: crate::nexus::ApprovalMode) {
+        self.agent.set_approval_mode(mode);
+    }
+
+    /// The active approval preset, for rendering the status label.
+    pub(crate) fn approval_mode(&self) -> crate::nexus::ApprovalMode {
+        self.agent.approval_mode()
+    }
+
     /// Swap the active provider at a safe turn boundary, delegating to the bare
     /// agent (which re-plans the model-visible tool surface). Tier 3 owns the
     /// active selection, system prompt, and provider construction; the harness

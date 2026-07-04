@@ -788,6 +788,28 @@ fn run_session_inner<P: ChatProvider>(
             }
             continue;
         }
+        // Approval preset (ADR-0032). A real session control, meaningful in the
+        // non-TTY path too (e.g. `never` for a read-only/non-interactive
+        // posture), handled at this safe boundary and never sent to the model.
+        if prompt == "/approval" || prompt.starts_with("/approval ") {
+            let rest = prompt["/approval".len()..].trim();
+            let line = if rest.is_empty() {
+                format!(
+                    "approval mode: {} (use /approval strict|auto|never)",
+                    harness.approval_mode().as_token()
+                )
+            } else {
+                match crate::nexus::ApprovalMode::parse(rest) {
+                    Some(mode) => {
+                        harness.set_approval_mode(mode);
+                        format!("approval mode set to {}", mode.as_token())
+                    }
+                    None => format!("unknown approval mode `{rest}` (use strict|auto|never)"),
+                }
+            };
+            ui.emit(UiEvent::Notice(line))?;
+            continue;
+        }
         // The final task diff (issue #264): render the net diff on demand at this
         // safe boundary. Emits a colorized/plain diff event, not just notices.
         if prompt.trim() == "/diff" {
