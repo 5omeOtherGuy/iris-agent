@@ -16,8 +16,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use sha2::{Digest, Sha256};
+
+use crate::nexus::ClassifiedError;
 
 type ContentHash = [u8; 32];
 
@@ -57,15 +59,32 @@ impl ObservedFiles {
     pub(crate) fn ensure_fresh(&mut self, path: &Path, current: &[u8]) -> Result<()> {
         let canonical = key(path);
         let current_hash = hash_of(current);
+        // Both rejections are the `stale-file` class: the tool's view of the
+        // file cannot be trusted for a mutation. The `reason` field separates
+        // never-observed from changed-since-observed; the prose is unchanged.
         let observed_mtime = match self.seen.get(&canonical) {
-            None => bail!(
-                "{} has not been read this session; read it before modifying it",
-                path.display()
-            ),
-            Some(observed) if observed.hash != current_hash => bail!(
-                "{} changed since it was last read; read it again before modifying it",
-                path.display()
-            ),
+            None => {
+                return Err(ClassifiedError::new(
+                    "stale-file",
+                    format!(
+                        "{} has not been read this session; read it before modifying it",
+                        path.display()
+                    ),
+                )
+                .with("reason", serde_json::json!("unread"))
+                .into());
+            }
+            Some(observed) if observed.hash != current_hash => {
+                return Err(ClassifiedError::new(
+                    "stale-file",
+                    format!(
+                        "{} changed since it was last read; read it again before modifying it",
+                        path.display()
+                    ),
+                )
+                .with("reason", serde_json::json!("modified"))
+                .into());
+            }
             Some(observed) => observed.mtime,
         };
         // hash matches, so the content is fresh. If only the mtime drifted
