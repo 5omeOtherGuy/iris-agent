@@ -30,11 +30,11 @@ grep = "0.4"
 ignore = "0.4"
 libc = "0.2.186"
 rand = "0.10"
-# Terminal UI primitives. Iris owns the terminal surface lifecycle/diff/replay
-# in `src/ui/terminal_surface.rs`; Ratatui supplies stable text/style/layout
-# primitives and re-exports Crossterm for raw mode, key/resize/paste events, and
-# cursor visibility. Production TUI code does not use Ratatui `Terminal`, an
-# alternate screen, or an inline viewport lifecycle.
+# Terminal UI primitives. Ratatui supplies stable text/style/layout primitives
+# and re-exports Crossterm for raw mode, key/resize/paste events, and cursor
+# visibility. The alt-screen pager mode drives a Ratatui `Terminal` with cell
+# diffing (ADR-0029); the inline fallback surface stays Iris-owned in
+# `src/ui/terminal_surface.rs` (ADR-0006). Adoption boundary: ADR-0033.
 ratatui = "0.30"
 ansi-to-tui = "8.0.1"
 # Markdown parser for assistant text rendering. pulldown-cmark is the canonical

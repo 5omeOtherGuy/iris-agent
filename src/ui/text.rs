@@ -75,7 +75,7 @@ fn truncate_plain(input: &str, max: usize) -> String {
 /// boundaries by display width. Wrapping by columns (not cluster count) keeps
 /// the fixed-width frame aligned for CJK/emoji content while staying
 /// byte-identical for ASCII (one cluster == one column).
-fn wrap_plain(input: &str, width: usize) -> Vec<String> {
+fn hard_wrap_frame_line(input: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     if visible_width(input) <= width {
         return vec![input.to_string()];
@@ -194,7 +194,7 @@ impl<R: BufRead, W: Write, E: Write> TextUi<R, W, E> {
             bar(&format!("{}┐", "─".repeat(top_fill)))
         )?;
         for line in body {
-            for physical in wrap_plain(line, WIDTH.saturating_sub(4)) {
+            for physical in hard_wrap_frame_line(line, WIDTH.saturating_sub(4)) {
                 writeln!(
                     self.out,
                     "{} {}{} {}",
@@ -901,14 +901,14 @@ mod tests {
         // the body hard-wrap keeps every row within the field width (so the
         // fixed-width frame border stays aligned for non-ASCII content).
         assert_eq!(visible_width("\u{4e2d}\u{6587}"), 4);
-        let rows = wrap_plain("\u{4e2d}\u{6587}\u{5b57}\u{6570}", 4);
+        let rows = hard_wrap_frame_line("\u{4e2d}\u{6587}\u{5b57}\u{6570}", 4);
         assert!(rows.len() > 1, "CJK line should wrap: {rows:?}");
         for row in &rows {
             assert!(visible_width(row) <= 4, "row overran field width: {row:?}");
         }
         // ASCII parity: a line that fits is returned unchanged (color preserved).
         assert_eq!(
-            wrap_plain("\x1b[32mhi\x1b[0m", 8),
+            hard_wrap_frame_line("\x1b[32mhi\x1b[0m", 8),
             vec!["\x1b[32mhi\x1b[0m"]
         );
         // Title truncation is column-bounded.
