@@ -151,8 +151,11 @@ impl Spinner {
     }
 }
 
-/// Whether the working-indicator animation should be frozen
-/// (`IRIS_REDUCED_MOTION`); read once when the screen is constructed.
+/// Whether the working-indicator animation should be frozen at construction:
+/// the `IRIS_REDUCED_MOTION` env flag only, so a pure UI unit test never depends
+/// on the machine's persisted config. The persisted `tui.reducedMotion`
+/// preference is applied post-construction via [`Screen::set_reduced_motion`]
+/// (env still wins), the same way `scroll_speed`/alt-screen are threaded.
 fn reduced_motion() -> bool {
     crate::config::iris_flag_enabled("IRIS_REDUCED_MOTION")
 }
@@ -629,6 +632,11 @@ pub(crate) struct Screen {
     pub(crate) mouse_capture: bool,
     /// Wheel scroll step in lines (pager mode; `tui.scrollSpeed`, default 3).
     pub(crate) scroll_speed: u16,
+    /// Freeze animations for accessibility (`IRIS_REDUCED_MOTION` /
+    /// `tui.reducedMotion`). Seeded from the env flag at construction and
+    /// refined from the persisted preference via [`Screen::set_reduced_motion`]
+    /// (env still wins), so pure UI unit tests stay isolated from machine config.
+    reduced_motion: bool,
     /// Pager focus: `true` while the scrollback pane has keyboard focus (Tab
     /// toggles; typing a printable character always returns to the prompt;
     /// Esc is never a focus key -- ADR-0029).
@@ -691,6 +699,7 @@ impl Screen {
             pager_active: false,
             mouse_capture: true,
             scroll_speed: 3,
+            reduced_motion: reduced_motion(),
             scrollback_focus: false,
             selected_entry: None,
             search: None,
@@ -861,7 +870,16 @@ impl Screen {
 
     /// Show the start page (IrisMark + launcher) until the session begins.
     pub(crate) fn show_start_page(&mut self) {
-        self.start_page = Some(StartPage::new(reduced_motion()));
+        self.start_page = Some(StartPage::new(self.reduced_motion));
+    }
+
+    /// Apply the resolved reduced-motion posture (env flag OR persisted
+    /// `tui.reducedMotion`) after construction, mirroring how `scroll_speed`
+    /// and the alt-screen policy are threaded from `tui_settings`. Updates the
+    /// live spinner too so an already-built screen honors the preference.
+    pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool) {
+        self.reduced_motion = reduced_motion;
+        self.spinner.reduced_motion = reduced_motion;
     }
 
     /// Dismiss the start page: entering a session replaces the launcher with

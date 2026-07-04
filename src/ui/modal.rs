@@ -83,8 +83,31 @@ pub(crate) enum ModalAction {
     SaveScoped(Option<Vec<String>>),
     /// Apply this effort/thinking level.
     SetEffort(ReasoningEffort),
-    /// Settings menu -> open the thinking-level submenu.
+    /// Settings menu -> open the thinking-level submenu (default reasoning).
     OpenEffortPicker,
+    /// Settings -> back to the top-level category list.
+    OpenSettingsRoot,
+    /// Settings -> open a category's submenu.
+    OpenSettingsCategory(crate::ui::settings_menu::Category),
+    /// Settings -> open the enum picker for this field.
+    OpenSettingsEnum(crate::ui::settings_menu::Field),
+    /// Settings -> open the text/numeric entry for this field.
+    OpenSettingsEntry(crate::ui::settings_menu::Field),
+    /// Persist a settings field to the user-global file (`None` clears the key).
+    /// The loop maps the field to its `config::save_*` and re-opens the parent
+    /// category submenu on the refreshed values.
+    SaveSetting {
+        field: crate::ui::settings_menu::Field,
+        value: Option<String>,
+    },
+    /// Settings -> open the existing `/model` picker (default model).
+    OpenModelPicker,
+    /// Settings -> open the existing `/trust` project-permissions modal.
+    OpenTrustMenu,
+    /// Settings -> open the existing `/scoped-models` picker.
+    OpenScopedModels,
+    /// Settings -> open the existing `/login` method selector.
+    OpenLoginMethod,
     /// Edit this project's persistent permission policy (ADR-0027). The loop
     /// persists the edit to the HOME-owned store and refreshes the live agent's
     /// in-memory policy at the safe inter-turn boundary.
@@ -136,7 +159,10 @@ pub(crate) enum Modal {
     Model(ModelPicker),
     Scoped(ScopedModels),
     Effort(EffortPicker),
-    Settings(SettingsMenu),
+    Settings(crate::ui::settings_menu::SettingsMenu),
+    SettingsSub(crate::ui::settings_menu::SubMenu),
+    SettingsEnum(crate::ui::settings_menu::EnumMenu),
+    SettingsEntry(crate::ui::settings_menu::EntryDialog),
     Trust(TrustMenu),
     Session(SessionPicker),
     Tasks(TaskPicker),
@@ -153,6 +179,9 @@ impl Modal {
             Modal::Scoped(picker) => picker.handle_key(key),
             Modal::Effort(picker) => picker.handle_key(key),
             Modal::Settings(menu) => menu.handle_key(key),
+            Modal::SettingsSub(menu) => menu.handle_key(key),
+            Modal::SettingsEnum(menu) => menu.handle_key(key),
+            Modal::SettingsEntry(dialog) => dialog.handle_key(key),
             Modal::Trust(menu) => menu.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
             Modal::Tasks(picker) => picker.handle_key(key),
@@ -173,6 +202,10 @@ impl Modal {
                 dialog.push_str(text);
                 ModalOutcome::Redraw
             }
+            Modal::SettingsEntry(dialog) => {
+                dialog.push_str(text);
+                ModalOutcome::Redraw
+            }
             _ => ModalOutcome::Ignore,
         }
     }
@@ -183,6 +216,9 @@ impl Modal {
             Modal::Scoped(picker) => picker.render(width),
             Modal::Effort(picker) => picker.render(width),
             Modal::Settings(menu) => menu.render(width),
+            Modal::SettingsSub(menu) => menu.render(width),
+            Modal::SettingsEnum(menu) => menu.render(width),
+            Modal::SettingsEntry(dialog) => dialog.render(width),
             Modal::Trust(menu) => menu.render(width),
             Modal::Session(picker) => picker.render(width),
             Modal::Tasks(picker) => picker.render(width),
@@ -206,7 +242,7 @@ impl crate::ui::tui::Component for Modal {
 
 // --- shared rendering helpers ---
 
-fn dim() -> Style {
+pub(crate) fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
@@ -215,7 +251,7 @@ fn dim() -> Style {
 /// row the surface fill (never a colored accent). The selected label is bold;
 /// metadata stays muted; an enabled/disabled mark uses the `◉`/`○` glyphs from
 /// the closed vocabulary (never `[x]`). `empty` is the no-match message.
-fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'static>, bool)> {
+pub(crate) fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'static>, bool)> {
     let mut out: Vec<(Line<'static>, bool)> = Vec::new();
     if selector.searchable() {
         let search = selector.search().unwrap_or("");
@@ -814,52 +850,6 @@ impl EffortPicker {
         let rows = selector_rows(&self.selector, "No levels");
         crate::ui::tui::overlay_box(
             Some("Reasoning effort"),
-            rows,
-            Some("↑↓ move · ↵ select · esc cancel"),
-            usize::from(width),
-        )
-    }
-}
-
-// --- settings menu ---
-
-#[derive(Debug, Clone)]
-pub(crate) struct SettingsMenu {
-    selector: Selector,
-}
-
-impl SettingsMenu {
-    pub(crate) fn new(current_effort: ReasoningEffort) -> Self {
-        let item = SelectorItem::new("thinking", "Thinking level")
-            .detail(format!("current: {}", current_effort.as_str()));
-        SettingsMenu {
-            selector: Selector::new(vec![item], false, false, 8),
-        }
-    }
-
-    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
-        match key {
-            ModalKey::Up => {
-                self.selector.up();
-                ModalOutcome::Redraw
-            }
-            ModalKey::Down => {
-                self.selector.down();
-                ModalOutcome::Redraw
-            }
-            ModalKey::Enter => match self.selector.selected_id() {
-                Some("thinking") => ModalOutcome::Emit(ModalAction::OpenEffortPicker),
-                _ => ModalOutcome::Ignore,
-            },
-            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
-            _ => ModalOutcome::Ignore,
-        }
-    }
-
-    fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let rows = selector_rows(&self.selector, "No settings");
-        crate::ui::tui::overlay_box(
-            Some("Settings"),
             rows,
             Some("↑↓ move · ↵ select · esc cancel"),
             usize::from(width),
@@ -2043,15 +2033,6 @@ mod tests {
         assert_eq!(
             Component::render(&modal, usize::from(u16::MAX) + 100),
             Modal::render(&modal, u16::MAX)
-        );
-    }
-
-    #[test]
-    fn settings_menu_opens_effort_picker() {
-        let mut menu = SettingsMenu::new(ReasoningEffort::Medium);
-        assert_eq!(
-            menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenEffortPicker)
         );
     }
 

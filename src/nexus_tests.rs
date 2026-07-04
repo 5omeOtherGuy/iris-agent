@@ -6680,6 +6680,29 @@ fn approval_mode_parses_and_round_trips_tokens() {
 }
 
 #[test]
+fn approval_mode_from_startup_setting_resolves_or_defaults() {
+    // Absent -> today's default (posture unchanged).
+    assert_eq!(
+        ApprovalMode::from_startup_setting(None),
+        ApprovalMode::Strict
+    );
+    // A valid token is applied.
+    assert_eq!(
+        ApprovalMode::from_startup_setting(Some("auto")),
+        ApprovalMode::Auto
+    );
+    assert_eq!(
+        ApprovalMode::from_startup_setting(Some("never")),
+        ApprovalMode::NeverAsk
+    );
+    // An invalid token falls back to the default rather than changing posture.
+    assert_eq!(
+        ApprovalMode::from_startup_setting(Some("bogus")),
+        ApprovalMode::Strict
+    );
+}
+
+#[test]
 fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
     // End-to-end through the text session driver: `/approval auto` flips the
     // session preset at the inter-turn boundary, so the following clean

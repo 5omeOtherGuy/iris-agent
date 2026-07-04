@@ -622,6 +622,12 @@ pub(crate) fn run_interactive<P: ChatProvider>(
                 if let Some(speed) = tui_settings.and_then(|tui| tui.scroll_speed) {
                     tui.screen.scroll_speed = speed.clamp(1, 100);
                 }
+                // Reduced motion: the env flag OR the persisted preference. Env
+                // still wins (it is OR-ed in the resolver).
+                tui.screen
+                    .set_reduced_motion(crate::config::reduced_motion_enabled(
+                        tui_settings.and_then(|tui| tui.reduced_motion),
+                    ));
                 for notice in resolution.notices {
                     tui.screen.apply(crate::ui::UiEvent::Notice(notice));
                 }
@@ -647,8 +653,8 @@ pub(crate) fn run_interactive<P: ChatProvider>(
 
 /// Whether the interactive entry point will fall back to the plain, ANSI-free
 /// text UI rather than the terminal-surface TUI: the plain renderer was
-/// requested (`--plain`, `IRIS_PLAIN`, `NO_COLOR`) or either stdio end is not a
-/// terminal. `main.rs` consults this so `iris resume` (no id) prints a plain
+/// requested (`--plain`, `IRIS_PLAIN`, or `NO_COLOR`) or either stdio end is not
+/// a terminal. `main.rs` consults this so `iris resume` (no id) prints a plain
 /// session list in exactly the cases the picker would be unavailable.
 pub(crate) fn prefers_text_ui(force_plain: bool) -> bool {
     use_plain_renderer(force_plain)
