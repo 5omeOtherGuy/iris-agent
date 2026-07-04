@@ -133,6 +133,7 @@ impl AntigravityProvider {
         if status.is_success() {
             let mut parser = GeminiStreamParser::default();
             if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                sink.on_activity()?;
                 parser.ingest_event(data, sink)
             }) {
                 return Attempt::Fatal(error);

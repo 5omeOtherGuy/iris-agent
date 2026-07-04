@@ -183,6 +183,7 @@ impl OpenAiCodexResponsesProvider {
         if status.is_success() {
             let mut parser = ResponseStreamParser::new(&self.model);
             if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                sink.on_activity()?;
                 parser.ingest_event(data, sink)
             }) {
                 if !cancel.is_cancelled()
@@ -476,7 +477,10 @@ fn parse_response_stream_reader(
     model: &str,
 ) -> Result<AssistantTurn> {
     let mut parser = ResponseStreamParser::new(model);
-    for_each_sse_event(reader, cancel, |data| parser.ingest_event(data, sink))?;
+    for_each_sse_event(reader, cancel, |data| {
+        sink.on_activity()?;
+        parser.ingest_event(data, sink)
+    })?;
     parser.finish()
 }
 

@@ -17,6 +17,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
+use futures::StreamExt;
 use futures::channel::mpsc;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
@@ -37,6 +38,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// peers, not silent ones. Replaces the old 120s timeout, which killed
 /// legitimate long streams.
 const TOTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Provider-event idle timeout. The total timeout above bounds the whole
+/// blocking request, but without an idle timeout a provider can accept an SSE
+/// request and then leave the UI spinning with no bytes until the 30-minute
+/// backstop. Streaming providers send SSE events/pings while alive, so this is
+/// an inactivity detector rather than a cap on long legitimate turns.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Keep pooled connections around across turns. Idle gaps between turns (the
 /// user reading/typing, long tool runs) routinely exceed reqwest's 90s default,
 /// which forced a fresh TCP+TLS handshake on the next turn's first token.
@@ -90,6 +97,13 @@ pub(crate) fn shared_client() -> Client {
 /// parser pushes deltas here; the live provider forwards them onto the
 /// [`ProviderStream`] channel, while tests use a recording/no-op sink.
 pub(super) trait TurnSink {
+    /// Forward provider activity that does not yet have user-visible text. Used
+    /// to keep idle detection from timing out live streams that are currently
+    /// sending buffered reasoning/tool-call-input frames.
+    fn on_activity(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Forward one text delta. Returns `Err` when the consumer dropped the
     /// stream (cancellation) so the SSE read loop stops early instead of
     /// draining the rest of the response on a leaked blocking thread.
@@ -102,6 +116,12 @@ pub(super) struct ChannelSink {
 }
 
 impl TurnSink for ChannelSink {
+    fn on_activity(&mut self) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::Activity))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
+
     fn on_text_delta(&mut self, delta: &str) -> Result<()> {
         self.tx
             .unbounded_send(Ok(ProviderEvent::TextDelta(delta.to_string())))
@@ -119,6 +139,7 @@ pub(super) fn spawn_stream(
     cancel: CancellationToken,
 ) -> ProviderStream<'static> {
     let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
+    let stream_cancel = cancel.clone();
     tokio::task::spawn_blocking(move || {
         let mut sink = ChannelSink { tx: tx.clone() };
         let terminal = match run(&mut sink, &cancel) {
@@ -127,7 +148,25 @@ pub(super) fn spawn_stream(
         };
         let _ = tx.unbounded_send(terminal);
     });
-    Box::pin(rx)
+    Box::pin(futures::stream::unfold(
+        (rx, stream_cancel),
+        |(mut rx, cancel)| async move {
+            match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.next()).await {
+                Ok(Some(item)) => Some((item, (rx, cancel))),
+                Ok(None) => None,
+                Err(_) => {
+                    cancel.cancel();
+                    Some((
+                        Err(anyhow!(
+                            "provider stream produced no events for {}s",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        )),
+                        (rx, cancel),
+                    ))
+                }
+            }
+        },
+    ))
 }
 
 /// Outcome of a single HTTP attempt, classified for [`run_with_reauth`] /

@@ -384,6 +384,11 @@ pub(crate) enum ToolEventState {
 /// `Completed` carrying the assembled turn (text + tool calls).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProviderEvent {
+    /// Provider stream made progress that carries no user-visible text yet
+    /// (reasoning/tool-call input deltas, pings, or other buffered SSE frames).
+    /// The loop ignores it for transcript purposes, but it keeps transport idle
+    /// detection from treating a live non-text stream as stalled.
+    Activity,
     /// Incremental assistant text.
     TextDelta(String),
     /// Terminal event: the fully assembled assistant turn.
@@ -1523,6 +1528,7 @@ impl<P: ChatProvider> Agent<P> {
                         partial.push_str(&delta);
                         obs.on_event(AgentEvent::AssistantTextDelta(delta))?;
                     }
+                    Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {
                         return Ok(StreamResult::Completed { turn, saw_delta });
                     }
