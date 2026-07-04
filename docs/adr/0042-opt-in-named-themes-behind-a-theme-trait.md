@@ -1,4 +1,4 @@
-# ADR-0041: Opt-in named color themes behind a Theme trait, terminal-relative by default
+# ADR-0042: Opt-in named color themes behind a Theme trait, terminal-relative by default
 
 **Date**: 2026-07-04
 **Status**: proposed

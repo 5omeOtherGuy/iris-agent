@@ -678,7 +678,7 @@ pub(crate) fn run_interactive<P: ChatProvider>(
         match TuiUi::new(resolution.mode) {
             Ok(mut tui) => {
                 // Apply the persisted color theme once the TUI is live
-                // (ADR-0041); an invalid id logs a warning and falls back to the
+                // (ADR-0042); an invalid id logs a warning and falls back to the
                 // adaptive default. Kept inside the TUI branch so
                 // NO_COLOR/`--plain`/pipe users on the plain text renderer never
                 // activate a fixed-RGB theme.

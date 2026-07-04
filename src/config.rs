@@ -146,7 +146,7 @@ pub(crate) struct TuiSettings {
     /// `IRIS_REDUCED_MOTION` env switch to persisted config; the env flag still
     /// wins. Display-only preference, so a project may set it.
     pub(crate) reduced_motion: Option<bool>,
-    /// Color theme id (ADR-0041). Adaptive `terminal` default; an invalid id
+    /// Color theme id (ADR-0042). Adaptive `terminal` default; an invalid id
     /// falls back to that default.
     pub(crate) theme: Option<String>,
 }
@@ -473,7 +473,7 @@ pub(crate) fn save_reduced_motion(enabled: bool) -> Result<()> {
     update_global_block("tui", &[("reducedMotion", Value::Bool(enabled))])
 }
 
-/// Persist the selected color theme id under the `tui` block (ADR-0041).
+/// Persist the selected color theme id under the `tui` block (ADR-0042).
 pub(crate) fn save_theme(theme: &str) -> Result<()> {
     update_global_block("tui", &[("theme", Value::String(theme.to_string()))])
 }
