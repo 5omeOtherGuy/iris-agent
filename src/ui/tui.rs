@@ -3275,6 +3275,26 @@ mod tests {
     }
 
     #[test]
+    fn edit_preview_with_unavailable_message_renders_its_own_text() {
+        // Regression: a non-empty preview that does not parse into diff rows
+        // (e.g. "diff unavailable: preview too large") carries actionable text
+        // and must be rendered verbatim, not replaced by the generic
+        // "no preview available" placeholder.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::DiffPreview {
+            call: call_args("edit", json!({ "file_path": "src/main.rs" })),
+            diff: "diff unavailable: preview too large".to_string(),
+        });
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(rendered.contains("PREVIEW"), "{rendered}");
+        assert!(
+            rendered.contains("diff unavailable: preview too large"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("no preview available"), "{rendered}");
+    }
+
+    #[test]
     fn compaction_event_renders_quiet_info_notice() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::CompactionApplied {

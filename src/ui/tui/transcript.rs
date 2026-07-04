@@ -830,20 +830,37 @@ impl Transcript {
                 self.rows.push(row.with_fold(FoldVis::WhenExpanded));
             }
         } else if diff_rows.is_empty() && error.is_none() {
-            // A preview/edit whose diff is missing or empty (e.g. the edit's
-            // old_string did not match the file) would otherwise render an
-            // empty frame -- header + bottom border, zero body rows -- leaving
-            // nothing to review while the approval modal waits. Emit one honest
-            // dim placeholder instead of fabricating a diff.
-            let placeholder = "no preview available";
-            self.rows.push(TranscriptRow::chrome_with_text(
-                ChromeRow::Body {
-                    line: Line::from(Span::styled(placeholder, dim_style())),
-                    bg: None,
-                },
-                placeholder.to_string(),
-                dim_style(),
-            ));
+            if diff.trim().is_empty() {
+                // A preview/edit whose diff is genuinely empty (e.g. the edit's
+                // old_string did not match the file) would otherwise render an
+                // empty frame -- header + bottom border, zero body rows --
+                // leaving nothing to review while the approval modal waits.
+                // Emit one honest dim placeholder instead of fabricating a diff.
+                let placeholder = "no preview available";
+                self.rows.push(TranscriptRow::chrome_with_text(
+                    ChromeRow::Body {
+                        line: Line::from(Span::styled(placeholder, dim_style())),
+                        bg: None,
+                    },
+                    placeholder.to_string(),
+                    dim_style(),
+                ));
+            } else {
+                // Non-empty preview text that does not parse into diff rows --
+                // e.g. "diff unavailable: preview too large" -- carries
+                // actionable meaning. Render it verbatim as dim body rows
+                // rather than hiding it behind the generic placeholder.
+                for line in diff.trim_end_matches('\n').split('\n') {
+                    self.rows.push(TranscriptRow::chrome_with_text(
+                        ChromeRow::Body {
+                            line: Line::from(Span::styled(line.to_string(), dim_style())),
+                            bg: None,
+                        },
+                        line.to_string(),
+                        dim_style(),
+                    ));
+                }
+            }
         } else {
             self.rows.extend(diff_rows);
         }
