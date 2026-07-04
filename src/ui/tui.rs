@@ -16,9 +16,7 @@
 //! output are unit-testable without a TTY.
 
 use std::io::{self, Stdout, Write};
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::cursor::{Hide, Show};
@@ -38,9 +36,11 @@ use ratatui::text::{Line, Span};
 use crate::nexus::ProviderUsage;
 use crate::ui::screen_mode::ScreenMode;
 use crate::ui::terminal_surface::TerminalSurface;
+use frame_stats::FrameStats;
 use pager::PagerSurface;
 
 mod component;
+mod frame_stats;
 mod overlay;
 mod pager;
 mod pane;
@@ -276,6 +276,9 @@ pub(crate) struct TuiUi {
     /// `draw` syncs it to `Screen::mouse_capture` so the Ctrl+T / `/mouse`
     /// toggle takes effect on the next frame.
     mouse_applied: bool,
+    /// Per-frame compose/flush timings, surfaced through `/debug`. Recording is
+    /// O(1) per frame; the ring is bounded, so this is always-on (no flag).
+    frame_stats: FrameStats,
 }
 
 impl TuiUi {
@@ -359,6 +362,7 @@ impl TuiUi {
             active: true,
             keyboard_enhanced,
             mouse_applied,
+            frame_stats: FrameStats::new(),
         })
     }
 
@@ -377,17 +381,42 @@ impl TuiUi {
                 self.mouse_applied = self.screen.mouse_capture;
             }
             let screen = &mut self.screen;
-            pager.render_with(|frame_size| pager::compose_frame(screen, frame_size))?;
+            // Split compose (frame build) from flush (terminal write): the
+            // closure builds the frame, `render_with` writes it under `?2026`
+            // with ratatui diffing, so the remainder of the call is flush.
+            let mut compose = Duration::ZERO;
+            let frame_start = Instant::now();
+            pager.render_with(|frame_size| {
+                let started = Instant::now();
+                let frame = pager::compose_frame(screen, frame_size);
+                compose = started.elapsed();
+                frame
+            })?;
+            let flush = frame_start.elapsed().saturating_sub(compose);
+            self.frame_stats.record(compose, flush);
             return Ok(());
         }
+        let compose_start = Instant::now();
         let document = render_document_with_hints(&mut self.screen, size);
+        let compose = compose_start.elapsed();
+        let flush_start = Instant::now();
         self.surface.render_with_hints(
             size,
             &document.lines,
             document.chrome_tail,
             document.stable_prefix,
         )?;
+        self.frame_stats.record(compose, flush_start.elapsed());
         Ok(())
+    }
+
+    /// Frame-timing lines for the `/debug` snapshot; empty until the first frame
+    /// is drawn. Percentiles are computed here, on demand, never per frame.
+    pub(crate) fn frame_stats_lines(&self) -> Vec<String> {
+        self.frame_stats
+            .summary()
+            .map(|summary| summary.lines())
+            .unwrap_or_default()
     }
 
     /// Snapshot the rendered document for `/debug`: the current terminal size
