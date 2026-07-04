@@ -916,7 +916,7 @@ impl<P: ChatProvider> Harness<P> {
             match provider_summary(
                 &self.agent.provider,
                 self.agent.tools(),
-                &messages[..plan.end],
+                &messages[plan.start..plan.end],
                 token,
             )
             .await
@@ -1013,19 +1013,22 @@ impl<P: ChatProvider> Harness<P> {
 }
 
 /// One-shot, tool-free summarization request against the active provider
-/// (ADR-0041). The request replays the live context prefix through the end of
-/// the covered range plus a final user instruction, and advertises the normal
-/// tool declarations, so the provider's cached prompt prefix (tools + system +
-/// history) is reused instead of re-billed at the uncached rate. Only a
-/// completed text answer is accepted; a tool-calling or empty response is an
-/// error the caller turns into the deterministic fallback.
+/// (ADR-0041). The request carries exactly the covered range (the messages the
+/// compaction entry replaces, never the retained prefix) plus a final user
+/// instruction, and advertises the normal tool declarations, so the provider's
+/// cached prompt prefix (tools + system, and the full history when the covered
+/// range starts at the live prefix) is reused instead of re-billed at the
+/// uncached rate. Scoping to the covered range keeps the summary from
+/// duplicating a retained prefix when `plan.start > 0` (resume or a prior
+/// compaction). Only a completed text answer is accepted; a tool-calling or
+/// empty response is an error the caller turns into the deterministic fallback.
 async fn provider_summary<P: ChatProvider>(
     provider: &P,
     tools: &Tools,
-    prefix: &[Message],
+    covered: &[Message],
     token: &CancellationToken,
 ) -> Result<String> {
-    let mut request = prefix.to_vec();
+    let mut request = covered.to_vec();
     request.push(Message::user(SUMMARY_PROMPT));
     let mut stream = provider.respond_stream(&request, tools, token)?;
     loop {

@@ -1380,6 +1380,11 @@ async fn run_harness_op<P: ChatProvider>(
         .ok()
         .map(|(width, _)| width);
 
+    // A compaction is not a turn, so any Enter/Alt-Enter text the user typed
+    // into the steering queue while the `/compact` spinner ran must not be
+    // carried forward: `compact_now` never drains steering, so it would
+    // otherwise be silently merged into the next real prompt.
+    let is_compact = matches!(op, HarnessOp::Compact);
     let result = {
         let mut turn: futures::future::LocalBoxFuture<'_, Result<()>> = match op {
             HarnessOp::Turn(prompt) => {
@@ -1500,8 +1505,9 @@ async fn run_harness_op<P: ChatProvider>(
     // the turn future won the select before the input arm processed the Ctrl-C
     // event (`handle_running_event` clears the queue on the keystroke; this
     // covers the race where that event is never observed here). Idempotent with
-    // that path.
-    if token.is_cancelled() {
+    // that path. A compaction always clears too: its typed input is not
+    // steering for a turn and must not leak into the next real prompt.
+    if token.is_cancelled() || is_compact {
         steering.clear();
         tui.screen.set_queued(0);
     }

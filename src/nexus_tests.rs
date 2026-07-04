@@ -4858,6 +4858,97 @@ fn provider_backed_summarizer_writes_model_summary() -> Result<()> {
     Ok(())
 }
 
+/// Regression (ADR-0041): with a retained prefix (a resumed session's id-less
+/// loaded history, so `plan.start > 0`), the provider summarization request
+/// must carry only the covered range, never the retained prefix. Sending the
+/// prefix would make the model re-summarize messages that stay verbatim,
+/// duplicating them in the rebuilt context.
+#[test]
+fn provider_summary_covers_only_the_range_not_the_retained_prefix() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+
+    // A prior session whose loaded history carries a unique marker. On resume
+    // these entries are id-less, so compaction never covers them: they are the
+    // retained prefix.
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    log.append(&Message::user("PREFIXFACT the codeword is ostrich"))?;
+    log.append(&Message::assistant("understood"))?;
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session id present");
+    let stored = store.open(&meta)?;
+    let resumed = stored.messages.len();
+    assert_eq!(resumed, 2);
+
+    // Scripted in request order: turn 1, the summarization request fired at
+    // turn 2's boundary, then turn 2 itself.
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&"a".repeat(400))),
+        Ok(AssistantTurn::text("session handoff summary")),
+        Ok(AssistantTurn::text("b")),
+    ]);
+    let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        resumed,
+        Some(50),
+    );
+    harness.set_summarizer(crate::wayland::SummarizerKind::Provider);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        &"P".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    block_on(harness.submit_turn(
+        &"Q".repeat(400),
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 3, "turn, summarization request, turn");
+    let summary_request = &seen[1];
+    assert!(
+        summary_request
+            .last()
+            .expect("summary request has messages")
+            .content
+            .starts_with("Summarize this coding session"),
+        "seen[1] must be the summarization request"
+    );
+    // The retained id-less prefix must not be re-summarized.
+    assert!(
+        !summary_request
+            .iter()
+            .any(|m| m.content.contains("PREFIXFACT")),
+        "provider summary request leaked the retained prefix: {:?}",
+        summary_request
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+    );
+    // Exactly the covered range (2 post-resume messages) plus the instruction.
+    assert_eq!(
+        summary_request.len(),
+        3,
+        "summary must cover only the range: 2 covered + instruction"
+    );
+    Ok(())
+}
+
 /// A failing provider summary falls back to the deterministic excerpts rather
 /// than aborting the turn or skipping compaction.
 #[test]
