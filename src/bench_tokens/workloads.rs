@@ -145,11 +145,19 @@ pub(crate) fn probe_workloads() -> Vec<Workload> {
         },
         Workload {
             // find compaction (issue-340): the target lives in a >1000-file
-            // tree that compacts; the grouped listing must still surface it.
-            name: "probe-find-target-path",
+            // tree that compacts. The question is phrased so the model CANNOT
+            // route around the reduction with a targeted glob -- you cannot glob
+            // for "the odd name out", so it must list broadly (`*.rs` /
+            // `handler_*.rs` -> 1351 matches -> compaction) and scan the reduced
+            // listing for the one non-numeric handler. The target sorts into the
+            // shown prefix (newest mtime) and the render probe proves it
+            // survives, so a green render probe guarantees the answer is present.
+            name: "probe-find-odd-handler",
             fixture: "probe_find",
-            prompt: "Find the source file whose name contains `zebra`. Report its full path \
-                     relative to the workspace root. Answer with only that path.",
+            prompt: "Every handler file is named `handler_NN_NN.rs` (two two-digit numbers) \
+                     except exactly one. Using the find tool, list the handler files and \
+                     report the full path of the single handler whose name does NOT follow \
+                     that numeric pattern. Answer with only that path.",
             script: script_probe_find,
             check: check_probe_find_path,
             approval: ApprovalProfile::DenyGateNoPrompts,
@@ -157,18 +165,21 @@ pub(crate) fn probe_workloads() -> Vec<Workload> {
             build: Some(build_find_tree),
         },
         Workload {
-            // read skim (issue-337): a comment-heavy source whose exported
-            // constant survives skim verbatim -- the model must report the
-            // exact value from a skimmed read. The scripted replay reads with
-            // `skim:true` to exercise the skim path; the live model chooses.
-            name: "probe-read-skim-constant",
+            // read skim (issue-337): the answer is a body-level local inside the
+            // `sweep` function, NOT a top-level symbol -- so the model must read
+            // the code (a grep for a constant cannot answer it), which is what
+            // exercises skim. skim keeps the function body verbatim while
+            // stripping the heavy comment narrative. Scripted replay reads with
+            // `skim:true`; the live model chooses its own path.
+            name: "probe-read-sweep-local",
             fixture: "probe_read",
-            prompt: "Read the settlement module and report the exact integer value assigned \
-                     to the CHECKOUT_DEADLINE_MS constant. Answer with only that integer.",
+            prompt: "Read settlement.rs. Inside the `sweep` function body, what is the name \
+                     of the local Vec variable that collects the due charge ids and is \
+                     returned? Answer with only that identifier.",
             script: script_probe_read,
-            check: check_probe_read_value,
+            check: check_probe_read_local,
             approval: ApprovalProfile::DenyGateNoPrompts,
-            needles: &["47231"],
+            needles: &["due_ids"],
             build: None,
         },
     ]
@@ -271,16 +282,17 @@ fn script_probe_grep() -> Vec<AssistantTurn> {
     ]
 }
 
-/// Scripted find probe: search for the target file, then answer its path.
+/// Scripted find probe: broad `*.rs` listing (trips compaction), then answer
+/// the one non-numeric handler's path from the reduced listing.
 fn script_probe_find() -> Vec<AssistantTurn> {
     vec![
-        call_turn("f", "find", json!({ "pattern": "*zebra*" })),
+        call_turn("f", "find", json!({ "pattern": "*.rs" })),
         answer_turn("services/aaa_target/gateway/handler_zebra_target.rs"),
     ]
 }
 
 /// Scripted read-skim probe: skim-read the comment-heavy source, then answer
-/// the exported constant (which survives skim as code).
+/// the body-level local inside `sweep` (which survives skim as code).
 fn script_probe_read() -> Vec<AssistantTurn> {
     vec![
         call_turn(
@@ -288,7 +300,7 @@ fn script_probe_read() -> Vec<AssistantTurn> {
             "read",
             json!({ "path": "settlement.rs", "skim": true }),
         ),
-        answer_turn("47231"),
+        answer_turn("due_ids"),
     ]
 }
 
@@ -434,19 +446,19 @@ fn check_probe_grep_value(_workspace: &Path, final_text: &str) -> Outcome {
     }
 }
 
-/// Read-skim exact-value probe: the answer must carry the exported constant
-/// value, which a skim read keeps verbatim while stripping the surrounding
-/// comment narrative.
-fn check_probe_read_value(_workspace: &Path, final_text: &str) -> Outcome {
-    if final_text.contains("47231") {
+/// Read-skim probe: the answer must name the body-level local inside `sweep`,
+/// which the model can only get by reading the code -- skim keeps the function
+/// body verbatim while stripping the surrounding comment narrative.
+fn check_probe_read_local(_workspace: &Path, final_text: &str) -> Outcome {
+    if final_text.contains("due_ids") {
         Outcome {
             success: true,
-            detail: "answer carries the exact CHECKOUT_DEADLINE_MS value (47231)".to_string(),
+            detail: "answer names the sweep body-local variable (due_ids)".to_string(),
         }
     } else {
         Outcome {
             success: false,
-            detail: "answer missing the exact value 47231".to_string(),
+            detail: "answer missing the body-local identifier due_ids".to_string(),
         }
     }
 }

@@ -67,12 +67,12 @@ pub fn settlement_id(merchant: &str, charge: u64, window: u64) -> String {
 pub fn sweep(pending: &BTreeMap<u64, PendingCharge>, now_ms: u64) -> Vec<u64> {
     // Collect ids to close; the actual acquirer calls happen in the caller so
     // this stays pure and unit-testable.
-    let mut closed = Vec::new();
+    let mut due_ids = Vec::new();
     for (id, _charge) in pending {
         // A charge is due when its age exceeds the contractual deadline.
         if now_ms.saturating_sub(*id) > CHECKOUT_DEADLINE_MS {
-            closed.push(*id);
+            due_ids.push(*id);
         }
     }
-    closed
+    due_ids
 }

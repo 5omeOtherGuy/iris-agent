@@ -229,11 +229,15 @@ pub(crate) fn tool_probes() -> Vec<ToolProbe> {
             axis: ProbeAxis::ArgOverlay(|| json!({ "skim": true })),
             args: || json!({ "path": "settlement.rs" }),
             min_reduction_pct: 20,
+            // `due_ids` is a body-level local inside `sweep`; proving it
+            // survives skim is what the paired live question depends on (a read
+            // task, not a top-level symbol a grep answers trivially).
             needles: &[
                 "CHECKOUT_DEADLINE_MS",
                 "47231",
                 "settlement_id",
                 "PendingCharge",
+                "due_ids",
             ],
             slow: false,
         },

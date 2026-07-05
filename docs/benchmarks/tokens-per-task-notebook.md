@@ -944,3 +944,43 @@ design that must force the intended tool path. This tool-choice gap IS the
 "connection between per-tool advantage and end-to-end outcome" the suite exists
 to find, and it argues against any blanket "reductions save tokens per task"
 claim: the saving is contingent on the model using the tool the reducing way.
+
+## Entry 19 - Fixing the find/read live-question intent mismatch
+
+Entry 18 found the find and read LIVE questions let a capable model route around
+the very reduction they were meant to exercise. Fixed by redesigning the
+questions to force the intended tool path (the render probes were already
+correct; only the live-question design was wrong).
+
+**find: `probe-find-target-path` -> `probe-find-odd-handler`.** The old question
+("find the file whose name contains zebra") let the model glob `*zebra*` -> one
+match -> compaction never fires. The new question asks for the ONE handler whose
+name does not follow the `handler_NN_NN.rs` numeric pattern. You cannot glob for
+"the odd one out", so the model must list broadly (`*.rs` / `handler_*.rs` ->
+1351 matches -> compaction) and scan the reduced listing. The answer
+(`handler_zebra_target.rs`) sorts into the shown prefix (newest mtime) and the
+render probe already proves it survives, so a green render probe guarantees the
+answer is present in both arms; only the token cost differs. Reuses
+`check_probe_find_path`.
+
+**read: `probe-read-skim-constant` -> `probe-read-sweep-local`.** The old
+question asked for a top-level constant, which a single grep answers better than
+a read -- so skim was never exercised. The new question asks for a body-level
+local (`due_ids`) inside the `sweep` function: the model has to read the code (a
+constant-grep cannot answer it), which is exactly what skim optimizes -- skim
+keeps the function body verbatim while stripping the heavy comment narrative.
+Renamed the fixture local `closed` -> `due_ids` (distinctive needle) and added
+`due_ids` to the read render probe's needles, so the render probe now proves a
+BODY-level identifier (not just top-level signatures) survives skim. Render
+probe still 83.1%.
+
+**Honest limitation (stated, not hidden):** question design can strongly NUDGE
+but cannot GUARANTEE a specific tool for a capable model -- a determined model
+could still `find handler_*.rs` then reason, or `grep 'fn sweep' -A` with wide
+context. The point is not to trap the model but to remove the trivial route
+around the reduction so the live probe actually stresses the feature more often
+than not; a model that still routes around it is itself a measured outcome (the
+schema logs the tool sequence). The deterministic render probes remain the
+ground truth for "the reduction is real and lossless"; the live probes measure
+whether it pays off end-to-end. No re-run yet -- these questions await the next
+authorized live pass.
