@@ -1063,3 +1063,41 @@ efficiency term -- the reduction's DIRECT effect here was negligible; the
 apparent win was turn-count variance. Lesson reinforced (see Entry 12): at low
 turn counts, turn-count variance dominates the token delta; only same-turn-count
 cells or large N isolate the reduction.
+
+## Entry 22 - Headline matrix, full 3-spec default, N=5 (authorized live run)
+
+First full authorized headline matrix: 3 models (gpt-5.4-mini, gpt-5.3-codex-spark,
+claude-haiku-4-5) x 3 workloads x 2 arms x N=5 = 90 real sessions, reasoning=low
+(held identical across arms), real usage-record input tokens. Smoke-guard first
+(all 3 reachable, all succeeded). Committed artifact:
+docs/benchmarks/headline-matrix-2026-07-05.{md,jsonl}.
+
+**Overall verdict: BASELINE WINS -- no tokens-per-task claim shipped.**
+
+- **No success regression** (the stop-and-report trigger). A >= B success in
+  every cell; gpt-5.4-mini/investigate improved it (A 5/5 vs B 4/5); two cells
+  tied at 4/5 (haiku multi-file). Verified by direct count.
+- **No consistent token win:** 3/9 cells defaults-cheaper, 6/9 baseline-cheaper.
+- **Turn-count variance dominates (again, now at N=5).** Every big swing
+  (-22% to +66%) is flagged `more/fewer turns (confounded w/ strategy)` by the
+  Entry-21 mechanism label -- the arm changed turn count, and each turn is mostly
+  fixed system-prompt + tool-schema overhead. E.g. codex-spark/investigate A
+  +66.5% is entirely +11081 turn term (5 vs 3 turns), not per-turn cost.
+- **The 4 clean same-turn-count cells** (`per-turn` mechanism) put the reduction
+  inside noise: -4.1%, +0.1%, +0.5%, +2.2%. The lone negative
+  (gpt-5.4-mini/multi-file, result-bytes -913, reduction fired) is INCONCLUSIVE
+  by spread. So even where turn count is controlled, N=5 does not clear zero.
+
+**Interpretation.** The per-tool render probes are real (grep 36%, find 56%,
+read 83% raw-output reduction), but that shrink does NOT propagate to a
+measurable per-completed-task token reduction here: reduced tool-result bytes are
+a small slice of each turn's cumulative context, and turn-count strategy variance
+swamps them. This is the benchmark doing its job -- it refuses to manufacture a
+win. Milestone-2's tokens-per-completed-task claim is UNSUPPORTED by this run;
+ROADMAP gate stays open; README carries no such claim.
+
+**Caveats / next moves (not run):** low effort + these 3 tasks + N=5; a larger N
+or an effort sweep (separate dimension) might narrow the clean-cell spreads, but
+turn-count variance is the real obstacle and it is a property of model strategy,
+not of the reduction. The micro-probe axis (single-tool tasks, more same-turn
+cells) remains the cleaner place to isolate a per-tool token effect.
