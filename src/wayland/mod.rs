@@ -87,8 +87,10 @@ pub(crate) struct Harness<P> {
     persisted: usize,
     // Entry ids of the persisted messages, parallel to the first `persisted`
     // agent messages. `Some(id)` = a coverable on-disk `message` entry; `None`
-    // = not coverable (a resumed loaded message, tracked id-less). The
-    // auto-compaction policy covers a contiguous run of `Some`-id messages.
+    // = not coverable (a summary position, or a legacy id-less entry). Resumed
+    // loaded messages now carry their durable ids (#375, #377), so a resumed
+    // prefix is coverable. The auto-compaction policy covers a contiguous run
+    // of `Some`-id messages.
     entry_ids: Vec<Option<String>>,
     // Context token budget that triggers auto-compaction, or `None` to disable
     // it (in-memory loop tests). The Tier-3 app passes the configured budget.
@@ -147,32 +149,27 @@ impl<P: ChatProvider> Harness<P> {
     /// only new turns are appended, continuing the same transcript instead of
     /// rewriting the loaded entries.
     ///
-    /// The loaded history is tracked id-less (entry ids `None`), so this slice
-    /// does not re-compact already-loaded messages -- only turns appended after
-    /// resume become coverable. The store's read-time rebuild already applied
-    /// any prior compaction entries, so resumed context is summary-aware on
-    /// arrival.
-    //
-    // ponytail: id-less loaded history is the known ceiling -- a resumed
-    // session whose rebuilt bulk alone exceeds the budget cannot shrink further
-    // until new coverable turns accumulate. Upgrade path = surface per-message
-    // entry ids from the read/rebuild path so loaded originals stay coverable.
+    /// The loaded history carries its durable entry ids (parallel to the loaded
+    /// messages, `None` at summary positions and for id-less legacy entries),
+    /// so a near-budget resumed prefix stays compactable by auto-compaction and
+    /// `/compact` -- matching the in-session `/resume` swap (#375, #377). The
+    /// store's read-time rebuild already applied any prior compaction entries,
+    /// so resumed context is summary-aware on arrival; summary positions arrive
+    /// as `None` so `plan_compaction` stops at them (no summary-of-summaries).
     pub(crate) fn resumed(
         agent: Agent<P>,
         workspace: PathBuf,
         state: ToolState,
         session: Option<SessionLog>,
-        persisted: usize,
+        entry_ids: Vec<Option<String>>,
         budget: Option<u64>,
     ) -> Self {
+        // The loaded messages and their ids describe the same on-disk prefix, so
+        // the persisted cursor is the id count; the ids are seeded verbatim so a
+        // near-budget resumed prefix is compactable (#377).
+        let persisted = entry_ids.len();
         Self::build(
-            agent,
-            workspace,
-            state,
-            session,
-            persisted,
-            vec![None; persisted],
-            budget,
+            agent, workspace, state, session, persisted, entry_ids, budget,
         )
     }
 
@@ -775,9 +772,9 @@ impl<P: ChatProvider> Harness<P> {
         // leaves headroom for the summary and the next prompt.
         let keep_target = budget.saturating_mul(3) / 4;
         let Some(plan) = self.plan_compaction(&messages, keep_target) else {
-            // Nothing coverable (e.g. resumed id-less history or a single
-            // oversized message at a tool boundary): a no-op, never history
-            // destruction or a faked token count.
+            // Nothing coverable (e.g. an all-summary/legacy id-less prefix or a
+            // single oversized message at a tool boundary): a no-op, never
+            // history destruction or a faked token count.
             return Ok(());
         };
 
