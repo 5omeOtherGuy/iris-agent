@@ -1,7 +1,7 @@
 # ADR-0048: Fold spent tool results behind handles (opt-in microcompaction)
 
 **Date**: 2026-07-04
-**Status**: proposed
+**Status**: accepted
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context
@@ -52,7 +52,19 @@ Fold spent tool results to deterministic stubs, opt-in, with recovery one step a
 - **Fold policy.** Batch folds at a micro-watermark below the compaction budget, so one
   prefix cache break amortizes many folds; never fold inside the retained tail; never fold
   an error-classified result (ADR-0040) that no later success of the same command has
-  superseded. First slice: superseded reads (latest-read-wins) and retired failure output.
+  superseded.
+
+**V1 scope (re-scoped on the committed M2 benchmark).** The measurement gate
+(`docs/benchmarks/issue-378-residual-tool-mass.md`) found superseded reads + retired-failure
+output do NOT dominate residual tool mass (~19.5% overall, ~32.3% in long sessions), and
+within that foldable slice superseded reads are effectively the entire signal (~18%); retired
+failure output is negligible (~1.5%, an identical-rerun upper bound, since bash exit status is
+not persisted). **V1 therefore folds superseded reads only (latest-read-wins,
+workspace-recoverable).** Retired-failure-output folding and bash-output-handle folding are
+**deferred** on that evidence — not architected out: the fold engine is a set of pluggable
+policies (`src/wayland/fold.rs`), so each deferred class plugs in later as an additional
+policy arm and stub variant without reworking the pass. The stub format stays extensible for
+the bash `ToolOutputStore` handle it will carry.
 - **Opt-in, default off, surfaced in `/settings`.** A `microcompaction` config field
   (camelCase key `microcompaction`), project-tunable as a cost/quality knob like
   `compactionSummarizer` — it cannot redirect requests, and everything folded stays

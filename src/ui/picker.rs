@@ -332,6 +332,7 @@ fn settings_snapshot<P>(switch: &ModelSwitch<'_, P>) -> settings_menu::Snapshot 
             .clone()
             .unwrap_or_else(|| "strict".to_string()),
         context_token_budget: settings.context_token_budget(),
+        microcompaction: settings.microcompaction(),
         max_tool_roundtrips: settings.max_tool_roundtrips(),
         prompt_cache_retention: settings
             .prompt_cache_retention
@@ -366,6 +367,7 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::ContextTokenBudget => {
             config::save_context_token_budget(value.unwrap_or("0").parse()?)
         }
+        Field::Microcompaction => config::save_microcompaction(parse_bool(value)),
         Field::MaxToolRoundtrips => config::save_max_tool_roundtrips(match value {
             Some(v) => Some(v.parse::<usize>()?),
             None => None,

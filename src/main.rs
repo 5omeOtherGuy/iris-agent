@@ -386,6 +386,8 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
+    harness.set_microcompaction(settings.microcompaction());
     // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
     // preference; absent/invalid leaves the built-in default (`strict`). The live
     // `/approval` command stays session-only and is unaffected.
@@ -515,6 +517,8 @@ fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
+    harness.set_microcompaction(settings.microcompaction());
 
     // Merge piped stdin (when not a TTY) into the prompt before the turn.
     let piped = print::read_piped_stdin()?;
@@ -605,6 +609,8 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     );
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
+    harness.set_microcompaction(settings.microcompaction());
     // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
     // preference; absent/invalid leaves the built-in default (`strict`).
     harness.set_approval_mode(nexus::ApprovalMode::from_startup_setting(

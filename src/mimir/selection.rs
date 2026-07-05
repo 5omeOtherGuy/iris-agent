@@ -486,6 +486,7 @@ mod tests {
             context_token_budget: None,
             default_reasoning: reasoning.map(str::to_string),
             compaction_summarizer: None,
+            microcompaction: None,
             prompt_cache_retention: None,
             anthropic_context_management: None,
             enabled_models: None,

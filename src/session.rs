@@ -219,6 +219,44 @@ impl SessionLog {
         Ok(id)
     }
 
+    /// Append a durable `fold` entry recording that the `Tool`-role result of
+    /// message `target_id` was replaced in rebuilt context by the deterministic
+    /// `stub` (ADR-0048 microcompaction). Unlike a compaction, a fold targets a
+    /// single message id and keeps the tool call/result pair intact -- only the
+    /// result's rendered content changes on rebuild, so provider pair invariants
+    /// hold trivially. Precedence at rebuild ([`rebuild_with_compactions`]):
+    /// compactions apply first, and a fold whose target lies in a covered range
+    /// is a no-op, so a fold never applies inside a range a compaction covers.
+    ///
+    /// This is a separate entry kind, not a single-message compaction, so the
+    /// compaction overlap-rejection rule keeps holding for range coverage. It is
+    /// additive-optional: older readers skip an unknown `type`, and a session
+    /// with no fold entries rebuilds byte-identically to the pre-fold behavior.
+    /// `token_estimate` records the stub's token cost so the rebuild counts the
+    /// stub instead of the folded result.
+    pub(crate) fn append_fold(
+        &mut self,
+        target_id: &str,
+        stub: &str,
+        token_estimate: Option<u64>,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "fold",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "createdAt": now_ms(),
+            "targetId": target_id,
+            "stub": stub,
+            "tokenEstimate": token_estimate,
+        });
+        write_line(&mut self.file, &entry)
+            .with_context(|| format!("failed to append fold to session {}", self.path.display()))?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
     /// Append a `modelSelection` entry recording a runtime provider/model/
     /// reasoning switch, chained onto the leaf like any other entry. This is a
     /// first-class audit record of mode switches; `read_messages` skips it (it is
@@ -993,8 +1031,8 @@ fn read_meta(path: &Path) -> Result<SessionMeta> {
 /// are skipped rather than failing the whole open. Also returns the rebuilt
 /// context's estimated token total ([`RebuiltContext`]).
 fn read_messages(path: &Path) -> Result<RebuiltContext> {
-    let (entries, compactions) = read_entries(path)?;
-    rebuild_with_compactions(path, entries, compactions)
+    let (entries, compactions, folds) = read_entries(path)?;
+    rebuild_with_compactions(path, entries, compactions, folds)
 }
 
 /// Read the ORIGINAL turns of a durable entry-id span from a session transcript
@@ -1005,7 +1043,10 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
 /// session), so it cannot address another session's data. Turns are returned in
 /// transcript order; the vec is empty when the span selects nothing.
 pub(crate) fn read_span(path: &Path, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
-    let (entries, _compactions) = read_entries(path)?;
+    // Recall returns the ORIGINAL turns verbatim, so folds (which only rewrite
+    // the rebuilt result rendering) are discarded here: the folded message's
+    // original content stays verbatim in its `message` entry on disk.
+    let (entries, _compactions, _folds) = read_entries(path)?;
     Ok(entries
         .into_iter()
         .filter(|entry| {
@@ -1023,7 +1064,7 @@ pub(crate) fn read_span(path: &Path, from: u64, to: u64) -> Result<Vec<(Option<S
 /// applying the same per-line leniency the read path needs (a truncated or
 /// garbled line is skipped, not fatal). Shared by the rebuild read path
 /// ([`read_messages`]) and the standalone-span read path ([`read_span`]).
-fn read_entries(path: &Path) -> Result<(Vec<MessageEntry>, Vec<Compaction>)> {
+fn read_entries(path: &Path) -> Result<(Vec<MessageEntry>, Vec<Compaction>, Vec<Fold>)> {
     // Read raw bytes and split on '\n' so a truncated trailing fragment that
     // splits a multibyte UTF-8 char is discarded as one bad line, rather than
     // failing the whole read -- which `read_to_string` would, since invalid
@@ -1049,6 +1090,7 @@ fn read_entries(path: &Path) -> Result<(Vec<MessageEntry>, Vec<Compaction>)> {
     // instead of the original turns.
     let mut entries: Vec<MessageEntry> = Vec::new();
     let mut compactions: Vec<Compaction> = Vec::new();
+    let mut folds: Vec<Fold> = Vec::new();
     for line in lines {
         let Ok(text) = line else {
             tracing::warn!(path = %path.display(), "skipping non-UTF-8 session line");
@@ -1086,10 +1128,16 @@ fn read_entries(path: &Path) -> Result<(Vec<MessageEntry>, Vec<Compaction>)> {
                     tracing::warn!(path = %path.display(), "skipping malformed compaction entry");
                 }
             },
+            Some("fold") => match parse_fold(&value) {
+                Some(fold) => folds.push(fold),
+                None => {
+                    tracing::warn!(path = %path.display(), "skipping malformed fold entry");
+                }
+            },
             _ => continue,
         }
     }
-    Ok((entries, compactions))
+    Ok((entries, compactions, folds))
 }
 
 /// A message entry rebuilt from disk: its durable id (for compaction coverage
@@ -1145,9 +1193,31 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
     })
 }
 
+/// A persisted `fold` entry's rebuild-relevant fields (ADR-0048): the durable
+/// message id whose `Tool`-role result was folded, the deterministic stub that
+/// replaces its rendered content, and the stub's persisted token estimate (the
+/// stub stands in for the folded result in the context total).
+struct Fold {
+    target_id: String,
+    stub: String,
+    token_estimate: Option<u64>,
+}
+
+/// Parse a `fold` entry's rebuild fields. `None` (skipped as malformed) when a
+/// required field is missing, mirroring the line-level leniency for
+/// truncated/garbled entries.
+fn parse_fold(value: &Value) -> Option<Fold> {
+    Some(Fold {
+        target_id: value.get("targetId").and_then(Value::as_str)?.to_string(),
+        stub: value.get("stub").and_then(Value::as_str)?.to_string(),
+        token_estimate: value.get("tokenEstimate").and_then(Value::as_u64),
+    })
+}
+
 /// Rebuild the provider-visible message list, replacing each compaction's
 /// covered inclusive id range with a single summary message in place of the
-/// first covered message.
+/// first covered message, then applying each fold's stub to any target message
+/// a compaction did not already cover (ADR-0048 precedence: compactions win).
 ///
 /// Coverage is keyed on durable message entry ids, not array positions, so the
 /// result is stable across reads. Multiple non-overlapping compactions apply
@@ -1164,17 +1234,20 @@ fn rebuild_with_compactions(
     path: &Path,
     entries: Vec<MessageEntry>,
     compactions: Vec<Compaction>,
+    folds: Vec<Fold>,
 ) -> Result<RebuiltContext> {
-    if compactions.is_empty() {
+    if compactions.is_empty() && folds.is_empty() {
         // saturating: tokenEstimate is read from disk; a corrupted/edited file
         // must not panic (debug) or wrap (release) the read, matching the rest
         // of this module's never-crash-on-bad-data stance.
         let context_tokens = entries
             .iter()
             .fold(0u64, |acc, e| acc.saturating_add(e.tokens));
-        // No compaction: every entry stays verbatim, so its durable id carries
-        // through 1:1 (legacy id-less entries stay `None`). Parallel to
-        // `messages` so a resumed session can compact the loaded prefix.
+        // No compaction and no fold: every entry stays verbatim, so its durable
+        // id carries through 1:1 (legacy id-less entries stay `None`). Parallel
+        // to `messages` so a resumed session can compact the loaded prefix. This
+        // is the byte-identical-when-absent path (ADR-0048): a session with no
+        // fold entries rebuilds exactly as it did before folds existed.
         let entry_ids = entries.iter().map(|e| e.id.clone()).collect();
         let messages = entries.into_iter().map(|e| e.message).collect();
         return Ok(RebuiltContext {
@@ -1230,6 +1303,33 @@ fn rebuild_with_compactions(
         summary_at[from] = Some((body, summary_tokens));
     }
 
+    // Folds apply AFTER compaction coverage (ADR-0048 precedence): a fold whose
+    // target lies in a covered range is a no-op, so a fold never overrides a
+    // range a compaction already covers. The stub (and its token estimate)
+    // replaces the folded result's rendered content at its own position; the
+    // message keeps its role/pairing and durable id, so a folded result stays
+    // coverable by a later compaction. An unknown target id is skipped with the
+    // same leniency the read path applies to other malformed data.
+    let mut fold_at: Vec<Option<(String, u64)>> = vec![None; entries.len()];
+    for fold in folds {
+        let Some(&idx) = index_of.get(&fold.target_id) else {
+            tracing::warn!(
+                target = %fold.target_id,
+                path = %path.display(),
+                "skipping fold for unknown message id"
+            );
+            continue;
+        };
+        // Compaction wins: a fold inside a covered range is a no-op.
+        if covered[idx] {
+            continue;
+        }
+        let stub_tokens = fold
+            .token_estimate
+            .unwrap_or_else(|| estimate_tokens(&fold.stub));
+        fold_at[idx] = Some((fold.stub, stub_tokens));
+    }
+
     let mut messages = Vec::new();
     // Parallel to `messages`: `None` at each summary position (a compaction
     // entry, never itself re-coverable) and the verbatim entry's durable id
@@ -1253,9 +1353,20 @@ fn rebuild_with_compactions(
             context_tokens = context_tokens.saturating_add(summary_tokens);
         }
         if !covered[i] {
-            context_tokens = context_tokens.saturating_add(entry.tokens);
-            messages.push(entry.message);
-            entry_ids.push(entry.id);
+            if let Some((stub, stub_tokens)) = fold_at[i].take() {
+                // Fold: replace only the result's rendered content with the
+                // deterministic stub, keeping the role/tool pairing and durable
+                // id so the pair invariant holds and the message stays coverable.
+                context_tokens = context_tokens.saturating_add(stub_tokens);
+                let mut folded = entry.message;
+                folded.content = stub;
+                messages.push(folded);
+                entry_ids.push(entry.id);
+            } else {
+                context_tokens = context_tokens.saturating_add(entry.tokens);
+                messages.push(entry.message);
+                entry_ids.push(entry.id);
+            }
         }
     }
     Ok(RebuiltContext {
@@ -1689,6 +1800,251 @@ mod tests {
             .find(|meta| meta.id == id)
             .expect("session id present in listing");
         store.open(&meta).unwrap()
+    }
+
+    /// A successful `read` tool-result the way Nexus persists it (ADR-0021): the
+    /// content is the success envelope naming the workspace-relative target.
+    fn read_result(call_id: &str, target: &str, body: &str) -> Message {
+        Message::tool_result(
+            call_id,
+            "read",
+            &json!({
+                "ok": true,
+                "content": body,
+                "metadata": { "target": target }
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn fold_replaces_result_content_but_keeps_the_call_pairing_and_id() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "SECRET-NEEDLE payload"))
+            .unwrap();
+        log.append_fold(
+            &result_id,
+            "[folded] superseded read of `a.rs`; re-read to recover.",
+            None,
+        )
+        .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        // No message is removed: the user turn and the (folded) tool result both
+        // remain, so the tool call/result pairing is intact.
+        assert_eq!(session.messages.len(), 2);
+        let folded = &session.messages[1];
+        assert_eq!(folded.role, Role::Tool);
+        assert_eq!(folded.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(folded.tool_name.as_deref(), Some("read"));
+        // The result content is the deterministic stub, not the original payload.
+        assert_eq!(
+            folded.content,
+            "[folded] superseded read of `a.rs`; re-read to recover."
+        );
+        assert!(!folded.content.contains("SECRET-NEEDLE"));
+        // The folded message keeps its durable id, so it stays coverable by a
+        // later compaction.
+        assert_eq!(session.entry_ids[1].as_deref(), Some(result_id.as_str()));
+    }
+
+    #[test]
+    fn needle_from_a_folded_read_survives_verbatim_behind_the_named_reference() {
+        // ADR-0045/0048 needle contract: a load-bearing needle from a folded
+        // read must survive either in context or behind a named reference that
+        // survives rebuild verbatim. The rebuilt stub NAMES the path (the named
+        // reference); the ORIGINAL turn stays verbatim in the transcript and is
+        // recoverable through the standalone-span reader (the #373 recall tool).
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read src/lib.rs")).unwrap();
+        let result_id = log
+            .append(&read_result(
+                "call_9",
+                "src/lib.rs",
+                "fn load_bearing_NEEDLE() {}",
+            ))
+            .unwrap();
+        log.append_fold(
+            &result_id,
+            "[folded] The `read` result for `src/lib.rs` was superseded and folded; \
+             re-read the file or recall the original.",
+            None,
+        )
+        .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Rebuilt context: the needle is gone from the result, but the stub names
+        // the recoverable path (the named reference).
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert!(!session.messages[1].content.contains("NEEDLE"));
+        assert!(session.messages[1].content.contains("src/lib.rs"));
+
+        // Recovery: the ORIGINAL turn survives verbatim in the transcript, so the
+        // recall span reader returns the needle unchanged.
+        let target_num = u64::from_str_radix(&result_id, 16).unwrap();
+        let span = read_span(&path, target_num, target_num).unwrap();
+        assert_eq!(span.len(), 1);
+        assert!(span[0].1.content.contains("fn load_bearing_NEEDLE() {}"));
+    }
+
+    #[test]
+    fn fold_outside_any_compacted_range_applies() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages[1].content, "[folded] stub for a.rs");
+    }
+
+    #[test]
+    fn fold_then_compact_over_the_same_range_lets_compaction_win() {
+        // Order (a): the fold is written FIRST, then a compaction covers a range
+        // that includes the folded target. The compaction must win: the covered
+        // range collapses to the summary and the fold stub never appears.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let first = log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        // Fold first.
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+            .unwrap();
+        // Then compact the range [first, result_id], covering the folded target.
+        log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        let joined = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("SUMMARY of the range"));
+        assert!(
+            !joined.contains("FOLD-STUB"),
+            "compaction must block the fold inside its covered range"
+        );
+        // The covered range collapsed to the single summary message.
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn compact_blocks_a_fold_written_inside_an_already_covered_range() {
+        // Order (b): the compaction is written FIRST, then a fold targets a
+        // message inside the already-covered range. Same outcome as order (a) --
+        // the compaction wins and the stub never appears -- proving precedence
+        // is order-independent.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let first = log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        // Compact first.
+        log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
+            .unwrap();
+        // Then attempt to fold a target inside the covered range.
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        let joined = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("SUMMARY of the range"));
+        assert!(
+            !joined.contains("FOLD-STUB"),
+            "a fold inside an already-compacted range must be a no-op"
+        );
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_honors_persisted_folds_regardless_of_current_setting() {
+        // The setting gates fold WRITING, not reading: a transcript that already
+        // carries fold entries rebuilds through them on every open, so a session
+        // folded under one setting reads identically under another. Rebuild has
+        // no access to the live setting -- it always applies persisted folds.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+            .unwrap();
+        drop(log);
+
+        // Reopen twice: the persisted fold is honored both times.
+        for _ in 0..2 {
+            let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+            assert_eq!(session.messages[1].content, "[folded] stub for a.rs");
+        }
+    }
+
+    #[test]
+    fn a_session_with_no_folds_rebuilds_unchanged() {
+        // Additive-optional persistence: with no fold entries the rebuild is
+        // byte-identical to the pre-fold behavior -- every message stays verbatim
+        // and no fold key touches the message/compaction entries on disk.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("hello")).unwrap();
+        log.append(&read_result("call_1", "a.rs", "verbatim body"))
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages[0].content, "hello");
+        assert!(session.messages[1].content.contains("verbatim body"));
+        // No `fold` line is present in the transcript.
+        let raw = lines(&session.meta.path);
+        assert!(raw.iter().all(|entry| entry["type"] != "fold"));
+    }
+
+    #[test]
+    fn a_fold_for_an_unknown_target_id_is_skipped_leniently() {
+        // A fold naming a message id that is not present must not crash the read
+        // (matching the read path's never-crash-on-bad-data stance) and must not
+        // alter any message.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("hello")).unwrap();
+        log.append_fold("deadbeef", "[folded] orphan stub", None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "hello");
     }
 
     #[test]

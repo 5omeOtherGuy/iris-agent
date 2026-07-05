@@ -82,6 +82,14 @@ pub(crate) struct Settings {
     /// [`Settings::context_token_budget`] (it can only choose who writes the
     /// summary, never where requests go), so a project file may tune it.
     pub(crate) compaction_summarizer: Option<String>,
+    /// Opt-in microcompaction (ADR-0048, #378): fold spent tool results
+    /// (superseded reads, latest-read-wins) to deterministic recoverable stubs
+    /// at a micro-watermark below the compaction budget. Absent/false -> off (no
+    /// folds are written). A cost/quality knob like `compactionSummarizer`: it
+    /// only trades in-context detail for workspace-recoverable detail and can
+    /// never redirect requests, so a project file may tune it. Gates fold
+    /// WRITING only; a persisted fold always rebuilds regardless of this value.
+    pub(crate) microcompaction: Option<bool>,
     /// Optional graceful soft cap on tool round-trips per turn. Absent (the
     /// default) leaves the agent loop unbounded: it runs while the model emits
     /// tool calls and stops naturally, with cancellation as the runaway guard.
@@ -252,6 +260,10 @@ impl Settings {
             // Summarizer choice is a cost/quality knob like the budget (it can
             // only pick who writes the summary text), so a project may tune it.
             compaction_summarizer: project.compaction_summarizer.or(self.compaction_summarizer),
+            // Microcompaction is a cost/quality knob like the summarizer (it only
+            // trades in-context detail for recoverable detail, never redirects a
+            // request), so a project may tune it; project value wins, else global.
+            microcompaction: project.microcompaction.or(self.microcompaction),
             // Prompt cache retention can affect privacy/cost, so keep it
             // global-only like provider/base-url and scoped model sets.
             prompt_cache_retention: self.prompt_cache_retention,
@@ -370,6 +382,14 @@ impl Settings {
             }
         }
     }
+
+    /// Whether opt-in microcompaction is enabled (ADR-0048, #378). Default off
+    /// (absent/false), so a session folds spent tool results only when the user
+    /// (or a project file) turns it on. The harness reads this once at startup;
+    /// a `/settings` toggle takes effect at the next turn boundary.
+    pub(crate) fn microcompaction(&self) -> bool {
+        self.microcompaction.unwrap_or(false)
+    }
 }
 
 /// Persist `provider`/`model` as the default model in the global settings file,
@@ -436,6 +456,13 @@ pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
 pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {
     let budget = budget.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
     update_global(&[("contextTokenBudget", Value::from(budget))])
+}
+
+/// Persist the opt-in microcompaction toggle in the global settings file
+/// (ADR-0048, #378). A boolean, so no clamping is needed; the `/settings` toggle
+/// and config parsing both validate at the boundary.
+pub(crate) fn save_microcompaction(enabled: bool) -> Result<()> {
+    update_global(&[("microcompaction", Value::Bool(enabled))])
 }
 
 /// Persist (or clear) the tool round-trip soft cap in the global settings file.
@@ -758,6 +785,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn microcompaction_defaults_off_and_a_project_may_tune_it() {
+        // Default off: an unset key means no folds are written (ADR-0048).
+        assert!(!Settings::default().microcompaction());
+
+        // Project-tunable cost/quality knob: a project file may turn it on.
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, "{}").unwrap();
+        fs::write(&project, r#"{ "microcompaction": true }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert!(settings.microcompaction());
     }
 
     #[test]
