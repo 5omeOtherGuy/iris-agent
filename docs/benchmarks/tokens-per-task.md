@@ -127,3 +127,78 @@ Repro (replay, no cost):
 cargo test --bin iris bench_tokens_per_task
 cargo test --bin iris tokens_per_task_replay_report -- --nocapture
 ```
+
+## Discussion
+
+What the numbers actually say, without spin:
+
+- **The reductions are real but small on this corpus (3.4-9.1%).** The lever
+  that survives the auto-preset/zero-prompt design is grep and find *grouping*,
+  and grouping only pays off in proportion to how much repeated file-path and
+  structural scaffolding the raw output would have carried. The three fixtures
+  are deliberately small and self-contained (so the mechanical checks stay
+  unambiguous), which under-exercises the exact conditions grouping rewards --
+  many hits spread across many files in shared directories. The single-digit
+  result is therefore a *floor* for a favorable workload, not a ceiling for the
+  feature. It is reported as measured.
+- **The biggest documented levers are structurally out of this experiment.** The
+  bash output filter (ADR-0037: 50-98% per class) and `read` skim (#337:
+  50-72%) are the large reducers, but the auto preset defers bash approval and
+  skim is opt-in, so neither can move an end-to-end, prompt-free, auto-approved
+  task. This benchmark measures the reduction that a *hands-off* agent loop gets
+  for free; the per-result benchmarks measure the rest. Both are true; neither
+  alone is the whole story.
+- **Replay is a plumbing proof, not a capability proof.** Because the tool-call
+  sequence is scripted, both arms complete by construction, so "100% success in
+  both arms" here means "the identical scripted fix applied and the reduced
+  output still carried every needle" -- not "a model chose the right calls from
+  reduced context." The needle-survival assertion closes the obvious hole (arm A
+  cannot pass while having dropped an actionable fact), but it cannot close the
+  reasoning hole. That is the honest boundary of the deterministic path, and it
+  is why the Milestone-2 gate does not flip on replay evidence alone.
+- **Two token sources, one honest split.** Replay uses a 4-bytes/token proxy
+  (ratios only); the headline path uses real provider usage records (absolute
+  tokens). They are never mixed in a single claim. The proxy is adequate for a
+  regression fence ("did arm A stop beating arm B?"); it is not adequate for a
+  headline number, which is exactly why the real path exists.
+
+Net: the replay path is a durable, zero-cost regression guard that the reduction
+plumbing keeps working and keeps preserving task-critical facts. The headline
+question Milestone 2 actually asks -- fewer tokens per *completed* task, with a
+real model, at no cost to success -- is not answered here and is not claimed.
+
+## Further research / further testing
+
+Ordered by how much each would strengthen the Milestone-2 claim:
+
+1. **Run the real-provider headline (the actual gate).** N >= 3 per cell, real
+   usage records, per-cell mean tokens-per-completed-task + success rate + spend.
+   This is the only path that proves a model completes from reduced context.
+   Blocker: operator spend authorization. Until then the gate stays open.
+2. **Grow the fixtures toward grouping's strength.** Add a search/triage workload
+   with many hits across many files in shared directories (dozens of matches,
+   deep trees) -- the regime where grep/find grouping compounds. This would show
+   whether the end-to-end lever is genuinely single-digit or just under-sampled
+   here. Keep the mechanical-check discipline (planted, unambiguous facts).
+3. **Add a bash-bearing arm under a non-auto preset.** To measure the ADR-0037
+   filter end-to-end (not just per-result), run a workload where the agent *is*
+   allowed to run `cargo test`, under an approve-all-but-floors config, and
+   assert zero *floor* violations instead of zero prompts. This widens coverage
+   to the largest lever at the cost of a more complex approval story; design the
+   contract before wiring it.
+4. **Replace the token proxy with a tokenizer on the replay path.** The
+   4-bytes/token heuristic is fine for a ratio fence but drifts from real BPE
+   segmentation. A committed tokenizer (matching the target model family) would
+   make the replay ratios trustworthy in absolute-ish terms and reduce the gap
+   to the headline path.
+5. **Track variance and turn count, not just mean tokens.** Reduced context can
+   change how many turns a task takes; a token win that costs an extra turn may
+   be net-neutral. The headline harness already records turns -- report the
+   distribution (min/median/max) once real data exists, and flag any arm-A turn
+   inflation as a finding.
+6. **Guard against a success-rate regression explicitly.** The most important
+   negative result would be arm A completing *fewer* real tasks than arm B
+   (reduction hid something the model needed). The headline harness must treat
+   any arm-A success drop as blocking; a dedicated adversarial fixture (a fact
+   that only survives if a specific reduction is conservative) would stress this
+   directly.

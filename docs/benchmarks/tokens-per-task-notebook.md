@@ -419,6 +419,35 @@ All 4 replay tests + the toggle test stay green after both fixes.
 
 ---
 
+## Entry 9 — Discussion, further-research, and an honest README update
+
+**DECISION — wrote Discussion + Further-research sections** into
+`tokens-per-task.md`. Discussion states the boundary plainly: the surviving
+lever (grep/find grouping) is small on this deliberately-small corpus, the big
+levers (bash filter, skim) are structurally out of the auto/zero-prompt
+experiment, and replay is a plumbing proof not a capability proof. Further-
+research is ordered by Milestone-2 leverage: (1) run the real headline (the
+actual gate), (2) grow fixtures toward grouping's strength, (3) add a
+bash-bearing arm under a non-auto preset, (4) swap the byte proxy for a real
+tokenizer, (5) report turn-count variance not just mean tokens, (6) an
+adversarial fixture that stresses success-rate regression.
+
+**DECISION — README updated, honestly, no headline claim.** Changed three
+spots: the Status clause, the Next bullet, and the Token-efficiency section's
+end-to-end paragraph. All three now say the SAME true thing: the benchmark
+(plan + replay harness + report) landed, replay shows the default arm winning
+3.4-9.1% with equal success and zero prompts and verbatim needle survival, BUT
+the real-provider confirmation is pending so the Milestone-2 gate stays open and
+no headline efficiency number is claimed. This is a status update, not the
+claim the DoD gates on real runs — the honesty line holds: replay evidence is
+reportable, a proven tokens-per-completed-task win is not, and I did not write
+one.
+
+**NEXT:** gate green; update PR #391; still awaiting operator go/no-go on the
+real-provider spend.
+
+---
+
 ## Entry 3 — Toggle mechanism + reduction semantics + real-run feasibility
 
 **OBSERVATION — the reduction seams and what "off" means.**
