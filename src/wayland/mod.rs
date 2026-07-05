@@ -845,6 +845,9 @@ impl<P: ChatProvider> Harness<P> {
             .expect("compaction callers check the session first");
         let compaction_id =
             log.append_compaction(&plan.from_id, &plan.to_id, &summary, Some(summary_tokens))?;
+        // Generation ordinal (ADR-0047), read right after the append that
+        // incremented it: the Nth compaction in this session reports N.
+        let generation = log.compaction_generation();
         tracing::info!(
             covered,
             from = %plan.from_id,
@@ -899,6 +902,7 @@ impl<P: ChatProvider> Harness<P> {
             original_tokens_estimate: original_tokens,
             summary_tokens_estimate: summary_tokens,
             budget: self.budget.unwrap_or(0),
+            generation,
         })?;
         Ok(Some(CompactionOutcome {
             covered,

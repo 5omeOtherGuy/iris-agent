@@ -74,6 +74,11 @@ pub(crate) struct SessionLog {
     /// Monotonic counter backing the next entry id, so ids are unique within
     /// this session by construction (no random draws, no collision check).
     next_seq: u32,
+    /// Count of `compaction` entries in this transcript so far, seeded from the
+    /// file on resume. The next compaction's generation ordinal (ADR-0047) is
+    /// this count plus one; derived from entry order, so a session without the
+    /// persisted field still counts correctly.
+    compactions: u32,
 }
 
 impl SessionLog {
@@ -127,6 +132,7 @@ impl SessionLog {
             id: id.to_string(),
             last_id: None,
             next_seq: 0,
+            compactions: 0,
         })
     }
 
@@ -163,6 +169,10 @@ impl SessionLog {
         token_estimate: Option<u64>,
     ) -> Result<String> {
         let id = self.next_id();
+        // Generation ordinal (ADR-0047): 1-based count of compactions in this
+        // session. Increment before writing so the Nth compaction persists N.
+        self.compactions += 1;
+        let generation = self.compactions;
         let entry = json!({
             "type": "compaction",
             "id": id,
@@ -176,6 +186,10 @@ impl SessionLog {
             // explicit null placeholder. Upgrade path = write the real estimate
             // here when auto-compaction/token budgeting lands; kind unchanged.
             "tokenEstimate": token_estimate,
+            // Additive optional field (ADR-0047): older readers ignore it and
+            // it is recomputable from compaction-entry order, so its absence
+            // never changes how a pre-ADR-0047 session rebuilds.
+            "generation": generation,
         });
         write_line(&mut self.file, &entry).with_context(|| {
             format!(
@@ -310,6 +324,7 @@ impl SessionLog {
             id: state.id,
             last_id: state.last_id,
             next_seq: state.next_seq,
+            compactions: state.compactions,
         })
     }
 
@@ -321,6 +336,15 @@ impl SessionLog {
     /// Path of the transcript file on disk.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Generation ordinal (ADR-0047) of the most recent compaction in this
+    /// session: the 1-based count of `compaction` entries written or seen so
+    /// far. `0` before the first compaction; equals the last-appended entry's
+    /// persisted `generation`. Callers read it right after `append_compaction`
+    /// to surface the ordinal on `CompactionApplied`.
+    pub(crate) fn compaction_generation(&self) -> u64 {
+        u64::from(self.compactions)
     }
 
     /// Generate the next entry id from the per-session counter.
@@ -806,6 +830,10 @@ struct ResumeState {
     /// Whether the file lacks a trailing newline (a truncated final fragment),
     /// so resume must terminate it before appending.
     needs_newline: bool,
+    /// Count of `compaction` entries seen, so the resumed log continues the
+    /// generation ordinal (ADR-0047) from entry order -- correct even for
+    /// sessions written before the persisted `generation` field existed.
+    compactions: u32,
 }
 
 /// Scan an existing transcript so [`SessionLog::resume`] can continue it.
@@ -832,6 +860,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         .to_string();
     let mut last_id = None;
     let mut count: u32 = 0;
+    let mut compactions: u32 = 0;
     let mut max_seq: Option<u32> = None;
     for line in lines {
         let Ok(text) = line else { continue };
@@ -851,6 +880,9 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
             | Some("taskLifecycle") => {}
             _ => continue,
         }
+        if value.get("type").and_then(Value::as_str) == Some("compaction") {
+            compactions += 1;
+        }
         count += 1;
         if let Some(entry_id) = value.get("id").and_then(Value::as_str) {
             last_id = Some(entry_id.to_string());
@@ -869,6 +901,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         last_id,
         next_seq,
         needs_newline,
+        compactions,
     })
 }
 
@@ -2162,6 +2195,97 @@ mod tests {
         // Token estimate is an explicit upgrade-safe placeholder until a token
         // convention exists.
         assert!(entry["tokenEstimate"].is_null());
+        // The first compaction in the session persists generation 1 (ADR-0047).
+        assert_eq!(entry["generation"], 1);
+    }
+
+    #[test]
+    fn append_compaction_increments_the_generation_ordinal() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let a = log.append(&Message::user("a")).unwrap();
+        let b = log.append(&Message::assistant("b")).unwrap();
+        let c = log.append(&Message::user("c")).unwrap();
+        log.append_compaction(&a, &a, "S1", None).unwrap();
+        assert_eq!(log.compaction_generation(), 1);
+        log.append_compaction(&b, &c, "S2", None).unwrap();
+        assert_eq!(log.compaction_generation(), 2);
+
+        let entries = lines(log.path());
+        let generations: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["type"] == "compaction")
+            .map(|e| &e["generation"])
+            .collect();
+        assert_eq!(generations, [&Value::from(1), &Value::from(2)]);
+    }
+
+    #[test]
+    fn resume_continues_the_compaction_generation_count() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let a = log.append(&Message::user("a")).unwrap();
+        log.append_compaction(&a, &a, "S1", None).unwrap();
+        assert_eq!(log.compaction_generation(), 1);
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Resume seeds the counter from the one prior compaction entry, so the
+        // next compaction continues at generation 2 rather than restarting.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        let b = resumed.append(&Message::user("b")).unwrap();
+        resumed.append_compaction(&b, &b, "S2", None).unwrap();
+        assert_eq!(resumed.compaction_generation(), 2);
+        drop(resumed);
+
+        let generations: Vec<Value> = lines(&path)
+            .into_iter()
+            .filter(|e| e["type"] == "compaction")
+            .map(|e| e["generation"].clone())
+            .collect();
+        assert_eq!(generations, [Value::from(1), Value::from(2)]);
+    }
+
+    #[test]
+    fn legacy_compaction_without_generation_rebuilds_unchanged() {
+        // A session written before ADR-0047 has no `generation` field on its
+        // compaction entry. Rebuild must be byte-for-byte unaffected by the new
+        // optional field: same messages, and the read never rewrites the file.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let leaf = log.append(&Message::user("gamma")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Hand-append a legacy compaction entry with no `generation` field.
+        let legacy = json!({
+            "type": "compaction",
+            "id": "deadbeef",
+            "parentId": leaf,
+            "timestamp": 1,
+            "createdAt": 1,
+            "coveredFrom": from,
+            "coveredTo": to,
+            "summary": "LEGACY",
+            "tokenEstimate": Value::Null,
+        });
+        let mut line = serde_json::to_string(&legacy).unwrap();
+        line.push('\n');
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let session = open_by_id(&store, &id);
+        assert_eq!(contents(&session), ["LEGACY", "gamma"]);
+        // Reading the legacy session did not rewrite it.
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
