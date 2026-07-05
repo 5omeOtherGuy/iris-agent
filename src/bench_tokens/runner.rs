@@ -13,7 +13,7 @@ use super::arms::Arm;
 use super::fixtures::materialize;
 use super::observer::{BenchObserver, ZeroPromptGate};
 use super::provider::ScriptedProvider;
-use super::workloads::{Outcome, Workload};
+use super::workloads::{ApprovalProfile, Outcome, Workload};
 
 /// JSONL run-record schema version. Bump when fields are added/renamed so an
 /// analyzer can branch on shape; readers must tolerate unknown extra fields.
@@ -72,6 +72,64 @@ pub(crate) fn run_replay_arm(workload: &Workload, arm: Arm) -> RunMetrics {
         provider_turns: observer.provider_turns.get(),
         approvals_consulted: gate.consulted.get(),
         transcript: agent.provider.final_transcript_text(),
+        outcome,
+    }
+}
+
+/// Outcome of a scripted run under `--dangerously-skip-permissions` -- the
+/// deterministic proof that ADR-0049 unlocks `bash` in the harness (the gate is
+/// bypassed, bash executes in the confined temp workspace, and its exit code is
+/// captured). Free and CI-safe: no real provider.
+pub(crate) struct ScriptedSkipRun {
+    pub(crate) approvals_consulted: bool,
+    pub(crate) dangerous_approvals: u32,
+    pub(crate) bash_exit_codes: Vec<i32>,
+    pub(crate) tool_result_bytes: u64,
+    pub(crate) outcome: Outcome,
+}
+
+/// Drive one workload x arm with the scripted replay provider under
+/// `Agent::with_skip_permissions(true)`, so a scripted `bash` call actually
+/// runs (the deny gate is bypassed). The denying gate is still installed so we
+/// can prove it was NOT consulted (the bypass fired first).
+pub(crate) fn run_scripted_skip_perms(workload: &Workload, arm: Arm) -> ScriptedSkipRun {
+    let workspace = materialize(workload.fixture);
+    assert!(
+        !workspace.path.starts_with(env!("CARGO_MANIFEST_DIR")),
+        "bench workspace must be a temp dir, not the repo: {}",
+        workspace.path.display()
+    );
+    let provider = ScriptedProvider::new((workload.script)());
+    let mut agent = Agent::new(provider, built_in_tools()).with_skip_permissions(true);
+    agent.set_approval_mode(ApprovalMode::Auto);
+
+    let state = RefCell::new(ToolState::new().with_reduce_output(arm.reduce()));
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        output_sink: None,
+        mutation_guard: None,
+        session_span: None,
+    };
+    let observer = BenchObserver::default();
+    let gate = ZeroPromptGate::default();
+    block_on(agent.submit_turn(
+        workload.prompt,
+        &observer,
+        &gate,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))
+    .expect("scripted skip-perms turn completes");
+
+    let outcome = (workload.check)(&workspace.path, &observer.final_text());
+    ScriptedSkipRun {
+        approvals_consulted: gate.consulted.get(),
+        dangerous_approvals: observer.dangerous_approvals.get(),
+        bash_exit_codes: observer.bash_exit_codes.borrow().clone(),
+        tool_result_bytes: observer.tool_result_bytes.get(),
         outcome,
     }
 }
@@ -188,6 +246,14 @@ pub(crate) fn run_real_cell(
 ) -> std::result::Result<RealRunRecord, String> {
     let workspace = materialize(workload.fixture);
     let cwd = workspace.path.clone();
+    // Confinement guard: the fixture always materializes into a temp dir, never
+    // the repo tree. Under skip-permissions bash runs here, so prove it can
+    // never touch the real workspace.
+    assert!(
+        !cwd.starts_with(env!("CARGO_MANIFEST_DIR")),
+        "bench workspace escaped to the repo tree: {}",
+        cwd.display()
+    );
     let tools = built_in_tools();
     let system_prompt = crate::wayland::system_prompt::assemble(&cwd, &tools);
     let settings = crate::config::Settings::load(&cwd).map_err(|e| e.to_string())?;
@@ -196,6 +262,11 @@ pub(crate) fn run_real_cell(
         .map_err(|e| format!("build provider: {e}"))?;
     let mut agent = Agent::new(provider, built_in_tools())
         .with_max_tool_roundtrips(settings.max_tool_roundtrips());
+    // Skip-permissions workloads (bash) bypass the approval gate for every
+    // gated call (ADR-0049); no-bash workloads keep the deny gate.
+    if matches!(workload.approval, ApprovalProfile::SkipPermissions) {
+        agent = agent.with_skip_permissions(true);
+    }
     agent.set_approval_mode(ApprovalMode::Auto);
 
     let state = RefCell::new(ToolState::new().with_reduce_output(arm.reduce()));

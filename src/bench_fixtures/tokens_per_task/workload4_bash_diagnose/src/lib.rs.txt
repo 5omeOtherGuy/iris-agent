@@ -1,0 +1,23 @@
+//! Token-budget ceiling used by the planner.
+
+/// The planner's hard cap on prompt tokens.
+pub const HARD_CAP: usize = 8192;
+
+/// Returns the token-budget ceiling the planner enforces.
+///
+/// BUG: this is off by one -- it returns one below the hard cap, so the
+/// exact-ceiling test fails.
+pub fn ceiling() -> usize {
+    HARD_CAP - 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ceiling_is_exact() {
+        // The ceiling must match the planner's hard cap exactly.
+        assert_eq!(ceiling(), HARD_CAP);
+    }
+}

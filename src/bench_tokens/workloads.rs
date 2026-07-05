@@ -16,6 +16,20 @@ pub(crate) struct Outcome {
     pub(crate) detail: String,
 }
 
+/// How a workload's tool calls are approved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalProfile {
+    /// Auto preset + a denying zero-prompt gate: only auto-safe tools
+    /// (read/grep/find/ls + clean edit) can run; a prompt means the run is
+    /// invalid. The no-bash workloads.
+    DenyGateNoPrompts,
+    /// `--dangerously-skip-permissions` (ADR-0049): the gate is bypassed for
+    /// every gated call, so `bash` can run (build/test loops). The denying
+    /// gate is still installed and asserted UN-consulted, and the dangerous
+    /// auto-approval is asserted to have fired. Confined to a temp workspace.
+    SkipPermissions,
+}
+
 pub(crate) struct Workload {
     pub(crate) name: &'static str,
     pub(crate) fixture: &'static str,
@@ -23,9 +37,12 @@ pub(crate) struct Workload {
     /// The scripted tool-call sequence the replay provider replays (real path
     /// ignores it; the real model chooses its own calls).
     pub(crate) script: fn() -> Vec<AssistantTurn>,
-    /// Mechanical success check run OUTSIDE the agent turn (harness-side), so
-    /// the agent never needs `bash`.
+    /// Mechanical success check run OUTSIDE the agent turn (harness-side) for
+    /// no-bash workloads; a bash workload may run its check via the agent's own
+    /// shell output instead.
     pub(crate) check: fn(&Path, &str) -> Outcome,
+    /// How this workload's tool calls are approved (deny-gate vs skip-perms).
+    pub(crate) approval: ApprovalProfile,
     /// Facts the tool outputs MUST surface verbatim for the task to be solvable
     /// from context. Asserted present in the transcript the agent saw in BOTH
     /// arms, so a reduction that dropped an actionable fact fails the run even
@@ -43,6 +60,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
                      commands; the test will be run for you.",
             script: script_fix_test,
             check: check_fix_test,
+            approval: ApprovalProfile::DenyGateNoPrompts,
             // The grep across files must surface the buggy symbol and the read
             // must surface the buggy expression the fix targets.
             needles: &["parse_len", "split_whitespace().count() - 1"],
@@ -55,6 +73,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
                      and edit to change them. Do not run any shell commands.",
             script: script_rename,
             check: check_rename,
+            approval: ApprovalProfile::DenyGateNoPrompts,
             // The grep must surface the identifier being renamed.
             needles: &["MAX_RETRIES"],
         },
@@ -66,12 +85,32 @@ pub(crate) fn workloads() -> Vec<Workload> {
                      reported. Answer in one sentence. Do not run any shell commands.",
             script: script_log_triage,
             check: check_log_triage,
+            approval: ApprovalProfile::DenyGateNoPrompts,
             // The reduced grep/read output must still carry the planted fact
             // (test name + both drift values), or the task is not solvable from
             // context in arm A.
             needles: &["ceiling_is_exact", "8192", "8191"],
         },
     ]
+}
+
+/// Bash-enabled workloads (require `--dangerously-skip-permissions`). Kept
+/// separate from `workloads()` so the deny-gate replay + no-bash headline paths
+/// never touch a bash workload. Phase 4: one read-only diagnosis task -- run
+/// the failing tests and report the failure facts; no file is mutated.
+pub(crate) fn bash_workloads() -> Vec<Workload> {
+    vec![Workload {
+        name: "bash-diagnose-test-failure",
+        fixture: "workload4_bash_diagnose",
+        prompt: "The crate's tests fail. Run the tests, read the failure, and report which \
+                 test failed and the exact left/right values it asserted. Answer in one \
+                 sentence. Do not edit any files.",
+        script: script_bash_diagnose,
+        check: check_bash_diagnose,
+        approval: ApprovalProfile::SkipPermissions,
+        // The reduced bash output must still carry the planted assertion values.
+        needles: &["8191", "8192"],
+    }]
 }
 
 // -- scripted tool-call sequences -------------------------------------------
@@ -145,6 +184,18 @@ fn script_rename() -> Vec<AssistantTurn> {
         "Renamed MAX_RETRIES to MAX_ATTEMPTS across config/retry.rs, net/client.rs, net/pool.rs, worker/runner.rs, and docs/notes.md.",
     ));
     turns
+}
+
+/// Scripted (deterministic) bash flow: read the buggy source in the confined
+/// workspace and exit non-zero. The exact command is cheap on purpose -- the
+/// deterministic gate test only proves the skip-permissions WIRING (gate
+/// bypassed, bash executed, non-zero exit captured); the real model chooses its
+/// own `cargo test` command in the live smoke.
+fn script_bash_diagnose() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("b", "bash", json!({ "command": "cat src/lib.rs; exit 3" })),
+        answer_turn("The failing test is ceiling_is_exact: it asserted left: 8191, right: 8192."),
+    ]
 }
 
 fn script_log_triage() -> Vec<AssistantTurn> {
@@ -252,6 +303,24 @@ fn check_log_triage(_workspace: &Path, final_text: &str) -> Outcome {
         Outcome {
             success: false,
             detail: format!("answer missing planted values (8192={has_left}, 8191={has_right})"),
+        }
+    }
+}
+
+/// Bash diagnosis: the model's answer must carry both planted assertion values
+/// (unique to this crate's failing test), so a generic answer fails.
+fn check_bash_diagnose(_workspace: &Path, final_text: &str) -> Outcome {
+    let has_left = final_text.contains("8191");
+    let has_right = final_text.contains("8192");
+    if has_left && has_right {
+        Outcome {
+            success: true,
+            detail: "answer carries both planted assertion values (8191/8192)".to_string(),
+        }
+    } else {
+        Outcome {
+            success: false,
+            detail: format!("answer missing planted values (8191={has_left}, 8192={has_right})"),
         }
     }
 }

@@ -56,9 +56,9 @@ mod replay {
     use super::arms::Arm;
     use super::runner::{
         RunMetrics, bench_log_path, bench_log_reset, bench_reasoning, model_specs, run_real_cell,
-        run_replay_arm, selection_for_spec,
+        run_replay_arm, run_scripted_skip_perms, selection_for_spec,
     };
-    use super::workloads::{Workload, workloads};
+    use super::workloads::{Workload, bash_workloads, workloads};
 
     /// The margin (in estimated tokens) arm A must beat arm B by, so the win is
     /// not a rounding artifact of the estimator.
@@ -320,5 +320,129 @@ mod replay {
                 );
             }
         }
+    }
+
+    /// Deterministic proof that `--dangerously-skip-permissions` (ADR-0049)
+    /// unlocks `bash` in the harness: the scripted bash call runs, the deny
+    /// gate is bypassed (never consulted), the dangerous auto-approval fires,
+    /// and the non-zero exit code + result bytes are captured. No real
+    /// provider -- runs in CI, in both arms.
+    #[test]
+    fn bash_wiring_skip_permissions() {
+        let workload = &bash_workloads()[0];
+        for arm in [Arm::Baseline, Arm::Defaults] {
+            let run = run_scripted_skip_perms(workload, arm);
+            assert!(
+                !run.approvals_consulted,
+                "[{}] deny gate was consulted -- skip-permissions did not bypass it first",
+                arm.label()
+            );
+            assert!(
+                run.dangerous_approvals >= 1,
+                "[{}] expected a ToolAutoApprovedDangerous event (bash under skip-perms)",
+                arm.label()
+            );
+            assert_eq!(
+                run.bash_exit_codes,
+                vec![3],
+                "[{}] bash must execute and report its exit code (3)",
+                arm.label()
+            );
+            assert!(
+                run.tool_result_bytes > 0,
+                "[{}] bash result bytes must enter context",
+                arm.label()
+            );
+            // The scripted answer carries the planted values, so the mechanical
+            // check passes -- this proves the check wiring, not output quality
+            // (that is the live smoke's job).
+            assert!(
+                run.outcome.success,
+                "[{}] scripted answer should satisfy the diagnosis check: {}",
+                arm.label(),
+                run.outcome.detail
+            );
+        }
+    }
+
+    /// Opt-in real-provider BASH smoke (Phase 4). Runs the read-only diagnosis
+    /// workload under `--dangerously-skip-permissions` so the real model runs
+    /// `bash` (e.g. `cargo test`) to find the failure, over the model matrix x
+    /// both arms x N=1. Double-gated: `IRIS_BENCH_REAL=1` AND
+    /// `IRIS_BENCH_DANGEROUS_OK=1` (it executes shell commands). Asserts the
+    /// deny gate is never consulted (the bypass fired). Run:
+    ///   IRIS_BENCH_REAL=1 IRIS_BENCH_DANGEROUS_OK=1 cargo test --bin iris \
+    ///     tokens_per_task_bash_smoke -- --ignored --nocapture
+    #[test]
+    #[ignore = "real-provider bash smoke: costs calls and runs bash; set IRIS_BENCH_REAL=1 and IRIS_BENCH_DANGEROUS_OK=1"]
+    fn tokens_per_task_bash_smoke() {
+        if std::env::var("IRIS_BENCH_REAL").ok().as_deref() != Some("1") {
+            eprintln!("skipping bash smoke: set IRIS_BENCH_REAL=1 (this run costs money)");
+            return;
+        }
+        if std::env::var("IRIS_BENCH_DANGEROUS_OK").ok().as_deref() != Some("1") {
+            eprintln!(
+                "skipping bash smoke: set IRIS_BENCH_DANGEROUS_OK=1 (this run executes bash under --dangerously-skip-permissions)"
+            );
+            return;
+        }
+        let specs = model_specs();
+        let reasoning = bench_reasoning();
+        let workload = &bash_workloads()[0];
+        let cwd = std::env::current_dir().expect("cwd");
+        bench_log_reset();
+        println!(
+            "bash smoke: workload={} reasoning={:?} models={} log={}",
+            workload.name,
+            reasoning,
+            specs.join(", "),
+            bench_log_path()
+        );
+        println!(
+            "| model | arm | reachable | success | turns | in tok | bash exits | dangerous | approvals | note |"
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|");
+        let mut consulted_any = false;
+        for spec in &specs {
+            let selection = match selection_for_spec(&cwd, spec, reasoning) {
+                Ok(sel) => sel,
+                Err(e) => {
+                    println!("| {spec} | - | no | - | - | - | - | - | - | select: {e} |");
+                    continue;
+                }
+            };
+            for arm in [Arm::Baseline, Arm::Defaults] {
+                match run_real_cell(spec, workload, arm, 1, &selection) {
+                    Ok(m) => {
+                        if m.approvals_consulted {
+                            consulted_any = true;
+                        }
+                        println!(
+                            "| {} | {} | yes | {} | {} | {} | {:?} | {} | {} | |",
+                            spec,
+                            m.arm.label(),
+                            m.outcome.success,
+                            m.turns,
+                            m.input_tokens,
+                            m.bash_exit_codes,
+                            m.dangerous_approvals,
+                            m.approvals_consulted,
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "| {} | {} | no | - | - | - | - | - | - | {} |",
+                            spec,
+                            arm.label(),
+                            e
+                        )
+                    }
+                }
+            }
+        }
+        assert!(
+            !consulted_any,
+            "a bash smoke run consulted the deny gate; skip-permissions must bypass it"
+        );
     }
 }
