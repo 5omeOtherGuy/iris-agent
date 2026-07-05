@@ -680,6 +680,33 @@ pub(crate) struct Screen {
     /// since it cannot carry OSC 8), so a mouse click resolves to a target via
     /// [`Screen::pager_link_at`].
     pub(crate) pager_links: Vec<crate::ui::hyperlink::LinkRegion>,
+    /// Session-scoped fold/compaction accounting for the `/context` breakdown
+    /// (issue #400, design §5.1): accumulated from the display-event stream in
+    /// [`Screen::apply`]. Covers THIS process's events only -- reductions from
+    /// a prior process are visible structurally (stubs/summaries in context)
+    /// but their reclaimed mass is not re-derived.
+    pub(crate) context_accounting: ContextAccounting,
+}
+
+/// Session-scoped reduction totals for the `/context` breakdown (issue #400):
+/// every fold batch with its trigger tag, and every compaction's before/after
+/// estimates, as reported by the runtime events (never fabricated).
+#[derive(Debug, Default)]
+pub(crate) struct ContextAccounting {
+    /// One entry per fold flush: `(trigger code, folds, reclaimed tokens)`.
+    pub(crate) fold_batches: Vec<(&'static str, usize, u64)>,
+    /// One entry per compaction: `(original tokens, summary tokens)`.
+    pub(crate) compactions: Vec<(u64, u64)>,
+}
+
+impl ContextAccounting {
+    /// Total tokens reclaimed by fold flushes this session.
+    pub(crate) fn folded_reclaimed(&self) -> u64 {
+        self.fold_batches
+            .iter()
+            .map(|(_, _, reclaimed)| *reclaimed)
+            .fold(0, u64::saturating_add)
+    }
 }
 
 /// `/find` state: the query plus the current match position. Match lines are
@@ -731,6 +758,7 @@ impl Screen {
             search: None,
             reveal_line: None,
             pager_links: Vec::new(),
+            context_accounting: ContextAccounting::default(),
         }
     }
 
@@ -1038,6 +1066,29 @@ impl Screen {
             // total.
             footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
+        }
+        // Accumulate the session-scoped reduction accounting for `/context`
+        // (issue #400): fold batches with their trigger tags, and compaction
+        // before/after estimates, straight from the runtime events.
+        match &event {
+            UiEvent::FoldApplied {
+                folds,
+                reclaimed_tokens_estimate,
+                trigger,
+            } => self.context_accounting.fold_batches.push((
+                trigger.code(),
+                *folds,
+                *reclaimed_tokens_estimate,
+            )),
+            UiEvent::CompactionApplied {
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                ..
+            } => self
+                .context_accounting
+                .compactions
+                .push((*original_tokens_estimate, *summary_tokens_estimate)),
+            _ => {}
         }
         // Advance the always-visible work phase from the display-event stream.
         // Approval transitions are owned by `show_approval`/`clear_approval`, so

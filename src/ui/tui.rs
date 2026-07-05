@@ -63,7 +63,7 @@ pub(crate) use overlay::{FocusTarget, overlay_box};
 use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
-pub(crate) use screen::{ApprovalPolicy, Screen};
+pub(crate) use screen::{ApprovalPolicy, ContextAccounting, Screen};
 pub(crate) use screen::{BarSegment, session_bar_hit};
 use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]

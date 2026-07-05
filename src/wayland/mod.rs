@@ -973,10 +973,25 @@ impl<P: ChatProvider> Harness<P> {
     }
 
     /// Detected-but-unflushed folds at the current boundary, for the context
-    /// accounting surface and hold-path tests (issue #400). Derived state:
-    /// recomputed, never stored. The accounting surface is the non-test
-    /// consumer; until it lands, only the hold-path tests read it.
-    #[allow(dead_code)]
+    /// accounting surface (`/context`) and hold-path tests (issue #400):
+    /// `(count, reclaimable token estimate)` -- the mass the pending stubs
+    /// would free (original bodies minus stubs). Derived state: recomputed,
+    /// never stored.
+    pub(crate) fn pending_fold_stats(&self) -> (usize, u64) {
+        let messages = self.agent.messages();
+        let plans = self.pending_folds();
+        let reclaimable = plans
+            .iter()
+            .map(|plan| {
+                estimate_tokens(&messages[plan.index].content)
+                    .saturating_sub(estimate_tokens(&plan.stub))
+            })
+            .fold(0u64, u64::saturating_add);
+        (plans.len(), reclaimable)
+    }
+
+    /// Detected-but-unflushed fold count (see [`Self::pending_fold_stats`]).
+    #[cfg(test)]
     pub(crate) fn pending_fold_count(&self) -> usize {
         self.pending_folds().len()
     }
