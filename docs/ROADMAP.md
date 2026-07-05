@@ -812,6 +812,34 @@ Potential scope:
   auto-compaction. Deferred (outside #55): provider-generated summaries,
   branch-aware compaction, rollback, a manual TUI/CLI `/compact` command, and
   background/offloaded compaction.]
+  Recoverable-context stack + compaction benchmark (epic
+  [#379](https://github.com/5omeOtherGuy/iris-agent/issues/379), gate issue
+  [#372](https://github.com/5omeOtherGuy/iris-agent/issues/372),
+  [ADR-0045](adr/0045-benchmark-compaction-on-task-success-and-retention.md),
+  accepted). The recoverable-context work landed: coverable resumed prefixes and
+  resume ids (#375/#377), the compaction generation ordinal (#374/ADR-0047),
+  deterministic structured carry (ADR-0044), the mid-session recall tool
+  (#373/ADR-0046), and opt-in microcompaction folds (#378/ADR-0048). The
+  compaction benchmark now measures four summarizer arms on the deterministic
+  fake-provider lane through the production seam -- `provider`, `excerpts`,
+  `provider+carry`, and `provider+carry+microcompaction` -- with token deltas
+  reported as ratios (`bench_support::est_tokens`) and minimum-reduction bars
+  test-asserted. Each arm clears a 60% covered-range reduction bar on its
+  scenario; provider and excerpts converge on a single-message covered range and
+  separate as the range grows (excerpts/provider summary tokens climb ~1.0 ->
+  ~4.6 from one message to ten turns). Retention is split into retained
+  (verbatim in rebuilt context, e.g. carry paths) versus
+  recoverable-behind-reference (folded or compacted, reachable via a stub path or
+  recall handle), each asserted separately. Reported dimensions: compaction
+  generation, covered-range size, and cache economics -- the cache-hit-eligible
+  covered-range start (only generation 1 rides the live cached prefix) and the
+  retained-tail rewrite mass are measured, while the ProviderUsage-derived
+  cache-hit rate and cache-write amplification are documented methodology with
+  measurement pending a recorded live lane (never fabricated). Report:
+  `docs/benchmarks/issue-372-compaction-retention-slice-b.md`. Deferred (still
+  open, outside #372): the over-budget-no-coverable-range floor,
+  estimate-vs-actual token calibration, and provider-native context-management
+  interplay.]
 - Comparison against naive transcript-passing.
 - Native bash output filtering
   ([#336](https://github.com/5omeOtherGuy/iris-agent/issues/336),

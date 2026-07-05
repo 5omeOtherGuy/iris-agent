@@ -1,7 +1,7 @@
 # ADR-0045: Benchmark compaction on task success and load-bearing-detail retention
 
 **Date**: 2026-07-04
-**Status**: proposed
+**Status**: accepted
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context
@@ -60,8 +60,16 @@ compaction seam.
   token-efficiency-benchmark). Tokens are ratios via `bench_support::est_tokens`; no absolute
   counts as fact.
 
-This ADR defines the gate shape. Measured results land with the benchmark implementation;
-until then the claim stays a goal (skill: write-documentation, Claims).
+This ADR defines the gate shape. Measured results have landed: the benchmark implements all
+four arms on the deterministic fake-provider lane through the production seam, with the token
+deltas as ratios and the retention needles asserted; see
+`docs/benchmarks/issue-372-compaction-retention.md` (slice A: the needle contract and the two
+base arms) and `docs/benchmarks/issue-372-compaction-retention-slice-b.md` (slice B: the carry
+and microcompaction arms, the generation / covered-range-size / cache-economics dimensions,
+and the retained vs. recoverable-behind-reference split). The two ProviderUsage-derived
+cache-economics numbers stay documented methodology with measurement pending a recorded live
+lane -- the fake-provider lane exposes no cache read/write splits, so they are never
+fabricated.
 
 ## Alternatives Considered
 

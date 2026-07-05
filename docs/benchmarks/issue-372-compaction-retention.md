@@ -36,11 +36,18 @@ producing a self-fulfilling pass.
 
 | class | tokens before | tokens after | reduction | via |
 |---|---|---|---|---|
-| compaction/excerpts | 405 | 55 | 86% | excerpts |
-| compaction/provider | 405 | 55 | 86% | provider |
+| compaction/excerpts | 405 | 94 | 77% | excerpts |
+| compaction/provider | 405 | 92 | 77% | provider |
 
-provider/excerpts summary token ratio: 1.00 (55 vs 55 est tokens).
+provider/excerpts summary token ratio: 0.98 (92 vs 94 est tokens).
 Auto-compactions fired: excerpts = 1, provider = 1.
+
+These numbers are 77%, not the 86% this table first recorded: the recall
+reference (ADR-0046, #373) now rides inside every rebuilt summary, adding a
+fixed ~38-token marker to both arms. The marker is load-bearing (it is how the
+model reaches the covered originals), so it is counted, not stripped. Slice B
+(`issue-372-compaction-retention-slice-b.md`) treats that marker as the summary
+floor when it reads the same lane.
 
 ## Reading guide
 
@@ -49,7 +56,7 @@ Auto-compactions fired: excerpts = 1, provider = 1.
   leak into the retained tail. This is the pass/fail contract; a summarizer
   that drops a load-bearing fact fails here, deterministically.
 - **Asserted reduction bars** (`each_arm_clears_the_minimum_reduction_bar`):
-  each arm shrinks the covered range by ≥ 60% (both clear it at 86% today).
+  each arm shrinks the covered range by ≥ 60% (both clear it at 77% today).
   Bars are minimums, never exact figures; a summarizer regression that stops
   compressing the covered range trips it.
 - **Cross-arm ratio bound** (`provider_arm_stays_within_a_bounded_ratio_of_excerpts`):
@@ -66,11 +73,13 @@ Auto-compactions fired: excerpts = 1, provider = 1.
   (`[auto-compacted summary ...]`). If provider summarization silently fell
   back to excerpts, the provider/excerpts ratio would be an
   excerpts-vs-excerpts comparison — this guard fails it instead.
-- Both arms report an identical 86% here because the covered range is a single
-  large message: the `excerpts` arm truncates it to a bounded excerpt and the
-  `provider` arm returns a short structured handoff of comparable size. The
-  arms diverge on retention *quality* (structured handoff vs. truncated raw),
-  which the needles guard, not on token size in this covered-range shape.
+- Both arms report ~77% here because the covered range is a single large
+  message: the `excerpts` arm truncates it to a bounded excerpt and the
+  `provider` arm returns a short structured handoff of comparable size, and both
+  carry the same recall marker. The arms diverge on retention *quality*
+  (structured handoff vs. truncated raw), which the needles guard, not on token
+  size in this covered-range shape. Slice B measures where they separate on
+  covered-range size.
 
 ## Measurement conditions
 
@@ -79,9 +88,13 @@ budget, so the covered range, both summaries, and every ratio are reproducible
 in CI. Tokens are `bench_support::est_tokens` estimates (4 bytes/token); no
 absolute count is quoted as fact.
 
-## Deferred to slice B (ADR-0045, #372)
+## Slice B (ADR-0045, #372) — now built
 
-Named here so the gate shape is on record; not built in this slice:
+The items below were deferred from slice A and are now measured in
+`issue-372-compaction-retention-slice-b.md`: the `provider + carry` and
+`provider + carry + microcompaction` arms, the generation / covered-range-size /
+cache-economics dimensions, and the retained vs. recoverable-behind-reference
+split. Original slice-A framing kept for the record:
 
 - **Arms**: `provider + structured carry` (ADR-0044) and `provider + carry +
   microcompaction` (ADR-0048, after #378).
