@@ -88,17 +88,35 @@ Reading the numbers honestly:
 
 Status: **not yet run.** The harness is wired
 (`bench_tokens_per_task::replay::tokens_per_task_headline`, `#[ignore]`d and
-additionally gated on `IRIS_BENCH_REAL=1`), but a real run spends money against
-the OpenAI Codex provider (~18 multi-turn sessions for N=3 x 3 workloads x 2
-arms), which is an operator-authorized action. Until it is run and shows arm A
-winning with no success regression, **the README token-efficiency claim does not
-ship and the ROADMAP Milestone-2 gate is not marked satisfied** (honesty over
-hype, per the issue and ADR-0036).
+additionally gated on `IRIS_BENCH_REAL=1`), but a real run spends money against a
+real provider (~18 multi-turn sessions for N=3 x 3 workloads x 2 arms), which is
+an operator-authorized action. Until it is run and shows arm A winning with no
+success regression, **the README token-efficiency claim does not ship and the
+ROADMAP Milestone-2 gate is not marked satisfied** (honesty over hype, per the
+issue and ADR-0036).
 
-Repro (costs money):
+**Provider is not fixed to Codex.** `run_real_arm` builds the provider from the
+resolved config (`build_provider(&selection, ..)`), so the cell runs whichever
+provider/model the config selects. Codex (`gpt-5.5`) is only the *default*
+(`ProviderId::DEFAULT`); Anthropic (`claude-sonnet-4-6`) and Antigravity are
+equally wired, each with its own `record_usage`, so a Claude cell needs only
+Anthropic auth + a config/model override -- no harness change. Because output
+reduction interacts with a model's tokenizer and its willingness to work from
+compact context, the headline SHOULD be run on at least Codex AND Claude; a
+cross-provider win is a materially stronger Milestone-2 result than either alone.
+
+Repro (costs money) -- run once per provider you want a cell for:
 
 ```
+# Default provider (Codex today):
 IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 \
+  cargo test --bin iris tokens_per_task_headline -- --ignored --nocapture
+
+# Claude cell: select the Anthropic provider first (needs Anthropic auth), via
+# either the settings file ("default_provider": "anthropic") or the
+# ANTHROPIC_API_KEY env fallback; optionally pin IRIS_MODEL=claude-sonnet-4-6.
+# Then run the SAME test -- the harness reads the resolved selection.
+ANTHROPIC_API_KEY=... IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 \
   cargo test --bin iris tokens_per_task_headline -- --ignored --nocapture
 ```
 
@@ -171,10 +189,17 @@ real model, at no cost to success -- is not answered here and is not claimed.
 
 Ordered by how much each would strengthen the Milestone-2 claim:
 
-1. **Run the real-provider headline (the actual gate).** N >= 3 per cell, real
-   usage records, per-cell mean tokens-per-completed-task + success rate + spend.
-   This is the only path that proves a model completes from reduced context.
-   Blocker: operator spend authorization. Until then the gate stays open.
+1. **Run the real-provider headline (the actual gate), on more than one
+   provider.** N >= 3 per cell, real usage records, per-cell mean
+   tokens-per-completed-task + success rate + spend. This is the only path that
+   proves a model completes from reduced context. Run at least **Codex
+   (`gpt-5.5`) AND Claude (`claude-sonnet-4-6`)** -- the harness is
+   provider-agnostic (it builds from the resolved config), and reduction
+   interacts with each model's tokenizer and its tolerance for compact context,
+   so a per-provider table is the honest shape and a cross-provider win is a
+   materially stronger result. Blocker: operator spend authorization (and, for
+   Claude, adding Anthropic auth -- only Codex/Antigravity are authed today).
+   Until then the gate stays open.
 2. **Grow the fixtures toward grouping's strength.** Add a search/triage workload
    with many hits across many files in shared directories (dozens of matches,
    deep trees) -- the regime where grep/find grouping compounds. This would show

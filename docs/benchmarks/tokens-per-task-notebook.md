@@ -448,6 +448,41 @@ real-provider spend.
 
 ---
 
+## Entry 10 — "Why only Codex, not Claude?" (good catch)
+
+**QUESTION (reviewer):** why is the headline framed around OpenAI Codex and not
+Anthropic/Claude?
+
+**OBSERVATION — ground truth from code, not memory.** The real harness is
+provider-AGNOSTIC: `run_real_arm` builds via `build_provider(&selection, ..)`
+where `selection = ModelSelection::resolve(&Settings::load())`, so the cell runs
+whichever provider the config selects. Anthropic is fully wired
+(`ProviderId::Anthropic`, default `claude-sonnet-4-6`, its own `record_usage` in
+`anthropic_messages.rs`, `api.anthropic.com`). Provider precedence:
+`settings.default_provider` -> env fallback (`OPENAI_API_KEY` ->
+`ANTHROPIC_API_KEY` -> ...) -> `ProviderId::DEFAULT` (= Codex). `IRIS_MODEL`
+sets only the model string, NOT the provider.
+
+**Why my docs read "Codex":** (1) Codex is `ProviderId::DEFAULT`; (2) local
+`~/.iris/auth.json` has only `antigravity` + `openai-codex` (no `anthropic`), so
+a Claude run needs auth added; (3) a STALE note in the primary AGENTS.md ("Iris's
+only provider today is OpenAI Codex Responses") that the code contradicts. None
+is a design limit.
+
+**DEVIATION — corrected the over-narrowing.** Fixed the one report line that
+said "the OpenAI Codex provider" (implying hardcoded) to state the harness is
+provider-agnostic; added an accurate Claude repro (select Anthropic via
+`default_provider`/`ANTHROPIC_API_KEY`, not a fabricated `IRIS_MODEL=provider:model`
+syntax I first wrote and then verified against `selection.rs` was wrong); and
+upgraded Further-research point 1 to require Codex AND Claude cells, since
+reduction interacts with each model's tokenizer + compact-context tolerance.
+Flagged the stale AGENTS.md note to the operator rather than editing it (out of
+this PR's scope).
+
+**NEXT:** gate green; push to PR #391.
+
+---
+
 ## Entry 3 — Toggle mechanism + reduction semantics + real-run feasibility
 
 **OBSERVATION — the reduction seams and what "off" means.**
