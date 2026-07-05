@@ -1216,6 +1216,64 @@ Open design question: pager scrollbar vs text indicators
 ([#326](https://github.com/5omeOtherGuy/iris-agent/issues/326)) — decision
 before code.
 
+## Live-streaming — Codex-grade TUI streaming
+
+**Status: shipped (2026-07-05, PRs
+[#390](https://github.com/5omeOtherGuy/iris-agent/pull/390),
+[#396](https://github.com/5omeOtherGuy/iris-agent/pull/396),
+[#398](https://github.com/5omeOtherGuy/iris-agent/pull/398),
+[#399](https://github.com/5omeOtherGuy/iris-agent/pull/399),
+[#402](https://github.com/5omeOtherGuy/iris-agent/pull/402)).**
+Five slices, each worktree → gate → pre-merge review → squash-merge. Closes
+[#87](https://github.com/5omeOtherGuy/iris-agent/issues/87) (streamed markdown
+snapped to formatted on finalize); the deferred #90 session-path advances by its
+tool-input seam only — the live patch-preview UI stays deferred.
+
+**Goal:** the TUI streams assistant text, reasoning, and tool-call construction
+smoothly — no raw-then-snap reflow, never a blank status line — while keeping the
+single authoritative commit-to-scrollback and the security invariants.
+
+Slices, in order:
+
+- **Assistant-message stream controller**
+  ([#87](https://github.com/5omeOtherGuy/iris-agent/issues/87), PR
+  [#390](https://github.com/5omeOtherGuy/iris-agent/pull/390)) — newline-gated
+  collector + adaptive paced drain + one mutable active tail + table holdback,
+  in `src/ui/tui/streaming/`. A streamed markdown table no longer reflows on
+  finalize. The chunking policy is lifted from Codex (Apache-2.0, attributed in
+  `NOTICE` + per-file SPDX).
+- **Provider-neutral live reasoning deltas**
+  ([ADR-0050](adr/0050-stream-reasoning-summary-deltas.md), PR
+  [#396](https://github.com/5omeOtherGuy/iris-agent/pull/396)) — reasoning
+  *summary* deltas stream into a live thinking rail; redacted reasoning text is
+  never rendered or reconstructed
+  ([ADR-0016](adr/0016-preserve-provider-reasoning-continuity-in-flattened-transcripts.md));
+  the final block is persisted exactly once; degrades to the block rail when a
+  provider streams no deltas. Nexus + Mimir (OpenAI Codex Responses) + TUI.
+- **Freeform tool-input delta seam**
+  ([ADR-0039](adr/0039-freeform-tool-input-deltas-are-display-only.md), PR
+  [#398](https://github.com/5omeOtherGuy/iris-agent/pull/398)) — display-only
+  tool-input deltas that never enter provider context; approval and execution
+  use only the completed canonical `ToolCall`. Inert until a freeform tool
+  (`apply_patch`/V4A) exists to render, so the live patch-preview UI stays
+  deferred ([#90](https://github.com/5omeOtherGuy/iris-agent/issues/90)).
+- **Always-visible work-phase state machine** (PR
+  [#399](https://github.com/5omeOtherGuy/iris-agent/pull/399)) — a UI-owned
+  `WorkPhase` (`src/ui/tui/activity.rs`) drives a provider-neutral status label
+  from turn start through thinking / answering / running tool / approval /
+  finishing, so the header is never blank or misleading. The approval prompt
+  stays the primary surface (no competing working animation).
+- **Ordering, cancellation, pager hardening** (PR
+  [#402](https://github.com/5omeOtherGuy/iris-agent/pull/402)) — regression tests
+  locking the invariants: a tool never renders before the preceding streamed
+  lines (FIFO), cancellation commits the partial exactly once and clears the
+  tail/queue, the pager visible total counts the active tail, and history trim is
+  held while a stream or tool is active. Test-only.
+
+Gate: every pane-rendering change carries frame assertions; the `--plain` path is
+unaffected; Codex-derived files carry Apache-2.0 SPDX + `NOTICE` while the repo
+stays MIT.
+
 ## Architecture work — Tier-Boundary Enforcement
 
 **Goal:** make the code match the three-tier ownership split in
