@@ -75,6 +75,11 @@ pub(super) const DEFAULTS: &[Default] = &[
         body: FILE_LINKS,
     },
     Default {
+        name: "compaction_recall",
+        slot: Some(11),
+        body: COMPACTION_RECALL,
+    },
+    Default {
         name: "tool_use",
         slot: None,
         body: TOOL_USE,
@@ -151,6 +156,10 @@ No Mermaid: never write `graph TD`, `sequenceDiagram`, or `mermaid` fences.
                      ╰───────╯"#;
 
 const FILE_LINKS: &str = r#"Link every file you mention when the interface supports file links: fluent Markdown — `[display text](file:///absolute/path#L10-L20)` — never a raw `file://` URL as visible text. URL-encode specials: space → `%20`, `(` → `%28`, `)` → `%29`. Example: "Session setup lives in [bootstrap](file:///home/dev/web%20app/%28core%29/bootstrap.ts#L8-L19).""#;
+
+const COMPACTION_RECALL: &str = r#"When the context grows large, an earlier stretch of this conversation is compacted: the original turns are replaced by a short summary that begins with "[compacted summary ...]" or "[auto-compacted summary ...]", sometimes followed by a "[files touched or read in the compacted range]" list and a "[recall] ... recall(handle="...")" reference. The originals are not lost -- they are stored durably and retrievable on demand.
+
+Use the recall tool when the summary dropped a specific detail you now need (an exact path, symbol, value, or decision). Pass the handle from the recall reference. Search first with a `pattern` to locate where the detail lives -- it returns matching turns with their entry ids -- then do a windowed read (offset/limit, or a from/to entry-id span) targeting the hit. Do not page the whole range back in: that re-inflates the context compaction just reduced. Recall retrieves on demand; it does not un-compact, and it never rewrites live context."#;
 
 const TOOL_USE: &str = r#"Use context first; reach for a tool when it would change your answer — never guess what a tool can tell you. Run independent read-only calls in parallel; never parallelize edits to the same file. Don't re-read content you already have.
 

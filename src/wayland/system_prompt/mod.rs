@@ -75,6 +75,11 @@ const ANCHOR_TOOL_USE: &str = "tool_use";
 const GEN_AVAILABLE_TOOLS: &str = "available_tools";
 /// Generated tool-tail block: the tool guidelines.
 const GEN_TOOL_GUIDELINES: &str = "available_tool_guidelines";
+/// Tool-gated fragment: the recall guidance (ADR-0046) documents the compaction
+/// markers and when to recall, and ships only when the recall tool is actually
+/// registered -- so a build without the tool never advertises an absent
+/// affordance.
+const FRAGMENT_COMPACTION_RECALL: &str = "compaction_recall";
 
 /// Project-doc filenames discovered per directory, in priority order (first
 /// existing wins for that directory). Mirrors pi's candidate list.
@@ -131,6 +136,14 @@ fn build_prompt(
     let identity = take_anchor(&mut fragments, ANCHOR_IDENTITY);
     let tool_use = take_anchor(&mut fragments, ANCHOR_TOOL_USE);
     fragments.retain(|f| f.name != GEN_AVAILABLE_TOOLS && f.name != GEN_TOOL_GUIDELINES);
+    // Tool-gated fragments render only when their tool is in the live registry
+    // (ADR-0046): drop the recall guidance when recall is not registered.
+    if tools
+        .by_name(crate::tools::recall::RECALL_TOOL_NAME)
+        .is_none()
+    {
+        fragments.retain(|f| f.name != FRAGMENT_COMPACTION_RECALL);
+    }
     let middles = order_middles(fragments);
 
     let mut blocks: Vec<String> = Vec::new();

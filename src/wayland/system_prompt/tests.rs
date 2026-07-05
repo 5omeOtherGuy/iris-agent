@@ -258,6 +258,7 @@ fn available_tools_lists_every_registered_tool_with_the_guardrail() {
         "find",
         "ls",
         "read_output",
+        "recall",
     ] {
         assert!(body.contains(&format!("- {name}:")), "missing tool {name}");
     }
@@ -273,6 +274,26 @@ fn available_tools_preserves_registration_order() {
     let bash_at = body.find("- bash:").unwrap();
     let ls_at = body.find("- ls:").unwrap();
     assert!(read_at < bash_at && bash_at < ls_at);
+}
+
+#[test]
+fn recall_fragment_renders_only_when_the_recall_tool_is_registered() {
+    let workspace = Path::new("/tmp/recall-fragment-test");
+    // Registered (the full built-in set includes recall): the fragment renders,
+    // documenting the marker and the `recall(handle=...)` affordance.
+    let with_recall = assemble_defaults(workspace, &built_in_tools());
+    assert!(
+        with_recall.contains("<compaction_recall>"),
+        "recall fragment must render when the tool is registered"
+    );
+    assert!(with_recall.contains("recall(handle="));
+    // Not registered: the fragment must be absent, so no build advertises an
+    // affordance the model cannot invoke (ADR-0046 / ADR-0014).
+    let without_recall = assemble_defaults(workspace, &Tools::new(Vec::new()));
+    assert!(
+        !without_recall.contains("<compaction_recall>"),
+        "recall fragment must not render when the tool is absent"
+    );
 }
 
 #[test]

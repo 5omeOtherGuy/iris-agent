@@ -3107,6 +3107,66 @@ fn oversized_tool_output_is_stored_behind_a_handle_and_compacted_in_context() ->
 }
 
 #[test]
+fn oversized_recall_output_is_offloaded_behind_a_handle() -> Result<()> {
+    // ADR-0046 x ADR-0011: a recall result that is still oversized after
+    // windowing must offload through the SAME central tool-result path as any
+    // other big output, not dump the whole covered range into context. Seed a
+    // large covered-range blob into the session store, then drive a wide recall.
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+
+    // 100 turns of ~800 bytes each: a full-window recall exceeds the 50 KiB
+    // inline threshold, so the central offload stores it behind a handle.
+    let messages: Vec<Message> = (0..100)
+        .map(|n| Message::user(&format!("turn {n} :: {}", "detail ".repeat(120))))
+        .collect();
+    let ids: Vec<Option<String>> = (0..100).map(|n| Some(format!("{n:02x}"))).collect();
+    let blob = crate::tools::recall::serialize_covered(&messages, &ids, "00", "63");
+    let seed_store = crate::handles::HandleStore::for_session(&log_path);
+    let handle = seed_store.put(&blob)?;
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "recall",
+            json!({ "handle": handle, "limit": 100 }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    // The recall tool result reaching the provider is the compact preview with an
+    // outputHandle, not the full paged range.
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert_eq!(tool_result.role, Role::Tool);
+    assert!(
+        tool_result.content.contains("outputHandle"),
+        "oversized recall output must offload behind a handle: {}",
+        tool_result.content
+    );
+    // And the offloaded full output round-trips from the store by its handle.
+    let id = output_handle_id(&tool_result.content);
+    let store = crate::handles::HandleStore::for_session(&log_path);
+    assert!(
+        store.get(&id)?.is_some(),
+        "offloaded recall output is retrievable"
+    );
+    Ok(())
+}
+
+#[test]
 fn small_tool_output_stays_inline_unchanged() -> Result<()> {
     let workspace = test_workspace()?;
     let root = test_workspace()?;
@@ -5535,7 +5595,7 @@ impl ChatProvider for SurfaceProbe {
     }
 }
 
-const FULL_SURFACE: [&str; 8] = [
+const FULL_SURFACE: [&str; 9] = [
     "read",
     "bash",
     "edit",
@@ -5544,6 +5604,7 @@ const FULL_SURFACE: [&str; 8] = [
     "find",
     "ls",
     "read_output",
+    "recall",
 ];
 
 #[test]
@@ -5564,7 +5625,16 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
     let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
     assert_eq!(
         visible,
-        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
+        [
+            "read",
+            "bash",
+            "write",
+            "grep",
+            "find",
+            "ls",
+            "read_output",
+            "recall"
+        ]
     );
     assert!(
         !visible.contains(&"edit"),
@@ -5641,7 +5711,16 @@ fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
     let advertised = harness.agent.provider.advertised.borrow();
     assert_eq!(
         advertised[0],
-        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
+        [
+            "read",
+            "bash",
+            "write",
+            "grep",
+            "find",
+            "ls",
+            "read_output",
+            "recall"
+        ]
     );
     assert!(!advertised[0].iter().any(|name| name == "edit"));
     Ok(())

@@ -33,7 +33,8 @@ use tokio_util::sync::CancellationToken;
 use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
 use super::{
-    Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, render_preview, write,
+    Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, recall,
+    render_preview, write,
 };
 
 /// Construct the workspace tools the CLI injects into the agent. The order is
@@ -49,6 +50,7 @@ pub(crate) fn built_in_tools() -> Tools {
         Box::new(FindTool),
         Box::new(LsTool),
         Box::new(ReadOutputTool),
+        Box::new(RecallTool),
     ])
 }
 
@@ -429,6 +431,32 @@ impl Tool for ReadOutputTool {
     }
     fn is_concurrency_safe(&self) -> bool {
         true
+    }
+}
+
+struct RecallTool;
+impl Tool for RecallTool {
+    fn name(&self) -> &str {
+        recall::RECALL_TOOL_NAME
+    }
+    fn description(&self) -> &str {
+        recall::DESCRIPTION
+    }
+    fn parameters(&self) -> Value {
+        recall::parameters()
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        // Read-only over this session's own transcript via the same
+        // `ToolOutputStore` contract `read_output` uses (ADR-0011 / ADR-0046):
+        // no workspace path, no shell, no `ToolState`. Kept sequential (the
+        // default) rather than opted into safe-parallel: it needs no such
+        // guarantee and the task keeps recall sequential-by-default.
+        Box::pin(async move { recall::execute(env.output_store, args) })
     }
 }
 

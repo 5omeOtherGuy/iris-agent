@@ -23,6 +23,7 @@ use tracing::Instrument;
 
 use crate::config::VerificationConfig;
 use crate::handles::HandleStore;
+use crate::nexus::ToolOutputStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderEvent, Role,
     SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
@@ -32,6 +33,7 @@ use crate::session::{
     render_compaction_body,
 };
 use crate::tools::ToolState;
+use crate::tools::recall;
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
 /// range always shrinks the context regardless of how long the covered turns
@@ -841,12 +843,35 @@ impl<P: ChatProvider> Harness<P> {
         // borrow below. Independent of the summarizer, so it survives any summary.
         let carry_paths = derive_carry_paths(covered_slice, self.workspace());
         let carry_tokens = estimate_tokens(&render_carry_block(&carry_paths));
-        let Some(summary) = self
+        let Some(mut summary) = self
             .summarize_range(messages, &plan, original_tokens, carry_tokens, token)
             .await
         else {
             return Ok(None);
         };
+        // Register the covered originals behind a session-scoped handle (ADR-0046),
+        // reusing the ADR-0011 output store rather than a parallel one, and fold a
+        // recall reference into the summary so the model can retrieve any detail
+        // the summary dropped. The reference lives INSIDE `summary`, so it is
+        // persisted with the compaction entry and reproduced verbatim by the
+        // read-time rebuild (the ADR-0045 needle: unreachable tool otherwise).
+        // When no durable store is attached (in-memory session) there is nothing
+        // to recall, so compaction proceeds unchanged.
+        if let Some(store) = self.output_store.as_ref() {
+            let covered_ids = &self.entry_ids[plan.start..plan.end];
+            let blob =
+                recall::serialize_covered(covered_slice, covered_ids, &plan.from_id, &plan.to_id);
+            match store.put(&blob) {
+                Ok(handle) => {
+                    let marker = recall::recall_marker(&handle, &plan.from_id, &plan.to_id);
+                    summary = format!("{summary}\n\n{marker}");
+                }
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "recall handle registration failed; compaction proceeds without a recall reference"
+                ),
+            }
+        }
         // The rebuilt body is the prose summary plus the carry block; count its
         // tokens so the persisted estimate and the in-memory total both cover the
         // carry. With an empty carry the body is exactly the summary.
@@ -1257,6 +1282,10 @@ fn verification_feedback(command: &str, exit_code: Option<i32>, output: &str) ->
          above by editing files. The verification command will run again after your changes."
     )
 }
+
+#[cfg(test)]
+#[path = "recall_tests.rs"]
+mod recall_tests;
 
 #[cfg(test)]
 mod carry_tests {

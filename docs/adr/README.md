@@ -46,7 +46,7 @@
 | [0043](0043-provider-wait-visibility-and-stream-idle-guard.md) | Provider waits are visible and bounded by provider-event idleness | accepted | 2026-07-05 |
 | [0044](0044-carry-structured-state-across-compaction.md) | Carry structured state across compaction, separate from the prose summary | accepted | 2026-07-04 |
 | [0045](0045-benchmark-compaction-on-task-success-and-retention.md) | Benchmark compaction on task success and load-bearing-detail retention | proposed | 2026-07-04 |
-| [0046](0046-recall-compacted-originals-mid-session.md) | Recall compacted originals mid-session | proposed | 2026-07-04 |
+| [0046](0046-recall-compacted-originals-mid-session.md) | Recall compacted originals mid-session | accepted | 2026-07-04 |
 | [0047](0047-count-compaction-generations.md) | Count and surface a compaction generation ordinal | accepted | 2026-07-04 |
 | [0048](0048-fold-spent-tool-results-behind-handles.md) | Fold spent tool results behind handles (opt-in microcompaction) | proposed | 2026-07-04 |
 
