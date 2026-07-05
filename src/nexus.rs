@@ -227,6 +227,36 @@ pub(crate) enum VerificationOutcome {
     SkippedApprovalDenied,
 }
 
+/// Why a microcompaction fold flush ran (issue #400, cache-aware scheduling).
+/// Detection recomputes the pending fold set at every turn boundary; a flush
+/// waits for one of these triggers. Classes follow the design's taxonomy:
+/// `A*` = piggyback on a prefix-cache break that happens anyway (marginal
+/// cache-write cost ~0), `B` = inferred-cold cache, `C` = the shipped
+/// token-watermark pressure backstop. Carried on the persisted `fold` entry
+/// and the [`AgentEvent::FoldApplied`] observer event; provider-neutral
+/// metadata only (never affects whether or how compaction runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldTrigger {
+    /// A1: a compaction will fire at this same boundary; the fold rides it.
+    CompactionBoundary,
+    /// C: the context reached the micro-watermark (pressure backstop).
+    Watermark,
+    // The remaining classes land with the provider cache profile: A2
+    // (model/provider switch), A3 (reasoning switch), A4 (cold resume), A5
+    // (below the minimum cacheable prefix), A6 (manual `/compact`), and B
+    // (inferred mid-session cold).
+}
+
+impl FoldTrigger {
+    /// The short class code recorded on fold entries and shown in the UI.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            FoldTrigger::CompactionBoundary => "A1",
+            FoldTrigger::Watermark => "C",
+        }
+    }
+}
+
 /// The semantic events the loop emits during a turn. Provider- and UI-neutral:
 /// a front-end maps these onto its own rendering. Mirrors pi's `AgentEvent`
 /// union (`packages/agent/src/types.ts`).
@@ -304,6 +334,17 @@ pub(crate) enum AgentEvent {
         /// alongside the prose summary (ADR-0044). Additive instrumentation; 0
         /// when the covered range had no in-workspace tool targets.
         carried_paths: usize,
+    },
+    /// The harness flushed a batch of microcompaction folds at a safe turn
+    /// boundary (ADR-0048, issue #400). Counts and estimates only, tagged with
+    /// the trigger class that released the batch; never carries folded content.
+    FoldApplied {
+        /// Folds applied in this batch.
+        folds: usize,
+        /// Estimated context tokens reclaimed (original bodies minus stubs).
+        reclaimed_tokens_estimate: u64,
+        /// Why the flush ran (design §4.4 trigger taxonomy).
+        trigger: FoldTrigger,
     },
     AssistantText(String),
     AssistantTextDelta(String),

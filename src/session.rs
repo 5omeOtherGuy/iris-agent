@@ -233,12 +233,16 @@ impl SessionLog {
     /// additive-optional: older readers skip an unknown `type`, and a session
     /// with no fold entries rebuilds byte-identically to the pre-fold behavior.
     /// `token_estimate` records the stub's token cost so the rebuild counts the
-    /// stub instead of the folded result.
+    /// stub instead of the folded result. `trigger` is the scheduler's trigger
+    /// class code (issue #400, e.g. `"C"` for the watermark backstop):
+    /// additive-optional audit metadata -- rebuild ignores it, and entries
+    /// written before it existed simply lack the field.
     pub(crate) fn append_fold(
         &mut self,
         target_id: &str,
         stub: &str,
         token_estimate: Option<u64>,
+        trigger: &str,
     ) -> Result<String> {
         let id = self.next_id();
         let entry = json!({
@@ -250,6 +254,7 @@ impl SessionLog {
             "targetId": target_id,
             "stub": stub,
             "tokenEstimate": token_estimate,
+            "trigger": trigger,
         });
         write_line(&mut self.file, &entry)
             .with_context(|| format!("failed to append fold to session {}", self.path.display()))?;
@@ -1904,6 +1909,7 @@ mod tests {
             &result_id,
             "[folded] superseded read of `a.rs`; re-read to recover.",
             None,
+            "C",
         )
         .unwrap();
         drop(log);
@@ -1950,6 +1956,7 @@ mod tests {
             "[folded] The `read` result for `src/lib.rs` was superseded and folded; \
              re-read the file or recall the original.",
             None,
+            "C",
         )
         .unwrap();
         let path = log.path().to_path_buf();
@@ -1978,7 +1985,7 @@ mod tests {
         let result_id = log
             .append(&read_result("call_1", "a.rs", "original body"))
             .unwrap();
-        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+        log.append_fold(&result_id, "[folded] stub for a.rs", None, "C")
             .unwrap();
         drop(log);
 
@@ -1999,7 +2006,7 @@ mod tests {
             .append(&read_result("call_1", "a.rs", "original body"))
             .unwrap();
         // Fold first.
-        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None, "C")
             .unwrap();
         // Then compact the range [first, result_id], covering the folded target.
         log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
@@ -2039,7 +2046,7 @@ mod tests {
         log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
             .unwrap();
         // Then attempt to fold a target inside the covered range.
-        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None, "C")
             .unwrap();
         drop(log);
 
@@ -2071,7 +2078,7 @@ mod tests {
         let result_id = log
             .append(&read_result("call_1", "a.rs", "original body"))
             .unwrap();
-        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+        log.append_fold(&result_id, "[folded] stub for a.rs", None, "C")
             .unwrap();
         drop(log);
 
@@ -2112,7 +2119,7 @@ mod tests {
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
         let id = log.id().to_string();
         log.append(&Message::user("hello")).unwrap();
-        log.append_fold("deadbeef", "[folded] orphan stub", None)
+        log.append_fold("deadbeef", "[folded] orphan stub", None, "C")
             .unwrap();
         drop(log);
 
@@ -2236,7 +2243,7 @@ mod tests {
             .append(&read_result("call_1", "a.rs", "payload"))
             .unwrap();
         let fold_id = log
-            .append_fold(&result_id, "[folded] superseded read of `a.rs`.", None)
+            .append_fold(&result_id, "[folded] superseded read of `a.rs`.", None, "C")
             .unwrap();
         let path = log.path().to_path_buf();
         drop(log);
