@@ -63,7 +63,7 @@ Sensitivity:
 - Long sessions (>=40 tool results, n=16 — where residency actually
   accumulates): foldable share 32.3%.
 
-Detection notes (why these are lower bounds, not inflated):
+Detection notes and measurement limits:
 
 - Superseded reads use latest-read-wins: a `read`/`ls` whose path is later read,
   edited, or written again. This is the clean, conservative signal.
