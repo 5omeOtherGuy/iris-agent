@@ -170,9 +170,11 @@ impl SessionLog {
     ) -> Result<String> {
         let id = self.next_id();
         // Generation ordinal (ADR-0047): 1-based count of compactions in this
-        // session. Increment before writing so the Nth compaction persists N.
-        self.compactions += 1;
-        let generation = self.compactions;
+        // session. Compute the next generation but do not advance the counter
+        // until the entry is durably written, so a failed append never leaves
+        // the in-memory counter ahead of what is persisted (which would make a
+        // later successful append report the wrong generation).
+        let generation = self.compactions + 1;
         let entry = json!({
             "type": "compaction",
             "id": id,
@@ -197,6 +199,9 @@ impl SessionLog {
                 self.path.display()
             )
         })?;
+        // Only advance the counter after the write succeeds; on failure the
+        // `?` above returns early and `self.compactions` is left unchanged.
+        self.compactions = generation;
         self.last_id = Some(id.clone());
         Ok(id)
     }
@@ -2218,6 +2223,46 @@ mod tests {
             .map(|e| &e["generation"])
             .collect();
         assert_eq!(generations, [&Value::from(1), &Value::from(2)]);
+    }
+
+    // Injecting a write failure needs a writable path whose writes always fail;
+    // `/dev/full` (Linux) accepts opens but returns ENOSPC on every write, so it
+    // is the cleanest failure seam without a fake writer trait.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_compaction_append_does_not_advance_the_generation() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let path = log.path().to_path_buf();
+        let a = log.append(&Message::user("a")).unwrap();
+
+        // Redirect writes to /dev/full so the next append fails mid-write while
+        // the in-memory counter is still 0.
+        log.file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        assert!(
+            log.append_compaction(&a, &a, "S1", None).is_err(),
+            "write to /dev/full must fail"
+        );
+        // The failed append must not have advanced the counter.
+        assert_eq!(log.compaction_generation(), 0);
+
+        // Restore a real writable handle; the first durable compaction after a
+        // failed attempt must still report generation 1, not 2.
+        log.file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        log.append_compaction(&a, &a, "S1", None).unwrap();
+        assert_eq!(log.compaction_generation(), 1);
+
+        let entries = lines(log.path());
+        let generations: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["type"] == "compaction")
+            .map(|e| &e["generation"])
+            .collect();
+        // Exactly one durable compaction entry, persisting generation 1.
+        assert_eq!(generations, [&Value::from(1)]);
     }
 
     #[test]
