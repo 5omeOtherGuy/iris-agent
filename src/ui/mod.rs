@@ -325,6 +325,10 @@ impl UiEvent {
             AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
             AgentEvent::ToolStarted(call) => UiEvent::ToolStarted(call),
             AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),
+            // The dangerous skip-permissions auto-approval (ADR-0049) renders
+            // through the existing auto-approved cell; the loud session-start
+            // banner and the transcript audit record carry the mode itself.
+            AgentEvent::ToolAutoApprovedDangerous(call) => UiEvent::ToolAutoApproved(call),
             AgentEvent::DiffPreview { call, diff } => UiEvent::DiffPreview { call, diff },
             AgentEvent::ToolDenied(call) => UiEvent::ToolDenied(call),
             AgentEvent::ToolResult {
