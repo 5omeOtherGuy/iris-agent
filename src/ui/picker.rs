@@ -491,7 +491,17 @@ pub(crate) fn apply_action<P: ChatProvider>(
         }
         ModalAction::SaveSetting { field, value } => {
             let lines = match save_setting_field(field, value.as_deref()) {
-                Ok(()) => Vec::new(),
+                Ok(()) => {
+                    // Some settings are read live by the harness, not just at
+                    // startup: mirror the persisted value onto the running
+                    // harness so the toggle takes effect at the next turn
+                    // boundary in this session (DoD, ADR-0048/#378), the same
+                    // way `EditPolicy` refreshes live Nexus state on save.
+                    if field == settings_menu::Field::Microcompaction {
+                        harness.set_microcompaction(value.as_deref() == Some("true"));
+                    }
+                    Vec::new()
+                }
                 Err(error) => vec![format!("could not save setting: {error:#}")],
             };
             // Re-open the parent category submenu on the refreshed values.

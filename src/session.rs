@@ -957,15 +957,18 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        // `message`, `compaction`, `modelSelection`, and `taskLifecycle` entries
-        // all occupy the leaf chain and an entry-id slot, so a resumed append
-        // must link its `parentId` past, and count its `next_seq` beyond,
-        // whichever kind is the current leaf. (`modelSelection` and
-        // `taskLifecycle` are audit records; the read/rebuild path skips them,
-        // but the chain must still flow through them or `parentId` breaks.)
+        // `message`, `compaction`, `fold`, `modelSelection`, and `taskLifecycle`
+        // entries all occupy the leaf chain and an entry-id slot, so a resumed
+        // append must link its `parentId` past, and count its `next_seq`
+        // beyond, whichever kind is the current leaf. (`fold`, `modelSelection`,
+        // and `taskLifecycle` are audit records; the read/rebuild path skips
+        // them, but the chain must still flow through them or `parentId` breaks
+        // -- and `append_fold` consumes a seq, so ignoring `fold` here would let
+        // the next append reuse the fold's id (issue #378).)
         match value.get("type").and_then(Value::as_str) {
             Some("message")
             | Some("compaction")
+            | Some("fold")
             | Some("modelSelection")
             | Some("taskLifecycle") => {}
             _ => continue,
@@ -2145,6 +2148,45 @@ mod tests {
         // The continued entry links to the prior leaf and gets a fresh id.
         assert_eq!(entries[3]["parentId"], second_id);
         assert_ne!(third_id, second_id);
+    }
+
+    #[test]
+    fn resume_after_a_fold_keeps_the_fold_in_the_durable_id_chain() {
+        // Regression (issue #378): `append_fold` writes an id, advances the leaf,
+        // and consumes a seq. If `scan_for_resume` ignores `fold`, the next
+        // append after resuming a folded transcript reuses the fold's id and
+        // parent-links around it, corrupting the durable id chain. The resumed
+        // append must chain PAST the fold: fresh id (no collision) and a
+        // `parentId` pointing at the fold leaf.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "payload"))
+            .unwrap();
+        let fold_id = log
+            .append_fold(&result_id, "[folded] superseded read of `a.rs`.", None)
+            .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Resume the folded transcript and continue it.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        resumed.append(&Message::user("next turn")).unwrap();
+        drop(resumed);
+
+        let entries = lines(&path);
+        // header + user + result + fold + new message.
+        assert_eq!(entries.len(), 5);
+        let persisted_fold_id = entries[3]["id"].as_str().unwrap();
+        assert_eq!(entries[3]["type"], "fold");
+        assert_eq!(persisted_fold_id, fold_id);
+        let new_id = entries[4]["id"].as_str().unwrap();
+        assert_eq!(entries[4]["message"]["content"], "next turn");
+        // The continued entry must not reuse the fold's id...
+        assert_ne!(new_id, fold_id);
+        // ...and must parent-link to the fold leaf, not around it.
+        assert_eq!(entries[4]["parentId"], fold_id);
     }
 
     #[test]
