@@ -23,18 +23,19 @@
 
 /// The kind of block currently open at the scan cursor. Tables, blockquotes,
 /// headings, and HTML runs are all treated as `Para`: a contiguous run of
-/// non-blank lines that closes on a blank line.
+/// non-blank lines that closes on a blank line. Fenced code is tracked out of
+/// band (`fence`/`fence_return`) so a code block nested inside a list does not
+/// look like a top-level block.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Block {
     /// Between blocks: the cursor sits on a committable boundary.
     None,
     /// A paragraph-like run (also tables/quotes/headings) held until a blank.
     Para,
-    /// A list, held until a following non-indented, non-item line (loose lists
-    /// keep interior blank lines, so a blank never closes a list).
+    /// A list, held until a blank line followed by a non-indented, non-item
+    /// line (loose lists keep interior blank lines; a non-indented line without
+    /// a preceding blank is a lazy continuation and stays in the list).
     List,
-    /// A fenced code block, held until its closing fence.
-    Code,
 }
 
 /// Return the largest byte offset up to which `source` is safe to commit.
@@ -44,7 +45,15 @@ enum Block {
 /// ignored and left for finalize.
 pub(super) fn safe_commit_end(source: &str) -> usize {
     let mut fence: Option<(char, usize)> = None;
+    // Block to resume when the current fenced code block closes: `List` when the
+    // fence is nested in a list item, otherwise `None` (a top-level code block
+    // interrupts a paragraph and leaves a fresh boundary).
+    let mut fence_return = Block::None;
     let mut block = Block::None;
+    // Whether the previously scanned line was blank. A list only ends when a
+    // blank line is followed by a non-indented, non-item line; without the
+    // blank, such a line is a lazy paragraph continuation of the list item.
+    let mut prev_blank = true;
     let mut offset = 0usize;
     let mut safe_end = 0usize;
 
@@ -62,21 +71,26 @@ pub(super) fn safe_commit_end(source: &str) -> usize {
         if let Some(open) = fence {
             if is_fence_close(trimmed, open) {
                 fence = None;
-                block = Block::None;
-                safe_end = offset + line_len;
+                block = fence_return;
+                if block == Block::None {
+                    safe_end = offset + line_len;
+                }
             }
+            prev_blank = is_blank;
             offset += line_len;
             continue;
         }
 
-        if let Some(open) = fence_open(trimmed) {
-            fence = Some(open);
-            if block == Block::None {
-                block = Block::Code;
-            }
-            // If a fence opens inside a held Para/List run, keep holding: the
-            // whole run commits together once the fence closes and a boundary
-            // is reached.
+        if fence_open(trimmed).is_some() {
+            fence = fence_open(trimmed);
+            // A fence inside a list item keeps the list open; otherwise it ends
+            // any paragraph and leaves a boundary after the closing fence.
+            fence_return = if block == Block::List {
+                Block::List
+            } else {
+                Block::None
+            };
+            prev_blank = false;
             offset += line_len;
             continue;
         }
@@ -101,19 +115,21 @@ pub(super) fn safe_commit_end(source: &str) -> usize {
                 if is_blank || is_list_item(raw) || indented {
                     // Interior blank lines and continuations keep the list open
                     // (loose vs tight is decided by the whole list).
-                } else {
-                    // A non-indented, non-item line proves the list ended at the
-                    // preceding boundary; commit everything before this line.
+                } else if prev_blank {
+                    // A blank line followed by a non-indented, non-item line
+                    // ends the list; commit everything before this line.
                     safe_end = offset;
                     block = Block::Para;
                 }
+                // Otherwise this is a lazy continuation of the list item's
+                // paragraph -- keep it in the mutable tail.
             }
-            Block::Code => {}
         }
+        prev_blank = is_blank;
         offset += line_len;
     }
 
-    if block == Block::None {
+    if fence.is_none() && block == Block::None {
         safe_end = offset;
     }
     safe_end
@@ -230,6 +246,34 @@ mod tests {
     fn indented_continuation_keeps_list_open() {
         let src = "- one\n\n  still item one\n\nAfter\n";
         assert_eq!(safe_commit_end(src), "- one\n\n  still item one\n\n".len());
+    }
+
+    #[test]
+    fn lazy_list_continuation_is_not_committed_early() {
+        // "- item\ncontinuation" is a CommonMark lazy continuation: the item
+        // text is "item continuation", so "- item" must NOT commit on its own
+        // (Iris renders the soft break as a space, so an early commit reflows).
+        let src = "- item\ncontinuation\n";
+        assert_eq!(safe_commit_end(src), 0, "lazy continuation held");
+        // Only a blank line + a non-indented line ends the list.
+        let terminated = "- item\ncontinuation\n\nAfter\n";
+        assert_eq!(
+            safe_commit_end(terminated),
+            "- item\ncontinuation\n\n".len()
+        );
+    }
+
+    #[test]
+    fn fenced_code_inside_list_does_not_end_the_list() {
+        // The nested code block must not be mistaken for a top-level block that
+        // closes the list.
+        let src = "- item\n  ```\n  code\n  ```\n  more\n";
+        assert_eq!(safe_commit_end(src), 0, "list with nested code held");
+        let terminated = "- item\n  ```\n  code\n  ```\n\nAfter\n";
+        assert_eq!(
+            safe_commit_end(terminated),
+            "- item\n  ```\n  code\n  ```\n\n".len()
+        );
     }
 
     #[test]

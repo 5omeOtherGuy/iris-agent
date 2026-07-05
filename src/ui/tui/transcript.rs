@@ -425,6 +425,9 @@ impl Transcript {
                 // trailing blank separating the rail from the answer below.
                 block.push(TranscriptRow::new(String::new(), Style::default()));
                 let n = block.len();
+                // Keep every retained row-index anchor at or after the insert
+                // point valid (pager prompt anchors, any open-panel body rows).
+                self.shift_row_anchors(start, n);
                 self.thinking_header_row = Some(start);
                 self.mark_dirty_from(start);
                 self.rows.splice(start..start, block);
@@ -435,6 +438,40 @@ impl Transcript {
                 self.mark_append_dirty();
                 self.thinking_header_row = Some(self.rows.len());
                 self.rows.extend(block);
+            }
+        }
+    }
+
+    /// Shift every retained row-index anchor at or after `at` by `delta`, for a
+    /// mid-array row insert (the reasoning splice above a committed answer).
+    /// Keeps pager prompt anchors and any open-panel body-row indices valid.
+    /// Open tool/exec/edit panels do not normally overlap an active assistant
+    /// stream (tools run after the turn's text), but shifting them is correct
+    /// and cheap, and makes the insert self-consistent.
+    fn shift_row_anchors(&mut self, at: usize, delta: usize) {
+        for anchor in &mut self.user_prompt_starts {
+            if *anchor >= at {
+                *anchor += delta;
+            }
+        }
+        if let Some(exec) = self.active_exec.as_mut()
+            && exec.body_start >= at
+        {
+            exec.body_start += delta;
+        }
+        if let Some(tool) = self.active_tool.as_mut()
+            && tool.body_start >= at
+        {
+            tool.body_start += delta;
+        }
+        if let Some(edit) = self.active_edit.as_mut()
+            && edit.body_start >= at
+        {
+            edit.body_start += delta;
+        }
+        for expl in &mut self.active_explorations {
+            if expl.row >= at {
+                expl.row += delta;
             }
         }
     }
