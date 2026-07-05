@@ -1,5 +1,4 @@
-//! Compaction retention-needle benchmark scaffold (ADR-0045, issue #372,
-//! "slice A").
+//! Compaction retention-needle benchmark (ADR-0045, issue #372, slices A + B).
 //!
 //! ADR-0036 rule 5 made per-tool output reduction measurable; ADR-0045 extends
 //! the same discipline to compaction: a long-horizon scenario that forces at
@@ -15,13 +14,17 @@
 //! calls), with fixed-size prompts and a fixed budget, so the covered range,
 //! the summaries, and every ratio are reproducible in CI.
 //!
-//! Slice B (deferred, not built here; tracked in ADR-0045 / #372): the
-//! `provider + structured carry` (ADR-0044) and `provider + carry +
-//! microcompaction` (ADR-0048) arms, and the report dimensions -- compaction
-//! generation (ADR-0047), covered-range size, and the two `ProviderUsage`
-//! cache-economics measurements (summary-request cache-hit rate and
-//! post-compaction cache-write amplification). This slice fixes the
-//! retention-needle contract and the two base arms only.
+//! Slice A (above) fixes the retention-needle contract and the two base arms
+//! (`provider` vs `excerpts`). Slice B now lives in this same file, starting at
+//! the "Slice B" banner further down: the `provider + structured carry`
+//! (ADR-0044) and `provider + carry + microcompaction` (ADR-0048) arms, the
+//! report dimensions -- compaction generation (ADR-0047), covered-range size --
+//! and the cache economics. Cache economics are MODELED deterministically here
+//! ("modeled (prefix-divergence, estimated tokens)": the char-exact common
+//! prefix of consecutive request payloads is the cache-READ mass, the divergent
+//! suffix is the cache-WRITE mass); the live provider-reported `ProviderUsage`
+//! cache splits that anchor the model are captured by the env-gated harness in
+//! the sibling `compaction_live_bench` module (never run under the gate).
 
 use super::*;
 use crate::session::{SessionLog, SessionStore};
@@ -34,8 +37,8 @@ use crate::wayland::{Harness, SummarizerKind};
 use serde_json::json;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
@@ -97,6 +100,12 @@ struct CompactionFakeProvider {
     /// Shared with the scenario so it can prove the provider summarizer actually
     /// ran for the provider arm (vs. a silent fallback to excerpts).
     summary_calls: Arc<AtomicUsize>,
+    /// Every request payload this fake received, in order, so the modeled cache
+    /// economics (`model_cache_economics`) can diff consecutive pre-/post-
+    /// compaction payloads. The provider is moved into the `Agent`, so the
+    /// scenario keeps a clone of this handle to read the payloads back after the
+    /// run instead of reaching into the moved provider.
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
     /// Facts the fake asserts present in the covered range before echoing them
     /// in a short handoff. Non-empty for the text arms (the four load-bearing
     /// facts, retained THROUGH the summary); empty for the seeded carry arms,
@@ -107,9 +116,14 @@ struct CompactionFakeProvider {
 }
 
 impl CompactionFakeProvider {
-    fn new(summary_calls: Arc<AtomicUsize>, echo_needles: Vec<&'static str>) -> Self {
+    fn new(
+        summary_calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        echo_needles: Vec<&'static str>,
+    ) -> Self {
         Self {
             summary_calls,
+            requests,
             echo_needles,
         }
     }
@@ -165,6 +179,15 @@ impl ChatProvider for CompactionFakeProvider {
         let is_summary = messages
             .last()
             .is_some_and(|m| m.content.starts_with(SUMMARY_INSTRUCTION_PREFIX));
+        // Record the exact request payload this boundary carries so the modeled
+        // cache economics can char-diff it against the previous request.
+        self.requests
+            .lock()
+            .expect("requests capture lock")
+            .push(CapturedRequest {
+                is_summary,
+                payload: serialize_request(messages),
+            });
         let turn = if is_summary {
             self.summary_calls.fetch_add(1, Ordering::Relaxed);
             // Covered range = every message before the final summary
@@ -179,6 +202,123 @@ impl ChatProvider for CompactionFakeProvider {
         })))
     }
 }
+
+// ===========================================================================
+// Modeled cache economics (DoD item 1). The fake-provider lane reports no
+// `ProviderUsage` cache splits, so cache read/write mass is MODELED, never
+// presented as provider-reported. The model: a prompt cache serves the longest
+// prefix shared with the previous request and re-bills (writes) the divergent
+// suffix. So for each consecutive request pair straddling a compaction the
+// char-EXACT common prefix is the expected cache-READ mass and the divergent
+// suffix of the newer request is the expected cache-WRITE mass, both in
+// `bench_support::est_tokens`. Labeled everywhere as
+// "modeled (prefix-divergence, estimated tokens)". The env-gated live harness
+// (`compaction_live_bench`) anchors this model against realized `ProviderUsage`.
+// ===========================================================================
+
+/// One request payload the fake provider received, tagged as a summarization
+/// request (the covered range + summary instruction) or a normal turn request.
+#[derive(Clone)]
+struct CapturedRequest {
+    is_summary: bool,
+    payload: String,
+}
+
+/// Canonical, boundary-aware serialization of a request's messages: each
+/// message is `role<US>content`, messages joined by a record separator, so the
+/// char-exact common prefix of two payloads cannot span a message boundary by
+/// accident. This is the string a prefix cache would key on (deterministic and
+/// reproducible; the live lane keys on the provider's own serialization).
+fn serialize_request(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|m| format!("{}\u{1f}{}", m.role.as_str(), m.content))
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+/// Byte length of the char-exact common prefix of `a` and `b`. Sums whole
+/// `char` widths so the returned length is always a UTF-8 boundary safe to slice
+/// at.
+fn common_prefix_bytes(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(ca, cb)| ca == cb)
+        .map(|(ca, _)| ca.len_utf8())
+        .sum()
+}
+
+/// One compaction boundary's modeled cache economics, in estimated tokens.
+#[derive(Clone)]
+struct CacheGen {
+    /// 1-based compaction ordinal (one per summarization request observed).
+    generation: u64,
+    /// Expected cache-READ mass: the char-exact prefix the post-compaction
+    /// request still shares with the pre-compaction request.
+    read_tokens: usize,
+    /// Expected cache-WRITE mass: the divergent suffix of the post-compaction
+    /// request (the rewritten summary + retained tail + new turn).
+    write_tokens: usize,
+    /// Total estimated tokens of the pre-compaction request.
+    pre_tokens: usize,
+    /// Total estimated tokens of the post-compaction request
+    /// (`read_tokens + write_tokens` by construction).
+    post_tokens: usize,
+}
+
+/// Model the cache economics of a captured request stream. Each summarization
+/// request marks a compaction boundary: the last normal request before it is
+/// the pre-compaction payload, the first normal request after it is the
+/// post-compaction payload. Their char-exact common prefix is the modeled
+/// cache-READ mass; the divergent suffix of the post payload is the modeled
+/// cache-WRITE mass. One `CacheGen` per generation, in order.
+///
+/// `seed_baseline` is the serialized resumed context for a seeded arm whose
+/// FIRST turn already compacts (so no normal request precedes generation 1):
+/// it is the pre-compaction payload the summary rewrites. `None` for the text
+/// arms, where a real turn-1 normal request precedes the first compaction.
+/// Only the PROVIDER-summarizer arms issue a summarization request, so only
+/// they yield generations; the deterministic excerpts arm makes no provider
+/// summary call and therefore has no provider-side summary-request cache
+/// economics to model (stated in the report).
+fn model_cache_economics(
+    requests: &[CapturedRequest],
+    seed_baseline: Option<&str>,
+) -> Vec<CacheGen> {
+    let mut gens = Vec::new();
+    let mut last_normal: Option<String> = seed_baseline.map(str::to_string);
+    let mut pending_pre: Option<String> = None;
+    let mut awaiting_post = false;
+    let mut generation = 0u64;
+    for req in requests {
+        if req.is_summary {
+            generation += 1;
+            pending_pre = last_normal.clone();
+            awaiting_post = true;
+        } else {
+            if awaiting_post {
+                if let Some(pre) = &pending_pre {
+                    let post = &req.payload;
+                    let split = common_prefix_bytes(pre, post);
+                    gens.push(CacheGen {
+                        generation,
+                        read_tokens: est_tokens(&post[..split]),
+                        write_tokens: est_tokens(&post[split..]),
+                        pre_tokens: est_tokens(pre),
+                        post_tokens: est_tokens(post),
+                    });
+                }
+                awaiting_post = false;
+            }
+            last_normal = Some(req.payload.clone());
+        }
+    }
+    gens
+}
+
+/// The label every modeled cache number carries so it is never mistaken for a
+/// provider-reported split.
+const MODELED_LABEL: &str = "modeled (prefix-divergence, estimated tokens)";
 
 /// One `CompactionApplied` event, captured so slice-B dimensions (generation,
 /// covered-range size, carry count, and the covered-range start id the cache
@@ -273,6 +413,9 @@ struct ArmResult {
     /// excerpts arm; >= 1 on the provider arm proves it did not silently fall
     /// back to excerpts.
     summary_calls: usize,
+    /// Every request payload the fake provider received, for modeled cache
+    /// economics (`model_cache_economics`).
+    requests: Vec<CapturedRequest>,
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -300,10 +443,11 @@ fn run_scenario(summarizer: SummarizerKind) -> ArmResult {
     let log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
 
     let summary_calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let agent = Agent::new(
         // Text arms echo the four load-bearing facts THROUGH the summary, so the
         // fake asserts them present in the covered range it received.
-        CompactionFakeProvider::new(summary_calls.clone(), NEEDLES.to_vec()),
+        CompactionFakeProvider::new(summary_calls.clone(), requests.clone(), NEEDLES.to_vec()),
         Tools::new(Vec::new()),
     );
     let mut harness = Harness::new(
@@ -404,6 +548,7 @@ fn run_scenario(summarizer: SummarizerKind) -> ArmResult {
         covered_original,
         compactions: counter.count(),
         summary_calls,
+        requests: requests.lock().expect("requests capture lock").clone(),
     }
 }
 
@@ -670,6 +815,12 @@ struct SeededArm {
     /// Context tokens remaining after the run: the mass the `keep_target`
     /// hysteresis rewrites to cache on the next compaction (cache-write proxy).
     post_context_tokens: u64,
+    /// Every request payload the fake provider received, for modeled cache
+    /// economics (`model_cache_economics`).
+    requests: Vec<CapturedRequest>,
+    /// The serialized resumed context: the pre-compaction baseline for a seeded
+    /// arm whose first turn already compacts (see `model_cache_economics`).
+    seed_baseline: String,
 }
 
 impl SeededArm {
@@ -715,8 +866,9 @@ fn run_seeded(
     let log = SessionLog::resume(&path).expect("resume session log");
 
     let summary_calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let agent = Agent::resumed(
-        CompactionFakeProvider::new(summary_calls.clone(), echo),
+        CompactionFakeProvider::new(summary_calls.clone(), requests.clone(), echo),
         Tools::new(Vec::new()),
         stored.messages,
     );
@@ -760,6 +912,8 @@ fn run_seeded(
         folds,
         summary_calls: summary_calls.load(Ordering::Relaxed),
         post_context_tokens,
+        requests: requests.lock().expect("requests capture lock").clone(),
+        seed_baseline: serialize_request(seed),
     }
 }
 
@@ -1040,6 +1194,109 @@ fn generation_ordinal_advances_across_compactions() {
     );
 }
 
+// --- Modeled cache economics (DoD item 1). ---
+
+#[test]
+fn modeled_cache_write_dominates_the_post_compaction_request() {
+    // MODELED (prefix-divergence, estimated tokens): a compaction whose covered
+    // range starts at the live cached prefix (generation 1, covered_from =
+    // 00000000) rewrites that prefix, so the post-compaction request's char-exact
+    // shared prefix with the pre-compaction request (modeled cache-READ) is
+    // near-zero and the divergent suffix (modeled cache-WRITE) is the majority of
+    // the request. Asserted per provider-summarizer arm. This is a MODEL, not a
+    // provider-reported split; the live anchor lives in `compaction_live_bench`.
+    let provider = run_scenario(SummarizerKind::Provider);
+    let carry = run_carry_arm();
+    let micro = run_carry_micro_arm();
+    let arms: [(&str, Vec<CacheGen>); 3] = [
+        ("provider", model_cache_economics(&provider.requests, None)),
+        (
+            "provider+carry",
+            model_cache_economics(&carry.requests, Some(&carry.seed_baseline)),
+        ),
+        (
+            "provider+carry+microcompaction",
+            model_cache_economics(&micro.requests, Some(&micro.seed_baseline)),
+        ),
+    ];
+    // A compaction always rewrites at least this much fresh mass at the modeled
+    // cache-WRITE boundary; a summarizer that stopped rewriting the prefix would
+    // trip it. Minimum, never an exact figure.
+    const MIN_WRITE_TOKENS: usize = 50;
+    for (name, gens) in &arms {
+        let g1 = gens
+            .first()
+            .unwrap_or_else(|| panic!("{name}: no modeled generation-1 cache economics captured"));
+        assert_eq!(
+            g1.generation, 1,
+            "{name}: first modeled generation must be 1"
+        );
+        // read + est_tokens split rounding: each side is div_ceil, so the pair
+        // can exceed the whole request by at most one token.
+        assert!(
+            (g1.read_tokens + g1.write_tokens).abs_diff(g1.post_tokens) <= 1,
+            "{name}: modeled cache-READ {} + cache-WRITE {} must reconstruct the {}-token post \
+             request (+/- 1 for split rounding)",
+            g1.read_tokens,
+            g1.write_tokens,
+            g1.post_tokens,
+        );
+        assert!(
+            g1.write_tokens >= MIN_WRITE_TOKENS,
+            "{name}: modeled cache-WRITE {} is below the {MIN_WRITE_TOKENS}-token bar",
+            g1.write_tokens,
+        );
+        assert!(
+            g1.write_tokens * 2 >= g1.post_tokens,
+            "{name}: modeled cache-WRITE {} is not the majority of the {}-token post-compaction \
+             request; a compaction starting at the live prefix should rewrite the majority",
+            g1.write_tokens,
+            g1.post_tokens,
+        );
+    }
+}
+
+#[test]
+fn modeled_cache_read_warms_across_generations() {
+    // MODELED (prefix-divergence, estimated tokens): after generation 1 collapses
+    // the cache, later compactions retain a stable summary + tail prefix, so the
+    // modeled cache-READ (char-exact shared prefix) accrues generation over
+    // generation while the cache-WRITE stays bounded -- the warm-cache accrual the
+    // model predicts across successive compactions.
+    let run = run_multi_generation();
+    let gens = model_cache_economics(&run.requests, Some(&run.seed_baseline));
+    assert!(
+        gens.len() >= 2,
+        "expected at least two modeled generations, got {}",
+        gens.len()
+    );
+    for (i, g) in gens.iter().enumerate() {
+        assert_eq!(
+            g.generation,
+            (i + 1) as u64,
+            "modeled generations must be the 1-based compaction ordinal"
+        );
+        assert!(
+            (g.read_tokens + g.write_tokens).abs_diff(g.post_tokens) <= 1,
+            "generation {}: modeled READ {} + WRITE {} must reconstruct the {}-token post request",
+            g.generation,
+            g.read_tokens,
+            g.write_tokens,
+            g.post_tokens,
+        );
+    }
+    let first = gens.first().expect("generation 1");
+    let last = gens.last().expect("final generation");
+    assert!(
+        last.read_tokens > first.read_tokens,
+        "modeled cache-READ should grow as later generations share a stable summary+tail prefix \
+         (generation 1 = {} tokens, generation {} = {} tokens)",
+        first.read_tokens,
+        last.generation,
+        last.read_tokens,
+    );
+}
+
 /// Prints the slice-B report tables under `docs/benchmarks/`. Not an assertion;
 /// run with `--nocapture` to regenerate the snapshot. The contract lives in the
 /// asserting tests above.
@@ -1133,32 +1390,77 @@ fn compaction_slice_b_benchmark_report() {
         );
     }
 
+    println!("\n== Cache economics -- {MODELED_LABEL} ==");
     println!(
-        "\n== Cache economics (structural determinants MEASURED; ProviderUsage rates PENDING) =="
+        "| arm | generation | pre req tok | post req tok | cache-READ (shared prefix) | cache-WRITE (divergent suffix) |"
+    );
+    println!("|---|---|---|---|---|---|");
+    let modeled_arms: [(&str, Vec<CacheGen>); 4] = [
+        ("provider", model_cache_economics(&provider.requests, None)),
+        (
+            "provider+carry",
+            model_cache_economics(&carry.requests, Some(&carry.seed_baseline)),
+        ),
+        (
+            "provider+carry+microcompaction",
+            model_cache_economics(&micro.requests, Some(&micro.seed_baseline)),
+        ),
+        (
+            "provider (multi-generation)",
+            model_cache_economics(&generations.requests, Some(&generations.seed_baseline)),
+        ),
+    ];
+    for (arm, gens) in &modeled_arms {
+        for g in gens {
+            println!(
+                "| {arm} | {} | {} | {} | {} | {} |",
+                g.generation, g.pre_tokens, g.post_tokens, g.read_tokens, g.write_tokens,
+            );
+        }
+    }
+    println!(
+        "\nMODEL: a prefix cache serves the char-exact prefix a request still shares with the \
+         previous request (cache-READ) and re-bills the divergent suffix (cache-WRITE). Compaction \
+         rewrites the prefix, so the post-compaction cache-WRITE mass is the amplification the \
+         summary buys back. These are {MODELED_LABEL}, NOT provider-reported."
     );
     println!(
-        "generation 1 covered-from id: {} (starts at the live cached prefix -> summary request \
-         is cache-hit eligible)",
+        "NOTE: the deterministic excerpts arm makes no provider summarization call, so it issues \
+         no summary request and has no provider-side summary-request cache economics to model; its \
+         compaction is provider-invisible."
+    );
+    println!(
+        "structural cross-check -- post-compaction retained-tail tokens (keep_target rewrite mass, \
+         a coarse cache-write proxy): {}",
+        micro.post_context_tokens,
+    );
+    println!(
+        "generation 1 covered-from id: {} (starts at the live cached prefix); generation 2 \
+         covered-from id: {} (starts AFTER the generation-1 summary -> a later range).",
         generations
             .records
             .first()
             .map(|r| r.covered_from.as_str())
             .unwrap_or("-"),
+        generations
+            .records
+            .get(1)
+            .map(|r| r.covered_from.as_str())
+            .unwrap_or("-"),
     );
-    if let Some(second) = generations.records.get(1) {
-        println!(
-            "generation 2 covered-from id: {} (starts AFTER the generation-1 summary -> cache-cold)",
-            second.covered_from,
-        );
-    }
+
+    println!("\n== Provider asymmetry (what a LIVE lane would report) ==");
     println!(
-        "post-compaction retained-tail tokens (keep_target rewrite mass, cache-write proxy): {}",
-        micro.post_context_tokens,
+        "Anthropic Messages (Claude Code OAuth): reports cache_read_input_tokens AND \
+         cache_write_input_tokens, plus the cache_creation 5m/1h tier split -- so both the modeled \
+         cache-READ and cache-WRITE masses above have a directly realized counterpart."
     );
     println!(
-        "NOTE: the summary-request cache-HIT rate and post-compaction cache-WRITE amplification in \
-         tokens require ProviderUsage cache_read/cache_write splits from a live provider; the \
-         fake-provider lane produces none, so those two ratios are documented methodology with \
-         measurement PENDING a recorded live lane (never fabricated)."
+        "Codex Responses: reports cache_read_input_tokens only; cache_write_input_tokens is \
+         hardcoded 0 and cache_creation is None (openai_codex_responses.rs:854), a PROVIDER \
+         limitation. Its cache-WRITE column is therefore a DERIVED fresh-input amplification: \
+         input_tokens - cached_tokens on the first post-compaction request vs the pre-compaction \
+         baseline. The modeled divergent-suffix mass is the deterministic stand-in for that derived \
+         amplification."
     );
 }

@@ -2780,3 +2780,11 @@ mod tests;
 #[cfg(test)]
 #[path = "compaction_bench.rs"]
 mod compaction_bench;
+
+// Env-gated LIVE anchor for the modeled cache economics (ADR-0045, #372). Kept
+// beside `compaction_bench` so it reuses the in-crate provider/message types via
+// `use super::*`. Double-gated (`#[ignore]` + `IRIS_BENCH_LIVE=1`), so the gate's
+// `cargo test` never issues a live API call.
+#[cfg(test)]
+#[path = "compaction_live_bench.rs"]
+mod compaction_live_bench;
