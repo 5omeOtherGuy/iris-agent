@@ -744,7 +744,7 @@ fn read_result(call: &str, target: &str, body: &str) -> Message {
 
 /// Count durable `fold` entries in a transcript (ADR-0048), so a seeded arm can
 /// report how many spent reads microcompaction folded.
-fn fold_count(path: &Path) -> usize {
+pub(super) fn fold_count(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .expect("read transcript")
         .lines()
@@ -1488,5 +1488,218 @@ fn compaction_slice_b_benchmark_report() {
          input_tokens - cached_tokens on the first post-compaction request vs the pre-compaction \
          baseline. The modeled divergent-suffix mass is the deterministic stand-in for that derived \
          amplification."
+    );
+}
+
+// --- Fold-flush cost (issue #400): what a fold-ONLY prefix break pays. ---
+//
+// The slice-B microcompaction arm folds inside a range compaction covers in
+// the same boundary, so the fold's own cache break is masked by the
+// compaction's. These arms isolate it: a budget high enough that compaction
+// NEVER fires, so the micro-watermark flush is the only transcript rewrite,
+// and its price and payback are measured alone.
+
+/// Stated Anthropic 5-minute-tier pricing ratios, used ONLY to illustrate the
+/// warm-cache break-even horizon in the report: cache writes bill at 1.25x
+/// base input, cache reads at 0.10x. Published-pricing assumptions, not
+/// measurements; every token mass they multiply is modeled.
+const PRICE_WRITE_5M: f64 = 1.25;
+const PRICE_READ: f64 = 0.10;
+
+/// `(read, write)` est-token split of one request payload against its
+/// predecessor: the char-exact shared prefix models the cache-READ mass, the
+/// divergent suffix the cache-WRITE mass. Boundary-free counterpart of
+/// `model_cache_economics` for runs with no summarization request.
+fn diff_payloads(pre: &str, post: &str) -> (usize, usize) {
+    let split = common_prefix_bytes(pre, post);
+    (est_tokens(&post[..split]), est_tokens(&post[split..]))
+}
+
+/// Budget for a fold-ONLY run over `seed`: at 1.5x the seed estimate the
+/// micro-watermark (budget/2 = 0.75x seed) sits below the seed, so the fold
+/// pass flushes at the very first turn boundary, while the budget stays above
+/// the running total so compaction never fires.
+fn fold_only_budget(seed: &[Message]) -> u64 {
+    let est: u64 = seed.iter().map(|m| est_tokens(&m.content) as u64).sum();
+    est + est / 2
+}
+
+/// A fold-only arm (`micro` on) or its byte-identical control (`micro` off):
+/// the carry seed under a compaction-proof budget, driven two turns so turn 1
+/// carries the flush boundary and turn 2 measures the steady-state request.
+fn run_fold_only(micro: bool) -> SeededArm {
+    let seed = carry_seed();
+    let budget = fold_only_budget(&seed);
+    run_seeded(
+        &seed,
+        budget,
+        micro,
+        SummarizerKind::Provider,
+        Vec::new(),
+        &[
+            "continue: proceed with the next small wiring step.",
+            "then: confirm the buffer state briefly.",
+        ],
+    )
+}
+
+#[test]
+fn fold_only_flush_folds_without_compacting() {
+    // Integrity gate for the isolation: the arm folds exactly the superseded
+    // read and neither run ever compacts or calls the summarizer, so every
+    // byte of divergence measured below is the fold flush and nothing else.
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    assert_eq!(arm.folds, 1, "arm must fold exactly the superseded read");
+    assert!(arm.records.is_empty(), "arm must not compact");
+    assert_eq!(arm.summary_calls, 0, "arm must not call the summarizer");
+    assert_eq!(control.folds, 0, "control must not fold");
+    assert!(control.records.is_empty(), "control must not compact");
+    assert_eq!(arm.requests.len(), 2, "one request per driven turn");
+    assert_eq!(control.requests.len(), 2, "one request per driven turn");
+    assert!(arm.requests.iter().all(|r| !r.is_summary));
+}
+
+#[test]
+fn modeled_marginal_cost_of_a_fold_only_flush() {
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    // Turn 1 carries the flush boundary. Same seed baseline, same prompt: the
+    // only difference between the two turn-1 payloads is the fold stub
+    // replacing the superseded read mid-transcript.
+    let (read_arm, write_arm) = diff_payloads(&arm.seed_baseline, &arm.requests[0].payload);
+    let (read_ctrl, write_ctrl) =
+        diff_payloads(&control.seed_baseline, &control.requests[0].payload);
+    // Control is append-only: its divergent suffix is just the new user turn.
+    assert!(
+        write_ctrl < 100,
+        "control turn-1 divergence must be the appended prompt only, got {write_ctrl}"
+    );
+    // The flush breaks the prefix at the folded read; everything after it
+    // re-bills. The ~4400-token superseding read sits after the fold point, so
+    // the marginal write dwarfs the fold's own saving.
+    let marginal = write_arm.saturating_sub(write_ctrl);
+    assert!(
+        marginal >= 1_000,
+        "fold-only flush must re-bill the suffix below the fold point \
+         (expected >= 1000 modeled write tokens, got {marginal})"
+    );
+    assert!(
+        read_arm < read_ctrl,
+        "the arm's shared prefix must shrink to the fold point \
+         (arm READ {read_arm} vs control READ {read_ctrl})"
+    );
+}
+
+#[test]
+fn fold_only_flush_shrinks_every_subsequent_request() {
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    // Steady state (turn 2): the arm's request is smaller by the folded body
+    // minus the stub, on this and every subsequent request.
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    let saving = ctrl_t2.saturating_sub(arm_t2);
+    assert!(
+        saving >= 100,
+        "fold must shrink the steady-state request by at least the folded body \
+         minus the stub, got {saving}"
+    );
+    // The stub (the recovery affordance) survives verbatim in steady state.
+    assert_survives_verbatim(
+        "fold-only steady state",
+        &arm.requests[1].payload,
+        &["[folded]", FOLD_PATH],
+    );
+    // And the break is ONE-TIME: after the flush the arm is append-only again.
+    let (_, arm_t1_to_t2_write) = diff_payloads(&arm.requests[0].payload, &arm.requests[1].payload);
+    assert!(
+        arm_t1_to_t2_write < 100,
+        "post-flush turns must be append-only (divergence {arm_t1_to_t2_write})"
+    );
+}
+
+#[test]
+fn same_boundary_fold_flush_adds_no_marginal_write() {
+    // Piggyback case (#400 trigger 1): when the flush lands on the same
+    // boundary as a compaction, the compaction rewrites the prefix anyway, so
+    // the fold adds no marginal cache-WRITE -- it can only shrink the rewrite.
+    let carry = run_carry_arm();
+    let micro = run_carry_micro_arm();
+    let carry_gen = model_cache_economics(&carry.requests, Some(&carry.seed_baseline));
+    let micro_gen = model_cache_economics(&micro.requests, Some(&micro.seed_baseline));
+    let c = carry_gen.first().expect("carry arm generation 1");
+    let m = micro_gen.first().expect("micro arm generation 1");
+    assert!(
+        m.write_tokens <= c.write_tokens,
+        "same-boundary fold must not increase the post-compaction write \
+         (micro {} > carry-only {})",
+        m.write_tokens,
+        c.write_tokens
+    );
+}
+
+/// Prints the fold-flush cost tables for
+/// `docs/benchmarks/issue-400-fold-flush-cost.md`. Regenerate with:
+/// `cargo test fold_flush_cost_benchmark_report -- --nocapture`
+#[test]
+fn fold_flush_cost_benchmark_report() {
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    let (read_arm, write_arm) = diff_payloads(&arm.seed_baseline, &arm.requests[0].payload);
+    let (read_ctrl, write_ctrl) =
+        diff_payloads(&control.seed_baseline, &control.requests[0].payload);
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    let marginal = write_arm.saturating_sub(write_ctrl);
+    let saving = ctrl_t2.saturating_sub(arm_t2);
+
+    println!("\n== Fold-ONLY flush at the micro-watermark -- {MODELED_LABEL} ==");
+    println!("| run | turn-1 cache-READ | turn-1 cache-WRITE | turn-2 request tok | folds |");
+    println!("|---|---|---|---|---|");
+    println!(
+        "| control (micro off) | {read_ctrl} | {write_ctrl} | {ctrl_t2} | {} |",
+        control.folds
+    );
+    println!(
+        "| fold-only arm (micro on) | {read_arm} | {write_arm} | {arm_t2} | {} |",
+        arm.folds
+    );
+    println!("\nmarginal flush cost (arm - control turn-1 WRITE): {marginal} modeled tokens");
+    println!("steady-state saving per subsequent request: {saving} modeled tokens");
+    let breakeven =
+        (marginal as f64 * (PRICE_WRITE_5M - PRICE_READ)) / (saving as f64 * PRICE_READ);
+    println!(
+        "WARM-cache break-even under stated Anthropic 5m pricing ratios \
+         (write {PRICE_WRITE_5M}x, read {PRICE_READ}x base input): ~{:.0} turns",
+        breakeven.ceil()
+    );
+    println!(
+        "COLD-cache case (idle past TTL, cold resume): the suffix re-bills regardless, so the \
+         flush is free and the saving is immediate (#400 trigger 3)."
+    );
+
+    println!("\n== Same-boundary flush (piggyback on compaction, #400 trigger 1) ==");
+    let carry = run_carry_arm();
+    let micro = run_carry_micro_arm();
+    let carry_gen = model_cache_economics(&carry.requests, Some(&carry.seed_baseline));
+    let micro_gen = model_cache_economics(&micro.requests, Some(&micro.seed_baseline));
+    println!("| arm | generation-1 post req tok | cache-WRITE (divergent suffix) |");
+    println!("|---|---|---|");
+    if let Some(c) = carry_gen.first() {
+        println!(
+            "| provider+carry (no folds) | {} | {} |",
+            c.post_tokens, c.write_tokens
+        );
+    }
+    if let Some(m) = micro_gen.first() {
+        println!(
+            "| provider+carry+microcompaction | {} | {} |",
+            m.post_tokens, m.write_tokens
+        );
+    }
+    println!(
+        "\nSame boundary as a compaction, the fold's marginal cache-WRITE is zero or negative: \
+         the compaction rewrites the prefix anyway and the fold only shrinks the rewrite."
     );
 }
