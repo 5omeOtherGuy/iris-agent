@@ -88,11 +88,19 @@ impl WorkPhase {
             UiEvent::ToolStarted(call) => Some(WorkPhase::running_tool(call)),
             // A running tool's output keeps the RunningTool phase (and its label).
             UiEvent::ToolOutputDelta { .. } => None,
+            // Every terminal step of a provider turn or the whole task winds
+            // down to the neutral Finishing label, so a cancel or error never
+            // leaves a stale "Thinking"/"Responding"/"Waiting for model" on the
+            // header while the turn unwinds (the old `provider_waiting` bool
+            // cleared on these too).
             UiEvent::ToolResult { .. }
             | UiEvent::ToolError { .. }
             | UiEvent::ToolCancelled(_)
             | UiEvent::ToolDenied(_)
-            | UiEvent::ProviderTurnCompleted { .. } => Some(WorkPhase::Finishing),
+            | UiEvent::ProviderTurnCompleted { .. }
+            | UiEvent::ProviderTurnCancelled { .. }
+            | UiEvent::ProviderTurnError { .. }
+            | UiEvent::TurnError { .. } => Some(WorkPhase::Finishing),
             _ => None,
         }
     }

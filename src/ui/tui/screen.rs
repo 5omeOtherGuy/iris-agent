@@ -1285,15 +1285,21 @@ impl Screen {
         self.transcript.record_approval(call, decision);
     }
 
-    pub(crate) fn clear_approval(&mut self) {
+    /// Clear the docked approval prompt. `approved` selects the phase to resume:
+    /// an approved call is about to run (`PreparingTool`, refined to
+    /// `RunningTool` by the next `ToolStarted`), while a denial, cancellation,
+    /// or error is winding the turn down (`Finishing`). The change is guarded on
+    /// the phase still being `AwaitingApproval`, so a terminal event applied
+    /// just before clearing (the turn-error cleanup path applies its event
+    /// first) is never overwritten.
+    pub(crate) fn clear_approval(&mut self, approved: bool) {
         self.approval_hint = None;
-        // The decision is in; a tool is about to run (approved) or the turn will
-        // wrap up (denied/cancelled). Resume the neutral preparing label until
-        // the next event (`ToolStarted` -> RunningTool, or a terminal event ->
-        // Finishing) refines it, so the header never lingers on "awaiting
-        // approval" after the prompt is gone.
         if matches!(self.phase, WorkPhase::AwaitingApproval) {
-            self.phase = WorkPhase::PreparingTool;
+            self.phase = if approved {
+                WorkPhase::PreparingTool
+            } else {
+                WorkPhase::Finishing
+            };
         }
     }
 
@@ -2894,8 +2900,9 @@ mod tests {
             "no working header competes with the approval prompt"
         );
 
-        // Decision in: the header resumes, then the turn winds down.
-        screen.clear_approval();
+        // Decision in (approved): the header resumes preparing the tool, then
+        // the turn winds down.
+        screen.clear_approval(true);
         assert_eq!(screen.work_phase_label(), "Preparing tool");
         screen.apply(UiEvent::ProviderTurnCompleted {
             turn_id: "t1".to_string(),
@@ -2903,6 +2910,45 @@ mod tests {
             usage: None,
         });
         assert_eq!(screen.work_phase_label(), "Finishing");
+    }
+
+    #[test]
+    fn cancel_and_denied_approval_wind_down_without_a_stale_label() {
+        // A cancelled turn must not leave the header stuck on the phase it was
+        // in (the old provider_waiting bool cleared on cancel); it winds down.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta("Planning".to_string()));
+        assert_eq!(screen.work_phase_label(), "Thinking");
+        screen.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+        assert_eq!(
+            screen.work_phase_label(),
+            "Finishing",
+            "a cancelled turn winds down, not a stale Thinking"
+        );
+
+        // A DENIED approval winds the turn down too -- it must not resume the
+        // misleading "Preparing tool" label, since no tool is about to run.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.show_approval(
+            &bash_call("rm -rf build"),
+            false,
+            false,
+            &ReviewContext::default(),
+        );
+        assert_eq!(screen.work_phase_label(), "Awaiting approval");
+        screen.clear_approval(false);
+        assert_eq!(
+            screen.work_phase_label(),
+            "Finishing",
+            "a denied/cancelled approval does not claim a tool is being prepared"
+        );
     }
 
     #[test]
