@@ -1,0 +1,288 @@
+//! Drivers + records: the deterministic replay arm, the opt-in real-provider
+//! cell, run metrics/records, model selection, and JSONL logging.
+
+use std::cell::RefCell;
+
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::nexus::{Agent, ApprovalMode, ToolEnv};
+use crate::tools::{ToolState, built_in_tools};
+
+use super::arms::Arm;
+use super::fixtures::materialize;
+use super::observer::{BenchObserver, ZeroPromptGate};
+use super::provider::ScriptedProvider;
+use super::workloads::{Outcome, Workload};
+
+/// Metrics from one workload x arm run.
+pub(crate) struct RunMetrics {
+    pub(crate) arm: Arm,
+    /// Estimated cumulative input tokens (replay proxy) OR real provider input
+    /// tokens (headline). See the field the caller reads.
+    pub(crate) cumulative_proxy: usize,
+    pub(crate) final_context_proxy: usize,
+    pub(crate) provider_turns: u32,
+    pub(crate) approvals_consulted: bool,
+    /// The final transcript text the agent saw (replay path only; empty for the
+    /// real path). Used for the needle-survival assertion.
+    pub(crate) transcript: String,
+    pub(crate) outcome: Outcome,
+}
+
+/// Drive one workload x arm with the scripted replay provider under the auto
+/// preset + zero-prompt gate. The fixture is materialized fresh so edits never
+/// touch the committed copy.
+pub(crate) fn run_replay_arm(workload: &Workload, arm: Arm) -> RunMetrics {
+    let workspace = materialize(workload.fixture);
+    let provider = ScriptedProvider::new((workload.script)());
+    let mut agent = Agent::new(provider, built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+
+    let state = RefCell::new(ToolState::new().with_reduce_output(arm.reduce()));
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        output_sink: None,
+        mutation_guard: None,
+        session_span: None,
+    };
+    let observer = BenchObserver::default();
+    let gate = ZeroPromptGate::default();
+    block_on(agent.submit_turn(
+        workload.prompt,
+        &observer,
+        &gate,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))
+    .expect("replay turn completes");
+
+    let outcome = (workload.check)(&workspace.path, &observer.final_text());
+    RunMetrics {
+        arm,
+        cumulative_proxy: agent.provider.cumulative_input_proxy(),
+        final_context_proxy: agent.provider.final_context_proxy(),
+        provider_turns: observer.provider_turns.get(),
+        approvals_consulted: gate.consulted.get(),
+        transcript: agent.provider.final_transcript_text(),
+        outcome,
+    }
+}
+
+/// Benchmark reasoning effort, held IDENTICAL across arms (it is a confounder).
+/// `IRIS_BENCH_REASONING` overrides; default `low` -- the agreed cost-conscious
+/// setting (reasoning tokens are output-side and add cost/variance without
+/// sharpening the input-reduction signal this benchmark measures).
+pub(crate) fn bench_reasoning() -> Option<crate::mimir::selection::ReasoningEffort> {
+    let raw = std::env::var("IRIS_BENCH_REASONING").unwrap_or_else(|_| "low".to_string());
+    if raw.trim().eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(
+        crate::mimir::selection::ReasoningEffort::parse(raw.trim())
+            .expect("valid IRIS_BENCH_REASONING"),
+    )
+}
+
+/// Build a `ModelSelection` for a `provider:model` spec, overriding provider,
+/// model, base URL, and reasoning on top of a config-resolved base (so cache /
+/// retry / context-management defaults are inherited). Used by the smoke and
+/// headline paths to drive an explicit model matrix.
+pub(crate) fn selection_for_spec(
+    cwd: &std::path::Path,
+    spec: &str,
+    reasoning: Option<crate::mimir::selection::ReasoningEffort>,
+) -> std::result::Result<crate::mimir::selection::ModelSelection, String> {
+    use crate::mimir::selection::{ModelSelection, ProviderId, base_url_for};
+    let (provider_str, model) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("model spec {spec:?} must be 'provider:model'"))?;
+    let provider = ProviderId::parse(provider_str).map_err(|e| e.to_string())?;
+    let settings = crate::config::Settings::load(cwd).map_err(|e| e.to_string())?;
+    let mut selection = ModelSelection::resolve(&settings).map_err(|e| e.to_string())?;
+    selection.provider = provider;
+    selection.model = model.trim().to_string();
+    selection.base_url = base_url_for(provider, None);
+    selection.reasoning = reasoning;
+    crate::mimir::model_capabilities::validate(&selection).map_err(|e| e.to_string())?;
+    Ok(selection)
+}
+
+/// Rich outcome of one real-provider cell (the unit we log and aggregate).
+pub(crate) struct RealRunRecord {
+    pub(crate) arm: Arm,
+    pub(crate) outcome: Outcome,
+    pub(crate) turns: u32,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) reasoning_tokens: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) tool_counts: std::collections::BTreeMap<String, u32>,
+    pub(crate) handles_stored: u32,
+    pub(crate) per_turn: Vec<(u64, u64)>,
+    pub(crate) approvals_consulted: bool,
+}
+
+impl RealRunRecord {
+    pub(crate) fn tool_calls_total(&self) -> u32 {
+        self.tool_counts.values().sum()
+    }
+    /// Mean input tokens per provider turn -- the factor the reduction lever
+    /// actually moves, isolated from the (noisy, model-chosen) turn count.
+    pub(crate) fn tokens_per_turn(&self) -> f64 {
+        if self.turns == 0 {
+            0.0
+        } else {
+            self.input_tokens as f64 / self.turns as f64
+        }
+    }
+}
+
+/// JSONL run-log path (override with `IRIS_BENCH_LOG`). One line per real run,
+/// with every field captured -- the durable record for offline statistics.
+pub(crate) fn bench_log_path() -> String {
+    std::env::var("IRIS_BENCH_LOG")
+        .unwrap_or_else(|_| "target/tokens-per-task-runs.jsonl".to_string())
+}
+
+pub(crate) fn bench_log_reset() {
+    let _ = std::fs::write(bench_log_path(), "");
+}
+
+fn bench_log_append(line: &Value) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(bench_log_path())
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Run one real-provider cell for an explicit selection, capturing rich
+/// per-run/per-turn data and appending it to the JSONL log. Fallible: a backend
+/// rejection (bad model id, unsupported thinking level, auth) is returned as
+/// `Err(message)` so the smoke can report per-model reachability instead of
+/// aborting the whole matrix.
+pub(crate) fn run_real_cell(
+    model: &str,
+    workload: &Workload,
+    arm: Arm,
+    run: usize,
+    selection: &crate::mimir::selection::ModelSelection,
+) -> std::result::Result<RealRunRecord, String> {
+    let workspace = materialize(workload.fixture);
+    let cwd = workspace.path.clone();
+    let tools = built_in_tools();
+    let system_prompt = crate::wayland::system_prompt::assemble(&cwd, &tools);
+    let settings = crate::config::Settings::load(&cwd).map_err(|e| e.to_string())?;
+    let session_id = crate::session::new_session_id();
+    let provider = crate::build_provider(selection, &system_prompt, &session_id)
+        .map_err(|e| format!("build provider: {e}"))?;
+    let mut agent = Agent::new(provider, built_in_tools())
+        .with_max_tool_roundtrips(settings.max_tool_roundtrips());
+    agent.set_approval_mode(ApprovalMode::Auto);
+
+    let state = RefCell::new(ToolState::new().with_reduce_output(arm.reduce()));
+    let env = ToolEnv {
+        workspace: &cwd,
+        state: &state,
+        output_store: None,
+        output_sink: None,
+        mutation_guard: None,
+        session_span: None,
+    };
+    let observer = BenchObserver::default();
+    let gate = ZeroPromptGate::default();
+    block_on(agent.submit_turn(
+        workload.prompt,
+        &observer,
+        &gate,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))
+    .map_err(|e| format!("provider turn: {e}"))?;
+
+    let outcome = (workload.check)(&cwd, &observer.final_text());
+    let record = RealRunRecord {
+        arm,
+        outcome,
+        turns: observer.provider_turns.get(),
+        input_tokens: observer.usage_input_tokens.get(),
+        output_tokens: observer.output_tokens.get(),
+        reasoning_tokens: observer.reasoning_tokens.get(),
+        cache_read: observer.cache_read.get(),
+        total_tokens: observer.total_tokens.get(),
+        tool_counts: observer.tool_counts.borrow().clone(),
+        handles_stored: observer.handles_stored.get(),
+        per_turn: observer.per_turn.borrow().clone(),
+        approvals_consulted: gate.consulted.get(),
+    };
+    bench_log_append(&json!({
+        "model": model,
+        "workload": workload.name,
+        "arm": record.arm.label(),
+        "reduce_output": arm.reduce(),
+        "run": run,
+        "reasoning": format!("{:?}", selection.reasoning),
+        "success": record.outcome.success,
+        "detail": record.outcome.detail,
+        "turns": record.turns,
+        "input_tokens": record.input_tokens,
+        "output_tokens": record.output_tokens,
+        "reasoning_tokens": record.reasoning_tokens,
+        "cache_read_tokens": record.cache_read,
+        "total_tokens": record.total_tokens,
+        "tokens_per_turn": record.tokens_per_turn(),
+        "tool_calls_total": record.tool_calls_total(),
+        "tool_counts": record.tool_counts,
+        "handles_stored": record.handles_stored,
+        "approvals": record.approvals_consulted,
+        "per_turn": record
+            .per_turn
+            .iter()
+            .map(|(i, o)| json!({ "in": i, "out": o }))
+            .collect::<Vec<_>>(),
+    }));
+    Ok(record)
+}
+
+/// Default smoke/headline model matrix (all on OAuth/subscription lanes
+/// reachable with existing credentials). Override with `IRIS_BENCH_MODELS`
+/// (comma-separated `provider:model`).
+///
+/// Antigravity/Gemini is EXCLUDED for now: the provider hardcodes `usage: None`
+/// (`antigravity.rs`), so it reports 0 usage tokens and cannot produce a
+/// tokens-per-task number (smoke Entry 11). Re-add `antigravity:gemini-3.5-flash`
+/// once the Antigravity adapter parses Gemini `usageMetadata`.
+const DEFAULT_MODEL_SPECS: &[&str] = &[
+    "openai-codex:gpt-5.4-mini",
+    "openai-codex:gpt-5.3-codex-spark",
+    "anthropic:claude-haiku-4-5",
+];
+
+pub(crate) fn model_specs() -> Vec<String> {
+    match std::env::var("IRIS_BENCH_MODELS") {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => DEFAULT_MODEL_SPECS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Drive one async future to completion on a current-thread runtime.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime")
+        .block_on(future)
+}
