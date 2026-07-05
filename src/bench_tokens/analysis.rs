@@ -185,6 +185,13 @@ pub(crate) struct Pairing {
     pub(crate) term_turns: f64,
     /// Real tool-result bytes delta (A - B), the "reduction fired?" signal.
     pub(crate) delta_result_bytes: i64,
+    /// Welch 95% CI on the mean input-token saving (B - A; positive = A cheaper).
+    pub(crate) mean_saving: f64,
+    pub(crate) ci_low: f64,
+    pub(crate) ci_high: f64,
+    /// The saving CI lies entirely above zero -- a statistically defensible
+    /// reduction (the SUPPORTED gate, with success held + adequate N).
+    pub(crate) significant: bool,
     pub(crate) verdict: Verdict,
 }
 
@@ -231,10 +238,37 @@ fn median(values: &[u64]) -> f64 {
     }
 }
 
-fn spread(values: &[u64]) -> (u64, u64) {
-    let min = values.iter().copied().min().unwrap_or(0);
-    let max = values.iter().copied().max().unwrap_or(0);
-    (min, max)
+/// Arithmetic mean of a sample.
+fn mean(values: &[u64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<u64>() as f64 / values.len() as f64
+}
+
+/// Unbiased (n-1) sample variance about `m`.
+fn sample_var(values: &[u64], m: f64) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let ss: f64 = values.iter().map(|&x| (x as f64 - m).powi(2)).sum();
+    ss / (values.len() as f64 - 1.0)
+}
+
+/// Welch 95% confidence interval on the mean input-token saving `mean_b -
+/// mean_a` (positive = the reduced arm A is cheaper). Normal-approximation
+/// (z=1.96) two-sample interval with unequal variances -- the correct test for
+/// "is the saving distinguishable from zero" at moderate+ N. It REPLACES the old
+/// range-overlap guard, which can never certify at large N (one outlier A-run
+/// always exceeds the cheapest B-run) yet was the only Supported gate. Returns
+/// (saving, lo, hi).
+fn welch_ci(a: &[u64], b: &[u64]) -> (f64, f64, f64) {
+    let (ma, mb) = (mean(a), mean(b));
+    let saving = mb - ma;
+    let se = (sample_var(a, ma) / a.len().max(1) as f64
+        + sample_var(b, mb) / b.len().max(1) as f64)
+        .sqrt();
+    (saving, saving - 1.96 * se, saving + 1.96 * se)
 }
 
 /// Parse and analyze a JSONL log body. Blank and unparsable lines are counted
@@ -357,8 +391,10 @@ fn pair(model: String, workload: String, group: &[Cell]) -> Pairing {
     let term_turns = (turns_a - turns_b) * tpt_b;
 
     let delta_result_bytes = median(&a.bytes) as i64 - median(&b.bytes) as i64;
+    let (mean_saving, ci_low, ci_high) = welch_ci(&a.input, &b.input);
+    let significant = ci_low > 0.0;
 
-    let verdict = verdict_for(&a, &b, delta_input);
+    let verdict = verdict_for(&a, &b, delta_input, significant);
 
     Pairing {
         model,
@@ -376,12 +412,16 @@ fn pair(model: String, workload: String, group: &[Cell]) -> Pairing {
         term_efficiency,
         term_turns,
         delta_result_bytes,
+        mean_saving,
+        ci_low,
+        ci_high,
+        significant,
         verdict,
     }
 }
 
 /// The honesty verdict, in precedence order (most-blocking first).
-fn verdict_for(a: &ArmStats, b: &ArmStats, delta_input: i64) -> Verdict {
+fn verdict_for(a: &ArmStats, b: &ArmStats, delta_input: i64, significant: bool) -> Verdict {
     if a.n == 0 || b.n == 0 {
         return Verdict::Incomplete;
     }
@@ -389,15 +429,15 @@ fn verdict_for(a: &ArmStats, b: &ArmStats, delta_input: i64) -> Verdict {
     if a.success_rate() + f64::EPSILON < b.success_rate() {
         return Verdict::SuccessRegression;
     }
-    // Baseline ties or wins on tokens: no reduction to claim.
+    // Baseline ties or wins on the (robust, median) token delta: nothing to claim.
     if delta_input >= 0 {
         return Verdict::BaselineWins;
     }
-    // Cheaper reduced arm, but not defensible: small N or overlapping spreads
-    // (the small-N stand-in for a CI that crosses zero).
-    let (_, a_max) = spread(&a.input);
-    let (b_min, _) = spread(&b.input);
-    if a.n.min(b.n) < MIN_N_FOR_CLAIM || a_max >= b_min {
+    // Cheaper reduced arm: defensible only with adequate N AND a saving whose
+    // Welch 95% CI clears zero. Small N or a CI that crosses zero stays
+    // inconclusive (descriptive only) -- this is what keeps a noisy cell (e.g.
+    // a model with high turn-count variance) from being called a win.
+    if a.n.min(b.n) < MIN_N_FOR_CLAIM || !significant {
         return Verdict::Inconclusive;
     }
     Verdict::Supported
@@ -489,6 +529,34 @@ pub(crate) fn format_report(analysis: &Analysis) -> String {
          tokens are cumulative it is a clean reduction signal ONLY when turn counts \
          match. `result-bytes delta` is real tool-output bytes in context (A - B); ~0 \
          means the reduction never fired for that cell's tool path."
+    );
+
+    let _ = writeln!(
+        out,
+        "\n## Significance (Welch 95% CI on mean input-token saving, B - A; + = defaults cheaper)\n"
+    );
+    let _ = writeln!(
+        out,
+        "| model | workload | mean saving | 95% CI | clears zero |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|");
+    for p in &analysis.pairings {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {:+.0} | [{:+.0}, {:+.0}] | {} |",
+            p.model,
+            p.workload,
+            p.mean_saving,
+            p.ci_low,
+            p.ci_high,
+            if p.significant { "yes" } else { "no" },
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nA cell is SUPPORTED only when its saving CI clears zero, success held, \
+         and N is adequate -- a real, statistically defensible reduction. A CI that \
+         crosses zero stays INCONCLUSIVE no matter how large N is."
     );
     out
 }

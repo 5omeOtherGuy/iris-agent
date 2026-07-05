@@ -1142,3 +1142,43 @@ more consistent on stronger models, but N=5 and small magnitudes -- not a claim.
 - Path to significance: more runs on the clean same-turn-count cells (larger N
   on single-strategy tasks), not a wider model sweep. Turn-count variance
   remains the dominant obstacle and is a property of model strategy.
+
+## Entry 24 - N=50 investigate cell: first SIGNIFICANT win (Sonnet), + analyzer fix
+
+Effort verified before the run (operator flagged it): Sonnet 4.6 is manual-budget
+=> iris `low` = `thinking.budget_tokens: 4096`, NOT Anthropic's named "low"
+effort (that scale is adaptive-tier only; there iris `minimal` -> Anthropic
+"low"). GPT-5.4 `low` -> `reasoning.effort: "low"` direct. Added
+`IRIS_BENCH_WORKLOAD` filter (6f31484) to target one cell without paying for the
+other two. 200 sessions (2 models x investigate x 2 arms x N=50), low, held
+across arms. Artifact: investigate-n50-sonnet46-gpt54-2026-07-05.{md,jsonl}.
+
+**Sonnet 4.6: SUPPORTED (first in the study).** median saving 575 / mean 541
+input tokens (-2.4%), SAME 3 turns, 100% success both arms, result-bytes -1168.
+Welch 95% CI [+397,+685] clears zero; out-of-band permutation p<0.0001, bootstrap
+median CI [+572,+578], 50/50 A-runs beat B median. Low variance (sd ~330-400)
+makes the small real effect visible.
+
+**GPT-5.4: INCONCLUSIVE.** same sign (-1.2%) but Welch CI [-1607,+2246] spans
+zero (permutation p=0.75, 29/50). sd ~4400-5300 -- turn-count variance (2-4
+turns) swamps the reduction. Overall verdict INCONCLUSIVE (one supported, one
+not).
+
+**Analyzer fix forced by N=50.** The verdict used a range-overlap guard
+(max_A>=min_B) that can never certify at large N (an outlier A-run always exceeds
+the cheapest B-run), so it wrongly called the p<0.0001 Sonnet cell INCONCLUSIVE
+-- under-reporting a real effect. Replaced with a Welch 95% CI on the mean
+saving: SUPPORTED only when the CI clears zero (+ success held + N>=5). Correctly
+certifies Sonnet AND leaves noisy GPT-5.4 inconclusive, so it is a real test not a
+rubber stamp. Two new gate cases lock it in (overlapping-ranges/separated-means
+-> Supported; large-N/high-variance -> Inconclusive). This was a correctness fix
+(the old test was statistically wrong), not tuning-to-result -- and it does not
+flip GPT-5.4.
+
+**Scope (no overclaim).** One model, one workload -- the most reduction-favorable
+(log grep, compaction hits the answer-bearing output). Supports a narrow
+statement: on a stable model doing grep-heavy triage, reduction gives a small
+(~2.4%) but statistically defensible saving at equal success. Does NOT support a
+blanket tokens-per-task claim (GPT-5.4 within noise; prior 3-workload matrices
+mixed). No README claim, no ROADMAP-gate closure on one cell; logged as measured
+evidence for review.

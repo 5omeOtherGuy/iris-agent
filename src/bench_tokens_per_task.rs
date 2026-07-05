@@ -464,10 +464,26 @@ mod replay {
             lines.push(cell_line("m1", "w-baseline", false, true, 3, 1000));
             lines.push(cell_line("m1", "w-baseline", true, true, 3, 1100));
         }
-        // Inconclusive: A cheaper on median but spreads overlap.
+        // Inconclusive: A cheaper on median but the saving CI crosses zero.
         for i in 0..5 {
             lines.push(cell_line("m1", "w-incon", false, true, 3, 1000 + i * 3));
             lines.push(cell_line("m1", "w-incon", true, true, 3, 995 + i * 3));
+        }
+        // Supported despite OVERLAPPING RANGES: means clearly separated, tight
+        // variance, N=10. The old max_A>=min_B guard would have called this
+        // INCONCLUSIVE; the Welch CI correctly certifies it (the N=50 Sonnet
+        // situation in miniature).
+        for i in 0..10 {
+            lines.push(cell_line("m1", "w-overlap-sig", false, true, 3, 1000 + i));
+            lines.push(cell_line("m1", "w-overlap-sig", true, true, 3, 995 + i));
+        }
+        // Inconclusive at LARGE N: A cheaper on median but high variance -> the
+        // saving CI still spans zero (the N=50 GPT-5.4 situation). Proves N alone
+        // never buys a claim.
+        let noisy_b = [500, 700, 900, 1100, 1300, 600, 800, 1000, 1200, 1400];
+        for b in noisy_b {
+            lines.push(cell_line("m1", "w-noisy", false, true, 3, b));
+            lines.push(cell_line("m1", "w-noisy", true, true, 3, b - 50));
         }
         // Coverage: a render probe, an error cell, an invalid (usage-None) cell,
         // and an unparsable line -- all counted, none crash the analyzer.
@@ -499,9 +515,13 @@ mod replay {
         assert_eq!(verdict("w-regress"), Verdict::SuccessRegression);
         assert_eq!(verdict("w-baseline"), Verdict::BaselineWins);
         assert_eq!(verdict("w-incon"), Verdict::Inconclusive);
+        // The Welch-CI upgrade: overlapping ranges but separated means -> Supported;
+        // large N but high variance -> still Inconclusive.
+        assert_eq!(verdict("w-overlap-sig"), Verdict::Supported);
+        assert_eq!(verdict("w-noisy"), Verdict::Inconclusive);
         // Overall is the most-blocking pairing verdict.
         assert_eq!(analysis.overall, Verdict::SuccessRegression);
-        assert_eq!(analysis.cell_count, 40);
+        assert_eq!(analysis.cell_count, 80);
         assert_eq!(analysis.invalid_count, 1);
         assert_eq!(analysis.error_count, 1);
         assert!(analysis.skipped_lines >= 1);
