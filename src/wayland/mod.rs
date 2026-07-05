@@ -26,8 +26,9 @@ use crate::config::VerificationConfig;
 use crate::handles::HandleStore;
 use crate::nexus::ToolOutputStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderEvent, Role,
-    SessionSpanReader, SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
+    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, FoldTrigger, Message,
+    ProviderEvent, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools, VerificationOutcome,
+    VerifyRun,
 };
 use crate::session::{
     SessionLog, estimate_tokens, message_token_estimate, preview_line, read_span,
@@ -599,7 +600,7 @@ impl<P: ChatProvider> Harness<P> {
         // first so reclaimed mass can defer a full compaction. The prior turn's
         // transcript is complete here (every tool call answered), so neither the
         // fold pass nor the covered range splits a pending tool-call/result pair.
-        self.maybe_microcompact()?;
+        self.maybe_microcompact(obs)?;
         self.maybe_auto_compact(obs, token).await?;
         // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
         // the current session id to the guard before the turn. The guard stamps
@@ -823,79 +824,141 @@ impl<P: ChatProvider> Harness<P> {
     /// boundary: append a `compaction` entry covering an older message range and
     /// replace the in-memory context with `summary + retained tail`, so the
     /// next provider request uses the summary instead of the covered messages.
-    /// No-op when auto-compaction is disabled, no log is attached, the context
-    /// is within budget, nothing coverable remains, or the summary request was
-    /// cancelled (the turn's own cancellation handling takes over).
-    /// Opt-in microcompaction fold pass (ADR-0048, #378), run at the safe turn
-    /// boundary before the provider request. When enabled and the context has
-    /// reached the micro-watermark (below the compaction budget), fold every
-    /// spent tool result the V1 policy detects (superseded reads, latest-read-
-    /// wins) to a deterministic stub: append a durable `fold` entry AND rewrite
-    /// the in-memory result content, so live and resumed context agree. Returns
-    /// the number of folds applied (0 = disabled, below the watermark, no
-    /// durable session, or nothing spent).
+    /// Recompute the pending fold set (issue #400, design §4.1): the fold
+    /// plans the V1 policy detects over the current context, before the
+    /// protected tail. Pure derived state -- in-memory only, recomputed at
+    /// every turn boundary and on resume from the transcript alone (no new
+    /// persistence). Empty when microcompaction is off or no durable session
+    /// is attached (a fold has nowhere to be recorded), so detection is gated
+    /// exactly like flushing.
+    fn pending_folds(&self) -> Vec<fold::FoldPlan> {
+        if !self.microcompaction || self.session.is_none() {
+            return Vec::new();
+        }
+        let messages = self.agent.messages();
+        // Protect the recent tail: the fold engine never folds at or after this
+        // index (the model's immediate working set stays verbatim).
+        let tail_start = fold_tail_start(messages, MICRO_FOLD_KEEP_TOKENS);
+        fold::plan_folds(
+            messages,
+            &self.entry_ids,
+            tail_start,
+            &self.workspace,
+            fold::V1_POLICIES,
+        )
+    }
+
+    /// Detected-but-unflushed folds at the current boundary, for the context
+    /// accounting surface and hold-path tests (issue #400). Derived state:
+    /// recomputed, never stored. The accounting surface is the non-test
+    /// consumer; until it lands, only the hold-path tests read it.
+    #[allow(dead_code)]
+    pub(crate) fn pending_fold_count(&self) -> usize {
+        self.pending_folds().len()
+    }
+
+    /// The trigger releasing a fold flush at this boundary, or `None` to hold
+    /// (issue #400, design §4.4). Holding is free: the pending set is derived
+    /// state. M1 wires the boundary-local classes -- A1 (a compaction will
+    /// fire at this same boundary, so the prefix re-bills anyway) and the
+    /// shipped Class C watermark backstop (`budget/2`, unchanged behavior).
+    /// The break-event classes (A2-A6) and inferred-cold (B) land with the
+    /// provider cache profile. A1 is checked first so a flush that rides a
+    /// compaction is attributed to the break, not the pressure backstop.
+    fn fold_trigger(&self, total: u64) -> Option<FoldTrigger> {
+        let budget = self.budget?;
+        if total > budget {
+            return Some(FoldTrigger::CompactionBoundary);
+        }
+        if total >= micro_watermark(budget) {
+            return Some(FoldTrigger::Watermark);
+        }
+        None
+    }
+
+    /// Opt-in microcompaction fold pass (ADR-0048, #378, #400), run at the safe
+    /// turn boundary before the provider request. Detection and flushing are
+    /// split (design §4.1): the pending fold set is recomputed every boundary,
+    /// and flushes only when a trigger fires -- today the compaction boundary
+    /// (A1) or the micro-watermark backstop (C). Returns the number of folds
+    /// applied (0 = disabled, holding, no durable session, or nothing spent).
     ///
     /// The setting gates fold WRITING only; rebuild always honors persisted
     /// folds. No provider round-trip and no summary-quality risk: folding is
     /// deterministic and every folded result stays recoverable (the stub names
     /// the workspace-relative path; the original turn survives verbatim for the
     /// #373 recall tool).
-    fn maybe_microcompact(&mut self) -> Result<usize> {
-        if !self.microcompaction {
-            return Ok(0);
-        }
-        // A fold is a durable read-time view; without a log there is nowhere to
-        // record it, so skip rather than diverge live from resumed context.
-        if self.session.is_none() {
-            return Ok(0);
-        }
-        // Batch at the micro-watermark: no per-turn folding. Below the watermark
-        // the accumulated spent mass is not yet worth a prefix-cache break.
-        let Some(budget) = self.budget else {
-            return Ok(0);
-        };
-        let total = context_tokens(self.agent.messages());
-        if total < micro_watermark(budget) {
-            return Ok(0);
-        }
-
-        let messages = self.agent.messages().to_vec();
-        // Protect the recent tail: the fold engine never folds at or after this
-        // index (the model's immediate working set stays verbatim).
-        let tail_start = fold_tail_start(&messages, MICRO_FOLD_KEEP_TOKENS);
-        let plans = fold::plan_folds(
-            &messages,
-            &self.entry_ids,
-            tail_start,
-            &self.workspace,
-            fold::V1_POLICIES,
-        );
+    fn maybe_microcompact(&mut self, obs: &dyn AgentObserver) -> Result<usize> {
+        let plans = self.pending_folds();
         if plans.is_empty() {
             return Ok(0);
         }
+        let total = context_tokens(self.agent.messages());
+        let Some(trigger) = self.fold_trigger(total) else {
+            // Hold: folds are detected but the cache is presumed warm and no
+            // break is pending. The pending set is derived, so holding costs
+            // nothing and survives resume by recomputation.
+            return Ok(0);
+        };
+        self.flush_folds(&plans, trigger, obs)
+    }
 
-        // Apply each fold durably (a `fold` entry naming the target id) and in
-        // memory (rewrite the result content) in the same step. The folded
-        // message keeps its role/pairing and durable id, so the pair invariant
-        // holds and it stays coverable by a later compaction; `persisted` and
-        // `entry_ids` are unchanged (no message entry is added or removed).
+    /// Apply a batch of fold plans: durably (a `fold` entry naming the target
+    /// id, tagged with the trigger class) and in memory (rewrite the result
+    /// content) in the same step. The folded message keeps its role/pairing and
+    /// durable id, so the pair invariant holds and it stays coverable by a
+    /// later compaction; `persisted` and `entry_ids` are unchanged (no message
+    /// entry is added or removed). Emits one [`AgentEvent::FoldApplied`] per
+    /// batch carrying counts, the reclaimed-token estimate, and the trigger.
+    fn flush_folds(
+        &mut self,
+        plans: &[fold::FoldPlan],
+        trigger: FoldTrigger,
+        obs: &dyn AgentObserver,
+    ) -> Result<usize> {
         let log = self
             .session
             .as_mut()
-            .expect("microcompaction callers check the session first");
-        let mut folded = messages;
+            .expect("fold flush callers check the session first");
+        let mut folded = self.agent.messages().to_vec();
         let mut applied = 0usize;
-        for plan in &plans {
+        let mut reclaimed = 0u64;
+        for plan in plans {
             let stub_tokens = estimate_tokens(&plan.stub);
-            log.append_fold(&plan.entry_id, &plan.stub, Some(stub_tokens))?;
+            log.append_fold(
+                &plan.entry_id,
+                &plan.stub,
+                Some(stub_tokens),
+                trigger.code(),
+            )?;
+            reclaimed = reclaimed.saturating_add(
+                estimate_tokens(&folded[plan.index].content).saturating_sub(stub_tokens),
+            );
             folded[plan.index].content = plan.stub.clone();
             applied += 1;
         }
-        tracing::info!(folds = applied, "microcompacted spent tool results");
+        tracing::info!(
+            folds = applied,
+            reclaimed,
+            trigger = trigger.code(),
+            "microcompacted spent tool results"
+        );
         self.agent.replace_messages(folded);
+        obs.on_event(AgentEvent::FoldApplied {
+            folds: applied,
+            reclaimed_tokens_estimate: reclaimed,
+            trigger,
+        })?;
         Ok(applied)
     }
 
+    /// If the current context exceeds the budget, compact at this safe turn
+    /// boundary: append a `compaction` entry covering an older message range and
+    /// replace the in-memory context with `summary + retained tail`, so the
+    /// next provider request uses the summary instead of the covered messages.
+    /// No-op when auto-compaction is disabled, no log is attached, the context
+    /// is within budget, nothing coverable remains, or the summary request was
+    /// cancelled (the turn's own cancellation handling takes over).
     async fn maybe_auto_compact(
         &mut self,
         obs: &dyn AgentObserver,

@@ -397,7 +397,8 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             | UiEvent::ProviderTurnError { .. }
             | UiEvent::ToolLifecycle { .. }
             | UiEvent::OutputHandleStored { .. }
-            | UiEvent::CompactionApplied { .. } => {}
+            | UiEvent::CompactionApplied { .. }
+            | UiEvent::FoldApplied { .. } => {}
             UiEvent::SessionStarted => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;

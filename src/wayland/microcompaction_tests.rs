@@ -1,9 +1,12 @@
 //! Integration tests for the opt-in microcompaction fold pass at the harness
-//! seam (ADR-0048, #378): folds batch only at/above the micro-watermark (never
-//! per-turn), the opt-in flag gates fold WRITING (off -> no folds), a folded
-//! result is rewritten in memory AND recorded durably, and a resumed session
-//! rebuilds through the persisted fold regardless of the current setting.
+//! seam (ADR-0048, #378, #400): detection recomputes the pending set every
+//! turn boundary, flushing waits for a trigger (watermark = Class C backstop;
+//! compaction boundary = A1), the opt-in flag gates fold WRITING (off -> no
+//! folds), a folded result is rewritten in memory AND recorded durably with
+//! its trigger tag, and a resumed session rebuilds through the persisted fold
+//! regardless of the current setting.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,9 +16,42 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::Harness;
-use crate::nexus::{Agent, ChatProvider, Message, ProviderStream, Tools};
+use crate::nexus::{
+    Agent, AgentEvent, AgentObserver, ChatProvider, FoldTrigger, Message, ProviderStream, Tools,
+};
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
+
+/// Swallows every agent event: most tests inspect the rebuilt context and the
+/// transcript directly, not the event stream.
+struct NullObserver;
+impl AgentObserver for NullObserver {
+    fn on_event(&self, _event: AgentEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Records every fold observer event, so tests can assert the fold pass
+/// surfaces its trigger tag (issue #400, design §4.4).
+#[derive(Default)]
+struct FoldRecorder {
+    folds: RefCell<Vec<(usize, u64, FoldTrigger)>>,
+}
+impl AgentObserver for FoldRecorder {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if let AgentEvent::FoldApplied {
+            folds,
+            reclaimed_tokens_estimate,
+            trigger,
+        } = event
+        {
+            self.folds
+                .borrow_mut()
+                .push((folds, reclaimed_tokens_estimate, trigger));
+        }
+        Ok(())
+    }
+}
 
 /// A needle that lives only in the superseded (foldable) read body, so its
 /// disappearance from rebuilt context proves the fold happened.
@@ -128,12 +164,17 @@ fn resume(
 
 /// Count `fold` entries in a transcript.
 fn fold_count(path: &Path) -> usize {
+    fold_entries(path).len()
+}
+
+/// The parsed `fold` entries in a transcript, for trigger-tag assertions.
+fn fold_entries(path: &Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|entry| entry["type"] == "fold")
-        .count()
+        .collect()
 }
 
 #[test]
@@ -151,7 +192,7 @@ fn no_fold_below_the_micro_watermark_and_a_fold_at_or_above_it() {
     // the batch must not run (no per-turn folding below the watermark).
     let high_budget = Some(total.saturating_mul(4));
     let mut below = resume(&root.path, &workspace.path, &path, high_budget, true);
-    let applied = below.maybe_microcompact().unwrap();
+    let applied = below.maybe_microcompact(&NullObserver).unwrap();
     assert_eq!(applied, 0, "below the micro-watermark, nothing folds");
     assert_eq!(
         fold_count(&path),
@@ -164,7 +205,7 @@ fn no_fold_below_the_micro_watermark_and_a_fold_at_or_above_it() {
     // batch runs and folds the superseded read.
     let low_budget = Some(total);
     let mut above = resume(&root.path, &workspace.path, &path, low_budget, true);
-    let applied = above.maybe_microcompact().unwrap();
+    let applied = above.maybe_microcompact(&NullObserver).unwrap();
     assert_eq!(
         applied, 1,
         "at/above the watermark the superseded read folds"
@@ -203,7 +244,7 @@ fn microcompaction_off_writes_no_folds_even_above_the_watermark() {
     // Opt-in OFF: even with the budget low enough that the watermark is crossed,
     // no fold is written and the in-memory needle survives.
     let mut off = resume(&root.path, &workspace.path, &path, Some(total), false);
-    let applied = off.maybe_microcompact().unwrap();
+    let applied = off.maybe_microcompact(&NullObserver).unwrap();
     assert_eq!(applied, 0, "opt-in off -> the fold pass is a no-op");
     assert_eq!(fold_count(&path), 0, "opt-in off -> no fold entry written");
     let joined = off
@@ -225,7 +266,7 @@ fn a_fold_written_while_on_rebuilds_after_the_setting_is_turned_off() {
 
     // Fold once with microcompaction ON.
     let mut on = resume(&root.path, &workspace.path, &path, Some(total), true);
-    assert_eq!(on.maybe_microcompact().unwrap(), 1);
+    assert_eq!(on.maybe_microcompact(&NullObserver).unwrap(), 1);
     drop(on);
 
     // Reopen the transcript: rebuild honors the persisted fold regardless of the
@@ -253,4 +294,125 @@ fn a_fold_written_while_on_rebuilds_after_the_setting_is_turned_off() {
         joined.contains("a.rs"),
         "the stub names the path after rebuild"
     );
+}
+
+#[test]
+fn detection_holds_pending_folds_until_a_trigger_fires() {
+    // Hold-path regression (issue #400, design §4.1/§4.4): the fold policy
+    // DETECTS the superseded read at every boundary, but with no trigger (cache
+    // presumed warm, context below the watermark) nothing is flushed -- no fold
+    // entry, no in-memory rewrite, no observer event.
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let high_budget = Some(total.saturating_mul(4));
+    let mut held = resume(&root.path, &workspace.path, &path, high_budget, true);
+    assert_eq!(
+        held.pending_fold_count(),
+        1,
+        "detection sees the superseded read even while holding"
+    );
+    let recorder = FoldRecorder::default();
+    assert_eq!(held.maybe_microcompact(&recorder).unwrap(), 0);
+    assert_eq!(fold_count(&path), 0, "held folds are never persisted");
+    assert!(
+        recorder.folds.borrow().is_empty(),
+        "no fold event while holding"
+    );
+    let joined = held
+        .agent
+        .messages()
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains(NEEDLE), "held fold leaves context verbatim");
+    drop(held);
+
+    // The pending set is derived state: a fresh resume recomputes the same
+    // pending fold from the transcript alone (no persistence of the ledger).
+    let resumed = resume(&root.path, &workspace.path, &path, high_budget, true);
+    assert_eq!(
+        resumed.pending_fold_count(),
+        1,
+        "pending set survives resume by recomputation"
+    );
+}
+
+#[test]
+fn pending_folds_are_empty_when_microcompaction_is_off() {
+    // Detection is gated by the opt-in exactly like flushing: off means the
+    // scheduler holds nothing and the accounting surface reports zero pending.
+    let (root, workspace, path) = seed_session();
+    let off = resume(&root.path, &workspace.path, &path, Some(1), false);
+    assert_eq!(off.pending_fold_count(), 0);
+}
+
+#[test]
+fn watermark_flush_is_tagged_class_c_on_the_entry_and_the_event() {
+    // Trigger-source tagging (issue #400, design §4.4): a watermark-driven
+    // flush records `C` on the persisted fold entry and on the observer event.
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut above = resume(&root.path, &workspace.path, &path, Some(total), true);
+    let recorder = FoldRecorder::default();
+    assert_eq!(above.maybe_microcompact(&recorder).unwrap(), 1);
+    let entries = fold_entries(&path);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["trigger"], "C", "fold entry carries the trigger");
+    let folds = recorder.folds.borrow();
+    assert_eq!(folds.len(), 1, "one fold event per flush batch");
+    let (count, reclaimed, trigger) = folds[0];
+    assert_eq!(count, 1);
+    assert!(reclaimed > 0, "the fold event reports reclaimed mass");
+    assert_eq!(trigger, FoldTrigger::Watermark);
+}
+
+#[test]
+fn compaction_boundary_flush_is_tagged_class_a1() {
+    // When the context also exceeds the compaction budget, the same boundary
+    // will compact: the fold flush rides that break and is attributed A1, not C.
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    // Budget below the current total: compaction would fire this boundary.
+    let mut over = resume(&root.path, &workspace.path, &path, Some(total / 2), true);
+    let recorder = FoldRecorder::default();
+    assert_eq!(over.maybe_microcompact(&recorder).unwrap(), 1);
+    let entries = fold_entries(&path);
+    assert_eq!(entries[0]["trigger"], "A1");
+    assert_eq!(
+        recorder.folds.borrow()[0].2,
+        FoldTrigger::CompactionBoundary
+    );
+}
+
+#[test]
+fn fold_event_reaches_the_ui_layer_with_its_tag() {
+    // The nexus fold event maps into the UI event stream carrying its trigger
+    // (issue #400 M1 DoD): wayland -> nexus event -> UiEvent.
+    let event = AgentEvent::FoldApplied {
+        folds: 2,
+        reclaimed_tokens_estimate: 1200,
+        trigger: FoldTrigger::Watermark,
+    };
+    match crate::ui::UiEvent::from_agent_event(event) {
+        crate::ui::UiEvent::FoldApplied {
+            folds,
+            reclaimed_tokens_estimate,
+            trigger,
+        } => {
+            assert_eq!(folds, 2);
+            assert_eq!(reclaimed_tokens_estimate, 1200);
+            assert_eq!(trigger, FoldTrigger::Watermark);
+        }
+        other => panic!("expected FoldApplied, got {other:?}"),
+    }
 }
