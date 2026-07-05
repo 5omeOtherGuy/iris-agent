@@ -7,6 +7,7 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+mod fold;
 pub(crate) mod git_safety;
 pub(crate) mod system_prompt;
 pub(crate) mod trust;
@@ -64,6 +65,27 @@ const MAX_EXCERPT_CHARS: usize = 160;
 /// exchange so a follow-up prompt still has its immediate referent verbatim,
 /// and cover everything older with the summary.
 const MANUAL_COMPACT_KEEP_TOKENS: u64 = 1_000;
+
+/// Micro-watermark fraction of the compaction budget (ADR-0048): a fold batch
+/// runs only when the context reaches this fraction of the budget, strictly
+/// below the budget itself so folding reclaims spent reads BEFORE full
+/// compaction is needed. Batching at a watermark (not every turn) means one
+/// prefix-cache break amortizes many folds. Half the budget leaves clear
+/// headroom below the compaction trigger while still engaging on long sessions.
+const MICRO_WATERMARK_NUM: u64 = 1;
+const MICRO_WATERMARK_DEN: u64 = 2;
+
+/// Recent-tail token target the fold pass protects: the most-recent turns within
+/// this many tokens NEVER fold, so the model's immediate working set stays
+/// verbatim (ADR-0048). Kept small (one recent exchange) so folding still
+/// reaches most of the accumulated older mass.
+const MICRO_FOLD_KEEP_TOKENS: u64 = 2_000;
+
+/// The micro-watermark in tokens for a given compaction `budget`: the context
+/// total at or above which a fold batch runs. Always strictly below `budget`.
+fn micro_watermark(budget: u64) -> u64 {
+    budget.saturating_mul(MICRO_WATERMARK_NUM) / MICRO_WATERMARK_DEN
+}
 
 /// Instruction appended after the carried context for the provider-backed
 /// summarizer. Mirrors pi-mono's compaction ask: a structured handoff another
@@ -144,6 +166,12 @@ pub(crate) struct Harness<P> {
     // How compaction produces its summary text (ADR-0041). Defaults to the
     // deterministic excerpts; the Tier-3 app installs the configured kind.
     summarizer: SummarizerKind,
+    // Opt-in microcompaction (ADR-0048, #378): when true, spent tool results are
+    // folded to deterministic stubs at a micro-watermark below the compaction
+    // budget. Default false (a bare/test harness never folds); the Tier-3 app
+    // installs the configured value. Gates fold WRITING only -- rebuild always
+    // honors persisted fold entries regardless of this flag.
+    microcompaction: bool,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -232,6 +260,7 @@ impl<P: ChatProvider> Harness<P> {
             git_safety,
             verify: None,
             summarizer: SummarizerKind::default(),
+            microcompaction: false,
         }
     }
 
@@ -247,6 +276,15 @@ impl<P: ChatProvider> Harness<P> {
     /// never issue surprise provider calls.
     pub(crate) fn set_summarizer(&mut self, summarizer: SummarizerKind) {
         self.summarizer = summarizer;
+    }
+
+    /// Enable or disable opt-in microcompaction (ADR-0048, #378). Installed once
+    /// at startup by the Tier-3 app from the resolved `Settings::microcompaction`;
+    /// the harness default is off. Takes effect at the next turn boundary (the
+    /// fold pass runs in [`submit_turn`](Self::submit_turn) before the request),
+    /// so a `/settings` toggle applies to the following turn, not the current one.
+    pub(crate) fn set_microcompaction(&mut self, enabled: bool) {
+        self.microcompaction = enabled;
     }
 
     /// Install the mid-run steering/follow-up source (the Tier-3 app's typed
@@ -555,10 +593,13 @@ impl<P: ChatProvider> Harness<P> {
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
     ) -> Result<()> {
-        // Safe turn boundary: before the provider request, compact if the
-        // current context exceeds the configured budget. The prior turn's
-        // transcript is complete here (every tool call answered), so the
-        // covered range never splits a pending tool-call/result pair.
+        // Safe turn boundary: before the provider request, first fold spent
+        // tool results (opt-in microcompaction, ADR-0048), then compact if the
+        // current context still exceeds the configured budget. Folding runs
+        // first so reclaimed mass can defer a full compaction. The prior turn's
+        // transcript is complete here (every tool call answered), so neither the
+        // fold pass nor the covered range splits a pending tool-call/result pair.
+        self.maybe_microcompact()?;
         self.maybe_auto_compact(obs, token).await?;
         // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
         // the current session id to the guard before the turn. The guard stamps
@@ -785,6 +826,76 @@ impl<P: ChatProvider> Harness<P> {
     /// No-op when auto-compaction is disabled, no log is attached, the context
     /// is within budget, nothing coverable remains, or the summary request was
     /// cancelled (the turn's own cancellation handling takes over).
+    /// Opt-in microcompaction fold pass (ADR-0048, #378), run at the safe turn
+    /// boundary before the provider request. When enabled and the context has
+    /// reached the micro-watermark (below the compaction budget), fold every
+    /// spent tool result the V1 policy detects (superseded reads, latest-read-
+    /// wins) to a deterministic stub: append a durable `fold` entry AND rewrite
+    /// the in-memory result content, so live and resumed context agree. Returns
+    /// the number of folds applied (0 = disabled, below the watermark, no
+    /// durable session, or nothing spent).
+    ///
+    /// The setting gates fold WRITING only; rebuild always honors persisted
+    /// folds. No provider round-trip and no summary-quality risk: folding is
+    /// deterministic and every folded result stays recoverable (the stub names
+    /// the workspace-relative path; the original turn survives verbatim for the
+    /// #373 recall tool).
+    fn maybe_microcompact(&mut self) -> Result<usize> {
+        if !self.microcompaction {
+            return Ok(0);
+        }
+        // A fold is a durable read-time view; without a log there is nowhere to
+        // record it, so skip rather than diverge live from resumed context.
+        if self.session.is_none() {
+            return Ok(0);
+        }
+        // Batch at the micro-watermark: no per-turn folding. Below the watermark
+        // the accumulated spent mass is not yet worth a prefix-cache break.
+        let Some(budget) = self.budget else {
+            return Ok(0);
+        };
+        let total = context_tokens(self.agent.messages());
+        if total < micro_watermark(budget) {
+            return Ok(0);
+        }
+
+        let messages = self.agent.messages().to_vec();
+        // Protect the recent tail: the fold engine never folds at or after this
+        // index (the model's immediate working set stays verbatim).
+        let tail_start = fold_tail_start(&messages, MICRO_FOLD_KEEP_TOKENS);
+        let plans = fold::plan_folds(
+            &messages,
+            &self.entry_ids,
+            tail_start,
+            &self.workspace,
+            fold::V1_POLICIES,
+        );
+        if plans.is_empty() {
+            return Ok(0);
+        }
+
+        // Apply each fold durably (a `fold` entry naming the target id) and in
+        // memory (rewrite the result content) in the same step. The folded
+        // message keeps its role/pairing and durable id, so the pair invariant
+        // holds and it stays coverable by a later compaction; `persisted` and
+        // `entry_ids` are unchanged (no message entry is added or removed).
+        let log = self
+            .session
+            .as_mut()
+            .expect("microcompaction callers check the session first");
+        let mut folded = messages;
+        let mut applied = 0usize;
+        for plan in &plans {
+            let stub_tokens = estimate_tokens(&plan.stub);
+            log.append_fold(&plan.entry_id, &plan.stub, Some(stub_tokens))?;
+            folded[plan.index].content = plan.stub.clone();
+            applied += 1;
+        }
+        tracing::info!(folds = applied, "microcompacted spent tool results");
+        self.agent.replace_messages(folded);
+        Ok(applied)
+    }
+
     async fn maybe_auto_compact(
         &mut self,
         obs: &dyn AgentObserver,
@@ -1249,6 +1360,30 @@ fn assistant_turn_start(messages: &[Message], mut index: usize) -> usize {
     index
 }
 
+/// Index where the fold pass's retained tail begins: the most-recent turns whose
+/// token sum stays within `keep_target` are protected (never folded), aligned to
+/// a turn boundary so the retained tail starts at a user message and the current
+/// working set is not split. Mirrors `plan_compaction`'s tail walk (ADR-0048).
+fn fold_tail_start(messages: &[Message], keep_target: u64) -> usize {
+    let mut k = messages.len();
+    let mut tail = 0u64;
+    while k > 0 {
+        let t = message_token_estimate(&messages[k - 1]);
+        if tail.saturating_add(t) > keep_target {
+            break;
+        }
+        tail = tail.saturating_add(t);
+        k -= 1;
+    }
+    // Align to a turn boundary: if the tail would begin mid-turn, pull it back to
+    // the start of that assistant turn so a tool-call/result pair is not split.
+    if k < messages.len() && messages[k].role != Role::User {
+        assistant_turn_start(messages, k)
+    } else {
+        k
+    }
+}
+
 /// Produce a deterministic stand-in summary for a covered message range.
 ///
 /// ponytail: this is the smallest real summarizer seam -- a deterministic,
@@ -1322,6 +1457,10 @@ fn verification_feedback(command: &str, exit_code: Option<i32>, output: &str) ->
 #[cfg(test)]
 #[path = "recall_tests.rs"]
 mod recall_tests;
+
+#[cfg(test)]
+#[path = "microcompaction_tests.rs"]
+mod microcompaction_tests;
 
 #[cfg(test)]
 mod carry_tests {
