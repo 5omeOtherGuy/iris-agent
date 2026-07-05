@@ -80,13 +80,20 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// then a small recent tail. Returns the session-store root, the workspace, and
 /// the transcript path.
 fn seed_session() -> (TempDir, TempDir, PathBuf) {
+    seed_session_with_needle(NEEDLE)
+}
+
+/// Like `seed_session`, but embeds a caller-chosen needle in the big covered
+/// turn so a test can prove a needle that lives in ONE session never surfaces
+/// through a reader bound to a different transcript.
+fn seed_session_with_needle(needle: &str) -> (TempDir, TempDir, PathBuf) {
     let root = temp_dir();
     let workspace = temp_dir();
     let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
     // ~6000 chars (~1500 est tokens): far over the 1000-token manual keep
     // target, so it lands in the covered range while the small tail is retained.
     let big = format!(
-        "{NEEDLE} :: {}",
+        "{needle} :: {}",
         "ledger reconciliation detail. ".repeat(200)
     );
     for message in [
@@ -252,13 +259,24 @@ fn standalone_span_recalls_originals_from_this_session_read_path() {
     // handle) resolves the covered original DIRECTLY from THIS session's read
     // path (`session::read_span`), reusing the durable ids #377 threaded --
     // there is no reverse span->handle index and no parallel store.
-    let (root, workspace, path) = seed_session();
+    // Session A carries a UNIQUE needle that exists in NO other session, so the
+    // isolation check below has teeth: the needle can only appear if a reader
+    // actually reaches session A's transcript.
+    const A_NEEDLE: &str = "SESSION-A-UNIQUE-recall-isolation-needle";
+    let (root, workspace, path) = seed_session_with_needle(A_NEEDLE);
     let (_harness, entry_ids) = resume_and_compact(&root.path, &workspace.path, &path);
     let first_id = entry_ids
         .first()
         .cloned()
         .flatten()
         .expect("resumed prefix has a durable first id");
+    let last_id = entry_ids
+        .iter()
+        .rev()
+        .flatten()
+        .next()
+        .cloned()
+        .expect("resumed prefix has a durable last id");
 
     // The reader is built over THIS session's transcript path only, so the span
     // read is scoped to this session and cannot address another session's data.
@@ -268,11 +286,11 @@ fn standalone_span_recalls_originals_from_this_session_read_path() {
     let out = recall::execute_for_test(
         None,
         Some(&reader as &dyn SessionSpanReader),
-        &serde_json::json!({ "from": first_id, "to": first_id }),
+        &serde_json::json!({ "from": first_id, "to": last_id }),
     )
     .unwrap();
     assert!(
-        out.content.contains(NEEDLE),
+        out.content.contains(A_NEEDLE),
         "standalone span returns the covered original from the session read path: {}",
         out.content
     );
@@ -282,20 +300,37 @@ fn standalone_span_recalls_originals_from_this_session_read_path() {
         out.content
     );
 
-    // Scoping proof: a reader over a DIFFERENT, unrelated session transcript
-    // resolves the same span to nothing (a tool error), never this session's
-    // turns -- the span cannot escape its own session's transcript.
-    let (_other_root, _other_workspace, other_path) = seed_session();
-    let other_reader = super::SessionSpanSource {
-        transcript: Some(other_path),
+    // Isolation proof with teeth: bind a reader to a DIFFERENT, empty session B
+    // transcript, then query session A's *real, resolvable* id span (the very
+    // span that just returned A's needle through reader `reader`). Because
+    // `SessionSpanSource` resolves only against its own bound transcript, the
+    // session-B reader must surface NOTHING for that span -- never session A's
+    // unique needle. If the seam ever resolved spans against anything other
+    // than its bound transcript, reader B would return A_NEEDLE and both
+    // assertions below would fail.
+    let b_root = temp_dir();
+    let b_workspace = temp_dir();
+    let b_log = SessionLog::create_in(&b_root.path, &b_workspace.path).unwrap();
+    let b_path = b_log.path().to_path_buf();
+    drop(b_log); // empty transcript: no entries, so any span selects no turns
+    let reader_b = super::SessionSpanSource {
+        transcript: Some(b_path),
     };
-    // A far-out-of-range span on that session selects nothing -> tool error.
-    let err = recall::execute_for_test(
+    let result = recall::execute_for_test(
         None,
-        Some(&other_reader as &dyn SessionSpanReader),
-        &serde_json::json!({ "from": "ffff0", "to": "ffff9" }),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("selects no turns"), "{err}");
+        Some(&reader_b as &dyn SessionSpanReader),
+        &serde_json::json!({ "from": first_id, "to": last_id }),
+    );
+    let rendered = match &result {
+        Ok(out) => out.content.clone(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        !rendered.contains(A_NEEDLE),
+        "a reader bound to session B must never surface session A's needle: {rendered}"
+    );
+    assert!(
+        result.is_err(),
+        "session A's real id span selects no turns in the empty session B (tool error), got: {rendered}"
+    );
 }
