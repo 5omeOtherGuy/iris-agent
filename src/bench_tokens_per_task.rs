@@ -74,6 +74,26 @@ mod replay {
     /// not a rounding artifact of the estimator.
     const MIN_MARGIN_TOKENS: usize = 32;
 
+    fn selected_arms() -> Vec<Arm> {
+        let raw = std::env::var("IRIS_BENCH_ARM").unwrap_or_default();
+        let names: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if names.is_empty() {
+            return vec![Arm::Baseline, Arm::Defaults];
+        }
+        names
+            .into_iter()
+            .map(|name| match name.to_ascii_lowercase().as_str() {
+                "b" | "baseline" => Arm::Baseline,
+                "a" | "defaults" | "default" => Arm::Defaults,
+                other => panic!("invalid IRIS_BENCH_ARM {other:?}; use baseline or defaults"),
+            })
+            .collect()
+    }
+
     fn assert_workload(workload: &Workload) -> (RunMetrics, RunMetrics) {
         let arm_a = run_replay_arm(workload, Arm::Defaults);
         let arm_b = run_replay_arm(workload, Arm::Baseline);
@@ -653,8 +673,9 @@ mod replay {
     /// `cargo test`/build-test loops. Double-gated: `IRIS_BENCH_REAL=1` AND
     /// `IRIS_BENCH_DANGEROUS_OK=1` (it executes shell commands). `IRIS_BENCH_N`
     /// controls runs per arm; `IRIS_BENCH_WORKLOAD` can select a specific bash
-    /// workload such as `chained-openai-summary-fix`. Asserts the deny gate is
-    /// never consulted (the bypass fired). Run:
+    /// workload such as `chained-openai-summary-fix`; `IRIS_BENCH_ARM` can split
+    /// a parallel run into `baseline` and `defaults` processes with separate log
+    /// files. Asserts the deny gate is never consulted (the bypass fired). Run:
     ///   IRIS_BENCH_REAL=1 IRIS_BENCH_DANGEROUS_OK=1 cargo test --bin iris \
     ///     tokens_per_task_bash_smoke -- --ignored --nocapture
     #[test]
@@ -674,14 +695,16 @@ mod replay {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
+        let arms = selected_arms();
         let specs = model_specs();
         let reasoning = bench_reasoning();
         let workloads = selected_bash_workloads();
         let cwd = std::env::current_dir().expect("cwd");
         bench_log_reset();
         println!(
-            "bash smoke: workloads={} reasoning={:?} N={} models={} log={}",
+            "bash smoke: workloads={} arms={} reasoning={:?} N={} models={} log={}",
             workloads.len(),
+            arms.len(),
             reasoning,
             n,
             specs.join(", "),
@@ -705,7 +728,7 @@ mod replay {
                         continue;
                     }
                 };
-                for arm in [Arm::Baseline, Arm::Defaults] {
+                for arm in arms.iter().copied() {
                     for run in 0..n {
                         match run_real_cell(spec, workload, arm, run + 1, &selection) {
                             Ok(m) => {

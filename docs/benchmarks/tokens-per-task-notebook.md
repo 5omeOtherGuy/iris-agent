@@ -1181,3 +1181,38 @@ greps, read failing test, noisy `cargo test -- --nocapture`, read provider, edit
 and passing `cargo test -- --nocapture`. That is the right place to look for
 material end-to-end token savings because bash/cargo-test output can dominate the
 transcript while success still proves the model solved the task.
+
+## Entry 25 - Parallel Sonnet 4.6 chained workload smoke (N=5 x 2 arms)
+
+Operator authorized a small live run to validate the new `chained-openai-summary-fix`
+workload and parallel-run shape: Sonnet 4.6, `low`, `IRIS_BENCH_N=5`, split into
+two simultaneous processes with `IRIS_BENCH_ARM=baseline` and
+`IRIS_BENCH_ARM=defaults`, separate logs, then merged for analysis. Runtime was
+~134s; both cargo-test processes exited 0 and wrote 5 rows each.
+
+Mechanical outcome under the then-current check: 10/10 rows succeeded, no approval
+prompts, no tool errors. That proves the fixture is runnable in parallel and the
+model can solve the hidden PR-404-style bug. Safety/loop metrics from the merged
+log: defaults 100% / baseline 100%; turns 6/5; median tool calls 6.0/6.0; max
+calls 7/6; tool errors 0/0. Not a massive loop, but defaults did take one extra
+median turn and one higher max call. Token result was baseline-wins (+5.7% for
+A/defaults) because the extra turn dominated; result bytes were slightly lower in
+A (-509), so reduction fired but was swamped by strategy.
+
+Important design finding: the workload prompt said to reproduce the failure first,
+but the success check only required the final cargo tests to pass and
+`summary:auto` to be present. Sonnet often read enough source/test context to edit
+first and then only ran a passing test. Baseline did this in all 5 runs (`bash`
+exits `[0]`), while defaults reproduced the failure in 2/5 runs (`[101, 0]`) and
+therefore paid extra turns/tokens. That means the smoke validated the harness but
+also proved the workload was not mechanically enforcing the intended chained
+workflow.
+
+Fix applied after the smoke: `IRIS_BENCH_ARM` now splits the bash matrix for safe
+parallel arm runs, and `chained-openai-summary-fix` now requires a failing bash
+exit before the final passing bash exit. Future runs will mark edit-first shortcuts
+as failures instead of letting them skew the token comparison.
+
+Raw logs were left in `/tmp/chained_s46_low_{baseline,defaults}_n5.jsonl` and not
+committed because their `success=true` values predate the stricter failing-first
+check.

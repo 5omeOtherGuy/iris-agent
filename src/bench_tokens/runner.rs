@@ -95,6 +95,24 @@ pub(crate) struct ScriptedSkipRun {
     pub(crate) outcome: Outcome,
 }
 
+fn enforce_failing_then_passing_bash(workload: &Workload, outcome: &mut Outcome, exits: &[i32]) {
+    if !workload.require_failing_then_passing_bash || !outcome.success {
+        return;
+    }
+    let Some((&last, before_last)) = exits.split_last() else {
+        outcome.success = false;
+        outcome.detail = "expected a failing cargo test before the final passing cargo test; no bash exits were recorded".to_string();
+        return;
+    };
+    let reproduced_failure = before_last.iter().any(|&code| code != 0);
+    if last != 0 || !reproduced_failure {
+        outcome.success = false;
+        outcome.detail = format!(
+            "expected failing-then-passing bash exits for the chained repair; got {exits:?}"
+        );
+    }
+}
+
 /// Drive one workload x arm with the scripted replay provider under
 /// `Agent::with_skip_permissions(true)`, so a scripted `bash` call actually
 /// runs (the deny gate is bypassed). The denying gate is still installed so we
@@ -134,11 +152,13 @@ pub(crate) fn run_scripted_skip_perms(workload: &Workload, arm: Arm) -> Scripted
     ))
     .expect("scripted skip-perms turn completes");
 
-    let outcome = (workload.check)(&workspace.path, &observer.final_text());
+    let bash_exit_codes = observer.bash_exit_codes.borrow().clone();
+    let mut outcome = (workload.check)(&workspace.path, &observer.final_text());
+    enforce_failing_then_passing_bash(workload, &mut outcome, &bash_exit_codes);
     ScriptedSkipRun {
         approvals_consulted: gate.consulted.get(),
         dangerous_approvals: observer.dangerous_approvals.get(),
-        bash_exit_codes: observer.bash_exit_codes.borrow().clone(),
+        bash_exit_codes,
         tool_result_bytes: observer.tool_result_bytes.get(),
         outcome,
     }
@@ -352,7 +372,9 @@ pub(crate) fn run_real_cell(
     ))
     .map_err(|e| format!("provider turn: {e}"))?;
 
-    let outcome = (workload.check)(&cwd, &observer.final_text());
+    let bash_exit_codes = observer.bash_exit_codes.borrow().clone();
+    let mut outcome = (workload.check)(&cwd, &observer.final_text());
+    enforce_failing_then_passing_bash(workload, &mut outcome, &bash_exit_codes);
     let record = RealRunRecord {
         arm,
         outcome,
@@ -371,7 +393,7 @@ pub(crate) fn run_real_cell(
         tool_errors: observer.tool_errors.borrow().clone(),
         tool_result_bytes: observer.tool_result_bytes.get(),
         tool_result_bytes_by_tool: observer.tool_result_bytes_by_tool.borrow().clone(),
-        bash_exit_codes: observer.bash_exit_codes.borrow().clone(),
+        bash_exit_codes,
     };
     bench_log_append(&json!({
         "schema_version": BENCH_SCHEMA_VERSION,

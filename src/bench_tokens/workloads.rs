@@ -54,6 +54,11 @@ pub(crate) struct Workload {
     /// materialized -- for inputs too large to commit (e.g. the >1000-file tree
     /// the find probe needs). `None` for ordinary committed-fixture workloads.
     pub(crate) build: Option<fn(&Path)>,
+    /// For repair-loop bash workloads, require the model to actually reproduce
+    /// a failing test before the final passing test. This prevents a shortcut
+    /// where the model reads enough code to patch first and only runs a green
+    /// test, which would no longer exercise the intended chained workflow.
+    pub(crate) require_failing_then_passing_bash: bool,
 }
 
 pub(crate) fn workloads() -> Vec<Workload> {
@@ -71,6 +76,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
             // must surface the buggy expression the fix targets.
             needles: &["parse_len", "split_whitespace().count() - 1"],
             build: None,
+            require_failing_then_passing_bash: false,
         },
         Workload {
             name: "multi-file-search-and-edit",
@@ -84,6 +90,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
             // The grep must surface the identifier being renamed.
             needles: &["MAX_RETRIES"],
             build: None,
+            require_failing_then_passing_bash: false,
         },
         Workload {
             name: "investigate-large-log",
@@ -99,6 +106,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
             // context in arm A.
             needles: &["ceiling_is_exact", "8192", "8191"],
             build: None,
+            require_failing_then_passing_bash: false,
         },
     ]
 }
@@ -152,6 +160,7 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
             // The reduced bash output must still carry the planted assertion values.
             needles: &["8191", "8192"],
             build: None,
+            require_failing_then_passing_bash: false,
         },
         Workload {
             name: "chained-openai-summary-fix",
@@ -171,6 +180,7 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
                 "summary:auto",
             ],
             build: Some(build_chained_provider_tree),
+            require_failing_then_passing_bash: true,
         },
     ]
 }
@@ -194,6 +204,7 @@ pub(crate) fn probe_workloads() -> Vec<Workload> {
             approval: ApprovalProfile::DenyGateNoPrompts,
             needles: &["47231"],
             build: None,
+            require_failing_then_passing_bash: false,
         },
         Workload {
             // find compaction (issue-340): the target lives in a >1000-file
@@ -215,6 +226,7 @@ pub(crate) fn probe_workloads() -> Vec<Workload> {
             approval: ApprovalProfile::DenyGateNoPrompts,
             needles: &["handler_zebra_target.rs"],
             build: Some(build_find_tree),
+            require_failing_then_passing_bash: false,
         },
         Workload {
             // read skim (issue-337): the answer is a body-level local inside the
@@ -233,6 +245,7 @@ pub(crate) fn probe_workloads() -> Vec<Workload> {
             approval: ApprovalProfile::DenyGateNoPrompts,
             needles: &["due_ids"],
             build: None,
+            require_failing_then_passing_bash: false,
         },
     ]
 }
