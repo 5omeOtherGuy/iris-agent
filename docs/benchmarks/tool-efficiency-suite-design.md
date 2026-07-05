@@ -91,22 +91,26 @@ not to be the repo, no network.
 
 ## Module layout (test-only)
 
+AS BUILT through Phase 5b (the aspirational split below was folded to keep
+cohesive files; no `mod.rs` -- the root uses `#[path]` mod decls):
+
 ```
-src/bench_tokens_per_task.rs     thin #[cfg(test)] entrypoints (kept)
+src/bench_tokens_per_task.rs     thin #[cfg(test)] entrypoints + all tests (kept)
 src/bench_tokens/
-  mod.rs
-  arms.rs        Arm, ComparisonAxis, ToolVariant
-  config.rs      BenchConfig::from_env()
-  fixtures.rs    materialize() + temp-workspace safety
-  approval.rs    ZeroPromptGate + ApprovalProfile
-  observer.rs    BenchObserver (extended)
-  provider.rs    ScriptedProvider, selection_for_spec()
-  probes.rs      TOOL_PROBES data table
-  workloads.rs   WORKLOADS data table + checks
-  runner.rs      replay / real / render / model-probe runners
-  records.rs     RunRecord JSONL schema
-  analysis.rs    Rust JSONL aggregation + verdicts
+  arms.rs        Arm, reduce(), label()
+  fixtures.rs    materialize() + temp-workspace safety + build_find_tree()
+  observer.rs    BenchObserver (extended) + ZeroPromptGate   (was approval.rs)
+  provider.rs    ScriptedProvider + proxy-token helpers
+  probes.rs      tool_probes() render-probe table (ProbeWorkspace, ProbeMetric)
+  workloads.rs   workloads()/bash_workloads()/probe_workloads() + checks + ApprovalProfile
+  runner.rs      replay / real / scripted-skip-perms runners + RealRunRecord
+                 JSONL schema (was records.rs) + env knobs (was config.rs)
 ```
+
+Still PLANNED (Phase 6-7): `analysis.rs` (Rust JSONL aggregation + verdicts).
+Folded rather than split: `config.rs` -> env fns in `runner.rs`; `approval.rs`
+-> `observer.rs` (gate) + `workloads.rs` (`ApprovalProfile`); `records.rs` ->
+`runner.rs`.
 
 Adding a tool or workload is a data change (append a table row), not new control
 flow. No external TOML until a second consumer needs it.
@@ -156,18 +160,24 @@ zero -> inconclusive; baseline wins -> say so. No LLM-judge scoring.
 
 ## Phasing (smallest-correct-change first)
 
-1. (S) Merge PR #388 / ADR-0049 into the branch; verify current harness + gate
-   unchanged (`ToolState::new()` still reduces by default).
-2. (M) No-behavior module refactor into `src/bench_tokens/*`; replay + ignored
-   real tests reproduce identical results.
-3. (M) Extend observer + JSONL schema (dangerous approvals, tool sequence,
-   errors, edit outcomes, exit codes).
-4. (M/L) Add `ApprovalProfile::SkipPermissions` + ONE bash smoke workload;
-   requires `IRIS_BENCH_REAL=1 IRIS_BENCH_DANGEROUS_OK=1`; assert audit event.
-5. (L) Per-tool micro probes for grep/find/ls/bash (render + real-model).
-6. (M) read/edit separate-axis probes (reported as their own axes).
-7. (L) Full e2e matrix + Rust analyzer; smoke before matrix; commit sanitized
-   JSONL + report under `docs/benchmarks/`.
+Status through the current branch (`bench/tokens-per-task`, PR #391):
+
+1. [DONE] (S) Merge PR #388 / ADR-0049 into the branch; verify current harness +
+   gate unchanged (`ToolState::new()` still reduces by default). -- commit 9a7ca6c
+2. [DONE] (M) No-behavior module refactor into `src/bench_tokens/*`; replay +
+   ignored real tests reproduce identical results. -- commit f4f4f74
+3. [DONE] (M) Extend observer + JSONL schema (dangerous approvals, tool
+   sequence, errors, exit codes; edit outcome classes deferred to Phase 6). --
+   commit a5c4725
+4. [DONE] (M/L) Add `ApprovalProfile::SkipPermissions` + ONE bash smoke workload
+   (`IRIS_BENCH_REAL=1 IRIS_BENCH_DANGEROUS_OK=1`) + a deterministic wiring gate
+   test that asserts the audit event. -- commit 62d6238
+5. [DONE] (L) Per-tool micro probes: grep + find + bash (render + real-model).
+   `ls` has NO probe -- not arm-toggled (issue-339). "Log all results" (schema
+   v3 kind discriminator) landed here too. -- commits 88671c6, e65649c
+6. [TODO] (M) read/edit separate-axis probes (reported as their own axes).
+7. [TODO] (L) Full e2e matrix + Rust analyzer (`analysis.rs`); smoke before
+   matrix; commit sanitized JSONL + report under `docs/benchmarks/`.
 
 ## Risks + guardrails
 

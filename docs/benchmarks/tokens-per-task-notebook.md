@@ -804,3 +804,42 @@ render measurements and wiring. The live micro-probe/find/bash layers are wired
 and opt-in; they cost provider calls and await operator go/no-go. No token or
 success-rate claim is made from render bytes alone (proxy ratios, never mixed
 with real usage records).
+
+## Entry 16 - Backfill: Phases 3 + 4 (schema extend, skip-perms bash)
+
+Retroactive entry (out of order): Phases 3 and 4 shipped in commits a5c4725 and
+62d6238 with full commit messages + code doc comments, but were never given
+notebook entries. Recording them here so the audit trail is complete.
+
+**Phase 3 - JSONL schema v2 (commit a5c4725).** Extended `BenchObserver` to
+capture, as metadata only (never raw tool output): `dangerous_approvals` (count
+of `ToolAutoApprovedDangerous`), `tool_sequence` (ordered call names, every
+attempt), `tool_errors` ((name, truncated message)), `tool_result_bytes`
+(+by-tool -- the real-run analogue of the replay byte proxy), and
+`bash_exit_codes`. Mirrored into `RealRunRecord` + the JSONL line; added
+`schema_version`. A deterministic observer unit test drives synthetic
+`ToolStarted/ToolResult/ToolError/ToolAutoApprovedDangerous` events and asserts
+every field (no live provider). Edit outcome CLASSES (exact/tolerant/not-found/
+not-unique/stale) were deliberately deferred to Phase 6's edit axis -- parsing
+edit result content is coupled to edit's output format and belongs with that
+probe.
+
+**Phase 4 - skip-permissions bash (commit 62d6238).** Added
+`ApprovalProfile {DenyGateNoPrompts, SkipPermissions}` on `Workload`; the three
+existing workloads stay deny-gate. `run_real_cell` calls
+`Agent::with_skip_permissions(true)` only for skip-perms workloads (ADR-0049) and
+asserts the materialized workspace is a temp dir, never the repo tree
+(confinement). Read-only diagnosis workload first (no mutation): a fixture crate
+whose `ceiling_is_exact` test fails (`left: 8191, right: 8192`); the model runs
+the tests and reports the values.
+
+The gate-safe proof is `bash_wiring_skip_permissions` (deterministic, no
+provider, ~0.4s): it scripts a bash call under skip-perms and proves, in BOTH
+arms, that the deny gate is NEVER consulted, `ToolAutoApprovedDangerous` fires,
+the non-zero exit code (3) is captured, and result bytes enter context -- the
+CI-safe evidence that ADR-0049 genuinely unlocks bash in the harness. The live
+`tokens_per_task_bash_smoke` (double-gated `IRIS_BENCH_REAL=1` +
+`IRIS_BENCH_DANGEROUS_OK=1`) runs the real model over the matrix and asserts the
+deny gate is never consulted. Later finding (Entry 15): the failing `cargo test`
+this workload runs IS structured-filtered, so it also exercises the bash filter,
+not just execution.
