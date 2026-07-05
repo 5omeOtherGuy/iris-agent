@@ -4089,6 +4089,85 @@ fn cancellation_during_provider_stream_exits_promptly_with_valid_state() -> Resu
 }
 
 #[test]
+fn cancellation_commits_partial_assistant_text_exactly_once() -> Result<()> {
+    // Slice 5 / DoD: a cancellation mid-stream commits the partial assistant
+    // text EXACTLY once. Deltas were seen, so the partial is flushed as a
+    // single `AssistantTextEnd` (never also an `AssistantText`), the display
+    // never sees a duplicate commit, and the transcript keeps exactly one
+    // assistant message. The `AssistantTextEnd` precedes `ProviderTurnCancelled`
+    // so the front-end finalizes the stream before the turn is torn down.
+    let workspace = test_workspace()?;
+    let mut harness = test_harness(
+        BlockingStreamProvider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let token = CancellationToken::new();
+
+    block_on(async {
+        let turn = harness.submit_turn("go", &frontend, &frontend, &token);
+        let canceller = async {
+            loop {
+                let saw_delta = frontend
+                    .events
+                    .borrow()
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::AssistantTextDelta(_)));
+                if saw_delta {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(turn, canceller);
+        result
+    })?;
+
+    let events = frontend.events.borrow();
+    let text_ends: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AssistantTextEnd(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_ends,
+        vec![&"partial".to_string()],
+        "cancellation flushes the partial as exactly one AssistantTextEnd"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AssistantText(_))),
+        "the delta path must not also emit a whole-text AssistantText"
+    );
+    // Ordering: the partial commit precedes the cancellation event.
+    let end_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AssistantTextEnd(_)))
+        .expect("AssistantTextEnd emitted");
+    let cancel_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ProviderTurnCancelled { .. }))
+        .expect("ProviderTurnCancelled emitted");
+    assert!(
+        end_at < cancel_at,
+        "partial text is committed before the turn is cancelled"
+    );
+    // And the persisted transcript holds exactly one assistant message.
+    let messages = harness.agent.messages();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[1],
+        Message::assistant("partial").with_provider_turn_id("turn_00000000")
+    );
+    Ok(())
+}
+
+#[test]
 fn cancellation_before_tools_proposes_remaining_calls_before_cancelling() -> Result<()> {
     struct CancelParentTool {
         parent: CancellationToken,
