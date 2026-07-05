@@ -1983,6 +1983,12 @@ impl Transcript {
             | UiEvent::ProviderTurnError { .. }
             | UiEvent::ToolLifecycle { .. }
             | UiEvent::OutputHandleStored { .. } => {}
+            // Freeform tool-input deltas (ADR-0039) are display-only. The live
+            // preview cell is deferred until a freeform tool (`apply_patch`, V4A)
+            // exists to render; until then the event is inert here. The guard
+            // above still commits any open reasoning trace, since this is a
+            // non-reasoning event.
+            UiEvent::ToolInputDelta { .. } => {}
             UiEvent::AssistantTextDelta(delta) => {
                 if !self.stream.is_active() {
                     // A fresh stream starts here: drop any memoized tail render

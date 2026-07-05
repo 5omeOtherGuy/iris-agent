@@ -198,6 +198,16 @@ pub(crate) enum UiEvent {
     /// A boundary between two reasoning-summary parts (a blank line in the live
     /// thinking trace). Display-only; carries no text.
     AssistantReasoningSectionBreak,
+    /// One incremental fragment of a *freeform/custom* tool call's input, streamed
+    /// while the model is still constructing the call (ADR-0039). Display-only and
+    /// inert: it never affects approval, execution, or transcript state. No
+    /// freeform tool is declared in Iris today, so this does not fire in practice;
+    /// the live preview UI is deferred until `apply_patch` (V4A) exists to render.
+    /// See [`AgentEvent::ToolInputDelta`].
+    ToolInputDelta {
+        call_id: String,
+        delta: String,
+    },
     ToolProposed(ToolCall),
     /// A tool is about to execute; lets the front-end open a live progress cell.
     ToolStarted(ToolCall),
@@ -332,6 +342,9 @@ impl UiEvent {
             }
             AgentEvent::AssistantReasoningDelta(delta) => UiEvent::AssistantReasoningDelta(delta),
             AgentEvent::AssistantReasoningSectionBreak => UiEvent::AssistantReasoningSectionBreak,
+            AgentEvent::ToolInputDelta { call_id, delta } => {
+                UiEvent::ToolInputDelta { call_id, delta }
+            }
             AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
             AgentEvent::ToolStarted(call) => UiEvent::ToolStarted(call),
             AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),

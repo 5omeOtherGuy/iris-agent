@@ -121,6 +121,14 @@ pub(super) trait TurnSink {
     fn on_reasoning_section_break(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Forward one *freeform/custom* tool-call input fragment (ADR-0039),
+    /// carrying the streaming correlation id. Display-only: the runtime never
+    /// executes or stores these fragments. Default no-op so JSON-argument
+    /// adapters and test sinks that do not stream tool input are unaffected.
+    fn on_tool_input_delta(&mut self, _call_id: &str, _delta: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// [`TurnSink`] that forwards each text delta onto the provider's event channel.
@@ -150,6 +158,15 @@ impl TurnSink for ChannelSink {
     fn on_reasoning_section_break(&mut self) -> Result<()> {
         self.tx
             .unbounded_send(Ok(ProviderEvent::ReasoningSectionBreak))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
+
+    fn on_tool_input_delta(&mut self, call_id: &str, delta: &str) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::ToolInputDelta {
+                call_id: call_id.to_string(),
+                delta: delta.to_string(),
+            }))
             .map_err(|_| anyhow!("response stream dropped by consumer"))
     }
 }

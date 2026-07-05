@@ -8,6 +8,7 @@ struct RecordingSink {
     deltas: Vec<String>,
     reasoning_deltas: Vec<String>,
     section_breaks: usize,
+    tool_input_deltas: Vec<(String, String)>,
 }
 
 impl TurnSink for RecordingSink {
@@ -23,6 +24,12 @@ impl TurnSink for RecordingSink {
 
     fn on_reasoning_section_break(&mut self) -> Result<()> {
         self.section_breaks += 1;
+        Ok(())
+    }
+
+    fn on_tool_input_delta(&mut self, call_id: &str, delta: &str) -> Result<()> {
+        self.tool_input_deltas
+            .push((call_id.to_string(), delta.to_string()));
         Ok(())
     }
 }
@@ -792,6 +799,96 @@ fn visible_reasoning_summary_disables_silent_retry() -> Result<()> {
     assert!(
         !protocol_anomaly_retryable(&anomaly, parser.emitted_visible_output()),
         "a protocol anomaly after visible reasoning must not be silently retried"
+    );
+    Ok(())
+}
+
+#[test]
+fn streams_custom_tool_call_input_deltas() -> Result<()> {
+    // Freeform/custom tool-call input fragments are forwarded display-only
+    // (ADR-0039), carrying the streaming correlation id. They are never folded
+    // into the assembled turn's text or tool calls.
+    let stream = concat!(
+        "event: response.custom_tool_call_input.delta\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"call_1\",\"delta\":\"*** Begin Patch\"}\n\n",
+        "event: response.custom_tool_call_input.delta\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"call_1\",\"delta\":\"*** End Patch\"}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    let mut sink = RecordingSink::default();
+    let turn = parse_response_stream_reader(
+        BufReader::new(stream.as_bytes()),
+        &mut sink,
+        &CancellationToken::new(),
+        "gpt-test",
+    )?;
+    assert_eq!(
+        sink.tool_input_deltas,
+        vec![
+            ("call_1".to_string(), "*** Begin Patch".to_string()),
+            ("call_1".to_string(), "*** End Patch".to_string()),
+        ]
+    );
+    // Display-only: the fragments are never folded into the assistant answer or
+    // into the assembled tool calls.
+    assert_eq!(turn.text.as_deref(), Some("Done"));
+    assert!(
+        turn.tool_calls.is_empty(),
+        "deltas do not become tool calls"
+    );
+    Ok(())
+}
+
+#[test]
+fn json_argument_deltas_are_not_streamed() -> Result<()> {
+    // Only freeform/custom tool input streams. JSON-argument (`function`) tools
+    // keep buffering their arguments until completion, so their argument deltas
+    // are ignored (no display event).
+    let stream = concat!(
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"delta\":\"{\\\"path\\\":\"}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    let mut sink = RecordingSink::default();
+    parse_response_stream_reader(
+        BufReader::new(stream.as_bytes()),
+        &mut sink,
+        &CancellationToken::new(),
+        "gpt-test",
+    )?;
+    assert!(
+        sink.tool_input_deltas.is_empty(),
+        "JSON-argument tool deltas must stay buffered, not streamed"
+    );
+    Ok(())
+}
+
+#[test]
+fn visible_tool_input_disables_silent_retry() -> Result<()> {
+    // A shown freeform tool-input preview counts as visible output, so a later
+    // mid-stream protocol anomaly is fatal (a retry would duplicate what the
+    // user saw) -- exactly like assistant text or a reasoning summary.
+    let mut parser = ResponseStreamParser::new("gpt-test");
+    let mut sink = RecordingSink::default();
+    parser.ingest_event(
+        "{\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"call_1\",\"delta\":\"*** Begin Patch\"}",
+        &mut sink,
+    )?;
+    assert!(
+        parser.emitted_visible_output(),
+        "streamed tool input is visible output"
+    );
+    assert!(!parser.emitted_visible_text, "but not via assistant text");
+    let anomaly = anyhow::Error::new(CodexStreamProtocolAnomaly::invalid_json(None));
+    assert!(
+        !protocol_anomaly_retryable(&anomaly, parser.emitted_visible_output()),
+        "a protocol anomaly after visible tool input must not be silently retried"
     );
     Ok(())
 }

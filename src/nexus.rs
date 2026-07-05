@@ -364,6 +364,22 @@ pub(crate) enum AgentEvent {
         /// Wall-clock execution time, when the tool reports it.
         duration: Option<Duration>,
     },
+    /// One incremental fragment of a *freeform/custom* tool call's input, streamed
+    /// while the model is still constructing the call (ADR-0039). Carries the
+    /// streaming correlation id so a front-end could attach a live preview to the
+    /// right call. Display-only and provably inert: the fragment is NEVER pushed
+    /// to `self.messages`, never accumulated into `partial`/assistant text, and
+    /// never merged into `AssistantTurn.tool_calls`. Approval and execution
+    /// consume only the completed, validated `ToolCall` assembled at turn
+    /// completion, so tampering with or dropping these deltas cannot change what
+    /// runs. JSON-argument (`function`) tools do not emit this -- their arguments
+    /// stay buffered until completion. No provider surfaces it in Iris today (no
+    /// freeform tool is declared); the live preview UI is deferred until a
+    /// freeform tool (`apply_patch`, V4A) exists to render.
+    ToolInputDelta {
+        call_id: String,
+        delta: String,
+    },
     /// A display-only chunk of a running tool's live output (issue #90 sub-item
     /// 1). Carries the originating call id so a front-end attaches it to the
     /// right live cell. NEVER pushed to `self.messages`: the full output reaches
@@ -433,6 +449,12 @@ pub(crate) enum ProviderEvent {
     ReasoningDelta(String),
     /// A boundary between two reasoning-summary parts (blank line in the trace).
     ReasoningSectionBreak,
+    /// One incremental fragment of a *freeform/custom* tool call's input
+    /// (ADR-0039). Forwarded display-only and provably inert: never accumulated
+    /// into the assembled turn's text or tool calls. Only freeform-tool adapters
+    /// (currently the OpenAI Responses adapter, for `custom_tool_call` input)
+    /// emit it; JSON-argument tool deltas stay buffered until completion.
+    ToolInputDelta { call_id: String, delta: String },
     /// Terminal event: the fully assembled assistant turn.
     Completed(AssistantTurn),
 }
@@ -1666,6 +1688,15 @@ impl<P: ChatProvider> Agent<P> {
                     }
                     Some(Ok(ProviderEvent::ReasoningSectionBreak)) => {
                         obs.on_event(AgentEvent::AssistantReasoningSectionBreak)?;
+                    }
+                    Some(Ok(ProviderEvent::ToolInputDelta { call_id, delta })) => {
+                        // Display-only (ADR-0039): forwarded for a live preview
+                        // but NEVER accumulated into `partial` (the persisted
+                        // assistant text), `self.messages`, or the assembled
+                        // turn's tool calls. Approval and execution use only the
+                        // completed `ToolCall`, so these deltas cannot change what
+                        // runs even if tampered with or dropped.
+                        obs.on_event(AgentEvent::ToolInputDelta { call_id, delta })?;
                     }
                     Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {

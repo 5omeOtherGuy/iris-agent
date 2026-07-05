@@ -498,6 +498,10 @@ struct ResponseStreamParser {
     /// anomaly: the user has already seen live reasoning, so a replay would
     /// duplicate visible output.
     emitted_visible_reasoning: bool,
+    /// Whether a freeform tool-call input delta was forwarded for display
+    /// (ADR-0039). Also disables silent retry: the user has seen a live tool-input
+    /// preview, so replaying the stream would duplicate visible output.
+    emitted_visible_tool_input: bool,
     last_event_type: Option<String>,
 }
 
@@ -513,15 +517,19 @@ impl ResponseStreamParser {
             saw_completed: false,
             emitted_visible_text: false,
             emitted_visible_reasoning: false,
+            emitted_visible_tool_input: false,
             last_event_type: None,
         }
     }
 
-    /// Whether any visible output (assistant text or live reasoning summary) was
-    /// forwarded to the front-end. Once true, a mid-stream protocol anomaly is
-    /// fatal rather than silently retried, to avoid duplicating shown output.
+    /// Whether any visible output (assistant text, a live reasoning summary, or
+    /// a freeform tool-input preview) was forwarded to the front-end. Once true,
+    /// a mid-stream protocol anomaly is fatal rather than silently retried, to
+    /// avoid duplicating shown output on replay.
     fn emitted_visible_output(&self) -> bool {
-        self.emitted_visible_text || self.emitted_visible_reasoning
+        self.emitted_visible_text
+            || self.emitted_visible_reasoning
+            || self.emitted_visible_tool_input
     }
 
     fn ingest_event(&mut self, event: &str, sink: &mut dyn TurnSink) -> Result<()> {
@@ -567,6 +575,26 @@ impl ResponseStreamParser {
                 // first part.added opens the trace and renders nothing).
                 if self.emitted_visible_reasoning {
                     sink.on_reasoning_section_break()?;
+                }
+            }
+            // Live *freeform/custom* tool-call input fragments (ADR-0039).
+            // Forwarded display-only and never parsed, accumulated, approved,
+            // executed, or stored: the completed `function_call`/`custom_tool_call`
+            // item at `response.output_item.done`/`response.completed` remains the
+            // only source of executed arguments. JSON-argument tools emit
+            // `response.function_call_arguments.delta`, which is deliberately NOT
+            // handled -- those arguments stay buffered until completion.
+            Some("response.custom_tool_call_input.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    let call_id = value
+                        .get("item_id")
+                        .or_else(|| value.get("call_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    sink.on_tool_input_delta(call_id, delta)?;
+                    self.emitted_visible_tool_input = true;
                 }
             }
             Some("response.created") => {
