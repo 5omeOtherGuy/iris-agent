@@ -385,6 +385,29 @@ impl ContextManagement {
         }
         Ok(())
     }
+
+    /// Reject server-side tool-result clearing combined with local
+    /// microcompaction (issue #400, ADR-0022 addendum): `clear_tool_uses`
+    /// makes the server drop tool results Iris still models as present, so
+    /// context estimates diverge and fold plans target content already gone
+    /// -- two reducers fighting over the same mass. `clear_thinking` stays
+    /// allowed: folds never touch thinking blocks and recall reads Iris's
+    /// own log, unaffected by server-side thinking clears.
+    pub(crate) fn validate_compatible_with_microcompaction(
+        &self,
+        microcompaction: bool,
+    ) -> Result<()> {
+        if microcompaction && self.clear_tool_uses.is_some() {
+            return Err(UsageError::new(
+                "anthropicContextManagement.clearToolUses and microcompaction cannot be enabled \
+                 together: the server drops tool results Iris still models as present, so \
+                 context accounting and fold plans diverge. Disable one of them \
+                 (clearThinking remains compatible with microcompaction).",
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -469,6 +492,7 @@ impl ModelSelection {
             None => ContextManagement::default(),
         };
         context_management.validate_supported()?;
+        context_management.validate_compatible_with_microcompaction(settings.microcompaction())?;
         let retry_policy =
             crate::mimir::retry::RetryPolicy::from_settings(&settings.retry_settings());
         let open_ai_compatible =
@@ -567,6 +591,41 @@ mod tests {
             default_approval: None,
             worktree_root: None,
         }
+    }
+
+    #[test]
+    fn clear_tool_uses_and_microcompaction_are_mutually_exclusive() {
+        // Both enabled -> rejected, naming both settings (issue #400,
+        // ADR-0022 addendum).
+        let mut s = settings(Some("anthropic"), None, None, None);
+        s.anthropic_context_management = Some(serde_json::json!({
+            "clearToolUses": { "triggerInputTokens": 50000 }
+        }));
+        s.microcompaction = Some(true);
+        let error = format!("{:#}", ModelSelection::resolve(&s).unwrap_err());
+        assert!(error.contains("clearToolUses"), "names the edit: {error}");
+        assert!(
+            error.contains("microcompaction"),
+            "names the toggle: {error}"
+        );
+
+        // Either alone passes.
+        let mut clear_only = settings(Some("anthropic"), None, None, None);
+        clear_only.anthropic_context_management = Some(serde_json::json!({
+            "clearToolUses": { "triggerInputTokens": 50000 }
+        }));
+        assert!(ModelSelection::resolve(&clear_only).is_ok());
+        let mut micro_only = settings(Some("anthropic"), None, None, None);
+        micro_only.microcompaction = Some(true);
+        assert!(ModelSelection::resolve(&micro_only).is_ok());
+
+        // clear_thinking is orthogonal: folds never touch thinking blocks.
+        let mut thinking = settings(Some("anthropic"), None, None, None);
+        thinking.anthropic_context_management = Some(serde_json::json!({
+            "clearThinking": { "triggerInputTokens": 50000 }
+        }));
+        thinking.microcompaction = Some(true);
+        assert!(ModelSelection::resolve(&thinking).is_ok());
     }
 
     /// A selection literal for the cache-profile table tests, bypassing
