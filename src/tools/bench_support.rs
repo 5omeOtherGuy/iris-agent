@@ -57,6 +57,35 @@ pub(crate) fn assert_parity_or_better(class: &str, baseline: &str, reduced: &str
     );
 }
 
+/// Ratio of estimated tokens: `after` as a fraction of `before` (1.0 = no
+/// change, < 1.0 = smaller). Complements [`reduction_pct`] for the case where
+/// two already-reduced forms are compared against each other (e.g. the
+/// compaction `provider` vs `excerpts` arms) rather than raw-vs-reduced.
+/// Returns 0.0 when `before` is empty so a degenerate baseline never divides
+/// by zero.
+pub(crate) fn est_ratio(before: &str, after: &str) -> f64 {
+    let before = est_tokens(before) as f64;
+    if before == 0.0 {
+        return 0.0;
+    }
+    est_tokens(after) as f64 / before
+}
+
+/// Assert `after` stays at or under `max_ratio` of `before` in estimated
+/// tokens. Used to bound one reduced arm against another (compaction
+/// `provider` vs `excerpts`): the bar is a ceiling on the ratio, i.e. a floor
+/// on the win, so a summarizer arm that balloons past the peer fails loudly.
+/// Ratios only; absolute counts are estimates.
+pub(crate) fn assert_ratio_within(class: &str, before: &str, after: &str, max_ratio: f64) {
+    let ratio = est_ratio(before, after);
+    assert!(
+        ratio <= max_ratio,
+        "[{class}] token ratio {ratio:.2} exceeds the {max_ratio:.2} ceiling ({} vs {} est tokens)",
+        est_tokens(after),
+        est_tokens(before),
+    );
+}
+
 /// Assert that every needle survives reduction verbatim. Needles encode the
 /// quality-loss contract: error messages, `file:line` references, failing
 /// test names, summaries a competent engineer would have read.
@@ -134,6 +163,25 @@ mod tests {
     #[should_panic(expected = "lost")]
     fn survival_assert_fails_loudly() {
         assert_survives_verbatim("class", "kept line", &["dropped line"]);
+    }
+
+    #[test]
+    fn est_ratio_and_ceiling() {
+        assert_eq!(est_ratio("", "abcd"), 0.0);
+        let before = "x".repeat(400);
+        let after = "x".repeat(100);
+        assert!((est_ratio(&before, &after) - 0.25).abs() < 0.01);
+        // At-ceiling passes (<=), well-under passes.
+        assert_ratio_within("class", &before, &after, 0.25);
+        assert_ratio_within("class", &before, &after, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the 0.10 ceiling")]
+    fn ratio_ceiling_fails_loudly() {
+        let before = "x".repeat(400);
+        let after = "x".repeat(100);
+        assert_ratio_within("class", &before, &after, 0.10);
     }
 
     #[test]

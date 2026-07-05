@@ -2726,3 +2726,10 @@ fn compact_preview(
 #[cfg(test)]
 #[path = "nexus_tests.rs"]
 mod tests;
+
+// Compaction retention-needle benchmark scaffold (ADR-0045, issue #372). Lives
+// beside the Nexus test module so it can reuse the in-crate provider/message
+// types via `use super::*`, while driving the Tier-2 `wayland` compaction seam.
+#[cfg(test)]
+#[path = "compaction_bench.rs"]
+mod compaction_bench;
