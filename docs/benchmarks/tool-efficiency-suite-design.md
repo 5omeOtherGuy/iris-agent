@@ -95,10 +95,23 @@ flow. No external TOML until a second consumer needs it.
 
 ## Config surface
 
-Env-first, all optional: `IRIS_BENCH_REAL=1`, `IRIS_BENCH_DANGEROUS_OK=1` (bash),
-`IRIS_BENCH_MODELS=provider:model,...`, `IRIS_BENCH_N`, `IRIS_BENCH_REASONING`
-(default `low`, held identical across arms), `IRIS_BENCH_PHASES=smoke,micro,e2e`,
+Every run parameter is operator-adjustable, env-first, all optional. The three
+primary knobs an operator changes per run:
+
+| knob | env | accepts | notes |
+|---|---|---|---|
+| mode | `IRIS_BENCH_MODE` | `deny` \| `skip-perms` (and/or arm/axis + phase selectors) | which execution/comparison mode runs; exact meaning pending operator confirmation |
+| effort | `IRIS_BENCH_REASONING` | one level `off..xhigh`, OR a comma list to sweep | HELD IDENTICAL across the two arms within one A/B comparison (it is a confounder); sweeping levels is its own dimension, not an arm |
+| runs (N) | `IRIS_BENCH_N` | one integer, or `anchor=10,breadth=5` per-role | repetitions per model x workload x arm cell |
+
+Secondary knobs: `IRIS_BENCH_REAL=1`, `IRIS_BENCH_DANGEROUS_OK=1` (bash),
+`IRIS_BENCH_MODELS=provider:model,...`, `IRIS_BENCH_PHASES=smoke,micro,e2e`,
 `IRIS_BENCH_TOOLS`, `IRIS_BENCH_WORKLOADS`, `IRIS_BENCH_LOG`, `IRIS_BENCH_SEED`.
+
+Invariant preserved regardless of knob values: within a single A/B comparison,
+arm is the ONLY thing that differs; effort, model, reasoning, prompt, fixture,
+and order are identical across the two arms. Adjusting effort/mode/N changes what
+is compared, never breaks the like-for-like arm pairing.
 
 ## Metrics + connections
 
