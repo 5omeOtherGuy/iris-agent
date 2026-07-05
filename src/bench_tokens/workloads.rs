@@ -167,10 +167,10 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
             fixture: "workload5_chained_provider_fix",
             prompt: "Live reasoning summaries do not stream for the OpenAI Codex Responses \
                      provider even when reasoning effort is enabled. This fixture mirrors a \
-                     recent Iris bug. Discover the relevant files with find/grep/read, run \
-                     `cargo test -- --nocapture` to reproduce the failure, fix the request \
-                     builder without weakening tests, then run `cargo test -- --nocapture` \
-                     until it passes. Summarize the fix.",
+                     recent Iris bug. First, before reading or editing any file, run \
+                     `cargo test` to reproduce the failure. Then discover the relevant files \
+                     with find/grep/read, fix the request builder without weakening tests, \
+                     and run `cargo test` until it passes. Summarize the fix.",
             script: script_chained_openai_summary_fix,
             check: check_chained_openai_summary_fix,
             approval: ApprovalProfile::SkipPermissions,
@@ -353,11 +353,7 @@ fn script_chained_openai_summary_fix() -> Vec<AssistantTurn> {
             "read",
             json!({ "path": "tests/live_reasoning_summary.rs" }),
         ),
-        call_turn(
-            "b1",
-            "bash",
-            json!({ "command": "cargo test -- --nocapture" }),
-        ),
+        call_turn("b1", "bash", json!({ "command": "cargo test" })),
         call_turn(
             "r2",
             "read",
@@ -372,11 +368,7 @@ fn script_chained_openai_summary_fix() -> Vec<AssistantTurn> {
                 "new_string": "    Some(CodexReasoning {\n        effort,\n        summary: Some(\"auto\"),\n    })",
             }),
         ),
-        call_turn(
-            "b2",
-            "bash",
-            json!({ "command": "cargo test -- --nocapture" }),
-        ),
+        call_turn("b2", "bash", json!({ "command": "cargo test" })),
         answer_turn(
             "Fixed the OpenAI Codex reasoning request by adding summary:auto whenever reasoning is enabled; cargo test now passes.",
         ),

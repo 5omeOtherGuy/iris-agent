@@ -95,14 +95,18 @@ pub(crate) struct ScriptedSkipRun {
     pub(crate) outcome: Outcome,
 }
 
-fn enforce_failing_then_passing_bash(workload: &Workload, outcome: &mut Outcome, exits: &[i32]) {
+fn enforce_failing_then_passing_bash(
+    workload: &Workload,
+    outcome: &mut Outcome,
+    exits: &[i32],
+) -> bool {
     if !workload.require_failing_then_passing_bash || !outcome.success {
-        return;
+        return true;
     }
     let Some((&last, before_last)) = exits.split_last() else {
         outcome.success = false;
         outcome.detail = "expected a failing cargo test before the final passing cargo test; no bash exits were recorded".to_string();
-        return;
+        return false;
     };
     let reproduced_failure = before_last.iter().any(|&code| code != 0);
     if last != 0 || !reproduced_failure {
@@ -110,7 +114,9 @@ fn enforce_failing_then_passing_bash(workload: &Workload, outcome: &mut Outcome,
         outcome.detail = format!(
             "expected failing-then-passing bash exits for the chained repair; got {exits:?}"
         );
+        return false;
     }
+    true
 }
 
 /// Drive one workload x arm with the scripted replay provider under
@@ -205,6 +211,7 @@ pub(crate) fn selection_for_spec(
 
 /// Rich outcome of one real-provider cell (the unit we log and aggregate).
 pub(crate) struct RealRunRecord {
+    pub(crate) valid: bool,
     pub(crate) arm: Arm,
     pub(crate) outcome: Outcome,
     pub(crate) turns: u32,
@@ -374,8 +381,9 @@ pub(crate) fn run_real_cell(
 
     let bash_exit_codes = observer.bash_exit_codes.borrow().clone();
     let mut outcome = (workload.check)(&cwd, &observer.final_text());
-    enforce_failing_then_passing_bash(workload, &mut outcome, &bash_exit_codes);
+    let valid = enforce_failing_then_passing_bash(workload, &mut outcome, &bash_exit_codes);
     let record = RealRunRecord {
+        valid,
         arm,
         outcome,
         turns: observer.provider_turns.get(),
@@ -398,7 +406,7 @@ pub(crate) fn run_real_cell(
     bench_log_append(&json!({
         "schema_version": BENCH_SCHEMA_VERSION,
         "kind": "real_cell",
-        "valid": true,
+        "valid": record.valid,
         "model": model,
         "workload": workload.name,
         "arm": record.arm.label(),

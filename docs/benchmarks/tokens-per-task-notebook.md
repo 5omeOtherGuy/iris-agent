@@ -1177,8 +1177,8 @@ surface compaction regressions directly instead of only showing token deltas.
 Workload follow-up: added `chained-openai-summary-fix`, seeded from real PR #404
 (OpenAI request had `effort` but missed `summary: "auto"`). It hides the provider
 bug among generated decoy provider files and scripts a real chain: find, multiple
-greps, read failing test, noisy `cargo test -- --nocapture`, read provider, edit,
-and passing `cargo test -- --nocapture`. That is the right place to look for
+greps, read failing test, `cargo test`, read provider, edit, and passing
+`cargo test`. That is the right place to look for
 material end-to-end token savings because bash/cargo-test output can dominate the
 transcript while success still proves the model solved the task.
 
@@ -1209,10 +1209,37 @@ also proved the workload was not mechanically enforcing the intended chained
 workflow.
 
 Fix applied after the smoke: `IRIS_BENCH_ARM` now splits the bash matrix for safe
-parallel arm runs, and `chained-openai-summary-fix` now requires a failing bash
-exit before the final passing bash exit. Future runs will mark edit-first shortcuts
-as failures instead of letting them skew the token comparison.
+parallel arm runs, the prompt now says to run plain `cargo test` first (before
+reading/editing), and `chained-openai-summary-fix` now treats runs without a
+failing bash exit before the final passing bash exit as invalid/noncompliant
+rather than valid task failures. Future token comparisons exclude those rows but
+still report the invalid count.
 
 Raw logs were left in `/tmp/chained_s46_low_{baseline,defaults}_n5.jsonl` and not
-committed because their `success=true` values predate the stricter failing-first
-check.
+committed because their `success=true` values predate the invalid/noncompliant
+classification.
+
+## Entry 26 - Chained workload rerun with explicit plain `cargo test` first
+
+Adjusted the workload after the previous smoke: prompt now says to run plain
+`cargo test` before reading/editing; scripted replay uses `cargo test` (no
+`--nocapture`); shortcut/noncompliant runs are marked invalid (excluded from token
+comparison) rather than counted as task failures. Rationale: normal failing Rust
+tests already report the failing test, panic site, and assertion left/right; the
+fixture does not need artificial `--nocapture` noise.
+
+Authorized rerun: Sonnet 4.6, low, `chained-openai-summary-fix`, N=5 per arm,
+parallel arm processes (`IRIS_BENCH_ARM=baseline` and `defaults`). Artifact:
+chained-openai-summary-fix-sonnet46-low-n5-2026-07-05.{md,jsonl}.
+
+Result: 10/10 valid + successful. Every run reproduced a failing cargo test before
+the final passing cargo test (exit code `101` before final `0`). Safety signals:
+success 100%/100%, median turns 7/7, median tool calls 7.0/7.0, max calls 8/9
+(A/B), tool errors 1/0 (A/B; one edit-before-read error in A run 5, recovered).
+Token result: A/defaults median 97,690 vs B/baseline 101,987 input tokens, delta
+-4,297 (-4.2%), same turn count; result-bytes delta -377. Welch CI crosses zero
+at N=5, so descriptive only/no claim.
+
+Conclusion: the workload design now works for the intended benchmark shape: it
+forces the reproduce-failure -> fix -> verify chain, can run arms in parallel, and
+surfaces both safety and token signals without relying on `--nocapture`.
