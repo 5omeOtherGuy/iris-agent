@@ -1408,13 +1408,18 @@ mod tests {
             screen.transcript.rows.is_empty(),
             "the tail is not committed without a tick"
         );
-        let render = screen.transcript.render(80);
+        // The pager sizes its scrollable range from `transcript_visible_total`
+        // (committed rows + streaming preview), not `render().total_lines`.
+        // With nothing committed, the whole visible total is the active tail, so
+        // a regression that dropped the tail from the pager total would read 0.
+        let visible_total = screen.transcript_visible_total(80);
         assert!(
-            render.total_lines >= 3,
-            "the uncommitted tail is counted in the pager total: {}",
-            render.total_lines
+            visible_total >= 3,
+            "the uncommitted tail is counted in the pager visible total: {visible_total}"
         );
-        let frame: String = render
+        let frame: String = screen
+            .transcript
+            .render(80)
             .lines
             .iter()
             .map(line_text)
@@ -1498,7 +1503,10 @@ mod tests {
             call: tool.clone(),
             content: "hi".to_string(),
             exit_code: Some(0),
-            duration: None,
+            // Deterministic elapsed so the finalized tool header cannot derive a
+            // wall-clock duration from `Instant::now()` (avoids a 0.0s/0.1s flake
+            // between the two sides of the parity comparison).
+            duration: Some(std::time::Duration::ZERO),
         });
         inc.apply(UiEvent::AssistantTextDelta(two.to_string()));
         inc.apply(UiEvent::AssistantTextEnd(two.to_string()));
@@ -1517,7 +1525,7 @@ mod tests {
             call: tool.clone(),
             content: "hi".to_string(),
             exit_code: Some(0),
-            duration: None,
+            duration: Some(std::time::Duration::ZERO),
         });
         full.apply(UiEvent::AssistantText(two.to_string()));
         full.apply(UiEvent::ProviderTurnCancelled {
