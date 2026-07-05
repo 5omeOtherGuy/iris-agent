@@ -893,3 +893,54 @@ is `cfg!(test) || env`, so read-before-mutate and path confinement are genuinely
 active in the probe -- the stale-file class is a real rejection, not a stub. No
 token or success claim is made from these bytes (proxy ratios only, never mixed
 with real usage records).
+
+## Entry 18 - Live validation (Sonnet 4.6, low): the tool-choice gap
+
+Ran two opt-in live sets on `anthropic:claude-sonnet-4-6`, reasoning `low`, N=1
+(8 real sessions total). All cells succeeded (8/8), no approval prompts, real
+usage records. N=1 -> descriptive only, no claim, ROADMAP gate stays open.
+
+**Smoke (log-triage, grep+read):** B 23076 -> A 22505 input tok (-2.5%),
+identical 3 turns / 2 tools; tool_result_bytes 5451 -> 4283 (-21%). Reduction
+showed up in context, cost no turn, hurt no success. One data point.
+
+**Micro-probes (per-tool):**
+
+| probe | arm | in tok | turns | tool seq | result B |
+|---|---|---|---|---|---|
+| grep | B | 15031 | 2 | grep | 4354 |
+| grep | A | 14493 | 2 | grep | 2588 |
+| find | B | 13583 | 2 | find | 51 |
+| find | A | 13583 | 2 | find | 51 |
+| read | B | 21029 | 3 | grep,grep | 1025 |
+| read | A | 14002 | 2 | find,grep | 903 |
+
+**The key finding: a render-probe reduction is necessary but NOT sufficient --
+the model must actually invoke the tool in the reduction-triggering way, and at
+low effort Sonnet often does not.**
+
+- **grep** behaved as designed: one grep both arms, A's tool output 40.6% smaller
+  (4354 -> 2588 B), A input 3.6% lower, both correct. The render probe's 36.4%
+  translated into a real (small) live delta.
+- **find was byte-IDENTICAL across arms** (13583 == 13583, result 51 B). Asked to
+  find the file whose name contains `zebra`, the model searched `*zebra*` -> ONE
+  match -> no >1000-match listing -> compaction never fires. find's 55.7% render
+  reduction only exists on a broad listing; a targeted search (the common real
+  case) never trips the rail, so there is nothing to reduce. Honest: the feature
+  helps a narrower slice of real usage than the render probe implies.
+- **read skim was never exercised**: the model did NOT read the file at all -- it
+  grepped for the constant (B: two greps + an extra turn; A: find+grep). So the
+  83.1% skim reduction contributed zero here; the A - B delta (-33%, one fewer
+  turn) is a grep-strategy difference at N=1, not skim. To exercise read skim the
+  question must force a read (e.g. "summarize the module's exported API"), not a
+  point-lookup a grep answers better.
+
+**Consequence for the suite (Phase 7 follow-ups, not bugs):** the find and read
+LIVE probe questions are mismatched to their tools -- they let a smart model
+route around the reduction. Fixes: make the find question demand a broad listing
+(e.g. count/enumerate) and the read question demand reading a file. The render
+probes remain valid (they measure the tool directly); it is the live-question
+design that must force the intended tool path. This tool-choice gap IS the
+"connection between per-tool advantage and end-to-end outcome" the suite exists
+to find, and it argues against any blanket "reductions save tokens per task"
+claim: the saving is contingent on the model using the tool the reducing way.
