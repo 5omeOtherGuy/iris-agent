@@ -585,3 +585,274 @@ fn fold_flush_cost_live_anthropic() {
         );
     }
 }
+
+// --- Phase 2 (issue #400 M5): inferred-cold (Class B) live pair. ---
+//
+// One run per lane, both double-gated. Each drives the SAME shape: turn 1
+// warms the prefix, a real idle wait past the provider TTL follows, and turn
+// 2 (whose boundary infers cold and flushes the pending fold when
+// microcompaction is on) captures the realized usage. Anthropic reports the
+// write side (realized write delta); the write-blind Codex lane reports the
+// read side (realized cached_tokens drop). Default idle: 390 s (past the
+// Anthropic 5 m tier and inside the documented OpenAI 5-10 min eviction
+// window); override with IRIS_BENCH_IDLE_SECS for a shorter smoke run -- the
+// actual wait is printed with the numbers either way.
+
+fn live_idle_wait() -> std::time::Duration {
+    let secs = std::env::var("IRIS_BENCH_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(390);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Drive one inferred-cold live run against `provider`: turn 1 warm, real
+/// idle wait, turn 2 post-gap. The cold threshold is set just below the wait
+/// so the Class-B trigger fires exactly at the turn-2 boundary when `micro`
+/// is on. Returns the captured usages and the fold count.
+fn run_inferred_cold_live<P: ChatProvider>(
+    provider: P,
+    micro: bool,
+    idle: std::time::Duration,
+) -> Option<(Vec<CapturedUsage>, usize)> {
+    let root = TempDir::new("cold-root");
+    let workspace = TempDir::new("cold-ws");
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
+    for message in fold_live_seed() {
+        log.append(&message).expect("append seed message");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list sessions")
+        .into_iter()
+        .find(|m| m.path == path)
+        .expect("seeded session is listed");
+    let stored = store.open(&meta).expect("open seeded session");
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path).expect("resume session log");
+
+    let usages = Arc::new(Mutex::new(Vec::new()));
+    let recording = RecordingProvider {
+        inner: provider,
+        usages: usages.clone(),
+    };
+    // Budget far above the running total: neither compaction nor the
+    // watermark can fire; only the inferred-cold trigger releases the fold.
+    let seed_estimate = stored
+        .messages
+        .iter()
+        .map(|m| m.content.len())
+        .sum::<usize>() as u64
+        / 4;
+    let budget = seed_estimate * 8;
+    let agent = Agent::resumed(recording, Tools::new(Vec::new()), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(budget),
+    );
+    harness.set_summarizer(SummarizerKind::Provider);
+    harness.set_microcompaction(micro);
+
+    let obs = NoopObserver;
+    let gate = NoToolGate;
+    let token = CancellationToken::new();
+    // Turn 1: warm the prefix (no cold threshold installed yet, and the
+    // resume-time A4 check sees a seconds-old transcript -> holds).
+    if let Err(error) = block_on(harness.submit_turn(
+        "Do not use any tools. Reply with one short sentence acknowledging the buffer state.",
+        &obs,
+        &gate,
+        &token,
+    )) {
+        eprintln!("LIVE RUN FAILED: submit_turn (warm) error: {error:#}");
+        return None;
+    }
+    // The real idle gap, with the profile threshold just inside it.
+    harness.set_cache_profile(crate::wayland::CacheProfile {
+        cold_after: Some(idle.saturating_sub(std::time::Duration::from_secs(10))),
+        ..Default::default()
+    });
+    std::thread::sleep(idle);
+    if let Err(error) = block_on(harness.submit_turn(
+        "Do not use any tools. In one short sentence: is the buffer state current?",
+        &obs,
+        &gate,
+        &token,
+    )) {
+        eprintln!("LIVE RUN FAILED: submit_turn (post-gap) error: {error:#}");
+        return None;
+    }
+
+    let folds = super::compaction_bench::fold_count(&path);
+    let captured = usages.lock().expect("usages lock").clone();
+    Some((captured, folds))
+}
+
+/// Post-gap (turn-2) usage: the request tagged with the steady prompt.
+fn post_gap_usage(run: &[CapturedUsage]) -> Option<ProviderUsage> {
+    run.iter()
+        .find(|c| c.tag.starts_with("Do not use any tools. In one sho"))
+        .and_then(|c| c.usage.clone())
+}
+
+#[test]
+#[ignore = "live Anthropic API calls with a real idle wait; set IRIS_BENCH_LIVE=1 to run"]
+fn inferred_cold_flush_live_anthropic() {
+    if std::env::var("IRIS_BENCH_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("inferred_cold_flush_live_anthropic: skipped (set IRIS_BENCH_LIVE=1 to run)");
+        return;
+    }
+    if !claude_code_credentials_available() {
+        eprintln!("LIVE RUN FAILED: no Claude Code credentials discovered");
+        return;
+    }
+    let idle = live_idle_wait();
+    let date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    println!("\n== LIVE inferred-cold flush (Anthropic Claude Code OAuth) ==");
+    println!(
+        "lane: Anthropic Messages / Claude Code OAuth; model: {LIVE_MODEL}; \
+         idle wait: {}s (5m-tier TTL is 300s); unix_date: {date}",
+        idle.as_secs()
+    );
+    let build = || {
+        AnthropicProvider::new(
+            LIVE_MODEL,
+            "https://api.anthropic.com",
+            None,
+            LIVE_SYSTEM_PROMPT,
+            PromptCacheRetention::DEFAULT,
+            ContextManagement::default(),
+            RetryPolicy::default(),
+        )
+    };
+    let control = match build() {
+        Ok(p) => run_inferred_cold_live(p, false, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: AnthropicProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let arm = match build() {
+        Ok(p) => run_inferred_cold_live(p, true, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: AnthropicProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let (Some((ctrl, ctrl_folds)), Some((arm, arm_folds))) = (control, arm) else {
+        return;
+    };
+    println!("folds: control={ctrl_folds}, arm={arm_folds}");
+    if arm_folds == 0 {
+        println!("LIVE RUN INCONCLUSIVE: the arm wrote no fold at the post-gap boundary.");
+        return;
+    }
+    let (ctrl_t2, arm_t2) = (post_gap_usage(&ctrl), post_gap_usage(&arm));
+    let report = |label: &str, u: &Option<ProviderUsage>| match u {
+        Some(u) => println!(
+            "{label}: input_tokens={}, cache_read={}, cache_write={}",
+            u.input_tokens, u.cache_read_input_tokens, u.cache_write_input_tokens
+        ),
+        None => println!("{label}: no usage captured"),
+    };
+    report("control post-gap (no fold)", &ctrl_t2);
+    report("arm post-gap (B flush)    ", &arm_t2);
+    if let (Some(c), Some(a)) = (&ctrl_t2, &arm_t2) {
+        println!(
+            "realized write delta (arm - control): {} tokens (past the TTL both re-write; \
+             <= 0 means the fold only shrank the cold re-write)",
+            a.cache_write_input_tokens as i64 - c.cache_write_input_tokens as i64
+        );
+    }
+}
+
+#[test]
+#[ignore = "live Codex API calls with a real idle wait; set IRIS_BENCH_LIVE=1 to run"]
+fn inferred_cold_flush_live_codex() {
+    if std::env::var("IRIS_BENCH_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("inferred_cold_flush_live_codex: skipped (set IRIS_BENCH_LIVE=1 to run)");
+        return;
+    }
+    let idle = live_idle_wait();
+    let date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    println!("\n== LIVE inferred-cold flush (OpenAI Codex Responses) ==");
+    println!(
+        "lane: Codex Responses (write-blind: cache_write is hardcoded 0; the read side is \
+         what this lane can measure); model: gpt-5.5; idle wait: {}s (documented in-memory \
+         eviction 5-10 min); unix_date: {date}",
+        idle.as_secs()
+    );
+    let build = |key: &str| {
+        crate::mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+            "gpt-5.5",
+            "https://chatgpt.com/backend-api",
+            None,
+            LIVE_SYSTEM_PROMPT,
+            key,
+            PromptCacheRetention::DEFAULT,
+            RetryPolicy::default(),
+        )
+    };
+    let control = match build("iris-bench-cold-ctrl") {
+        Ok(p) => run_inferred_cold_live(p, false, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: OpenAiCodexResponsesProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let arm = match build("iris-bench-cold-arm") {
+        Ok(p) => run_inferred_cold_live(p, true, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: OpenAiCodexResponsesProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let (Some((ctrl, ctrl_folds)), Some((arm, arm_folds))) = (control, arm) else {
+        return;
+    };
+    println!("folds: control={ctrl_folds}, arm={arm_folds}");
+    if arm_folds == 0 {
+        println!("LIVE RUN INCONCLUSIVE: the arm wrote no fold at the post-gap boundary.");
+        return;
+    }
+    // The write-blind lane measures the read side: past the eviction window
+    // the post-gap request's cached_tokens collapse for BOTH runs (the drop
+    // is the gap's doing, not the fold's), and the fold costs nothing extra.
+    let warm = |run: &[CapturedUsage]| {
+        run.iter()
+            .find(|c| c.tag.starts_with("Do not use any tools. Reply with"))
+            .and_then(|c| c.usage.clone())
+    };
+    let report = |label: &str, u: &Option<ProviderUsage>| match u {
+        Some(u) => println!(
+            "{label}: input_tokens={}, cached_tokens(read)={}",
+            u.input_tokens, u.cache_read_input_tokens
+        ),
+        None => println!("{label}: no usage captured"),
+    };
+    report("control warm turn          ", &warm(&ctrl));
+    report("control post-gap (no fold) ", &post_gap_usage(&ctrl));
+    report("arm post-gap (B flush)     ", &post_gap_usage(&arm));
+    if let (Some(c), Some(a)) = (&post_gap_usage(&ctrl), &post_gap_usage(&arm)) {
+        println!(
+            "realized cached-read delta (control - arm): {} tokens; realized input delta \
+             (control - arm): {} tokens (the fold's residency saving on the cold re-bill)",
+            c.cache_read_input_tokens as i64 - a.cache_read_input_tokens as i64,
+            c.input_tokens as i64 - a.input_tokens as i64
+        );
+    }
+}

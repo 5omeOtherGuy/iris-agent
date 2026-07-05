@@ -635,6 +635,69 @@ fn manual_compact_flushes_pending_folds_tagged_a6_before_compacting() {
 }
 
 #[test]
+fn a_mid_session_idle_gap_past_the_cold_threshold_flushes_and_is_tagged_b() {
+    // Class B (Phase 2): after the first boundary consumed the resume-time
+    // A4 check, a mid-session idle gap past the profile's cold threshold
+    // releases the pending folds -- the cache is expired, so the flush is
+    // free. The gap is measured from the transcript's last activity.
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    // First boundary: neutral profile, consumes the A4 resume check and holds.
+    h.set_cache_profile(neutral_profile());
+    let recorder = FoldRecorder::default();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 0);
+
+    // Mid-session: install a cold threshold far below the (real) idle gap.
+    h.set_cache_profile(super::CacheProfile {
+        cold_after: Some(std::time::Duration::from_millis(10)),
+        ..neutral_profile()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::InferredCold);
+    assert_eq!(fold_entries(&path)[0]["trigger"], "B");
+}
+
+#[test]
+fn a_short_mid_session_gap_below_the_threshold_holds() {
+    // The inferred-cold trigger never fires while the gap is within the
+    // profile threshold: recent transcript activity means a warm cache.
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    h.set_cache_profile(neutral_profile());
+    let recorder = FoldRecorder::default();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 0);
+
+    // A generous threshold: the seconds-old transcript is well within it.
+    h.set_cache_profile(super::CacheProfile {
+        cold_after: Some(std::time::Duration::from_secs(60 * 60)),
+        ..neutral_profile()
+    });
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 0);
+    assert_eq!(fold_count(&path), 0, "a warm mid-session cache holds");
+}
+
+#[test]
 fn fold_event_reaches_the_ui_layer_with_its_tag() {
     // The nexus fold event maps into the UI event stream carrying its trigger
     // (issue #400 M1 DoD): wayland -> nexus event -> UiEvent.

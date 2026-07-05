@@ -92,6 +92,76 @@ Regenerate: `cargo test trigger_class_flush_cost_benchmark_report -- --nocapture
 - Trigger tags on the persisted fold entries and observer events are asserted
   in `src/wayland/microcompaction_tests.rs` per class.
 
+## Class-B inferred-cold flush — modeled + realized (#400 M5, Phase 2)
+
+Mid-session idle gap past the provider profile's `cold_after`: the transcript
+activity clock (entry timestamps; live appends in-process) is compared against
+the profile threshold at every fold boundary, and the pending folds flush when
+the gap says the cache is expired.
+
+### Modeled arm
+
+Regenerate: `cargo test inferred_cold_flush_cost_benchmark_report -- --nocapture`
+
+| trigger | arm t2 payload (cold re-bill) | control t2 payload | marginal write | steady saving (t3) |
+|---|---|---|---|---|
+| B idle gap | 4796 | 4940 | -144 | 144 |
+
+**Simulation stated honestly**: the fake lane has no real TTL; the cold cache
+is modeled as a full re-bill of the post-gap request, which holds by
+definition once the provider TTL is past. What the arm proves
+deterministically is the trigger mechanics (fires on a real idle gap,
+mid-session, no pending break, threshold from the profile — never a hardcoded
+constant) and that the folded payload never exceeds the unfolded one
+(asserted, `inferred_cold_flush_fires_mid_session_and_is_free_under_a_cold_cache`).
+
+### Realized live pair (one run per lane, 390 s real idle)
+
+Anthropic Messages / Claude Code OAuth, `claude-sonnet-4-6`, unix_date
+`1783274019` (5 m tier, TTL 300 s < 390 s idle):
+
+| run, post-gap request | input_tokens | cache_read | cache_write |
+|---|---|---|---|
+| control (no fold) | 2301 | 0 | 2298 |
+| arm (B flush) | 1946 | 0 | 1943 |
+
+- Both runs realized `cache_read = 0` — the TTL had truly expired, so the
+  whole prefix re-wrote regardless of folding.
+- **Realized write delta: −355 tokens** — the inferred-cold flush was free
+  and the fold *shrank* the cold re-write by the folded mass.
+
+OpenAI Codex Responses (subscription backend), `gpt-5.5`, unix_date
+`1783274823` (write-blind lane: `cache_write` hardcoded 0, the read side is
+what it can measure; documented in-memory eviction 5–10 min < 390 s idle):
+
+| run | input_tokens | cached_tokens (read) |
+|---|---|---|
+| control warm turn | 1849 | 0 |
+| control post-gap (no fold) | 1886 | 0 |
+| arm post-gap (B flush) | 1569 | 0 |
+
+- Post-gap `cached_tokens = 0` on both runs — consistent with eviction; the
+  fold cost nothing on the read side (delta 0).
+- **Realized input delta: 317 tokens saved** on the cold re-bill by the fold.
+- Caveat, recorded honestly: this capture shape has no warm second turn, so a
+  warm-baseline `cached_tokens > 0` → post-gap drop could not be shown from
+  this run alone (the warm turn is each run's *first* request, which
+  necessarily reads 0). The read side realized here is the post-gap floor;
+  the eviction inference and the fold's zero marginal cost on it stand.
+
+Regenerate (one run per lane, real API calls + a real idle wait; override the
+wait with `IRIS_BENCH_IDLE_SECS`):
+
+```
+IRIS_BENCH_LIVE=1 cargo test inferred_cold_flush_live_anthropic -- --ignored --nocapture
+IRIS_BENCH_LIVE=1 cargo test inferred_cold_flush_live_codex -- --ignored --nocapture
+```
+
+**Wrong-inference cost** (gap inferred cold but cache still warm): one warm
+flush — measured at 4485 modeled / 2129 realized write tokens on this seed —
+bounded, and strictly less than what the watermark-only trigger paid on
+*every* flush.
+
 ## Fold-only flush — realized (Anthropic Claude Code OAuth)
 
 One live capture; lane: Anthropic Messages / Claude Code OAuth; model:
