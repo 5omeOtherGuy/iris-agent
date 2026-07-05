@@ -522,9 +522,10 @@ impl ResponseStreamParser {
         }
     }
 
-    /// Whether any visible output (assistant text or live reasoning summary) was
-    /// forwarded to the front-end. Once true, a mid-stream protocol anomaly is
-    /// fatal rather than silently retried, to avoid duplicating shown output.
+    /// Whether any visible output (assistant text, a live reasoning summary, or
+    /// a freeform tool-input preview) was forwarded to the front-end. Once true,
+    /// a mid-stream protocol anomaly is fatal rather than silently retried, to
+    /// avoid duplicating shown output on replay.
     fn emitted_visible_output(&self) -> bool {
         self.emitted_visible_text
             || self.emitted_visible_reasoning
