@@ -320,6 +320,19 @@ pub(crate) enum AgentEvent {
         text: String,
         redacted: bool,
     },
+    /// One incremental chunk of the model's reasoning *summary*, streamed while
+    /// the provider is still thinking (before any assistant text). Display-only,
+    /// exactly like [`AssistantReasoning`]: emitting it never changes storage or
+    /// what is sent to the provider, and the persisted reasoning row is still
+    /// written once at completion. Only the human-readable summary is carried;
+    /// raw chain-of-thought and encrypted/redacted reasoning are never streamed
+    /// (ADR-0016/ADR-0050). When a turn streams these, the terminal
+    /// [`AssistantReasoning`] display event for the same (non-redacted) block is
+    /// suppressed so the finished thinking block is not shown twice.
+    AssistantReasoningDelta(String),
+    /// A boundary between two reasoning-summary parts (a blank line in the live
+    /// thinking trace). Display-only; carries no text.
+    AssistantReasoningSectionBreak,
     ToolProposed(ToolCall),
     /// A tool is about to execute (emitted once per call, immediately before the
     /// run, on both the exclusive and parallel paths). Lets a front-end open a
@@ -414,6 +427,12 @@ pub(crate) enum ProviderEvent {
     Activity,
     /// Incremental assistant text.
     TextDelta(String),
+    /// Incremental reasoning *summary* text (never raw chain-of-thought, never
+    /// encrypted/redacted content). Emitted by providers that surface a live
+    /// reasoning summary before the answer; forwarded display-only.
+    ReasoningDelta(String),
+    /// A boundary between two reasoning-summary parts (blank line in the trace).
+    ReasoningSectionBreak,
     /// Terminal event: the fully assembled assistant turn.
     Completed(AssistantTurn),
 }
@@ -1017,8 +1036,15 @@ pub(crate) struct Agent<P> {
 /// the stream is released before the loop mutates the transcript.
 enum StreamResult {
     Completed {
-        turn: AssistantTurn,
+        // Boxed: `AssistantTurn` is large, so an unboxed variant makes
+        // `StreamResult` lopsided (clippy::large_enum_variant).
+        turn: Box<AssistantTurn>,
         saw_delta: bool,
+        /// Whether any reasoning-summary delta was forwarded for display during
+        /// this stream. When true, the terminal reasoning display event for the
+        /// (non-redacted) summary is suppressed so the live thinking block the
+        /// front-end already showed is not duplicated.
+        saw_reasoning_delta: bool,
     },
     Cancelled {
         partial: String,
@@ -1422,7 +1448,11 @@ impl<P: ChatProvider> Agent<P> {
                     self.emit_interrupted(obs)?;
                     return Ok(());
                 }
-                StreamResult::Completed { turn, saw_delta } => {
+                StreamResult::Completed {
+                    turn,
+                    saw_delta,
+                    saw_reasoning_delta,
+                } => {
                     let AssistantTurn {
                         text,
                         reasoning,
@@ -1430,7 +1460,7 @@ impl<P: ChatProvider> Agent<P> {
                         response_id,
                         usage,
                         completion_reason,
-                    } = turn;
+                    } = *turn;
                     // Captured before `reasoning` is consumed below: drives
                     // whether a content-less completion (e.g. a bare refusal)
                     // needs an explanatory notice.
@@ -1442,12 +1472,20 @@ impl<P: ChatProvider> Agent<P> {
                         // the row is still persisted below exactly as before
                         // (ADR-0016 continuity/redacted handling is untouched).
                         // Redacted blocks never carry their text downstream.
+                        //
+                        // Suppression (ADR-0050): when this turn already streamed
+                        // its reasoning summary live (`saw_reasoning_delta`), the
+                        // front-end has shown the thinking block, so the terminal
+                        // display event for the same non-redacted summary is
+                        // suppressed to avoid a duplicate. Redacted blocks are
+                        // never streamed, so their placeholder is always emitted.
+                        // Storage below is unchanged either way (persisted once).
                         if block.redacted {
                             obs.on_event(AgentEvent::AssistantReasoning {
                                 text: String::new(),
                                 redacted: true,
                             })?;
-                        } else if !block.text.is_empty() {
+                        } else if !block.text.is_empty() && !saw_reasoning_delta {
                             obs.on_event(AgentEvent::AssistantReasoning {
                                 text: block.text.clone(),
                                 redacted: false,
@@ -1604,6 +1642,7 @@ impl<P: ChatProvider> Agent<P> {
             .provider
             .respond_stream(&self.messages, &self.tools, token)?;
         let mut saw_delta = false;
+        let mut saw_reasoning_delta = false;
         let mut partial = String::new();
         loop {
             tokio::select! {
@@ -1617,9 +1656,24 @@ impl<P: ChatProvider> Agent<P> {
                         partial.push_str(&delta);
                         obs.on_event(AgentEvent::AssistantTextDelta(delta))?;
                     }
+                    Some(Ok(ProviderEvent::ReasoningDelta(delta))) => {
+                        // Display-only: never accumulated into `partial` (which
+                        // becomes the persisted assistant text) or into storage.
+                        if !delta.is_empty() {
+                            saw_reasoning_delta = true;
+                            obs.on_event(AgentEvent::AssistantReasoningDelta(delta))?;
+                        }
+                    }
+                    Some(Ok(ProviderEvent::ReasoningSectionBreak)) => {
+                        obs.on_event(AgentEvent::AssistantReasoningSectionBreak)?;
+                    }
                     Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {
-                        return Ok(StreamResult::Completed { turn, saw_delta });
+                        return Ok(StreamResult::Completed {
+                            turn: Box::new(turn),
+                            saw_delta,
+                            saw_reasoning_delta,
+                        });
                     }
                     Some(Err(error)) => return Err(error),
                     None => bail!("provider stream closed before completion"),

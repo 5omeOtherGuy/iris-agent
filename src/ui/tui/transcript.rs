@@ -95,6 +95,30 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
     }
 }
 
+/// Build the transient thinking-preview rows for a live reasoning summary: the
+/// `THINKING` rail header plus dim rail-body lines of the rendered markdown.
+/// Not foldable and rendered whole (a live, growing trace shows everything); it
+/// is replaced by the foldable committed block once the trace is finalized. The
+/// markdown is rendered at the same `content_width` the committed block uses, so
+/// finalizing never reflows the already-shown lines.
+fn live_reasoning_preview_rows(text: &str, content_width: usize) -> Vec<TranscriptRow> {
+    let theme = MarkdownTheme::thinking()
+        .with_code_highlighting()
+        .with_hyperlinks();
+    let mut rows = Vec::new();
+    rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
+        expanded: false,
+        label: THINKING_LABEL.to_string(),
+        right: String::new(),
+        foldable: false,
+    }));
+    for line in render_markdown_themed(text, &theme, content_width) {
+        rows.push(rail_body_row(line));
+    }
+    rows.push(TranscriptRow::chrome(ChromeRow::RailEnd));
+    rows
+}
+
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
 /// exclusive, so at most one is ever open. `body_start` is the row index of the
 /// block body (its `Running`/`Ran` header). `output` is the bounded live tail
@@ -195,6 +219,10 @@ struct StreamingRender {
     key: (usize, usize),
     width: usize,
     lines: Vec<Line<'static>>,
+    /// Whether these lines are the live reasoning-summary preview (vs the
+    /// assistant-answer active tail). The two sources are mutually exclusive per
+    /// frame; the flag keeps a source switch from reusing a stale memo.
+    is_reasoning: bool,
 }
 
 #[derive(Debug)]
@@ -224,6 +252,12 @@ pub(super) struct Transcript {
     /// its opening separator). A late `AssistantReasoning` block is spliced here
     /// so reasoning renders above an already-committed answer.
     stream_answer_start: Option<usize>,
+    /// Accumulated live reasoning-*summary* text for the current turn, shown as
+    /// a transient thinking preview while the provider is still thinking and
+    /// before the answer streams. Committed to scrollback as a thinking block by
+    /// [`Self::finish_live_reasoning_if_any`] on the first non-reasoning event.
+    /// `None` when no reasoning is streaming (block-level fallback path).
+    live_reasoning: Option<String>,
     /// The open live exec cell, if a streaming tool is running.
     active_exec: Option<ActiveExec>,
     active_explorations: Vec<ActiveExploration>,
@@ -439,6 +473,54 @@ impl Transcript {
                 self.thinking_header_row = Some(self.rows.len());
                 self.rows.extend(block);
             }
+        }
+    }
+
+    /// Append one live reasoning-summary delta to the transient thinking preview.
+    /// Display-only: never committed to `rows` until finalize, never stored.
+    fn push_reasoning_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.live_reasoning
+            .get_or_insert_with(String::new)
+            .push_str(delta);
+        // The preview is re-derived from `live_reasoning`; drop the memo so the
+        // next frame re-renders with the appended text.
+        self.streaming_render = None;
+    }
+
+    /// Insert a blank line between two reasoning-summary parts. No-op before any
+    /// reasoning has streamed or when the buffer already ends with a break.
+    fn push_reasoning_section_break(&mut self) {
+        let append = self
+            .live_reasoning
+            .as_deref()
+            .is_some_and(|buf| !buf.is_empty() && !buf.ends_with("\n\n"));
+        if append {
+            self.live_reasoning
+                .as_mut()
+                .expect("checked non-empty above")
+                .push_str("\n\n");
+            self.streaming_render = None;
+        }
+    }
+
+    /// Commit any live reasoning trace to scrollback as a thinking block. Called
+    /// before handling any non-reasoning event, so the reasoning ends up above
+    /// the answer that streams afterwards. Idempotent: a no-op when nothing
+    /// streamed. `stream_answer_start` is `None` here (reasoning precedes the
+    /// answer), so `push_thinking_block` appends rather than splices.
+    fn finish_live_reasoning_if_any(&mut self) {
+        let Some(text) = self.live_reasoning.take() else {
+            return;
+        };
+        // Drop the transient reasoning-preview memo; the block below is committed
+        // through the wrap cache instead.
+        self.streaming_render = None;
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            self.push_thinking_block(trimmed, false);
         }
     }
 
@@ -1831,7 +1913,25 @@ impl Transcript {
     /// Apply one semantic event to the transcript rows.
     pub(super) fn apply(&mut self, event: UiEvent) {
         let old_len = self.rows.len();
+        // Reasoning summaries stream before the answer. The transient preview can
+        // only render below every committed row, so a live reasoning trace must
+        // be committed as a thinking block the moment ANY non-reasoning event
+        // arrives (first answer delta, tool, completion, cancel, error, ...).
+        // This idempotent guard is the single finalize point; the two reasoning
+        // events below are the only ones that keep the live trace open.
+        if !matches!(
+            event,
+            UiEvent::AssistantReasoningDelta(_) | UiEvent::AssistantReasoningSectionBreak
+        ) {
+            self.finish_live_reasoning_if_any();
+        }
         match event {
+            UiEvent::AssistantReasoningDelta(delta) => {
+                self.push_reasoning_delta(&delta);
+            }
+            UiEvent::AssistantReasoningSectionBreak => {
+                self.push_reasoning_section_break();
+            }
             UiEvent::ProviderTurnStarted { .. } => {
                 self.provider_turn_started = Some(Instant::now());
                 self.thinking_header_row = None;
@@ -2524,36 +2624,72 @@ impl Transcript {
     /// did not grow). Shared by the full render and the pager's windowed
     /// render so both see the same transient stream rows.
     fn refresh_streaming_memo(&mut self, width: usize) {
-        if !self.stream.is_active() {
-            self.streaming_render = None;
+        // The answer active tail and the live reasoning preview are mutually
+        // exclusive per frame (reasoning fully precedes the answer). The answer
+        // stream takes precedence if somehow both are set.
+        if self.stream.is_active() {
+            let key = self.stream.tail_signature();
+            let fresh = self
+                .streaming_render
+                .as_ref()
+                .is_some_and(|memo| !memo.is_reasoning && memo.key == key && memo.width == width);
+            if !fresh {
+                let content_width = width
+                    .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+                    .max(1);
+                let mut lines = Vec::new();
+                for row in &self.stream.tail_rows(content_width) {
+                    row.render_rows(width, &mut lines);
+                }
+                self.streaming_render = Some(StreamingRender {
+                    key,
+                    width,
+                    lines,
+                    is_reasoning: false,
+                });
+            }
             return;
         }
-        let key = self.stream.tail_signature();
-        let fresh = self
-            .streaming_render
-            .as_ref()
-            .is_some_and(|memo| memo.key == key && memo.width == width);
-        if !fresh {
-            let content_width = width
-                .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
-                .max(1);
-            let mut lines = Vec::new();
-            for row in &self.stream.tail_rows(content_width) {
-                row.render_rows(width, &mut lines);
+        if let Some(text) = self
+            .live_reasoning
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            // Key on the summary length: the trace only grows, so a longer
+            // buffer means new content to re-render.
+            let key = (usize::MAX, text.len());
+            let fresh = self
+                .streaming_render
+                .as_ref()
+                .is_some_and(|memo| memo.is_reasoning && memo.key == key && memo.width == width);
+            if !fresh {
+                let content_width = width
+                    .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+                    .max(1);
+                let rows = live_reasoning_preview_rows(text, content_width);
+                let mut lines = Vec::new();
+                for row in &rows {
+                    row.render_rows(width, &mut lines);
+                }
+                self.streaming_render = Some(StreamingRender {
+                    key,
+                    width,
+                    lines,
+                    is_reasoning: true,
+                });
             }
-            self.streaming_render = Some(StreamingRender { key, width, lines });
+            return;
         }
+        self.streaming_render = None;
     }
 
     /// Number of transient streaming-preview lines at `width` (0 when idle).
+    /// Covers both preview sources (answer tail and reasoning preview) via the
+    /// memo, which the callers refresh for the current width first.
     fn streaming_lines(&self) -> usize {
-        if self.stream.is_active() {
-            self.streaming_render
-                .as_ref()
-                .map_or(0, |memo| memo.lines.len())
-        } else {
-            0
-        }
+        self.streaming_render
+            .as_ref()
+            .map_or(0, |memo| memo.lines.len())
     }
 
     /// Total visible physical lines (committed rows + streaming preview) at
@@ -2682,9 +2818,7 @@ impl Transcript {
         // `(len, width)` so only frames where the stream actually grew pay the
         // markdown re-parse.
         self.refresh_streaming_memo(width);
-        if self.stream.is_active()
-            && let Some(memo) = self.streaming_render.as_ref()
-        {
+        if let Some(memo) = self.streaming_render.as_ref() {
             out.extend(memo.lines.iter().cloned());
         }
         let total_lines = stable_prefix + out.len();

@@ -190,6 +190,14 @@ pub(crate) enum UiEvent {
         text: String,
         redacted: bool,
     },
+    /// One incremental chunk of the model's reasoning *summary*, streamed while
+    /// the provider is still thinking (before the answer). Display-only; only
+    /// the human-readable summary is carried (never raw or redacted reasoning).
+    /// See [`AgentEvent::AssistantReasoningDelta`].
+    AssistantReasoningDelta(String),
+    /// A boundary between two reasoning-summary parts (a blank line in the live
+    /// thinking trace). Display-only; carries no text.
+    AssistantReasoningSectionBreak,
     ToolProposed(ToolCall),
     /// A tool is about to execute; lets the front-end open a live progress cell.
     ToolStarted(ToolCall),
@@ -322,6 +330,8 @@ impl UiEvent {
             AgentEvent::AssistantReasoning { text, redacted } => {
                 UiEvent::AssistantReasoning { text, redacted }
             }
+            AgentEvent::AssistantReasoningDelta(delta) => UiEvent::AssistantReasoningDelta(delta),
+            AgentEvent::AssistantReasoningSectionBreak => UiEvent::AssistantReasoningSectionBreak,
             AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
             AgentEvent::ToolStarted(call) => UiEvent::ToolStarted(call),
             AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),

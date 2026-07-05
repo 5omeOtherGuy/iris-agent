@@ -6,11 +6,23 @@ use std::path::Path;
 #[derive(Default)]
 struct RecordingSink {
     deltas: Vec<String>,
+    reasoning_deltas: Vec<String>,
+    section_breaks: usize,
 }
 
 impl TurnSink for RecordingSink {
     fn on_text_delta(&mut self, delta: &str) -> Result<()> {
         self.deltas.push(delta.to_string());
+        Ok(())
+    }
+
+    fn on_reasoning_delta(&mut self, delta: &str) -> Result<()> {
+        self.reasoning_deltas.push(delta.to_string());
+        Ok(())
+    }
+
+    fn on_reasoning_section_break(&mut self) -> Result<()> {
+        self.section_breaks += 1;
         Ok(())
     }
 }
@@ -699,6 +711,89 @@ fn encrypted_reasoning_without_summary_is_continuity_not_redaction() {
     assert_eq!(block.text, "");
     assert_eq!(block.continuity.as_deref(), Some("enc-only"));
     assert!(!block.redacted);
+}
+
+#[test]
+fn streams_reasoning_summary_deltas_and_section_breaks() -> Result<()> {
+    // Summary deltas are forwarded display-only; a section break is emitted for
+    // each new summary part AFTER the first (which opens the trace silently).
+    let stream = concat!(
+        "event: response.reasoning_summary_part.added\n",
+        "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":0}\n\n",
+        "event: response.reasoning_summary_text.delta\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"First \",\"summary_index\":0}\n\n",
+        "event: response.reasoning_summary_text.delta\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thought.\",\"summary_index\":0}\n\n",
+        "event: response.reasoning_summary_part.added\n",
+        "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":1}\n\n",
+        "event: response.reasoning_summary_text.delta\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Second.\",\"summary_index\":1}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Answer\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    let mut sink = RecordingSink::default();
+    let turn = parse_response_stream_reader(
+        BufReader::new(stream.as_bytes()),
+        &mut sink,
+        &CancellationToken::new(),
+        "gpt-test",
+    )?;
+    assert_eq!(sink.reasoning_deltas, vec!["First ", "thought.", "Second."]);
+    assert_eq!(
+        sink.section_breaks, 1,
+        "only the part.added after visible reasoning breaks"
+    );
+    // Display-only: summary text is never folded into the assistant answer.
+    assert_eq!(turn.text.as_deref(), Some("Answer"));
+    Ok(())
+}
+
+#[test]
+fn raw_reasoning_text_delta_is_not_streamed() -> Result<()> {
+    // Only the human-readable summary is display-safe; raw chain-of-thought
+    // deltas (`response.reasoning_text.delta`) are deliberately ignored.
+    let stream = concat!(
+        "event: response.reasoning_text.delta\n",
+        "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"raw cot\",\"content_index\":0}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Answer\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+    );
+    let mut sink = RecordingSink::default();
+    parse_response_stream_reader(
+        BufReader::new(stream.as_bytes()),
+        &mut sink,
+        &CancellationToken::new(),
+        "gpt-test",
+    )?;
+    assert!(
+        sink.reasoning_deltas.is_empty(),
+        "raw chain-of-thought must never be streamed for display"
+    );
+    Ok(())
+}
+
+#[test]
+fn visible_reasoning_summary_disables_silent_retry() -> Result<()> {
+    // A shown reasoning summary counts as visible output, so a later mid-stream
+    // protocol anomaly is fatal (a retry would duplicate what the user saw).
+    let mut parser = ResponseStreamParser::new("gpt-test");
+    let mut sink = RecordingSink::default();
+    parser.ingest_event(
+        "{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\",\"summary_index\":0}",
+        &mut sink,
+    )?;
+    assert!(parser.emitted_visible_output(), "summary is visible output");
+    assert!(!parser.emitted_visible_text, "but not via assistant text");
+    let anomaly = anyhow::Error::new(CodexStreamProtocolAnomaly::invalid_json(None));
+    assert!(
+        !protocol_anomaly_retryable(&anomaly, parser.emitted_visible_output()),
+        "a protocol anomaly after visible reasoning must not be silently retried"
+    );
+    Ok(())
 }
 
 #[test]

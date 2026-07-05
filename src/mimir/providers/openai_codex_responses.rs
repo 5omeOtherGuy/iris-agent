@@ -187,13 +187,13 @@ impl OpenAiCodexResponsesProvider {
                 parser.ingest_event(data, sink)
             }) {
                 if !cancel.is_cancelled()
-                    && protocol_anomaly_retryable(&error, parser.emitted_visible_text)
+                    && protocol_anomaly_retryable(&error, parser.emitted_visible_output())
                 {
                     return Attempt::Retry(error, None);
                 }
                 return Attempt::Fatal(error);
             }
-            let emitted_visible_text = parser.emitted_visible_text;
+            let emitted_visible_output = parser.emitted_visible_output();
             return match parser.finish() {
                 Ok(turn) => {
                     if let Some(usage) = &turn.usage {
@@ -202,7 +202,7 @@ impl OpenAiCodexResponsesProvider {
                     Attempt::Done(Box::new(turn))
                 }
                 Err(error) => {
-                    if protocol_anomaly_retryable(&error, emitted_visible_text) {
+                    if protocol_anomaly_retryable(&error, emitted_visible_output) {
                         Attempt::Retry(error, None)
                     } else {
                         Attempt::Fatal(error)
@@ -493,6 +493,11 @@ struct ResponseStreamParser {
     response_id: Option<String>,
     saw_completed: bool,
     emitted_visible_text: bool,
+    /// Whether a reasoning-summary delta was forwarded for display. Like
+    /// `emitted_visible_text`, it disables silent retry of a mid-stream protocol
+    /// anomaly: the user has already seen live reasoning, so a replay would
+    /// duplicate visible output.
+    emitted_visible_reasoning: bool,
     last_event_type: Option<String>,
 }
 
@@ -507,8 +512,16 @@ impl ResponseStreamParser {
             response_id: None,
             saw_completed: false,
             emitted_visible_text: false,
+            emitted_visible_reasoning: false,
             last_event_type: None,
         }
+    }
+
+    /// Whether any visible output (assistant text or live reasoning summary) was
+    /// forwarded to the front-end. Once true, a mid-stream protocol anomaly is
+    /// fatal rather than silently retried, to avoid duplicating shown output.
+    fn emitted_visible_output(&self) -> bool {
+        self.emitted_visible_text || self.emitted_visible_reasoning
     }
 
     fn ingest_event(&mut self, event: &str, sink: &mut dyn TurnSink) -> Result<()> {
@@ -532,6 +545,28 @@ impl ResponseStreamParser {
                     self.text.push_str(delta);
                     sink.on_text_delta(delta)?;
                     self.emitted_visible_text = true;
+                }
+            }
+            // Live reasoning *summary* deltas (human-readable, display-safe).
+            // Forwarded display-only and never accumulated into `self.text` or
+            // any stored reasoning: the persisted reasoning block still comes
+            // from `output_item.done`/`response.completed` (graceful degrade).
+            // Raw `response.reasoning_text.delta` (chain-of-thought) is
+            // deliberately NOT handled -- only the summary is shown (ADR-0050).
+            Some("response.reasoning_summary_text.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    sink.on_reasoning_delta(delta)?;
+                    self.emitted_visible_reasoning = true;
+                }
+            }
+            Some("response.reasoning_summary_part.added") => {
+                // A new summary part begins: a blank line between parts. Only a
+                // section break *after* visible reasoning is meaningful (the
+                // first part.added opens the trace and renders nothing).
+                if self.emitted_visible_reasoning {
+                    sink.on_reasoning_section_break()?;
                 }
             }
             Some("response.created") => {
@@ -688,8 +723,11 @@ impl std::fmt::Display for CodexStreamProtocolAnomaly {
 
 impl std::error::Error for CodexStreamProtocolAnomaly {}
 
-fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_text: bool) -> bool {
-    !emitted_visible_text
+/// A mid-stream protocol anomaly is only silently retryable when no visible
+/// output (assistant text OR a live reasoning summary) has been shown yet;
+/// otherwise a retry would duplicate output the user already saw.
+fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_output: bool) -> bool {
+    !emitted_visible_output
         && (error.downcast_ref::<CodexStreamProtocolAnomaly>().is_some()
             || error.downcast_ref::<StreamReadError>().is_some())
 }
