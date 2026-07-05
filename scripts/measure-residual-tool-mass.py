@@ -20,9 +20,13 @@ Token mass is read straight from `tokenEstimate` -- never re-estimated.
                           is stale by construction.
   - retired command    -- a `grep`/`find`/`bash` result whose exact call args are
                           re-run later in the same session; the earlier copy is
-                          superseded. This is the only signal for retired
-                          failure output, since bash results do not persist an
-                          exit code (only an `ok` execution flag).
+                          superseded. This counts every identical earlier copy
+                          regardless of whether it failed, so it is an
+                          identical-rerun command-output proxy -- an *upper
+                          bound* for retired failure output, not a failure-output
+                          floor. Bash results do not persist an exit code (only
+                          an `ok` execution flag), so true exit-status failures
+                          are not measurable from current transcripts.
 
 Usage
 -----
@@ -36,7 +40,6 @@ stdout.
 from __future__ import annotations
 
 import collections
-import glob
 import json
 import os
 import sys
@@ -133,9 +136,32 @@ def foldable_indices(results):
     return fold
 
 
+def iter_session_files(root):
+    """Yield resolved `*.jsonl` paths confined to the canonical session root.
+
+    Read-only containment guard: resolve the root, walk it without following
+    symlinks, and require each resolved file path to stay under the resolved
+    root before it is opened. This prevents reading `*.jsonl` outside the
+    session store via a symlinked subdirectory or an accidentally broad root.
+    """
+    root_real = os.path.realpath(root)
+    if not os.path.isdir(root_real):
+        return
+    prefix = root_real + os.sep
+    for dirpath, _dirnames, filenames in os.walk(root_real, followlinks=False):
+        for name in filenames:
+            if not name.endswith(".jsonl"):
+                continue
+            real = os.path.realpath(os.path.join(dirpath, name))
+            # Confine to the canonical root: reject symlink escapes.
+            if real != root_real and not real.startswith(prefix):
+                continue
+            yield real
+
+
 def main(argv):
-    root = session_root(argv)
-    files = sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
+    root = os.path.realpath(session_root(argv))
+    files = sorted(iter_session_files(root))
     if not files:
         print(f"no session transcripts under {root}", file=sys.stderr)
         return 1
@@ -236,7 +262,9 @@ def main(argv):
         f"({pct(superseded_read_mass, grand_total)})"
     )
     print(
-        f"  retired command output (grep/find/bash re-run): {retired_cmd_mass} "
+        f"  retired command output (grep/find/bash, identical re-run -- "
+        f"identical-rerun proxy / upper bound for failure output, incl. "
+        f"successful reruns): {retired_cmd_mass} "
         f"({pct(retired_cmd_mass, grand_total)})"
     )
     print(f"  combined foldable share of all tool mass: {pct(grand_fold, grand_total)}")

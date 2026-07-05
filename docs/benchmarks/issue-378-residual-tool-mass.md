@@ -53,7 +53,7 @@ Spent mass (ADR-0048 v1 scope — provably superseded, detected per session):
 | spent class | mass | share of total |
 |---|---|---|
 | superseded reads (read/ls, latest-read-wins) | 295,643 | 18.0% |
-| retired command output (grep/find/bash, identical args re-run) | 25,239 | 1.5% |
+| retired command output (grep/find/bash, identical-rerun proxy / upper bound) | 25,239 | 1.5% |
 | **combined foldable** | **320,882** | **19.5%** |
 
 Sensitivity:
@@ -67,14 +67,18 @@ Detection notes (why these are lower bounds, not inflated):
 
 - Superseded reads use latest-read-wins: a `read`/`ls` whose path is later read,
   edited, or written again. This is the clean, conservative signal.
-- Retired command output requires *identical* call args on a later run. Bash
-  results do not persist an exit code (only an `ok` execution flag), so a
-  failing-then-passing test loop is only caught when the command string is
-  byte-identical across runs. Real red-green loops that vary the command
-  (`| tail -30` -> `| tail -50`) are missed. The measured retired-command mass
-  is therefore a floor, but even generously it cannot approach the superseded-read
-  figure: `ok:false` results total 68 across the whole corpus and carry
-  negligible mass.
+- Retired command output counts every *identical*-args earlier copy re-run
+  later, regardless of whether that earlier copy failed. It is therefore an
+  **identical-rerun command-output proxy**, not a failure-output measurement:
+  as an answer to the DoD's "retired failure output" question it is an **upper
+  bound**, because it includes successful reruns. Bash results do not persist an
+  exit code (only an `ok` execution flag), so true exit-status failures are not
+  measurable from current transcripts; a failing-then-passing test loop is only
+  caught when the command string is byte-identical across runs, and real
+  red-green loops that vary the command (`| tail -30` -> `| tail -50`) are
+  missed entirely (so the proxy also undercounts total reruns). Either way the
+  figure is negligible and cannot approach the superseded-read figure:
+  `ok:false` results total 68 across the whole corpus and carry negligible mass.
 
 ## Verdict
 
@@ -83,8 +87,10 @@ tool-result mass? No.** Combined they are 19.5% of all tool-result mass, 22.8%
 of the residual after excluding a retained tail, and 32.3% even in the long
 sessions where accumulation is worst — never a majority. Within that foldable
 slice, superseded reads are effectively the entire signal (18.0% of 19.5%);
-retired failure output is negligible (1.5%, and a floor inflated only by
-identical-args re-runs). The dominant residual mass is single-use `bash` output
+retired failure output is negligible (1.5% — and that figure is an
+identical-rerun *upper bound* for failure output, inflated by successful
+reruns, since bash exit status is not persisted and true failure output is not
+directly measurable). The dominant residual mass is single-use `bash` output
 (42.5%) and reads that are never re-touched (most of the 39.0% `read` mass) —
 results that were load-bearing once and are neither superseded nor reproducible-
 by-args, so they sit outside the ADR-0048 "spent" definition entirely.
@@ -96,8 +102,8 @@ by-args, so they sit outside the ADR-0048 "spent" definition entirely.
    stub names the path). This is the highest-value, lowest-risk fold class and
    should ship first.
 2. **Drop retired failure output from the v1 slice.** It is negligible in this
-   corpus (1.5%, mostly a detection floor) and the persisted data lacks a bash
-   exit code to classify failure reliably — the guard against folding
+   corpus (1.5%, an identical-rerun upper-bound proxy) and the persisted data
+   lacks a bash exit code to classify failure reliably — the guard against folding
    unresolved failures (ADR-0040) would be doing real work to protect a class
    that reclaims almost nothing. Defer it until a corpus with heavy red-green
    test loops shows it earns its guard complexity.
