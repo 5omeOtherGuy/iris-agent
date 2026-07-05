@@ -1101,3 +1101,44 @@ or an effort sweep (separate dimension) might narrow the clean-cell spreads, but
 turn-count variance is the real obstacle and it is a property of model strategy,
 not of the reduction. The micro-probe axis (single-tool tasks, more same-turn
 cells) remains the cleaner place to isolate a per-tool token effect.
+
+## Entry 23 - Stronger-model matrix: Sonnet 4.6 + GPT-5.4, low, N=5
+
+Operator-requested second matrix: the two stronger models at low thinking, to
+test whether a per-turn reduction signal is cleaner than on the default 3-spec
+set. 2 models x 3 workloads x 2 arms x N=5 = 60 real sessions. Smoke first
+(both reachable; `openai-codex:gpt-5.4` full model IS served, not just -mini).
+Committed artifact: headline-matrix-sonnet46-gpt54-2026-07-05.{md,jsonl}.
+
+**Verdict: BASELINE WINS (no claim) -- but directionally favorable, INCONCLUSIVE.**
+
+- 100% success in BOTH arms of ALL 6 cells (no regression, no ties).
+- Sign is now CONSISTENT: 5/6 cells defaults-cheaper (-1.5, -2.5, -36.9, -5.0,
+  -1.0%); only 1 baseline-cheaper. Contrast the 3-spec run's mixed 3/9 vs 6/9.
+- All 4 clean same-turn-count (`per-turn`) cells favor defaults (-1% to -5%),
+  each with a matching negative result-bytes delta (-291/-1168/-1295/-539): the
+  reduction fired and each turn was modestly cheaper. Yet every one is
+  INCONCLUSIVE -- at N=5 the small delta does not clear the run-to-run spread.
+- Overall BASELINE WINS is dragged by ONE confounded cell: gpt-5.4/investigate,
+  A 4 turns vs B 2 (`more turns`, +94.7%, result-bytes +23 ~ nil) -- strategy
+  variance, not the reduction losing.
+
+**Cross-model observation.** The clean-cell reduction sign flipped from mixed
+(3-spec: codex-spark/gpt-5.4-mini fix were per-turn BASELINE WINS at +0.1..+2.2%)
+to uniformly favorable here (-1..-5%). Weak evidence that the per-turn benefit is
+more consistent on stronger models, but N=5 and small magnitudes -- not a claim.
+
+**Honesty notes.**
+- Did NOT change the analyzer to soften the overall label after seeing the
+  result. Overall BASELINE WINS stands as computed; no README claim; ROADMAP
+  gate stays open.
+- Logged a genuine analyzer asymmetry for SEPARATE consideration: a
+  turn-count-`confounded` cell resolves INCONCLUSIVE when A is cheaper but
+  BASELINE WINS when A is pricier. Both are "no claim", so the shipping decision
+  is unchanged; a symmetric "confounded => inconclusive regardless of sign"
+  would reclassify only this run's overall (3-spec stays BASELINE WINS because
+  its BASELINE WINS cells are genuine per-turn, same-turn-count). Raise as its
+  own change, not reactively.
+- Path to significance: more runs on the clean same-turn-count cells (larger N
+  on single-strategy tasks), not a wider model sweep. Turn-count variance
+  remains the dominant obstacle and is a property of model strategy.
