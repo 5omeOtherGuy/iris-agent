@@ -65,7 +65,9 @@ mod replay {
         bench_reasoning, model_specs, run_real_cell, run_replay_arm, run_scripted_skip_perms,
         selection_for_spec,
     };
-    use super::workloads::{Workload, bash_workloads, probe_workloads, workloads};
+    use super::workloads::{
+        Workload, bash_workloads, probe_workloads, selected_workloads, workloads,
+    };
 
     /// The margin (in estimated tokens) arm A must beat arm B by, so the win is
     /// not a rounding artifact of the estimator.
@@ -138,7 +140,8 @@ mod replay {
     /// `#[ignore]`d AND additionally gated on `IRIS_BENCH_REAL=1`; CI and a plain
     /// `cargo test` never spend money even with `--ignored`. Prints the per-cell
     /// table (workload x arm x run) with REAL usage-record input tokens. N runs
-    /// per cell via `IRIS_BENCH_N` (default 3). Run:
+    /// per cell via `IRIS_BENCH_N` (default 3). `IRIS_BENCH_WORKLOAD` (comma-
+    /// separated names) narrows to specific workloads (default: all three). Run:
     ///   IRIS_BENCH_REAL=1 cargo test --bin iris tokens_per_task_headline \
     ///     -- --ignored --nocapture
     #[test]
@@ -163,7 +166,7 @@ mod replay {
             specs.join(", "),
             reasoning,
             n,
-            workloads().len(),
+            selected_workloads().len(),
             bench_log_path()
         );
         println!(
@@ -179,7 +182,7 @@ mod replay {
                     continue;
                 }
             };
-            for workload in workloads() {
+            for workload in selected_workloads() {
                 // Baseline first, then defaults -- same order for every cell.
                 for arm in [Arm::Baseline, Arm::Defaults] {
                     for run in 0..n {

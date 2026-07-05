@@ -103,6 +103,27 @@ pub(crate) fn workloads() -> Vec<Workload> {
     ]
 }
 
+/// Headline workloads, optionally narrowed by `IRIS_BENCH_WORKLOAD` (a
+/// comma-separated list of workload names). Unset or empty -> all three. Lets a
+/// focused real run target one cell (e.g. the cheap `investigate-large-log`)
+/// without paying for the others. An entirely non-matching filter yields an
+/// empty set, which the caller surfaces via the printed workload count.
+pub(crate) fn selected_workloads() -> Vec<Workload> {
+    let filter = std::env::var("IRIS_BENCH_WORKLOAD").unwrap_or_default();
+    let names: Vec<&str> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return workloads();
+    }
+    workloads()
+        .into_iter()
+        .filter(|w| names.contains(&w.name))
+        .collect()
+}
+
 /// Bash-enabled workloads (require `--dangerously-skip-permissions`). Kept
 /// separate from `workloads()` so the deny-gate replay + no-bash headline paths
 /// never touch a bash workload. Phase 4: one read-only diagnosis task -- run
