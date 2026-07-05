@@ -1270,6 +1270,23 @@ Slices, in order:
   tail/queue, the pager visible total counts the active tail, and history trim is
   held while a stream or tool is active. Test-only.
 
+Follow-ups (post-wrap-up, 2026-07-05):
+
+- **Live thinking actually streams on OpenAI** (PR
+  [#404](https://github.com/5omeOtherGuy/iris-agent/pull/404)) — the Codex
+  Responses request now asks for `reasoning.summary: "auto"`, so the API emits
+  the summary deltas the reasoning rail consumes. Slice 3's tests injected SSE
+  directly, so the missing request field went unnoticed until end-to-end use.
+- **Anthropic reasoning joins the rail** (PR
+  [#410](https://github.com/5omeOtherGuy/iris-agent/pull/410)) — Anthropic
+  Messages forwards non-redacted `thinking_delta` summaries live through the
+  same provider-neutral rail. Redacted thinking is never streamed
+  ([ADR-0016](adr/0016-preserve-provider-reasoning-continuity-in-flattened-transcripts.md)),
+  the retry gate treats shown reasoning as visible output, and reasoning a
+  refusal fallback would discard is withheld until the fallback boundary. Nexus
+  dedup is provider-agnostic, so no core/TUI change was needed. Live reasoning
+  now covers OpenAI Codex Responses and Anthropic Messages.
+
 Gate: every pane-rendering change carries frame assertions; the `--plain` path is
 unaffected; Codex-derived files carry Apache-2.0 SPDX + `NOTICE` while the repo
 stays MIT.
