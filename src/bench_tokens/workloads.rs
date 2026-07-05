@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 
 use crate::nexus::{AssistantTurn, CompletionReason, ToolCall};
 
+use super::fixtures::build_find_tree;
+
 /// The result of a workload's mechanical success check.
 pub(crate) struct Outcome {
     pub(crate) success: bool,
@@ -48,6 +50,10 @@ pub(crate) struct Workload {
     /// arms, so a reduction that dropped an actionable fact fails the run even
     /// though the scripted answer would still mention it.
     pub(crate) needles: &'static [&'static str],
+    /// Optional programmatic workspace builder, run after the fixture is
+    /// materialized -- for inputs too large to commit (e.g. the >1000-file tree
+    /// the find probe needs). `None` for ordinary committed-fixture workloads.
+    pub(crate) build: Option<fn(&Path)>,
 }
 
 pub(crate) fn workloads() -> Vec<Workload> {
@@ -64,6 +70,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
             // The grep across files must surface the buggy symbol and the read
             // must surface the buggy expression the fix targets.
             needles: &["parse_len", "split_whitespace().count() - 1"],
+            build: None,
         },
         Workload {
             name: "multi-file-search-and-edit",
@@ -76,6 +83,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
             approval: ApprovalProfile::DenyGateNoPrompts,
             // The grep must surface the identifier being renamed.
             needles: &["MAX_RETRIES"],
+            build: None,
         },
         Workload {
             name: "investigate-large-log",
@@ -90,6 +98,7 @@ pub(crate) fn workloads() -> Vec<Workload> {
             // (test name + both drift values), or the task is not solvable from
             // context in arm A.
             needles: &["ceiling_is_exact", "8192", "8191"],
+            build: None,
         },
     ]
 }
@@ -110,6 +119,7 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
         approval: ApprovalProfile::SkipPermissions,
         // The reduced bash output must still carry the planted assertion values.
         needles: &["8191", "8192"],
+        build: None,
     }]
 }
 
@@ -120,16 +130,33 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
 /// answer -- paired with the deterministic render probe in `probes.rs`. Uses
 /// the deny gate (grep/find/ls/read are auto-safe; no bash).
 pub(crate) fn probe_workloads() -> Vec<Workload> {
-    vec![Workload {
-        name: "probe-grep-exact-value",
-        fixture: "probe_grep",
-        prompt: "Search the codebase for `deadline`. Report the exact integer value assigned \
-                 to the CHECKOUT_DEADLINE_MS constant. Answer with only that integer.",
-        script: script_probe_grep,
-        check: check_probe_grep_value,
-        approval: ApprovalProfile::DenyGateNoPrompts,
-        needles: &["47231"],
-    }]
+    vec![
+        Workload {
+            name: "probe-grep-exact-value",
+            fixture: "probe_grep",
+            prompt: "Search the codebase for `deadline`. Report the exact integer value \
+                     assigned to the CHECKOUT_DEADLINE_MS constant. Answer with only that \
+                     integer.",
+            script: script_probe_grep,
+            check: check_probe_grep_value,
+            approval: ApprovalProfile::DenyGateNoPrompts,
+            needles: &["47231"],
+            build: None,
+        },
+        Workload {
+            // find compaction (issue-340): the target lives in a >1000-file
+            // tree that compacts; the grouped listing must still surface it.
+            name: "probe-find-target-path",
+            fixture: "probe_find",
+            prompt: "Find the source file whose name contains `zebra`. Report its full path \
+                     relative to the workspace root. Answer with only that path.",
+            script: script_probe_find,
+            check: check_probe_find_path,
+            approval: ApprovalProfile::DenyGateNoPrompts,
+            needles: &["handler_zebra_target.rs"],
+            build: Some(build_find_tree),
+        },
+    ]
 }
 
 // -- scripted tool-call sequences -------------------------------------------
@@ -226,6 +253,14 @@ fn script_probe_grep() -> Vec<AssistantTurn> {
             json!({ "pattern": "deadline", "ignoreCase": true }),
         ),
         answer_turn("CHECKOUT_DEADLINE_MS is 47231."),
+    ]
+}
+
+/// Scripted find probe: search for the target file, then answer its path.
+fn script_probe_find() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("f", "find", json!({ "pattern": "*zebra*" })),
+        answer_turn("services/aaa_target/gateway/handler_zebra_target.rs"),
     ]
 }
 
@@ -367,6 +402,22 @@ fn check_probe_grep_value(_workspace: &Path, final_text: &str) -> Outcome {
         Outcome {
             success: false,
             detail: "answer missing the exact value 47231".to_string(),
+        }
+    }
+}
+
+/// Find target-path probe: the answer must name the distinctive target file the
+/// grouped listing had to surface from a >1000-file compacted tree.
+fn check_probe_find_path(_workspace: &Path, final_text: &str) -> Outcome {
+    if final_text.contains("handler_zebra_target.rs") {
+        Outcome {
+            success: true,
+            detail: "answer names the target path (handler_zebra_target.rs)".to_string(),
+        }
+    } else {
+        Outcome {
+            success: false,
+            detail: "answer missing the target file handler_zebra_target.rs".to_string(),
         }
     }
 }

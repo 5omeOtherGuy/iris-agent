@@ -15,16 +15,34 @@ reported as first-class.
 
 ## What each arm actually toggles
 
+Verified against the code (Phase 5b), not aspiration:
+
 - Arm-toggled via `ToolState::with_reduce_output(bool)` (test-only, never
-  production): `grep`, `find`, `ls`, `bash`.
+  production): `grep` (path grouping, issue-338), `find` (directory compaction,
+  issue-340), `bash` (output filter, ADR-0037).
+- **`ls` is NOT arm-toggled**: `ls::execute` takes `_reduce` and ignores it
+  (issue-339 not started). `reduce_output` true vs false yields byte-identical
+  ls output, so ls has NO A/B render probe and is deliberately absent from the
+  probe table. (Earlier drafts of this doc listed ls as arm-toggled; that was
+  wrong.)
 - Always-on, NOT covered by the arm toggle: `read` skim (issue-337), `edit`
   result classes (issue-341). These get a separate comparison axis; the doc must
   not imply `reduce_output=false` tests them.
 
+Measured render reductions (deterministic, proxy tokens; `tool_render_probe_log`):
+grep 36.4%, find 55.7%, bash 21.2% -- all with needles surviving verbatim.
+find's saving is real byte reduction: past the 1000-match default limit the
+listing compacts and directory grouping shows the same shown paths in fewer
+bytes. bash reduces only commands its filter recognizes -- a FAILING `cargo
+test` is structured-filtered (chatter collapses, the failing test + assertion
+values are kept); the deterministic bash render corpus lives in adr-0037, so the
+suite's bash render probe is opt-in (it compiles) and pairs with the Phase 4
+live bash workload.
+
 ## Comparison axes
 
 ```
-DefaultOutputReduction  reduce_output true vs false   grep/find/ls/bash
+DefaultOutputReduction  reduce_output true vs false   grep/find/bash (NOT ls)
 ReadSkim                skim:false vs skim:true       read
 EditResultClass         shipped compact vs reference  edit
 ```
@@ -47,9 +65,9 @@ answer an exact question from the tool output; scored mechanically).
 | tool | axis | probe | quality check | behavior metrics |
 |---|---|---|---|---|
 | grep | reduce | many repeated-path matches; ask exact file/line/value | exact path + value in answer; needles survive | grep calls, repeat-greps, follow-up reads, turns |
-| find | reduce | deep tree, similar names; ask one exact path/count | exact match | find calls, repeats, ls fallbacks |
-| ls | reduce | dir large enough to trigger summary; ask cap/entry facts | exact summary fields | ls calls, find fallbacks, handles |
-| bash | reduce + skip-perms | tiny crate w/ failing `cargo test`; ask failure facts or fix+rerun | exact left/right/test, or external `cargo`/`rustc` check | bash calls, exit codes, reruns, dangerous approvals |
+| find | reduce | >1000-match generated tree (trips compaction); ask one exact path | exact target path in answer; needle survives | find calls, repeats, ls fallbacks |
+| ls | (none) | NOT arm-toggled -- `_reduce` ignored (issue-339); no A/B probe | n/a | n/a |
+| bash | reduce + skip-perms | tiny crate w/ failing `cargo test` (structured-filtered on failure); ask failure facts or fix+rerun | exact left/right/test, or external `cargo`/`rustc` check | bash calls, exit codes, reruns, dangerous approvals |
 | read | skim | comment-heavy source w/ sentinel signatures | exact exported names/constants | read calls, full rereads after skim |
 | edit | result-class | exact / tolerant / not-found / not-unique / stale | disk hash + exact outcome class | edit attempts, tolerant/not-found rate, extra turns |
 

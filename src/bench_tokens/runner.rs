@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::nexus::{Agent, ApprovalMode, ToolEnv};
+use crate::tools::bench_support::est_tokens;
 use crate::tools::{ToolState, built_in_tools};
 
 use super::arms::Arm;
@@ -17,7 +18,10 @@ use super::workloads::{ApprovalProfile, Outcome, Workload};
 
 /// JSONL run-record schema version. Bump when fields are added/renamed so an
 /// analyzer can branch on shape; readers must tolerate unknown extra fields.
-const BENCH_SCHEMA_VERSION: u32 = 2;
+/// v3: every record carries a `kind` discriminator (`real_cell` /
+/// `real_cell_error` / `render_probe`), so a run logs ALL results -- successes,
+/// unreachable/errored cells, and deterministic render measurements alike.
+const BENCH_SCHEMA_VERSION: u32 = 3;
 
 /// Metrics from one workload x arm run.
 pub(crate) struct RunMetrics {
@@ -39,6 +43,9 @@ pub(crate) struct RunMetrics {
 /// touch the committed copy.
 pub(crate) fn run_replay_arm(workload: &Workload, arm: Arm) -> RunMetrics {
     let workspace = materialize(workload.fixture);
+    if let Some(build) = workload.build {
+        build(&workspace.path);
+    }
     let provider = ScriptedProvider::new((workload.script)());
     let mut agent = Agent::new(provider, built_in_tools());
     agent.set_approval_mode(ApprovalMode::Auto);
@@ -94,6 +101,9 @@ pub(crate) struct ScriptedSkipRun {
 /// can prove it was NOT consulted (the bypass fired first).
 pub(crate) fn run_scripted_skip_perms(workload: &Workload, arm: Arm) -> ScriptedSkipRun {
     let workspace = materialize(workload.fixture);
+    if let Some(build) = workload.build {
+        build(&workspace.path);
+    }
     assert!(
         !workspace.path.starts_with(env!("CARGO_MANIFEST_DIR")),
         "bench workspace must be a temp dir, not the repo: {}",
@@ -232,6 +242,55 @@ fn bench_log_append(line: &Value) {
     }
 }
 
+/// Log an unreachable/failed live cell so a run records ALL results, not just
+/// the reachable ones (no silent drops). `reason` is the backend/selection
+/// message; the cell is marked invalid so the analyzer excludes it from token
+/// stats while still counting it as attempted.
+pub(crate) fn bench_log_cell_error(
+    model: &str,
+    workload: &str,
+    arm: &str,
+    run: usize,
+    reason: &str,
+) {
+    bench_log_append(&json!({
+        "schema_version": BENCH_SCHEMA_VERSION,
+        "kind": "real_cell_error",
+        "model": model,
+        "workload": workload,
+        "arm": arm,
+        "run": run,
+        "valid": false,
+        "error": reason,
+    }));
+}
+
+/// Log one deterministic render-probe measurement (proxy tokens, both arms,
+/// needle survival) so the analyzer can correlate a tool's render reduction
+/// with its live outcome. Deterministic, so it is logged on demand (not in the
+/// CI gate).
+pub(crate) fn bench_log_render_probe(
+    probe: &str,
+    tool: &str,
+    baseline: &str,
+    reduced: &str,
+    reduction_pct: f64,
+    needles_survived: bool,
+) {
+    bench_log_append(&json!({
+        "schema_version": BENCH_SCHEMA_VERSION,
+        "kind": "render_probe",
+        "probe": probe,
+        "tool": tool,
+        "baseline_bytes": baseline.len(),
+        "reduced_bytes": reduced.len(),
+        "baseline_proxy_tokens": est_tokens(baseline),
+        "reduced_proxy_tokens": est_tokens(reduced),
+        "reduction_pct": reduction_pct,
+        "needles_survived": needles_survived,
+    }));
+}
+
 /// Run one real-provider cell for an explicit selection, capturing rich
 /// per-run/per-turn data and appending it to the JSONL log. Fallible: a backend
 /// rejection (bad model id, unsupported thinking level, auth) is returned as
@@ -245,6 +304,9 @@ pub(crate) fn run_real_cell(
     selection: &crate::mimir::selection::ModelSelection,
 ) -> std::result::Result<RealRunRecord, String> {
     let workspace = materialize(workload.fixture);
+    if let Some(build) = workload.build {
+        build(&workspace.path);
+    }
     let cwd = workspace.path.clone();
     // Confinement guard: the fixture always materializes into a temp dir, never
     // the repo tree. Under skip-permissions bash runs here, so prove it can
@@ -313,6 +375,8 @@ pub(crate) fn run_real_cell(
     };
     bench_log_append(&json!({
         "schema_version": BENCH_SCHEMA_VERSION,
+        "kind": "real_cell",
+        "valid": true,
         "model": model,
         "workload": workload.name,
         "arm": record.arm.label(),

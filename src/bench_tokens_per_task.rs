@@ -58,8 +58,9 @@ mod replay {
     use super::arms::Arm;
     use super::probes::{assert_render_contract, tool_probes};
     use super::runner::{
-        RunMetrics, bench_log_path, bench_log_reset, bench_reasoning, model_specs, run_real_cell,
-        run_replay_arm, run_scripted_skip_perms, selection_for_spec,
+        RunMetrics, bench_log_cell_error, bench_log_path, bench_log_render_probe, bench_log_reset,
+        bench_reasoning, model_specs, run_real_cell, run_replay_arm, run_scripted_skip_perms,
+        selection_for_spec,
     };
     use super::workloads::{Workload, bash_workloads, probe_workloads, workloads};
 
@@ -170,6 +171,7 @@ mod replay {
             let selection = match selection_for_spec(&cwd, spec, reasoning) {
                 Ok(sel) => sel,
                 Err(e) => {
+                    bench_log_cell_error(spec, "-", "-", 0, &format!("select: {e}"));
                     println!("| {spec} | - | - | - | - | - | - | - | - | - | - | select: {e} |");
                     continue;
                 }
@@ -194,14 +196,17 @@ mod replay {
                                 m.handles_stored,
                                 m.approvals_consulted,
                             ),
-                            Err(e) => println!(
-                                "| {} | {} | {} | {} | - | - | - | - | - | - | - | - | {} |",
-                                spec,
-                                workload.name,
-                                arm.label(),
-                                run + 1,
-                                e
-                            ),
+                            Err(e) => {
+                                bench_log_cell_error(spec, workload.name, arm.label(), run + 1, &e);
+                                println!(
+                                    "| {} | {} | {} | {} | - | - | - | - | - | - | - | - | {} |",
+                                    spec,
+                                    workload.name,
+                                    arm.label(),
+                                    run + 1,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -247,6 +252,7 @@ mod replay {
             let selection = match selection_for_spec(&cwd, spec, reasoning) {
                 Ok(sel) => sel,
                 Err(e) => {
+                    bench_log_cell_error(spec, workload.name, "-", 0, &format!("select: {e}"));
                     println!("| {spec} | - | no | - | - | - | - | - | select: {e} |");
                     continue;
                 }
@@ -270,6 +276,7 @@ mod replay {
                         );
                     }
                     Err(e) => {
+                        bench_log_cell_error(spec, workload.name, arm.label(), 1, &e);
                         println!(
                             "| {} | {} | no | - | - | - | - | - | {} |",
                             spec,
@@ -368,16 +375,16 @@ mod replay {
         }
     }
 
-    /// Deterministic per-tool RENDER PROBE (Phase 5, layer 1). For each tool
-    /// probe, invoke the tool over its fixture in both arms and prove the
-    /// reduced output (a) clears its token-reduction bar and (b) keeps every
-    /// needle verbatim. No real provider -- runs in CI. This is the "the
-    /// reduction is real and lossless for the asked fact" half that the paired
-    /// live probe builds on.
+    /// Deterministic per-tool RENDER PROBE (Phase 5, layer 1), FAST set. For
+    /// each non-slow tool probe, invoke the tool over its workspace in both arms
+    /// and prove the reduced output (a) clears its token-reduction bar and (b)
+    /// keeps every needle verbatim. No real provider -- runs in CI. This is the
+    /// "reduction is real and lossless for the asked fact" half the paired live
+    /// probe builds on.
     #[test]
     fn tool_render_probes_reduce_and_preserve() {
-        for probe in tool_probes() {
-            let r = assert_render_contract(&probe);
+        for probe in tool_probes().iter().filter(|p| !p.slow) {
+            let r = assert_render_contract(probe);
             println!(
                 "[{}] reduction {:.1}% (baseline {} B -> reduced {} B); needles survived",
                 probe.name,
@@ -386,6 +393,50 @@ mod replay {
                 r.reduced.len()
             );
         }
+    }
+
+    /// SLOW render probes (compile / heavy spawn), opt-in. Same contract as the
+    /// fast set, kept out of the CI gate for speed. Run:
+    ///   cargo test --bin iris tool_render_probes_slow -- --ignored --nocapture
+    #[test]
+    #[ignore = "slow render probe (compiles a fixture crate); run on demand"]
+    fn tool_render_probes_slow() {
+        for probe in tool_probes().iter().filter(|p| p.slow) {
+            let r = assert_render_contract(probe);
+            println!(
+                "[{}] reduction {:.1}% (baseline {} B -> reduced {} B); needles survived",
+                probe.name,
+                r.reduction_pct,
+                r.baseline.len(),
+                r.reduced.len()
+            );
+        }
+    }
+
+    /// Log ALL render-probe measurements (fast + slow) to the JSONL as
+    /// `kind:"render_probe"` records, so the analyzer can correlate a tool's
+    /// render reduction with its live outcome. Opt-in (writes the log file and
+    /// compiles the slow probe), so it is not in the CI gate. Run:
+    ///   cargo test --bin iris tool_render_probe_log -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes JSONL + compiles slow probe; run on demand"]
+    fn tool_render_probe_log() {
+        bench_log_reset();
+        for probe in tool_probes() {
+            // assert_render_contract panics unless every needle survived, so
+            // reaching the log line means needles_survived is true.
+            let r = assert_render_contract(&probe);
+            bench_log_render_probe(
+                probe.name,
+                probe.tool,
+                &r.baseline,
+                &r.reduced,
+                r.reduction_pct,
+                true,
+            );
+            println!("logged [{}] {:.1}%", probe.name, r.reduction_pct);
+        }
+        println!("render-probe log -> {}", bench_log_path());
     }
 
     /// Opt-in real-provider BASH smoke (Phase 4). Runs the read-only diagnosis
@@ -430,6 +481,7 @@ mod replay {
             let selection = match selection_for_spec(&cwd, spec, reasoning) {
                 Ok(sel) => sel,
                 Err(e) => {
+                    bench_log_cell_error(spec, workload.name, "-", 0, &format!("select: {e}"));
                     println!("| {spec} | - | no | - | - | - | - | - | - | select: {e} |");
                     continue;
                 }
@@ -453,6 +505,7 @@ mod replay {
                         );
                     }
                     Err(e) => {
+                        bench_log_cell_error(spec, workload.name, arm.label(), 1, &e);
                         println!(
                             "| {} | {} | no | - | - | - | - | - | - | {} |",
                             spec,
@@ -504,6 +557,7 @@ mod replay {
                 let selection = match selection_for_spec(&cwd, spec, reasoning) {
                     Ok(sel) => sel,
                     Err(e) => {
+                        bench_log_cell_error(spec, workload.name, "-", 0, &format!("select: {e}"));
                         println!(
                             "| {} | {} | - | - | - | - | - | - | - | - | select: {e} |",
                             workload.name, spec
@@ -530,13 +584,16 @@ mod replay {
                                 m.approvals_consulted,
                             );
                         }
-                        Err(e) => println!(
-                            "| {} | {} | {} | - | - | - | - | - | - | - | {} |",
-                            workload.name,
-                            spec,
-                            arm.label(),
-                            e
-                        ),
+                        Err(e) => {
+                            bench_log_cell_error(spec, workload.name, arm.label(), 1, &e);
+                            println!(
+                                "| {} | {} | {} | - | - | - | - | - | - | - | {} |",
+                                workload.name,
+                                spec,
+                                arm.label(),
+                                e
+                            );
+                        }
                     }
                 }
             }

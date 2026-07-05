@@ -21,6 +21,37 @@ pub(crate) fn materialize(fixture: &str) -> TestDir {
     dir
 }
 
+/// Build a wide file tree that trips find's compaction rail: > `DEFAULT_FIND_LIMIT`
+/// (1000) matches so the default limit omits some (needs_compact), with the
+/// shown prefix small enough to fit the byte budget so grouping wins on bytes
+/// (same paths, dir prefix shared once). A distinctive target path carries the
+/// needle the paired live question asks for. Shared by the find render probe
+/// (`probes.rs`) and the find live workload (`workloads.rs`).
+pub(crate) fn build_find_tree(root: &Path) {
+    // 30 dirs x 45 files = 1350 matches > the 1000 default limit.
+    for d in 0..30u32 {
+        let dir = root.join(format!("services/svc{d:02}/gateway"));
+        fs::create_dir_all(&dir).expect("create probe dir");
+        for f in 0..45u32 {
+            fs::write(
+                dir.join(format!("handler_{d:02}_{f:02}.rs")),
+                b"// probe file\n",
+            )
+            .expect("write probe file");
+        }
+    }
+    // The target file last (newest mtime) in an alphabetically-first dir, so it
+    // sorts into the shown prefix under either ordering (find sorts mtime-desc,
+    // ties by name) -- the needle must survive reduction, not be truncated away.
+    let target_dir = root.join("services/aaa_target/gateway");
+    fs::create_dir_all(&target_dir).expect("create target dir");
+    fs::write(
+        target_dir.join("handler_zebra_target.rs"),
+        b"// probe file\n",
+    )
+    .expect("write target file");
+}
+
 fn copy_stripping_txt(src: &Path, dst: &Path) {
     for entry in fs::read_dir(src).expect("fixture dir readable") {
         let entry = entry.expect("dir entry");

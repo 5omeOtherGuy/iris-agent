@@ -749,3 +749,58 @@ the smallest workable set and record real usage-record numbers; if not, the
 report ships with the replay evidence + a clearly-labeled "real-provider cells
 pending operator run" section and the README claim does NOT ship. This is the
 honest failure mode the issue demands, not a fabricated table.
+
+## Entry 15 - Phase 5/5b: per-tool micro-probes + "log all results"
+
+**Vertical slice (grep) then fan-out (find/bash), verified against the code, not
+the design doc.** Each per-tool advantage now has two layers: a deterministic
+RENDER probe (invoke the tool by name through the real dispatch, reduce on vs
+off, assert a token-reduction bar AND that the exact fact the paired live
+question asks for survives verbatim) and a live MODEL probe (a real model must
+answer that exact question from the reduced output; scored mechanically; reuses
+`run_real_cell` + the JSONL schema for behavior metrics).
+
+**Measured render reductions (deterministic, proxy tokens, needles survive):**
+
+| tool | probe | baseline B | reduced B | reduction | gate |
+|---|---|---|---|---|---|
+| grep | path grouping (issue-338) | 6421 | 4084 | 36.4% | fast (CI) |
+| find | dir compaction (issue-340) | 40222 | 17798 | 55.7% | fast (CI) |
+| bash | failing `cargo test` filter (ADR-0037) | 754 | 593 | 21.2% | slow (opt-in) |
+
+**Key corrections to the design doc (code beats doc):**
+
+- **`ls` is NOT arm-toggled.** `ls::execute` takes `_reduce` and ignores it
+  (issue-339 not started), so reduce on/off is byte-identical -- ls has no A/B
+  render probe and is deliberately absent from the probe table. Earlier drafts
+  (and the compaction summary) called ls arm-toggled; that was wrong.
+- **`find`'s advantage IS byte reduction, not just completeness.** Once matches
+  exceed the 1000 default limit the listing compacts, and directory grouping
+  renders the same shown paths in fewer bytes (dir prefix shared once). The
+  probe builds a 1351-file tree at run time (too large to commit) via
+  `fixtures::build_find_tree`; the target file is written last (newest mtime) in
+  an alphabetically-first dir so find's mtime-desc sort keeps it in the shown
+  prefix.
+- **`bash`'s filter is command-specific.** A *failing* `cargo test` IS
+  structured-filtered (chatter collapses, the failing test + `left/right`
+  assertion values are preserved); pure-chatter cargo test passes through. The
+  deterministic bash render corpus already lives in adr-0037, so the suite's
+  bash render probe is opt-in (it compiles the fixture ~= a few seconds) and
+  exists mainly to pair with the Phase 4 live bash workload on the same fixture.
+
+**"Log all results" (operator directive).** JSONL schema bumped to v3: every
+record now carries a `kind` discriminator -- `real_cell` (valid live run),
+`real_cell_error` (unreachable/failed/select-rejected cell, `valid:false`, with
+the backend message), and `render_probe` (deterministic per-tool measurement:
+baseline/reduced bytes + proxy tokens + reduction% + needles_survived). All four
+live tests (headline/smoke/bash-smoke/micro-probes) now log EVERY cell including
+failures and unreachable models -- no silent drops. `tool_render_probe_log`
+(opt-in) writes all render measurements to the same log so the Phase 7 analyzer
+can correlate a tool's render reduction with its live outcome. The CI gate stays
+side-effect-free (render probes only assert there).
+
+**Honesty note.** No live model runs in this entry -- these are deterministic
+render measurements and wiring. The live micro-probe/find/bash layers are wired
+and opt-in; they cost provider calls and await operator go/no-go. No token or
+success-rate claim is made from render bytes alone (proxy ratios, never mixed
+with real usage records).
