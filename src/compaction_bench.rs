@@ -1270,12 +1270,25 @@ fn modeled_cache_read_warms_across_generations() {
         "expected at least two modeled generations, got {}",
         gens.len()
     );
+    // Each later generation shares a strictly longer stable summary+tail prefix,
+    // so adjacent cache-READ grows by at least this much. Observed deltas are
+    // ~80 tokens (2 -> 84 -> 165 -> 247); a 40-token bar catches an intermediate
+    // generation that stopped warming (delta collapses toward 0) without being
+    // trivially true.
+    const MIN_READ_GROWTH: usize = 40;
+    // A compaction rewrites the summary + retained tail + new turn, which stays
+    // roughly constant even as the post request grows (post climbs 405 -> 600),
+    // so cache-WRITE stays bounded. Observed writes are ~350-405; a 450-token
+    // cap trips if an intermediate generation stopped warming and rewrote the
+    // whole (growing) prefix instead of just the divergent suffix.
+    const MAX_WRITE_TOKENS: usize = 450;
     for (i, g) in gens.iter().enumerate() {
         assert_eq!(
             g.generation,
             (i + 1) as u64,
             "modeled generations must be the 1-based compaction ordinal"
         );
+        // Reconstruction holds PER generation: READ + WRITE ~= post request.
         assert!(
             (g.read_tokens + g.write_tokens).abs_diff(g.post_tokens) <= 1,
             "generation {}: modeled READ {} + WRITE {} must reconstruct the {}-token post request",
@@ -1284,17 +1297,30 @@ fn modeled_cache_read_warms_across_generations() {
             g.write_tokens,
             g.post_tokens,
         );
+        // Bounded write PER generation.
+        assert!(
+            g.write_tokens <= MAX_WRITE_TOKENS,
+            "generation {}: modeled cache-WRITE {} exceeds the {MAX_WRITE_TOKENS}-token bound; \
+             write should stay bounded as the post request grows, not rewrite the whole prefix",
+            g.generation,
+            g.write_tokens,
+        );
     }
-    let first = gens.first().expect("generation 1");
-    let last = gens.last().expect("final generation");
-    assert!(
-        last.read_tokens > first.read_tokens,
-        "modeled cache-READ should grow as later generations share a stable summary+tail prefix \
-         (generation 1 = {} tokens, generation {} = {} tokens)",
-        first.read_tokens,
-        last.generation,
-        last.read_tokens,
-    );
+    // Warming is asserted across EACH ADJACENT generation pair, not just first vs
+    // last: a regression in any intermediate generation trips the bar.
+    for pair in gens.windows(2) {
+        let (prev, next) = (&pair[0], &pair[1]);
+        assert!(
+            next.read_tokens >= prev.read_tokens + MIN_READ_GROWTH,
+            "modeled cache-READ must grow by at least {MIN_READ_GROWTH} tokens from generation {} \
+             ({} tokens) to generation {} ({} tokens) as later generations share a longer stable \
+             summary+tail prefix",
+            prev.generation,
+            prev.read_tokens,
+            next.generation,
+            next.read_tokens,
+        );
+    }
 }
 
 /// Prints the slice-B report tables under `docs/benchmarks/`. Not an assertion;

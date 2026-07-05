@@ -310,10 +310,20 @@ fn compaction_cache_economics_live_anthropic() {
         }
         None => println!("summarization request: no usage captured"),
     }
-    let post = captured
-        .iter()
-        .filter(|c| !c.is_summary)
-        .find_map(|c| c.usage.clone());
+    // Ordering invariant: `captured` is in capture (send) order. Turn 1 sends a
+    // pre-compaction WARMING request (non-summary) BEFORE the turn-2
+    // summarization request, so the first non-summary sample in the whole run is
+    // that warming request, NOT a post-compaction request. Select the first
+    // non-summary usage that comes strictly AFTER the summarization request in
+    // capture order; that is the genuine first post-compaction request.
+    let summary_index = captured.iter().position(|c| c.is_summary);
+    let post = summary_index.and_then(|idx| {
+        captured
+            .iter()
+            .skip(idx + 1)
+            .filter(|c| !c.is_summary)
+            .find_map(|c| c.usage.clone())
+    });
     match post {
         Some(u) => {
             let (m5, h1) = u

@@ -178,14 +178,18 @@ request.
 | request | input_tokens | cache_read | cache_write | 5m / 1h tier |
 |---|---|---|---|---|
 | summarization | 1463 | 0 | 1460 | — |
-| first post-compaction | 2599 | 0 | 2596 | 2596 / 0 |
+| first post-compaction | 1761 | 0 | 1758 | 1758 / 0 |
+
+The first post-compaction request is the first non-summary usage captured
+*after* the summarization request in send order — not the turn-1 warming request
+that precedes compaction.
 
 Realized vs. modeled:
 
-- **Cache-WRITE validated.** The post-compaction request writes 2596 of 2599
-  input tokens (99.9%) — the realized counterpart of the model's post-compaction
+- **Cache-WRITE validated.** The post-compaction request writes 1758 of 1761
+  input tokens (99.8%) — the realized counterpart of the model's post-compaction
   cache-WRITE dominance. The write lands entirely in the 5-minute tier
-  (2596 / 0), the split only Anthropic reports.
+  (1758 / 0), the split only Anthropic reports.
 - **Cache-HIT realized 0.00, honestly.** Both requests show `cache_read = 0`.
   Realizing a warm summarization hit needs a breakpoint-aligned prefix re-sent
   across turns; a three-turn synthetic resume does not reproduce that alignment,
@@ -194,11 +198,11 @@ Realized vs. modeled:
   therefore remains a model for the multi-turn steady state, anchored here only
   on the write side. No hit-rate number is invented.
 
-The exact captured output (unix date `1783251191`):
+The exact captured output (unix date `1783252154`):
 
 ```
 summarization request: input_tokens=1463, cache_read=0, cache_write=1460, realized cache-HIT rate=0.00
-first post-compaction request: input_tokens=2599, cache_read=0, cache_write=2596 (5m=2596, 1h=0)
+first post-compaction request: input_tokens=1761, cache_read=0, cache_write=1758 (5m=1758, 1h=0)
 ```
 
 ## Provider asymmetry
