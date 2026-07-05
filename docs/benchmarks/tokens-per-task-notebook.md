@@ -984,3 +984,48 @@ schema logs the tool sequence). The deterministic render probes remain the
 ground truth for "the reduction is real and lossless"; the live probes measure
 whether it pays off end-to-end. No re-run yet -- these questions await the next
 authorized live pass.
+
+## Entry 20 - Phase 7: the deterministic analyzer (no live matrix)
+
+Built `analysis.rs`: pure functions over the schema-v3 JSONL -> per-arm
+aggregate -> paired A(defaults) vs B(baseline) -> honesty verdict. No provider;
+the live matrix stays a separately-authorized opt-in. Gate-tested by
+`analyzer_verdicts_hold`, which feeds synthetic logs covering every branch
+(Supported / SuccessRegression / BaselineWins / Inconclusive) plus a render
+probe, an error cell, a usage-None invalid cell, and a garbage line -- all
+counted, none crash it.
+
+**Verdict precedence (most-blocking wins; one regression fails the run):**
+SuccessRegression > BaselineWins > Inconclusive > Incomplete > Supported.
+A success drop is the headline regardless of N or tokens; baseline ties/wins ->
+no claim; small N (< 5) or overlapping input spreads -> inconclusive.
+
+**Two design choices that keep it honest:**
+- **Never mix token sources.** Absolute deltas use ONLY `real_cell.input_tokens`
+  (real usage). `render_probe` proxy tokens live in their own section as ratios.
+  The "did the reduction actually fire in context" signal is the
+  `tool_result_bytes` delta -- REAL bytes measured in BOTH arms, sharing units
+  with neither proxy nor usage tokens, so nothing is mixed.
+- **Token-delta decomposition.** delta = turns_a*(tpt_a - tpt_b) +
+  (turns_a - turns_b)*tpt_b, splitting "each turn got cheaper" (the reduction
+  working) from "the arm changed the turn count" (strategy variance).
+
+**Validated on the real Sonnet 4.6 low micro-probe log (Entry 18 data):**
+
+| workload | delta in | eff / turns | result-bytes delta | verdict |
+|---|---|---|---|---|
+| find | +0 (0%) | +0 / +0 | +0 | BASELINE WINS |
+| grep | -538 (-3.6%) | -538 / +0 | -1766 | INCONCLUSIVE (N=1) |
+| read | -7027 (-33.4%) | -17 / -7010 | -122 | INCONCLUSIVE (N=1) |
+
+The analyzer mechanically reproduced the hand analysis: find's +0
+`result-bytes` delta proves the reduction never fired (the model narrowed the
+search), and read's decomposition attributes the -33% almost entirely to the
+turn term (-7010), NOT cheaper output (-17) -- a strategy artifact, not skim.
+Overall BASELINE WINS -> no claim, exactly right. This is the per-tool ->
+end-to-end connection computed, not eyeballed.
+
+**What remains (opt-in, authorization-gated):** run the live matrix against the
+FIXED find/read questions (Entry 19), point `tokens_per_task_report` at that
+log, and commit the sanitized JSONL + rendered report under docs/benchmarks/.
+No claim ships until real N >= 5 clears the verdict gate without a regression.

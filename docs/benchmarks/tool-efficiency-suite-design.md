@@ -113,12 +113,12 @@ src/bench_tokens/
   workloads.rs   workloads()/bash_workloads()/probe_workloads() + checks + ApprovalProfile
   runner.rs      replay / real / scripted-skip-perms runners + RealRunRecord
                  JSONL schema (was records.rs) + env knobs (was config.rs)
+  analysis.rs    JSONL aggregation, paired A/B deltas, decomposition, verdicts
 ```
 
-Still PLANNED (Phase 6-7): `analysis.rs` (Rust JSONL aggregation + verdicts).
 Folded rather than split: `config.rs` -> env fns in `runner.rs`; `approval.rs`
 -> `observer.rs` (gate) + `workloads.rs` (`ApprovalProfile`); `records.rs` ->
-`runner.rs`.
+`runner.rs`. No `mod.rs` (root uses `#[path]`).
 
 Adding a tool or workload is a data change (append a table row), not new control
 flow. No external TOML until a second consumer needs it.
@@ -185,9 +185,14 @@ Status through the current branch (`bench/tokens-per-task`, PR #391):
    v3 kind discriminator) landed here too. -- commits 88671c6, e65649c
 6. [DONE] (M) read/edit separate-axis probes (reported as their own axes):
    read skim render probe (`ProbeAxis::ArgOverlay`, 83.1%) + edit result-class
-   probe (5 classes + disk effect + exact-terser-than-tolerant). -- commit pending
-7. [TODO] (L) Full e2e matrix + Rust analyzer (`analysis.rs`); smoke before
-   matrix; commit sanitized JSONL + report under `docs/benchmarks/`.
+   probe (5 classes + disk effect + exact-terser-than-tolerant). -- commit 5731dd6
+7. [PARTIAL] (L) The Rust analyzer (`analysis.rs`) is DONE and gate-tested on
+   synthetic logs (`analyzer_verdicts_hold`): per-arm aggregate, paired A/B
+   delta, token-delta decomposition (efficiency vs turn-count), a real
+   `tool_result_bytes` mechanism signal, and honesty verdicts (Supported /
+   Inconclusive / BaselineWins / SuccessRegression / Incomplete). The live e2e
+   matrix (`tokens_per_task_headline`) and the committed sanitized JSONL +
+   report remain opt-in and await an authorized real run.
 
 ## Risks + guardrails
 

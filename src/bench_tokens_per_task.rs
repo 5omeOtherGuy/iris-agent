@@ -34,6 +34,8 @@
 //! calls `bash` (auto-bash is deferred), so a workload that would prompt under
 //! auto is a harness/workload bug, caught by the zero-prompt assertion.
 
+#[path = "bench_tokens/analysis.rs"]
+mod analysis;
 #[path = "bench_tokens/arms.rs"]
 mod arms;
 #[path = "bench_tokens/fixtures.rs"]
@@ -55,6 +57,7 @@ mod workloads;
 
 #[cfg(test)]
 mod replay {
+    use super::analysis::{Verdict, analyze_jsonl, format_report, report_from_file};
     use super::arms::Arm;
     use super::probes::{assert_edit_case, assert_render_contract, edit_cases, tool_probes};
     use super::runner::{
@@ -422,6 +425,116 @@ mod replay {
             "exact success ({exact_len} B) must stay terser than tolerant success \
              ({tolerant_len} B); the ADR-0038 conditional echo fires only on tolerant",
         );
+    }
+
+    /// Build one synthetic `real_cell` JSONL line for the analyzer verdict test.
+    #[cfg(test)]
+    fn cell_line(model: &str, wl: &str, reduce: bool, ok: bool, turns: u64, input: u64) -> String {
+        serde_json::json!({
+            "kind": "real_cell", "valid": true, "schema_version": 3,
+            "model": model, "workload": wl, "reduce_output": reduce,
+            "success": ok, "turns": turns, "input_tokens": input,
+            "tool_result_bytes": if reduce { 400 } else { 500 },
+        })
+        .to_string()
+    }
+
+    /// The Phase 7 analyzer's honesty verdicts hold on synthetic logs -- one
+    /// case per branch (Supported / SuccessRegression / BaselineWins /
+    /// Inconclusive) plus a render probe, an error cell, an invalid (usage-None)
+    /// cell, and a garbage line. Deterministic; no provider.
+    #[test]
+    fn analyzer_verdicts_hold() {
+        let mut lines: Vec<String> = Vec::new();
+        // Supported: A cheaper, success held, spreads separated, N=5.
+        for i in 0..5 {
+            lines.push(cell_line("m1", "w-supported", false, true, 3, 1000 + i));
+            lines.push(cell_line("m1", "w-supported", true, true, 3, 900 + i));
+        }
+        // SuccessRegression: reduced arm drops 2 of 5 successes.
+        for i in 0..5 {
+            lines.push(cell_line("m1", "w-regress", false, true, 3, 1000));
+            lines.push(cell_line("m1", "w-regress", true, i < 3, 3, 900));
+        }
+        // BaselineWins: reduced arm costs MORE.
+        for _ in 0..5 {
+            lines.push(cell_line("m1", "w-baseline", false, true, 3, 1000));
+            lines.push(cell_line("m1", "w-baseline", true, true, 3, 1100));
+        }
+        // Inconclusive: A cheaper on median but spreads overlap.
+        for i in 0..5 {
+            lines.push(cell_line("m1", "w-incon", false, true, 3, 1000 + i * 3));
+            lines.push(cell_line("m1", "w-incon", true, true, 3, 995 + i * 3));
+        }
+        // Coverage: a render probe, an error cell, an invalid (usage-None) cell,
+        // and an unparsable line -- all counted, none crash the analyzer.
+        lines.push(
+            serde_json::json!({ "kind": "render_probe", "probe": "grep-x", "tool": "grep",
+                "reduction_pct": 36.4, "needles_survived": true,
+                "baseline_proxy_tokens": 1606, "reduced_proxy_tokens": 1021 })
+            .to_string(),
+        );
+        lines.push(
+            serde_json::json!({ "kind": "real_cell_error", "valid": false, "model": "m1",
+                "workload": "w-supported", "arm": "-", "error": "select: unreachable" })
+            .to_string(),
+        );
+        lines.push(cell_line("m1", "w-supported", true, true, 3, 0)); // usage None => invalid
+        lines.push("{ not json".to_string());
+
+        let analysis = analyze_jsonl(&lines.join("\n"));
+
+        let verdict = |wl: &str| {
+            analysis
+                .pairings
+                .iter()
+                .find(|p| p.workload == wl)
+                .unwrap_or_else(|| panic!("missing pairing {wl}"))
+                .verdict
+        };
+        assert_eq!(verdict("w-supported"), Verdict::Supported);
+        assert_eq!(verdict("w-regress"), Verdict::SuccessRegression);
+        assert_eq!(verdict("w-baseline"), Verdict::BaselineWins);
+        assert_eq!(verdict("w-incon"), Verdict::Inconclusive);
+        // Overall is the most-blocking pairing verdict.
+        assert_eq!(analysis.overall, Verdict::SuccessRegression);
+        assert_eq!(analysis.cell_count, 40);
+        assert_eq!(analysis.invalid_count, 1);
+        assert_eq!(analysis.error_count, 1);
+        assert!(analysis.skipped_lines >= 1);
+        assert_eq!(analysis.render_rows.len(), 1);
+        // The decomposition reconciles: at equal turns, all of the delta is the
+        // efficiency term and the turn term is zero.
+        let sup = analysis
+            .pairings
+            .iter()
+            .find(|p| p.workload == "w-supported")
+            .unwrap();
+        assert!(sup.delta_input < 0, "defaults should be cheaper");
+        assert_eq!(
+            sup.term_turns as i64, 0,
+            "equal turns => no turn-count term"
+        );
+
+        let report = format_report(&analysis);
+        assert!(report.contains("OVERALL VERDICT: SUCCESS REGRESSION"));
+        assert!(report.contains("w-baseline"));
+    }
+
+    /// Opt-in: analyze a real run's JSONL (default `IRIS_BENCH_LOG`) and print
+    /// the Markdown report. Run AFTER an authorized live matrix:
+    ///   IRIS_BENCH_LOG=... cargo test --bin iris tokens_per_task_report -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads a real run's JSONL; run after an authorized matrix"]
+    fn tokens_per_task_report() {
+        let path = bench_log_path();
+        match report_from_file(&path) {
+            Ok(report) => {
+                println!("{report}");
+                println!("(analyzed {path})");
+            }
+            Err(e) => println!("no readable log at {path}: {e}"),
+        }
     }
 
     #[test]
