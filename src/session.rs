@@ -993,6 +993,37 @@ fn read_meta(path: &Path) -> Result<SessionMeta> {
 /// are skipped rather than failing the whole open. Also returns the rebuilt
 /// context's estimated token total ([`RebuiltContext`]).
 fn read_messages(path: &Path) -> Result<RebuiltContext> {
+    let (entries, compactions) = read_entries(path)?;
+    rebuild_with_compactions(path, entries, compactions)
+}
+
+/// Read the ORIGINAL turns of a durable entry-id span from a session transcript
+/// (ADR-0046 / issue #373 standalone recall). The originals stay verbatim in
+/// the JSONL even after compaction replaced them in the rebuilt view, so this
+/// returns them with their durable ids, filtered to the inclusive numeric
+/// `[from, to]` range. Reads ONLY the given transcript path (the caller's own
+/// session), so it cannot address another session's data. Turns are returned in
+/// transcript order; the vec is empty when the span selects nothing.
+pub(crate) fn read_span(path: &Path, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
+    let (entries, _compactions) = read_entries(path)?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .id
+                .as_deref()
+                .and_then(|id| u64::from_str_radix(id, 16).ok())
+                .is_some_and(|n| n >= from && n <= to)
+        })
+        .map(|entry| (entry.id, entry.message))
+        .collect())
+}
+
+/// Parse a session transcript's raw `message` and `compaction` entries in order,
+/// applying the same per-line leniency the read path needs (a truncated or
+/// garbled line is skipped, not fatal). Shared by the rebuild read path
+/// ([`read_messages`]) and the standalone-span read path ([`read_span`]).
+fn read_entries(path: &Path) -> Result<(Vec<MessageEntry>, Vec<Compaction>)> {
     // Read raw bytes and split on '\n' so a truncated trailing fragment that
     // splits a multibyte UTF-8 char is discarded as one bad line, rather than
     // failing the whole read -- which `read_to_string` would, since invalid
@@ -1058,7 +1089,7 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
             _ => continue,
         }
     }
-    rebuild_with_compactions(path, entries, compactions)
+    Ok((entries, compactions))
 }
 
 /// A message entry rebuilt from disk: its durable id (for compaction coverage

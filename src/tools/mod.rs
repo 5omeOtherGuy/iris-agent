@@ -36,6 +36,7 @@ mod observe;
 pub(crate) mod path;
 mod read;
 mod read_output;
+pub(crate) mod recall;
 mod registry;
 mod skim;
 mod text;
@@ -191,7 +192,7 @@ mod tests {
                 "{name} should be gated"
             );
         }
-        for name in ["read", "grep", "find", "ls", "read_output"] {
+        for name in ["read", "grep", "find", "ls", "read_output", "recall"] {
             assert!(
                 !tools.by_name(name).unwrap().requires_approval(),
                 "{name} should not be gated"
@@ -256,7 +257,8 @@ mod tests {
                 "grep",
                 "find",
                 "ls",
-                "read_output"
+                "read_output",
+                "recall"
             ]
         );
     }
