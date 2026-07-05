@@ -127,9 +127,54 @@ pub(super) fn relative_display(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// The workspace-relative form of `requested` when it resolves strictly inside
+/// `root`, else `None`. Combines the always-enforced containment check
+/// ([`is_inside_workspace`]) with relative rendering so callers that persist or
+/// re-inject a path (the compaction carry, ADR-0044) never leak an absolute
+/// path or a `..` escape: an absolute path outside the workspace, a traversal
+/// escape, or a symlinked ancestor pointing out all yield `None`. Enforced
+/// independent of the `IRIS_SECURITY_OPT_IN` execution-time toggle, because the
+/// carry is durable context, not a one-shot execution decision.
+pub(crate) fn workspace_relative(root: &Path, requested: &str) -> Option<String> {
+    if !is_inside_workspace(root, requested) {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let candidate = lexical_normalize(&join_request(&root, requested));
+    let rel = candidate.strip_prefix(&root).ok()?;
+    Some(rel.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::restrictions_enabled_value;
+    use super::super::test_support::{root_of, temp_dir};
+    use super::{restrictions_enabled_value, workspace_relative};
+
+    #[test]
+    fn workspace_relative_keeps_inside_paths_and_drops_escapes() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let root = root.as_path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"x").unwrap();
+
+        // Inside the workspace: rendered workspace-relative, no leading root.
+        assert_eq!(
+            workspace_relative(root, "src/a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        // A `.`-noisy but inside path normalizes to the same relative form.
+        assert_eq!(
+            workspace_relative(root, "./src/./a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        // Absolute path outside the workspace: rejected (no leak).
+        assert_eq!(workspace_relative(root, "/etc/passwd"), None);
+        // Traversal escape above the workspace root: rejected.
+        assert_eq!(workspace_relative(root, "../../etc/passwd"), None);
+        // Empty request: rejected.
+        assert_eq!(workspace_relative(root, ""), None);
+    }
 
     #[test]
     fn security_restrictions_require_explicit_opt_in_value() {

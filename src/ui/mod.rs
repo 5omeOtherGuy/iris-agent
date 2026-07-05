@@ -304,6 +304,9 @@ impl UiEvent {
                 // event/benchmark, not a display field; the UI does not surface
                 // it, so drop it in the display mapping.
                 generation: _,
+                // Carry count (ADR-0044) is event/benchmark instrumentation, not
+                // a display field; drop it in the display mapping too.
+                carried_paths: _,
             } => UiEvent::CompactionApplied {
                 compaction_id,
                 covered_from,

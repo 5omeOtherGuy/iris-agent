@@ -4705,6 +4705,7 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
                 summary_tokens_estimate,
                 budget,
                 generation,
+                carried_paths: _,
             } => Some((
                 compaction_id,
                 covered_from,

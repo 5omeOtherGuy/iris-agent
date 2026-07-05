@@ -44,7 +44,7 @@
 | [0041](0041-token-efficient-model-switching-and-provider-summaries.md) | Token-efficient model switching and provider-backed compaction summaries | accepted | 2026-07-02 |
 | [0042](0042-opt-in-named-themes-behind-a-theme-trait.md) | Opt-in named color themes behind a Theme trait, terminal-relative by default | proposed | 2026-07-04 |
 | [0043](0043-provider-wait-visibility-and-stream-idle-guard.md) | Provider waits are visible and bounded by provider-event idleness | accepted | 2026-07-05 |
-| [0044](0044-carry-structured-state-across-compaction.md) | Carry structured state across compaction, separate from the prose summary | proposed | 2026-07-04 |
+| [0044](0044-carry-structured-state-across-compaction.md) | Carry structured state across compaction, separate from the prose summary | accepted | 2026-07-04 |
 | [0045](0045-benchmark-compaction-on-task-success-and-retention.md) | Benchmark compaction on task success and load-bearing-detail retention | proposed | 2026-07-04 |
 | [0046](0046-recall-compacted-originals-mid-session.md) | Recall compacted originals mid-session | proposed | 2026-07-04 |
 | [0047](0047-count-compaction-generations.md) | Count and surface a compaction generation ordinal | accepted | 2026-07-04 |

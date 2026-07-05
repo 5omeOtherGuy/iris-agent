@@ -293,6 +293,10 @@ pub(crate) enum AgentEvent {
         /// in the session reports N. Instrumentation of compaction depth; does
         /// not affect range selection or summary content.
         generation: u64,
+        /// Number of workspace-relative touched/read paths carried verbatim
+        /// alongside the prose summary (ADR-0044). Additive instrumentation; 0
+        /// when the covered range had no in-workspace tool targets.
+        carried_paths: usize,
     },
     AssistantText(String),
     AssistantTextDelta(String),

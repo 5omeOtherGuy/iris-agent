@@ -158,14 +158,21 @@ impl SessionLog {
     /// The summary text is produced by the caller, so the entry is independent
     /// of *how* it was summarized (a deterministic internal summarizer today; a
     /// provider/local/remote summarizer later). `token_estimate` records the
-    /// summary's own token estimate so the rebuild counts it instead of the
-    /// covered turns. The Tier-2 harness's auto-compaction policy is the
-    /// production trigger (issue #55).
+    /// rebuilt body's token estimate (summary plus carry) so the rebuild counts
+    /// it instead of the covered turns. The Tier-2 harness's auto-compaction
+    /// policy is the production trigger (issue #55).
+    ///
+    /// `carry_paths` is the deterministic touched/read path carry (ADR-0044),
+    /// derived from the covered range's structured tool calls, persisted as an
+    /// additive optional `carryPaths` field. It is written only when non-empty,
+    /// so an empty carry is byte-identical to a pre-carry compaction entry and
+    /// older readers ignore it either way.
     pub(crate) fn append_compaction(
         &mut self,
         covered_from: &str,
         covered_to: &str,
         summary: &str,
+        carry_paths: &[String],
         token_estimate: Option<u64>,
     ) -> Result<String> {
         let id = self.next_id();
@@ -175,7 +182,7 @@ impl SessionLog {
         // the in-memory counter ahead of what is persisted (which would make a
         // later successful append report the wrong generation).
         let generation = self.compactions + 1;
-        let entry = json!({
+        let mut entry = json!({
             "type": "compaction",
             "id": id,
             "parentId": self.last_id.as_deref(),
@@ -193,6 +200,12 @@ impl SessionLog {
             // never changes how a pre-ADR-0047 session rebuilds.
             "generation": generation,
         });
+        // Additive optional carry (ADR-0044): only written when non-empty, so an
+        // empty carry leaves the serialized entry byte-identical to a pre-carry
+        // compaction and older readers are unaffected.
+        if !carry_paths.is_empty() {
+            entry["carryPaths"] = json!(carry_paths);
+        }
         write_line(&mut self.file, &entry).with_context(|| {
             format!(
                 "failed to append compaction to session {}",
@@ -821,6 +834,40 @@ pub(crate) fn message_token_estimate(message: &Message) -> u64 {
     estimate_tokens(&message.content).saturating_add(continuity)
 }
 
+/// Header line of the compaction carry block (ADR-0044), naming the block as
+/// the deterministic touched/read path set that rides alongside the prose
+/// summary.
+const CARRY_BLOCK_HEADER: &str = "[files touched or read in the compacted range]";
+
+/// Render the compaction carry (ADR-0044): a deterministic, compact block
+/// listing the covered range's workspace-relative touched/read paths. Empty
+/// carry renders the empty string, so [`render_compaction_body`] with no paths
+/// is byte-identical to the pre-carry summary-only body.
+pub(crate) fn render_carry_block(carry_paths: &[String]) -> String {
+    if carry_paths.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n\n{CARRY_BLOCK_HEADER}");
+    for path in carry_paths {
+        out.push_str("\n- ");
+        out.push_str(path);
+    }
+    out
+}
+
+/// The compaction message body rebuilt into context (ADR-0044): the prose
+/// summary followed by the carry block. With an empty carry this returns the
+/// summary unchanged, so an empty-carry compaction rebuilds byte-identically to
+/// the pre-carry behavior. Both the live in-process rebuild
+/// (`wayland::Harness::compact_range`) and the read-time rebuild
+/// ([`rebuild_with_compactions`]) render through this one function so live and
+/// resumed context agree.
+pub(crate) fn render_compaction_body(summary: &str, carry_paths: &[String]) -> String {
+    let mut out = summary.to_string();
+    out.push_str(&render_carry_block(carry_paths));
+    out
+}
+
 /// What [`SessionLog::resume`] needs to continue an existing transcript.
 struct ResumeState {
     /// Header session id.
@@ -1033,6 +1080,10 @@ struct Compaction {
     covered_to: String,
     summary: String,
     token_estimate: Option<u64>,
+    /// Deterministic touched/read path carry (ADR-0044), rendered into the
+    /// rebuilt body alongside the summary. Empty for pre-carry entries and any
+    /// entry whose covered range touched no in-workspace files.
+    carry_paths: Vec<String>,
 }
 
 /// Parse a `compaction` entry's rebuild fields. `None` (skipped as malformed)
@@ -1047,6 +1098,19 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
         covered_to: value.get("coveredTo").and_then(Value::as_str)?.to_string(),
         summary: value.get("summary").and_then(Value::as_str)?.to_string(),
         token_estimate: value.get("tokenEstimate").and_then(Value::as_u64),
+        // Additive optional carry (ADR-0044): absent on pre-carry entries and on
+        // empty-carry entries, both of which read as no carry. Only string
+        // members are kept, so a garbled element cannot inject a non-path value.
+        carry_paths: value
+            .get("carryPaths")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -1123,13 +1187,16 @@ fn rebuild_with_compactions(
             }
             *slot = true;
         }
-        // Prefer the compaction's persisted estimate; recompute from the summary
-        // text when absent, so the summary contributes its own tokens to the
-        // total instead of the covered turns it replaced.
+        // The compaction message body is the prose summary plus the carry block
+        // (ADR-0044); with an empty carry it is exactly the summary, so pre-carry
+        // entries rebuild unchanged. Prefer the persisted estimate (which already
+        // counts summary + carry); recompute from the rendered body when absent,
+        // so the body contributes its own tokens instead of the covered turns.
+        let body = render_compaction_body(&compaction.summary, &compaction.carry_paths);
         let summary_tokens = compaction
             .token_estimate
-            .unwrap_or_else(|| estimate_tokens(&compaction.summary));
-        summary_at[from] = Some((compaction.summary, summary_tokens));
+            .unwrap_or_else(|| estimate_tokens(&body));
+        summary_at[from] = Some((body, summary_tokens));
     }
 
     let mut messages = Vec::new();
@@ -2184,7 +2251,7 @@ mod tests {
         let from = log.append(&Message::user("alpha")).unwrap();
         let to = log.append(&Message::assistant("beta")).unwrap();
         let compaction_id = log
-            .append_compaction(&from, &to, "summary text", None)
+            .append_compaction(&from, &to, "summary text", &[], None)
             .unwrap();
 
         let entries = lines(log.path());
@@ -2211,9 +2278,9 @@ mod tests {
         let a = log.append(&Message::user("a")).unwrap();
         let b = log.append(&Message::assistant("b")).unwrap();
         let c = log.append(&Message::user("c")).unwrap();
-        log.append_compaction(&a, &a, "S1", None).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
         assert_eq!(log.compaction_generation(), 1);
-        log.append_compaction(&b, &c, "S2", None).unwrap();
+        log.append_compaction(&b, &c, "S2", &[], None).unwrap();
         assert_eq!(log.compaction_generation(), 2);
 
         let entries = lines(log.path());
@@ -2243,7 +2310,7 @@ mod tests {
             .open("/dev/full")
             .unwrap();
         assert!(
-            log.append_compaction(&a, &a, "S1", None).is_err(),
+            log.append_compaction(&a, &a, "S1", &[], None).is_err(),
             "write to /dev/full must fail"
         );
         // The failed append must not have advanced the counter.
@@ -2252,7 +2319,7 @@ mod tests {
         // Restore a real writable handle; the first durable compaction after a
         // failed attempt must still report generation 1, not 2.
         log.file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        log.append_compaction(&a, &a, "S1", None).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
         assert_eq!(log.compaction_generation(), 1);
 
         let entries = lines(log.path());
@@ -2270,7 +2337,7 @@ mod tests {
         let dir = temp_dir();
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
         let a = log.append(&Message::user("a")).unwrap();
-        log.append_compaction(&a, &a, "S1", None).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
         assert_eq!(log.compaction_generation(), 1);
         let path = log.path().to_path_buf();
         drop(log);
@@ -2279,7 +2346,7 @@ mod tests {
         // next compaction continues at generation 2 rather than restarting.
         let mut resumed = SessionLog::resume(&path).unwrap();
         let b = resumed.append(&Message::user("b")).unwrap();
-        resumed.append_compaction(&b, &b, "S2", None).unwrap();
+        resumed.append_compaction(&b, &b, "S2", &[], None).unwrap();
         assert_eq!(resumed.compaction_generation(), 2);
         drop(resumed);
 
@@ -2342,7 +2409,8 @@ mod tests {
         let to = log.append(&Message::assistant("beta")).unwrap();
         log.append(&Message::user("gamma")).unwrap();
         log.append(&Message::assistant("delta")).unwrap();
-        log.append_compaction(&from, &to, "SUMMARY", None).unwrap();
+        log.append_compaction(&from, &to, "SUMMARY", &[], None)
+            .unwrap();
         drop(log);
 
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
@@ -2360,6 +2428,145 @@ mod tests {
     }
 
     #[test]
+    fn append_compaction_writes_carry_paths_when_present() {
+        // ADR-0044: the carry is an additive optional `carryPaths` field; the
+        // prose `summary` stays carry-free, and the existing fields are unchanged.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let carry = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        log.append_compaction(&from, &to, "prose only", &carry, Some(9))
+            .unwrap();
+
+        let entry = lines(log.path()).pop().unwrap();
+        assert_eq!(entry["summary"], "prose only");
+        assert_eq!(entry["carryPaths"], json!(["src/a.rs", "src/b.rs"]));
+        assert_eq!(entry["tokenEstimate"], json!(9));
+        assert_eq!(entry["generation"], 1);
+    }
+
+    #[test]
+    fn empty_carry_writes_no_field_and_stays_byte_identical() {
+        // ADR-0044 item 5: an empty carry writes no `carryPaths` key, so the
+        // serialized compaction entry is byte-identical to the pre-carry entry
+        // and older readers are unaffected.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        log.append_compaction(&from, &to, "SUMMARY", &[], None)
+            .unwrap();
+        drop(log);
+
+        // The raw persisted line carries no carry field at all.
+        let raw = fs::read_to_string(
+            SessionStore::with_root(dir.path.clone())
+                .find(&id)
+                .unwrap()
+                .unwrap()
+                .path,
+        )
+        .unwrap();
+        assert!(
+            !raw.contains("carryPaths"),
+            "empty carry must not serialize a carryPaths field"
+        );
+        let entry: Value = raw
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["type"] == "compaction")
+            .unwrap();
+        assert!(
+            !entry.as_object().unwrap().contains_key("carryPaths"),
+            "empty carry must not add a carryPaths key"
+        );
+
+        // Rebuild is unchanged: summary in, no carry block.
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(contents(&session), ["SUMMARY"]);
+    }
+
+    #[test]
+    fn rebuild_renders_summary_and_carry_and_counts_the_carry_tokens() {
+        // ADR-0044 item 3: rebuild renders summary + carry, and the carry's
+        // tokens are counted in the entry estimate the rebuilt total uses.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let carry = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        // Mirror the live path: the persisted estimate is the rendered body's.
+        let body = render_compaction_body("SUMMARY", &carry);
+        log.append_compaction(&from, &to, "SUMMARY", &carry, Some(estimate_tokens(&body)))
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        // One rebuilt message: the summary plus the carry block verbatim.
+        assert_eq!(session.messages.len(), 1);
+        let rebuilt = &session.messages[0].content;
+        assert!(rebuilt.starts_with("SUMMARY"));
+        assert!(rebuilt.contains("src/a.rs") && rebuilt.contains("src/b.rs"));
+        assert_eq!(*rebuilt, body);
+        // The total counts the summary + carry body, not the covered turns.
+        assert_eq!(session.context_tokens, estimate_tokens(&body));
+    }
+
+    #[test]
+    fn carry_paths_survive_a_summary_that_omits_them() {
+        // ADR-0044 item 4 (retention contract that retires ADR-0041's named
+        // risk): a load-bearing path dropped from the prose summary still
+        // survives in the carry through rebuild.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        // The summary deliberately omits the load-bearing path.
+        let summary = "the agent finished the task";
+        let carry = vec!["src/load_bearing.rs".to_string()];
+        assert!(!summary.contains("load_bearing"));
+        let body = render_compaction_body(summary, &carry);
+        log.append_compaction(&from, &to, summary, &carry, Some(estimate_tokens(&body)))
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert!(
+            session.messages[0].content.contains("src/load_bearing.rs"),
+            "the carried path must survive a summary that dropped it"
+        );
+    }
+
+    #[test]
+    fn compaction_entry_without_carry_field_rebuilds() {
+        // ADR-0044 item 2 (backward compat): a pre-carry compaction entry with
+        // no carryPaths field rebuilds exactly as before.
+        let dir = temp_dir();
+        let cwd_dir = dir.path.join("w");
+        fs::create_dir(&cwd_dir).unwrap();
+        let path = cwd_dir.join("legacy.jsonl");
+        let legacy = concat!(
+            r#"{"type":"session","version":2,"id":"nocarry1","timestamp":1700000000000,"cwd":"/w"}"#,
+            "\n",
+            r#"{"type":"message","id":"00000000","parentId":null,"timestamp":1700000000001,"tokenEstimate":1,"message":{"role":"user","content":"alpha"}}"#,
+            "\n",
+            r#"{"type":"message","id":"00000001","parentId":"00000000","timestamp":1700000000002,"tokenEstimate":1,"message":{"role":"assistant","content":"beta"}}"#,
+            "\n",
+            // A compaction entry as written before ADR-0044: no carryPaths key.
+            r#"{"type":"compaction","id":"00000002","parentId":"00000001","timestamp":1700000000003,"createdAt":1700000000003,"coveredFrom":"00000000","coveredTo":"00000001","summary":"OLD SUMMARY","tokenEstimate":3}"#,
+            "\n",
+        );
+        fs::write(&path, legacy).unwrap();
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), "nocarry1");
+        assert_eq!(contents(&session), ["OLD SUMMARY"]);
+    }
+
+    #[test]
     fn rebuild_applies_multiple_non_overlapping_compactions() {
         let dir = temp_dir();
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
@@ -2368,8 +2575,8 @@ mod tests {
         log.append(&Message::assistant("b")).unwrap();
         let c = log.append(&Message::user("c")).unwrap();
         log.append(&Message::assistant("d")).unwrap();
-        log.append_compaction(&a, &a, "S1", None).unwrap();
-        log.append_compaction(&c, &c, "S2", None).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
+        log.append_compaction(&c, &c, "S2", &[], None).unwrap();
         drop(log);
 
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
@@ -2386,8 +2593,8 @@ mod tests {
         let b = log.append(&Message::assistant("b")).unwrap();
         let c = log.append(&Message::user("c")).unwrap();
         // Two compactions whose covered ranges overlap on `b`.
-        log.append_compaction(&a, &b, "S1", None).unwrap();
-        log.append_compaction(&b, &c, "S2", None).unwrap();
+        log.append_compaction(&a, &b, "S1", &[], None).unwrap();
+        log.append_compaction(&b, &c, "S2", &[], None).unwrap();
         drop(log);
 
         let store = SessionStore::with_root(dir.path.clone());
@@ -2405,7 +2612,7 @@ mod tests {
         let id = log.id().to_string();
         log.append(&Message::user("a")).unwrap();
         // `ffffffff` is not an entry id in this session.
-        log.append_compaction("ffffffff", "ffffffff", "S", None)
+        log.append_compaction("ffffffff", "ffffffff", "S", &[], None)
             .unwrap();
         drop(log);
 
@@ -2421,7 +2628,7 @@ mod tests {
         let id = log.id().to_string();
         let from = log.append(&Message::user("a")).unwrap();
         let to = log.append(&Message::assistant("b")).unwrap();
-        let compaction_id = log.append_compaction(&from, &to, "SUM", None).unwrap();
+        let compaction_id = log.append_compaction(&from, &to, "SUM", &[], None).unwrap();
         let path = log.path().to_path_buf();
         drop(log);
 
@@ -2539,7 +2746,7 @@ mod tests {
             .unwrap();
         let tail = Message::user("short tail");
         log.append(&tail).unwrap();
-        log.append_compaction(&from, &to, "sum", None).unwrap();
+        log.append_compaction(&from, &to, "sum", &[], None).unwrap();
         drop(log);
 
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
