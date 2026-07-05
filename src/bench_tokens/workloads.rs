@@ -113,6 +113,25 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
     }]
 }
 
+/// Per-tool live model-probe workloads (Phase 5, layer 2). Each asks a real
+/// model an EXACT question whose answer lives in one tool's (reduced) output,
+/// so success is scored mechanically (the exact value in the answer) and the
+/// arm A vs B comparison shows whether the reduced output still lets the model
+/// answer -- paired with the deterministic render probe in `probes.rs`. Uses
+/// the deny gate (grep/find/ls/read are auto-safe; no bash).
+pub(crate) fn probe_workloads() -> Vec<Workload> {
+    vec![Workload {
+        name: "probe-grep-exact-value",
+        fixture: "probe_grep",
+        prompt: "Search the codebase for `deadline`. Report the exact integer value assigned \
+                 to the CHECKOUT_DEADLINE_MS constant. Answer with only that integer.",
+        script: script_probe_grep,
+        check: check_probe_grep_value,
+        approval: ApprovalProfile::DenyGateNoPrompts,
+        needles: &["47231"],
+    }]
+}
+
 // -- scripted tool-call sequences -------------------------------------------
 
 fn call_turn(id: &str, name: &str, arguments: Value) -> AssistantTurn {
@@ -195,6 +214,18 @@ fn script_bash_diagnose() -> Vec<AssistantTurn> {
     vec![
         call_turn("b", "bash", json!({ "command": "cat src/lib.rs; exit 3" })),
         answer_turn("The failing test is ceiling_is_exact: it asserted left: 8191, right: 8192."),
+    ]
+}
+
+/// Scripted grep probe: search `deadline`, then answer the planted value.
+fn script_probe_grep() -> Vec<AssistantTurn> {
+    vec![
+        call_turn(
+            "g",
+            "grep",
+            json!({ "pattern": "deadline", "ignoreCase": true }),
+        ),
+        answer_turn("CHECKOUT_DEADLINE_MS is 47231."),
     ]
 }
 
@@ -321,6 +352,21 @@ fn check_bash_diagnose(_workspace: &Path, final_text: &str) -> Outcome {
         Outcome {
             success: false,
             detail: format!("answer missing planted values (8191={has_left}, 8192={has_right})"),
+        }
+    }
+}
+
+/// Grep exact-value probe: the answer must carry the planted constant value.
+fn check_probe_grep_value(_workspace: &Path, final_text: &str) -> Outcome {
+    if final_text.contains("47231") {
+        Outcome {
+            success: true,
+            detail: "answer carries the exact CHECKOUT_DEADLINE_MS value (47231)".to_string(),
+        }
+    } else {
+        Outcome {
+            success: false,
+            detail: "answer missing the exact value 47231".to_string(),
         }
     }
 }

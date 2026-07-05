@@ -377,7 +377,7 @@ pub(crate) fn model_specs() -> Vec<String> {
 }
 
 /// Drive one async future to completion on a current-thread runtime.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

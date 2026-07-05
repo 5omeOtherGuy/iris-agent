@@ -40,6 +40,8 @@ mod arms;
 mod fixtures;
 #[path = "bench_tokens/observer.rs"]
 mod observer;
+#[path = "bench_tokens/probes.rs"]
+mod probes;
 #[path = "bench_tokens/provider.rs"]
 mod provider;
 #[path = "bench_tokens/runner.rs"]
@@ -54,11 +56,12 @@ mod workloads;
 #[cfg(test)]
 mod replay {
     use super::arms::Arm;
+    use super::probes::{assert_render_contract, tool_probes};
     use super::runner::{
         RunMetrics, bench_log_path, bench_log_reset, bench_reasoning, model_specs, run_real_cell,
         run_replay_arm, run_scripted_skip_perms, selection_for_spec,
     };
-    use super::workloads::{Workload, bash_workloads, workloads};
+    use super::workloads::{Workload, bash_workloads, probe_workloads, workloads};
 
     /// The margin (in estimated tokens) arm A must beat arm B by, so the win is
     /// not a rounding artifact of the estimator.
@@ -365,6 +368,26 @@ mod replay {
         }
     }
 
+    /// Deterministic per-tool RENDER PROBE (Phase 5, layer 1). For each tool
+    /// probe, invoke the tool over its fixture in both arms and prove the
+    /// reduced output (a) clears its token-reduction bar and (b) keeps every
+    /// needle verbatim. No real provider -- runs in CI. This is the "the
+    /// reduction is real and lossless for the asked fact" half that the paired
+    /// live probe builds on.
+    #[test]
+    fn tool_render_probes_reduce_and_preserve() {
+        for probe in tool_probes() {
+            let r = assert_render_contract(&probe);
+            println!(
+                "[{}] reduction {:.1}% (baseline {} B -> reduced {} B); needles survived",
+                probe.name,
+                r.reduction_pct,
+                r.baseline.len(),
+                r.reduced.len()
+            );
+        }
+    }
+
     /// Opt-in real-provider BASH smoke (Phase 4). Runs the read-only diagnosis
     /// workload under `--dangerously-skip-permissions` so the real model runs
     /// `bash` (e.g. `cargo test`) to find the failure, over the model matrix x
@@ -444,5 +467,79 @@ mod replay {
             !consulted_any,
             "a bash smoke run consulted the deny gate; skip-permissions must bypass it"
         );
+    }
+
+    /// Opt-in real-provider MICRO-PROBE (Phase 5, layer 2). For each per-tool
+    /// probe workload, a real model must answer an EXACT question from one
+    /// tool's (reduced) output; scored mechanically. Runs both arms per model
+    /// so the table shows whether the reduced output still lets the model
+    /// answer AND what it costs -- paired with the deterministic render probe
+    /// (`tool_render_probes_reduce_and_preserve`). Behavior metrics (grep/read
+    /// call counts, turns, tok/turn) come from the JSONL schema. Run:
+    ///   IRIS_BENCH_REAL=1 cargo test --bin iris tokens_per_task_micro_probes \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "real-provider micro-probe: costs calls; set IRIS_BENCH_REAL=1"]
+    fn tokens_per_task_micro_probes() {
+        if std::env::var("IRIS_BENCH_REAL").ok().as_deref() != Some("1") {
+            eprintln!("skipping micro-probes: set IRIS_BENCH_REAL=1 (this run costs money)");
+            return;
+        }
+        let specs = model_specs();
+        let reasoning = bench_reasoning();
+        let cwd = std::env::current_dir().expect("cwd");
+        bench_log_reset();
+        println!(
+            "micro-probes: reasoning={:?} models={} log={}",
+            reasoning,
+            specs.join(", "),
+            bench_log_path()
+        );
+        println!(
+            "| probe | model | arm | success | turns | in tok | tok/turn | grep | read | approvals | note |"
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|---|");
+        for workload in probe_workloads() {
+            for spec in &specs {
+                let selection = match selection_for_spec(&cwd, spec, reasoning) {
+                    Ok(sel) => sel,
+                    Err(e) => {
+                        println!(
+                            "| {} | {} | - | - | - | - | - | - | - | - | select: {e} |",
+                            workload.name, spec
+                        );
+                        continue;
+                    }
+                };
+                for arm in [Arm::Baseline, Arm::Defaults] {
+                    match run_real_cell(spec, &workload, arm, 1, &selection) {
+                        Ok(m) => {
+                            let grep = m.tool_counts.get("grep").copied().unwrap_or(0);
+                            let read = m.tool_counts.get("read").copied().unwrap_or(0);
+                            println!(
+                                "| {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | |",
+                                workload.name,
+                                spec,
+                                m.arm.label(),
+                                m.outcome.success,
+                                m.turns,
+                                m.input_tokens,
+                                m.tokens_per_turn(),
+                                grep,
+                                read,
+                                m.approvals_consulted,
+                            );
+                        }
+                        Err(e) => println!(
+                            "| {} | {} | {} | - | - | - | - | - | - | - | {} |",
+                            workload.name,
+                            spec,
+                            arm.label(),
+                            e
+                        ),
+                    }
+                }
+            }
+        }
     }
 }
