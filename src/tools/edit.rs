@@ -40,7 +40,8 @@ pub(super) fn execute(
 ) -> Result<super::ToolOutput> {
     let input: EditInput = serde_json::from_value(args.clone())
         .context("edit tool arguments must include file_path, old_string, new_string")?;
-    edit(root, &input, observed)
+    // Record the edited file for the compaction carry (ADR-0044).
+    Ok(edit(root, &input, observed)?.with_workspace_target(root, &input.file_path))
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {

@@ -36,7 +36,10 @@ pub(super) fn execute(
 ) -> Result<super::ToolOutput> {
     let input: ReadInput =
         serde_json::from_value(args.clone()).context("read tool arguments must include path")?;
-    read(root, &input, observed)
+    // Record the read target for the compaction carry (ADR-0044): a successful
+    // read's workspace-relative path rides the result metadata so the carry
+    // derives from successful results, not raw tool-call arguments.
+    Ok(read(root, &input, observed)?.with_workspace_target(root, &input.path))
 }
 
 #[derive(Debug, Deserialize)]

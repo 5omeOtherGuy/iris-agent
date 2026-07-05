@@ -40,7 +40,9 @@ pub(super) fn execute(
         .with(
             crate::nexus::WRITE_CONFIRM_HASH_KEY,
             json!(super::content_hash(input.content.as_bytes())),
-        ))
+        )
+        // Record the written file for the compaction carry (ADR-0044).
+        .with_workspace_target(root, &input.path))
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {

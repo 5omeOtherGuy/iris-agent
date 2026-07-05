@@ -5116,6 +5116,86 @@ fn manual_compact_covers_older_turns_and_keeps_recent_tail() -> Result<()> {
     Ok(())
 }
 
+/// Finding 3 (#371): the shrink/worthwhile guard must hold on EVERY summarizer
+/// path, not only the provider-summary branch. A covered range of short turns
+/// whose deterministic excerpt summary is no smaller than the originals -- and
+/// which carries non-empty touched/read paths (ADR-0044) -- must NOT produce a
+/// compaction entry: the combined summary + carry body would be larger than the
+/// range it replaces. Before the fix `compact_range` appended it anyway because
+/// the guard lived only inside the provider branch.
+#[test]
+fn deterministic_fallback_skips_non_shrinking_compaction_with_carry() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+
+    // Short covered turns: each is below the excerpt cap, so the excerpt summary
+    // reproduces them verbatim plus per-message role/header overhead -- it never
+    // shrinks. Two successful read results contribute a non-empty carry.
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let path = log.path().to_path_buf();
+    log.append(&Message::user("u"))?;
+    log.append(&Message::assistant_tool_call(&ToolCall {
+        id: "c1".to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": "a.rs" }),
+        thought_signature: None,
+    }))?;
+    log.append(&Message::tool_result(
+        "c1",
+        "read",
+        &serde_json::json!({ "ok": true, "content": "x", "metadata": { "target": "a.rs" } })
+            .to_string(),
+    ))?;
+    log.append(&Message::assistant_tool_call(&ToolCall {
+        id: "c2".to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": "b.rs" }),
+        thought_signature: None,
+    }))?;
+    log.append(&Message::tool_result(
+        "c2",
+        "read",
+        &serde_json::json!({ "ok": true, "content": "x", "metadata": { "target": "b.rs" } })
+            .to_string(),
+    ))?;
+    // A long recent tail (~999 tokens) that fills the manual keep window so the
+    // short older turns above are the coverable range, not folded into the tail.
+    log.append(&Message::assistant(&"R".repeat(3_996)))?;
+    drop(log);
+
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present in store");
+    let stored = store.open(&meta)?;
+    let resumed = stored.messages.len();
+
+    let agent = Agent::new(FakeProvider::new(vec![]), crate::tools::built_in_tools());
+    // Excerpts is the harness default summarizer (no provider round-trip), so
+    // this exercises the deterministic fallback path directly.
+    let mut harness = Harness::new(agent, dir.path.clone(), ToolState::new(), None, None);
+    let resume_log = SessionLog::resume(&path)?;
+    harness.swap_session(Some(resume_log), stored.messages, stored.entry_ids, resumed);
+
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let before = harness.context_token_estimate();
+    block_on(harness.compact_now(&frontend, &CancellationToken::new()))?;
+    let after = harness.context_token_estimate();
+
+    assert_eq!(
+        after, before,
+        "a non-shrinking summary + carry body must not replace the covered range"
+    );
+    let on_disk = fs::read_to_string(&path)?;
+    assert!(
+        !on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")),
+        "the deterministic fallback must not append a non-shrinking compaction entry"
+    );
+    Ok(())
+}
+
 /// Regression (#375): resuming an id-bearing session must carry the durable
 /// message ids into the harness, so the resumed prefix is compactable. Before
 /// the fix `swap_session` set `entry_ids = vec![None; resumed]`, so

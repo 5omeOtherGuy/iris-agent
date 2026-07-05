@@ -853,6 +853,21 @@ impl<P: ChatProvider> Harness<P> {
         let body = render_compaction_body(&summary, &carry_paths);
         let body_tokens = estimate_tokens(&body);
 
+        // Shrink/worthwhile guard on EVERY summarizer path (ADR-0044, DoD item
+        // 3). The provider branch guards its own summary, but the deterministic
+        // excerpt fallback and manual `/compact` reach here without one, and a
+        // non-empty carry can push the combined summary + carry body back over
+        // the covered range. A compaction that does not shrink is worse than
+        // leaving the range intact: skip rather than append it.
+        if body_tokens >= original_tokens {
+            tracing::warn!(
+                body_tokens,
+                original_tokens,
+                "compaction summary + carry did not shrink the covered range; skipping"
+            );
+            return Ok(None);
+        }
+
         let log = self
             .session
             .as_mut()
@@ -1092,13 +1107,17 @@ const MAX_CARRY_PATHS: usize = 32;
 
 /// Derive the compaction carry (ADR-0044): the bounded, deduped, order-stable
 /// set of workspace-relative paths the covered range read or mutated, taken
-/// from the structured tool-call arguments (ADR-0021), never from tool output
-/// text. Only `read`/`write`/`ls`/`edit` targets are collected.
+/// from the covered range's SUCCESSFUL structured tool results (ADR-0021),
+/// never from raw tool-call arguments. Each successful `read`/`write`/`ls`/
+/// `edit` result records its workspace-relative `metadata.target`
+/// ([`ToolOutput::with_workspace_target`]); a denied, cancelled, tool-error, or
+/// malformed result has `ok != true` (or no `target`) and never contributes a
+/// path, so the carry cannot retain a file the model never actually touched.
 ///
-/// Security boundary: each candidate is normalized through
-/// [`crate::tools::path::workspace_relative`], which drops any path that does
-/// not resolve strictly inside `workspace`, so the carry can never persist an
-/// absolute path or a traversal escape.
+/// Security boundary: the persisted `target` is already workspace-relative, but
+/// each candidate is re-checked through [`crate::tools::path::workspace_relative`]
+/// so a crafted or legacy transcript carrying an absolute or `..`-escaping
+/// target is still dropped.
 ///
 /// Dedup keeps the most-recent occurrence of each path and orders by that
 /// occurrence (least-recent first), so a re-touched path advances to the tail
@@ -1106,24 +1125,32 @@ const MAX_CARRY_PATHS: usize = 32;
 fn derive_carry_paths(covered: &[Message], workspace: &Path) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     for message in covered {
-        if message.role != Role::AssistantToolCall {
+        if message.role != Role::Tool {
             continue;
         }
-        let key = match message.tool_name.as_deref() {
-            Some("read") | Some("write") | Some("ls") => "path",
-            Some("edit") => "file_path",
-            _ => continue,
-        };
-        // The tool-call arguments are persisted as their JSON string
-        // (`Message::assistant_tool_call`), so this reads the structured
-        // argument value, not free-form output text.
-        let Ok(args) = serde_json::from_str::<Value>(&message.content) else {
+        if !matches!(
+            message.tool_name.as_deref(),
+            Some("read" | "write" | "ls" | "edit")
+        ) {
+            continue;
+        }
+        // The tool-result content is the ADR-0021 wire envelope JSON.
+        let Ok(result) = serde_json::from_str::<Value>(&message.content) else {
             continue;
         };
-        let Some(requested) = args.get(key).and_then(Value::as_str) else {
+        // Successful results only: denied/cancelled/tool-error envelopes have
+        // `ok: false` (and no `target`), so their paths are never carried.
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(target) = result
+            .get("metadata")
+            .and_then(|metadata| metadata.get("target"))
+            .and_then(Value::as_str)
+        else {
             continue;
         };
-        let Some(rel) = crate::tools::path::workspace_relative(workspace, requested) else {
+        let Some(rel) = crate::tools::path::workspace_relative(workspace, target) else {
             continue;
         };
         if let Some(pos) = paths.iter().position(|p| *p == rel) {
@@ -1234,19 +1261,36 @@ fn verification_feedback(command: &str, exit_code: Option<i32>, output: &str) ->
 #[cfg(test)]
 mod carry_tests {
     use super::{MAX_CARRY_PATHS, combined_shrinks, derive_carry_paths};
-    use crate::nexus::{Message, ToolCall};
+    use crate::nexus::Message;
     use crate::tools::test_support::{root_of, temp_dir};
     use serde_json::json;
 
-    /// An `AssistantToolCall` message the way it is persisted: content is the
-    /// tool arguments serialized to JSON (`Message::assistant_tool_call`).
-    fn tool_call(name: &str, key: &str, path: &str) -> Message {
-        Message::assistant_tool_call(&ToolCall {
-            id: "call_1".to_string(),
-            name: name.to_string(),
-            arguments: json!({ key: path }),
-            thought_signature: None,
-        })
+    /// A successful `tool` result message the way Nexus persists it (ADR-0021):
+    /// content is the success envelope `{ "ok": true, ... }` whose
+    /// `metadata.target` names the touched/read workspace-relative path derived
+    /// at the tool boundary (ADR-0044). The carry is derived from these
+    /// successful results, not from raw tool-call arguments.
+    fn tool_result_ok(name: &str, target: &str) -> Message {
+        Message::tool_result(
+            "call_1",
+            name,
+            &json!({
+                "ok": true,
+                "content": "done",
+                "metadata": { "target": target }
+            })
+            .to_string(),
+        )
+    }
+
+    /// A non-successful `tool` result (denied/cancelled/error): `ok` is false and
+    /// no `target` is present, so its path must never enter the carry.
+    fn tool_result_failed(name: &str, flag: &str) -> Message {
+        Message::tool_result(
+            "call_2",
+            name,
+            &json!({ "ok": false, "error": "no", flag: true }).to_string(),
+        )
     }
 
     #[test]
@@ -1256,13 +1300,36 @@ mod carry_tests {
         // read a, read b, edit a, ls c -> distinct {a, b, c}; a re-touched last of
         // the pair moves ahead of b, ordered by most-recent occurrence.
         let covered = [
-            tool_call("read", "path", "a.rs"),
-            tool_call("read", "path", "b.rs"),
-            tool_call("edit", "file_path", "a.rs"),
-            tool_call("ls", "path", "c"),
+            tool_result_ok("read", "a.rs"),
+            tool_result_ok("read", "b.rs"),
+            tool_result_ok("edit", "a.rs"),
+            tool_result_ok("ls", "c"),
         ];
         let carry = derive_carry_paths(&covered, &root);
         assert_eq!(carry, vec!["b.rs", "a.rs", "c"]);
+    }
+
+    #[test]
+    fn derive_carry_paths_carries_only_successful_results() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // Only successful (ok:true) results contribute paths. A denied, a
+        // cancelled, and a tool-error result in the covered range -- each naming
+        // a path the model never actually read/touched -- are dropped.
+        let covered = [
+            tool_result_ok("read", "a.rs"),
+            tool_result_failed("read", "denied"),
+            tool_result_failed("edit", "cancelled"),
+            // A tool error: ok:false, no target field at all.
+            Message::tool_result(
+                "call_3",
+                "write",
+                &json!({ "ok": false, "error": "boom" }).to_string(),
+            ),
+            tool_result_ok("edit", "b.rs"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["a.rs", "b.rs"]);
     }
 
     #[test]
@@ -1273,7 +1340,7 @@ mod carry_tests {
         // survive, in order.
         let n = MAX_CARRY_PATHS + 2;
         let covered: Vec<Message> = (0..n)
-            .map(|i| tool_call("read", "path", &format!("f{i}.rs")))
+            .map(|i| tool_result_ok("read", &format!("f{i}.rs")))
             .collect();
         let carry = derive_carry_paths(&covered, &root);
         assert_eq!(carry.len(), MAX_CARRY_PATHS);
@@ -1287,11 +1354,11 @@ mod carry_tests {
         let dir = temp_dir();
         let root = root_of(&dir);
         let covered = [
-            tool_call("read", "path", "src/a.rs"),
-            // Absolute path outside the workspace: must never enter the carry.
-            tool_call("read", "path", "/etc/passwd"),
+            tool_result_ok("read", "src/a.rs"),
+            // Absolute path (even one pointing inside): the carry floor drops it.
+            tool_result_ok("read", "/etc/passwd"),
             // Traversal escape above the workspace root: must never enter it.
-            tool_call("edit", "file_path", "../../etc/shadow"),
+            tool_result_ok("edit", "../../etc/shadow"),
         ];
         let carry = derive_carry_paths(&covered, &root);
         assert_eq!(carry, vec!["src/a.rs"]);
@@ -1304,9 +1371,11 @@ mod carry_tests {
         let covered = [
             Message::user("read the file please"),
             Message::assistant("sure"),
-            tool_call("bash", "path", "a.rs"),
-            tool_call("grep", "path", "b.rs"),
-            tool_call("read", "path", "real.rs"),
+            // Non-target tools that (hypothetically) carry a target field: still
+            // ignored, only read/write/ls/edit targets are collected.
+            tool_result_ok("bash", "a.rs"),
+            tool_result_ok("grep", "b.rs"),
+            tool_result_ok("read", "real.rs"),
         ];
         let carry = derive_carry_paths(&covered, &root);
         assert_eq!(carry, vec!["real.rs"]);

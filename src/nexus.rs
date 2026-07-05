@@ -660,6 +660,20 @@ impl ToolOutput {
         self.metadata.insert(key.to_string(), value);
         self
     }
+
+    /// Attach the workspace-relative form of `requested` as `metadata.target`
+    /// for the ADR-0044 compaction carry, when it resolves strictly inside
+    /// `root`. The carry derives its touched/read path set from these successful
+    /// results, so a read/ls/write/edit success records the file it acted on
+    /// here. A path that escapes the workspace (absolute or `..` traversal)
+    /// yields `None` from the strict carry floor and no `target` is attached, so
+    /// an out-of-workspace path is never carried.
+    pub(crate) fn with_workspace_target(self, root: &Path, requested: &str) -> Self {
+        match crate::tools::path::workspace_relative(root, requested) {
+            Some(rel) if !rel.is_empty() => self.with("target", Value::String(rel)),
+            _ => self,
+        }
+    }
 }
 
 /// Execution environment handed to a tool: the workspace root plus the shared
@@ -2535,7 +2549,7 @@ impl Message {
         }
     }
 
-    fn tool_result(call_id: &str, name: &str, content: &str) -> Self {
+    pub(crate) fn tool_result(call_id: &str, name: &str, content: &str) -> Self {
         Self {
             role: Role::Tool,
             content: content.to_string(),

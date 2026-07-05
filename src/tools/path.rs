@@ -136,6 +136,22 @@ pub(super) fn relative_display(root: &Path, path: &Path) -> String {
 /// independent of the `IRIS_SECURITY_OPT_IN` execution-time toggle, because the
 /// carry is durable context, not a one-shot execution decision.
 pub(crate) fn workspace_relative(root: &Path, requested: &str) -> Option<String> {
+    // Strict carry floor (ADR-0044): reject at the derivation boundary rather
+    // than cosmetically normalizing. An absolute path, or any path with a `..`
+    // (`ParentDir`) component, is dropped BEFORE normalization -- so a path that
+    // points inside the workspace via an absolute prefix, or one that traverses
+    // out and back in, is never carried even though it would normalize to an
+    // in-workspace relative form.
+    let path = Path::new(requested);
+    if path.is_absolute() {
+        return None;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
     if !is_inside_workspace(root, requested) {
         return None;
     }
@@ -174,6 +190,26 @@ mod tests {
         assert_eq!(workspace_relative(root, "../../etc/passwd"), None);
         // Empty request: rejected.
         assert_eq!(workspace_relative(root, ""), None);
+    }
+
+    #[test]
+    fn workspace_relative_rejects_absolute_inside_and_traversal_back_inside() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let root = root.as_path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"x").unwrap();
+
+        // An absolute path that points INSIDE the workspace is rejected at the
+        // carry boundary (ADR-0044): the persisted carry must be a plain
+        // workspace-relative path, never an absolute one, even when it resolves
+        // inside.
+        let abs_inside = root.join("src/a.rs");
+        assert_eq!(workspace_relative(root, abs_inside.to_str().unwrap()), None);
+        // A `..`-containing path that normalizes back inside the workspace is
+        // rejected before normalization, not cosmetically collapsed.
+        assert_eq!(workspace_relative(root, "src/../src/a.rs"), None);
+        assert_eq!(workspace_relative(root, "./src/../src/a.rs"), None);
     }
 
     #[test]
