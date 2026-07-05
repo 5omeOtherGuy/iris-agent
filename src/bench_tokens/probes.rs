@@ -13,21 +13,32 @@
 //! `run_real_cell`, so it reuses the JSONL schema and behavior metrics. See
 //! `workloads::probe_workloads`.
 //!
-//! Not every tool's reduction is arm-toggled (verified against the code, not
-//! the design doc): `grep` (path grouping, issue-338), `find` (directory
-//! compaction, issue-340) and `bash` (output filter, ADR-0037) respond to the
-//! reduce flag; `ls` does NOT -- its `_reduce` is ignored (issue-339 is not
-//! started), so ls has no A/B render probe and is deliberately absent here.
+//! Not every tool's advantage is the reduce flag (verified against the code,
+//! not the design doc). Two render-probe axes (`ProbeAxis`):
+//!   - `ReduceToggle`: reduce_output false vs true, args identical. `grep`
+//!     (path grouping, issue-338), `find` (directory compaction, issue-340),
+//!     `bash` (output filter, ADR-0037). `ls` does NOT respond (its `_reduce`
+//!     is ignored, issue-339) so ls has no A/B probe and is absent here.
+//!   - `ArgOverlay`: an always-on behavior toggled by a JSON arg, not the
+//!     reduce flag. `read` skim (issue-337): baseline `skim:false` vs reduced
+//!     `skim:true`, both at default reduce_output.
 //!
-//! Adding a tool is a data change: append a `ToolProbe` row.
+//! `edit` (issue-341) is not a byte-reduction probe at all -- its advantage is
+//! result-class correctness + the ADR-0038 conditional echo (exact success
+//! stays terse; a tolerant match echoes the applied region). It has its own
+//! deterministic probe (`edit_cases` / `run_edit_case`) asserting the outcome
+//! CLASS + the on-disk effect, not a reduction ratio.
+//!
+//! Adding a tool is a data change: append a `ToolProbe` (or `EditCase`) row.
 
 use std::cell::RefCell;
+use std::fs;
 use std::path::Path;
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::nexus::ToolEnv;
+use crate::nexus::{ClassifiedError, ToolEnv};
 use crate::tools::bench_support::{assert_min_reduction, assert_survives_verbatim, reduction_pct};
 use crate::tools::test_support::{TestDir, temp_dir};
 use crate::tools::{ToolState, built_in_tools};
@@ -44,6 +55,17 @@ pub(crate) enum ProbeWorkspace {
     Build(fn(&Path)),
 }
 
+/// What varies between a probe's baseline and reduced arm.
+pub(crate) enum ProbeAxis {
+    /// reduce_output false (baseline) vs true (reduced); args identical. For
+    /// tools whose reduction is the default-on output filter.
+    ReduceToggle,
+    /// Both arms at default reduce_output; the reduced arm merges this object
+    /// into the base args (shallow). For always-on behaviors a JSON arg toggles
+    /// (e.g. read `{"skim": true}`), not the reduce flag.
+    ArgOverlay(fn() -> Value),
+}
+
 /// One tool's render probe: fixed args over a workspace, compared across arms.
 pub(crate) struct ToolProbe {
     /// Probe id (stable label for reports/JSONL).
@@ -52,7 +74,11 @@ pub(crate) struct ToolProbe {
     pub(crate) tool: &'static str,
     /// How the probe's workspace is produced.
     pub(crate) workspace: ProbeWorkspace,
-    /// Tool arguments (identical across arms; only the reduce flag differs).
+    /// What differs between the baseline and reduced arm.
+    pub(crate) axis: ProbeAxis,
+    /// Base tool arguments. For `ReduceToggle` they are identical across arms;
+    /// for `ArgOverlay` they are the baseline and the reduced arm merges the
+    /// overlay on top.
     pub(crate) args: fn() -> Value,
     /// Minimum token-reduction bar (percent), reduced vs baseline. A floor, not
     /// an exact figure (ADR-0036): the bar is the contract, not the measurement.
@@ -111,13 +137,38 @@ fn render_over(workspace: &Path, tool: &str, args: &Value, reduce: bool) -> Stri
 pub(crate) fn run_render_probe(probe: &ToolProbe) -> RenderProbe {
     let workspace = probe_workspace(probe);
     let args = (probe.args)();
-    let baseline = render_over(&workspace.path, probe.tool, &args, false);
-    let reduced = render_over(&workspace.path, probe.tool, &args, true);
+    let (baseline, reduced) = match &probe.axis {
+        // Same args; the reduce flag is the only difference.
+        ProbeAxis::ReduceToggle => (
+            render_over(&workspace.path, probe.tool, &args, false),
+            render_over(&workspace.path, probe.tool, &args, true),
+        ),
+        // Both arms at default reduce_output; the reduced arm merges the
+        // overlay (e.g. read `skim:true`) into the base args.
+        ProbeAxis::ArgOverlay(overlay) => {
+            let mut reduced_args = args.clone();
+            merge_object(&mut reduced_args, (overlay)());
+            (
+                render_over(&workspace.path, probe.tool, &args, true),
+                render_over(&workspace.path, probe.tool, &reduced_args, true),
+            )
+        }
+    };
     let reduction_pct = reduction_pct(&baseline, &reduced);
     RenderProbe {
         baseline,
         reduced,
         reduction_pct,
+    }
+}
+
+/// Shallow-merge `overlay`'s object keys into `base` (both must be JSON
+/// objects). Used to add the reduced arm's arg (e.g. `skim:true`) to the base.
+fn merge_object(base: &mut Value, overlay: Value) {
+    if let (Some(base), Some(overlay)) = (base.as_object_mut(), overlay.as_object()) {
+        for (key, value) in overlay {
+            base.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -144,6 +195,7 @@ pub(crate) fn tool_probes() -> Vec<ToolProbe> {
             name: "grep-deadline-repeated-matches",
             tool: "grep",
             workspace: ProbeWorkspace::Fixture("probe_grep"),
+            axis: ProbeAxis::ReduceToggle,
             // Content mode, no context lines: isolate the path-dedup saving that
             // grep grouping (issue-338) delivers over the flat `path:line:` form.
             args: || json!({ "pattern": "deadline", "ignoreCase": true, "context": 0 }),
@@ -158,9 +210,31 @@ pub(crate) fn tool_probes() -> Vec<ToolProbe> {
             name: "find-wide-tree-grouping",
             tool: "find",
             workspace: ProbeWorkspace::Build(build_find_tree),
+            axis: ProbeAxis::ReduceToggle,
             args: || json!({ "pattern": "*.rs" }),
             min_reduction_pct: 20,
             needles: &["handler_zebra_target.rs"],
+            slow: false,
+        },
+        ToolProbe {
+            // read skim (issue-337, ADR-0036): an ALWAYS-ON behavior toggled by
+            // the `skim` arg, NOT the reduce flag. A comment-heavy source skims
+            // to its code signatures (whole-line comments + blank lines
+            // stripped); every exported name/constant survives verbatim. The
+            // never-worse guard means a thin file would fall back to full and
+            // fail the bar -- this fixture is deliberately comment-dominated.
+            name: "read-skim-comment-heavy",
+            tool: "read",
+            workspace: ProbeWorkspace::Fixture("probe_read"),
+            axis: ProbeAxis::ArgOverlay(|| json!({ "skim": true })),
+            args: || json!({ "path": "settlement.rs" }),
+            min_reduction_pct: 20,
+            needles: &[
+                "CHECKOUT_DEADLINE_MS",
+                "47231",
+                "settlement_id",
+                "PendingCharge",
+            ],
             slow: false,
         },
         ToolProbe {
@@ -174,10 +248,209 @@ pub(crate) fn tool_probes() -> Vec<ToolProbe> {
             name: "bash-cargo-test-failure",
             tool: "bash",
             workspace: ProbeWorkspace::Fixture("workload4_bash_diagnose"),
+            axis: ProbeAxis::ReduceToggle,
             args: || json!({ "command": "cargo test" }),
             min_reduction_pct: 20,
             needles: &["ceiling_is_exact", "8191", "8192"],
             slow: true,
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// edit result-class probe (issue-341): assert the OUTCOME CLASS + disk effect.
+//
+// edit is not a byte-reduction probe. Its advantage is that it distinguishes
+// five outcome classes with a stable machine token (ADR-0040) and keeps the
+// common exact-success case terse while echoing a tolerant match (ADR-0038).
+// Each case builds a tiny file, optionally reads it first (read-before-mutate),
+// optionally mutates it out-of-band, runs one edit, and reports the class +
+// whether disk changed. Deterministic; no provider.
+// ---------------------------------------------------------------------------
+
+/// One edit result-class case.
+pub(crate) struct EditCase {
+    /// Case id / stable label.
+    pub(crate) name: &'static str,
+    /// Initial contents written to `target.rs` in a fresh temp dir.
+    pub(crate) initial: &'static str,
+    /// `old_string` for the edit.
+    pub(crate) old: &'static str,
+    /// `new_string` for the edit.
+    pub(crate) new: &'static str,
+    /// Read the file first (satisfies read-before-mutate). `false` drives the
+    /// `stale-file` unread case.
+    pub(crate) pre_read: bool,
+    /// Optional out-of-band disk mutation applied after the read, before the
+    /// edit -- drives the `stale-file` modified case.
+    pub(crate) mutate: Option<fn(&Path)>,
+    /// Expected stable outcome class token (ADR-0040).
+    pub(crate) expect_class: &'static str,
+    /// Expected success (`Ok` vs classified `Err`).
+    pub(crate) expect_ok: bool,
+    /// Expected on-disk effect: did the file bytes change?
+    pub(crate) expect_disk_changed: bool,
+}
+
+/// Result of running one `EditCase`.
+pub(crate) struct EditOutcome {
+    pub(crate) class: String,
+    pub(crate) ok: bool,
+    pub(crate) disk_changed: bool,
+    /// Rendered success output length (0 on error) -- lets the caller prove an
+    /// exact success stays terser than a tolerant success (ADR-0038 echo).
+    pub(crate) output_len: usize,
+}
+
+/// Drive one edit case through the real read+edit dispatch on a shared
+/// `ToolState` (so read-before-mutate tracking carries across the two calls),
+/// and report the observed outcome class + disk effect.
+pub(crate) fn run_edit_case(case: &EditCase) -> EditOutcome {
+    let dir = temp_dir();
+    let file = dir.path.join("target.rs");
+    fs::write(&file, case.initial).expect("write edit fixture");
+    let before = fs::read(&file).expect("read edit fixture");
+
+    let tools = built_in_tools();
+    let read_tool = tools.by_name("read").expect("read tool");
+    let edit_tool = tools.by_name("edit").expect("edit tool");
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: &dir.path,
+        state: &state,
+        output_store: None,
+        output_sink: None,
+        mutation_guard: None,
+        session_span: None,
+    };
+
+    if case.pre_read {
+        // Full read (skim:false) satisfies read-before-mutate.
+        let _ = block_on(read_tool.execute(
+            &json!({ "path": "target.rs" }),
+            &env,
+            CancellationToken::new(),
+        ));
+    }
+    if let Some(mutate) = case.mutate {
+        mutate(&file);
+    }
+
+    let args = json!({
+        "file_path": "target.rs",
+        "old_string": case.old,
+        "new_string": case.new,
+    });
+    let result = block_on(edit_tool.execute(&args, &env, CancellationToken::new()));
+    let after = fs::read(&file).expect("re-read edit fixture");
+    let disk_changed = before != after;
+
+    match result {
+        Ok(out) => EditOutcome {
+            class: out
+                .metadata
+                .get("edit_outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("exact")
+                .to_string(),
+            ok: true,
+            disk_changed,
+            output_len: out.content.len(),
+        },
+        Err(error) => EditOutcome {
+            class: error
+                .downcast_ref::<ClassifiedError>()
+                .map(|c| c.class().to_string())
+                .unwrap_or_else(|| "unclassified".to_string()),
+            ok: false,
+            disk_changed,
+            output_len: 0,
+        },
+    }
+}
+
+/// Assert one edit case's contract: observed class, success flag, and on-disk
+/// effect all match the case's expectations. Returns the outcome so the caller
+/// can make cross-case assertions (e.g. exact terser than tolerant).
+pub(crate) fn assert_edit_case(case: &EditCase) -> EditOutcome {
+    let outcome = run_edit_case(case);
+    assert_eq!(
+        outcome.class, case.expect_class,
+        "[{}] outcome class",
+        case.name
+    );
+    assert_eq!(outcome.ok, case.expect_ok, "[{}] ok", case.name);
+    assert_eq!(
+        outcome.disk_changed, case.expect_disk_changed,
+        "[{}] disk changed",
+        case.name
+    );
+    outcome
+}
+
+/// The five edit outcome classes (ADR-0038/0040), each with its exact on-disk
+/// effect. Data-driven: adding a class is a row.
+pub(crate) fn edit_cases() -> Vec<EditCase> {
+    vec![
+        EditCase {
+            name: "exact",
+            initial: "let deadline = 47231;\nlet retries = 4;\n",
+            old: "47231",
+            new: "50000",
+            pre_read: true,
+            mutate: None,
+            expect_class: "exact",
+            expect_ok: true,
+            expect_disk_changed: true,
+        },
+        EditCase {
+            // Exact byte match fails (curly quotes in the file vs ASCII quotes
+            // in old_string) but the fuzzy fallback folds Unicode quotes and
+            // matches -> conditional echo fires (ADR-0038).
+            name: "tolerant",
+            initial: "let label = \u{201c}ready\u{201d};\n",
+            old: "let label = \"ready\";",
+            new: "let label = \"done\";",
+            pre_read: true,
+            mutate: None,
+            expect_class: "tolerant-match-fired",
+            expect_ok: true,
+            expect_disk_changed: true,
+        },
+        EditCase {
+            name: "not-found",
+            initial: "let deadline = 47231;\n",
+            old: "this text is absent",
+            new: "x",
+            pre_read: true,
+            mutate: None,
+            expect_class: "not-found",
+            expect_ok: false,
+            expect_disk_changed: false,
+        },
+        EditCase {
+            // "= v;" occurs twice; without replace_all the match is ambiguous.
+            name: "not-unique",
+            initial: "let a = v;\nlet b = v;\n",
+            old: "= v;",
+            new: "= w;",
+            pre_read: true,
+            mutate: None,
+            expect_class: "not-unique",
+            expect_ok: false,
+            expect_disk_changed: false,
+        },
+        EditCase {
+            // No prior read -> read-before-mutate rejects the edit as stale.
+            name: "stale-unread",
+            initial: "let deadline = 47231;\n",
+            old: "47231",
+            new: "50000",
+            pre_read: false,
+            mutate: None,
+            expect_class: "stale-file",
+            expect_ok: false,
+            expect_disk_changed: false,
         },
     ]
 }

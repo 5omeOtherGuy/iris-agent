@@ -843,3 +843,53 @@ CI-safe evidence that ADR-0049 genuinely unlocks bash in the harness. The live
 deny gate is never consulted. Later finding (Entry 15): the failing `cargo test`
 this workload runs IS structured-filtered, so it also exercises the bash filter,
 not just execution.
+
+## Entry 17 - Phase 6: read-skim + edit-result-class (the always-on axes)
+
+`read` and `edit` are NOT arm-toggled by `reduce_output`; each got its own probe
+shape rather than being forced into the reduce template.
+
+**read skim (issue-337) -- a second render-probe axis.** Generalized `ToolProbe`
+with `ProbeAxis`: `ReduceToggle` (grep/find/bash, reduce off vs on) and a new
+`ArgOverlay` (both arms at default reduce_output; the reduced arm merges a JSON
+arg). read uses `ArgOverlay(skim:true)`: baseline `skim:false` vs reduced
+`skim:true` on the SAME comment-heavy source. Measured **83.1%** (4306 -> 725 B)
+with all four needles (`CHECKOUT_DEADLINE_MS`, `47231`, `settlement_id`,
+`PendingCharge`) surviving verbatim -- skim strips whole-line comments + blank
+lines but keeps every code signature. The fixture is deliberately
+comment-dominated because read's never-worse guard falls back to a full read
+(and 0% reduction) on a thin file, which would fail the bar. A live
+`probe-read-skim-constant` workload asks a real model the exact constant from a
+skimmed read (opt-in, reuses `run_real_cell`).
+
+**edit result-class (issue-341) -- NOT a reduction ratio.** edit's advantage is
+that it distinguishes five outcome classes and keeps the common case cheap, so
+the probe asserts the CLASS + the on-disk effect, not bytes. `run_edit_case`
+drives the real read+edit dispatch on ONE `ToolState` (so read-before-mutate
+carries across the two calls), builds a tiny file, optionally pre-reads /
+mutates out-of-band, runs one edit, and reports the class + whether disk
+changed. All five hold deterministically:
+
+| case | class token | ok | disk changed | trigger |
+|---|---|---|---|---|
+| exact | `exact` | yes | yes | unique byte match |
+| tolerant | `tolerant-match-fired` | yes | yes | curly quotes in file vs ASCII in old_string; fuzzy folds Unicode |
+| not-found | `not-found` | no | no | old_string absent |
+| not-unique | `not-unique` | no | no | `= v;` twice, no replace_all |
+| stale | `stale-file` | no | no | edit with no prior read (read-before-mutate) |
+
+The class comes from the SUCCESS metadata `edit_outcome` and, on failure, from
+`ClassifiedError::class()` (a new `#[cfg(test)]` read accessor on the existing
+crate-internal error type -- the stable ADR-0040 token, so the probe never
+matches on error prose). The probe also proves an exact success output stays
+STRICTLY SHORTER than a tolerant success (the ADR-0038 conditional echo fires
+only on a tolerant match). edit's LIVE behavior metrics need no new workload --
+workload1 (fix-failing-test) and workload2 (multi-file rename) already drive
+real edits, so tool_counts/outcomes ride the existing schema.
+
+**Honesty note.** These are deterministic render + class measurements, not live
+model runs. The read live workload is wired and opt-in. `restrictions_enabled()`
+is `cfg!(test) || env`, so read-before-mutate and path confinement are genuinely
+active in the probe -- the stale-file class is a real rejection, not a stub. No
+token or success claim is made from these bytes (proxy ratios only, never mixed
+with real usage records).

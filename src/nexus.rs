@@ -671,6 +671,15 @@ impl ClassifiedError {
         self
     }
 
+    /// The stable machine-readable class token (ADR-0040), e.g. `not-found`,
+    /// `not-unique`, or `stale-file`. Read-only accessor used by the
+    /// tokens-per-task edit result-class probe to assert outcome classes
+    /// against the stable token instead of matching on error prose.
+    #[cfg(test)]
+    pub(crate) fn class(&self) -> &str {
+        &self.class
+    }
+
     /// The model-facing `metadata` object: `{ "class": ..., ...fields }`.
     fn to_metadata(&self) -> serde_json::Map<String, Value> {
         let mut obj = serde_json::Map::new();

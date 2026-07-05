@@ -30,7 +30,15 @@ Verified against the code (Phase 5b), not aspiration:
   not imply `reduce_output=false` tests them.
 
 Measured render reductions (deterministic, proxy tokens; `tool_render_probe_log`):
-grep 36.4%, find 55.7%, bash 21.2% -- all with needles surviving verbatim.
+grep 36.4%, find 55.7%, **read 83.1%** (skim, comment-heavy source), bash 21.2%
+-- all with needles surviving verbatim. read is toggled by the `skim` arg
+(`ProbeAxis::ArgOverlay`), not the reduce flag; its never-worse guard means a
+thin file would fall back to full, so the fixture is deliberately comment-heavy.
+
+`edit` (issue-341) has no reduction ratio -- its probe asserts the five OUTCOME
+CLASSES (exact / tolerant-match-fired / not-found / not-unique / stale-file)
+via the stable ADR-0040 class token plus the exact on-disk effect, and that an
+exact success stays terser than a tolerant success (ADR-0038 conditional echo).
 find's saving is real byte reduction: past the 1000-match default limit the
 listing compacts and directory grouping shows the same shown paths in fewer
 bytes. bash reduces only commands its filter recognizes -- a FAILING `cargo
@@ -175,7 +183,9 @@ Status through the current branch (`bench/tokens-per-task`, PR #391):
 5. [DONE] (L) Per-tool micro probes: grep + find + bash (render + real-model).
    `ls` has NO probe -- not arm-toggled (issue-339). "Log all results" (schema
    v3 kind discriminator) landed here too. -- commits 88671c6, e65649c
-6. [TODO] (M) read/edit separate-axis probes (reported as their own axes).
+6. [DONE] (M) read/edit separate-axis probes (reported as their own axes):
+   read skim render probe (`ProbeAxis::ArgOverlay`, 83.1%) + edit result-class
+   probe (5 classes + disk effect + exact-terser-than-tolerant). -- commit pending
 7. [TODO] (L) Full e2e matrix + Rust analyzer (`analysis.rs`); smoke before
    matrix; commit sanitized JSONL + report under `docs/benchmarks/`.
 

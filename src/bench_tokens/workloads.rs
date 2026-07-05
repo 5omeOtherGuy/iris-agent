@@ -156,6 +156,21 @@ pub(crate) fn probe_workloads() -> Vec<Workload> {
             needles: &["handler_zebra_target.rs"],
             build: Some(build_find_tree),
         },
+        Workload {
+            // read skim (issue-337): a comment-heavy source whose exported
+            // constant survives skim verbatim -- the model must report the
+            // exact value from a skimmed read. The scripted replay reads with
+            // `skim:true` to exercise the skim path; the live model chooses.
+            name: "probe-read-skim-constant",
+            fixture: "probe_read",
+            prompt: "Read the settlement module and report the exact integer value assigned \
+                     to the CHECKOUT_DEADLINE_MS constant. Answer with only that integer.",
+            script: script_probe_read,
+            check: check_probe_read_value,
+            approval: ApprovalProfile::DenyGateNoPrompts,
+            needles: &["47231"],
+            build: None,
+        },
     ]
 }
 
@@ -261,6 +276,19 @@ fn script_probe_find() -> Vec<AssistantTurn> {
     vec![
         call_turn("f", "find", json!({ "pattern": "*zebra*" })),
         answer_turn("services/aaa_target/gateway/handler_zebra_target.rs"),
+    ]
+}
+
+/// Scripted read-skim probe: skim-read the comment-heavy source, then answer
+/// the exported constant (which survives skim as code).
+fn script_probe_read() -> Vec<AssistantTurn> {
+    vec![
+        call_turn(
+            "r",
+            "read",
+            json!({ "path": "settlement.rs", "skim": true }),
+        ),
+        answer_turn("47231"),
     ]
 }
 
@@ -393,6 +421,23 @@ fn check_bash_diagnose(_workspace: &Path, final_text: &str) -> Outcome {
 
 /// Grep exact-value probe: the answer must carry the planted constant value.
 fn check_probe_grep_value(_workspace: &Path, final_text: &str) -> Outcome {
+    if final_text.contains("47231") {
+        Outcome {
+            success: true,
+            detail: "answer carries the exact CHECKOUT_DEADLINE_MS value (47231)".to_string(),
+        }
+    } else {
+        Outcome {
+            success: false,
+            detail: "answer missing the exact value 47231".to_string(),
+        }
+    }
+}
+
+/// Read-skim exact-value probe: the answer must carry the exported constant
+/// value, which a skim read keeps verbatim while stripping the surrounding
+/// comment narrative.
+fn check_probe_read_value(_workspace: &Path, final_text: &str) -> Outcome {
     if final_text.contains("47231") {
         Outcome {
             success: true,

@@ -56,7 +56,7 @@ mod workloads;
 #[cfg(test)]
 mod replay {
     use super::arms::Arm;
-    use super::probes::{assert_render_contract, tool_probes};
+    use super::probes::{assert_edit_case, assert_render_contract, edit_cases, tool_probes};
     use super::runner::{
         RunMetrics, bench_log_cell_error, bench_log_path, bench_log_render_probe, bench_log_reset,
         bench_reasoning, model_specs, run_real_cell, run_replay_arm, run_scripted_skip_perms,
@@ -398,6 +398,32 @@ mod replay {
     /// SLOW render probes (compile / heavy spawn), opt-in. Same contract as the
     /// fast set, kept out of the CI gate for speed. Run:
     ///   cargo test --bin iris tool_render_probes_slow -- --ignored --nocapture
+    /// The edit result-class probe (issue-341): every outcome class edit
+    /// distinguishes holds -- correct class token, success flag, and on-disk
+    /// effect -- and an exact success stays terser than a tolerant success
+    /// (the ADR-0038 conditional echo fires only on a tolerant match).
+    /// Deterministic; no provider.
+    #[test]
+    fn edit_result_classes_hold() {
+        let mut exact_len = None;
+        let mut tolerant_len = None;
+        for case in edit_cases() {
+            let outcome = assert_edit_case(&case);
+            match case.name {
+                "exact" => exact_len = Some(outcome.output_len),
+                "tolerant" => tolerant_len = Some(outcome.output_len),
+                _ => {}
+            }
+        }
+        let exact_len = exact_len.expect("exact case present");
+        let tolerant_len = tolerant_len.expect("tolerant case present");
+        assert!(
+            exact_len < tolerant_len,
+            "exact success ({exact_len} B) must stay terser than tolerant success \
+             ({tolerant_len} B); the ADR-0038 conditional echo fires only on tolerant",
+        );
+    }
+
     #[test]
     #[ignore = "slow render probe (compiles a fixture crate); run on demand"]
     fn tool_render_probes_slow() {
