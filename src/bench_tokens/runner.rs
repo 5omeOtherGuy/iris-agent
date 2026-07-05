@@ -15,6 +15,10 @@ use super::observer::{BenchObserver, ZeroPromptGate};
 use super::provider::ScriptedProvider;
 use super::workloads::{Outcome, Workload};
 
+/// JSONL run-record schema version. Bump when fields are added/renamed so an
+/// analyzer can branch on shape; readers must tolerate unknown extra fields.
+const BENCH_SCHEMA_VERSION: u32 = 2;
+
 /// Metrics from one workload x arm run.
 pub(crate) struct RunMetrics {
     pub(crate) arm: Arm,
@@ -125,6 +129,12 @@ pub(crate) struct RealRunRecord {
     pub(crate) handles_stored: u32,
     pub(crate) per_turn: Vec<(u64, u64)>,
     pub(crate) approvals_consulted: bool,
+    pub(crate) dangerous_approvals: u32,
+    pub(crate) tool_sequence: Vec<String>,
+    pub(crate) tool_errors: Vec<(String, String)>,
+    pub(crate) tool_result_bytes: u64,
+    pub(crate) tool_result_bytes_by_tool: std::collections::BTreeMap<String, u64>,
+    pub(crate) bash_exit_codes: Vec<i32>,
 }
 
 impl RealRunRecord {
@@ -223,8 +233,15 @@ pub(crate) fn run_real_cell(
         handles_stored: observer.handles_stored.get(),
         per_turn: observer.per_turn.borrow().clone(),
         approvals_consulted: gate.consulted.get(),
+        dangerous_approvals: observer.dangerous_approvals.get(),
+        tool_sequence: observer.tool_sequence.borrow().clone(),
+        tool_errors: observer.tool_errors.borrow().clone(),
+        tool_result_bytes: observer.tool_result_bytes.get(),
+        tool_result_bytes_by_tool: observer.tool_result_bytes_by_tool.borrow().clone(),
+        bash_exit_codes: observer.bash_exit_codes.borrow().clone(),
     };
     bench_log_append(&json!({
+        "schema_version": BENCH_SCHEMA_VERSION,
         "model": model,
         "workload": workload.name,
         "arm": record.arm.label(),
@@ -244,6 +261,16 @@ pub(crate) fn run_real_cell(
         "tool_counts": record.tool_counts,
         "handles_stored": record.handles_stored,
         "approvals": record.approvals_consulted,
+        "dangerous_approvals": record.dangerous_approvals,
+        "tool_sequence": record.tool_sequence,
+        "tool_errors": record
+            .tool_errors
+            .iter()
+            .map(|(name, message)| json!({ "name": name, "message": message }))
+            .collect::<Vec<_>>(),
+        "tool_result_bytes": record.tool_result_bytes,
+        "tool_result_bytes_by_tool": record.tool_result_bytes_by_tool,
+        "bash_exit_codes": record.bash_exit_codes,
         "per_turn": record
             .per_turn
             .iter()

@@ -30,6 +30,21 @@ pub(crate) struct BenchObserver {
     pub(crate) handles_stored: Cell<u32>,
     /// Per provider turn: (input_tokens, output_tokens), in order.
     pub(crate) per_turn: RefCell<Vec<(u64, u64)>>,
+    /// Calls auto-approved by `--dangerously-skip-permissions` (ADR-0049).
+    /// Proves a skip-permissions workload actually ran under the bypass.
+    pub(crate) dangerous_approvals: Cell<u32>,
+    /// Ordered tool-call names as executed (every attempt, incl. ones that
+    /// error) -- the shape that reveals re-looking (grep, read, grep, read...).
+    pub(crate) tool_sequence: RefCell<Vec<String>>,
+    /// Tool errors as (name, truncated message). Never the full output.
+    pub(crate) tool_errors: RefCell<Vec<(String, String)>>,
+    /// Total bytes of tool RESULT content that entered context -- the real-run
+    /// analogue of the replay proxy; differs between arms as reductions bite.
+    pub(crate) tool_result_bytes: Cell<u64>,
+    /// Per-tool result bytes (same total, split by tool name).
+    pub(crate) tool_result_bytes_by_tool: RefCell<BTreeMap<String, u64>>,
+    /// Exit codes reported by `bash` results, in order (for build/test loops).
+    pub(crate) bash_exit_codes: RefCell<Vec<i32>>,
 }
 
 impl BenchObserver {
@@ -78,6 +93,42 @@ impl AgentObserver for BenchObserver {
             AgentEvent::OutputHandleStored { .. } => {
                 self.handles_stored.set(self.handles_stored.get() + 1);
             }
+            // Ordered sequence of tool invocations (every attempt).
+            AgentEvent::ToolStarted(call) => {
+                self.tool_sequence.borrow_mut().push(call.name);
+            }
+            // Skip-permissions bypass (ADR-0049): count so a bash workload can
+            // assert it truly ran under the dangerous auto-approval.
+            AgentEvent::ToolAutoApprovedDangerous(_) => {
+                self.dangerous_approvals
+                    .set(self.dangerous_approvals.get() + 1);
+            }
+            // Result bytes that entered context (metadata only, never content),
+            // plus bash exit codes for build/test loops.
+            AgentEvent::ToolResult {
+                call,
+                content,
+                exit_code,
+                ..
+            } => {
+                let bytes = content.len() as u64;
+                self.tool_result_bytes
+                    .set(self.tool_result_bytes.get() + bytes);
+                *self
+                    .tool_result_bytes_by_tool
+                    .borrow_mut()
+                    .entry(call.name.clone())
+                    .or_insert(0) += bytes;
+                if call.name == "bash" {
+                    self.bash_exit_codes
+                        .borrow_mut()
+                        .push(exit_code.unwrap_or(0));
+                }
+            }
+            AgentEvent::ToolError { call, message } => {
+                let message: String = message.chars().take(200).collect();
+                self.tool_errors.borrow_mut().push((call.name, message));
+            }
             _ => {}
         }
         Ok(())
@@ -103,5 +154,57 @@ impl ApprovalGate for ZeroPromptGate {
     ) -> ApprovalFuture<'a> {
         self.consulted.set(true);
         Box::pin(async move { Ok(ApprovalDecision::Deny) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "c".to_string(),
+            thought_signature: None,
+            name: name.to_string(),
+            arguments: json!({}),
+        }
+    }
+
+    #[test]
+    fn observer_captures_extended_schema() {
+        let obs = BenchObserver::default();
+        obs.on_event(AgentEvent::ToolStarted(call("grep"))).unwrap();
+        obs.on_event(AgentEvent::ToolResult {
+            call: call("grep"),
+            content: "hello".to_string(),
+            exit_code: None,
+            duration: None,
+        })
+        .unwrap();
+        obs.on_event(AgentEvent::ToolStarted(call("bash"))).unwrap();
+        obs.on_event(AgentEvent::ToolResult {
+            call: call("bash"),
+            content: "boom".to_string(),
+            exit_code: Some(2),
+            duration: None,
+        })
+        .unwrap();
+        obs.on_event(AgentEvent::ToolAutoApprovedDangerous(call("bash")))
+            .unwrap();
+        obs.on_event(AgentEvent::ToolError {
+            call: call("edit"),
+            message: "old_string not found".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(obs.tool_sequence.borrow().as_slice(), &["grep", "bash"]);
+        // "hello" (5) + "boom" (4) = 9 result bytes into context.
+        assert_eq!(obs.tool_result_bytes.get(), 9);
+        assert_eq!(obs.tool_result_bytes_by_tool.borrow()["bash"], 4);
+        assert_eq!(obs.bash_exit_codes.borrow().as_slice(), &[2]);
+        assert_eq!(obs.dangerous_approvals.get(), 1);
+        assert_eq!(obs.tool_errors.borrow().len(), 1);
+        assert_eq!(obs.tool_errors.borrow()[0].0, "edit");
     }
 }
