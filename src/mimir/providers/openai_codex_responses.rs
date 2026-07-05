@@ -318,7 +318,10 @@ fn build_codex_request(
 /// `minimal..xhigh` (pi-mono `openai-codex-responses.ts`,
 /// `openai-responses.ts`). `Off` maps to omitted because gpt-5.5 cannot disable
 /// reasoning (`thinkingLevelMap.off == null`), so there is no disable field to
-/// send.
+/// send. The `summary: "auto"` field asks the Responses API to stream
+/// `response.reasoning_summary_text.delta` events that drive the live thinking
+/// rail (ADR-0050); this is the display-safe summary -- the raw chain-of-thought
+/// stays in `reasoning.encrypted_content` and is never shown (ADR-0016).
 fn codex_reasoning(reasoning: Option<ReasoningEffort>) -> Option<Value> {
     let effort = match reasoning? {
         ReasoningEffort::Off => return None,
@@ -328,7 +331,7 @@ fn codex_reasoning(reasoning: Option<ReasoningEffort>) -> Option<Value> {
         ReasoningEffort::High => "high",
         ReasoningEffort::XHigh => "xhigh",
     };
-    Some(json!({ "effort": effort }))
+    Some(json!({ "effort": effort, "summary": "auto" }))
 }
 
 /// Build the Codex `tools` declaration array from the injected tool set: one
