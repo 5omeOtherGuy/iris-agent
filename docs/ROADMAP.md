@@ -844,12 +844,23 @@ Potential scope:
   provider-reported write tokens) against a per-turn saving of the folded body
   -- break-even tens-to-hundreds of turns -- while the same fold at a compaction
   boundary is free (marginal write <= 0, asserted) and a cold cache makes it
-  free and immediately profitable; that economics motivates #400's cache-aware
-  flush triggers, with realized per-turn cache accounting tracked in
-  [#395](https://github.com/5omeOtherGuy/iris-agent/issues/395). Deferred (still
-  open, outside #372): the over-budget-no-coverable-range floor,
-  estimate-vs-actual token calibration, and provider-native context-management
-  interplay.]
+  free and immediately profitable. The cache-aware fold scheduler shipped on
+  that evidence ([#400](https://github.com/5omeOtherGuy/iris-agent/issues/400),
+  [ADR-0051](adr/0051-cache-aware-fold-flush-scheduling.md), PRs #405-#409):
+  detection recomputes a pending-fold set every boundary; flushes ride free
+  breaks (compaction A1, selection/reasoning switch A2/A3, cold resume A4,
+  below-minimum prefix A5, manual `/compact` A6, inferred mid-session cold B
+  from a provider-neutral `CacheProfile` seam in mimir) with the watermark as
+  the Class C backstop; every flush is trigger-tagged on the fold entry, the
+  observer event, and the `/context` breakdown. Per-trigger marginal write <= 0
+  is CI-asserted; the Class-B live pair realized a -355-token write delta
+  (Anthropic, real 390s idle) and a 317-token input saving (Codex, read-side).
+  `clearToolUses` + microcompaction are now mutually exclusive (ADR-0022
+  addendum), discharging the provider-native context-management interplay gap.
+  Phase 3 calibration (persisted per-turn usage, watermark retuning) is
+  [#395](https://github.com/5omeOtherGuy/iris-agent/issues/395). Deferred
+  (still open, outside #372): the over-budget-no-coverable-range floor and
+  estimate-vs-actual token calibration.]
 - Comparison against naive transcript-passing.
 - Native bash output filtering
   ([#336](https://github.com/5omeOtherGuy/iris-agent/issues/336),

@@ -1,7 +1,7 @@
 # ADR-0048: Fold spent tool results behind handles (opt-in microcompaction)
 
 **Date**: 2026-07-04
-**Status**: accepted
+**Status**: accepted; flush *timing* extended by [ADR-0051](0051-cache-aware-fold-flush-scheduling.md) (cache-aware trigger classes; the watermark is now the Class C backstop)
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context
