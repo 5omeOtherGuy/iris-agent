@@ -39,6 +39,7 @@ use crate::ui::terminal_surface::TerminalSurface;
 use frame_stats::FrameStats;
 use pager::PagerSurface;
 
+mod activity;
 mod component;
 mod frame_stats;
 mod overlay;

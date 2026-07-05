@@ -20,6 +20,7 @@ use crate::ui::UiEvent;
 use crate::ui::modal::Modal;
 use crate::ui::slash::Palette;
 use crate::ui::terminal_surface::CURSOR_MARKER;
+use crate::ui::tui::activity::WorkPhase;
 
 use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
@@ -617,10 +618,11 @@ pub(crate) struct Screen {
     /// user sees their queued input register before it is injected. Reset at
     /// each turn boundary.
     queued: usize,
-    /// Whether the active turn is currently awaiting the provider rather than a
-    /// local tool or approval. Surfaced on the working indicator so a provider
-    /// stall is distinguishable from a hidden local prompt or blocked tool.
-    provider_waiting: bool,
+    /// Coarse, provider-neutral phase of the running task, surfaced as the
+    /// always-visible working-header label so the status rail is never blank
+    /// while a task runs. Driven by display events (`WorkPhase::on_event`) and
+    /// the approval lifecycle; only meaningful while the spinner is active.
+    phase: WorkPhase,
     /// Whether the terminal (pane) reports itself focused. Terminals without
     /// focus reporting never send focus events, so this stays true. While
     /// unfocused the spinner holds its frame and requests no tick redraws, so N
@@ -713,7 +715,7 @@ impl Screen {
             footer: None,
             modal: None,
             queued: 0,
-            provider_waiting: false,
+            phase: WorkPhase::default(),
             terminal_focused: true,
             approval_policy: ApprovalPolicy::OnRequest,
             start_page: None,
@@ -1037,23 +1039,13 @@ impl Screen {
             footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
         }
-        match &event {
-            UiEvent::ProviderTurnStarted { .. } => {
-                self.provider_waiting = true;
-            }
-            UiEvent::ProviderTurnCompleted { .. }
-            | UiEvent::ProviderTurnCancelled { .. }
-            | UiEvent::ProviderTurnError { .. }
-            | UiEvent::AssistantTextDelta(_)
-            | UiEvent::ToolStarted(_)
-            | UiEvent::ToolAutoApproved(_)
-            | UiEvent::ToolResult { .. }
-            | UiEvent::ToolError { .. }
-            | UiEvent::ToolCancelled(_)
-            | UiEvent::ToolDenied(_) => {
-                self.provider_waiting = false;
-            }
-            _ => {}
+        // Advance the always-visible work phase from the display-event stream.
+        // Approval transitions are owned by `show_approval`/`clear_approval`, so
+        // they are not derived here; every other event that implies a phase
+        // updates the label. `None` keeps the current phase (e.g. a running
+        // tool's output deltas do not change the RunningTool label).
+        if let Some(phase) = WorkPhase::on_event(&event) {
+            self.phase = phase;
         }
         // `UiEvent::UserMessage` (a mid-run injected steering/follow-up message)
         // is committed as a user row inside `transcript.apply`, so order matches
@@ -1206,6 +1198,7 @@ impl Screen {
         // Pager: a submitted prompt snaps the view back to the live tail.
         self.scroll.follow_latest();
         self.spinner.start();
+        self.phase = WorkPhase::Starting;
         self.turn_divider = TurnDivider::default();
         self.approval_hint = None;
         self.queued = 0;
@@ -1271,6 +1264,10 @@ impl Screen {
         let shell = call.name == "bash";
         // A docked approval takes the input surface: close any dropdown.
         self.session_menu = None;
+        // The approval prompt is the primary surface; the working animation is
+        // suppressed (see `working_lines`) so it never competes with the
+        // decision, and the phase reflects that we are blocked on the user.
+        self.phase = WorkPhase::AwaitingApproval;
         self.approval_hint = Some(ApprovalHint {
             tool: call.name.clone(),
             target: run_target(call),
@@ -1288,8 +1285,22 @@ impl Screen {
         self.transcript.record_approval(call, decision);
     }
 
-    pub(crate) fn clear_approval(&mut self) {
+    /// Clear the docked approval prompt. `approved` selects the phase to resume:
+    /// an approved call is about to run (`PreparingTool`, refined to
+    /// `RunningTool` by the next `ToolStarted`), while a denial, cancellation,
+    /// or error is winding the turn down (`Finishing`). The change is guarded on
+    /// the phase still being `AwaitingApproval`, so a terminal event applied
+    /// just before clearing (the turn-error cleanup path applies its event
+    /// first) is never overwritten.
+    pub(crate) fn clear_approval(&mut self, approved: bool) {
         self.approval_hint = None;
+        if matches!(self.phase, WorkPhase::AwaitingApproval) {
+            self.phase = if approved {
+                WorkPhase::PreparingTool
+            } else {
+                WorkPhase::Finishing
+            };
+        }
     }
 
     /// ctrl+o: expand every foldable panel if any is collapsed, else collapse
@@ -1334,13 +1345,20 @@ impl Screen {
                 self.spinner.frame(),
                 self.spinner.elapsed(),
                 self.footer.as_ref(),
-                self.provider_waiting.then_some("model"),
+                Some(self.phase.label()),
                 self.queued,
                 usize::from(width),
             )
         } else {
             Vec::new()
         }
+    }
+
+    /// The current work-phase label (test-only): lets phase-transition tests
+    /// assert the phase even when the working header is suppressed (approval).
+    #[cfg(test)]
+    pub(crate) fn work_phase_label(&self) -> &str {
+        self.phase.label()
     }
 }
 
@@ -2296,6 +2314,7 @@ mod tests {
         approval_panel_lines, composer_statusline, context_meter_filled, display_width, line_text,
         parse_context_window, session_bar, truncate_cwd_middle, working_lines,
     };
+    use crate::nexus::{ReviewContext, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::tui::WORKING_FRAMES;
 
@@ -2813,6 +2832,163 @@ mod tests {
             !text.contains("model"),
             "provider wait label clears after completion: {text:?}"
         );
+    }
+
+    // --- Slice 2: always-visible work-phase state machine ---
+
+    fn bash_call(command: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            thought_signature: None,
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": command }),
+        }
+    }
+
+    #[test]
+    fn work_header_is_non_empty_within_one_frame_of_turn_start() {
+        // DoD: the status header must be meaningful the instant a task starts,
+        // before any provider event arrives -- never a blank/dead moment.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let lines = screen.working_lines(80);
+        assert!(!lines.is_empty(), "a running turn always shows a header");
+        let text = line_text(&lines[0]);
+        assert!(
+            text.contains("Starting"),
+            "header names the starting phase immediately: {text:?}"
+        );
+    }
+
+    #[test]
+    fn work_phase_walks_waiting_thinking_answering_running_approval_done() {
+        // DoD: the phase machine covers the whole task lifecycle with
+        // provider-neutral labels, including a named+targeted running tool and a
+        // distinct approval phase.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        assert_eq!(screen.work_phase_label(), "Starting");
+
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        assert_eq!(screen.work_phase_label(), "Waiting for model");
+
+        screen.apply(UiEvent::AssistantReasoningDelta("Planning".to_string()));
+        assert_eq!(screen.work_phase_label(), "Thinking");
+
+        screen.apply(UiEvent::AssistantTextDelta("Here".to_string()));
+        assert_eq!(screen.work_phase_label(), "Responding");
+
+        screen.apply(UiEvent::ToolStarted(bash_call("ls -la")));
+        let running = screen.work_phase_label().to_string();
+        assert!(running.contains("bash"), "names the tool: {running:?}");
+        assert!(running.contains("ls -la"), "names the target: {running:?}");
+
+        // Approval is its own phase and, while shown, suppresses the working
+        // animation so it never competes with the decision (the approval panel
+        // is the primary surface).
+        screen.show_approval(
+            &bash_call("rm -rf build"),
+            false,
+            false,
+            &ReviewContext::default(),
+        );
+        assert_eq!(screen.work_phase_label(), "Awaiting approval");
+        assert!(
+            screen.working_lines(80).is_empty(),
+            "no working header competes with the approval prompt"
+        );
+
+        // Decision in (approved): the header resumes preparing the tool, then
+        // the turn winds down.
+        screen.clear_approval(true);
+        assert_eq!(screen.work_phase_label(), "Preparing tool");
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: None,
+        });
+        assert_eq!(screen.work_phase_label(), "Finishing");
+    }
+
+    #[test]
+    fn cancel_and_denied_approval_wind_down_without_a_stale_label() {
+        // A cancelled turn must not leave the header stuck on the phase it was
+        // in (the old provider_waiting bool cleared on cancel); it winds down.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta("Planning".to_string()));
+        assert_eq!(screen.work_phase_label(), "Thinking");
+        screen.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+        assert_eq!(
+            screen.work_phase_label(),
+            "Finishing",
+            "a cancelled turn winds down, not a stale Thinking"
+        );
+
+        // A DENIED approval winds the turn down too -- it must not resume the
+        // misleading "Preparing tool" label, since no tool is about to run.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.show_approval(
+            &bash_call("rm -rf build"),
+            false,
+            false,
+            &ReviewContext::default(),
+        );
+        assert_eq!(screen.work_phase_label(), "Awaiting approval");
+        screen.clear_approval(false);
+        assert_eq!(
+            screen.work_phase_label(),
+            "Finishing",
+            "a denied/cancelled approval does not claim a tool is being prepared"
+        );
+    }
+
+    #[test]
+    fn work_phase_labels_are_provider_neutral() {
+        // DoD: no provider/model-specific strings in the status labels. Labels
+        // live in `activity.rs` and describe the activity, never the provider or
+        // model, so a new provider needs no label change.
+        use crate::ui::tui::activity::WorkPhase;
+        let labels = [
+            WorkPhase::Starting.label().to_string(),
+            WorkPhase::WaitingProvider.label().to_string(),
+            WorkPhase::Thinking.label().to_string(),
+            WorkPhase::Answering.label().to_string(),
+            WorkPhase::PreparingTool.label().to_string(),
+            WorkPhase::AwaitingApproval.label().to_string(),
+            WorkPhase::running_tool(&bash_call("ls"))
+                .label()
+                .to_string(),
+            WorkPhase::Finishing.label().to_string(),
+        ];
+        // Provider/model identity tokens that must never appear in a label.
+        let banned = [
+            "openai",
+            "gpt",
+            "codex",
+            "claude",
+            "anthropic",
+            "gemini",
+            "o1",
+            "o3",
+        ];
+        for label in labels {
+            let lower = label.to_lowercase();
+            for token in banned {
+                assert!(
+                    !lower.contains(token),
+                    "label {label:?} must not name provider/model {token:?}"
+                );
+            }
+        }
     }
 
     #[test]

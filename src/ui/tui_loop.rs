@@ -1545,7 +1545,10 @@ async fn run_harness_op<P: ChatProvider>(
     if let Err(error) = result {
         tui.screen.apply(UiEvent::from_turn_error(&error));
     }
-    tui.screen.clear_approval();
+    // The turn is unwinding on an error; not an approval-to-run. (The error
+    // event applied just above already set the Finishing phase, so this is a
+    // guarded no-op for the phase, but stays honest about the outcome.)
+    tui.screen.clear_approval(false);
     Ok(())
 }
 
@@ -2351,7 +2354,7 @@ fn resolve_input_eof(
     token.cancel();
     if let Some(p) = pending.take() {
         let _ = p.reply.send(ApprovalDecision::Deny);
-        screen.clear_approval();
+        screen.clear_approval(false);
     }
 }
 
@@ -2568,7 +2571,7 @@ fn handle_running_event(
                 steering.clear();
                 if let Some(p) = pending.take() {
                     let _ = p.reply.send(ApprovalDecision::Deny);
-                    screen.clear_approval();
+                    screen.clear_approval(false);
                 }
                 return true;
             }
@@ -2623,7 +2626,13 @@ fn handle_running_event(
                     let p = pending.take().expect("pending approval present");
                     screen.record_approval(&p.call, decision);
                     let _ = p.reply.send(decision);
-                    screen.clear_approval();
+                    let approved = matches!(
+                        decision,
+                        ApprovalDecision::Allow
+                            | ApprovalDecision::AllowAlways
+                            | ApprovalDecision::AllowProject
+                    );
+                    screen.clear_approval(approved);
                     return true;
                 }
                 return false;
