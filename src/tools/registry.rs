@@ -456,7 +456,7 @@ impl Tool for RecallTool {
         // no workspace path, no shell, no `ToolState`. Kept sequential (the
         // default) rather than opted into safe-parallel: it needs no such
         // guarantee and the task keeps recall sequential-by-default.
-        Box::pin(async move { recall::execute(env.output_store, args) })
+        Box::pin(async move { recall::execute(env.output_store, env.session_span, args) })
     }
 }
 
@@ -659,6 +659,7 @@ mod tests {
             workspace,
             state,
             output_store: None,
+            session_span: None,
             output_sink: sink,
             mutation_guard: None,
         }

@@ -26,14 +26,33 @@ use crate::handles::HandleStore;
 use crate::nexus::ToolOutputStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderEvent, Role,
-    SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
+    SessionSpanReader, SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
 };
 use crate::session::{
-    SessionLog, estimate_tokens, message_token_estimate, preview_line, render_carry_block,
-    render_compaction_body,
+    SessionLog, estimate_tokens, message_token_estimate, preview_line, read_span,
+    render_carry_block, render_compaction_body,
 };
 use crate::tools::ToolState;
 use crate::tools::recall;
+
+/// Read-only [`SessionSpanReader`] over a SINGLE session transcript, for the
+/// `recall` tool's standalone entry-id span (ADR-0046 / issue #373). Holds only
+/// this session's transcript path (cloned, so it never borrows the harness), so
+/// a span read is scoped to this session by construction -- it cannot address
+/// another session's data. `None` (in-memory session with no durable log)
+/// resolves every span to no turns, which the tool surfaces as a clean error.
+struct SessionSpanSource {
+    transcript: Option<PathBuf>,
+}
+
+impl SessionSpanReader for SessionSpanSource {
+    fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
+        match &self.transcript {
+            Some(path) => read_span(path, from, to),
+            None => Ok(Vec::new()),
+        }
+    }
+}
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
 /// range always shrinks the context regardless of how long the covered turns
@@ -429,6 +448,16 @@ impl<P: ChatProvider> Harness<P> {
         self.session.as_ref().map(SessionLog::path)
     }
 
+    /// Build the read-only standalone-span reader for THIS session's transcript,
+    /// injected into each turn's [`ToolEnv`] for the `recall` tool (ADR-0046 /
+    /// issue #373). It clones only this session's path, so a span read can never
+    /// address another session.
+    fn span_source(&self) -> SessionSpanSource {
+        SessionSpanSource {
+            transcript: self.session.as_ref().map(|log| log.path().to_path_buf()),
+        }
+    }
+
     /// The workspace directory this harness is anchored to, used to scope the
     /// deterministic session lookup (`/sessions`, ADR-0031) to this project's
     /// cwd-slug directory.
@@ -542,6 +571,7 @@ impl<P: ChatProvider> Harness<P> {
         if let Some(id) = self.session_id().map(str::to_string) {
             self.git_safety.set_session_id(id);
         }
+        let span_source = self.span_source();
         let env = ToolEnv {
             workspace: &self.workspace,
             state: &self.state,
@@ -549,6 +579,8 @@ impl<P: ChatProvider> Harness<P> {
                 .output_store
                 .as_ref()
                 .map(|store| store as &dyn crate::nexus::ToolOutputStore),
+            // Read-only standalone-span reader over THIS session (ADR-0046).
+            session_span: Some(&span_source),
             // Streaming is Nexus-owned: it injects a per-call sink on the
             // exclusive path. The harness env carries none.
             output_sink: None,
@@ -626,6 +658,7 @@ impl<P: ChatProvider> Harness<P> {
             // Builds the same env the turn loop uses so the dirty-tree guard
             // (#262) protects any files the command writes (build artifacts).
             let run = {
+                let span_source = self.span_source();
                 let env = ToolEnv {
                     workspace: &self.workspace,
                     state: &self.state,
@@ -633,6 +666,7 @@ impl<P: ChatProvider> Harness<P> {
                         .output_store
                         .as_ref()
                         .map(|store| store as &dyn crate::nexus::ToolOutputStore),
+                    session_span: Some(&span_source),
                     output_sink: None,
                     mutation_guard: Some(&self.git_safety),
                 };
@@ -674,6 +708,7 @@ impl<P: ChatProvider> Harness<P> {
                     // let it make another attempt.
                     let feedback = verification_feedback(&command, exit_code, &output);
                     let retry_result = {
+                        let span_source = self.span_source();
                         let env = ToolEnv {
                             workspace: &self.workspace,
                             state: &self.state,
@@ -681,6 +716,7 @@ impl<P: ChatProvider> Harness<P> {
                                 .output_store
                                 .as_ref()
                                 .map(|store| store as &dyn crate::nexus::ToolOutputStore),
+                            session_span: Some(&span_source),
                             output_sink: None,
                             mutation_guard: Some(&self.git_safety),
                         };

@@ -7053,6 +7053,7 @@ fn run_preset_turn(
         workspace,
         state: &state,
         output_store: None,
+        session_span: None,
         output_sink: None,
         mutation_guard: guard,
     };

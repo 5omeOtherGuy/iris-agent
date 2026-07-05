@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 use super::{Harness, SummarizerKind};
 use crate::handles::HandleStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ChatProvider, Message, ProviderStream, ToolOutputStore, Tools,
+    Agent, AgentEvent, AgentObserver, ChatProvider, Message, ProviderStream, SessionSpanReader,
+    ToolOutputStore, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools, recall};
@@ -179,6 +180,7 @@ fn resume_then_compact_registers_a_recall_handle_returning_the_originals() {
     let store = HandleStore::for_session(&path);
     let out = recall::execute_for_test(
         Some(&store as &dyn ToolOutputStore),
+        None,
         &serde_json::json!({ "handle": handle }),
     )
     .unwrap();
@@ -237,8 +239,63 @@ fn recall_reference_survives_rebuild_verbatim() {
     let handle_store = HandleStore::for_session(&path);
     let out = recall::execute_for_test(
         Some(&handle_store as &dyn ToolOutputStore),
+        None,
         &serde_json::json!({ "handle": rebuilt_handle }),
     )
     .unwrap();
     assert!(out.content.contains(NEEDLE));
+}
+
+#[test]
+fn standalone_span_recalls_originals_from_this_session_read_path() {
+    // FINDING 2 at the harness seam: a recall with ONLY an entry-id span (no
+    // handle) resolves the covered original DIRECTLY from THIS session's read
+    // path (`session::read_span`), reusing the durable ids #377 threaded --
+    // there is no reverse span->handle index and no parallel store.
+    let (root, workspace, path) = seed_session();
+    let (_harness, entry_ids) = resume_and_compact(&root.path, &workspace.path, &path);
+    let first_id = entry_ids
+        .first()
+        .cloned()
+        .flatten()
+        .expect("resumed prefix has a durable first id");
+
+    // The reader is built over THIS session's transcript path only, so the span
+    // read is scoped to this session and cannot address another session's data.
+    let reader = super::SessionSpanSource {
+        transcript: Some(path.clone()),
+    };
+    let out = recall::execute_for_test(
+        None,
+        Some(&reader as &dyn SessionSpanReader),
+        &serde_json::json!({ "from": first_id, "to": first_id }),
+    )
+    .unwrap();
+    assert!(
+        out.content.contains(NEEDLE),
+        "standalone span returns the covered original from the session read path: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains(&format!("id={first_id}")),
+        "recalled turn carries its durable entry id {first_id}: {}",
+        out.content
+    );
+
+    // Scoping proof: a reader over a DIFFERENT, unrelated session transcript
+    // resolves the same span to nothing (a tool error), never this session's
+    // turns -- the span cannot escape its own session's transcript.
+    let (_other_root, _other_workspace, other_path) = seed_session();
+    let other_reader = super::SessionSpanSource {
+        transcript: Some(other_path),
+    };
+    // A far-out-of-range span on that session selects nothing -> tool error.
+    let err = recall::execute_for_test(
+        None,
+        Some(&other_reader as &dyn SessionSpanReader),
+        &serde_json::json!({ "from": "ffff0", "to": "ffff9" }),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("selects no turns"), "{err}");
 }

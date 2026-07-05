@@ -23,7 +23,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::nexus::{Message, Role, ToolOutputStore};
+use crate::nexus::{Message, Role, SessionSpanReader, ToolOutputStore};
 
 /// Model-facing tool name (also the key the system-prompt fragment and the
 /// registry gate on). Kept in one place so the tool, its fragment, and the
@@ -43,20 +43,19 @@ const MAX_SEARCH_HITS: usize = 30;
 /// full turns; a windowed read then retrieves the hit verbatim).
 const SEARCH_PREVIEW_CHARS: usize = 200;
 
-pub(super) const DESCRIPTION: &str = "Retrieve the ORIGINAL turns of a compacted range that a summary replaced (ADR-0046). After compaction the context shows a summary plus a recall reference naming a `handle`; pass that `handle` to page the original turns back, windowed with `offset` (1-indexed turn-group) and `limit`. Narrow to an entry-id `from`..`to` span, or pass a `pattern` to search the range and get back matching turns with their entry ids (then do a windowed read on a hit). Tool-call/tool-result pairs are returned intact. Read-only over this session's own transcript: no file path, no shell, no approval.";
+pub(super) const DESCRIPTION: &str = "Retrieve the ORIGINAL turns of a compacted range that a summary replaced (ADR-0046). Address them EITHER by `handle` OR by a standalone entry-id span. After compaction the context shows a summary plus a recall reference naming a `handle`; pass that `handle` to page the original turns back, windowed with `offset` (1-indexed turn-group) and `limit`, narrowed to a `from`..`to` span, or searched with `pattern` (returns matching turns with their entry ids). Or omit `handle` and pass a `from`/`to` entry-id span to recall those original turns of THIS session directly. Provide exactly one of `handle` or a standalone span. Tool-call/tool-result pairs are returned intact. Read-only over this session's own transcript: no file path, no shell, no approval.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "handle": { "type": "string", "description": "The recall handle id from a compaction reference (the `recall(handle=...)` marker in the summary)." },
-            "from": { "type": "string", "description": "Optional inclusive start entry id: narrow the returned turns to the [from, to] span within the compacted range." },
-            "to": { "type": "string", "description": "Optional inclusive end entry id for the span (used with `from`)." },
+            "handle": { "type": "string", "description": "The recall handle id from a compaction reference (the `recall(handle=...)` marker in the summary). Omit it to address original turns by a standalone `from`/`to` entry-id span instead." },
+            "from": { "type": "string", "description": "Inclusive start entry id. With a `handle`, narrows the returned turns to the [from, to] span within the compacted range; without a `handle`, defines a standalone span read directly from this session." },
+            "to": { "type": "string", "description": "Inclusive end entry id for the span (used with `from`)." },
             "pattern": { "type": "string", "description": "Optional search: return only turns whose content contains this substring, with their entry ids (bounded count)." },
             "offset": { "type": "integer", "description": "1-indexed turn-group to start the window at (windowed reads only)." },
             "limit": { "type": "integer", "description": "Maximum turn-groups to return in a windowed read." }
-        },
-        "required": ["handle"]
+        }
     })
 }
 
@@ -97,13 +96,7 @@ pub(crate) fn serialize_covered(
     let turns = messages
         .iter()
         .enumerate()
-        .map(|(i, message)| RecalledTurn {
-            id: entry_ids.get(i).cloned().flatten(),
-            role: message.role.as_str().to_string(),
-            content: message.content.clone(),
-            tool_name: message.tool_name.clone(),
-            tool_call_id: message.tool_call_id.clone(),
-        })
+        .map(|(i, message)| recalled_turn(entry_ids.get(i).cloned().flatten(), message))
         .collect();
     let blob = RecallBlob {
         covered_from: from.to_string(),
@@ -113,6 +106,19 @@ pub(crate) fn serialize_covered(
     // Serialization is infallible for these owned scalar fields; fall back to an
     // empty object rather than panicking inside the compaction path.
     serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Build one [`RecalledTurn`] from a durable id and a message, copying the
+/// pairing fields verbatim. Shared by the compaction-time blob serializer and
+/// the standalone-span read path so both produce identical turn records.
+fn recalled_turn(id: Option<String>, message: &Message) -> RecalledTurn {
+    RecalledTurn {
+        id,
+        role: message.role.as_str().to_string(),
+        content: message.content.clone(),
+        tool_name: message.tool_name.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+    }
 }
 
 /// The recall reference embedded in a rebuilt summary (ADR-0046 / ADR-0045
@@ -127,7 +133,8 @@ pub(crate) fn recall_marker(handle: &str, from: &str, to: &str) -> String {
 
 #[derive(Debug, Deserialize)]
 struct RecallInput {
-    handle: String,
+    #[serde(default)]
+    handle: Option<String>,
     #[serde(default)]
     from: Option<String>,
     #[serde(default)]
@@ -146,17 +153,42 @@ struct RecallInput {
 #[cfg(test)]
 pub(crate) fn execute_for_test(
     store: Option<&dyn ToolOutputStore>,
+    session_span: Option<&dyn SessionSpanReader>,
     args: &Value,
 ) -> Result<super::ToolOutput> {
-    execute(store, args)
+    execute(store, session_span, args)
 }
 
 pub(super) fn execute(
     store: Option<&dyn ToolOutputStore>,
+    session_span: Option<&dyn SessionSpanReader>,
     args: &Value,
 ) -> Result<super::ToolOutput> {
-    let input: RecallInput = serde_json::from_value(args.clone())
-        .context("recall tool arguments must include a string `handle`")?;
+    let input: RecallInput =
+        serde_json::from_value(args.clone()).context("recall tool arguments are malformed")?;
+    // Optional entry-id span, validated at the boundary: a non-hex bound is
+    // malformed input and rejected rather than silently ignored.
+    let span = parse_span(input.from.as_deref(), input.to.as_deref())?;
+
+    // Exactly one addressing MODE: a `handle` (a compaction reference; a span
+    // then narrows within its blob) OR a standalone entry-id span read directly
+    // from this session. A non-empty handle selects the handle path.
+    match input.handle.as_deref().filter(|h| !h.trim().is_empty()) {
+        Some(handle) => execute_handle(store, handle, span, &input),
+        None => execute_span(session_span, span, &input),
+    }
+}
+
+/// Handle path: resolve the covered range from the ADR-0011 store, optionally
+/// narrow to `span` within the blob, then search or window. An explicit span
+/// that lands outside the covered range (selects zero turns) is a tool error,
+/// not a successful "no turns" (issue #373 FINDING 1).
+fn execute_handle(
+    store: Option<&dyn ToolOutputStore>,
+    handle: &str,
+    span: Option<(u64, u64)>,
+    input: &RecallInput,
+) -> Result<super::ToolOutput> {
     let store = store.ok_or_else(|| {
         anyhow!("no session handle store is available; there is nothing to recall")
     })?;
@@ -164,18 +196,14 @@ pub(super) fn execute(
     // id -- the store validates ids before any read -- so a bad handle is a clean
     // tool error here, never a panic or a traversal.
     let content = store
-        .get(&input.handle)?
-        .ok_or_else(|| anyhow!("unknown or expired recall handle: {}", input.handle))?;
+        .get(handle)?
+        .ok_or_else(|| anyhow!("unknown or expired recall handle: {}", handle))?;
     let blob: RecallBlob = serde_json::from_str(&content).map_err(|_| {
         anyhow!(
-            "handle {} is not a recall handle (it holds a different kind of stored output)",
-            input.handle
+            "handle {handle} is not a recall handle (it holds a different kind of stored output)"
         )
     })?;
 
-    // Optional entry-id span, validated at the boundary: a non-hex bound is
-    // malformed input and rejected rather than silently ignored.
-    let span = parse_span(input.from.as_deref(), input.to.as_deref())?;
     let selected: Vec<&RecalledTurn> = match span {
         Some((lo, hi)) => blob
             .turns
@@ -184,11 +212,68 @@ pub(super) fn execute(
             .collect(),
         None => blob.turns.iter().collect(),
     };
+    // An explicit span that selects nothing is out of range for this handle:
+    // report it rather than returning a misleading successful empty read.
+    if span.is_some() && selected.is_empty() {
+        return Err(anyhow!(
+            "recall span selects no turns in this handle (covered entry ids {}..{})",
+            blob.covered_from,
+            blob.covered_to
+        ));
+    }
 
     if let Some(pattern) = input.pattern.as_deref().filter(|p| !p.is_empty()) {
         return Ok(search(&selected, pattern, &blob));
     }
     Ok(window(&selected, input.offset, input.limit, &blob))
+}
+
+/// Standalone-span path (issue #373 FINDING 2): resolve the original turns of an
+/// entry-id `[from, to]` range directly from THIS session's transcript through
+/// the read-only [`SessionSpanReader`] seam (no handle, no parallel store). The
+/// seam reads only the harness's own session, so a span cannot address another
+/// session. A span that selects zero turns is out of range and a tool error.
+fn execute_span(
+    session_span: Option<&dyn SessionSpanReader>,
+    span: Option<(u64, u64)>,
+    input: &RecallInput,
+) -> Result<super::ToolOutput> {
+    let (lo, hi) = span
+        .ok_or_else(|| anyhow!("recall needs either a `handle` or a `from`/`to` entry-id span"))?;
+    let reader = session_span
+        .ok_or_else(|| anyhow!("no session transcript is available; there is nothing to recall"))?;
+    let turns: Vec<RecalledTurn> = reader
+        .recall_span(lo, hi)?
+        .iter()
+        .map(|(id, message)| recalled_turn(id.clone(), message))
+        .collect();
+    if turns.is_empty() {
+        return Err(anyhow!(
+            "recall span {lo:#x}..{hi:#x} selects no turns in this session"
+        ));
+    }
+    // Synthesize the blob metadata from the actual bounds of the resolved turns
+    // so the output carries the real covered range, then reuse the same
+    // search/window rendering the handle path uses.
+    let blob = RecallBlob {
+        covered_from: span_bound_id(&turns, false),
+        covered_to: span_bound_id(&turns, true),
+        turns,
+    };
+    let selected: Vec<&RecalledTurn> = blob.turns.iter().collect();
+    if let Some(pattern) = input.pattern.as_deref().filter(|p| !p.is_empty()) {
+        return Ok(search(&selected, pattern, &blob));
+    }
+    Ok(window(&selected, input.offset, input.limit, &blob))
+}
+
+/// The first (or last) resolved turn's entry id, for the standalone-span blob's
+/// `covered_from`/`covered_to` display metadata. `(none)` when the bound turn
+/// carries no id (a legacy id-less entry).
+fn span_bound_id(turns: &[RecalledTurn], last: bool) -> String {
+    let turn = if last { turns.last() } else { turns.first() };
+    turn.and_then(|t| t.id.clone())
+        .unwrap_or_else(|| "(none)".to_string())
 }
 
 /// Parse the optional `from`/`to` entry-id span into an inclusive `(lo, hi)`
@@ -384,6 +469,26 @@ mod tests {
         })
     }
 
+    /// A stand-in [`SessionSpanReader`] over a fixed set of `(id, message)`
+    /// turns, filtering to the requested inclusive numeric range exactly as the
+    /// real session read path does. Scoped to its own canned turns, so it models
+    /// the harness's single-session boundary.
+    struct FakeSpan(Vec<(Option<String>, Message)>);
+    impl SessionSpanReader for FakeSpan {
+        fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|(id, _)| {
+                    id.as_deref()
+                        .and_then(|s| u64::from_str_radix(s, 16).ok())
+                        .is_some_and(|n| n >= from && n <= to)
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
     #[test]
     fn recall_returns_original_turns_with_pairs_intact() {
         // A user turn, an assistant tool call, and its tool result: recall must
@@ -402,7 +507,7 @@ mod tests {
         ];
         let (_dir, store, handle) = store_with(&messages, &ids);
 
-        let out = execute(Some(&store), &json!({ "handle": handle })).unwrap();
+        let out = execute(Some(&store), None, &json!({ "handle": handle })).unwrap();
         // All original content is present.
         assert!(
             out.content.contains("please read the config"),
@@ -440,6 +545,7 @@ mod tests {
 
         let out = execute(
             Some(&store),
+            None,
             &json!({ "handle": handle, "pattern": "NEEDLE" }),
         )
         .unwrap();
@@ -465,6 +571,7 @@ mod tests {
         // Entry ids 03..05 inclusive.
         let out = execute(
             Some(&store),
+            None,
             &json!({ "handle": handle, "from": "03", "to": "05" }),
         )
         .unwrap();
@@ -484,6 +591,7 @@ mod tests {
 
         let out = execute(
             Some(&store),
+            None,
             &json!({ "handle": handle, "offset": 3, "limit": 2 }),
         )
         .unwrap();
@@ -497,7 +605,7 @@ mod tests {
     #[test]
     fn unknown_or_malformed_handle_is_a_tool_error_not_a_traversal() {
         let (_dir, store, _handle) = store_with(&[Message::user("x")], &[Some("01".to_string())]);
-        let unknown = execute(Some(&store), &json!({ "handle": "deadbeef" }))
+        let unknown = execute(Some(&store), None, &json!({ "handle": "deadbeef" }))
             .unwrap_err()
             .to_string();
         assert!(
@@ -505,7 +613,7 @@ mod tests {
             "{unknown}"
         );
         // A forged traversal id is rejected by the store, surfaced as unknown.
-        let traversal = execute(Some(&store), &json!({ "handle": "../secret" }))
+        let traversal = execute(Some(&store), None, &json!({ "handle": "../secret" }))
             .unwrap_err()
             .to_string();
         assert!(
@@ -516,7 +624,7 @@ mod tests {
 
     #[test]
     fn missing_store_is_a_tool_error() {
-        let err = execute(None, &json!({ "handle": "deadbeef" }))
+        let err = execute(None, None, &json!({ "handle": "deadbeef" }))
             .unwrap_err()
             .to_string();
         assert!(err.contains("no session handle store"), "{err}");
@@ -527,11 +635,127 @@ mod tests {
         let (_dir, store, handle) = store_with(&[Message::user("x")], &[Some("01".to_string())]);
         let err = execute(
             Some(&store),
+            None,
             &json!({ "handle": handle, "from": "not-hex", "to": "05" }),
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("must be a hex entry id"), "{err}");
+    }
+
+    #[test]
+    fn standalone_span_without_handle_returns_originals_with_pairs_intact() {
+        // FINDING 2: a span with NO handle resolves original turns directly from
+        // the session read path, keeping tool-call/result pairs in one group.
+        let session = FakeSpan(vec![
+            (
+                Some("01".to_string()),
+                Message::user("please read the config"),
+            ),
+            (
+                Some("02".to_string()),
+                tool_call_msg("call_1", "read", "config.toml"),
+            ),
+            (
+                Some("03".to_string()),
+                Message::tool_result("call_1", "read", "PORT=8080"),
+            ),
+            (Some("04".to_string()), Message::assistant("done")),
+        ]);
+        // No handle at all: addressing is by the standalone entry-id span.
+        let out = execute(None, Some(&session), &json!({ "from": "01", "to": "04" })).unwrap();
+        assert!(
+            out.content.contains("please read the config"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("PORT=8080"), "{}", out.content);
+        assert!(out.content.contains("done"), "{}", out.content);
+        // Ids surfaced, and the call+result stay in one turn-group (#2), not split.
+        let call_pos = out.content.find("id=02").unwrap();
+        let result_pos = out.content.find("id=03").unwrap();
+        assert!(
+            out.content[call_pos..result_pos].contains("#2"),
+            "call is group #2"
+        );
+        assert!(
+            !out.content[result_pos..].starts_with("#3 id=03"),
+            "tool result must not open its own turn-group"
+        );
+    }
+
+    #[test]
+    fn standalone_span_narrows_to_the_requested_range() {
+        // The span is applied by the session read path, so only in-range turns
+        // come back -- proving the span, not the whole session, is returned.
+        let session = FakeSpan(
+            (0..10)
+                .map(|n| {
+                    (
+                        Some(format!("{n:02x}")),
+                        Message::user(&format!("turn {n}")),
+                    )
+                })
+                .collect(),
+        );
+        let out = execute(None, Some(&session), &json!({ "from": "03", "to": "05" })).unwrap();
+        assert!(out.content.contains("turn 3"));
+        assert!(out.content.contains("turn 5"));
+        assert!(!out.content.contains("turn 2"));
+        assert!(!out.content.contains("turn 6"));
+    }
+
+    #[test]
+    fn out_of_range_span_on_a_handle_is_a_tool_error() {
+        // FINDING 1: an explicit span outside the covered range must be a tool
+        // error, not a successful "no turns" read.
+        let messages: Vec<Message> = (0..4)
+            .map(|n| Message::user(&format!("turn {n}")))
+            .collect();
+        let ids: Vec<Option<String>> = (0..4).map(|n| Some(format!("{n:02x}"))).collect();
+        let (_dir, store, handle) = store_with(&messages, &ids);
+        let err = execute(
+            Some(&store),
+            None,
+            &json!({ "handle": handle, "from": "90", "to": "99" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("selects no turns"), "{err}");
+    }
+
+    #[test]
+    fn out_of_range_standalone_span_is_a_tool_error() {
+        // FINDING 1 for the standalone path: a span the session has no turns for
+        // is a tool error, never a successful empty read.
+        let session = FakeSpan(vec![(Some("01".to_string()), Message::user("only turn"))]);
+        let err = execute(None, Some(&session), &json!({ "from": "90", "to": "99" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("selects no turns in this session"), "{err}");
+    }
+
+    #[test]
+    fn malformed_standalone_span_bound_is_rejected() {
+        // SECURITY FLOOR: a non-hex span bound is rejected at the boundary before
+        // any session read -- never a panic or a traversal.
+        let session = FakeSpan(vec![(Some("01".to_string()), Message::user("x"))]);
+        let err = execute(
+            None,
+            Some(&session),
+            &json!({ "from": "../etc", "to": "05" }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be a hex entry id"), "{err}");
+    }
+
+    #[test]
+    fn neither_handle_nor_span_is_a_tool_error() {
+        // Exactly one addressing mode is required: with neither a handle nor a
+        // span there is nothing to address.
+        let err = execute(None, None, &json!({})).unwrap_err().to_string();
+        assert!(err.contains("either a `handle` or"), "{err}");
     }
 
     #[test]

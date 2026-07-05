@@ -444,6 +444,25 @@ pub(crate) trait ToolOutputStore {
     fn get(&self, id: &str) -> Result<Option<String>>;
 }
 
+/// Read-only seam the `recall` tool uses to resolve a STANDALONE entry-id span
+/// (ADR-0046 / issue #373): the original turns of a durable `[from, to]` id
+/// range, read straight from THIS session's transcript rather than through a
+/// compaction handle. The Tier-2 Wayland harness implements it over its OWN
+/// session log, so it is scoped to a single session by construction -- a span
+/// can never address another session's data or escape the session boundary.
+/// Nexus owns only this contract (mirroring [`ToolOutputStore`]) and never
+/// touches the filesystem itself. `None` on [`ToolEnv::session_span`] (tests,
+/// in-memory sessions) means no standalone-span read path is available.
+pub(crate) trait SessionSpanReader {
+    /// Return the original turns whose durable entry id falls in the inclusive
+    /// numeric `[from, to]` range, in transcript order, each paired with its
+    /// durable id. The bounds are already parsed/validated by the caller; an
+    /// empty vec means the span selected nothing (the caller turns that into a
+    /// tool error for an explicit span). Errors only on a transcript read
+    /// failure -- never a panic or a path escape.
+    fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>>;
+}
+
 /// Display-only live-output sink for a running tool (issue #90 sub-item 1). A
 /// long-running tool (today only `bash`) forwards each output chunk here as it
 /// is produced; Nexus wraps it per-call and re-emits an
@@ -691,6 +710,11 @@ pub(crate) struct ToolEnv<'a> {
     /// `None` keeps every output inline (no durable session storage available),
     /// preserving the original in-memory behavior. Harness-owned, injected here.
     pub(crate) output_store: Option<&'a dyn ToolOutputStore>,
+    /// Optional read-only session-span seam for the `recall` tool's standalone
+    /// entry-id span (ADR-0046 / issue #373). `None` (tests, in-memory session)
+    /// disables the standalone-span path; the harness injects a reader over its
+    /// OWN transcript, so a span stays scoped to this session. Harness-owned.
+    pub(crate) session_span: Option<&'a dyn SessionSpanReader>,
     /// Optional live-output sink for streaming a running tool's output (issue
     /// #90 sub-item 1). `None` (the harness default) keeps the tool
     /// non-streaming; Nexus injects a per-call sink on the exclusive path so a
@@ -1899,6 +1923,7 @@ impl<P: ChatProvider> Agent<P> {
                     workspace: env.workspace,
                     state: env.state,
                     output_store: env.output_store,
+                    session_span: env.session_span,
                     output_sink: Some(&emitter),
                     mutation_guard: env.mutation_guard,
                 };
