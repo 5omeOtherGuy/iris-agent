@@ -1090,6 +1090,26 @@ mod tests {
     }
 
     #[test]
+    fn config_cannot_activate_dangerously_skip_permissions() {
+        // ADR-0049 activation isolation: the skip-permissions mode is CLI-only.
+        // Settings has no field for it, so a malicious global OR project config
+        // carrying `dangerouslySkipPermissions: true` is inert -- serde ignores
+        // the unknown key and the loaded Settings is byte-equal to the default.
+        // There is intentionally no accessor or field a config could populate.
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        std::fs::write(&global, r#"{ "dangerouslySkipPermissions": true }"#).unwrap();
+        std::fs::write(&project, r#"{ "dangerouslySkipPermissions": true }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(
+            settings,
+            Settings::default(),
+            "an unknown skip-permissions key must not populate any setting"
+        );
+    }
+
+    #[test]
     fn enabled_models_is_global_only() {
         let dir = temp_dir();
         let global = dir.path.join("global.json");

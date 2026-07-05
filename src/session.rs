@@ -353,6 +353,33 @@ impl SessionLog {
         Ok(id)
     }
 
+    /// Append a `dangerousMode` entry recording that this session ran with
+    /// `--dangerously-skip-permissions` (ADR-0049): every gated tool call was
+    /// auto-approved without a floor check. Modeled on
+    /// [`append_task_opened`](Self::append_task_opened): append-only, chained in
+    /// the leaf link, and skipped by [`read_messages`] so it never enters
+    /// provider context. It is transcript metadata for auditors -- a resumed or
+    /// audited session shows the mode was active -- not an enforcement or
+    /// recovery input, and it is only ever written from the explicit CLI flag.
+    pub(crate) fn append_dangerous_mode(&mut self) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "dangerousMode",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "mode": "dangerously-skip-permissions",
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append dangerous-mode marker to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
     /// Reopen an existing transcript file for append, so a resumed session
     /// continues the same log instead of starting a new one. Reads the header
     /// id and the existing entries to restore the leaf link (`parentId` of the
@@ -957,20 +984,22 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        // `message`, `compaction`, `fold`, `modelSelection`, and `taskLifecycle`
-        // entries all occupy the leaf chain and an entry-id slot, so a resumed
-        // append must link its `parentId` past, and count its `next_seq`
-        // beyond, whichever kind is the current leaf. (`fold`, `modelSelection`,
-        // and `taskLifecycle` are audit records; the read/rebuild path skips
-        // them, but the chain must still flow through them or `parentId` breaks
-        // -- and `append_fold` consumes a seq, so ignoring `fold` here would let
-        // the next append reuse the fold's id (issue #378).)
+        // `message`, `compaction`, `fold`, `modelSelection`, `taskLifecycle`,
+        // and `dangerousMode` entries all occupy the leaf chain and an
+        // entry-id slot, so a resumed append must link its `parentId` past,
+        // and count its `next_seq` beyond, whichever kind is the current leaf.
+        // (`fold`, `modelSelection`, `taskLifecycle`, and `dangerousMode` are
+        // audit records; the read/rebuild path skips them, but the chain must
+        // still flow through them or `parentId` breaks -- and `append_fold`
+        // consumes a seq, so ignoring `fold` here would let the next append
+        // reuse the fold's id (issue #378).)
         match value.get("type").and_then(Value::as_str) {
             Some("message")
             | Some("compaction")
             | Some("fold")
             | Some("modelSelection")
-            | Some("taskLifecycle") => {}
+            | Some("taskLifecycle")
+            | Some("dangerousMode") => {}
             _ => continue,
         }
         if value.get("type").and_then(Value::as_str) == Some("compaction") {
@@ -1673,6 +1702,48 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("invalid session id"));
+    }
+
+    #[test]
+    fn append_dangerous_mode_writes_an_audit_entry() {
+        // ADR-0049: the skip-permissions mode is recorded as transcript
+        // metadata so a resumed/audited session shows it was active.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append_dangerous_mode().unwrap();
+        let entries = lines(log.path());
+        assert_eq!(entries.len(), 2); // header + marker
+        assert_eq!(entries[1]["type"], "dangerousMode");
+        assert_eq!(entries[1]["mode"], "dangerously-skip-permissions");
+        assert!(entries[1]["parentId"].is_null());
+    }
+
+    #[test]
+    fn resume_chains_through_the_dangerous_mode_entry() {
+        // The audit marker occupies the leaf chain, so a resumed append must
+        // link its parentId to it (not fork past it) and never reuse its id.
+        let dir = temp_dir();
+        let path = {
+            let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+            log.append_dangerous_mode().unwrap();
+            log.append(&Message::user("hi")).unwrap();
+            log.path().to_path_buf()
+        };
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        resumed.append(&Message::assistant("there")).unwrap();
+        let entries = lines(&path);
+        assert_eq!(entries.len(), 4); // header + marker + user + assistant
+        let marker_id = entries[1]["id"].as_str().unwrap();
+        let user_id = entries[2]["id"].as_str().unwrap();
+        let asst_id = entries[3]["id"].as_str().unwrap();
+        assert_eq!(
+            entries[2]["parentId"], marker_id,
+            "user links to the marker"
+        );
+        assert_eq!(entries[3]["parentId"], user_id, "resumed append chains on");
+        // Ids are unique: the resumed append did not collide with the marker.
+        assert_ne!(asst_id, marker_id);
+        assert_ne!(asst_id, user_id);
     }
 
     #[test]

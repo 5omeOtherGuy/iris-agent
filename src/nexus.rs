@@ -44,6 +44,13 @@ const PREVIEW_TAIL_BYTES: usize = 2 * 1024;
 // provider stream.
 const INTERRUPT_NOTICE: &str = "interrupted; send another message to continue.";
 
+/// Loud one-time warning shown at session start when
+/// `--dangerously-skip-permissions` is active (ADR-0049). ASCII only so it
+/// renders identically on stderr and in the TUI; kept here as the single source
+/// of truth for the host banner and the audit trail.
+pub(crate) const SKIP_PERMISSIONS_BANNER: &str =
+    "ALL PERMISSION CHECKS DISABLED - every command will run without approval";
+
 /// Outcome of an approval review for a single tool call. Provider/UI-neutral so
 /// the core loop owns the approval policy without depending on any front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +329,14 @@ pub(crate) enum AgentEvent {
     /// persistent project policy (ADR-0027). Emitted by Nexus, never inferred
     /// by a front-end, so the policy stays Nexus-owned.
     ToolAutoApproved(ToolCall),
+    /// A gated tool was auto-approved because the session runs in
+    /// `--dangerously-skip-permissions` mode (ADR-0049): the approval gate is
+    /// bypassed for EVERY gated call, including calls a safety floor
+    /// (destructive/dirty) would normally stop. A distinct, greppable audit
+    /// event so this bypass is never silent and never confused with an
+    /// ordinary policy auto-approval. Emitted by Nexus; the mode is CLI-only
+    /// and session-scoped, so no repo/config/state can produce it.
+    ToolAutoApprovedDangerous(ToolCall),
     DiffPreview {
         call: ToolCall,
         diff: String,
@@ -968,6 +983,14 @@ pub(crate) struct Agent<P> {
     // Nexus owns the enforcement: the mode only decides prompt-vs-auto-vs-deny
     // for a call not already blocked by a floor or covered by an explicit grant.
     approval_mode: ApprovalMode,
+    // `--dangerously-skip-permissions` (ADR-0049): when true, EVERY gated tool
+    // call is auto-approved, including calls a safety floor (destructive/dirty)
+    // would normally stop. Set ONLY by the host from the explicit CLI flag at
+    // construction; it is deliberately not a live toggle and has no config,
+    // trust-store, env, or repo path that can enable it (activation isolation).
+    // Session-scoped: no grant is ever persisted while it is on, and turning it
+    // off restores exactly the prior behavior.
+    skip_permissions: bool,
     // Provider/model round-trip id sequence. Nexus owns these ids because it
     // owns the provider loop; Wayland may persist them, but never mints them.
     next_provider_turn_seq: u32,
@@ -1056,6 +1079,7 @@ impl<P: ChatProvider> Agent<P> {
             project_policy: ProjectPolicy::default(),
             policy_sink: None,
             approval_mode: ApprovalMode::default(),
+            skip_permissions: false,
             next_provider_turn_seq: 0,
             max_tool_roundtrips: None,
             mutated_this_turn: false,
@@ -1092,6 +1116,24 @@ impl<P: ChatProvider> Agent<P> {
         self.approval_mode
     }
 
+    /// Enable `--dangerously-skip-permissions` (ADR-0049) for this session. A
+    /// construction-time builder, NOT a runtime setter: the host installs it
+    /// once from the explicit CLI flag, and nothing else (config file, project
+    /// file, trust store, env var, or model/tool/provider request) can call it.
+    /// That keeps activation CLI-only, so a malicious repo has no path to
+    /// granting itself approval. When on, every gated call is auto-approved,
+    /// floors included, and no grant is ever persisted.
+    pub(crate) fn with_skip_permissions(mut self, skip: bool) -> Self {
+        self.skip_permissions = skip;
+        self
+    }
+
+    /// Whether this session runs in `--dangerously-skip-permissions` mode.
+    #[cfg(test)]
+    pub(crate) fn skip_permissions(&self) -> bool {
+        self.skip_permissions
+    }
+
     /// Install an optional graceful soft cap on tool round-trips per turn.
     /// `None` keeps the default unbounded loop; `Some(n)` ends the turn with a
     /// Notice after `n` round-trips. The host threads the configured value from
@@ -1118,6 +1160,7 @@ impl<P: ChatProvider> Agent<P> {
             project_policy: ProjectPolicy::default(),
             policy_sink: None,
             approval_mode: ApprovalMode::default(),
+            skip_permissions: false,
             next_provider_turn_seq,
             max_tool_roundtrips: None,
             mutated_this_turn: false,
@@ -1731,6 +1774,21 @@ impl<P: ChatProvider> Agent<P> {
             }
             if !tool.requires_approval() && !dirty_gate {
                 obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+            } else if self.skip_permissions {
+                // `--dangerously-skip-permissions` (ADR-0049): the operator has
+                // taken responsibility for every effect this session. Bypass the
+                // approval gate for this gated call BEFORE any floor, grant, or
+                // preset is consulted -- including the destructive and dirty-tree
+                // floors that normally re-prompt. This is the single skip check
+                // at the top of the approval decision path; the floor/preset
+                // logic below is left untouched for every non-skip session.
+                //
+                // Non-persistence (invariant): nothing is written to
+                // `session_allowed` or the project `policy_sink` here, so a
+                // skip-mode session leaves no persistent allow behind. The audit
+                // is a distinct, greppable event so the bypass is never silent.
+                obs.on_event(AgentEvent::ToolAutoApprovedDangerous(call.clone()))?;
+                emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
             } else {
                 // A dirty-tree gate (issue #262) forces the approval path even
                 // for a tool that does not otherwise require approval: a

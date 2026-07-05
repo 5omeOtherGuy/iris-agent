@@ -67,30 +67,44 @@ fn dispatch() -> Result<()> {
     if args.len() != before {
         ui::screen_mode::set_no_alt_screen_cli();
     }
+    // `--dangerously-skip-permissions` (ADR-0049) is positional-agnostic and
+    // CLI-ONLY: strip it here so every session entry point honors it, and pass
+    // the resulting bool explicitly down to Nexus. It is deliberately not read
+    // from any config file, project file, trust store, or env var, so a
+    // repository can never grant itself approval.
+    let before = args.len();
+    args.retain(|arg| arg != "--dangerously-skip-permissions");
+    let skip_permissions = args.len() != before;
     // Headless `--print` mode is detected before the command table so `-p`/
     // `--print` (with an optional `--approve` in any position) dispatches to the
     // one-shot runner; a malformed print invocation falls through to the usage
     // error below.
     if let Some(invocation) = print::parse_print_args(&args) {
-        return run_print(&invocation.prompt, invocation.approve);
+        return run_print(&invocation.prompt, invocation.approve, skip_permissions);
     }
     match args.as_slice() {
-        [] => run_agent(false),
-        [flag] if flag == "--plain" => run_agent(true),
+        [] => run_agent(false, skip_permissions),
+        [flag] if flag == "--plain" => run_agent(true, skip_permissions),
         // `-c`/`--continue` resumes the newest session for the cwd; parsed like
         // the other bare flags, with an optional trailing `--plain`.
-        [flag] if is_continue(flag) => continue_agent(false),
-        [flag, plain] if is_continue(flag) && plain == "--plain" => continue_agent(true),
+        [flag] if is_continue(flag) => continue_agent(false, skip_permissions),
+        [flag, plain] if is_continue(flag) && plain == "--plain" => {
+            continue_agent(true, skip_permissions)
+        }
         // `resume` with a trailing `--plain` (and no id) prints the plain list;
         // this must precede the `resume <id>` arm so `--plain` is not read as an
         // id.
-        [command, plain] if command == "resume" && plain == "--plain" => resume_pick(true),
+        [command, plain] if command == "resume" && plain == "--plain" => {
+            resume_pick(true, skip_permissions)
+        }
         // `resume` with no id: pick a session (picker on a rich TTY, plain list
         // otherwise).
-        [command] if command == "resume" => resume_pick(false),
-        [command, session_id] if command == "resume" => resume_agent(session_id, false),
+        [command] if command == "resume" => resume_pick(false, skip_permissions),
+        [command, session_id] if command == "resume" => {
+            resume_agent(session_id, false, skip_permissions)
+        }
         [command, session_id, flag] if command == "resume" && flag == "--plain" => {
-            resume_agent(session_id, true)
+            resume_agent(session_id, true, skip_permissions)
         }
         [command, provider] if command == "login" && provider == "openai-codex" => {
             login_openai_codex(select_openai_codex_method()?)
@@ -283,14 +297,14 @@ fn configured_provider() -> String {
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
 }
 
-fn run_agent(force_plain: bool) -> Result<()> {
-    run_agent_inner(force_plain, None)
+fn run_agent(force_plain: bool, skip_permissions: bool) -> Result<()> {
+    run_agent_inner(force_plain, None, skip_permissions)
 }
 
 /// `iris --continue` / `iris -c`: resume the newest session for the current
 /// directory. A clear usage error when the directory has no prior session; on
 /// success it reuses the standard [`resume_agent`] path.
-fn continue_agent(force_plain: bool) -> Result<()> {
+fn continue_agent(force_plain: bool, skip_permissions: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let store = session::SessionStore::open_default()?;
     let metas = store.list()?;
@@ -301,14 +315,14 @@ fn continue_agent(force_plain: bool) -> Result<()> {
                 "no prior session found for this directory; run `iris` to start one",
             )
         })?;
-    resume_agent(&id, force_plain)
+    resume_agent(&id, force_plain, skip_permissions)
 }
 
 /// `iris resume` with no id. On a plain/non-TTY front-end, print the resumable
 /// session list (id, age, preview) for this directory and exit 0. On a rich TTY,
 /// start a session with the `/resume` picker open so the user selects one
 /// (cancelling leaves them in the fresh session).
-fn resume_pick(force_plain: bool) -> Result<()> {
+fn resume_pick(force_plain: bool, skip_permissions: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let store = session::SessionStore::open_default()?;
     let sessions = store.resumable_for_cwd(&cwd.to_string_lossy())?;
@@ -319,7 +333,7 @@ fn resume_pick(force_plain: bool) -> Result<()> {
     // `open_resume` returns `None` when there is nothing to resume; the session
     // then simply starts fresh with no picker.
     let startup_modal = ui::picker::open_resume(&cwd);
-    run_agent_inner(force_plain, startup_modal)
+    run_agent_inner(force_plain, startup_modal, skip_permissions)
 }
 
 /// Print the resumable-session list for the plain/non-TTY `iris resume` path.
@@ -341,7 +355,11 @@ fn print_session_list(sessions: &[session::ResumableSession], now_ms: u128) {
     println!("Resume one with: iris resume <session-id>");
 }
 
-fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -> Result<()> {
+fn run_agent_inner(
+    force_plain: bool,
+    startup_modal: Option<ui::modal::Modal>,
+    skip_permissions: bool,
+) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
     // Harness-owned assembly: the fragment/slot baukasten composes the prompt
@@ -358,10 +376,11 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::new(provider, tools)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
-        .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd));
+        .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd))
+        .with_skip_permissions(skip_permissions);
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
-    let session = match session::SessionLog::create_with_id(&cwd, &session_id) {
+    let mut session = match session::SessionLog::create_with_id(&cwd, &session_id) {
         Ok(log) => {
             tracing::info!(id = %log.id(), path = %log.path().display(), "session transcript");
             Some(log)
@@ -371,6 +390,9 @@ fn run_agent_inner(force_plain: bool, startup_modal: Option<ui::modal::Modal>) -
             None
         }
     };
+    // ADR-0049: loud one-time warning + a transcript audit record so a resumed
+    // or audited session shows the mode was active.
+    announce_skip_permissions(skip_permissions, session.as_mut());
     // Resume foundation: surface prior persisted sessions for this workspace.
     // The /resume UI is a later milestone; this only proves the store reads
     // back and signals that persistence is durable and resumable.
@@ -487,7 +509,7 @@ fn load_session_source(
 /// failure. Non-interactive throughout: its approval gate denies gated tools
 /// by default, or auto-approves with `--approve`, so a piped/CI run cannot hang.
 /// The session is persisted like a normal run.
-fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
+fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
     let tools = tools::built_in_tools();
@@ -500,9 +522,10 @@ fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
     // auto-approves), but the print gate cannot mint new grants, so no sink.
     let agent = Agent::new(provider, tools)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
-        .with_project_policy(project_policy(&cwd), None);
+        .with_project_policy(project_policy(&cwd), None)
+        .with_skip_permissions(skip_permissions);
     // Persist the print run's transcript like a normal run; best-effort.
-    let session = match session::SessionLog::create_with_id(&cwd, &session_id) {
+    let mut session = match session::SessionLog::create_with_id(&cwd, &session_id) {
         Ok(log) => {
             tracing::info!(id = %log.id(), path = %log.path().display(), "session transcript");
             Some(log)
@@ -512,6 +535,7 @@ fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
             None
         }
     };
+    announce_skip_permissions(skip_permissions, session.as_mut());
     let budget = Some(settings.context_token_budget());
     let mut harness =
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
@@ -536,6 +560,24 @@ fn run_print(prompt_arg: &str, approve: bool) -> Result<()> {
     Ok(())
 }
 
+/// Session-start side effects of `--dangerously-skip-permissions` (ADR-0049):
+/// print the loud one-time warning banner to stderr, and record the mode as a
+/// transcript metadata entry so a resumed/audited session shows it was active.
+/// A no-op when the flag is off, so a normal session is byte-identical to
+/// today. Best-effort like all transcript persistence: a failed append is
+/// warned, never fatal.
+fn announce_skip_permissions(skip_permissions: bool, session: Option<&mut session::SessionLog>) {
+    if !skip_permissions {
+        return;
+    }
+    eprintln!("WARNING: {}", nexus::SKIP_PERMISSIONS_BANNER);
+    if let Some(log) = session
+        && let Err(error) = log.append_dangerous_mode()
+    {
+        tracing::warn!(error = %format!("{error:#}"), "failed to record skip-permissions mode");
+    }
+}
+
 /// The persisted per-project permission policy for `cwd` (ADR-0027), loaded
 /// from the HOME-owned store into the enforcement-layer shape Nexus consumes.
 fn project_policy(cwd: &Path) -> nexus::ProjectPolicy {
@@ -553,7 +595,7 @@ fn project_policy_sink(cwd: &Path) -> Option<Box<dyn nexus::ProjectPolicySink>> 
 /// reconstruct the provider-visible messages, seed the agent with them, and
 /// continue appending future turns to the same log. Errors clearly when the id
 /// is unknown or the session cannot be read.
-fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
+fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let store = session::SessionStore::open_default()?;
     let meta = store.find(session_id)?.ok_or_else(|| {
@@ -585,18 +627,20 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::resumed(provider, tools, stored.messages)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
-        .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd));
+        .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd))
+        .with_skip_permissions(skip_permissions);
 
     // Reopen the same transcript for append so continued turns extend it rather
     // than starting a new file. Best-effort, like new-session persistence: if
     // the reopen fails, warn and continue in-memory.
-    let session = match session::SessionLog::resume(&meta.path) {
+    let mut session = match session::SessionLog::resume(&meta.path) {
         Ok(log) => Some(log),
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "resume persistence disabled");
             None
         }
     };
+    announce_skip_permissions(skip_permissions, session.as_mut());
     tracing::info!(id = %meta.id, messages = resumed, context_tokens, "resumed session");
 
     let mut harness = wayland::Harness::resumed(
@@ -985,6 +1029,18 @@ fn print_help() {
     eprintln!("                                   flags: --device-code (openai-codex),");
     eprintln!("                                          --api-key (anthropic)");
     eprintln!("  iris update                       Update Iris from GitHub");
+    eprintln!();
+    eprintln!("Danger:");
+    eprintln!("  --dangerously-skip-permissions   DANGER: auto-approve EVERY tool call with no");
+    eprintln!(
+        "                                   approval prompt, INCLUDING destructive commands."
+    );
+    eprintln!(
+        "                                   Bypasses the safety floors; CLI-only, session-only,"
+    );
+    eprintln!(
+        "                                   nothing persists. Use only in a sandbox you trust."
+    );
     eprintln!();
     eprintln!("Display (flag / env var):");
     eprintln!("  --plain, IRIS_PLAIN=1, NO_COLOR   Plain, ANSI-free text UI");

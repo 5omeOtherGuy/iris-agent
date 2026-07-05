@@ -7526,3 +7526,205 @@ fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// `--dangerously-skip-permissions` (ADR-0049): every gated call is
+// auto-approved, floors included; nothing persists; the bypass is audited.
+// ---------------------------------------------------------------------------
+
+fn dangerous_approved_count(frontend: &RecordingFrontend) -> usize {
+    frontend
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolAutoApprovedDangerous(_)))
+        .count()
+}
+
+#[test]
+fn skip_permissions_defaults_off_and_only_the_builder_flips_it() {
+    // Activation isolation: a bare agent is never in skip mode, and the ONLY
+    // way to enable it is the explicit construction-time builder the host calls
+    // from the CLI flag. There is no config/env/trust-store/live-setter path.
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    assert!(!agent.skip_permissions(), "default is off");
+    let agent = agent.with_skip_permissions(true);
+    assert!(agent.skip_permissions(), "the explicit builder enables it");
+}
+
+#[test]
+fn skip_permissions_auto_approves_destructive_bash() -> Result<()> {
+    // The destructive floor (rm -rf) normally re-prompts even in auto. In skip
+    // mode it is auto-approved without consulting the gate, and the bypass is
+    // emitted as the distinct dangerous audit event.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "rm -rf build" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_skip_permissions(true);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "clean",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "skip mode must NOT consult the gate for a destructive command"
+    );
+    assert_eq!(
+        dangerous_approved_count(&frontend),
+        1,
+        "the destructive bypass is audited as a dangerous auto-approval"
+    );
+    assert_eq!(
+        auto_approved_count(&frontend),
+        0,
+        "the dangerous bypass is not confused with an ordinary auto-approval"
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_bypasses_the_dirty_tree_floor_prompt() -> Result<()> {
+    // The dirty-tree floor normally forces an approval prompt for a pre-existing
+    // dirty file. In skip mode the approval gate is bypassed (no prompt) and the
+    // bypass is audited. Read-before-mutate and the mutation guard are separate,
+    // still-enforced safety systems (invariant 5), not the approval gate this
+    // mode skips -- so this asserts approval ROUTING, not that the file mutates.
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("out.txt"), "old\n")?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_skip_permissions(true);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::protecting(vec![PathBuf::from("out.txt")]);
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "skip mode must NOT prompt for a protected dirty file"
+    );
+    assert_eq!(
+        dangerous_approved_count(&frontend),
+        1,
+        "the dirty-floor bypass is audited"
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_persists_nothing_and_later_normal_session_still_prompts() -> Result<()> {
+    // Non-persistence invariant: a skip-mode session that "approves" everything
+    // writes no grant to the project store, and a following normal (non-skip)
+    // session with the same empty policy prompts as usual.
+    let workspace = test_workspace()?;
+    let grants = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let sink = RecordingSink {
+        grants: grants.clone(),
+    };
+    // Phase 1: skip mode. Even with a frontend that WOULD grant-for-project,
+    // the gate is never consulted, so nothing is persisted.
+    let provider = FakeProvider::new(write_turn("out.txt", "one\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools())
+        .with_project_policy(ProjectPolicy::default(), Some(Box::new(sink)))
+        .with_skip_permissions(true);
+    let frontend = RecordingFrontend::new(ApprovalDecision::AllowProject);
+    let guard = FakeGuard::none();
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+    assert_eq!(dangerous_approved_count(&frontend), 1);
+    assert!(
+        grants.borrow().is_empty(),
+        "skip mode must not persist any project grant"
+    );
+
+    // Phase 2: a fresh normal session with the same empty policy prompts and,
+    // on Deny, refuses -- proving nothing was loosened for the future.
+    let provider2 = FakeProvider::new(write_turn("out2.txt", "two\n"));
+    let mut agent2 = Agent::new(provider2, crate::tools::built_in_tools())
+        .with_project_policy(ProjectPolicy::default(), None);
+    let frontend2 = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard2 = FakeGuard::none();
+    run_preset_turn(
+        &mut agent2,
+        "write it",
+        &workspace.path,
+        Some(&guard2),
+        &frontend2,
+    )?;
+    assert!(
+        frontend2.events_at_review.borrow().is_some(),
+        "the following normal session prompts as usual"
+    );
+    assert_eq!(denied_count(&frontend2), 1, "and denies when refused");
+    assert!(
+        !workspace.path.join("out2.txt").exists(),
+        "the denied write never ran"
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_off_leaves_floors_intact() -> Result<()> {
+    // Turning the flag off restores exactly today's behavior: a destructive
+    // command still consults the gate (here it is denied).
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "rm -rf build" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_skip_permissions(false);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "clean",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "with skip off, the destructive floor still prompts"
+    );
+    assert_eq!(dangerous_approved_count(&frontend), 0);
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_banner_states_all_checks_disabled() {
+    // The loud session-start banner is the single source of truth for the
+    // warning line; it must clearly say all checks are off.
+    assert!(crate::nexus::SKIP_PERMISSIONS_BANNER.contains("PERMISSION CHECKS DISABLED"));
+    assert!(crate::nexus::SKIP_PERMISSIONS_BANNER.contains("without approval"));
+}
