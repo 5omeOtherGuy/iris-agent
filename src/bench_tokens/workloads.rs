@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::nexus::{AssistantTurn, CompletionReason, ToolCall};
 
-use super::fixtures::build_find_tree;
+use super::fixtures::{build_chained_provider_tree, build_find_tree};
 
 /// The result of a workload's mechanical success check.
 pub(crate) struct Outcome {
@@ -109,17 +109,27 @@ pub(crate) fn workloads() -> Vec<Workload> {
 /// without paying for the others. An entirely non-matching filter yields an
 /// empty set, which the caller surfaces via the printed workload count.
 pub(crate) fn selected_workloads() -> Vec<Workload> {
-    let filter = std::env::var("IRIS_BENCH_WORKLOAD").unwrap_or_default();
+    filter_by_env(workloads(), "IRIS_BENCH_WORKLOAD")
+}
+
+/// Bash-enabled workloads filtered by the same `IRIS_BENCH_WORKLOAD` knob as
+/// the headline matrix. Kept separate so callers still have to opt into the
+/// dangerous bash approval path explicitly.
+pub(crate) fn selected_bash_workloads() -> Vec<Workload> {
+    filter_by_env(bash_workloads(), "IRIS_BENCH_WORKLOAD")
+}
+
+fn filter_by_env(all: Vec<Workload>, env: &str) -> Vec<Workload> {
+    let filter = std::env::var(env).unwrap_or_default();
     let names: Vec<&str> = filter
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
     if names.is_empty() {
-        return workloads();
+        return all;
     }
-    workloads()
-        .into_iter()
+    all.into_iter()
         .filter(|w| names.contains(&w.name))
         .collect()
 }
@@ -129,19 +139,40 @@ pub(crate) fn selected_workloads() -> Vec<Workload> {
 /// never touch a bash workload. Phase 4: one read-only diagnosis task -- run
 /// the failing tests and report the failure facts; no file is mutated.
 pub(crate) fn bash_workloads() -> Vec<Workload> {
-    vec![Workload {
-        name: "bash-diagnose-test-failure",
-        fixture: "workload4_bash_diagnose",
-        prompt: "The crate's tests fail. Run the tests, read the failure, and report which \
-                 test failed and the exact left/right values it asserted. Answer in one \
-                 sentence. Do not edit any files.",
-        script: script_bash_diagnose,
-        check: check_bash_diagnose,
-        approval: ApprovalProfile::SkipPermissions,
-        // The reduced bash output must still carry the planted assertion values.
-        needles: &["8191", "8192"],
-        build: None,
-    }]
+    vec![
+        Workload {
+            name: "bash-diagnose-test-failure",
+            fixture: "workload4_bash_diagnose",
+            prompt: "The crate's tests fail. Run the tests, read the failure, and report which \
+                     test failed and the exact left/right values it asserted. Answer in one \
+                     sentence. Do not edit any files.",
+            script: script_bash_diagnose,
+            check: check_bash_diagnose,
+            approval: ApprovalProfile::SkipPermissions,
+            // The reduced bash output must still carry the planted assertion values.
+            needles: &["8191", "8192"],
+            build: None,
+        },
+        Workload {
+            name: "chained-openai-summary-fix",
+            fixture: "workload5_chained_provider_fix",
+            prompt: "Live reasoning summaries do not stream for the OpenAI Codex Responses \
+                     provider even when reasoning effort is enabled. This fixture mirrors a \
+                     recent Iris bug. Discover the relevant files with find/grep/read, run \
+                     `cargo test -- --nocapture` to reproduce the failure, fix the request \
+                     builder without weakening tests, then run `cargo test -- --nocapture` \
+                     until it passes. Summarize the fix.",
+            script: script_chained_openai_summary_fix,
+            check: check_chained_openai_summary_fix,
+            approval: ApprovalProfile::SkipPermissions,
+            needles: &[
+                "reasoning_request_asks_for_summary_so_live_thinking_can_stream",
+                "summary: None",
+                "summary:auto",
+            ],
+            build: Some(build_chained_provider_tree),
+        },
+    ]
 }
 
 /// Per-tool live model-probe workloads (Phase 5, layer 2). Each asks a real
@@ -288,6 +319,54 @@ fn script_bash_diagnose() -> Vec<AssistantTurn> {
     vec![
         call_turn("b", "bash", json!({ "command": "cat src/lib.rs; exit 3" })),
         answer_turn("The failing test is ceiling_is_exact: it asserted left: 8191, right: 8192."),
+    ]
+}
+
+/// Scripted chained repair flow for the PR-404-style fixture: discover files,
+/// inspect the noisy failing cargo test, patch the provider request, and verify
+/// green. The real model chooses its own calls; this replay proves the tool
+/// chain and output reducers preserve the facts the task needs.
+fn script_chained_openai_summary_fix() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("f", "find", json!({ "pattern": "*.rs" })),
+        call_turn(
+            "g1",
+            "grep",
+            json!({ "pattern": "reasoning", "path": "src" }),
+        ),
+        call_turn("g2", "grep", json!({ "pattern": "summary", "path": "." })),
+        call_turn(
+            "r1",
+            "read",
+            json!({ "path": "tests/live_reasoning_summary.rs" }),
+        ),
+        call_turn(
+            "b1",
+            "bash",
+            json!({ "command": "cargo test -- --nocapture" }),
+        ),
+        call_turn(
+            "r2",
+            "read",
+            json!({ "path": "src/providers/openai_codex_responses.rs" }),
+        ),
+        call_turn(
+            "e",
+            "edit",
+            json!({
+                "file_path": "src/providers/openai_codex_responses.rs",
+                "old_string": "    Some(CodexReasoning {\n        effort,\n        summary: None,\n    })",
+                "new_string": "    Some(CodexReasoning {\n        effort,\n        summary: Some(\"auto\"),\n    })",
+            }),
+        ),
+        call_turn(
+            "b2",
+            "bash",
+            json!({ "command": "cargo test -- --nocapture" }),
+        ),
+        answer_turn(
+            "Fixed the OpenAI Codex reasoning request by adding summary:auto whenever reasoning is enabled; cargo test now passes.",
+        ),
     ]
 }
 
@@ -449,6 +528,40 @@ fn check_bash_diagnose(_workspace: &Path, final_text: &str) -> Outcome {
             success: false,
             detail: format!("answer missing planted values (8191={has_left}, 8192={has_right})"),
         }
+    }
+}
+
+/// Chained bash repair: the OpenAI Codex request builder must request
+/// `summary: "auto"` when reasoning is enabled, and the fixture's cargo tests
+/// must pass after the agent's edit. This mirrors PR #404's root cause while
+/// keeping the success check mechanical and outside the model.
+fn check_chained_openai_summary_fix(workspace: &Path, _final_text: &str) -> Outcome {
+    let provider_path = workspace.join("src/providers/openai_codex_responses.rs");
+    let source = fs::read_to_string(&provider_path).unwrap_or_default();
+    let has_summary_auto = source.contains("summary: Some(\"auto\")");
+    let run = Command::new("cargo")
+        .arg("test")
+        .current_dir(workspace)
+        .output();
+    match run {
+        Ok(output) if output.status.success() && has_summary_auto => Outcome {
+            success: true,
+            detail: "cargo test passed and the Codex reasoning request includes summary:auto"
+                .to_string(),
+        },
+        Ok(output) => Outcome {
+            success: false,
+            detail: format!(
+                "summary:auto present={has_summary_auto}; cargo test status={}; stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        },
+        Err(error) => Outcome {
+            success: false,
+            detail: format!("cargo test not runnable: {error}"),
+        },
     }
 }
 

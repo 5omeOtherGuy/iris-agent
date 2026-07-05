@@ -46,6 +46,10 @@ struct RawRecord {
     input_tokens: Option<u64>,
     #[serde(default)]
     tool_result_bytes: Option<u64>,
+    #[serde(default)]
+    tool_calls_total: Option<u64>,
+    #[serde(default)]
+    tool_errors: Vec<serde_json::Value>,
     // render_probe fields
     #[serde(default)]
     tool: String,
@@ -69,6 +73,8 @@ struct Cell {
     input_tokens: u64,
     turns: u64,
     tool_result_bytes: u64,
+    tool_calls_total: u64,
+    tool_errors: u64,
 }
 
 /// A render-probe measurement (proxy tokens; reported separately, never mixed).
@@ -131,6 +137,8 @@ struct ArmStats {
     input: Vec<u64>,
     turns: Vec<u64>,
     bytes: Vec<u64>,
+    tool_calls: Vec<u64>,
+    tool_errors: Vec<u64>,
 }
 
 impl ArmStats {
@@ -141,6 +149,8 @@ impl ArmStats {
             input: Vec::new(),
             turns: Vec::new(),
             bytes: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_errors: Vec::new(),
         }
     }
 
@@ -152,6 +162,8 @@ impl ArmStats {
         self.input.push(cell.input_tokens);
         self.turns.push(cell.turns);
         self.bytes.push(cell.tool_result_bytes);
+        self.tool_calls.push(cell.tool_calls_total);
+        self.tool_errors.push(cell.tool_errors);
     }
 
     fn success_rate(&self) -> f64 {
@@ -177,6 +189,12 @@ pub(crate) struct Pairing {
     pub(crate) delta_input_pct: f64,
     pub(crate) median_turns_a: f64,
     pub(crate) median_turns_b: f64,
+    pub(crate) median_tool_calls_a: f64,
+    pub(crate) median_tool_calls_b: f64,
+    pub(crate) max_tool_calls_a: u64,
+    pub(crate) max_tool_calls_b: u64,
+    pub(crate) total_tool_errors_a: u64,
+    pub(crate) total_tool_errors_b: u64,
     /// Decomposition of the input delta: cheaper-per-turn vs changed turn count.
     /// NOTE: `tpt = cumulative_input / turns` is an AVERAGE over a growing
     /// series (each turn resends the transcript), so when the arms take a
@@ -236,6 +254,10 @@ fn median(values: &[u64]) -> f64 {
     } else {
         (v[mid - 1] + v[mid]) as f64 / 2.0
     }
+}
+
+fn max(values: &[u64]) -> u64 {
+    values.iter().copied().max().unwrap_or(0)
 }
 
 /// Arithmetic mean of a sample.
@@ -320,6 +342,8 @@ pub(crate) fn analyze_jsonl(body: &str) -> Analysis {
                                 input_tokens: input,
                                 turns,
                                 tool_result_bytes: rec.tool_result_bytes.unwrap_or(0),
+                                tool_calls_total: rec.tool_calls_total.unwrap_or(0),
+                                tool_errors: rec.tool_errors.len() as u64,
                             });
                     }
                     _ => invalid_count += 1,
@@ -377,6 +401,12 @@ fn pair(model: String, workload: String, group: &[Cell]) -> Pairing {
     // strategy change). delta = turns_a*(tpt_a - tpt_b) + (turns_a-turns_b)*tpt_b.
     let turns_a = median(&a.turns);
     let turns_b = median(&b.turns);
+    let median_tool_calls_a = median(&a.tool_calls);
+    let median_tool_calls_b = median(&b.tool_calls);
+    let max_tool_calls_a = max(&a.tool_calls);
+    let max_tool_calls_b = max(&b.tool_calls);
+    let total_tool_errors_a = a.tool_errors.iter().sum();
+    let total_tool_errors_b = b.tool_errors.iter().sum();
     let tpt_a = if turns_a > 0.0 {
         median_in_a / turns_a
     } else {
@@ -409,6 +439,12 @@ fn pair(model: String, workload: String, group: &[Cell]) -> Pairing {
         delta_input_pct,
         median_turns_a: turns_a,
         median_turns_b: turns_b,
+        median_tool_calls_a,
+        median_tool_calls_b,
+        max_tool_calls_a,
+        max_tool_calls_b,
+        total_tool_errors_a,
+        total_tool_errors_b,
         term_efficiency,
         term_turns,
         delta_result_bytes,
@@ -529,6 +565,38 @@ pub(crate) fn format_report(analysis: &Analysis) -> String {
          tokens are cumulative it is a clean reduction signal ONLY when turn counts \
          match. `result-bytes delta` is real tool-output bytes in context (A - B); ~0 \
          means the reduction never fired for that cell's tool path."
+    );
+
+    let _ = writeln!(out, "\n## Safety / loop signals\n");
+    let _ = writeln!(
+        out,
+        "| model | workload | success a/b | turns a/b | tool calls med a/b | tool calls max a/b | tool errors a/b |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+    for p in &analysis.pairings {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {:.0}%/{:.0}% | {:.0}/{:.0} | {:.1}/{:.1} | {}/{} | {}/{} |",
+            p.model,
+            p.workload,
+            p.success_a * 100.0,
+            p.success_b * 100.0,
+            p.median_turns_a,
+            p.median_turns_b,
+            p.median_tool_calls_a,
+            p.median_tool_calls_b,
+            p.max_tool_calls_a,
+            p.max_tool_calls_b,
+            p.total_tool_errors_a,
+            p.total_tool_errors_b,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nThis section is the N-run compaction-safety check: if defaults keep the same \
+         success rate without higher turns, higher tool-call maxima, or a tool-error \
+         spike, the reduced output did not make the task harder to interpret or \
+         trigger tool loops for this workload."
     );
 
     let _ = writeln!(

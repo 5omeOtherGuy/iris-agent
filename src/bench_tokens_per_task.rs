@@ -66,7 +66,8 @@ mod replay {
         selection_for_spec,
     };
     use super::workloads::{
-        Workload, bash_workloads, probe_workloads, selected_workloads, workloads,
+        Workload, bash_workloads, probe_workloads, selected_bash_workloads, selected_workloads,
+        workloads,
     };
 
     /// The margin (in estimated tokens) arm A must beat arm B by, so the win is
@@ -381,6 +382,48 @@ mod replay {
         }
     }
 
+    /// Deterministic chained bash workload from PR #404: the scripted agent has
+    /// to discover provider files, inspect a noisy failing cargo test, edit the
+    /// request builder, and verify green. This proves the workload wiring before
+    /// any real-provider run and checks the reduced arm materially shrinks tool
+    /// output while still solving the task.
+    #[test]
+    fn chained_bash_workload_replay_fixes_provider_and_saves_tokens() {
+        let workload = &bash_workloads()[1];
+        let baseline = run_scripted_skip_perms(workload, Arm::Baseline);
+        let defaults = run_scripted_skip_perms(workload, Arm::Defaults);
+        for (arm, run) in [(Arm::Baseline, &baseline), (Arm::Defaults, &defaults)] {
+            assert!(
+                !run.approvals_consulted,
+                "[{}] deny gate was consulted -- skip-permissions did not bypass it first",
+                arm.label()
+            );
+            assert!(
+                run.dangerous_approvals >= 2,
+                "[{}] expected both cargo-test bash calls to be auto-approved dangerous",
+                arm.label()
+            );
+            assert_eq!(
+                run.bash_exit_codes,
+                vec![101, 0],
+                "[{}] first cargo test should fail, second should pass",
+                arm.label()
+            );
+            assert!(
+                run.outcome.success,
+                "[{}] scripted repair should satisfy the mechanical check: {}",
+                arm.label(),
+                run.outcome.detail
+            );
+        }
+        assert!(
+            defaults.tool_result_bytes < baseline.tool_result_bytes,
+            "reduced arm should shrink chained find/grep/bash output (A={} B={})",
+            defaults.tool_result_bytes,
+            baseline.tool_result_bytes
+        );
+    }
+
     /// Deterministic per-tool RENDER PROBE (Phase 5, layer 1), FAST set. For
     /// each non-slow tool probe, invoke the tool over its workspace in both arms
     /// and prove the reduced output (a) clears its token-reduction bar and (b)
@@ -438,6 +481,8 @@ mod replay {
             "model": model, "workload": wl, "reduce_output": reduce,
             "success": ok, "turns": turns, "input_tokens": input,
             "tool_result_bytes": if reduce { 400 } else { 500 },
+            "tool_calls_total": turns + 1,
+            "tool_errors": [],
         })
         .to_string()
     }
@@ -541,6 +586,8 @@ mod replay {
 
         let report = format_report(&analysis);
         assert!(report.contains("OVERALL VERDICT: SUCCESS REGRESSION"));
+        assert!(report.contains("## Safety / loop signals"));
+        assert!(report.contains("tool calls med a/b"));
         assert!(report.contains("w-baseline"));
     }
 
@@ -601,12 +648,13 @@ mod replay {
         println!("render-probe log -> {}", bench_log_path());
     }
 
-    /// Opt-in real-provider BASH smoke (Phase 4). Runs the read-only diagnosis
-    /// workload under `--dangerously-skip-permissions` so the real model runs
-    /// `bash` (e.g. `cargo test`) to find the failure, over the model matrix x
-    /// both arms x N=1. Double-gated: `IRIS_BENCH_REAL=1` AND
-    /// `IRIS_BENCH_DANGEROUS_OK=1` (it executes shell commands). Asserts the
-    /// deny gate is never consulted (the bypass fired). Run:
+    /// Opt-in real-provider BASH matrix (Phase 4+). Runs bash-enabled workloads
+    /// under `--dangerously-skip-permissions` so the real model can run
+    /// `cargo test`/build-test loops. Double-gated: `IRIS_BENCH_REAL=1` AND
+    /// `IRIS_BENCH_DANGEROUS_OK=1` (it executes shell commands). `IRIS_BENCH_N`
+    /// controls runs per arm; `IRIS_BENCH_WORKLOAD` can select a specific bash
+    /// workload such as `chained-openai-summary-fix`. Asserts the deny gate is
+    /// never consulted (the bypass fired). Run:
     ///   IRIS_BENCH_REAL=1 IRIS_BENCH_DANGEROUS_OK=1 cargo test --bin iris \
     ///     tokens_per_task_bash_smoke -- --ignored --nocapture
     #[test]
@@ -622,58 +670,74 @@ mod replay {
             );
             return;
         }
+        let n: usize = std::env::var("IRIS_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
         let specs = model_specs();
         let reasoning = bench_reasoning();
-        let workload = &bash_workloads()[0];
+        let workloads = selected_bash_workloads();
         let cwd = std::env::current_dir().expect("cwd");
         bench_log_reset();
         println!(
-            "bash smoke: workload={} reasoning={:?} models={} log={}",
-            workload.name,
+            "bash smoke: workloads={} reasoning={:?} N={} models={} log={}",
+            workloads.len(),
             reasoning,
+            n,
             specs.join(", "),
             bench_log_path()
         );
         println!(
-            "| model | arm | reachable | success | turns | in tok | bash exits | dangerous | approvals | note |"
+            "| workload | model | arm | run | reachable | success | turns | in tok | bash exits | dangerous | approvals | note |"
         );
-        println!("|---|---|---|---|---|---|---|---|---|---|");
+        println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
         let mut consulted_any = false;
-        for spec in &specs {
-            let selection = match selection_for_spec(&cwd, spec, reasoning) {
-                Ok(sel) => sel,
-                Err(e) => {
-                    bench_log_cell_error(spec, workload.name, "-", 0, &format!("select: {e}"));
-                    println!("| {spec} | - | no | - | - | - | - | - | - | select: {e} |");
-                    continue;
-                }
-            };
-            for arm in [Arm::Baseline, Arm::Defaults] {
-                match run_real_cell(spec, workload, arm, 1, &selection) {
-                    Ok(m) => {
-                        if m.approvals_consulted {
-                            consulted_any = true;
-                        }
-                        println!(
-                            "| {} | {} | yes | {} | {} | {} | {:?} | {} | {} | |",
-                            spec,
-                            m.arm.label(),
-                            m.outcome.success,
-                            m.turns,
-                            m.input_tokens,
-                            m.bash_exit_codes,
-                            m.dangerous_approvals,
-                            m.approvals_consulted,
-                        );
-                    }
+        for workload in &workloads {
+            for spec in &specs {
+                let selection = match selection_for_spec(&cwd, spec, reasoning) {
+                    Ok(sel) => sel,
                     Err(e) => {
-                        bench_log_cell_error(spec, workload.name, arm.label(), 1, &e);
+                        bench_log_cell_error(spec, workload.name, "-", 0, &format!("select: {e}"));
                         println!(
-                            "| {} | {} | no | - | - | - | - | - | - | {} |",
-                            spec,
-                            arm.label(),
-                            e
-                        )
+                            "| {} | {spec} | - | - | no | - | - | - | - | - | - | select: {e} |",
+                            workload.name
+                        );
+                        continue;
+                    }
+                };
+                for arm in [Arm::Baseline, Arm::Defaults] {
+                    for run in 0..n {
+                        match run_real_cell(spec, workload, arm, run + 1, &selection) {
+                            Ok(m) => {
+                                if m.approvals_consulted {
+                                    consulted_any = true;
+                                }
+                                println!(
+                                    "| {} | {} | {} | {} | yes | {} | {} | {} | {:?} | {} | {} | |",
+                                    workload.name,
+                                    spec,
+                                    m.arm.label(),
+                                    run + 1,
+                                    m.outcome.success,
+                                    m.turns,
+                                    m.input_tokens,
+                                    m.bash_exit_codes,
+                                    m.dangerous_approvals,
+                                    m.approvals_consulted,
+                                );
+                            }
+                            Err(e) => {
+                                bench_log_cell_error(spec, workload.name, arm.label(), run + 1, &e);
+                                println!(
+                                    "| {} | {} | {} | {} | no | - | - | - | - | - | - | {} |",
+                                    workload.name,
+                                    spec,
+                                    arm.label(),
+                                    run + 1,
+                                    e
+                                )
+                            }
+                        }
                     }
                 }
             }

@@ -1143,7 +1143,7 @@ more consistent on stronger models, but N=5 and small magnitudes -- not a claim.
   on single-strategy tasks), not a wider model sweep. Turn-count variance
   remains the dominant obstacle and is a property of model strategy.
 
-## Entry 24 - N=50 investigate cell: first SIGNIFICANT win (Sonnet), + analyzer fix
+## Entry 24 - N=50 investigate cell: safety/non-regression read
 
 Effort verified before the run (operator flagged it): Sonnet 4.6 is manual-budget
 => iris `low` = `thinking.budget_tokens: 4096`, NOT Anthropic's named "low"
@@ -1153,32 +1153,31 @@ effort (that scale is adaptive-tier only; there iris `minimal` -> Anthropic
 other two. 200 sessions (2 models x investigate x 2 arms x N=50), low, held
 across arms. Artifact: investigate-n50-sonnet46-gpt54-2026-07-05.{md,jsonl}.
 
-**Sonnet 4.6: SUPPORTED (first in the study).** median saving 575 / mean 541
-input tokens (-2.4%), SAME 3 turns, 100% success both arms, result-bytes -1168.
-Welch 95% CI [+397,+685] clears zero; out-of-band permutation p<0.0001, bootstrap
-median CI [+572,+578], 50/50 A-runs beat B median. Low variance (sd ~330-400)
-makes the small real effect visible.
+Corrected interpretation: this run was never expected to show a large product
+savings. `investigate-large-log` has a small reduced grep payload relative to the
+full system prompt + schemas + transcript, so whole-run input-token savings must
+be small by construction. The value of N=50 is **safety**: does compaction make
+the output harder to interpret, lower success, or cause extra tool loops?
 
-**GPT-5.4: INCONCLUSIVE.** same sign (-1.2%) but Welch CI [-1607,+2246] spans
-zero (permutation p=0.75, 29/50). sd ~4400-5300 -- turn-count variance (2-4
-turns) swamps the reduction. Overall verdict INCONCLUSIVE (one supported, one
-not).
+Safety result: no regression signal. Sonnet 4.6 was 100%/100% success, 3/3 median
+turns, 2.0/2.0 median tool calls, 2/2 max tool calls, 0/0 tool errors. GPT-5.4
+was 100%/100% success, 3/3 median turns, 3.0/3.0 median tool calls, 6/6 max tool
+calls, 0/0 tool errors. That is exactly what this high-N run should prove:
+reduced output did not cause wrong answers or a tool-call explosion on this task.
 
-**Analyzer fix forced by N=50.** The verdict used a range-overlap guard
-(max_A>=min_B) that can never certify at large N (an outlier A-run always exceeds
-the cheapest B-run), so it wrongly called the p<0.0001 Sonnet cell INCONCLUSIVE
--- under-reporting a real effect. Replaced with a Welch 95% CI on the mean
-saving: SUPPORTED only when the CI clears zero (+ success held + N>=5). Correctly
-certifies Sonnet AND leaves noisy GPT-5.4 inconclusive, so it is a real test not a
-rubber stamp. Two new gate cases lock it in (overlapping-ranges/separated-means
--> Supported; large-N/high-variance -> Inconclusive). This was a correctness fix
-(the old test was statistically wrong), not tuning-to-result -- and it does not
-flip GPT-5.4.
+Token result is secondary: Sonnet showed a small statistically detectable
+end-to-end input-token saving (~2.4%); GPT-5.4 was directionally cheaper but
+within noise. This is useful mechanism evidence, but not a headline efficiency
+claim because the eligible tool output was a minute part of the whole run.
 
-**Scope (no overclaim).** One model, one workload -- the most reduction-favorable
-(log grep, compaction hits the answer-bearing output). Supports a narrow
-statement: on a stable model doing grep-heavy triage, reduction gives a small
-(~2.4%) but statistically defensible saving at equal success. Does NOT support a
-blanket tokens-per-task claim (GPT-5.4 within noise; prior 3-workload matrices
-mixed). No README claim, no ROADMAP-gate closure on one cell; logged as measured
-evidence for review.
+Analyzer/report follow-up: added a `Safety / loop signals` section to the report
+(success, turns, median/max tool calls, total tool errors) so future N-run tests
+surface compaction regressions directly instead of only showing token deltas.
+
+Workload follow-up: added `chained-openai-summary-fix`, seeded from real PR #404
+(OpenAI request had `effort` but missed `summary: "auto"`). It hides the provider
+bug among generated decoy provider files and scripts a real chain: find, multiple
+greps, read failing test, noisy `cargo test -- --nocapture`, read provider, edit,
+and passing `cargo test -- --nocapture`. That is the right place to look for
+material end-to-end token savings because bash/cargo-test output can dominate the
+transcript while success still proves the model solved the task.
