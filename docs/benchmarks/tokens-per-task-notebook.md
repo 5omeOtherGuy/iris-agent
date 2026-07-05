@@ -1029,3 +1029,37 @@ end-to-end connection computed, not eyeballed.
 FIXED find/read questions (Entry 19), point `tokens_per_task_report` at that
 log, and commit the sanitized JSONL + rendered report under docs/benchmarks/.
 No claim ships until real N >= 5 clears the verdict gate without a regression.
+
+## Entry 21 - Decomposition confound: the "-7010 turns" term was misleading
+
+Operator flagged the read cell's `term_turns = -7010` as suspicious. It was
+right to. The raw per-turn input (cumulative; each turn resends the transcript)
+tells the real story:
+
+    B (baseline): [6734, 6902, 7393]  sum 21029   grep, grep -> 3 turns
+    A (defaults): [6734, 7268]         sum 14002   find, grep -> 2 turns
+
+Exact per-turn delta: turn1 0, turn2 +366 (A's turn was BIGGER), turn3 -7393 (B
+had one more turn). Total -7027. So A did not have cheaper turns -- A's
+comparable turn was heavier -- it simply used one fewer. The whole -33% was the
+eliminated third turn (mostly fixed system-prompt + tool-schema overhead), which
+at N=1 is strategy noise, not a reduction effect.
+
+The flaw: my decomposition used `tpt = cumulative_input / turns`, an AVERAGE over
+a growing series. That smeared the truth into "efficiency -17 / turns -7010",
+implying A's turns were slightly cheaper when per-turn they were slightly
+DEARER. The arithmetic split is exact but only interpretable when both arms take
+the same number of turns.
+
+Fix (no verdict change -- it was already INCONCLUSIVE at N=1): the analyzer now
+reports `turns a/b` and a `mechanism` label -- `per-turn (same turn count)` for a
+genuine reduction effect, or `fewer/more turns (confounded w/ strategy)` when the
+counts differ and the delta is dominated by whole turns of fixed overhead. The
+report caveat says the eff/turns split is a clean reduction signal ONLY when turn
+counts match. Re-rendered real log: grep/find show `per-turn` (2/2 turns), read
+shows `fewer turns (confounded)` (2/3). The `result-bytes delta` cross-checks it:
+read's real tool-output shrank only -122 B, consistent with the tiny -17
+efficiency term -- the reduction's DIRECT effect here was negligible; the
+apparent win was turn-count variance. Lesson reinforced (see Entry 12): at low
+turn counts, turn-count variance dominates the token delta; only same-turn-count
+cells or large N isolate the reduction.

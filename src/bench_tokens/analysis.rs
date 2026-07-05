@@ -175,12 +175,35 @@ pub(crate) struct Pairing {
     pub(crate) median_in_b: u64,
     pub(crate) delta_input: i64,
     pub(crate) delta_input_pct: f64,
+    pub(crate) median_turns_a: f64,
+    pub(crate) median_turns_b: f64,
     /// Decomposition of the input delta: cheaper-per-turn vs changed turn count.
+    /// NOTE: `tpt = cumulative_input / turns` is an AVERAGE over a growing
+    /// series (each turn resends the transcript), so when the arms take a
+    /// different number of turns this split is confounded -- see `mechanism()`.
     pub(crate) term_efficiency: f64,
     pub(crate) term_turns: f64,
     /// Real tool-result bytes delta (A - B), the "reduction fired?" signal.
     pub(crate) delta_result_bytes: i64,
     pub(crate) verdict: Verdict,
+}
+
+impl Pairing {
+    /// Where a token delta actually came from. When the arms took the same
+    /// number of turns, a delta is a genuine per-turn (reduction) effect. When
+    /// they differ, the delta is dominated by whole eliminated/added turns
+    /// (each ~fixed system-prompt + tool-schema overhead), a STRATEGY difference
+    /// confounded with the reduction -- NOT evidence the reduction made turns
+    /// cheaper. Reported so the eff/turns split is never over-read.
+    pub(crate) fn mechanism(&self) -> &'static str {
+        if (self.median_turns_a - self.median_turns_b).abs() < 0.5 {
+            "per-turn (same turn count)"
+        } else if self.delta_input < 0 {
+            "fewer turns (confounded w/ strategy)"
+        } else {
+            "more turns (confounded w/ strategy)"
+        }
+    }
 }
 
 /// The whole-run analysis.
@@ -348,6 +371,8 @@ fn pair(model: String, workload: String, group: &[Cell]) -> Pairing {
         median_in_b: median_in_b.round() as u64,
         delta_input,
         delta_input_pct,
+        median_turns_a: turns_a,
+        median_turns_b: turns_b,
         term_efficiency,
         term_turns,
         delta_result_bytes,
@@ -428,13 +453,13 @@ pub(crate) fn format_report(analysis: &Analysis) -> String {
     );
     let _ = writeln!(
         out,
-        "| model | workload | N a/b | success a/b | med in a/b | delta | eff / turns | result-bytes delta | verdict |"
+        "| model | workload | N a/b | success a/b | med in a/b | turns a/b | delta | mechanism | eff / turns | result-bytes delta | verdict |"
     );
-    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
     for p in &analysis.pairings {
         let _ = writeln!(
             out,
-            "| {} | {} | {}/{} | {:.0}%/{:.0}% | {}/{} | {:+} ({:+.1}%) | {:+.0} / {:+.0} | {:+} | {} |",
+            "| {} | {} | {}/{} | {:.0}%/{:.0}% | {}/{} | {:.0}/{:.0} | {:+} ({:+.1}%) | {} | {:+.0} / {:+.0} | {:+} | {} |",
             p.model,
             p.workload,
             p.n_a,
@@ -443,8 +468,11 @@ pub(crate) fn format_report(analysis: &Analysis) -> String {
             p.success_b * 100.0,
             p.median_in_a,
             p.median_in_b,
+            p.median_turns_a,
+            p.median_turns_b,
             p.delta_input,
             p.delta_input_pct,
+            p.mechanism(),
             p.term_efficiency,
             p.term_turns,
             p.delta_result_bytes,
@@ -454,9 +482,13 @@ pub(crate) fn format_report(analysis: &Analysis) -> String {
     let _ = writeln!(
         out,
         "\n`delta` is A - B median input tokens (negative = defaults cheaper). \
-         `eff / turns` decomposes it into cheaper-per-turn vs changed turn count. \
-         `result-bytes delta` is real tool-output bytes in context (A - B); ~0 means \
-         the reduction never fired for that cell's tool path."
+         `mechanism` says where it came from: `per-turn` (same turn count -- a genuine \
+         reduction effect) or `fewer/more turns` (dominated by whole eliminated/added \
+         turns of mostly-fixed prompt overhead, a STRATEGY difference confounded with \
+         the reduction). `eff / turns` is the arithmetic split, but because per-turn \
+         tokens are cumulative it is a clean reduction signal ONLY when turn counts \
+         match. `result-bytes delta` is real tool-output bytes in context (A - B); ~0 \
+         means the reduction never fired for that cell's tool path."
     );
     out
 }
