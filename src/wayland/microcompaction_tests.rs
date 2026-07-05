@@ -314,6 +314,12 @@ fn detection_holds_pending_folds_until_a_trigger_fires() {
         1,
         "detection sees the superseded read even while holding"
     );
+    let (pending, reclaimable) = held.pending_fold_stats();
+    assert_eq!(pending, 1);
+    assert!(
+        reclaimable > 0,
+        "the pending set reports its reclaimable mass for /context"
+    );
     let recorder = FoldRecorder::default();
     assert_eq!(held.maybe_microcompact(&recorder).unwrap(), 0);
     assert_eq!(fold_count(&path), 0, "held folds are never persisted");

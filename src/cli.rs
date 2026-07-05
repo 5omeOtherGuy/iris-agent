@@ -50,6 +50,12 @@ impl<'a, P> ModelSwitch<'a, P> {
     }
 
     /// The active resolved selection (provider/model/base-url/reasoning).
+    /// The system prompt the active provider was built with, for the
+    /// `/context` breakdown's system+tools estimate (display-only).
+    pub(crate) fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     pub(crate) fn selection(&self) -> &ModelSelection {
         &self.selection
     }
