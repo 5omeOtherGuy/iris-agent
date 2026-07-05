@@ -483,6 +483,192 @@ this PR's scope).
 
 ---
 
+## Entry 11 — First live smoke (real providers, low reasoning, N=1)
+
+Ran `IRIS_BENCH_REAL=1 cargo test --bin iris tokens_per_task_smoke -- --ignored
+--nocapture`. 8 real sessions (4 models x 1 read-only workload x 2 arms x N=1),
+reasoning=low. 56.9s, rc=0, subscription/OAuth lanes so ~$0 marginal.
+
+| model | arm | reachable | success | turns | usage in-tokens |
+|---|---|---|---|---|---|
+| openai-codex:gpt-5.4-mini | B | yes | false | 1 | 4216 |
+| openai-codex:gpt-5.4-mini | A | yes | true | 4 | 18785 |
+| openai-codex:gpt-5.3-codex-spark | B | yes | true | 4 | 18069 |
+| openai-codex:gpt-5.3-codex-spark | A | yes | true | 4 | 17971 |
+| anthropic:claude-haiku-4-5 | B | yes | true | 3 | 18299 |
+| anthropic:claude-haiku-4-5 | A | yes | true | 3 | 19357 |
+| antigravity:gemini-3.5-flash | B | yes | true | 4 | 0 |
+| antigravity:gemini-3.5-flash | A | yes | true | 4 | 0 |
+
+**RESULT — reachability + design both validated/challenged.**
+- All 4 models reachable on EXISTING OAuth; zero approval prompts across all 8
+  runs (auto/no-bash design holds live). Both Codex-lane models served by the
+  openai-codex OAuth (operator was right; my api-lane doubt was wrong). Haiku
+  4.5 ACCEPTS a `low` thinking level (operator's uncertainty resolved).
+
+**BLOCKER — Antigravity/Gemini reports 0 usage tokens.** `antigravity.rs:463`
+hardcodes `usage: None`; the provider never parses Gemini `usageMetadata`
+(promptTokenCount/...). Gemini cannot be a tokens-per-task headline cell until
+the Antigravity provider records usage. Real code gap, not noise. Options: drop
+Gemini, or implement Antigravity usage first (separate task).
+
+**DEVIATION — N=1 token deltas are dominated by variance, not the reduction
+lever.** Live, each arm is a separate non-deterministic session, so turn-count +
+success swamp a single-digit reduction: mini B=4216 only because it FAILED after
+1 turn; haiku arm A (reduced) used MORE than arm B; spark ~tied. The replay's
+clean 3-9% arm-A win came from SCRIPTING identical tool calls -- live that
+control is gone, and the ~4x run-to-run spread here is far above a 5-9% effect.
+Implication: **N=3 will not cleanly detect the effect.** The honest headline
+may be "no significant per-task token difference on these small models," which
+is itself a legitimate Milestone-2 result and consistent with the modest replay
+numbers. Do NOT spend on the 3-workload x N=3 matrix as designed; take the
+finding back to the operator for a design decision (raise N substantially +
+treat turns/success as covariates; or reframe the workload/model to one where
+the effect exceeds noise; or report the null honestly).
+
+**NEXT:** report smoke findings + get operator direction on (a) Gemini usage,
+(b) the variance/N/design question, before any further spend.
+
+**DECISION (operator) — exclude Gemini for now.** Dropped
+`antigravity:gemini-3.5-flash` from `DEFAULT_MODEL_SPECS`; the matrix is now the
+three usage-reporting models (gpt-5.4-mini, gpt-5.3-codex-spark,
+claude-haiku-4-5). Gemini stays re-addable via `IRIS_BENCH_MODELS` or by
+restoring the const once the Antigravity adapter records `usageMetadata`. The
+N=1 variance finding stands and is still open for the headline design.
+
+---
+
+## Entry 12 — First full headline run (3 models x 3 workloads x 2 arms x N=3)
+
+Operator authorized ONE full run to surface design issues. Ran
+`IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 cargo test --bin iris tokens_per_task_headline
+-- --ignored --nocapture`. 54 real sessions, 940.6s (~15.7 min), rc=0,
+reasoning=low, subscription/OAuth lanes (~$0 marginal). Per-cell aggregation
+(successful runs only for tokens; success rate separate):
+
+| model | workload | B succ | A succ | B tok(ok) | A tok(ok) | A vs B | note |
+|---|---|---|---|---|---|---|---|
+| gpt-5.4-mini | fix-failing-test | 3/3 | 3/3 | 22141 | 20593 | +7.0% | A wins |
+| gpt-5.4-mini | multi-file-edit | 3/3 | 3/3 | 32027 | 31563 | +1.4% | ~tie |
+| gpt-5.4-mini | investigate-log | 1/3 | 2/3 | 18360 | 23092 | -25.8% | success rates differ; both had 1-turn early-quit fails |
+| gpt-5.3-codex-spark | fix-failing-test | 3/3 | 3/3 | 35039 | 38381 | -9.5% | A loses (turn inflation 6-9) |
+| gpt-5.3-codex-spark | multi-file-edit | 3/3 | 3/3 | 83756 | 82455 | +1.6% | ~tie; HUGE variance (turns 6-21, 40k-149k) |
+| gpt-5.3-codex-spark | investigate-log | 3/3 | 3/3 | 19041 | 15404 | +19.1% | A wins, low variance |
+| claude-haiku-4-5 | fix-failing-test | 3/3 | 3/3 | 25654 | 32218 | -25.6% | A loses (turn inflation 4->6) |
+| claude-haiku-4-5 | multi-file-edit | 0/3 | 2/3 | - | 72306 | n/a | BASELINE failed all 3; A succeeded 2/3 |
+| claude-haiku-4-5 | investigate-log | 3/3 | 3/3 | 16902 | 21580 | -27.7% | A loses (turn inflation) |
+
+**RESULT — the design issues we came to find, all real:**
+
+1. **POSITIVE: zero approval prompts across all 54 runs, including both EDIT
+   workloads.** The auto/no-bash design holds live even when the agent edits
+   files -- clean in-workspace edits auto-approve, no model reached for bash.
+   The approval half of the design is sound.
+
+2. **No consistent tokens-per-task reduction.** Arm A (reduced) wins ~4 cells
+   and loses ~4. The SAME workload flips direction across models
+   (investigate-log: spark +19%, but mini -26% and haiku -28%). So the effect
+   is not a property of the workflow -- it is dominated by model/run behavior.
+
+3. **Token use is driven by TURN COUNT, which the model chooses
+   non-deterministically -- not by per-turn output size.** The A-loses cells are
+   turn inflation (haiku fix-test A took 4/5/6 turns vs steady 4; spark fix-test
+   A 6/9/7). One extra agentic turn swamps the small per-turn saving the
+   reduction lever produces. The lever is real per-RESULT (proven separately);
+   at whole-task scale it is second-order.
+
+4. **Variance dwarfs the ~5-9% effect.** spark multi-file baseline spanned
+   40k-149k tokens (turns 6-21) across 3 runs. N=3 cannot resolve a single-digit
+   effect against that; the N needed is impractical.
+
+5. **Success is not 100% and not arm-clean, breaking the metric.** mini
+   investigate-log B=1/3 vs A=2/3; haiku multi-file B=0/3 vs A=2/3. Comparing
+   mean tokens across arms with different success rates is apples-to-oranges,
+   and averaging failed 1-turn early-quits (~4216 tok) into the mean skews it
+   (fixed here by ok-only aggregation, but the underlying confound remains).
+   Notably in haiku multi-file the REDUCED arm succeeded MORE (2/3 vs 0/3).
+
+**HONEST CONCLUSION:** as designed, the end-to-end benchmark does NOT demonstrate
+a tokens-per-completed-task win on these small models -- and likely no robust
+whole-task win exists here, because task token use is governed by noisy turn
+counts, not the per-result reduction lever. This is a legitimate Milestone-2
+finding: per-result reductions are proven and real, but they do not translate
+into a measurable whole-task token reduction on this matrix. => README claim
+stays unshipped, ROADMAP gate stays OPEN. Honesty-first outcome, as committed.
+
+**DESIGN FIXES the run implies (for operator decision):**
+- Metric: count tokens only over SUCCESSFUL runs and report success rate
+  separately; gate token comparison on comparable success. The harness should
+  aggregate this, not dump raw rows.
+- Either accept + report the null (my lean: it is the honest answer and the
+  per-result benchmarks already carry the efficiency evidence), OR pivot the
+  metric to tokens-per-TURN / a huge-single-output workload where the lever
+  dominates (drifts from "realistic task"), OR big-N a single favorable cell
+  (spark/investigate-log +19%) -- but that is cherry-picking unless framed as
+  "at least one workflow," and even that workflow flips negative on other models.
+
+**NEXT:** report to operator; do not spend further or change design without a
+decision on metric + accept-null-vs-pivot.
+
+---
+
+## Entry 13 — Rich instrumentation + Sonnet 4.6 (the interpretation-cost test)
+
+Operator raised the key hypothesis: the stripped-down (arm A) tool output may be
+HARDER to interpret, making the model take MORE turns / tool calls -- so the
+reduction is not free. Instrumented the harness to log everything as JSONL
+(per-turn input/output tokens, per-tool call histogram, handle offloads,
+tokens-per-turn vs turn count) and ran Sonnet 4.6 low, N=3, 3 workloads x 2 arms
+(18 sessions, 400.8s, 18/18 success).
+
+**H1 (capability -> steadier approach): confirmed on pure tasks, not a clean
+law.** investigate-large-log arm A: Sonnet input tokens 19733/19738/19739 (CV
+~0%), turns 3/3/3; small models CV 14-51% on the same cell. BUT gpt-5.4-mini was
+CV 0% on multi-file (5/5/5) -- a small model can be consistently mediocre. Honest
+read: Sonnet is both more successful AND far steadier on the reasoning-only
+tasks, which is what finally makes the effect measurable; "capability lowers
+variance" holds on the pure cells, not universally.
+
+**H2 (reduction can COST turns/tool-calls): CONFIRMED on multi-file edit.**
+Per-cell A-vs-B (ok-only, N=3), Sonnet:
+
+| workload | dturns | dtool-calls | tok/turn A vs B | TOTAL input A vs B |
+|---|---|---|---|---|
+| fix-failing-test | -0.3 | +0.0 | +2.4% | +9.9% (A cheaper) |
+| investigate-large-log | +0.0 | +0.0 | +2.3% | +2.3% (A cheaper) |
+| multi-file-search-and-edit | +1.0 | +2.3 | -5.2% | **-20.3% (A COSTLIER)** |
+
+On multi-file the "token-efficient" arm A used **20% MORE** input tokens: it took
++1 turn and +2.3 tool calls. Tool-mix breakdown pins it: grep=2.0 and read=5.0 in
+BOTH arms, but edits went B=5.3 -> A=7.7 (+2.4 EDIT calls). So the compact
+grep/find output did not cause re-searching -- it changed the model's EDITING
+strategy (more, smaller edits), and the accumulating transcript from those extra
+calls swamped the per-call reduction (A's tok/turn was actually 5% HIGHER). This
+is exactly the hidden cost the operator predicted: on a multi-file edit flow the
+reduction is net-negative, contradicting a blanket "efficient" claim.
+
+**The clean wins are real but small.** investigate-large-log is the purest demo:
+identical turns + identical tool mix in both arms, arm A just carries a smaller
+per-turn context -> -2.3%, CV ~0%. fix-test -9.9% (mostly because arm B had one
+5-turn run; arm A was steadier).
+
+**SYNTHESIS:** even on a capable model the reduction is workload-dependent, not a
+uniform win: -2.3% and -9.9% on the read/fix tasks, but **+20.3% on multi-file
+edit**, driven by extra edit calls. => a blanket README token-efficiency claim is
+NOT supported; the honest Milestone-2 result is "reduction helps on
+search/read-heavy tasks and can hurt on multi-file edit flows."
+
+**CAVEATS:** N=3; multi-file A magnitude is noisy (49k/75k/75k). The extra calls
+are EDITs, so the mechanism is a strategy change, not "couldn't find it" -- to
+explain WHY needs tool-ARGUMENT logging (not captured yet; args are deliberately
+kept out of the lifecycle event). Good follow-up: log edit args + higher N on the
+multi-file cell.
+
+**NEXT:** report; propose (a) tool-arg logging + powered re-run of multi-file to
+explain the edit-inflation, and (b) keep the claim unshipped / gate open.
+
+---
+
 ## Entry 3 — Toggle mechanism + reduction semantics + real-run feasibility
 
 **OBSERVATION — the reduction seams and what "off" means.**

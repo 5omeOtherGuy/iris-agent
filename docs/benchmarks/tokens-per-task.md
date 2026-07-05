@@ -99,11 +99,15 @@ issue and ADR-0036).
 resolved config (`build_provider(&selection, ..)`), so the cell runs whichever
 provider/model the config selects. Codex (`gpt-5.5`) is only the *default*
 (`ProviderId::DEFAULT`); Anthropic (`claude-sonnet-4-6`) and Antigravity are
-equally wired, each with its own `record_usage`, so a Claude cell needs only
-Anthropic auth + a config/model override -- no harness change. Because output
-reduction interacts with a model's tokenizer and its willingness to work from
-compact context, the headline SHOULD be run on at least Codex AND Claude; a
-cross-provider win is a materially stronger Milestone-2 result than either alone.
+equally wired, each with its own `record_usage`, so a Claude cell needs only a
+config/model override -- no harness change. Both are usable on the current
+machine with no new credentials: Codex via the Iris auth store, and Anthropic
+via the existing Claude Code subscription OAuth, which Iris reads from the Iris
+store, then `~/.claude/.credentials.json`, then the macOS Keychain (see
+`src/mimir/auth/anthropic.rs`). Because output reduction interacts with a
+model's tokenizer and its willingness to work from compact context, the headline
+SHOULD be run on at least Codex AND Claude; a cross-provider win is a materially
+stronger Milestone-2 result than either alone.
 
 Repro (costs money) -- run once per provider you want a cell for:
 
@@ -112,11 +116,11 @@ Repro (costs money) -- run once per provider you want a cell for:
 IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 \
   cargo test --bin iris tokens_per_task_headline -- --ignored --nocapture
 
-# Claude cell: select the Anthropic provider first (needs Anthropic auth), via
-# either the settings file ("default_provider": "anthropic") or the
-# ANTHROPIC_API_KEY env fallback; optionally pin IRIS_MODEL=claude-sonnet-4-6.
-# Then run the SAME test -- the harness reads the resolved selection.
-ANTHROPIC_API_KEY=... IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 \
+# Claude cell: select the Anthropic provider (settings "default_provider":
+# "anthropic"; optionally pin IRIS_MODEL=claude-sonnet-4-6). Iris uses the
+# existing Claude Code OAuth credentials -- no new auth needed here. Then run the
+# SAME test; the harness reads the resolved selection.
+IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 \
   cargo test --bin iris tokens_per_task_headline -- --ignored --nocapture
 ```
 
@@ -197,9 +201,10 @@ Ordered by how much each would strengthen the Milestone-2 claim:
    provider-agnostic (it builds from the resolved config), and reduction
    interacts with each model's tokenizer and its tolerance for compact context,
    so a per-provider table is the honest shape and a cross-provider win is a
-   materially stronger result. Blocker: operator spend authorization (and, for
-   Claude, adding Anthropic auth -- only Codex/Antigravity are authed today).
-   Until then the gate stays open.
+   materially stronger result. Both providers are already usable on the current
+   machine (Codex via the Iris store, Claude via the existing Claude Code OAuth
+   credentials), so the only blocker is operator spend authorization. Until then
+   the gate stays open.
 2. **Grow the fixtures toward grouping's strength.** Add a search/triage workload
    with many hits across many files in shared directories (dozens of matches,
    deep trees) -- the regime where grep/find grouping compounds. This would show
