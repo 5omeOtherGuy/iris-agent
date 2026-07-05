@@ -459,6 +459,168 @@ fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
     Ok(())
 }
 
+/// Provider that streams a scripted sequence of `ProviderEvent`s (reasoning
+/// deltas, section breaks, text deltas) ending in one `Completed` turn. Used to
+/// exercise the live-reasoning display/suppression path.
+struct ScriptedStreamProvider {
+    events: RefCell<Option<Vec<Result<ProviderEvent>>>>,
+}
+
+impl ScriptedStreamProvider {
+    fn new(events: Vec<ProviderEvent>) -> Self {
+        Self {
+            events: RefCell::new(Some(events.into_iter().map(Ok).collect())),
+        }
+    }
+}
+
+impl ChatProvider for ScriptedStreamProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let events = self.events.borrow_mut().take().unwrap_or_default();
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+fn test_origin() -> ModelOrigin {
+    ModelOrigin::new("test", "test", "test")
+}
+
+fn reasoning_display_events(events: &[AgentEvent]) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantReasoning { text, redacted } => Some((text.clone(), *redacted)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reasoning_delta_texts(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantReasoningDelta(delta) => Some(delta.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn persisted_reasoning_rows<P: ChatProvider>(harness: &Harness<P>) -> usize {
+    harness
+        .agent
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::AssistantReasoning)
+        .count()
+}
+
+#[test]
+fn streamed_reasoning_suppresses_final_display_but_persists_once() -> Result<()> {
+    // A turn that streams its reasoning summary live: the front-end already
+    // showed the thinking block via deltas, so the terminal canonical display
+    // event is suppressed -- but the persisted reasoning row is written once
+    // (ADR-0016 storage untouched).
+    let workspace = test_workspace()?;
+    let mut turn = AssistantTurn::text("Answer");
+    turn.reasoning = vec![ReasoningBlock::new(
+        "First thought",
+        Some("enc"),
+        false,
+        test_origin(),
+    )];
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::ReasoningDelta("First ".to_string()),
+        ProviderEvent::ReasoningDelta("thought".to_string()),
+        ProviderEvent::Completed(turn),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert_eq!(reasoning_delta_texts(&events), vec!["First ", "thought"]);
+    assert!(
+        reasoning_display_events(&events).is_empty(),
+        "streamed reasoning must suppress the duplicate terminal display event"
+    );
+    assert_eq!(
+        persisted_reasoning_rows(&harness),
+        1,
+        "reasoning still persisted exactly once"
+    );
+    Ok(())
+}
+
+#[test]
+fn streamed_summary_plus_redacted_block_still_shows_redacted_placeholder() -> Result<()> {
+    // A turn with a streamed summary AND a redacted block: the summary display
+    // event is suppressed (shown live), but the redacted placeholder -- which is
+    // never streamed -- is still emitted. Both blocks persist.
+    let workspace = test_workspace()?;
+    let mut turn = AssistantTurn::text("Answer");
+    turn.reasoning = vec![
+        ReasoningBlock::new("Streamed summary", Some("enc1"), false, test_origin()),
+        ReasoningBlock::new("", Some("enc2"), true, test_origin()),
+    ];
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::ReasoningDelta("Streamed summary".to_string()),
+        ProviderEvent::Completed(turn),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert_eq!(
+        reasoning_display_events(&events),
+        vec![(String::new(), true)],
+        "only the redacted placeholder is emitted; the streamed summary is suppressed"
+    );
+    assert_eq!(
+        persisted_reasoning_rows(&harness),
+        2,
+        "both blocks persisted"
+    );
+    Ok(())
+}
+
+#[test]
+fn reasoning_without_deltas_emits_final_display_event() -> Result<()> {
+    // Graceful degradation: a provider that sends no reasoning deltas still gets
+    // the block-level display event at completion, exactly as before.
+    let workspace = test_workspace()?;
+    let mut turn = AssistantTurn::text("Answer");
+    turn.reasoning = vec![ReasoningBlock::new(
+        "Block reasoning",
+        Some("enc"),
+        false,
+        test_origin(),
+    )];
+    let provider = ScriptedStreamProvider::new(vec![ProviderEvent::Completed(turn)]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        reasoning_delta_texts(&events).is_empty(),
+        "no deltas were streamed"
+    );
+    assert_eq!(
+        reasoning_display_events(&events),
+        vec![("Block reasoning".to_string(), false)]
+    );
+    Ok(())
+}
+
 #[test]
 fn repl_reports_auth_errors_with_login_hint() -> Result<()> {
     let workspace = test_workspace()?;

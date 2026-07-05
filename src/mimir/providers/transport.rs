@@ -108,6 +108,19 @@ pub(super) trait TurnSink {
     /// stream (cancellation) so the SSE read loop stops early instead of
     /// draining the rest of the response on a leaked blocking thread.
     fn on_text_delta(&mut self, delta: &str) -> Result<()>;
+
+    /// Forward one reasoning-*summary* delta (display-only; never raw
+    /// chain-of-thought or encrypted content). Default no-op so providers and
+    /// test sinks that do not stream reasoning are unaffected.
+    fn on_reasoning_delta(&mut self, _delta: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Forward a boundary between two reasoning-summary parts (a blank line in
+    /// the live trace). Default no-op.
+    fn on_reasoning_section_break(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// [`TurnSink`] that forwards each text delta onto the provider's event channel.
@@ -125,6 +138,18 @@ impl TurnSink for ChannelSink {
     fn on_text_delta(&mut self, delta: &str) -> Result<()> {
         self.tx
             .unbounded_send(Ok(ProviderEvent::TextDelta(delta.to_string())))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
+
+    fn on_reasoning_delta(&mut self, delta: &str) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::ReasoningDelta(delta.to_string())))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
+
+    fn on_reasoning_section_break(&mut self) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::ReasoningSectionBreak))
             .map_err(|_| anyhow!("response stream dropped by consumer"))
     }
 }

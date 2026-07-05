@@ -1,7 +1,7 @@
 # ADR-0025: Expose stored reasoning as a display event
 
 **Date**: 2026-06-26
-**Status**: accepted
+**Status**: accepted (streaming stance revisited by ADR-0050)
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context
@@ -78,7 +78,9 @@ persisted reasoning row.
 - **Cons**: The provider path assembles reasoning into blocks at completion;
   there are no reasoning deltas to forward here.
 - **Why not**: Would invent a stream that does not exist; revisit if a provider
-  surfaces reasoning deltas.
+  surfaces reasoning deltas. **Revisited by ADR-0050**: the OpenAI Codex
+  Responses provider does surface reasoning-summary deltas, which are now
+  streamed as a display event in addition to this block-level event.
 
 ## Consequences
 

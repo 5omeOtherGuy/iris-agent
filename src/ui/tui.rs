@@ -1316,6 +1316,175 @@ mod tests {
         );
     }
 
+    // --- Slice 3: provider-neutral live reasoning deltas ---
+
+    #[test]
+    fn live_reasoning_previews_then_commits_above_the_answer() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        // Reasoning summary streams first, as a transient preview: visible in
+        // the frame but NOT yet committed to scrollback.
+        screen.apply(UiEvent::AssistantReasoningDelta("Weighing ".to_string()));
+        screen.apply(UiEvent::AssistantReasoningDelta("the options.".to_string()));
+        let preview = rendered_text(&mut screen, 80, 16);
+        assert!(
+            preview.contains("THINKING"),
+            "live thinking rail: {preview}"
+        );
+        assert!(preview.contains("Weighing the options."), "{preview}");
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("Weighing")),
+            "reasoning preview is transient, not committed yet"
+        );
+        // The answer starts: the reasoning trace commits to scrollback above it.
+        screen.apply(UiEvent::AssistantTextDelta(
+            "Here is the answer.".to_string(),
+        ));
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("Weighing the options.")),
+            "reasoning committed on first answer delta"
+        );
+        let out = rendered_text(&mut screen, 80, 16);
+        let thinking_at = out.find("THINKING").expect("thinking");
+        let answer_at = out.find("Here is the answer.").expect("answer");
+        assert!(thinking_at < answer_at, "reasoning above the answer: {out}");
+        // Exactly one thinking block (no duplicate from a late canonical event,
+        // which Nexus suppresses when the summary streamed).
+        assert_eq!(
+            out.matches("THINKING").count(),
+            1,
+            "one thinking block: {out}"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_commits_on_reasoning_only_completion() {
+        // A turn that streams reasoning and then ends with no answer text (e.g.
+        // straight into a tool or turn end) must still commit the trace.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Planning quietly.".to_string(),
+        ));
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("Planning")),
+            "still transient before completion"
+        );
+        screen.apply(UiEvent::TurnComplete);
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("Planning quietly.")),
+            "reasoning-only trace committed at turn end"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_commits_on_cancellation() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Half a thought".to_string(),
+        ));
+        screen.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("Half a thought")),
+            "a partial reasoning trace is committed, not lost, on cancel"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_section_break_separates_paragraphs() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta("First part.".to_string()));
+        screen.apply(UiEvent::AssistantReasoningSectionBreak);
+        screen.apply(UiEvent::AssistantReasoningDelta("Second part.".to_string()));
+        // A leading section break (before any text) is a no-op; the two parts
+        // both render in the live preview.
+        let preview = rendered_text(&mut screen, 80, 16);
+        assert!(preview.contains("First part."), "{preview}");
+        assert!(preview.contains("Second part."), "{preview}");
+        // On finalize the multi-paragraph trace commits as a foldable block.
+        screen.apply(UiEvent::TurnComplete);
+        let committed: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert!(
+            committed.iter().any(|t| t.contains("First part.")),
+            "{committed:?}"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_telemetry_patches_committed_header() {
+        // The thinking header committed from a live trace still receives the
+        // reasoning-token telemetry at ProviderTurnCompleted.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Deliberating.".to_string(),
+        ));
+        screen.apply(UiEvent::AssistantTextDelta("Answer.".to_string()));
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 10_000,
+                output_tokens: 3_000,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 2_400,
+                total_tokens: 13_000,
+                cache_creation: None,
+            }),
+        });
+        let header = rendered_lines(&mut screen, 100, 18)
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("THINKING"))
+            .expect("thinking header");
+        assert!(
+            header.contains("↓2.4k"),
+            "telemetry on committed header: {header}"
+        );
+    }
+
     /// Incremental rendering (wrapped-row cache + fold-visibility cache +
     /// stable-prefix hints + surface prefix reuse) must leave the terminal
     /// surface byte-identical to a fresh full replay of the same screen after
