@@ -1,0 +1,11 @@
+//! Background worker that drains a queue, retrying failed jobs.
+use crate::config::retry::MAX_RETRIES;
+
+pub fn should_requeue(failures: u32) -> bool {
+    // A job is requeued until it has failed MAX_RETRIES times.
+    failures < MAX_RETRIES
+}
+
+pub fn remaining(failures: u32) -> u32 {
+    MAX_RETRIES.saturating_sub(failures)
+}

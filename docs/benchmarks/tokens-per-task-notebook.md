@@ -1,0 +1,477 @@
+<!-- typos: this is a running lab notebook, not polished prose -->
+# Lab Notebook: tokens-per-task benchmark (issue #210)
+
+A live, running record of observations, decisions, deviations, and reactions
+while building the Milestone-2 end-to-end tokens-per-task benchmark. Append-only
+by convention: earlier entries are not rewritten, corrections are added as new
+entries so the reasoning trail stays honest.
+
+Format: timestamped entries (session-relative, not wall-clock), tagged
+`OBSERVATION`, `DECISION`, `DEVIATION`, `QUESTION`, `RESULT`, `BLOCKER`.
+
+---
+
+## Entry 0 — Setup and context (session start)
+
+**Task.** Implement issue #210: end-to-end tokens-per-COMPLETED-task benchmark.
+Prove Iris efficiency features (bash output filtering, grep/find shaping, read
+skim, handles) reduce tokens per completed task without reducing task success.
+
+**DECISION — git loop.** Followed the repo loop: `worktree-preflight.sh` →
+`PASS (primary main == origin/main)` → created worktree
+`../iris-210-tokens-per-task` on branch `bench/tokens-per-task` off
+`origin/main`. All edits happen only in that worktree. Do NOT merge (per task).
+
+**OBSERVATION — pinned plan (issue #210, 2026-07-04 comment).** The design is
+fixed; my job is to execute it, not redesign:
+- **Arms:** (A) Iris defaults; (B) baseline with efficiency features disabled.
+  B needs one benchmark-only global switch (env preferred) disabling bash output
+  filtering + grep/find shaping. Per-call `raw:true` is explicitly NOT sufficient
+  for an arm-level toggle. Switch is a measurement affordance, not a user feature.
+- **Workloads (3), each with a mechanical success check:**
+  1. fix-failing-test in a Rust fixture repo (success = gate/test green)
+  2. multi-file search-and-edit (success = expected diff applied)
+  3. investigate-large-log / test-output triage (success = correct answer keyed
+     to a planted fact)
+- **Metrics per arm×workload:** total prompt tokens (from provider usage
+  records, NOT byte estimates), tokens-per-completed-task, success rate, turn
+  count, wall cost. N>=3 real-provider runs per cell for headline; fake-provider
+  / recorded replays for the re-runnable regression harness.
+- **Honesty rules:** claims cite the committed report; if B ties or beats A, that
+  IS the finding and the README claim does NOT ship. A success-rate regression in
+  A vs B on any workload is stop-and-investigate, not a footnote.
+
+**OBSERVATION — approvals (issue #210 addenda).** Both arms under the existing
+ADR-0032 **auto preset**, identical config; no new bypass; safety floors stay
+active. Workloads must avoid non-bypassable floors (no destructive bash).
+Harness must assert **zero interactive approval prompts** per run — any prompt
+observed invalidates the run. Replay path uses the existing test ApprovalGate
+injection (as nexus_tests does), identical across arms.
+
+**OBSERVATION — ADR-0036 rule 5.** "Reduction is measured." The per-tool corpora
+(bash filter #336/ADR-0037, read skim #337, grep #338, find #340) already assert
+per-result minimum bars via `src/tools/bench_support.rs`. This issue is the
+end-to-end layer the skill explicitly defers: "does the model still complete the
+task from reduced context." Distinct harness, must not duplicate the per-result
+stack.
+
+**OBSERVATION — token accounting rule.** SKILL/bench_support use a 4-bytes/token
+*estimate* and only ratios are meaningful there. But #210 headline tokens must
+come from **real provider usage records**, not estimates. So the end-to-end
+harness needs a different token source than `bench_support::est_tokens`.
+
+### Seam findings so far (read-only investigation)
+
+**OBSERVATION — usage records.**
+- `ProviderUsage` struct: `src/nexus.rs:2302`. Fields include `input_tokens`,
+  `output_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`,
+  `reasoning_output_tokens`, `total_tokens`, `provider`, `model`.
+- `record_usage(&self, usage: &ProviderUsage)` implemented per provider:
+  `openai_codex_responses.rs:232`, `openai_compatible_chat.rs:234`,
+  `anthropic_messages.rs:392`. Today it only `tracing::info!`s the usage; it does
+  not appear to accumulate into a session total. NEED TO CONFIRM where/if usage
+  is aggregated per session (this is the headline token source).
+
+**OBSERVATION — bash filter seam.**
+- `src/tools/bash/mod.rs`: `filter_for_display(cmd, output, exit_ok, raw)` wraps
+  `filter::filter_output(...)` (ADR-0037). Called at two sites (foreground +
+  persistent shell). `raw:true` bypasses for one call. This is the arm-toggle
+  point for bash.
+
+### Open questions
+
+- **QUESTION:** Where do per-session prompt-token totals get aggregated (if at
+  all)? Headline metric depends on it. (Investigating `record_usage` callers /
+  session accounting next.)
+- **QUESTION:** What is the grep/find "shaping" seam the toggle must disable,
+  and are read-skim + handles in scope for arm B? Plan names bash + grep/find
+  explicitly; read skim/handles may be left on in both arms (documented).
+- **QUESTION:** How does the fake provider drive tool-call loops, and how does
+  nexus_tests inject an ApprovalGate? That defines the replay harness shape.
+
+---
+
+## Entry 1 — The auto-preset / bash constraint reshapes the workloads
+
+**OBSERVATION (pivotal) — ADR-0032 auto v1 never auto-approves bash.** Read
+`docs/adr/0032` + `src/nexus.rs` auto path (~L1719-1755) + the auto-mode tests
+(`src/nexus_tests.rs` ~L6690-6900). Auto v1 auto-approves ONLY clean
+in-workspace `edit`/`write`. `bash` always routes to the gate, even a clean
+non-destructive `echo hi` (`auto_mode_does_not_auto_run_plain_bash`) — the safe
+auto-bash path needs a proven sandbox preflight, which is deferred. `read`,
+`grep`, `find`, `ls` are non-gated (no approval ever).
+
+**Consequence for the plan:** the constraint "run under auto, assert ZERO
+interactive prompts, redesign the step (never the floor) if it would prompt"
+means **the agent may never call `bash`** in any workload. Under auto, an agent
+bash call = a prompt = invalid run.
+
+**DECISION — workloads: agent inspects/edits; harness runs the bash checks.**
+Re-frame all three workloads so the *agent* only uses auto-safe tools
+(read/grep/find/ls + clean in-workspace edit/write) and the *harness* performs
+the mechanical success check outside the agent turn:
+1. **fix-failing-test** (Rust fixture crate, one failing unit test). Agent:
+   grep/read to locate the bug, `edit` the source (clean in-workspace edit,
+   auto-approved). Harness: runs `cargo test` on the fixture AFTER the run;
+   success = green. Agent never runs bash.
+2. **multi-file search-and-edit** (symbol rename/fix across many files). Agent:
+   grep/find to locate all sites, `edit` each. Harness: compares result files
+   to the committed expected snapshot; success = expected diff applied.
+3. **investigate-large-log** (a committed captured test/build log fixture with a
+   planted fact). Agent: grep/read the committed log file, answer. Harness:
+   checks the final answer contains the planted fact. Agent never runs bash.
+
+**DECISION — which efficiency features the end-to-end benchmark measures.** With
+no agent bash, the exercised default-on reductions are **grep shaping (#338)**
+and **find compaction (#340)** (read-only, large-search-results / large-log
+territory — exactly the ROADMAP acceptance signal). `read` skim (#337) is
+*opt-in* (`skim:true` param, `src/tools/read.rs:84`), a model choice not a
+default, so it is identical across arms and NOT part of the arm toggle. The
+**bash filter (ADR-0037)** cannot be exercised end-to-end under auto (auto-bash
+deferred); its proof stays at the per-result corpus level. This is an honest
+scoping consequence of the approval constraint, to be stated plainly in the
+plan + report. The Milestone-2 acceptance signal is satisfied by the
+search/log workflows.
+
+**DECISION — arm toggle scope.** The benchmark-only env switch disables the
+default-on reductions: bash filter + grep shaping + find compaction. Bash is
+included for completeness/arm-B cleanliness even though the auto workloads do
+not trip it. Read skim is excluded (opt-in, not default). Default (unset) state
+must be proven unchanged by existing tests + a new default-on test.
+
+**OBSERVATION — token sources (two, honestly separated).**
+- **Replay path (fake provider, CI):** FakeProvider records `seen` (the messages
+  sent each turn). Prompt tokens = token estimate over `seen`. Differs between
+  arms because tool OUTPUT size differs (grep/find shaping on vs off). Estimate
+  only; asserts arm A < arm B deterministically. No cost.
+- **Headline path (real provider, N>=3):** attach an observer capturing
+  `AgentEvent::ProviderTurnCompleted.usage` (`ProviderUsage.input_tokens`) per
+  turn = REAL provider usage records. Sum across turns = prompt tokens per run.
+
+**OBSERVATION — driver seams.**
+- `run_print_turn(harness, prompt, obs, gate)` (`src/cli.rs:777`) drives one
+  headless turn-sequence (current-thread runtime + Ctrl-C watcher). Reusable.
+- `build_provider(selection, system_prompt, session_id)` (`src/main.rs:681`)
+  builds the real provider; `ModelSelection::resolve(&settings)`.
+- `nexus_tests.rs` is wired as `#[cfg(test)] #[path="nexus_tests.rs"] mod`
+  inside `nexus.rs` (L2726), so a sibling test module has crate-private access
+  to `Agent`, `Harness`, `ApprovalMode`, `ProviderUsage`, the gate traits.
+- `Agent::set_approval_mode(ApprovalMode::Auto)` (`src/nexus.rs:1040`) installs
+  the preset; the test `run_preset_turn` + `FakeGuard` + `RecordingFrontend`
+  scaffolding (`src/nexus_tests.rs` ~L6570-6673) already drive auto-mode turns
+  with an injected gate + dirty guard. Reuse this shape for the replay harness.
+
+**DECISION — harness placement (no new product surface).** Put the end-to-end
+driver in a test-scoped module (like the existing corpora + nexus_tests), NOT a
+new CLI subcommand (out-of-scope: no user features). Replay path = ordinary
+`#[test]`s in CI. Real-provider headline path = an `#[ignore]`d test that runs
+only when the operator opts in (env var + credentials), printing the usage
+table with `-- --nocapture`. Auto mode + zero-prompt recording gate are
+identical across arms and both providers; floors stay active.
+
+**QUESTION (for oracle):** Is the in-process test-module driver the right home,
+or should the real path reuse `iris -p` + RUST_LOG usage-trace parsing? Pressure
+-test before building.
+
+---
+
+## Entry 2 — Oracle design review (verdict + the env-race correction)
+
+**RESULT — oracle validated the direction** (overall 7.5/10, "good design with
+two fix-before-build issues"):
+- (A) auto+no-bash is the CORRECT reading; do NOT switch the headline to
+  `--approve`+bash — that would measure a bypass mode, not the ADR-0032 auto
+  preset. `--approve` bash could be a *separate, non-headline* exploratory run
+  later, never mixed into the Milestone proof.
+- (B) two-token-source split is honest IF labeled: replay = estimated message
+  proxy (never call it exact tokens; assert A < B with a MARGIN, not a
+  one-token inequality); headline = real `input_tokens`, and the headline path
+  must FAIL if usage is missing, never silently fall back.
+- (C) the `#[ignore]`d in-process test is the better home; `iris -p` + trace
+  parsing is brittle and adds product surface.
+- (D) not over-engineering; smallest shape = `Workload`, `Arm`, `RunMetrics`,
+  one shared driver, replay provider, real-provider ignored test,
+  harness-side success checks. No new CLI subcommand / framework / DB.
+- (E) scripted replay is defensible IF worded honestly: it proves the tool-loop
+  + transcript + success mechanics + token delta under a fixed SUCCESSFUL
+  script; the tool OUTPUTS are real (real tools over committed fixtures). For
+  the planted-fact workload, derive the answer from the actual tool result /
+  a captured successful run, do not hardcode an answer from thin air.
+
+**DECISION (fix-before-build #1) — arm toggle must NOT be a process-global env
+var that tests mutate.** `std::env::set_var` is process-global and (Rust 2024)
+unsafe under concurrent getenv; cargo runs `#[test]`s on parallel threads, so
+two replay arms toggling a global env var race. Correction:
+- The env var (`IRIS_BENCH_DISABLE_REDUCTIONS`, name TBD) remains the OPERATOR
+  switch for real-provider runs — each `iris` invocation is its own process, no
+  race.
+- The reduction seam reads an explicit per-run flag carried in the tool
+  execution context (ToolState/ToolEnv), NOT a global. Production seeds that
+  flag from the env var ONCE at ToolState construction. The replay harness
+  constructs TWO ToolStates (arm A reductions-on, arm B reductions-off), runs
+  both, compares — zero env mutation, race-free, deterministic.
+- Default (env unset) => reductions enabled => existing behavior unchanged
+  (proven by a new default-on test + the fact that existing tool tests build a
+  default ToolState and must stay green).
+
+**DECISION (fix-before-build #2) — claim scope discipline.** State explicitly the
+benchmark proves default *search-result* reductions (grep #338, find #340). It
+does NOT cover ADR-0037 bash filtering (auto-bash deferred), read skim (opt-in),
+or handles. Apply the same opt-in logic to grep `maxPerFile` (opt-in cap): the
+arm toggle covers only default-on shaping, and the report says so.
+
+**QUESTION:** Does the reduction seam (bash `filter_for_display`, grep/find
+render) have access to `ToolEnv`/`ToolState` so the arm flag can be threaded
+without an invasive refactor? Investigating next.
+
+---
+
+## Entry 4 — Toggle implemented (mechanism + one honest misstep)
+
+**RESULT — toggle in place, default arm unchanged.** Implemented
+`ToolState.reduce_output` (default true via `output_reductions_enabled_from_env`
+reading `IRIS_BENCH_DISABLE_REDUCTIONS`), builder `with_reduce_output`, and the
+pure `reductions_enabled_for(Option<&str>)` for race-free unit testing. Threaded
+the flag: `registry::reduce_output(env)` -> `run_off_thread(reduce, body)` with
+`grep::execute`/`find::execute`/`ls::execute` taking `reduce`; `BashTool` folds
+it into the existing `raw` bypass (`let raw = raw || !reduce_output;`, one line,
+no second code path). grep: `render_content` gained `group: bool` (flat =
+`path:line:content`, no per-file header/markers). find: `render_compact` forces
+`use_grouped=false` when `group` is false.
+- `cargo check --bin iris`: clean. `cargo test tools::`: 308 pass.
+- New `output_reductions_default_active_and_switch_is_explicit_truthy` passes;
+  corpus tests (`corpus_grouping_is_parity`, `bench_concentrated_grouping`,
+  `grouping_not_used_when_flat`) still green => default behavior byte-stable.
+
+**DEVIATION / self-correction — blind scripting over-reached.** To update ~40
+old-arity test call sites I ran a balanced-paren Python inserter for the call
+heads `find(`, `grep(`, `execute(`, `render_results(`, `render_compact(`. The
+`find(` head's `(?<![A-Za-z0-9_])` boundary also matched `.find(` METHOD calls
+(`String::find`, `Iterator::find`), inserting a spurious `, true` into 4 method
+calls, and it mangled 2 multiline `execute(` calls (`}),\n , true)`).
+Compiler caught all of them (E0061 + parse errors). Fixed each by hand and
+re-verified. Lesson logged: a call-head regex must exclude method-call
+receivers (`.`), and machine edits to dense test code must be gated on a
+re-compile before trusting them. The mechanical time saved was partly repaid in
+the fix; net still positive but the boundary bug is the kind the notebook exists
+to record.
+
+**NEXT:** add arm-B *behavior* tests (reduce=false actually yields flat grep /
+flat find / raw bash), then build the 3 fixtures + the replay harness.
+
+---
+
+## Entry 5 — Harness + fixture design (locked before building)
+
+**OBSERVATION — driver seam confirmed.** `Agent::submit_turn(prompt, obs, gate,
+env, cancel, steer)` (`src/nexus.rs:1137`) is driven directly with a
+caller-built `ToolEnv` in the auto-mode tests (`run_preset_turn`,
+`src/nexus_tests.rs:6626`). The replay harness copies that shape: build
+`ToolEnv { workspace, state: &RefCell<ToolState::new().with_reduce_output(arm)>,
+output_store: None, ... }`, `agent.set_approval_mode(Auto)`, and drive
+`submit_turn` per arm. `output_store: None` keeps every tool output inline (no
+handle offload) so the arm delta is the pure grep/find reduction, not offload.
+
+**OBSERVATION — `edit` requires read-before-mutate.** `edit` ->
+`observed.ensure_fresh` rejects an unread file (`stale-file`/`unread`,
+`src/tools/observe.rs`). So every scripted `edit` is preceded by a scripted
+`read` of that file — which is what a real agent does anyway.
+
+**DECISION — token proxy (replay).** Sum of `bench_support::est_tokens` over the
+messages the `ScriptedProvider` is sent each turn (`seen`), across all turns — a
+honest cumulative-input proxy (each turn re-sends the growing transcript, as a
+real provider bills it). Same estimator both arms; only the ratio is claimed;
+never presented as exact tokens. Arm A < arm B by a margin is the assertion.
+
+**DECISION — three fixtures (committed, mechanical checks, agent never runs
+bash).** Stored under `src/bench_fixtures/tokens_per_task/<workload>/` with a
+`.txt` suffix on every file (so fmt/clippy/typos never touch them); the harness
+materializes them to a temp workspace stripping `.txt`.
+1. **workload1_fix_test** — 4-file mini Rust lib; `parser.rs` has an off-by-one
+   in `parse_len` (`count() - 1`); a `#[test]` in `lib.rs` fails; `parse_len`
+   is referenced across all 4 files (multi-file grep lever). Script: grep
+   `parse_len` -> read `parser.rs` -> edit (remove `- 1`) -> answer. Success:
+   harness runs `rustc --test lib.rs` -> exit 0 (test goes green).
+2. **workload2_rename** — 5 files in nested dirs each using `MAX_RETRIES`
+   (large multi-file grep). Script: grep `MAX_RETRIES` -> per file read+edit
+   (replace_all -> MAX_ATTEMPTS) -> answer. Success: harness asserts no file
+   contains `MAX_RETRIES` and each source contains `MAX_ATTEMPTS` (expected diff
+   applied).
+3. **workload3_log_triage** — `logs/` with 4 realistic cargo-test-failure
+   shards (built from the real captured `bash/filter/corpus/cargo-test-fail.txt`
+   content) with `assertion` noise across all shards and ONE planted fact in
+   shard-03 (`ceiling_is_exact`, left 8192 / right 8191). Script: grep
+   `assertion` across `logs/` (multi-file grep lever) -> read shard-03 ->
+   answer quoting the planted line. Success: final answer contains the planted
+   numbers `8192`/`8191` (derived from the committed line, not invented).
+
+**DECISION — harness placement + gating.** Module `src/bench_tokens_per_task.rs`
+included via `#[cfg(test)] #[path] mod` in `nexus.rs`, sibling to the
+`nexus_tests` include, for crate-private access. Its own tiny `ScriptedProvider`
+/ `ZeroPromptGate` / `BenchObserver` (nexus_tests' doubles are module-private).
+Replay tests are ordinary `#[test]`s (CI, fast; `rustc --test` is ~0.5s). The
+real-provider headline is an `#[ignore]`d test gated on `IRIS_BENCH_REAL=1` +
+credentials, printing the usage table with `--nocapture`. Zero-prompt gate +
+auto mode identical across arms and both providers.
+
+---
+
+## Entry 6 — Replay path is GREEN (results + an honest caveat)
+
+**RESULT — all 4 replay tests pass; the whole tools suite stays green.** The
+harness materializes each fixture, drives `submit_turn` under auto + zero-prompt
+gate for both arms, and asserts success + arm A < arm B + zero prompts.
+`tokens_per_task_replay_report` (est-token proxy, 4 bytes/token; ratios only):
+
+| workload | turns | arm B proxy | arm A proxy | reduction | both succeed |
+|---|---|---|---|---|---|
+| fix-failing-test | 4 | 2417 | 2336 | 3.4% | yes |
+| multi-file-search-and-edit | 12 | 14730 | 13531 | 8.1% | yes |
+| investigate-large-log | 3 | 1296 | 1178 | 9.1% | yes |
+
+DoD item 4 is satisfied: re-runnable in CI-compatible time (< 0.5s), both arms,
+success asserted, arm A < arm B by a margin, zero approval prompts.
+
+**OBSERVATION — the reductions are modest, and that is honest.** 3.4-9.1% is a
+grep/find *grouping*-only lever (the #338 grep-grouping lever is 3-27%; find
+grouping helps most with many files in shared dirs, which these small fixtures
+under-exercise). The larger levers (bash filter 68-89%, read skim 52-72%) are
+out of scope end-to-end here (auto-bash deferred; skim opt-in). The report will
+state the magnitude plainly; no rounding up.
+
+**CAVEAT (must be loud in the report + ROADMAP) — what replay does NOT prove.**
+The replay SCRIPTS the tool-call sequence, so both arms apply the identical
+fix/answer and both succeed by construction. Replay therefore proves the token
+PLUMBING (reduced tool outputs => smaller transcript => fewer input tokens) and
+the success MECHANICS, but it does NOT prove the Milestone-2 acceptance signal's
+hard part: that a real model still COMPLETES the task when it must reason from
+the reduced context. That requires the real-provider run. So the ROADMAP gate is
+NOT marked satisfied on replay alone, and the README claim does NOT ship on
+replay alone.
+
+**DECISION — real-provider cells need explicit spend authorization.** Auth exists
+but: (1) real runs cost money (18+ multi-turn sessions); (2) GPT-5-Codex may
+reach for `bash` (`cargo test`), which under auto = a prompt = invalid run,
+likely needing prompt iteration; (3) spending the user's money is a
+human-authorize action. Plan: wire the `#[ignore]`d real harness + exact repro +
+cost estimate, ship the PR with the replay evidence, and surface the real-run
+go/no-go to the operator rather than spending silently. If run and arm A wins
+with no success regression, the README claim ships and the ROADMAP gate flips;
+otherwise the honest finding ships and the claim does not.
+
+---
+
+## Entry 7 — Docs + gate + README decision
+
+**RESULT — clippy + fmt clean** after gating `ToolState::with_reduce_output`
+behind `#[cfg(test)]` (clippy `-D warnings` flagged it as dead code in the
+non-test `--bin iris` build; it is only ever called by the harness + toggle
+test). Real-provider harness (`run_real_arm` + `tokens_per_task_headline`,
+`#[ignore]`d, `IRIS_BENCH_REAL=1`-gated) compiles under `--all-targets`.
+
+**DECISION — report + ROADMAP + README.**
+- `docs/benchmarks/tokens-per-task.md` committed: method, the replay table with
+  the real measured numbers, repro commands, and a loud "what replay does /
+  does not prove" + "headline pending operator run" section.
+- ROADMAP "End-to-end measurement pending" note rewritten to cite the plan +
+  report, credit the replay evidence, and keep the gate OPEN until the
+  real-provider run lands. Not marked satisfied.
+- README left UNCHANGED. It already says the end-to-end proof "follows #261" and
+  makes no tokens-per-task claim; the honesty rule says the claim ships only
+  when real numbers support it. They do not yet (no real run; replay lever is a
+  modest 3.4-9.1%). The PR body states this explicitly.
+
+**NEXT:** run `scripts/gate.sh` green; open the PR referencing #210 (no merge);
+surface the real-provider spend go/no-go to the operator.
+
+---
+
+## Entry 8 — Independent review: two fixes applied
+
+Ran the reviewer over the toggle + harness diff. Two medium findings, both
+legitimate, both fixed:
+
+**FIX 1 (reviewer) — removed the production env read (leak risk).** The reviewer
+flagged that `ToolState::new()` reading `IRIS_BENCH_DISABLE_REDUCTIONS` lets an
+ambient env var silently disable reductions in a NORMAL session — the
+"benchmark-only, must not leak into normal runs" contract broken. Correct.
+DECISION: drop the env var entirely. `ToolState::new()` is now pure
+`reduce_output: true`; the baseline arm is reachable ONLY via the test-only
+`with_reduce_output`. This supersedes Entry 3's env-seed design and the oracle's
+Entry 2 env-race worry in one move — an in-process test-only flag cannot leak
+OR race. The headline harness already runs in-process (uses `with_reduce_output`,
+not a standalone `iris` process), so nothing needed the env var. Deviation from
+the pinned "env var preferred" is documented in BENCHMARK_PLAN + report; the
+binding requirement (arm-LEVEL, not per-call) is still met. Docs reconciled.
+
+**FIX 2 (reviewer) — tied success to output fidelity (no vacuous pass).** The
+reviewer noted the log-triage success check only inspected the SCRIPTED final
+answer (hardcoded 8192/8191), so it could pass even if the reduced tool output
+dropped the fact. Correct — that would let arm A "succeed" without proving the
+reduction preserved the actionable content. FIX: added per-workload survival
+`needles` and asserted they appear verbatim in the transcript the agent actually
+saw, in BOTH arms (wl1: `parse_len`, `split_whitespace().count() - 1`; wl2:
+`MAX_RETRIES`; wl3: `ceiling_is_exact`, `8192`, `8191`). This is the ADR-0036
+rule-5 "verbatim survival" contract applied end-to-end — success is now tied to
+the reduced output actually carrying the facts, not to a scripted answer.
+
+All 4 replay tests + the toggle test stay green after both fixes.
+
+---
+
+## Entry 3 — Toggle mechanism + reduction semantics + real-run feasibility
+
+**OBSERVATION — the reduction seams and what "off" means.**
+- `bash`: `filter_for_display(cmd, out, exit_ok, raw)` (`src/tools/bash/mod.rs`)
+  already has a `raw` bypass. Arm B = force `raw`. Trivial. Bash `execute` gets
+  `env`, so it can read the flag. (No agent-bash in workloads; wired for the
+  toggle's completeness + a unit test.)
+- `find`: `render_results` (`src/tools/find.rs:148`) already has a flat path
+  (`if !needs_compact`) and grouping only happens inside `render_compact`
+  (`use_grouped = grouped.shown > flat.shown || ...`). Arm B = force
+  `use_grouped=false` (always flat), caps + omitted-summary preserved. Minimal.
+- `grep`: grouping is baked into `render_content` (`src/tools/grep.rs:615`);
+  `render_flat` exists only as a `#[cfg(test)]` benchmark baseline (no paging /
+  notices / caps). Arm B needs a flat production render with the SAME paging /
+  notices so the ONLY difference is grouping. DECISION: add `group: bool` to
+  `render_content` — when false, prefix each line `path:sep:number:sep:content`
+  and skip the per-file header + context markers; paging/caps/notices unchanged.
+
+**DECISION — carrier: `ToolState.reduce_output: bool` (default true).** `ToolEnv`
+carries `state: &RefCell<ToolState>` to every tool, so `ToolState` is the
+race-free per-run carrier the oracle asked for.
+- `ToolState::new()` keeps `reduce_output = true` (existing tests byte-identical;
+  this is the "default => reductions active" contract).
+- Add `ToolState::with_reduce_output(bool)` (builder) for the replay harness
+  (arm B constructs `ToolState::new().with_reduce_output(false)`).
+- Production entry points (`main.rs` run_print + interactive, `cli.rs` sites)
+  seed it from the env var via a single helper `bench::reductions_enabled_env()`
+  that reads `IRIS_BENCH_DISABLE_REDUCTIONS` with a getenv (never setenv). Tests
+  NEVER set the env var, so getenv is race-safe.
+- Registry threads the flag: `grep::execute`/`find::execute` gain a `reduce`
+  param read from `env.state`; `run_off_thread` passes it; `ls::execute` ignores
+  it (no ls reduction shipped). `BashTool::execute` OR-s it into `raw`.
+
+**Default-unchanged proof:** new test asserts `ToolState::new().reduce_output`
+is true and `reductions_enabled_env()` is true when the var is unset; the entire
+existing tool + corpus test suite (which builds default `ToolState`) must stay
+green. That is the "default config => filters active" contract.
+
+**RESULT — real-provider feasibility.** `~/.iris/auth.json` has an `openai-codex`
+entry (access/refresh/expires/type) — iris-agent's only provider (Codex
+Responses) IS authenticated here, so real-provider runs are technically
+possible. BUT: (1) real runs cost money (OpenAI Codex, reasoning model,
+multi-turn, N=3 x 3 workloads x 2 arms = 18+ real sessions); (2) the OAuth token
+may be expired; (3) spending money is an externally-visible, human-authorize
+action per my operating guidelines.
+
+**DECISION — sequencing to protect against wasted spend + keep honesty.** Build
+and prove the ENTIRE deterministic stack first (toggle + fixtures + replay
+harness + plan), which fully satisfies DoD 1-4 at zero cost. The real-provider
+headline (DoD 5) is wired as an opt-in `#[ignore]`d harness with exact repro
+commands + a cost estimate; actually spending money on >=3 cells is surfaced to
+the operator for explicit go/no-go rather than run silently. If approved, run
+the smallest workable set and record real usage-record numbers; if not, the
+report ships with the replay evidence + a clearly-labeled "real-provider cells
+pending operator run" section and the README claim does NOT ship. This is the
+honest failure mode the issue demands, not a fabricated table.

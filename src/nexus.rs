@@ -2726,3 +2726,11 @@ fn compact_preview(
 #[cfg(test)]
 #[path = "nexus_tests.rs"]
 mod tests;
+
+// End-to-end tokens-per-completed-task benchmark harness (issue #210). Sibling
+// test module (crate-private access to the Nexus loop, ApprovalMode, and the
+// tool env) driving the deterministic replay arms and the opt-in real-provider
+// headline. See `docs/BENCHMARK_PLAN.md`.
+#[cfg(test)]
+#[path = "bench_tokens_per_task.rs"]
+mod bench_tokens_per_task;

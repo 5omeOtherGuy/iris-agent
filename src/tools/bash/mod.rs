@@ -76,6 +76,7 @@ pub(super) fn execute(
     state: &mut BashState,
     cancel: &CancellationToken,
     sink: Option<&dyn crate::nexus::ToolOutputSink>,
+    reduce_output: bool,
 ) -> Result<super::ToolOutput> {
     let parsed: BashArgs =
         serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
@@ -89,6 +90,12 @@ pub(super) fn execute(
         action,
         raw,
     } = parsed;
+    // Benchmark arm switch (issue #210): the baseline arm forces raw output for
+    // every bash path (foreground, session, and background finalize) by folding
+    // it into the same `raw` bypass the per-call `raw:true` already uses, so the
+    // filter is skipped without a second code path. Default (arm A) leaves
+    // `reduce_output` true, so this is a no-op for normal runs.
+    let raw = raw || !reduce_output;
     // Exit code + wall-clock duration for the command-running arms (one-shot and
     // persistent session); `None` for the management arms (reset/close/jobs),
     // which carry no command status. Surfaced as `ToolOutput` metadata that
@@ -786,6 +793,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert_eq!(out.metadata.get("exitCode"), Some(&json!(3)));
@@ -814,6 +822,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert_eq!(out.metadata.get("exitCode"), Some(&json!(5)));
@@ -1040,6 +1049,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         let pwd = execute(
@@ -1048,6 +1058,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(
@@ -1063,6 +1074,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(!other.content.trim_end().ends_with("/sub"));
@@ -1074,6 +1086,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(closed.content.contains("closed"));
@@ -1083,6 +1096,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(
@@ -1108,6 +1122,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
 
@@ -1127,6 +1142,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         // The id is echoed as job-0 for the first job.
@@ -1142,6 +1158,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(listed.content.contains("job-0"));
@@ -1152,6 +1169,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(
@@ -1172,6 +1190,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(after.content.contains("no background jobs"));
@@ -1235,6 +1254,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(
@@ -1260,6 +1280,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(
@@ -1271,6 +1292,36 @@ mod tests {
         assert!(
             out.content.contains("In x line 1:\n\nfoo"),
             "raw output altered: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn benchmark_baseline_arm_bypasses_filtering_without_raw() {
+        use serde_json::json;
+        // Issue #210 arm switch: `reduce_output == false` bypasses the bash
+        // output filter process-wide, exactly like a per-call `raw: true`, so
+        // the baseline arm sees unfiltered output even though `raw` is unset.
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let mut state = BashState::new();
+        let out = execute(
+            &root,
+            &json!({ "command": FILTERED_CMD }),
+            &mut state,
+            &CancellationToken::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !out.content.contains("output filtered"),
+            "baseline arm must bypass filtering: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("In x line 1:\n\nfoo"),
+            "baseline arm output altered: {}",
             out.content
         );
     }
@@ -1290,6 +1341,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(
@@ -1322,6 +1374,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(
@@ -1336,6 +1389,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(!raw.content.contains("output filtered"), "{}", raw.content);
@@ -1353,6 +1407,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         let fin = execute(
@@ -1361,6 +1416,7 @@ mod tests {
             &mut state,
             &CancellationToken::new(),
             None,
+            true,
         )
         .unwrap();
         assert!(

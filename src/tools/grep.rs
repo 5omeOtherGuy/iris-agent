@@ -57,10 +57,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
+pub(super) fn execute(root: &Path, args: &Value, reduce: bool) -> Result<super::ToolOutput> {
     let input: GrepInput =
         serde_json::from_value(args.clone()).context("grep tool arguments must include pattern")?;
-    let (text, meta) = grep(root, &input)?;
+    let (text, meta) = grep(root, &input, reduce)?;
     Ok(meta.attach(super::ToolOutput::text(text)))
 }
 
@@ -166,7 +166,11 @@ struct FileHits {
     breaks: Vec<usize>,
 }
 
-fn grep(root: &Path, input: &GrepInput) -> Result<(String, GrepMeta)> {
+/// `group` (issue #210 benchmark arm): `true` renders the shipped grouped form
+/// (path once per file, `> line│` markers); `false` renders the flat baseline
+/// (`path:line:content` per line) that grep grouping is compared against. Only
+/// the tokens-per-task benchmark's baseline arm passes `false`.
+fn grep(root: &Path, input: &GrepInput, group: bool) -> Result<(String, GrepMeta)> {
     let search = input.path.as_deref().unwrap_or(".");
     let search_path = resolve_existing(root, search)?;
     let limit = positive_cap("limit", input.limit, DEFAULT_GREP_LIMIT)?;
@@ -197,6 +201,7 @@ fn grep(root: &Path, input: &GrepInput) -> Result<(String, GrepMeta)> {
             limit,
             page,
             max_per_file,
+            group,
         ),
         OutputMode::FilesWithMatches => {
             grep_files(root, &search_path, &matcher, overrides, limit, page)
@@ -215,6 +220,7 @@ fn grep_content(
     limit: usize,
     page: Page,
     max_per_file: Option<usize>,
+    group: bool,
 ) -> Result<(String, GrepMeta)> {
     let (files, total_matches, truncated_matches, skips) =
         collect_content(root, search_path, matcher, overrides, context, limit)?;
@@ -243,6 +249,7 @@ fn grep_content(
         skips,
         page,
         max_per_file,
+        group,
     );
     Ok((
         text,
@@ -619,6 +626,7 @@ fn render_content(
     skips: SkipStats,
     page: Page,
     max_per_file: Option<usize>,
+    group: bool,
 ) -> (String, Option<usize>) {
     let file_word = plural(files.len(), "file");
     let match_word = plural(total_matches, "match");
@@ -643,12 +651,22 @@ fn render_content(
                 }
                 shown_matches += 1;
             }
-            let marker = if line.is_match { "> " } else { "  " };
-            lines.push((
-                file_idx,
-                format!("{marker}{}│ {}", line.number, clamp_line(&line.text)),
-            ));
-            if file.breaks.contains(&idx) {
+            let rendered = if group {
+                let marker = if line.is_match { "> " } else { "  " };
+                format!("{marker}{}│ {}", line.number, clamp_line(&line.text))
+            } else {
+                // Flat baseline arm: prefix every line with its path, the form
+                // grouping removes (`path:line:content`, `-` for context lines).
+                let sep = if line.is_match { ':' } else { '-' };
+                format!(
+                    "{}{sep}{}{sep}{}",
+                    file.path,
+                    line.number,
+                    clamp_line(&line.text)
+                )
+            };
+            lines.push((file_idx, rendered));
+            if group && file.breaks.contains(&idx) {
                 lines.push((file_idx, "  ⋯".to_string()));
             }
         }
@@ -669,7 +687,9 @@ fn render_content(
     let mut last_file = None;
     if start < end {
         for (file_idx, line) in &lines[start..end] {
-            if last_file != Some(*file_idx) {
+            // Grouped output prints the path once as a per-file header; the flat
+            // baseline arm carries the path on every line instead.
+            if group && last_file != Some(*file_idx) {
                 out.push('\n');
                 out.push_str(&files[*file_idx].path);
                 out.push('\n');
@@ -1014,7 +1034,7 @@ mod tests {
     }
 
     fn run(root: &Path, input: GrepInput) -> String {
-        grep(root, &input).unwrap().0
+        grep(root, &input, true).unwrap().0
     }
 
     fn input(pattern: &str) -> GrepInput {
@@ -1051,6 +1071,34 @@ mod tests {
         assert!(out.contains("> 3│ needle here"), "out: {out}");
         assert!(out.contains("  2│ beta"), "out: {out}");
         assert!(out.contains("  4│ gamma"), "out: {out}");
+    }
+
+    #[test]
+    fn benchmark_baseline_arm_renders_flat_format() {
+        // Issue #210 arm switch: `group == false` produces the ungrouped
+        // `path:line:content` baseline (no per-file header, no `> N│` markers).
+        // The size relationship (grouped <= flat) is a property of realistic
+        // multi-match inputs, asserted by the grep corpus and the replay
+        // harness; this unit test pins the FORMAT the arm switches to.
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(
+            dir.path.join("g.txt"),
+            "needle 1\nfiller\nneedle 2\nfiller\nneedle 3\n",
+        )
+        .unwrap();
+        let grouped = grep(&root, &input("needle"), true).unwrap().0;
+        let flat = grep(&root, &input("needle"), false).unwrap().0;
+
+        // Grouped: `> N│` markers present.
+        assert!(grouped.contains("> 1│ needle 1"), "grouped: {grouped}");
+        // Flat baseline: every match line carries the path, no `│` markers.
+        assert!(flat.contains("g.txt:1:needle 1"), "flat: {flat}");
+        assert!(flat.contains("g.txt:3:needle 2"), "flat: {flat}");
+        assert!(
+            !flat.contains('│'),
+            "flat arm must drop group markers: {flat}"
+        );
     }
 
     #[test]
@@ -1273,7 +1321,7 @@ mod tests {
         fs::write(dir.path.join("g.txt"), "needle\n").unwrap();
         let mut bad = input("needle");
         bad.max_per_file = Some(0);
-        let err = grep(&root, &bad).unwrap_err().to_string();
+        let err = grep(&root, &bad, true).unwrap_err().to_string();
         assert!(
             err.contains("`maxPerFile` must be greater than 0"),
             "err: {err}"
@@ -1354,7 +1402,7 @@ mod tests {
         let mut escaped = input("needle");
         escaped.path = Some(outside.to_string_lossy().to_string());
 
-        let err = grep(&root, &escaped).unwrap_err().to_string();
+        let err = grep(&root, &escaped, true).unwrap_err().to_string();
 
         assert!(err.contains("path escapes workspace"), "err: {err}");
     }
@@ -1436,7 +1484,7 @@ mod tests {
         fs::write(dir.path.join("a.txt"), "needle\nneedle\n").unwrap();
         fs::write(dir.path.join("b.txt"), "needle\n").unwrap();
 
-        let output = execute(&root, &json!({ "pattern": "needle" })).unwrap();
+        let output = execute(&root, &json!({ "pattern": "needle" }), true).unwrap();
         let grep = output
             .metadata
             .get("grep")
@@ -1464,6 +1512,7 @@ mod tests {
         let output = execute(
             &root,
             &json!({ "pattern": "needle", "outputMode": "count" }),
+            true,
         )
         .unwrap();
         let grep = output.metadata.get("grep").expect("grep metadata");
@@ -1481,6 +1530,7 @@ mod tests {
         let output = execute(
             &root,
             &json!({ "pattern": "needle", "outputMode": "files_with_matches" }),
+            true,
         )
         .unwrap();
         let grep = output.metadata.get("grep").expect("grep metadata");
