@@ -669,6 +669,30 @@ explain the edit-inflation, and (b) keep the claim unshipped / gate open.
 
 ---
 
+## Entry 14 - Comprehensive suite design (oracle)
+
+Operator asked to widen scope: PR #388 / ADR-0049 (`--dangerously-skip-
+permissions`, `Agent::with_skip_permissions(bool)` + `ToolAutoApprovedDangerous`)
+unlocks the bash tool, so we can now add real build+test end-to-end tasks AND
+per-tool micro-tests that score model SUCCESS with the reduced output, not just
+byte reduction. Consulted the oracle for a reusable/configurable harness design
+(scored 4.25/5, conditioned on phasing + honest negatives).
+
+Design of record: `docs/benchmarks/tool-efficiency-suite-design.md`. Key points:
+data-driven `src/bench_tokens/*` modules (add a tool/workload = append a table
+row); three comparison axes (reduce-toggle for grep/find/ls/bash; separate
+read-skim and edit-result-class axes since the toggle does NOT cover read/edit);
+real-usage vs 4-bytes proxy never mixed; skip-permissions workloads assert the
+audit event + confinement; token-delta decomposed into per-turn saving vs
+strategy change; Rust JSONL analyzer (repo is Rust-only). 7 phases, smallest-
+correct-change first (merge #388 -> no-behavior refactor -> schema -> bash smoke
+-> micro probes -> read/edit axes -> full matrix).
+
+**NEXT:** operator sign-off on scope/phasing before the refactor + any live
+spend; then Phase 1 (merge #388, prove harness+gate unchanged).
+
+---
+
 ## Entry 3 — Toggle mechanism + reduction semantics + real-run feasibility
 
 **OBSERVATION — the reduction seams and what "off" means.**
