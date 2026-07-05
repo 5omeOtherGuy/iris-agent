@@ -254,9 +254,12 @@ pub(crate) enum FoldTrigger {
     /// A6: the user requested compaction manually (`/compact`); pending folds
     /// ride the user-initiated break.
     ManualCompact,
+    /// B: mid-session idle gap past the provider's cold threshold -- the
+    /// cache has expired (or provably will have) with no break pending, so
+    /// the next request re-bills the suffix regardless.
+    InferredCold,
     /// C: the context reached the micro-watermark (pressure backstop).
     Watermark,
-    // Class B (inferred mid-session cold) lands with Phase 2.
 }
 
 impl FoldTrigger {
@@ -269,6 +272,7 @@ impl FoldTrigger {
             FoldTrigger::ColdResume => "A4",
             FoldTrigger::BelowMinCacheable => "A5",
             FoldTrigger::ManualCompact => "A6",
+            FoldTrigger::InferredCold => "B",
             FoldTrigger::Watermark => "C",
         }
     }

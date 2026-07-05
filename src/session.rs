@@ -83,6 +83,10 @@ pub(crate) struct SessionLog {
     /// prior process's last activity for the cold-resume fold trigger (#400).
     /// `None` for a freshly created log or a transcript without timestamps.
     resumed_last_activity_ms: Option<u64>,
+    /// Unix ms of the most recent entry appended by THIS process, for the
+    /// mid-session inferred-cold fold trigger (#400 Class B). `None` until
+    /// the first append after create/resume.
+    appended_activity_ms: Option<u64>,
 }
 
 impl SessionLog {
@@ -138,6 +142,7 @@ impl SessionLog {
             next_seq: 0,
             compactions: 0,
             resumed_last_activity_ms: None,
+            appended_activity_ms: None,
         })
     }
 
@@ -419,6 +424,7 @@ impl SessionLog {
             next_seq: state.next_seq,
             compactions: state.compactions,
             resumed_last_activity_ms: state.last_activity_ms,
+            appended_activity_ms: None,
         })
     }
 
@@ -455,9 +461,22 @@ impl SessionLog {
     // if entry ids ever need to be globally unique across sessions or survive a
     // fork that copies entries.
     fn next_id(&mut self) -> String {
+        // Every entry append allocates its id here, so this is the single
+        // choke point that refreshes the live activity clock (#400 Class B):
+        // the entry about to be written carries `now_ms()` as its timestamp.
+        self.appended_activity_ms = Some(now_ms() as u64);
         let id = format!("{:08x}", self.next_seq);
         self.next_seq += 1;
         id
+    }
+
+    /// Unix ms of the most recent transcript activity: the last entry this
+    /// process appended, falling back to the resume-time scan. The
+    /// mid-session inferred-cold fold trigger (#400 Class B) compares an
+    /// idle gap against the provider profile's cold threshold. `None` for a
+    /// fresh, never-appended log.
+    pub(crate) fn last_activity_ms(&self) -> Option<u64> {
+        self.appended_activity_ms.or(self.resumed_last_activity_ms)
     }
 }
 

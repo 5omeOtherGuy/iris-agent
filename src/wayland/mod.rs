@@ -1038,6 +1038,25 @@ impl<P: ChatProvider> Harness<P> {
         if total < self.cache_profile.min_cacheable_tokens {
             return Some(FoldTrigger::BelowMinCacheable);
         }
+        // B (Phase 2): mid-session idle gap past the profile's cold threshold
+        // -- the transcript's last activity (live appends, falling back to the
+        // resume scan) is old enough that the prefix cache has expired, so the
+        // next request re-bills the suffix regardless. The threshold comes
+        // from the profile table (margins included there), never a hardcoded
+        // constant; a wrong inference costs one warm flush, bounded by the
+        // measured numbers.
+        if let (Some(last_ms), Some(cold_after)) = (
+            self.session.as_ref().and_then(SessionLog::last_activity_ms),
+            self.cache_profile.cold_after,
+        ) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if now.saturating_sub(last_ms) > cold_after.as_millis() as u64 {
+                return Some(FoldTrigger::InferredCold);
+            }
+        }
         let budget = self.budget?;
         if total >= micro_watermark(budget) {
             return Some(FoldTrigger::Watermark);

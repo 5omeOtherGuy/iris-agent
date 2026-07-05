@@ -2026,3 +2026,174 @@ fn trigger_class_flush_cost_benchmark_report() {
          shrinks the compaction's rewrite."
     );
 }
+
+// --- Phase 2 (issue #400 M5): inferred-cold (Class B) modeled arm. ---
+//
+// SIMULATION CAVEAT, stated honestly: the fake-provider lane has no real
+// prompt cache and no TTL. The arm simulates the cold cache by the same
+// modeling rule used everywhere in this file -- once the TTL is past, the
+// provider re-bills the entire request, so the "cost" of a request after the
+// idle gap is its full payload with or without the fold. What the arm proves
+// deterministically is (a) the trigger fires on a real idle gap measured from
+// the transcript's activity clock against the profile threshold, mid-session
+// and without any pending break, and (b) the folded payload the cold cache
+// re-bills is never larger than the unfolded one. The realized counterpart is
+// the env-gated live pair below (`compaction_live_bench`).
+
+/// One inferred-cold arm: turn 1 runs warm (neutral profile -- the resume-time
+/// A4 check is consumed and holds), then a cold threshold far below a real
+/// wall-clock wait is installed mid-session, so turn 2's boundary infers cold
+/// and flushes (Class B); turn 3 measures the steady state.
+fn run_inferred_cold_arm(micro: bool) -> SeededArm {
+    let seed = carry_seed();
+    let budget = break_arm_budget(&seed);
+    let root = TempDir::new();
+    let workspace = TempDir::new();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
+    for message in &seed {
+        log.append(message).expect("append seed message");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list sessions")
+        .into_iter()
+        .find(|m| m.path == path)
+        .expect("seeded session is listed");
+    let stored = store.open(&meta).expect("open seeded session");
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path).expect("resume session log");
+
+    let summary_calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::resumed(
+        CompactionFakeProvider::new(summary_calls.clone(), requests.clone(), Vec::new()),
+        Tools::new(Vec::new()),
+        stored.messages,
+    );
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(budget),
+    );
+    harness.set_summarizer(SummarizerKind::Provider);
+    harness.set_microcompaction(micro);
+
+    let counter = CompactionCounter::new();
+    let gate = NoToolGate;
+    let token = CancellationToken::new();
+    // Turn 1: warm (no cold threshold); the resume-time check is consumed.
+    block_on(harness.submit_turn(
+        "continue: proceed with the next small wiring step.",
+        &counter,
+        &gate,
+        &token,
+    ))
+    .expect("turn succeeds");
+    // Mid-session idle gap: a real wait against a threshold far below it.
+    harness.set_cache_profile(crate::wayland::CacheProfile {
+        cold_after: Some(std::time::Duration::from_millis(10)),
+        ..Default::default()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    for prompt in [
+        "then: confirm the buffer state briefly.",
+        "finally: report the wiring status in one line.",
+    ] {
+        block_on(harness.submit_turn(prompt, &counter, &gate, &token)).expect("turn succeeds");
+    }
+
+    let folds = fold_count(&path);
+    let messages = harness.agent.messages();
+    let rebuilt_context = messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let post_context_tokens = harness.context_token_estimate();
+    SeededArm {
+        rebuilt_context,
+        summary_body: String::new(),
+        records: counter.records.borrow().clone(),
+        folds,
+        summary_calls: summary_calls.load(Ordering::Relaxed),
+        post_context_tokens,
+        requests: requests.lock().expect("requests capture lock").clone(),
+        seed_baseline: serialize_request(&seed),
+    }
+}
+
+#[test]
+fn inferred_cold_flush_fires_mid_session_and_is_free_under_a_cold_cache() {
+    let arm = run_inferred_cold_arm(true);
+    let control = run_inferred_cold_arm(false);
+    // Integrity: the flush landed at the TURN-2 boundary (mid-session, after
+    // the warm turn), not at turn 1; nothing compacted; no summarizer call.
+    assert_eq!(arm.folds, 1, "the idle gap releases exactly one fold");
+    assert_eq!(control.folds, 0);
+    assert!(arm.records.is_empty() && control.records.is_empty());
+    assert_eq!(arm.summary_calls, 0);
+    assert_eq!(arm.requests.len(), 3, "three driven turns");
+    // Turn 1 payloads are byte-identical (the arm held while warm).
+    assert_eq!(
+        est_tokens(&arm.requests[0].payload),
+        est_tokens(&control.requests[0].payload),
+        "no fold before the idle gap: the warm turn is identical"
+    );
+    // Under the expired cache, turn 2 re-bills its full payload either way;
+    // the folded payload never exceeds the control's (marginal write <= 0).
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    assert!(
+        arm_t2 <= ctrl_t2,
+        "cold re-bill with the fold must not exceed the control ({arm_t2} vs {ctrl_t2})"
+    );
+    // Steady state (turn 3) keeps the full per-turn saving.
+    let arm_t3 = est_tokens(&arm.requests[2].payload);
+    let ctrl_t3 = est_tokens(&control.requests[2].payload);
+    assert!(
+        arm_t3 < ctrl_t3,
+        "steady-state request must shrink ({arm_t3} vs {ctrl_t3})"
+    );
+}
+
+/// Prints the Class-B row for `docs/benchmarks/issue-400-fold-flush-cost.md`.
+/// Regenerate with:
+/// `cargo test inferred_cold_flush_cost_benchmark_report -- --nocapture`
+#[test]
+fn inferred_cold_flush_cost_benchmark_report() {
+    let arm = run_inferred_cold_arm(true);
+    let control = run_inferred_cold_arm(false);
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    let arm_t3 = est_tokens(&arm.requests[2].payload);
+    let ctrl_t3 = est_tokens(&control.requests[2].payload);
+    println!("\n== Class-B inferred-cold flush -- {MODELED_LABEL} ==");
+    println!(
+        "| trigger | arm t2 payload (cold re-bill) | control t2 payload | marginal write | steady saving (t3) |"
+    );
+    println!("|---|---|---|---|---|");
+    println!(
+        "| B idle gap | {arm_t2} | {ctrl_t2} | {} | {} |",
+        arm_t2 as i64 - ctrl_t2 as i64,
+        ctrl_t3.saturating_sub(arm_t3),
+    );
+    println!(
+        "\nSIMULATION: the fake lane has no real TTL; the cold cache is modeled as a full \
+         re-bill of the post-gap request, which holds by definition once the provider TTL is \
+         past. The trigger firing on the real idle gap (transcript activity clock vs profile \
+         threshold, mid-session, no pending break) is what the arm proves deterministically; \
+         realized deltas come from the env-gated live pair."
+    );
+    println!(
+        "Wrong-inference cost (gap inferred cold but cache still warm): one warm flush, \
+         measured at 4485 modeled / 2129 realized write tokens on this seed -- bounded, and \
+         strictly less than what the watermark-only trigger paid on every flush."
+    );
+}
