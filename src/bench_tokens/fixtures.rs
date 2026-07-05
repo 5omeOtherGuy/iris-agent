@@ -77,6 +77,42 @@ pub(crate) fn build_chained_provider_tree(root: &Path) {
     }
 }
 
+/// Add generic cargo/npm decoys around PR-seeded chained repair fixtures. The
+/// decoys are not imported by the fixture programs, but they make broad
+/// discovery (`find`, `grep auth`, `grep fold`, `grep package`) look like a real
+/// repository instead of a tiny two-file puzzle.
+pub(crate) fn build_repair_noise_tree(root: &Path) {
+    if root.join("Cargo.toml").exists() {
+        let dir = root.join("src/generated_decoys");
+        fs::create_dir_all(&dir).expect("create cargo decoy dir");
+        for i in 0..48u32 {
+            fs::write(
+                dir.join(format!("workflow_decoy_{i:02}.rs")),
+                format!(
+                    "//! Decoy module {i:02}: mentions recall spans, fold resume chains, \
+                     provider summaries, and cargo test diagnostics.\n\
+                     pub const DECOY_{i:02}: &str = \"recall fold summary package auth\";\n"
+                ),
+            )
+            .expect("write cargo decoy");
+        }
+    } else if root.join("package.json").exists() {
+        let dir = root.join("src/generated-decoys");
+        fs::create_dir_all(&dir).expect("create npm decoy dir");
+        for i in 0..48u32 {
+            fs::write(
+                dir.join(format!("extension-decoy-{i:02}.mjs")),
+                format!(
+                    "// Decoy module {i:02}: mentions GitHub auth, npm pack, \
+                     docs/private, untracked files, and package release checks.\n\
+                     export const decoy{i:02} = 'github token package private docs';\n"
+                ),
+            )
+            .expect("write npm decoy");
+        }
+    }
+}
+
 fn copy_stripping_txt(src: &Path, dst: &Path) {
     for entry in fs::read_dir(src).expect("fixture dir readable") {
         let entry = entry.expect("dir entry");

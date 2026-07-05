@@ -1243,3 +1243,34 @@ at N=5, so descriptive only/no claim.
 Conclusion: the workload design now works for the intended benchmark shape: it
 forces the reproduce-failure -> fix -> verify chain, can run arms in parallel, and
 surfaces both safety and token signals without relying on `--nocapture`.
+
+## Entry 27 - Chained PR-seeded suite, Sonnet 4.6 low, N=50 per workload/arm
+
+Ran the expanded chained repair suite at high N using the recommended sharding:
+5 shards per arm, N=10 per shard, separate `IRIS_BENCH_LOG` files, merged after
+completion. Added shard/run-offset metadata before launch (`IRIS_BENCH_SHARD`,
+`IRIS_BENCH_RUN_OFFSET`) so merged rows remain debuggable and no process writes to
+the same log file. Total: 6 workloads x 2 arms x 50 = 600 live sessions. All 10
+processes exited 0 in ~1826s wall clock.
+
+Artifacts: chained-suite-sonnet46-low-n50-2026-07-05.{md,jsonl}.
+
+Summary: 600 valid rows, 0 invalid/noncompliant, 0 process errors, 590/600 task
+success. The only failures were `chained-ampi-private-docs-fix`, split evenly
+A 45/50 and B 45/50; those rows passed `npm test` but failed the mechanical source
+check because the expected `docs/private/` exclusion was absent (anti-test-
+weakening guard). No success regression: A matched B on every workload.
+
+Safety/loop read: median turns matched in every workload; max tool calls stayed
+bounded (7-9). Tool errors were low: 14 total, A=9/B=5, mostly edit-before-read or
+old-string mismatch recoveries. No evidence of a compaction-induced massive loop.
+
+Token read: overall BASELINE WINS/no blanket claim. Defaults cheaper on medians in
+4/6 cells (`github-token` ~flat, `pack-untracked` ~flat, `recall` -0.8%,
+`openai-summary` -8.6%), baseline cheaper in 2/6 (`private-docs` +0.1%,
+`fold-resume` +3.4%). Only `openai-summary` cleared the Welch CI (+8980 mean
+saving, CI [+3601,+14360]); `fold-resume` significantly favored baseline on the
+mean (CI [-4407,-749]). The rest are small/noisy/inconclusive.
+
+Conclusion: the sharded high-N harness works and gives the right safety evidence.
+The product-level efficiency claim remains workload-dependent, not global.

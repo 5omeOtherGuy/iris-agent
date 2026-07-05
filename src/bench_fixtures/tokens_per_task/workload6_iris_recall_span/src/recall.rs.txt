@@ -1,0 +1,43 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub id: &'static str,
+    pub text: &'static str,
+}
+
+pub struct RecallStore {
+    turns: Vec<Turn>,
+}
+
+impl RecallStore {
+    pub fn sample() -> Self {
+        Self {
+            turns: vec![
+                Turn { id: "00000001", text: "user: inspect parser.rs" },
+                Turn { id: "00000002", text: "tool: read parser.rs" },
+                Turn { id: "00000003", text: "assistant: found parse_len" },
+            ],
+        }
+    }
+
+    /// BUG (mirrors Iris PR #393): recall requires a handle and lets empty spans
+    /// succeed as an empty string. Standalone `from`/`to` spans should work, and
+    /// an explicit span that selects no turns should be a tool error.
+    pub fn recall(&self, handle: Option<&str>, from: Option<&str>, to: Option<&str>) -> Result<String, String> {
+        let (start, end) = if let Some(handle) = handle {
+            match handle {
+                "recent-parser" => ("00000001", "00000003"),
+                _ => return Err(format!("unknown recall handle {handle}")),
+            }
+        } else {
+            return Err("missing recall handle".to_string());
+        };
+        let start = from.unwrap_or(start);
+        let end = to.unwrap_or(end);
+        let selected: Vec<&str> = self.turns
+            .iter()
+            .filter(|turn| turn.id >= start && turn.id <= end)
+            .map(|turn| turn.text)
+            .collect();
+        Ok(selected.join("\n"))
+    }
+}

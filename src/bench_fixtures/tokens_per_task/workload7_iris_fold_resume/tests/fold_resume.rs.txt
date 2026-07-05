@@ -1,0 +1,13 @@
+use fold_resume_fixture::session::{append_message_after_resume, scan_for_resume, Entry};
+
+#[test]
+fn resume_after_a_fold_keeps_the_fold_in_the_durable_id_chain() {
+    let entries = vec![
+        Entry { kind: "message", id: 1 },
+        Entry { kind: "fold", id: 2 },
+    ];
+    let state = scan_for_resume(&entries);
+    assert_eq!(state.last_id, 2, "fold must be the resumed leaf");
+    assert_eq!(state.next_seq, 3, "next append must not reuse the fold id");
+    assert_eq!(append_message_after_resume(&entries).id, 3);
+}

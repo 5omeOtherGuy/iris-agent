@@ -1,0 +1,9 @@
+// BUG (mirrors ampi PR #223): publish verification catches private files but
+// forgets npm dry-run entries that are marked untracked.
+export function assertPublishable(files) {
+  const privateFiles = files.filter((file) => file.path.startsWith('docs/private/'));
+  if (privateFiles.length > 0) {
+    throw new Error(`private files in package: ${privateFiles.map((f) => f.path).join(', ')}`);
+  }
+  return true;
+}

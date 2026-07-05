@@ -409,39 +409,59 @@ mod replay {
     /// output while still solving the task.
     #[test]
     fn chained_bash_workload_replay_fixes_provider_and_saves_tokens() {
-        let workload = &bash_workloads()[1];
-        let baseline = run_scripted_skip_perms(workload, Arm::Baseline);
-        let defaults = run_scripted_skip_perms(workload, Arm::Defaults);
-        for (arm, run) in [(Arm::Baseline, &baseline), (Arm::Defaults, &defaults)] {
+        for workload in bash_workloads()
+            .into_iter()
+            .filter(|w| w.require_failing_then_passing_bash)
+        {
+            let baseline = run_scripted_skip_perms(&workload, Arm::Baseline);
+            let defaults = run_scripted_skip_perms(&workload, Arm::Defaults);
+            for (arm, run) in [(Arm::Baseline, &baseline), (Arm::Defaults, &defaults)] {
+                assert!(
+                    !run.approvals_consulted,
+                    "[{}:{}] deny gate was consulted -- skip-permissions did not bypass it first",
+                    workload.name,
+                    arm.label()
+                );
+                assert!(
+                    run.dangerous_approvals >= 2,
+                    "[{}:{}] expected both test bash calls to be auto-approved dangerous",
+                    workload.name,
+                    arm.label()
+                );
+                let Some((&last, prior)) = run.bash_exit_codes.split_last() else {
+                    panic!("[{}:{}] no bash exits recorded", workload.name, arm.label());
+                };
+                assert_eq!(
+                    last,
+                    0,
+                    "[{}:{}] final test command should pass: {:?}",
+                    workload.name,
+                    arm.label(),
+                    run.bash_exit_codes
+                );
+                assert!(
+                    prior.iter().any(|&code| code != 0),
+                    "[{}:{}] expected a failing test before the final passing test: {:?}",
+                    workload.name,
+                    arm.label(),
+                    run.bash_exit_codes
+                );
+                assert!(
+                    run.outcome.success,
+                    "[{}:{}] scripted repair should satisfy the mechanical check: {}",
+                    workload.name,
+                    arm.label(),
+                    run.outcome.detail
+                );
+            }
             assert!(
-                !run.approvals_consulted,
-                "[{}] deny gate was consulted -- skip-permissions did not bypass it first",
-                arm.label()
-            );
-            assert!(
-                run.dangerous_approvals >= 2,
-                "[{}] expected both cargo-test bash calls to be auto-approved dangerous",
-                arm.label()
-            );
-            assert_eq!(
-                run.bash_exit_codes,
-                vec![101, 0],
-                "[{}] first cargo test should fail, second should pass",
-                arm.label()
-            );
-            assert!(
-                run.outcome.success,
-                "[{}] scripted repair should satisfy the mechanical check: {}",
-                arm.label(),
-                run.outcome.detail
+                defaults.tool_result_bytes < baseline.tool_result_bytes,
+                "[{}] reduced arm should shrink chained find/grep/bash output (A={} B={})",
+                workload.name,
+                defaults.tool_result_bytes,
+                baseline.tool_result_bytes
             );
         }
-        assert!(
-            defaults.tool_result_bytes < baseline.tool_result_bytes,
-            "reduced arm should shrink chained find/grep/bash output (A={} B={})",
-            defaults.tool_result_bytes,
-            baseline.tool_result_bytes
-        );
     }
 
     /// Deterministic per-tool RENDER PROBE (Phase 5, layer 1), FAST set. For

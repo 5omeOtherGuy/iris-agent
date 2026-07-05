@@ -258,6 +258,20 @@ pub(crate) fn bench_log_reset() {
     let _ = std::fs::write(bench_log_path(), "");
 }
 
+fn bench_shard() -> Option<String> {
+    std::env::var("IRIS_BENCH_SHARD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn bench_run_global(run: usize) -> usize {
+    let offset = std::env::var("IRIS_BENCH_RUN_OFFSET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    offset + run
+}
+
 fn bench_log_append(line: &Value) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -287,6 +301,8 @@ pub(crate) fn bench_log_cell_error(
         "workload": workload,
         "arm": arm,
         "run": run,
+        "run_global": bench_run_global(run),
+        "shard": bench_shard(),
         "valid": false,
         "error": reason,
     }));
@@ -412,6 +428,8 @@ pub(crate) fn run_real_cell(
         "arm": record.arm.label(),
         "reduce_output": arm.reduce(),
         "run": run,
+        "run_global": bench_run_global(run),
+        "shard": bench_shard(),
         "reasoning": format!("{:?}", selection.reasoning),
         "success": record.outcome.success,
         "detail": record.outcome.detail,

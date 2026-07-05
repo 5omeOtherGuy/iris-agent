@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::nexus::{AssistantTurn, CompletionReason, ToolCall};
 
-use super::fixtures::{build_chained_provider_tree, build_find_tree};
+use super::fixtures::{build_chained_provider_tree, build_find_tree, build_repair_noise_tree};
 
 /// The result of a workload's mechanical success check.
 pub(crate) struct Outcome {
@@ -180,6 +180,101 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
                 "summary:auto",
             ],
             build: Some(build_chained_provider_tree),
+            require_failing_then_passing_bash: true,
+        },
+        Workload {
+            name: "chained-iris-recall-span-fix",
+            fixture: "workload6_iris_recall_span",
+            prompt: "Recall by standalone span fails and out-of-range spans are not rejected. \
+                     This fixture mirrors Iris PR #393. First, before reading or editing any \
+                     file, run `cargo test` to reproduce the failure. Then use find/grep/read \
+                     to locate the recall implementation, fix it without weakening tests, and \
+                     run `cargo test` until it passes. Summarize the fix.",
+            script: script_chained_iris_recall_span_fix,
+            check: check_chained_iris_recall_span_fix,
+            approval: ApprovalProfile::SkipPermissions,
+            needles: &[
+                "standalone_span_without_handle_returns_original_turns",
+                "missing recall handle",
+                "selected no turns",
+            ],
+            build: Some(build_repair_noise_tree),
+            require_failing_then_passing_bash: true,
+        },
+        Workload {
+            name: "chained-iris-fold-resume-fix",
+            fixture: "workload7_iris_fold_resume",
+            prompt: "Resume after a persisted fold corrupts the durable id chain. This \
+                     fixture mirrors Iris PR #394. First, before reading or editing any file, \
+                     run `cargo test` to reproduce the failure. Then use find/grep/read to \
+                     locate the resume scanner, fix it without weakening tests, and run \
+                     `cargo test` until it passes. Summarize the fix.",
+            script: script_chained_iris_fold_resume_fix,
+            check: check_chained_iris_fold_resume_fix,
+            approval: ApprovalProfile::SkipPermissions,
+            needles: &[
+                "resume_after_a_fold_keeps_the_fold_in_the_durable_id_chain",
+                "modelSelection",
+                "fold",
+            ],
+            build: Some(build_repair_noise_tree),
+            require_failing_then_passing_bash: true,
+        },
+        Workload {
+            name: "chained-ampi-github-token-fix",
+            fixture: "workload8_ampi_github_auth",
+            prompt: "GitHub auth does not pick up common token environment variables. This \
+                     fixture mirrors ampi PR #224. First, before reading or editing any file, \
+                     run `npm test` to reproduce the failure. Then use find/grep/read to locate \
+                     the auth resolver, fix it without weakening tests, and run `npm test` \
+                     until it passes. Summarize the fix.",
+            script: script_chained_ampi_github_token_fix,
+            check: check_chained_ampi_github_token_fix,
+            approval: ApprovalProfile::SkipPermissions,
+            needles: &[
+                "GH_TOKEN",
+                "GITHUB_PERSONAL_ACCESS_TOKEN",
+                "AMPI_GITHUB_TOKEN",
+            ],
+            build: Some(build_repair_noise_tree),
+            require_failing_then_passing_bash: true,
+        },
+        Workload {
+            name: "chained-ampi-pack-untracked-fix",
+            fixture: "workload9_ampi_pack_untracked",
+            prompt: "Publish verification allows untracked files in the npm dry-run tarball. \
+                     This fixture mirrors ampi PR #223. First, before reading or editing any \
+                     file, run `npm test` to reproduce the failure. Then use find/grep/read to \
+                     locate the pack verification code, fix it without weakening tests, and \
+                     run `npm test` until it passes. Summarize the fix.",
+            script: script_chained_ampi_pack_untracked_fix,
+            check: check_chained_ampi_pack_untracked_fix,
+            approval: ApprovalProfile::SkipPermissions,
+            needles: &[
+                "untracked files in package",
+                "debug.log",
+                "private files in package",
+            ],
+            build: Some(build_repair_noise_tree),
+            require_failing_then_passing_bash: true,
+        },
+        Workload {
+            name: "chained-ampi-private-docs-fix",
+            fixture: "workload10_ampi_private_docs",
+            prompt: "The npm package file list includes docs/private. This fixture mirrors \
+                     ampi PR #222. First, before reading or editing any file, run `npm test` \
+                     to reproduce the failure. Then use find/grep/read to locate the file-list \
+                     filter, fix it without weakening tests, and run `npm test` until it \
+                     passes. Summarize the fix.",
+            script: script_chained_ampi_private_docs_fix,
+            check: check_chained_ampi_private_docs_fix,
+            approval: ApprovalProfile::SkipPermissions,
+            needles: &[
+                "docs/private/operator-notes.md",
+                "publishedFiles",
+                "startsWith('.')",
+            ],
+            build: Some(build_repair_noise_tree),
             require_failing_then_passing_bash: true,
         },
     ]
@@ -375,6 +470,110 @@ fn script_chained_openai_summary_fix() -> Vec<AssistantTurn> {
     ]
 }
 
+fn script_chained_iris_recall_span_fix() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("b1", "bash", json!({ "command": "cargo test" })),
+        call_turn("f", "find", json!({ "pattern": "*.rs" })),
+        call_turn("g", "grep", json!({ "pattern": "missing recall handle" })),
+        call_turn("r", "read", json!({ "path": "src/recall.rs" })),
+        call_turn(
+            "e",
+            "edit",
+            json!({
+                "file_path": "src/recall.rs",
+                "old_string": "        let (start, end) = if let Some(handle) = handle {\n            match handle {\n                \"recent-parser\" => (\"00000001\", \"00000003\"),\n                _ => return Err(format!(\"unknown recall handle {handle}\")),\n            }\n        } else {\n            return Err(\"missing recall handle\".to_string());\n        };\n        let start = from.unwrap_or(start);\n        let end = to.unwrap_or(end);\n        let selected: Vec<&str> = self.turns\n            .iter()\n            .filter(|turn| turn.id >= start && turn.id <= end)\n            .map(|turn| turn.text)\n            .collect();\n        Ok(selected.join(\"\\n\"))",
+                "new_string": "        let (default_start, default_end) = if let Some(handle) = handle {\n            match handle {\n                \"recent-parser\" => (\"00000001\", \"00000003\"),\n                _ => return Err(format!(\"unknown recall handle {handle}\")),\n            }\n        } else {\n            (from.ok_or_else(|| \"missing recall span start\".to_string())?,\n             to.ok_or_else(|| \"missing recall span end\".to_string())?)\n        };\n        let start = from.unwrap_or(default_start);\n        let end = to.unwrap_or(default_end);\n        let selected: Vec<&str> = self.turns\n            .iter()\n            .filter(|turn| turn.id >= start && turn.id <= end)\n            .map(|turn| turn.text)\n            .collect();\n        if selected.is_empty() {\n            return Err(\"selected no turns in explicit span\".to_string());\n        }\n        Ok(selected.join(\"\\n\"))",
+            }),
+        ),
+        call_turn("b2", "bash", json!({ "command": "cargo test" })),
+        answer_turn(
+            "Fixed recall standalone spans and out-of-range span errors; cargo test passes.",
+        ),
+    ]
+}
+
+fn script_chained_iris_fold_resume_fix() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("b1", "bash", json!({ "command": "cargo test" })),
+        call_turn("f", "find", json!({ "pattern": "*.rs" })),
+        call_turn("g", "grep", json!({ "pattern": "modelSelection" })),
+        call_turn("r", "read", json!({ "path": "src/session.rs" })),
+        call_turn(
+            "e",
+            "edit",
+            json!({
+                "file_path": "src/session.rs",
+                "old_string": "\"message\" | \"compaction\" | \"modelSelection\" =>",
+                "new_string": "\"message\" | \"compaction\" | \"modelSelection\" | \"fold\" =>",
+            }),
+        ),
+        call_turn("b2", "bash", json!({ "command": "cargo test" })),
+        answer_turn(
+            "Fixed resume scanning so fold entries remain in the durable id chain; cargo test passes.",
+        ),
+    ]
+}
+
+fn script_chained_ampi_github_token_fix() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("b1", "bash", json!({ "command": "npm test" })),
+        call_turn("f", "find", json!({ "pattern": "*.mjs" })),
+        call_turn("g", "grep", json!({ "pattern": "AMPI_GITHUB_TOKEN" })),
+        call_turn("r", "read", json!({ "path": "src/auth.mjs" })),
+        call_turn(
+            "e",
+            "edit",
+            json!({
+                "file_path": "src/auth.mjs",
+                "old_string": "  return env.AMPI_GITHUB_TOKEN ?? env.GITHUB_TOKEN ?? null;",
+                "new_string": "  return env.AMPI_GITHUB_TOKEN ?? env.GITHUB_TOKEN ?? env.GH_TOKEN ?? env.GITHUB_PERSONAL_ACCESS_TOKEN ?? null;",
+            }),
+        ),
+        call_turn("b2", "bash", json!({ "command": "npm test" })),
+        answer_turn("Fixed GitHub token fallback handling; npm test passes."),
+    ]
+}
+
+fn script_chained_ampi_pack_untracked_fix() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("b1", "bash", json!({ "command": "npm test" })),
+        call_turn("f", "find", json!({ "pattern": "*.mjs" })),
+        call_turn("g", "grep", json!({ "pattern": "untracked" })),
+        call_turn("r", "read", json!({ "path": "src/verify-pack.mjs" })),
+        call_turn(
+            "e",
+            "edit",
+            json!({
+                "file_path": "src/verify-pack.mjs",
+                "old_string": "  if (privateFiles.length > 0) {\n    throw new Error(`private files in package: ${privateFiles.map((f) => f.path).join(', ')}`);\n  }\n  return true;",
+                "new_string": "  if (privateFiles.length > 0) {\n    throw new Error(`private files in package: ${privateFiles.map((f) => f.path).join(', ')}`);\n  }\n  const untrackedFiles = files.filter((file) => file.untracked === true);\n  if (untrackedFiles.length > 0) {\n    throw new Error(`untracked files in package: ${untrackedFiles.map((f) => f.path).join(', ')}`);\n  }\n  return true;",
+            }),
+        ),
+        call_turn("b2", "bash", json!({ "command": "npm test" })),
+        answer_turn("Fixed pack verification to reject untracked tarball files; npm test passes."),
+    ]
+}
+
+fn script_chained_ampi_private_docs_fix() -> Vec<AssistantTurn> {
+    vec![
+        call_turn("b1", "bash", json!({ "command": "npm test" })),
+        call_turn("f", "find", json!({ "pattern": "*.mjs" })),
+        call_turn("g", "grep", json!({ "pattern": "docs/private" })),
+        call_turn("r", "read", json!({ "path": "src/pack-files.mjs" })),
+        call_turn(
+            "e",
+            "edit",
+            json!({
+                "file_path": "src/pack-files.mjs",
+                "old_string": "  return files.filter((file) => !file.startsWith('.'));",
+                "new_string": "  return files.filter((file) => !file.startsWith('.') && !file.startsWith('docs/private/'));",
+            }),
+        ),
+        call_turn("b2", "bash", json!({ "command": "npm test" })),
+        answer_turn("Fixed package file filtering to exclude docs/private; npm test passes."),
+    ]
+}
+
 /// Scripted grep probe: search `deadline`, then answer the planted value.
 fn script_probe_grep() -> Vec<AssistantTurn> {
     vec![
@@ -566,6 +765,129 @@ fn check_chained_openai_summary_fix(workspace: &Path, _final_text: &str) -> Outc
         Err(error) => Outcome {
             success: false,
             detail: format!("cargo test not runnable: {error}"),
+        },
+    }
+}
+
+fn command_success(workspace: &Path, program: &str, args: &[&str]) -> Result<(), String> {
+    match Command::new(program)
+        .args(args)
+        .current_dir(workspace)
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "{program} {} status={}; stdout={} stderr={}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Err(format!("{program} not runnable: {error}")),
+    }
+}
+
+fn check_chained_iris_recall_span_fix(workspace: &Path, _final_text: &str) -> Outcome {
+    let tests = fs::read_to_string(workspace.join("tests/recall_span.rs")).unwrap_or_default();
+    let tests_still_assert_span = tests
+        .contains("standalone_span_without_handle_returns_original_turns")
+        && tests.contains("out_of_range_standalone_span_is_an_error")
+        && tests.contains("expect_err(\"empty explicit spans must be tool errors\")")
+        && tests.contains("selected no turns");
+    match command_success(workspace, "cargo", &["test"]) {
+        Ok(()) if tests_still_assert_span => Outcome {
+            success: true,
+            detail: "cargo test passed with standalone-span and empty-span tests intact"
+                .to_string(),
+        },
+        Ok(()) => Outcome {
+            success: false,
+            detail: "cargo test passed but recall span tests were changed or weakened".to_string(),
+        },
+        Err(detail) => Outcome {
+            success: false,
+            detail,
+        },
+    }
+}
+
+fn check_chained_iris_fold_resume_fix(workspace: &Path, _final_text: &str) -> Outcome {
+    let source = fs::read_to_string(workspace.join("src/session.rs")).unwrap_or_default();
+    let has_fold = source.contains("\"modelSelection\" | \"fold\"")
+        || source.contains("\"fold\" | \"modelSelection\"");
+    match command_success(workspace, "cargo", &["test"]) {
+        Ok(()) if has_fold => Outcome {
+            success: true,
+            detail: "cargo test passed; fold is counted in resume chain".to_string(),
+        },
+        Ok(()) => Outcome {
+            success: false,
+            detail: "cargo test passed but fold branch is missing from resume scanner".to_string(),
+        },
+        Err(detail) => Outcome {
+            success: false,
+            detail,
+        },
+    }
+}
+
+fn check_chained_ampi_github_token_fix(workspace: &Path, _final_text: &str) -> Outcome {
+    let source = fs::read_to_string(workspace.join("src/auth.mjs")).unwrap_or_default();
+    let has_gh = source.contains("GH_TOKEN");
+    let has_pat = source.contains("GITHUB_PERSONAL_ACCESS_TOKEN");
+    match command_success(workspace, "npm", &["test"]) {
+        Ok(()) if has_gh && has_pat => Outcome {
+            success: true,
+            detail: "npm test passed; GitHub token fallbacks implemented".to_string(),
+        },
+        Ok(()) => Outcome {
+            success: false,
+            detail: format!(
+                "npm test passed but fallback code missing (GH={has_gh}, PAT={has_pat})"
+            ),
+        },
+        Err(detail) => Outcome {
+            success: false,
+            detail,
+        },
+    }
+}
+
+fn check_chained_ampi_pack_untracked_fix(workspace: &Path, _final_text: &str) -> Outcome {
+    let source = fs::read_to_string(workspace.join("src/verify-pack.mjs")).unwrap_or_default();
+    let has_untracked =
+        source.contains("untrackedFiles") && source.contains("untracked files in package");
+    match command_success(workspace, "npm", &["test"]) {
+        Ok(()) if has_untracked => Outcome {
+            success: true,
+            detail: "npm test passed; untracked tarball files are rejected".to_string(),
+        },
+        Ok(()) => Outcome {
+            success: false,
+            detail: "npm test passed but untracked-file guard is missing".to_string(),
+        },
+        Err(detail) => Outcome {
+            success: false,
+            detail,
+        },
+    }
+}
+
+fn check_chained_ampi_private_docs_fix(workspace: &Path, _final_text: &str) -> Outcome {
+    let source = fs::read_to_string(workspace.join("src/pack-files.mjs")).unwrap_or_default();
+    let excludes_private = source.contains("docs/private/");
+    match command_success(workspace, "npm", &["test"]) {
+        Ok(()) if excludes_private => Outcome {
+            success: true,
+            detail: "npm test passed; docs/private is excluded".to_string(),
+        },
+        Ok(()) => Outcome {
+            success: false,
+            detail: "npm test passed but docs/private exclusion is missing".to_string(),
+        },
+        Err(detail) => Outcome {
+            success: false,
+            detail,
         },
     }
 }
