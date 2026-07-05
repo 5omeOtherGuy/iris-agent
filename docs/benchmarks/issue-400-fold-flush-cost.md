@@ -58,6 +58,40 @@ When the flush lands on the same boundary as a compaction, the compaction
 rewrites the prefix anyway: the fold's marginal cache-WRITE is zero or negative
 (asserted `same_boundary_fold_flush_adds_no_marginal_write`).
 
+## Class-A break-trigger flushes — modeled (#400 M2, trigger classes A2–A6)
+
+Each Class A trigger measured against its own control (same seed, same break,
+microcompaction on/off) on the deterministic fake-provider lane. Under a full
+break (A2 model switch, A3 reasoning switch — caches are model/params-scoped),
+an expired cache (A4 cold resume, past the profile `cold_after`), or an
+uncacheable prefix (A5 below the profile minimum), the request mass re-bills
+(or was never cached) with or without the fold, so the fold's marginal write
+is zero or negative — it can only shrink what is billed.
+
+Regenerate: `cargo test trigger_class_flush_cost_benchmark_report -- --nocapture`
+
+| trigger | arm t1 payload | control t1 payload | marginal write | t2 arm | t2 control | steady saving |
+|---|---|---|---|---|---|---|
+| A2 model switch | 4781 | 4926 | -145 | 4796 | 4940 | 144 |
+| A3 reasoning switch | 4781 | 4926 | -145 | 4796 | 4940 | 144 |
+| A4 cold resume | 4781 | 4926 | -145 | 4796 | 4940 | 144 |
+| A5 below minimum | 4781 | 4926 | -145 | 4796 | 4940 | 144 |
+
+- Asserted per arm (`*_flush_is_free_a2` … `_a5`): the arm folds exactly the
+  superseded read, neither run compacts, the folded break payload never
+  exceeds the control's (marginal write <= 0), and the steady-state request
+  strictly shrinks.
+- **A6 (manual `/compact`) mirrors A1**: the user-initiated compaction
+  rewrites the prefix anyway; asserted through the production `compact_now`
+  seam (`manual_compact_flush_rides_the_compaction_a6`) exactly like the
+  same-boundary table above.
+- The four rows are identical by construction: the arms share one seed and
+  one flush; only the *trigger* releasing the flush differs. The table's
+  claim is per-trigger attribution (each class released its flush and cost
+  nothing), not four independent workloads.
+- Trigger tags on the persisted fold entries and observer events are asserted
+  in `src/wayland/microcompaction_tests.rs` per class.
+
 ## Fold-only flush — realized (Anthropic Claude Code OAuth)
 
 One live capture; lane: Anthropic Messages / Claude Code OAuth; model:
@@ -97,7 +131,10 @@ original prefix.
   regardless, so the flush is free and the saving is immediate.
 - Together these are the economics behind #400's trigger list: flush folds
   when a prefix break is inevitable anyway (compaction, prompt/model change,
-  inferred TTL expiry), keep the watermark as backstop.
+  inferred TTL expiry), keep the watermark as backstop. The M2 scheduler
+  implements exactly this: Class A triggers (A1–A6) flush free on breaks,
+  the watermark stays as the Class C pressure backstop, and every flush is
+  trigger-tagged for attribution.
 
 ## Measurement conditions
 

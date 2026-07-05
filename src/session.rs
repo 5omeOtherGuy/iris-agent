@@ -79,6 +79,10 @@ pub(crate) struct SessionLog {
     /// this count plus one; derived from entry order, so a session without the
     /// persisted field still counts correctly.
     compactions: u32,
+    /// Highest entry `timestamp` (unix ms) at resume time, approximating the
+    /// prior process's last activity for the cold-resume fold trigger (#400).
+    /// `None` for a freshly created log or a transcript without timestamps.
+    resumed_last_activity_ms: Option<u64>,
 }
 
 impl SessionLog {
@@ -133,6 +137,7 @@ impl SessionLog {
             last_id: None,
             next_seq: 0,
             compactions: 0,
+            resumed_last_activity_ms: None,
         })
     }
 
@@ -413,7 +418,16 @@ impl SessionLog {
             last_id: state.last_id,
             next_seq: state.next_seq,
             compactions: state.compactions,
+            resumed_last_activity_ms: state.last_activity_ms,
         })
+    }
+
+    /// Highest entry timestamp (unix ms) observed when this log was resumed,
+    /// approximating the prior process's last activity for the cold-resume
+    /// fold trigger (#400). `None` for a freshly created log or a transcript
+    /// whose entries carry no timestamps.
+    pub(crate) fn resumed_last_activity_ms(&self) -> Option<u64> {
+        self.resumed_last_activity_ms
     }
 
     /// Session id (header `id`), used to open this session back later.
@@ -952,6 +966,9 @@ struct ResumeState {
     /// Whether the file lacks a trailing newline (a truncated final fragment),
     /// so resume must terminate it before appending.
     needs_newline: bool,
+    /// Highest entry `timestamp` (unix ms) seen in the file, approximating the
+    /// prior process's last activity for the cold-resume fold trigger (#400).
+    last_activity_ms: Option<u64>,
     /// Count of `compaction` entries seen, so the resumed log continues the
     /// generation ordinal (ADR-0047) from entry order -- correct even for
     /// sessions written before the persisted `generation` field existed.
@@ -984,6 +1001,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
     let mut count: u32 = 0;
     let mut compactions: u32 = 0;
     let mut max_seq: Option<u32> = None;
+    let mut last_activity_ms: Option<u64> = None;
     for line in lines {
         let Ok(text) = line else { continue };
         let Ok(value) = serde_json::from_str::<Value>(text) else {
@@ -1011,6 +1029,9 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
             compactions += 1;
         }
         count += 1;
+        if let Some(ts) = value.get("timestamp").and_then(Value::as_u64) {
+            last_activity_ms = Some(last_activity_ms.map_or(ts, |m: u64| m.max(ts)));
+        }
         if let Some(entry_id) = value.get("id").and_then(Value::as_str) {
             last_id = Some(entry_id.to_string());
             // Entry ids are hex of the seq counter; track the max so the next id
@@ -1029,6 +1050,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         next_seq,
         needs_newline,
         compactions,
+        last_activity_ms,
     })
 }
 

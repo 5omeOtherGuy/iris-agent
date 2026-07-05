@@ -843,6 +843,34 @@ fn run_seeded(
     echo: Vec<&'static str>,
     prompts: &[&str],
 ) -> SeededArm {
+    run_seeded_with(
+        seed,
+        budget,
+        micro,
+        summarizer,
+        echo,
+        prompts,
+        |_| {},
+        false,
+    )
+}
+
+/// [`run_seeded`] with two extra knobs for the cache-aware trigger arms
+/// (issue #400 M2): `prepare` runs against the resumed harness before any
+/// turn (install a cache profile, arm a selection switch), and
+/// `manual_compact` drives one `compact_now` (the `/compact` seam, trigger
+/// A6) before the driven prompts.
+#[allow(clippy::too_many_arguments)]
+fn run_seeded_with(
+    seed: &[Message],
+    budget: u64,
+    micro: bool,
+    summarizer: SummarizerKind,
+    echo: Vec<&'static str>,
+    prompts: &[&str],
+    prepare: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+    manual_compact: bool,
+) -> SeededArm {
     let root = TempDir::new();
     let workspace = TempDir::new();
     let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
@@ -882,10 +910,14 @@ fn run_seeded(
     );
     harness.set_summarizer(summarizer);
     harness.set_microcompaction(micro);
+    prepare(&mut harness);
 
     let counter = CompactionCounter::new();
     let gate = NoToolGate;
     let token = CancellationToken::new();
+    if manual_compact {
+        block_on(harness.compact_now(&counter, &token)).expect("manual compaction succeeds");
+    }
     for prompt in prompts {
         block_on(harness.submit_turn(prompt, &counter, &gate, &token)).expect("turn succeeds");
     }
@@ -1701,5 +1733,296 @@ fn fold_flush_cost_benchmark_report() {
     println!(
         "\nSame boundary as a compaction, the fold's marginal cache-WRITE is zero or negative: \
          the compaction rewrites the prefix anyway and the fold only shrinks the rewrite."
+    );
+}
+
+// ===========================================================================
+// Cache-aware trigger arms (issue #400 M2): each Class A trigger's flush is
+// measured against its own control on the same deterministic fake-provider
+// lane. The claim per arm is "marginal cache-WRITE ~ 0": under a full break
+// (A2 model switch), an expired cache (A4 cold resume), or an uncacheable
+// prefix (A5 below the minimum), the request mass re-bills (or was never
+// cached) regardless of folding -- the fold can only SHRINK what is billed.
+// A6 rides a manual compaction exactly like A1 rides an automatic one.
+// ===========================================================================
+
+/// A compaction-proof budget: the watermark (budget/2 = 2x seed) stays above
+/// the running total, so neither compaction (A1) nor the watermark backstop
+/// (C) can fire and the arm's flush is attributable to its trigger alone.
+fn break_arm_budget(seed: &[Message]) -> u64 {
+    let est: u64 = seed.iter().map(|m| est_tokens(&m.content) as u64).sum();
+    est.saturating_mul(4)
+}
+
+/// One Class-A break arm over the carry seed: `prepare` arms the trigger on
+/// the resumed harness, two driven turns measure the flush boundary (turn 1)
+/// and the steady state (turn 2).
+fn run_break_arm(
+    micro: bool,
+    prepare: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+) -> SeededArm {
+    let seed = carry_seed();
+    let budget = break_arm_budget(&seed);
+    run_seeded_with(
+        &seed,
+        budget,
+        micro,
+        SummarizerKind::Provider,
+        Vec::new(),
+        &[
+            "continue: proceed with the next small wiring step.",
+            "then: confirm the buffer state briefly.",
+        ],
+        prepare,
+        false,
+    )
+}
+
+/// `(arm, control, transcript fold tags)` for one break trigger: the arm and
+/// control differ ONLY in the microcompaction flag; both receive the same
+/// `prepare` so the break itself is identical.
+fn break_pair(
+    prepare_arm: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+    prepare_ctrl: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+) -> (SeededArm, SeededArm) {
+    (
+        run_break_arm(true, prepare_arm),
+        run_break_arm(false, prepare_ctrl),
+    )
+}
+
+/// Assert one break arm's economics: the flush happened (tagged as expected),
+/// nothing compacted, and under the break's re-bill the folded turn-1 payload
+/// is no larger than the control's -- marginal modeled write <= 0 -- while the
+/// steady state (turn 2) is strictly smaller.
+fn assert_break_arm_is_free(tag: &str, arm: &SeededArm, control: &SeededArm) {
+    assert_eq!(arm.folds, 1, "{tag}: the arm folds the superseded read");
+    assert_eq!(control.folds, 0, "{tag}: the control must not fold");
+    assert!(arm.records.is_empty(), "{tag}: the arm must not compact");
+    assert!(
+        control.records.is_empty(),
+        "{tag}: the control must not compact"
+    );
+    // Under the break, the entire request re-bills (or was never cached)
+    // either way: the write mass IS the payload, and the fold only shrinks it.
+    let arm_t1 = est_tokens(&arm.requests[0].payload);
+    let ctrl_t1 = est_tokens(&control.requests[0].payload);
+    assert!(
+        arm_t1 <= ctrl_t1,
+        "{tag}: folded break payload must not exceed the control's \
+         (arm {arm_t1} vs control {ctrl_t1})"
+    );
+    // Steady state keeps the full per-turn saving.
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    assert!(
+        arm_t2 < ctrl_t2,
+        "{tag}: steady-state request must shrink (arm {arm_t2} vs control {ctrl_t2})"
+    );
+}
+
+#[test]
+fn selection_switch_flush_is_free_a2() {
+    // A2: caches are model-scoped, so a model switch re-bills the whole
+    // request with or without the fold.
+    let arm_prepare = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", None);
+        h.record_selection_event("prov-a", "model-b", None)
+            .expect("selection event records");
+    };
+    let ctrl_prepare = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", None);
+        h.record_selection_event("prov-a", "model-b", None)
+            .expect("selection event records");
+    };
+    let (arm, control) = break_pair(arm_prepare, ctrl_prepare);
+    assert_break_arm_is_free("A2", &arm, &control);
+}
+
+#[test]
+fn reasoning_switch_flush_is_free_a3() {
+    // A3: a reasoning change breaks at the message level; folds live in
+    // messages, so the fold's rewrite is covered by the same break.
+    let prepare = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", Some("medium"));
+        h.record_selection_event("prov-a", "model-a", Some("high"))
+            .expect("selection event records");
+    };
+    let prepare_ctrl = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", Some("medium"));
+        h.record_selection_event("prov-a", "model-a", Some("high"))
+            .expect("selection event records");
+    };
+    let (arm, control) = break_pair(prepare, prepare_ctrl);
+    assert_break_arm_is_free("A3", &arm, &control);
+}
+
+#[test]
+fn cold_resume_flush_is_free_a4() {
+    // A4: the resumed transcript's last activity sits past the profile's
+    // cold threshold, so the cache is expired and the first request re-bills
+    // everything regardless. A tiny threshold plus a real wait keeps the arm
+    // deterministic without fabricating timestamps.
+    let cold = |h: &mut Harness<CompactionFakeProvider>| {
+        h.set_cache_profile(crate::wayland::CacheProfile {
+            cold_after: Some(std::time::Duration::from_millis(10)),
+            ..Default::default()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let (arm, control) = break_pair(cold, cold);
+    assert_break_arm_is_free("A4", &arm, &control);
+}
+
+#[test]
+fn below_minimum_prefix_flush_is_free_a5() {
+    // A5: a prefix below the provider's minimum cacheable length is never
+    // cached, so there is no cache to break -- the flush is free by
+    // construction (marginal write 0) and the steady state still shrinks.
+    let below_min = |h: &mut Harness<CompactionFakeProvider>| {
+        h.set_cache_profile(crate::wayland::CacheProfile {
+            min_cacheable_tokens: u64::MAX,
+            ..Default::default()
+        });
+    };
+    let (arm, control) = break_pair(below_min, below_min);
+    assert_break_arm_is_free("A5", &arm, &control);
+}
+
+#[test]
+fn manual_compact_flush_rides_the_compaction_a6() {
+    // A6 mirrors A1: the manual compaction rewrites the prefix anyway, so the
+    // fold adds no marginal write -- it can only shrink the rewrite. Driven
+    // through the production `/compact` seam (`compact_now`).
+    let run = |micro: bool| {
+        let seed = carry_seed();
+        let budget = break_arm_budget(&seed);
+        run_seeded_with(
+            &seed,
+            budget,
+            micro,
+            SummarizerKind::Provider,
+            Vec::new(),
+            &["continue: proceed with the next small wiring step."],
+            |_| {},
+            true,
+        )
+    };
+    let arm = run(true);
+    let control = run(false);
+    assert_eq!(
+        arm.folds, 1,
+        "A6: the pending fold rides the manual compact"
+    );
+    assert_eq!(arm.records.len(), 1, "A6: the manual compaction applied");
+    assert_eq!(control.records.len(), 1);
+    let arm_gen = model_cache_economics(&arm.requests, Some(&arm.seed_baseline));
+    let ctrl_gen = model_cache_economics(&control.requests, Some(&control.seed_baseline));
+    let a = arm_gen.first().expect("arm generation 1");
+    let c = ctrl_gen.first().expect("control generation 1");
+    assert!(
+        a.write_tokens <= c.write_tokens,
+        "A6: folding must not increase the post-compaction write \
+         (arm {} vs control {})",
+        a.write_tokens,
+        c.write_tokens
+    );
+}
+
+/// Prints the per-trigger flush-cost table appended to
+/// `docs/benchmarks/issue-400-fold-flush-cost.md`. Regenerate with:
+/// `cargo test trigger_class_flush_cost_benchmark_report -- --nocapture`
+#[test]
+fn trigger_class_flush_cost_benchmark_report() {
+    struct Row {
+        tag: &'static str,
+        arm: SeededArm,
+        control: SeededArm,
+    }
+    let mut rows = Vec::new();
+    {
+        let prepare = |h: &mut Harness<CompactionFakeProvider>| {
+            h.note_active_selection("prov-a", "model-a", None);
+            h.record_selection_event("prov-a", "model-b", None).unwrap();
+        };
+        let arm = run_break_arm(true, prepare);
+        let control = run_break_arm(false, |h| {
+            h.note_active_selection("prov-a", "model-a", None);
+            h.record_selection_event("prov-a", "model-b", None).unwrap();
+        });
+        rows.push(Row {
+            tag: "A2 model switch",
+            arm,
+            control,
+        });
+    }
+    {
+        let arm = run_break_arm(true, |h| {
+            h.note_active_selection("p", "m", Some("medium"));
+            h.record_selection_event("p", "m", Some("high")).unwrap();
+        });
+        let control = run_break_arm(false, |h| {
+            h.note_active_selection("p", "m", Some("medium"));
+            h.record_selection_event("p", "m", Some("high")).unwrap();
+        });
+        rows.push(Row {
+            tag: "A3 reasoning switch",
+            arm,
+            control,
+        });
+    }
+    {
+        let cold = |h: &mut Harness<CompactionFakeProvider>| {
+            h.set_cache_profile(crate::wayland::CacheProfile {
+                cold_after: Some(std::time::Duration::from_millis(10)),
+                ..Default::default()
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        rows.push(Row {
+            tag: "A4 cold resume",
+            arm: run_break_arm(true, cold),
+            control: run_break_arm(false, cold),
+        });
+    }
+    {
+        let below = |h: &mut Harness<CompactionFakeProvider>| {
+            h.set_cache_profile(crate::wayland::CacheProfile {
+                min_cacheable_tokens: u64::MAX,
+                ..Default::default()
+            });
+        };
+        rows.push(Row {
+            tag: "A5 below minimum",
+            arm: run_break_arm(true, below),
+            control: run_break_arm(false, below),
+        });
+    }
+
+    println!("\n== Class-A break-trigger flushes -- {MODELED_LABEL} ==");
+    println!(
+        "| trigger | arm t1 payload | control t1 payload | marginal write | t2 arm | t2 control | steady saving |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    for row in &rows {
+        let arm_t1 = est_tokens(&row.arm.requests[0].payload);
+        let ctrl_t1 = est_tokens(&row.control.requests[0].payload);
+        let arm_t2 = est_tokens(&row.arm.requests[1].payload);
+        let ctrl_t2 = est_tokens(&row.control.requests[1].payload);
+        println!(
+            "| {} | {arm_t1} | {ctrl_t1} | {} | {arm_t2} | {ctrl_t2} | {} |",
+            row.tag,
+            arm_t1 as i64 - ctrl_t1 as i64,
+            ctrl_t2.saturating_sub(arm_t2),
+        );
+    }
+    println!(
+        "\nUnder each break the request mass re-bills (A2/A3: model/params scoped cache; A4: \
+         expired TTL) or was never cached (A5: below the minimum cacheable prefix), with or \
+         without the fold. The negative marginal is the fold's own shrink riding the break."
+    );
+    println!(
+        "A6 (manual /compact) mirrors A1: see the same-boundary table above -- the fold only \
+         shrinks the compaction's rewrite."
     );
 }

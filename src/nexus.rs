@@ -239,12 +239,24 @@ pub(crate) enum VerificationOutcome {
 pub(crate) enum FoldTrigger {
     /// A1: a compaction will fire at this same boundary; the fold rides it.
     CompactionBoundary,
+    /// A2: the model/provider selection changed since the last request (a
+    /// full prefix-cache break on every lane -- caches are model-scoped).
+    SelectionSwitch,
+    /// A3: the reasoning-effort preference changed since the last request (a
+    /// message-level break; folds live in messages, so they are covered).
+    ReasoningSwitch,
+    /// A4: resumed after an idle gap past the provider's cold threshold, so
+    /// the prefix cache is expired and the suffix re-bills regardless.
+    ColdResume,
+    /// A5: the context is below the provider's minimum cacheable prefix, so
+    /// nothing is cached yet and a fold breaks nothing.
+    BelowMinCacheable,
+    /// A6: the user requested compaction manually (`/compact`); pending folds
+    /// ride the user-initiated break.
+    ManualCompact,
     /// C: the context reached the micro-watermark (pressure backstop).
     Watermark,
-    // The remaining classes land with the provider cache profile: A2
-    // (model/provider switch), A3 (reasoning switch), A4 (cold resume), A5
-    // (below the minimum cacheable prefix), A6 (manual `/compact`), and B
-    // (inferred mid-session cold).
+    // Class B (inferred mid-session cold) lands with Phase 2.
 }
 
 impl FoldTrigger {
@@ -252,6 +264,11 @@ impl FoldTrigger {
     pub(crate) fn code(self) -> &'static str {
         match self {
             FoldTrigger::CompactionBoundary => "A1",
+            FoldTrigger::SelectionSwitch => "A2",
+            FoldTrigger::ReasoningSwitch => "A3",
+            FoldTrigger::ColdResume => "A4",
+            FoldTrigger::BelowMinCacheable => "A5",
+            FoldTrigger::ManualCompact => "A6",
             FoldTrigger::Watermark => "C",
         }
     }
