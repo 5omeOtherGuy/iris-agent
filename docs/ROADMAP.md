@@ -831,12 +831,22 @@ Potential scope:
   (verbatim in rebuilt context, e.g. carry paths) versus
   recoverable-behind-reference (folded or compacted, reachable via a stub path or
   recall handle), each asserted separately. Reported dimensions: compaction
-  generation, covered-range size, and cache economics -- the cache-hit-eligible
-  covered-range start (only generation 1 rides the live cached prefix) and the
-  retained-tail rewrite mass are measured, while the ProviderUsage-derived
-  cache-hit rate and cache-write amplification are documented methodology with
-  measurement pending a recorded live lane (never fabricated). Report:
-  `docs/benchmarks/issue-372-compaction-retention-slice-b.md`. Deferred (still
+  generation, covered-range size, and cache economics -- modeled deterministically
+  (prefix-divergence, estimated tokens) and anchored by an env-gated live
+  Anthropic Claude Code OAuth capture: the post-compaction cache-WRITE side is
+  realized (1758/1761 input tokens, 5m tier), the summarization request's
+  cache-HIT realized 0 on the short synthetic seed (recorded honestly, not
+  fabricated). Report: `docs/benchmarks/issue-372-compaction-retention-slice-b.md`.
+  The fold-flush price is measured separately
+  ([#400](https://github.com/5omeOtherGuy/iris-agent/issues/400),
+  `docs/benchmarks/issue-400-fold-flush-cost.md`): a fold-only flush on a warm
+  cache re-bills everything below the fold point (realized 2129
+  provider-reported write tokens) against a per-turn saving of the folded body
+  -- break-even tens-to-hundreds of turns -- while the same fold at a compaction
+  boundary is free (marginal write <= 0, asserted) and a cold cache makes it
+  free and immediately profitable; that economics motivates #400's cache-aware
+  flush triggers, with realized per-turn cache accounting tracked in
+  [#395](https://github.com/5omeOtherGuy/iris-agent/issues/395). Deferred (still
   open, outside #372): the over-budget-no-coverable-range floor,
   estimate-vs-actual token calibration, and provider-native context-management
   interplay.]

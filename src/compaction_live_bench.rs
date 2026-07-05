@@ -45,9 +45,13 @@ const LIVE_SYSTEM_PROMPT: &str = "You are a coding assistant. Keep answers short
 const SUMMARY_INSTRUCTION_PREFIX: &str = "Summarize this coding session";
 
 /// One provider round-trip's realized usage, tagged summarization vs normal.
+/// `tag` is the first bytes of the request's LAST message content, so a run
+/// can select a specific turn's request by its prompt without relying on
+/// positional order (a spurious model tool-call would shift positions).
 #[derive(Clone)]
 struct CapturedUsage {
     is_summary: bool,
+    tag: String,
     usage: Option<ProviderUsage>,
 }
 
@@ -71,12 +75,17 @@ impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
         let is_summary = messages
             .last()
             .is_some_and(|m| m.content.starts_with(SUMMARY_INSTRUCTION_PREFIX));
+        let tag = messages
+            .last()
+            .map(|m| m.content.chars().take(32).collect::<String>())
+            .unwrap_or_default();
         let usages = self.usages.clone();
         let stream = self.inner.respond_stream(messages, tools, cancel)?;
         let mapped = stream.map(move |item| {
             if let Ok(ProviderEvent::Completed(turn)) = &item {
                 usages.lock().expect("usages lock").push(CapturedUsage {
                     is_summary,
+                    tag: tag.clone(),
                     usage: turn.usage.clone(),
                 });
             }
@@ -338,5 +347,241 @@ fn compaction_cache_economics_live_anthropic() {
             );
         }
         None => println!("first post-compaction request: no usage captured"),
+    }
+}
+
+// --- Fold-flush cost, realized (issue #400). ---
+
+/// The superseded-read path in the live fold seed (mirrors the modeled
+/// `FOLD_PATH` scenario in `compaction_bench.rs`).
+const LIVE_FOLD_PATH: &str = "crates/orbit/src/telemetry/buffer.rs";
+
+/// A successful ADR-0021 `read` result envelope, as the fold engine's
+/// `successful_target` expects (ok + `metadata.target`).
+fn live_read_result(call: &str, body: &str) -> Message {
+    Message::tool_result(
+        call,
+        "read",
+        &serde_json::json!({
+            "ok": true,
+            "content": body,
+            "metadata": { "target": LIVE_FOLD_PATH },
+        })
+        .to_string(),
+    )
+}
+
+/// An assistant `read` tool call for `LIVE_FOLD_PATH`. The Anthropic Messages
+/// API validates tool_use/tool_result pairing, so unlike the fake lane the
+/// live seed must carry the calls the results answer.
+fn live_read_call(id: &str) -> Message {
+    Message::assistant_tool_call(&ToolCall {
+        id: id.to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": LIVE_FOLD_PATH }),
+        thought_signature: None,
+    })
+}
+
+/// Fold-cost seed: an early needle-bearing `read` of `LIVE_FOLD_PATH` that a
+/// later, much larger read of the same path supersedes. The superseding read
+/// alone exceeds the 2000-token protected fold tail, so the earlier read sits
+/// before `fold_tail_start` and is foldable. Total ~2900 estimated tokens --
+/// comfortably above Anthropic's minimum cacheable prefix, so turn 1 writes a
+/// prefix turn 2 can realize reads against.
+fn fold_live_seed() -> Vec<Message> {
+    let fold_body = format!(
+        "LIVE-FOLD-DETAIL-4417 :: {}",
+        "spent buffer read detail for the reconciliation work. ".repeat(40)
+    );
+    let superseding = "current buffer contents after the ledger reconciliation pass. ".repeat(140);
+    vec![
+        Message::user("start: we are reconciling the ledger sink; read the buffer first."),
+        live_read_call("lf-1"),
+        live_read_result("lf-1", &fold_body),
+        Message::assistant("Noted the buffer contents."),
+        Message::user("the buffer changed; read it again before continuing"),
+        live_read_call("lf-2"),
+        live_read_result("lf-2", &superseding),
+        Message::assistant("Done; the latest buffer contents are loaded."),
+    ]
+}
+
+/// One live fold-cost run: seed, resume, drive two turns, return the captured
+/// usages, the fold count, and the seed estimate. `micro` toggles
+/// microcompaction; everything else is byte-identical between runs.
+fn run_fold_cost_live(
+    micro: bool,
+    warming_prompt: &str,
+    steady_prompt: &str,
+) -> Option<(Vec<CapturedUsage>, usize, u64)> {
+    let provider = match AnthropicProvider::new(
+        LIVE_MODEL,
+        "https://api.anthropic.com",
+        None,
+        LIVE_SYSTEM_PROMPT,
+        PromptCacheRetention::DEFAULT,
+        ContextManagement::default(),
+        RetryPolicy::default(),
+    ) {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: AnthropicProvider::new error: {error:#}");
+            return None;
+        }
+    };
+
+    let root = TempDir::new("fold-root");
+    let workspace = TempDir::new("fold-ws");
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
+    for message in fold_live_seed() {
+        log.append(&message).expect("append seed message");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list sessions")
+        .into_iter()
+        .find(|m| m.path == path)
+        .expect("seeded session is listed");
+    let stored = store.open(&meta).expect("open seeded session");
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path).expect("resume session log");
+
+    let usages = Arc::new(Mutex::new(Vec::new()));
+    let recording = RecordingProvider {
+        inner: provider,
+        usages: usages.clone(),
+    };
+    // The flush must land at the TURN-2 boundary so turn 1 warms the ORIGINAL
+    // (unfolded) prefix and turn 2's request shows the realized break. With
+    // budget = 2 * (seed + 150): the micro-watermark (budget/2 = seed + 150)
+    // sits ABOVE the bare seed (no flush at turn 1) and BELOW seed + turn-1
+    // exchange (flush at turn 2). Compaction never fires (total stays far
+    // under budget).
+    let seed_estimate = stored
+        .messages
+        .iter()
+        .map(|m| m.content.len())
+        .sum::<usize>() as u64
+        / 4;
+    let budget = 2 * (seed_estimate + 150);
+    let agent = Agent::resumed(recording, Tools::new(Vec::new()), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(budget),
+    );
+    harness.set_summarizer(SummarizerKind::Provider);
+    harness.set_microcompaction(micro);
+
+    let obs = NoopObserver;
+    let gate = NoToolGate;
+    let token = CancellationToken::new();
+    for prompt in [warming_prompt, steady_prompt] {
+        if let Err(error) = block_on(harness.submit_turn(prompt, &obs, &gate, &token)) {
+            eprintln!("LIVE RUN FAILED: submit_turn error: {error:#}");
+            return None;
+        }
+    }
+
+    let folds = super::compaction_bench::fold_count(&path);
+    let captured = usages.lock().expect("usages lock").clone();
+    Some((captured, folds, seed_estimate))
+}
+
+#[test]
+#[ignore = "live Anthropic API calls; set IRIS_BENCH_LIVE=1 to run"]
+fn fold_flush_cost_live_anthropic() {
+    if std::env::var("IRIS_BENCH_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("fold_flush_cost_live_anthropic: skipped (set IRIS_BENCH_LIVE=1 to run)");
+        return;
+    }
+    if !claude_code_credentials_available() {
+        eprintln!(
+            "LIVE RUN FAILED: no Claude Code credentials discovered \
+             (claude_code_credentials_available() == false); expected ~/.claude/.credentials.json"
+        );
+        return;
+    }
+
+    // Turn-1 prompt is large enough (~300 estimated tokens) to push the total
+    // past the micro-watermark; both prompts forbid tool use so the request
+    // stream stays two normal turns per run.
+    let warming_prompt = format!(
+        "Do not use any tools. Reply with one short sentence acknowledging the state. {}",
+        "The reconciliation status must be recorded before the next wiring step proceeds. "
+            .repeat(15)
+    );
+    let steady_prompt = "Do not use any tools. In one short sentence: is the buffer state current?";
+
+    let date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    println!("\n== LIVE fold-flush cost (Anthropic Claude Code OAuth) ==");
+    println!(
+        "lane: Anthropic Messages / Claude Code OAuth; model: {LIVE_MODEL}; unix_date: {date}"
+    );
+
+    let Some((ctrl, ctrl_folds, seed_est)) =
+        run_fold_cost_live(false, &warming_prompt, steady_prompt)
+    else {
+        return;
+    };
+    let Some((arm, arm_folds, _)) = run_fold_cost_live(true, &warming_prompt, steady_prompt) else {
+        return;
+    };
+    println!("seed estimate ~{seed_est} tokens; folds: control={ctrl_folds}, arm={arm_folds}");
+    if arm_folds == 0 {
+        println!(
+            "LIVE RUN INCONCLUSIVE: the arm wrote no fold (watermark not crossed at turn 2); \
+             no realized fold cost to report."
+        );
+        return;
+    }
+
+    // Select each run's turn-2 request by prompt tag, not position.
+    let steady_tag = |c: &CapturedUsage| c.tag.starts_with("Do not use any tools. In one sho");
+    let pick = |run: &[CapturedUsage]| -> Option<ProviderUsage> {
+        run.iter()
+            .find(|c| steady_tag(c))
+            .and_then(|c| c.usage.clone())
+    };
+    let report = |label: &str, u: &Option<ProviderUsage>| match u {
+        Some(u) => {
+            let (m5, h1) = u
+                .cache_creation
+                .as_ref()
+                .map(|c| (c.ephemeral_5m_input_tokens, c.ephemeral_1h_input_tokens))
+                .unwrap_or((0, 0));
+            println!(
+                "{label}: input_tokens={}, cache_read={}, cache_write={} (5m={m5}, 1h={h1})",
+                u.input_tokens, u.cache_read_input_tokens, u.cache_write_input_tokens,
+            );
+        }
+        None => println!("{label}: no usage captured"),
+    };
+    let ctrl_t2 = pick(&ctrl);
+    let arm_t2 = pick(&arm);
+    report("control turn-2 (no fold)", &ctrl_t2);
+    report("arm turn-2 (post-flush)  ", &arm_t2);
+    if let (Some(c), Some(a)) = (&ctrl_t2, &arm_t2) {
+        println!(
+            "realized marginal fold cost: cache_write {} - {} = {} tokens; \
+             cache_read drop: {} - {} = {} tokens",
+            a.cache_write_input_tokens,
+            c.cache_write_input_tokens,
+            a.cache_write_input_tokens as i64 - c.cache_write_input_tokens as i64,
+            c.cache_read_input_tokens,
+            a.cache_read_input_tokens,
+            c.cache_read_input_tokens as i64 - a.cache_read_input_tokens as i64,
+        );
     }
 }
