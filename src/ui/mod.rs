@@ -190,6 +190,14 @@ pub(crate) enum UiEvent {
         text: String,
         redacted: bool,
     },
+    /// One incremental chunk of the model's reasoning *summary*, streamed while
+    /// the provider is still thinking (before the answer). Display-only; only
+    /// the human-readable summary is carried (never raw or redacted reasoning).
+    /// See [`AgentEvent::AssistantReasoningDelta`].
+    AssistantReasoningDelta(String),
+    /// A boundary between two reasoning-summary parts (a blank line in the live
+    /// thinking trace). Display-only; carries no text.
+    AssistantReasoningSectionBreak,
     ToolProposed(ToolCall),
     /// A tool is about to execute; lets the front-end open a live progress cell.
     ToolStarted(ToolCall),
@@ -300,6 +308,13 @@ impl UiEvent {
                 original_tokens_estimate,
                 summary_tokens_estimate,
                 budget,
+                // Generation ordinal (ADR-0047) is instrumentation for the
+                // event/benchmark, not a display field; the UI does not surface
+                // it, so drop it in the display mapping.
+                generation: _,
+                // Carry count (ADR-0044) is event/benchmark instrumentation, not
+                // a display field; drop it in the display mapping too.
+                carried_paths: _,
             } => UiEvent::CompactionApplied {
                 compaction_id,
                 covered_from,
@@ -315,9 +330,15 @@ impl UiEvent {
             AgentEvent::AssistantReasoning { text, redacted } => {
                 UiEvent::AssistantReasoning { text, redacted }
             }
+            AgentEvent::AssistantReasoningDelta(delta) => UiEvent::AssistantReasoningDelta(delta),
+            AgentEvent::AssistantReasoningSectionBreak => UiEvent::AssistantReasoningSectionBreak,
             AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
             AgentEvent::ToolStarted(call) => UiEvent::ToolStarted(call),
             AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),
+            // The dangerous skip-permissions auto-approval (ADR-0049) renders
+            // through the existing auto-approved cell; the loud session-start
+            // banner and the transcript audit record carry the mode itself.
+            AgentEvent::ToolAutoApprovedDangerous(call) => UiEvent::ToolAutoApproved(call),
             AgentEvent::DiffPreview { call, diff } => UiEvent::DiffPreview { call, diff },
             AgentEvent::ToolDenied(call) => UiEvent::ToolDenied(call),
             AgentEvent::ToolResult {

@@ -44,6 +44,13 @@ const PREVIEW_TAIL_BYTES: usize = 2 * 1024;
 // provider stream.
 const INTERRUPT_NOTICE: &str = "interrupted; send another message to continue.";
 
+/// Loud one-time warning shown at session start when
+/// `--dangerously-skip-permissions` is active (ADR-0049). ASCII only so it
+/// renders identically on stderr and in the TUI; kept here as the single source
+/// of truth for the host banner and the audit trail.
+pub(crate) const SKIP_PERMISSIONS_BANNER: &str =
+    "ALL PERMISSION CHECKS DISABLED - every command will run without approval";
+
 /// Outcome of an approval review for a single tool call. Provider/UI-neutral so
 /// the core loop owns the approval policy without depending on any front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +296,14 @@ pub(crate) enum AgentEvent {
         original_tokens_estimate: u64,
         summary_tokens_estimate: u64,
         budget: u64,
+        /// 1-based compaction generation ordinal (ADR-0047): the Nth compaction
+        /// in the session reports N. Instrumentation of compaction depth; does
+        /// not affect range selection or summary content.
+        generation: u64,
+        /// Number of workspace-relative touched/read paths carried verbatim
+        /// alongside the prose summary (ADR-0044). Additive instrumentation; 0
+        /// when the covered range had no in-workspace tool targets.
+        carried_paths: usize,
     },
     AssistantText(String),
     AssistantTextDelta(String),
@@ -305,6 +320,19 @@ pub(crate) enum AgentEvent {
         text: String,
         redacted: bool,
     },
+    /// One incremental chunk of the model's reasoning *summary*, streamed while
+    /// the provider is still thinking (before any assistant text). Display-only,
+    /// exactly like [`AssistantReasoning`]: emitting it never changes storage or
+    /// what is sent to the provider, and the persisted reasoning row is still
+    /// written once at completion. Only the human-readable summary is carried;
+    /// raw chain-of-thought and encrypted/redacted reasoning are never streamed
+    /// (ADR-0016/ADR-0050). When a turn streams these, the terminal
+    /// [`AssistantReasoning`] display event for the same (non-redacted) block is
+    /// suppressed so the finished thinking block is not shown twice.
+    AssistantReasoningDelta(String),
+    /// A boundary between two reasoning-summary parts (a blank line in the live
+    /// thinking trace). Display-only; carries no text.
+    AssistantReasoningSectionBreak,
     ToolProposed(ToolCall),
     /// A tool is about to execute (emitted once per call, immediately before the
     /// run, on both the exclusive and parallel paths). Lets a front-end open a
@@ -314,6 +342,14 @@ pub(crate) enum AgentEvent {
     /// persistent project policy (ADR-0027). Emitted by Nexus, never inferred
     /// by a front-end, so the policy stays Nexus-owned.
     ToolAutoApproved(ToolCall),
+    /// A gated tool was auto-approved because the session runs in
+    /// `--dangerously-skip-permissions` mode (ADR-0049): the approval gate is
+    /// bypassed for EVERY gated call, including calls a safety floor
+    /// (destructive/dirty) would normally stop. A distinct, greppable audit
+    /// event so this bypass is never silent and never confused with an
+    /// ordinary policy auto-approval. Emitted by Nexus; the mode is CLI-only
+    /// and session-scoped, so no repo/config/state can produce it.
+    ToolAutoApprovedDangerous(ToolCall),
     DiffPreview {
         call: ToolCall,
         diff: String,
@@ -391,6 +427,12 @@ pub(crate) enum ProviderEvent {
     Activity,
     /// Incremental assistant text.
     TextDelta(String),
+    /// Incremental reasoning *summary* text (never raw chain-of-thought, never
+    /// encrypted/redacted content). Emitted by providers that surface a live
+    /// reasoning summary before the answer; forwarded display-only.
+    ReasoningDelta(String),
+    /// A boundary between two reasoning-summary parts (blank line in the trace).
+    ReasoningSectionBreak,
     /// Terminal event: the fully assembled assistant turn.
     Completed(AssistantTurn),
 }
@@ -434,6 +476,25 @@ pub(crate) trait ToolOutputStore {
     /// [`ToolEnv::output_store`] (issue #205); keeping it on the contract, not
     /// the concrete store, holds the tier boundary that `put` already draws.
     fn get(&self, id: &str) -> Result<Option<String>>;
+}
+
+/// Read-only seam the `recall` tool uses to resolve a STANDALONE entry-id span
+/// (ADR-0046 / issue #373): the original turns of a durable `[from, to]` id
+/// range, read straight from THIS session's transcript rather than through a
+/// compaction handle. The Tier-2 Wayland harness implements it over its OWN
+/// session log, so it is scoped to a single session by construction -- a span
+/// can never address another session's data or escape the session boundary.
+/// Nexus owns only this contract (mirroring [`ToolOutputStore`]) and never
+/// touches the filesystem itself. `None` on [`ToolEnv::session_span`] (tests,
+/// in-memory sessions) means no standalone-span read path is available.
+pub(crate) trait SessionSpanReader {
+    /// Return the original turns whose durable entry id falls in the inclusive
+    /// numeric `[from, to]` range, in transcript order, each paired with its
+    /// durable id. The bounds are already parsed/validated by the caller; an
+    /// empty vec means the span selected nothing (the caller turns that into a
+    /// tool error for an explicit span). Errors only on a transcript read
+    /// failure -- never a panic or a path escape.
+    fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>>;
 }
 
 /// Display-only live-output sink for a running tool (issue #90 sub-item 1). A
@@ -652,6 +713,20 @@ impl ToolOutput {
         self.metadata.insert(key.to_string(), value);
         self
     }
+
+    /// Attach the workspace-relative form of `requested` as `metadata.target`
+    /// for the ADR-0044 compaction carry, when it resolves strictly inside
+    /// `root`. The carry derives its touched/read path set from these successful
+    /// results, so a read/ls/write/edit success records the file it acted on
+    /// here. A path that escapes the workspace (absolute or `..` traversal)
+    /// yields `None` from the strict carry floor and no `target` is attached, so
+    /// an out-of-workspace path is never carried.
+    pub(crate) fn with_workspace_target(self, root: &Path, requested: &str) -> Self {
+        match crate::tools::path::workspace_relative(root, requested) {
+            Some(rel) if !rel.is_empty() => self.with("target", Value::String(rel)),
+            _ => self,
+        }
+    }
 }
 
 /// Execution environment handed to a tool: the workspace root plus the shared
@@ -669,6 +744,11 @@ pub(crate) struct ToolEnv<'a> {
     /// `None` keeps every output inline (no durable session storage available),
     /// preserving the original in-memory behavior. Harness-owned, injected here.
     pub(crate) output_store: Option<&'a dyn ToolOutputStore>,
+    /// Optional read-only session-span seam for the `recall` tool's standalone
+    /// entry-id span (ADR-0046 / issue #373). `None` (tests, in-memory session)
+    /// disables the standalone-span path; the harness injects a reader over its
+    /// OWN transcript, so a span stays scoped to this session. Harness-owned.
+    pub(crate) session_span: Option<&'a dyn SessionSpanReader>,
     /// Optional live-output sink for streaming a running tool's output (issue
     /// #90 sub-item 1). `None` (the harness default) keeps the tool
     /// non-streaming; Nexus injects a per-call sink on the exclusive path so a
@@ -922,6 +1002,14 @@ pub(crate) struct Agent<P> {
     // Nexus owns the enforcement: the mode only decides prompt-vs-auto-vs-deny
     // for a call not already blocked by a floor or covered by an explicit grant.
     approval_mode: ApprovalMode,
+    // `--dangerously-skip-permissions` (ADR-0049): when true, EVERY gated tool
+    // call is auto-approved, including calls a safety floor (destructive/dirty)
+    // would normally stop. Set ONLY by the host from the explicit CLI flag at
+    // construction; it is deliberately not a live toggle and has no config,
+    // trust-store, env, or repo path that can enable it (activation isolation).
+    // Session-scoped: no grant is ever persisted while it is on, and turning it
+    // off restores exactly the prior behavior.
+    skip_permissions: bool,
     // Provider/model round-trip id sequence. Nexus owns these ids because it
     // owns the provider loop; Wayland may persist them, but never mints them.
     next_provider_turn_seq: u32,
@@ -948,8 +1036,15 @@ pub(crate) struct Agent<P> {
 /// the stream is released before the loop mutates the transcript.
 enum StreamResult {
     Completed {
-        turn: AssistantTurn,
+        // Boxed: `AssistantTurn` is large, so an unboxed variant makes
+        // `StreamResult` lopsided (clippy::large_enum_variant).
+        turn: Box<AssistantTurn>,
         saw_delta: bool,
+        /// Whether any reasoning-summary delta was forwarded for display during
+        /// this stream. When true, the terminal reasoning display event for the
+        /// (non-redacted) summary is suppressed so the live thinking block the
+        /// front-end already showed is not duplicated.
+        saw_reasoning_delta: bool,
     },
     Cancelled {
         partial: String,
@@ -1010,6 +1105,7 @@ impl<P: ChatProvider> Agent<P> {
             project_policy: ProjectPolicy::default(),
             policy_sink: None,
             approval_mode: ApprovalMode::default(),
+            skip_permissions: false,
             next_provider_turn_seq: 0,
             max_tool_roundtrips: None,
             mutated_this_turn: false,
@@ -1046,6 +1142,24 @@ impl<P: ChatProvider> Agent<P> {
         self.approval_mode
     }
 
+    /// Enable `--dangerously-skip-permissions` (ADR-0049) for this session. A
+    /// construction-time builder, NOT a runtime setter: the host installs it
+    /// once from the explicit CLI flag, and nothing else (config file, project
+    /// file, trust store, env var, or model/tool/provider request) can call it.
+    /// That keeps activation CLI-only, so a malicious repo has no path to
+    /// granting itself approval. When on, every gated call is auto-approved,
+    /// floors included, and no grant is ever persisted.
+    pub(crate) fn with_skip_permissions(mut self, skip: bool) -> Self {
+        self.skip_permissions = skip;
+        self
+    }
+
+    /// Whether this session runs in `--dangerously-skip-permissions` mode.
+    #[cfg(test)]
+    pub(crate) fn skip_permissions(&self) -> bool {
+        self.skip_permissions
+    }
+
     /// Install an optional graceful soft cap on tool round-trips per turn.
     /// `None` keeps the default unbounded loop; `Some(n)` ends the turn with a
     /// Notice after `n` round-trips. The host threads the configured value from
@@ -1072,6 +1186,7 @@ impl<P: ChatProvider> Agent<P> {
             project_policy: ProjectPolicy::default(),
             policy_sink: None,
             approval_mode: ApprovalMode::default(),
+            skip_permissions: false,
             next_provider_turn_seq,
             max_tool_roundtrips: None,
             mutated_this_turn: false,
@@ -1333,7 +1448,11 @@ impl<P: ChatProvider> Agent<P> {
                     self.emit_interrupted(obs)?;
                     return Ok(());
                 }
-                StreamResult::Completed { turn, saw_delta } => {
+                StreamResult::Completed {
+                    turn,
+                    saw_delta,
+                    saw_reasoning_delta,
+                } => {
                     let AssistantTurn {
                         text,
                         reasoning,
@@ -1341,7 +1460,7 @@ impl<P: ChatProvider> Agent<P> {
                         response_id,
                         usage,
                         completion_reason,
-                    } = turn;
+                    } = *turn;
                     // Captured before `reasoning` is consumed below: drives
                     // whether a content-less completion (e.g. a bare refusal)
                     // needs an explanatory notice.
@@ -1353,12 +1472,20 @@ impl<P: ChatProvider> Agent<P> {
                         // the row is still persisted below exactly as before
                         // (ADR-0016 continuity/redacted handling is untouched).
                         // Redacted blocks never carry their text downstream.
+                        //
+                        // Suppression (ADR-0050): when this turn already streamed
+                        // its reasoning summary live (`saw_reasoning_delta`), the
+                        // front-end has shown the thinking block, so the terminal
+                        // display event for the same non-redacted summary is
+                        // suppressed to avoid a duplicate. Redacted blocks are
+                        // never streamed, so their placeholder is always emitted.
+                        // Storage below is unchanged either way (persisted once).
                         if block.redacted {
                             obs.on_event(AgentEvent::AssistantReasoning {
                                 text: String::new(),
                                 redacted: true,
                             })?;
-                        } else if !block.text.is_empty() {
+                        } else if !block.text.is_empty() && !saw_reasoning_delta {
                             obs.on_event(AgentEvent::AssistantReasoning {
                                 text: block.text.clone(),
                                 redacted: false,
@@ -1515,6 +1642,7 @@ impl<P: ChatProvider> Agent<P> {
             .provider
             .respond_stream(&self.messages, &self.tools, token)?;
         let mut saw_delta = false;
+        let mut saw_reasoning_delta = false;
         let mut partial = String::new();
         loop {
             tokio::select! {
@@ -1528,9 +1656,24 @@ impl<P: ChatProvider> Agent<P> {
                         partial.push_str(&delta);
                         obs.on_event(AgentEvent::AssistantTextDelta(delta))?;
                     }
+                    Some(Ok(ProviderEvent::ReasoningDelta(delta))) => {
+                        // Display-only: never accumulated into `partial` (which
+                        // becomes the persisted assistant text) or into storage.
+                        if !delta.is_empty() {
+                            saw_reasoning_delta = true;
+                            obs.on_event(AgentEvent::AssistantReasoningDelta(delta))?;
+                        }
+                    }
+                    Some(Ok(ProviderEvent::ReasoningSectionBreak)) => {
+                        obs.on_event(AgentEvent::AssistantReasoningSectionBreak)?;
+                    }
                     Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {
-                        return Ok(StreamResult::Completed { turn, saw_delta });
+                        return Ok(StreamResult::Completed {
+                            turn: Box::new(turn),
+                            saw_delta,
+                            saw_reasoning_delta,
+                        });
                     }
                     Some(Err(error)) => return Err(error),
                     None => bail!("provider stream closed before completion"),
@@ -1685,6 +1828,21 @@ impl<P: ChatProvider> Agent<P> {
             }
             if !tool.requires_approval() && !dirty_gate {
                 obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+            } else if self.skip_permissions {
+                // `--dangerously-skip-permissions` (ADR-0049): the operator has
+                // taken responsibility for every effect this session. Bypass the
+                // approval gate for this gated call BEFORE any floor, grant, or
+                // preset is consulted -- including the destructive and dirty-tree
+                // floors that normally re-prompt. This is the single skip check
+                // at the top of the approval decision path; the floor/preset
+                // logic below is left untouched for every non-skip session.
+                //
+                // Non-persistence (invariant): nothing is written to
+                // `session_allowed` or the project `policy_sink` here, so a
+                // skip-mode session leaves no persistent allow behind. The audit
+                // is a distinct, greppable event so the bypass is never silent.
+                obs.on_event(AgentEvent::ToolAutoApprovedDangerous(call.clone()))?;
+                emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Approved)?;
             } else {
                 // A dirty-tree gate (issue #262) forces the approval path even
                 // for a tool that does not otherwise require approval: a
@@ -1877,6 +2035,7 @@ impl<P: ChatProvider> Agent<P> {
                     workspace: env.workspace,
                     state: env.state,
                     output_store: env.output_store,
+                    session_span: env.session_span,
                     output_sink: Some(&emitter),
                     mutation_guard: env.mutation_guard,
                 };
@@ -2527,7 +2686,7 @@ impl Message {
         }
     }
 
-    fn tool_result(call_id: &str, name: &str, content: &str) -> Self {
+    pub(crate) fn tool_result(call_id: &str, name: &str, content: &str) -> Self {
         Self {
             role: Role::Tool,
             content: content.to_string(),
@@ -2734,3 +2893,18 @@ mod tests;
 #[cfg(test)]
 #[path = "bench_tokens_per_task.rs"]
 mod bench_tokens_per_task;
+
+// Compaction retention-needle benchmark scaffold (ADR-0045, issue #372). Lives
+// beside the Nexus test module so it can reuse the in-crate provider/message
+// types via `use super::*`, while driving the Tier-2 `wayland` compaction seam.
+#[cfg(test)]
+#[path = "compaction_bench.rs"]
+mod compaction_bench;
+
+// Env-gated LIVE anchor for the modeled cache economics (ADR-0045, #372). Kept
+// beside `compaction_bench` so it reuses the in-crate provider/message types via
+// `use super::*`. Double-gated (`#[ignore]` + `IRIS_BENCH_LIVE=1`), so the gate's
+// `cargo test` never issues a live API call.
+#[cfg(test)]
+#[path = "compaction_live_bench.rs"]
+mod compaction_live_bench;

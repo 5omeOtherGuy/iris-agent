@@ -595,6 +595,7 @@ fn run_replay_arm(workload: &Workload, arm: Arm) -> RunMetrics {
         output_store: None,
         output_sink: None,
         mutation_guard: None,
+        session_span: None,
     };
     let observer = BenchObserver::default();
     let gate = ZeroPromptGate::default();
@@ -747,6 +748,7 @@ fn run_real_cell(
         output_store: None,
         output_sink: None,
         mutation_guard: None,
+        session_span: None,
     };
     let observer = BenchObserver::default();
     let gate = ZeroPromptGate::default();

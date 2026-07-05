@@ -44,11 +44,13 @@
 | [0041](0041-token-efficient-model-switching-and-provider-summaries.md) | Token-efficient model switching and provider-backed compaction summaries | accepted | 2026-07-02 |
 | [0042](0042-opt-in-named-themes-behind-a-theme-trait.md) | Opt-in named color themes behind a Theme trait, terminal-relative by default | proposed | 2026-07-04 |
 | [0043](0043-provider-wait-visibility-and-stream-idle-guard.md) | Provider waits are visible and bounded by provider-event idleness | accepted | 2026-07-05 |
-| [0044](0044-carry-structured-state-across-compaction.md) | Carry structured state across compaction, separate from the prose summary | proposed | 2026-07-04 |
-| [0045](0045-benchmark-compaction-on-task-success-and-retention.md) | Benchmark compaction on task success and load-bearing-detail retention | proposed | 2026-07-04 |
-| [0046](0046-recall-compacted-originals-mid-session.md) | Recall compacted originals mid-session | proposed | 2026-07-04 |
-| [0047](0047-count-compaction-generations.md) | Count and surface a compaction generation ordinal | proposed | 2026-07-04 |
-| [0048](0048-fold-spent-tool-results-behind-handles.md) | Fold spent tool results behind handles (opt-in microcompaction) | proposed | 2026-07-04 |
+| [0044](0044-carry-structured-state-across-compaction.md) | Carry structured state across compaction, separate from the prose summary | accepted | 2026-07-04 |
+| [0045](0045-benchmark-compaction-on-task-success-and-retention.md) | Benchmark compaction on task success and load-bearing-detail retention | accepted | 2026-07-04 |
+| [0046](0046-recall-compacted-originals-mid-session.md) | Recall compacted originals mid-session | accepted | 2026-07-04 |
+| [0047](0047-count-compaction-generations.md) | Count and surface a compaction generation ordinal | accepted | 2026-07-04 |
+| [0048](0048-fold-spent-tool-results-behind-handles.md) | Fold spent tool results behind handles (opt-in microcompaction) | accepted | 2026-07-04 |
+| [0049](0049-dangerously-skip-permissions-mode.md) | `--dangerously-skip-permissions` bypasses the approval gate | accepted | 2026-07-05 |
+| [0050](0050-stream-reasoning-summary-deltas.md) | Stream reasoning summary deltas as a display event | accepted | 2026-07-05 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.

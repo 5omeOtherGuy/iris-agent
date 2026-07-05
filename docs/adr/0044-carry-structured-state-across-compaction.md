@@ -1,7 +1,7 @@
 # ADR-0044: Carry structured state across compaction, separate from the prose summary
 
 **Date**: 2026-07-04
-**Status**: proposed
+**Status**: accepted
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context

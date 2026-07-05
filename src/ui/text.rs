@@ -441,10 +441,12 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             UiEvent::AssistantTextEnd(_) => {
                 self.finish_assistant_stream()?;
             }
-            UiEvent::AssistantReasoning { .. } => {
+            UiEvent::AssistantReasoning { .. }
+            | UiEvent::AssistantReasoningDelta(_)
+            | UiEvent::AssistantReasoningSectionBreak => {
                 // The non-interactive text fallback intentionally does not render
-                // reasoning/thinking blocks: that is a TUI surface. Ignored here
-                // so the fallback's output is unchanged.
+                // reasoning/thinking blocks (block or streamed): that is a TUI
+                // surface. Ignored here so the fallback's output is unchanged.
             }
             UiEvent::ToolProposed(_call) => {
                 // Non-gated tools (read/grep/find/ls) show only their result row;

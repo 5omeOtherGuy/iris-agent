@@ -7,27 +7,53 @@
 //! appends transcript messages itself -- the bare agent stays persistence- and
 //! filesystem-free.
 
+mod fold;
 pub(crate) mod git_safety;
 pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::Result;
 use futures::StreamExt;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::config::VerificationConfig;
 use crate::handles::HandleStore;
+use crate::nexus::ToolOutputStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderEvent, Role,
-    SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
+    SessionSpanReader, SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
 };
-use crate::session::{SessionLog, estimate_tokens, message_token_estimate, preview_line};
+use crate::session::{
+    SessionLog, estimate_tokens, message_token_estimate, preview_line, read_span,
+    render_carry_block, render_compaction_body,
+};
 use crate::tools::ToolState;
+use crate::tools::recall;
+
+/// Read-only [`SessionSpanReader`] over a SINGLE session transcript, for the
+/// `recall` tool's standalone entry-id span (ADR-0046 / issue #373). Holds only
+/// this session's transcript path (cloned, so it never borrows the harness), so
+/// a span read is scoped to this session by construction -- it cannot address
+/// another session's data. `None` (in-memory session with no durable log)
+/// resolves every span to no turns, which the tool surfaces as a clean error.
+struct SessionSpanSource {
+    transcript: Option<PathBuf>,
+}
+
+impl SessionSpanReader for SessionSpanSource {
+    fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
+        match &self.transcript {
+            Some(path) => read_span(path, from, to),
+            None => Ok(Vec::new()),
+        }
+    }
+}
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
 /// range always shrinks the context regardless of how long the covered turns
@@ -39,6 +65,27 @@ const MAX_EXCERPT_CHARS: usize = 160;
 /// exchange so a follow-up prompt still has its immediate referent verbatim,
 /// and cover everything older with the summary.
 const MANUAL_COMPACT_KEEP_TOKENS: u64 = 1_000;
+
+/// Micro-watermark fraction of the compaction budget (ADR-0048): a fold batch
+/// runs only when the context reaches this fraction of the budget, strictly
+/// below the budget itself so folding reclaims spent reads BEFORE full
+/// compaction is needed. Batching at a watermark (not every turn) means one
+/// prefix-cache break amortizes many folds. Half the budget leaves clear
+/// headroom below the compaction trigger while still engaging on long sessions.
+const MICRO_WATERMARK_NUM: u64 = 1;
+const MICRO_WATERMARK_DEN: u64 = 2;
+
+/// Recent-tail token target the fold pass protects: the most-recent turns within
+/// this many tokens NEVER fold, so the model's immediate working set stays
+/// verbatim (ADR-0048). Kept small (one recent exchange) so folding still
+/// reaches most of the accumulated older mass.
+const MICRO_FOLD_KEEP_TOKENS: u64 = 2_000;
+
+/// The micro-watermark in tokens for a given compaction `budget`: the context
+/// total at or above which a fold batch runs. Always strictly below `budget`.
+fn micro_watermark(budget: u64) -> u64 {
+    budget.saturating_mul(MICRO_WATERMARK_NUM) / MICRO_WATERMARK_DEN
+}
 
 /// Instruction appended after the carried context for the provider-backed
 /// summarizer. Mirrors pi-mono's compaction ask: a structured handoff another
@@ -87,8 +134,10 @@ pub(crate) struct Harness<P> {
     persisted: usize,
     // Entry ids of the persisted messages, parallel to the first `persisted`
     // agent messages. `Some(id)` = a coverable on-disk `message` entry; `None`
-    // = not coverable (a resumed loaded message, tracked id-less). The
-    // auto-compaction policy covers a contiguous run of `Some`-id messages.
+    // = not coverable (a summary position, or a legacy id-less entry). Resumed
+    // loaded messages now carry their durable ids (#375, #377), so a resumed
+    // prefix is coverable. The auto-compaction policy covers a contiguous run
+    // of `Some`-id messages.
     entry_ids: Vec<Option<String>>,
     // Context token budget that triggers auto-compaction, or `None` to disable
     // it (in-memory loop tests). The Tier-3 app passes the configured budget.
@@ -117,6 +166,12 @@ pub(crate) struct Harness<P> {
     // How compaction produces its summary text (ADR-0041). Defaults to the
     // deterministic excerpts; the Tier-3 app installs the configured kind.
     summarizer: SummarizerKind,
+    // Opt-in microcompaction (ADR-0048, #378): when true, spent tool results are
+    // folded to deterministic stubs at a micro-watermark below the compaction
+    // budget. Default false (a bare/test harness never folds); the Tier-3 app
+    // installs the configured value. Gates fold WRITING only -- rebuild always
+    // honors persisted fold entries regardless of this flag.
+    microcompaction: bool,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -147,32 +202,27 @@ impl<P: ChatProvider> Harness<P> {
     /// only new turns are appended, continuing the same transcript instead of
     /// rewriting the loaded entries.
     ///
-    /// The loaded history is tracked id-less (entry ids `None`), so this slice
-    /// does not re-compact already-loaded messages -- only turns appended after
-    /// resume become coverable. The store's read-time rebuild already applied
-    /// any prior compaction entries, so resumed context is summary-aware on
-    /// arrival.
-    //
-    // ponytail: id-less loaded history is the known ceiling -- a resumed
-    // session whose rebuilt bulk alone exceeds the budget cannot shrink further
-    // until new coverable turns accumulate. Upgrade path = surface per-message
-    // entry ids from the read/rebuild path so loaded originals stay coverable.
+    /// The loaded history carries its durable entry ids (parallel to the loaded
+    /// messages, `None` at summary positions and for id-less legacy entries),
+    /// so a near-budget resumed prefix stays compactable by auto-compaction and
+    /// `/compact` -- matching the in-session `/resume` swap (#375, #377). The
+    /// store's read-time rebuild already applied any prior compaction entries,
+    /// so resumed context is summary-aware on arrival; summary positions arrive
+    /// as `None` so `plan_compaction` stops at them (no summary-of-summaries).
     pub(crate) fn resumed(
         agent: Agent<P>,
         workspace: PathBuf,
         state: ToolState,
         session: Option<SessionLog>,
-        persisted: usize,
+        entry_ids: Vec<Option<String>>,
         budget: Option<u64>,
     ) -> Self {
+        // The loaded messages and their ids describe the same on-disk prefix, so
+        // the persisted cursor is the id count; the ids are seeded verbatim so a
+        // near-budget resumed prefix is compactable (#377).
+        let persisted = entry_ids.len();
         Self::build(
-            agent,
-            workspace,
-            state,
-            session,
-            persisted,
-            vec![None; persisted],
-            budget,
+            agent, workspace, state, session, persisted, entry_ids, budget,
         )
     }
 
@@ -210,6 +260,7 @@ impl<P: ChatProvider> Harness<P> {
             git_safety,
             verify: None,
             summarizer: SummarizerKind::default(),
+            microcompaction: false,
         }
     }
 
@@ -225,6 +276,15 @@ impl<P: ChatProvider> Harness<P> {
     /// never issue surprise provider calls.
     pub(crate) fn set_summarizer(&mut self, summarizer: SummarizerKind) {
         self.summarizer = summarizer;
+    }
+
+    /// Enable or disable opt-in microcompaction (ADR-0048, #378). Installed once
+    /// at startup by the Tier-3 app from the resolved `Settings::microcompaction`;
+    /// the harness default is off. Takes effect at the next turn boundary (the
+    /// fold pass runs in [`submit_turn`](Self::submit_turn) before the request),
+    /// so a `/settings` toggle applies to the following turn, not the current one.
+    pub(crate) fn set_microcompaction(&mut self, enabled: bool) {
+        self.microcompaction = enabled;
     }
 
     /// Install the mid-run steering/follow-up source (the Tier-3 app's typed
@@ -426,6 +486,16 @@ impl<P: ChatProvider> Harness<P> {
         self.session.as_ref().map(SessionLog::path)
     }
 
+    /// Build the read-only standalone-span reader for THIS session's transcript,
+    /// injected into each turn's [`ToolEnv`] for the `recall` tool (ADR-0046 /
+    /// issue #373). It clones only this session's path, so a span read can never
+    /// address another session.
+    fn span_source(&self) -> SessionSpanSource {
+        SessionSpanSource {
+            transcript: self.session.as_ref().map(|log| log.path().to_path_buf()),
+        }
+    }
+
     /// The workspace directory this harness is anchored to, used to scope the
     /// deterministic session lookup (`/sessions`, ADR-0031) to this project's
     /// cwd-slug directory.
@@ -523,10 +593,13 @@ impl<P: ChatProvider> Harness<P> {
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
     ) -> Result<()> {
-        // Safe turn boundary: before the provider request, compact if the
-        // current context exceeds the configured budget. The prior turn's
-        // transcript is complete here (every tool call answered), so the
-        // covered range never splits a pending tool-call/result pair.
+        // Safe turn boundary: before the provider request, first fold spent
+        // tool results (opt-in microcompaction, ADR-0048), then compact if the
+        // current context still exceeds the configured budget. Folding runs
+        // first so reclaimed mass can defer a full compaction. The prior turn's
+        // transcript is complete here (every tool call answered), so neither the
+        // fold pass nor the covered range splits a pending tool-call/result pair.
+        self.maybe_microcompact()?;
         self.maybe_auto_compact(obs, token).await?;
         // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
         // the current session id to the guard before the turn. The guard stamps
@@ -539,6 +612,7 @@ impl<P: ChatProvider> Harness<P> {
         if let Some(id) = self.session_id().map(str::to_string) {
             self.git_safety.set_session_id(id);
         }
+        let span_source = self.span_source();
         let env = ToolEnv {
             workspace: &self.workspace,
             state: &self.state,
@@ -546,6 +620,8 @@ impl<P: ChatProvider> Harness<P> {
                 .output_store
                 .as_ref()
                 .map(|store| store as &dyn crate::nexus::ToolOutputStore),
+            // Read-only standalone-span reader over THIS session (ADR-0046).
+            session_span: Some(&span_source),
             // Streaming is Nexus-owned: it injects a per-call sink on the
             // exclusive path. The harness env carries none.
             output_sink: None,
@@ -623,6 +699,7 @@ impl<P: ChatProvider> Harness<P> {
             // Builds the same env the turn loop uses so the dirty-tree guard
             // (#262) protects any files the command writes (build artifacts).
             let run = {
+                let span_source = self.span_source();
                 let env = ToolEnv {
                     workspace: &self.workspace,
                     state: &self.state,
@@ -630,6 +707,7 @@ impl<P: ChatProvider> Harness<P> {
                         .output_store
                         .as_ref()
                         .map(|store| store as &dyn crate::nexus::ToolOutputStore),
+                    session_span: Some(&span_source),
                     output_sink: None,
                     mutation_guard: Some(&self.git_safety),
                 };
@@ -671,6 +749,7 @@ impl<P: ChatProvider> Harness<P> {
                     // let it make another attempt.
                     let feedback = verification_feedback(&command, exit_code, &output);
                     let retry_result = {
+                        let span_source = self.span_source();
                         let env = ToolEnv {
                             workspace: &self.workspace,
                             state: &self.state,
@@ -678,6 +757,7 @@ impl<P: ChatProvider> Harness<P> {
                                 .output_store
                                 .as_ref()
                                 .map(|store| store as &dyn crate::nexus::ToolOutputStore),
+                            session_span: Some(&span_source),
                             output_sink: None,
                             mutation_guard: Some(&self.git_safety),
                         };
@@ -746,6 +826,76 @@ impl<P: ChatProvider> Harness<P> {
     /// No-op when auto-compaction is disabled, no log is attached, the context
     /// is within budget, nothing coverable remains, or the summary request was
     /// cancelled (the turn's own cancellation handling takes over).
+    /// Opt-in microcompaction fold pass (ADR-0048, #378), run at the safe turn
+    /// boundary before the provider request. When enabled and the context has
+    /// reached the micro-watermark (below the compaction budget), fold every
+    /// spent tool result the V1 policy detects (superseded reads, latest-read-
+    /// wins) to a deterministic stub: append a durable `fold` entry AND rewrite
+    /// the in-memory result content, so live and resumed context agree. Returns
+    /// the number of folds applied (0 = disabled, below the watermark, no
+    /// durable session, or nothing spent).
+    ///
+    /// The setting gates fold WRITING only; rebuild always honors persisted
+    /// folds. No provider round-trip and no summary-quality risk: folding is
+    /// deterministic and every folded result stays recoverable (the stub names
+    /// the workspace-relative path; the original turn survives verbatim for the
+    /// #373 recall tool).
+    fn maybe_microcompact(&mut self) -> Result<usize> {
+        if !self.microcompaction {
+            return Ok(0);
+        }
+        // A fold is a durable read-time view; without a log there is nowhere to
+        // record it, so skip rather than diverge live from resumed context.
+        if self.session.is_none() {
+            return Ok(0);
+        }
+        // Batch at the micro-watermark: no per-turn folding. Below the watermark
+        // the accumulated spent mass is not yet worth a prefix-cache break.
+        let Some(budget) = self.budget else {
+            return Ok(0);
+        };
+        let total = context_tokens(self.agent.messages());
+        if total < micro_watermark(budget) {
+            return Ok(0);
+        }
+
+        let messages = self.agent.messages().to_vec();
+        // Protect the recent tail: the fold engine never folds at or after this
+        // index (the model's immediate working set stays verbatim).
+        let tail_start = fold_tail_start(&messages, MICRO_FOLD_KEEP_TOKENS);
+        let plans = fold::plan_folds(
+            &messages,
+            &self.entry_ids,
+            tail_start,
+            &self.workspace,
+            fold::V1_POLICIES,
+        );
+        if plans.is_empty() {
+            return Ok(0);
+        }
+
+        // Apply each fold durably (a `fold` entry naming the target id) and in
+        // memory (rewrite the result content) in the same step. The folded
+        // message keeps its role/pairing and durable id, so the pair invariant
+        // holds and it stays coverable by a later compaction; `persisted` and
+        // `entry_ids` are unchanged (no message entry is added or removed).
+        let log = self
+            .session
+            .as_mut()
+            .expect("microcompaction callers check the session first");
+        let mut folded = messages;
+        let mut applied = 0usize;
+        for plan in &plans {
+            let stub_tokens = estimate_tokens(&plan.stub);
+            log.append_fold(&plan.entry_id, &plan.stub, Some(stub_tokens))?;
+            folded[plan.index].content = plan.stub.clone();
+            applied += 1;
+        }
+        tracing::info!(folds = applied, "microcompacted spent tool results");
+        self.agent.replace_messages(folded);
+        Ok(applied)
+    }
+
     async fn maybe_auto_compact(
         &mut self,
         obs: &dyn AgentObserver,
@@ -775,9 +925,9 @@ impl<P: ChatProvider> Harness<P> {
         // leaves headroom for the summary and the next prompt.
         let keep_target = budget.saturating_mul(3) / 4;
         let Some(plan) = self.plan_compaction(&messages, keep_target) else {
-            // Nothing coverable (e.g. resumed id-less history or a single
-            // oversized message at a tool boundary): a no-op, never history
-            // destruction or a faked token count.
+            // Nothing coverable (e.g. an all-summary/legacy id-less prefix or a
+            // single oversized message at a tool boundary): a no-op, never
+            // history destruction or a faked token count.
             return Ok(());
         };
 
@@ -833,21 +983,77 @@ impl<P: ChatProvider> Harness<P> {
         token: &CancellationToken,
     ) -> Result<Option<CompactionOutcome>> {
         let covered = plan.end - plan.start;
-        let original_tokens = context_tokens(&messages[plan.start..plan.end]);
-        let Some(summary) = self
-            .summarize_range(messages, &plan, original_tokens, token)
+        let covered_slice = &messages[plan.start..plan.end];
+        let original_tokens = context_tokens(covered_slice);
+        // Deterministic touched/read path carry (ADR-0044), derived from the
+        // covered range's structured tool calls before the mutable session
+        // borrow below. Independent of the summarizer, so it survives any summary.
+        let carry_paths = derive_carry_paths(covered_slice, self.workspace());
+        let carry_tokens = estimate_tokens(&render_carry_block(&carry_paths));
+        let Some(mut summary) = self
+            .summarize_range(messages, &plan, original_tokens, carry_tokens, token)
             .await
         else {
             return Ok(None);
         };
-        let summary_tokens = estimate_tokens(&summary);
+        // Register the covered originals behind a session-scoped handle (ADR-0046),
+        // reusing the ADR-0011 output store rather than a parallel one, and fold a
+        // recall reference into the summary so the model can retrieve any detail
+        // the summary dropped. The reference lives INSIDE `summary`, so it is
+        // persisted with the compaction entry and reproduced verbatim by the
+        // read-time rebuild (the ADR-0045 needle: unreachable tool otherwise).
+        // When no durable store is attached (in-memory session) there is nothing
+        // to recall, so compaction proceeds unchanged.
+        if let Some(store) = self.output_store.as_ref() {
+            let covered_ids = &self.entry_ids[plan.start..plan.end];
+            let blob =
+                recall::serialize_covered(covered_slice, covered_ids, &plan.from_id, &plan.to_id);
+            match store.put(&blob) {
+                Ok(handle) => {
+                    let marker = recall::recall_marker(&handle, &plan.from_id, &plan.to_id);
+                    summary = format!("{summary}\n\n{marker}");
+                }
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "recall handle registration failed; compaction proceeds without a recall reference"
+                ),
+            }
+        }
+        // The rebuilt body is the prose summary plus the carry block; count its
+        // tokens so the persisted estimate and the in-memory total both cover the
+        // carry. With an empty carry the body is exactly the summary.
+        let body = render_compaction_body(&summary, &carry_paths);
+        let body_tokens = estimate_tokens(&body);
+
+        // Shrink/worthwhile guard on EVERY summarizer path (ADR-0044, DoD item
+        // 3). The provider branch guards its own summary, but the deterministic
+        // excerpt fallback and manual `/compact` reach here without one, and a
+        // non-empty carry can push the combined summary + carry body back over
+        // the covered range. A compaction that does not shrink is worse than
+        // leaving the range intact: skip rather than append it.
+        if body_tokens >= original_tokens {
+            tracing::warn!(
+                body_tokens,
+                original_tokens,
+                "compaction summary + carry did not shrink the covered range; skipping"
+            );
+            return Ok(None);
+        }
 
         let log = self
             .session
             .as_mut()
             .expect("compaction callers check the session first");
-        let compaction_id =
-            log.append_compaction(&plan.from_id, &plan.to_id, &summary, Some(summary_tokens))?;
+        let compaction_id = log.append_compaction(
+            &plan.from_id,
+            &plan.to_id,
+            &summary,
+            &carry_paths,
+            Some(body_tokens),
+        )?;
+        // Generation ordinal (ADR-0047), read right after the append that
+        // incremented it: the Nth compaction in this session reports N.
+        let generation = log.compaction_generation();
         tracing::info!(
             covered,
             from = %plan.from_id,
@@ -878,7 +1084,7 @@ impl<P: ChatProvider> Harness<P> {
             new_messages.push(message.clone());
             new_entry_ids.push(id.clone());
         }
-        new_messages.push(Message::user(&summary));
+        new_messages.push(Message::user(&body));
         new_entry_ids.push(None);
         for (offset, message) in messages[plan.end..].iter().enumerate() {
             new_messages.push(message.clone());
@@ -900,13 +1106,18 @@ impl<P: ChatProvider> Harness<P> {
             covered_to: plan.to_id,
             covered_messages: covered,
             original_tokens_estimate: original_tokens,
-            summary_tokens_estimate: summary_tokens,
+            summary_tokens_estimate: body_tokens,
             budget: self.budget.unwrap_or(0),
+            generation,
+            // Additive observability (ADR-0044): how many touched/read paths the
+            // carry retained for this compaction; 0 for a range with no
+            // in-workspace tool targets.
+            carried_paths: carry_paths.len(),
         })?;
         Ok(Some(CompactionOutcome {
             covered,
             original_tokens,
-            summary_tokens,
+            summary_tokens: body_tokens,
         }))
     }
 
@@ -921,6 +1132,7 @@ impl<P: ChatProvider> Harness<P> {
         messages: &[Message],
         plan: &CompactionPlan,
         original_tokens: u64,
+        carry_tokens: u64,
         token: &CancellationToken,
     ) -> Option<String> {
         if self.summarizer == SummarizerKind::Provider {
@@ -938,9 +1150,11 @@ impl<P: ChatProvider> Harness<P> {
                         plan.end - plan.start,
                         text.trim()
                     );
-                    // Shrink guard: a summary that fails to compress is worse
-                    // than the deterministic floor.
-                    if estimate_tokens(&framed) < original_tokens {
+                    // Shrink guard: the summary plus the carry block (ADR-0044)
+                    // must compress the covered range; a summary that only shrinks
+                    // once the carry is ignored is worse than the deterministic
+                    // floor.
+                    if combined_shrinks(estimate_tokens(&framed), carry_tokens, original_tokens) {
                         return Some(framed);
                     }
                     tracing::warn!(
@@ -1058,6 +1272,78 @@ async fn provider_summary<P: ChatProvider>(
     }
 }
 
+/// Cap on distinct carry paths persisted per compaction entry (ADR-0044): keeps
+/// the carry token-cheap and bounded even when a covered range touches many
+/// files. The most-recent `MAX_CARRY_PATHS` distinct paths are retained.
+const MAX_CARRY_PATHS: usize = 32;
+
+/// Derive the compaction carry (ADR-0044): the bounded, deduped, order-stable
+/// set of workspace-relative paths the covered range read or mutated, taken
+/// from the covered range's SUCCESSFUL structured tool results (ADR-0021),
+/// never from raw tool-call arguments. Each successful `read`/`write`/`ls`/
+/// `edit` result records its workspace-relative `metadata.target`
+/// ([`ToolOutput::with_workspace_target`]); a denied, cancelled, tool-error, or
+/// malformed result has `ok != true` (or no `target`) and never contributes a
+/// path, so the carry cannot retain a file the model never actually touched.
+///
+/// Security boundary: the persisted `target` is already workspace-relative, but
+/// each candidate is re-checked through [`crate::tools::path::workspace_relative`]
+/// so a crafted or legacy transcript carrying an absolute or `..`-escaping
+/// target is still dropped.
+///
+/// Dedup keeps the most-recent occurrence of each path and orders by that
+/// occurrence (least-recent first), so a re-touched path advances to the tail
+/// and the cap retains the most-recent `MAX_CARRY_PATHS` distinct paths.
+fn derive_carry_paths(covered: &[Message], workspace: &Path) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for message in covered {
+        if message.role != Role::Tool {
+            continue;
+        }
+        if !matches!(
+            message.tool_name.as_deref(),
+            Some("read" | "write" | "ls" | "edit")
+        ) {
+            continue;
+        }
+        // The tool-result content is the ADR-0021 wire envelope JSON.
+        let Ok(result) = serde_json::from_str::<Value>(&message.content) else {
+            continue;
+        };
+        // Successful results only: denied/cancelled/tool-error envelopes have
+        // `ok: false` (and no `target`), so their paths are never carried.
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(target) = result
+            .get("metadata")
+            .and_then(|metadata| metadata.get("target"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(rel) = crate::tools::path::workspace_relative(workspace, target) else {
+            continue;
+        };
+        if let Some(pos) = paths.iter().position(|p| *p == rel) {
+            paths.remove(pos);
+        }
+        paths.push(rel);
+    }
+    if paths.len() > MAX_CARRY_PATHS {
+        paths.drain(0..paths.len() - MAX_CARRY_PATHS);
+    }
+    paths
+}
+
+/// Whether a compaction is worthwhile: the summary plus the carry block
+/// (ADR-0044) must be smaller than the covered range it replaces. Counting the
+/// carry here stops a summary that only shrinks once the carry is ignored from
+/// slipping past the guard.
+fn combined_shrinks(summary_tokens: u64, carry_tokens: u64, original_tokens: u64) -> bool {
+    summary_tokens.saturating_add(carry_tokens) < original_tokens
+}
+
 /// Sum the per-message token estimates of a context, saturating so a corrupted
 /// or extreme value never panics/wraps.
 fn context_tokens(messages: &[Message]) -> u64 {
@@ -1072,6 +1358,30 @@ fn assistant_turn_start(messages: &[Message], mut index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+/// Index where the fold pass's retained tail begins: the most-recent turns whose
+/// token sum stays within `keep_target` are protected (never folded), aligned to
+/// a turn boundary so the retained tail starts at a user message and the current
+/// working set is not split. Mirrors `plan_compaction`'s tail walk (ADR-0048).
+fn fold_tail_start(messages: &[Message], keep_target: u64) -> usize {
+    let mut k = messages.len();
+    let mut tail = 0u64;
+    while k > 0 {
+        let t = message_token_estimate(&messages[k - 1]);
+        if tail.saturating_add(t) > keep_target {
+            break;
+        }
+        tail = tail.saturating_add(t);
+        k -= 1;
+    }
+    // Align to a turn boundary: if the tail would begin mid-turn, pull it back to
+    // the start of that assistant turn so a tool-call/result pair is not split.
+    if k < messages.len() && messages[k].role != Role::User {
+        assistant_turn_start(messages, k)
+    } else {
+        k
+    }
 }
 
 /// Produce a deterministic stand-in summary for a covered message range.
@@ -1142,4 +1452,149 @@ fn verification_feedback(command: &str, exit_code: Option<i32>, output: &str) ->
          diagnose the failure.\n\n```\n$ {command}\n{body}\n```\n\nFix the problems reported \
          above by editing files. The verification command will run again after your changes."
     )
+}
+
+#[cfg(test)]
+#[path = "recall_tests.rs"]
+mod recall_tests;
+
+#[cfg(test)]
+#[path = "microcompaction_tests.rs"]
+mod microcompaction_tests;
+
+#[cfg(test)]
+mod carry_tests {
+    use super::{MAX_CARRY_PATHS, combined_shrinks, derive_carry_paths};
+    use crate::nexus::Message;
+    use crate::tools::test_support::{root_of, temp_dir};
+    use serde_json::json;
+
+    /// A successful `tool` result message the way Nexus persists it (ADR-0021):
+    /// content is the success envelope `{ "ok": true, ... }` whose
+    /// `metadata.target` names the touched/read workspace-relative path derived
+    /// at the tool boundary (ADR-0044). The carry is derived from these
+    /// successful results, not from raw tool-call arguments.
+    fn tool_result_ok(name: &str, target: &str) -> Message {
+        Message::tool_result(
+            "call_1",
+            name,
+            &json!({
+                "ok": true,
+                "content": "done",
+                "metadata": { "target": target }
+            })
+            .to_string(),
+        )
+    }
+
+    /// A non-successful `tool` result (denied/cancelled/error): `ok` is false and
+    /// no `target` is present, so its path must never enter the carry.
+    fn tool_result_failed(name: &str, flag: &str) -> Message {
+        Message::tool_result(
+            "call_2",
+            name,
+            &json!({ "ok": false, "error": "no", flag: true }).to_string(),
+        )
+    }
+
+    #[test]
+    fn derive_carry_paths_dedups_and_orders_by_most_recent() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // read a, read b, edit a, ls c -> distinct {a, b, c}; a re-touched last of
+        // the pair moves ahead of b, ordered by most-recent occurrence.
+        let covered = [
+            tool_result_ok("read", "a.rs"),
+            tool_result_ok("read", "b.rs"),
+            tool_result_ok("edit", "a.rs"),
+            tool_result_ok("ls", "c"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["b.rs", "a.rs", "c"]);
+    }
+
+    #[test]
+    fn derive_carry_paths_carries_only_successful_results() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // Only successful (ok:true) results contribute paths. A denied, a
+        // cancelled, and a tool-error result in the covered range -- each naming
+        // a path the model never actually read/touched -- are dropped.
+        let covered = [
+            tool_result_ok("read", "a.rs"),
+            tool_result_failed("read", "denied"),
+            tool_result_failed("edit", "cancelled"),
+            // A tool error: ok:false, no target field at all.
+            Message::tool_result(
+                "call_3",
+                "write",
+                &json!({ "ok": false, "error": "boom" }).to_string(),
+            ),
+            tool_result_ok("edit", "b.rs"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn derive_carry_paths_bounds_to_the_most_recent_n() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // More distinct paths than the cap: only the most-recent MAX_CARRY_PATHS
+        // survive, in order.
+        let n = MAX_CARRY_PATHS + 2;
+        let covered: Vec<Message> = (0..n)
+            .map(|i| tool_result_ok("read", &format!("f{i}.rs")))
+            .collect();
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry.len(), MAX_CARRY_PATHS);
+        // The two oldest (f0, f1) dropped; the tail is f2..fN in order.
+        assert_eq!(carry.first().unwrap(), "f2.rs");
+        assert_eq!(carry.last().unwrap(), &format!("f{}.rs", n - 1));
+    }
+
+    #[test]
+    fn derive_carry_paths_drops_paths_outside_the_workspace() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let covered = [
+            tool_result_ok("read", "src/a.rs"),
+            // Absolute path (even one pointing inside): the carry floor drops it.
+            tool_result_ok("read", "/etc/passwd"),
+            // Traversal escape above the workspace root: must never enter it.
+            tool_result_ok("edit", "../../etc/shadow"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn derive_carry_paths_ignores_non_target_tools_and_text_turns() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let covered = [
+            Message::user("read the file please"),
+            Message::assistant("sure"),
+            // Non-target tools that (hypothetically) carry a target field: still
+            // ignored, only read/write/ls/edit targets are collected.
+            tool_result_ok("bash", "a.rs"),
+            tool_result_ok("grep", "b.rs"),
+            tool_result_ok("read", "real.rs"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["real.rs"]);
+    }
+
+    #[test]
+    fn combined_shrinks_counts_summary_plus_carry() {
+        // Summary alone shrinks (10 < 20), but summary + carry does not (10 + 12
+        // >= 20): the guard rejects a compaction that only shrinks when the carry
+        // is ignored.
+        assert!(!combined_shrinks(10, 12, 20));
+        // Summary + carry together still shrink: worthwhile.
+        assert!(combined_shrinks(10, 5, 20));
+        // Empty carry reduces to the summary-only guard.
+        assert!(combined_shrinks(10, 0, 20));
+        assert!(!combined_shrinks(20, 0, 20));
+    }
 }

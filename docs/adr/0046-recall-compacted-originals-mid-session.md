@@ -1,7 +1,7 @@
 # ADR-0046: Recall compacted originals mid-session
 
 **Date**: 2026-07-04
-**Status**: proposed
+**Status**: accepted
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context

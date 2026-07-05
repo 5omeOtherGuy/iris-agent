@@ -1,7 +1,7 @@
 # ADR-0047: Count and surface a compaction generation ordinal
 
 **Date**: 2026-07-04
-**Status**: proposed
+**Status**: accepted
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context

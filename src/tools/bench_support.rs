@@ -42,6 +42,33 @@ pub(crate) fn assert_min_reduction(class: &str, before: &str, after: &str, min_p
     );
 }
 
+/// Percentage of estimated tokens removed, given token counts already measured
+/// upstream. The compaction seam reports `original_tokens_estimate` /
+/// `summary_tokens_estimate` on `CompactionApplied` (same `chars/4` estimator
+/// as [`est_tokens`]); a folded covered range has no single verbatim string to
+/// re-measure, so the seam's counts are the authoritative before/after. Returns
+/// 0.0 for an empty baseline so a degenerate range never divides by zero.
+pub(crate) fn reduction_pct_tokens(before: u64, after: u64) -> f64 {
+    if before == 0 {
+        return 0.0;
+    }
+    100.0 * (1.0 - after as f64 / before as f64)
+}
+
+/// Assert a minimum reduction bar from token counts the seam already measured
+/// (see [`reduction_pct_tokens`]). Used where re-deriving a verbatim string is
+/// fragile or misleading (the microcompaction arm folds the covered range
+/// before compaction, so the covered tokens the seam saw are the honest
+/// baseline). Bars are minimums, never exact figures.
+pub(crate) fn assert_min_reduction_tokens(class: &str, before: u64, after: u64, min_pct: u32) {
+    let pct = reduction_pct_tokens(before, after);
+    assert!(
+        pct >= f64::from(min_pct),
+        "[{class}] token reduction {pct:.1}% is below the {min_pct}% bar ({after} vs {before} \
+         est tokens)"
+    );
+}
+
 /// Assert the reduced form is never larger than the baseline (parity-or-better).
 /// Used where the reduction's contract is "at least as small as the raw form"
 /// rather than a fixed percentage bar (e.g. grep grouping vs. the ungrouped
@@ -54,6 +81,35 @@ pub(crate) fn assert_parity_or_better(class: &str, baseline: &str, reduced: &str
         -pct as i64,
         est_tokens(reduced),
         est_tokens(baseline),
+    );
+}
+
+/// Ratio of estimated tokens: `after` as a fraction of `before` (1.0 = no
+/// change, < 1.0 = smaller). Complements [`reduction_pct`] for the case where
+/// two already-reduced forms are compared against each other (e.g. the
+/// compaction `provider` vs `excerpts` arms) rather than raw-vs-reduced.
+/// Returns 0.0 when `before` is empty so a degenerate baseline never divides
+/// by zero.
+pub(crate) fn est_ratio(before: &str, after: &str) -> f64 {
+    let before = est_tokens(before) as f64;
+    if before == 0.0 {
+        return 0.0;
+    }
+    est_tokens(after) as f64 / before
+}
+
+/// Assert `after` stays at or under `max_ratio` of `before` in estimated
+/// tokens. Used to bound one reduced arm against another (compaction
+/// `provider` vs `excerpts`): the bar is a ceiling on the ratio, i.e. a floor
+/// on the win, so a summarizer arm that balloons past the peer fails loudly.
+/// Ratios only; absolute counts are estimates.
+pub(crate) fn assert_ratio_within(class: &str, before: &str, after: &str, max_ratio: f64) {
+    let ratio = est_ratio(before, after);
+    assert!(
+        ratio <= max_ratio,
+        "[{class}] token ratio {ratio:.2} exceeds the {max_ratio:.2} ceiling ({} vs {} est tokens)",
+        est_tokens(after),
+        est_tokens(before),
     );
 }
 
@@ -103,6 +159,16 @@ pub(crate) fn report_row(class: &str, before: &str, after: &str, via: &str) -> S
     )
 }
 
+/// One report row from token counts the seam already measured (see
+/// [`reduction_pct_tokens`]). Mirrors [`report_row`] for the compaction arms
+/// whose covered range has no single verbatim string to re-measure.
+pub(crate) fn report_row_tokens(class: &str, before: u64, after: u64, via: &str) -> String {
+    format!(
+        "| {class} | {before} | {after} | {:.0}% | {via} |",
+        reduction_pct_tokens(before, after),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,8 +203,41 @@ mod tests {
     }
 
     #[test]
+    fn est_ratio_and_ceiling() {
+        assert_eq!(est_ratio("", "abcd"), 0.0);
+        let before = "x".repeat(400);
+        let after = "x".repeat(100);
+        assert!((est_ratio(&before, &after) - 0.25).abs() < 0.01);
+        // At-ceiling passes (<=), well-under passes.
+        assert_ratio_within("class", &before, &after, 0.25);
+        assert_ratio_within("class", &before, &after, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the 0.10 ceiling")]
+    fn ratio_ceiling_fails_loudly() {
+        let before = "x".repeat(400);
+        let after = "x".repeat(100);
+        assert_ratio_within("class", &before, &after, 0.10);
+    }
+
+    #[test]
     fn report_row_shape() {
         let row = report_row("c", "aaaaaaaa", "aaaa", "f");
         assert_eq!(row, "| c | 2 | 1 | 50% | f |");
+    }
+
+    #[test]
+    fn token_reduction_and_row_shape() {
+        assert_eq!(reduction_pct_tokens(0, 5), 0.0);
+        assert!((reduction_pct_tokens(400, 100) - 75.0).abs() < 0.01);
+        let row = report_row_tokens("c", 400, 100, "provider");
+        assert_eq!(row, "| c | 400 | 100 | 75% | provider |");
+    }
+
+    #[test]
+    #[should_panic(expected = "below the 60% bar")]
+    fn min_reduction_tokens_bar_fails_loudly() {
+        assert_min_reduction_tokens("class", 100, 90, 60);
     }
 }

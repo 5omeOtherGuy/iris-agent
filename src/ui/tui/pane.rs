@@ -9,9 +9,8 @@ use ratatui::text::{Line, Span};
 use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 
 use super::rows::{FoldVis, TranscriptRow};
-use super::transcript::streaming_markdown_preview;
 use super::wrap::line_text;
-use super::{TEXT_COLUMN_X_PADDING, dim_style, panel_style};
+use super::{dim_style, panel_style};
 
 pub(super) const ASSISTANT_TEXT_PREFIX: &str = "  ";
 
@@ -24,35 +23,21 @@ fn markdown_width(content_width: usize) -> usize {
         .max(1)
 }
 
-/// The assistant content column for a given full frame width, matching the
-/// inset `TranscriptRow::render` applies (`width - 2 * TEXT_COLUMN_X_PADDING`).
-/// Used by the streaming path, which is handed the full frame width.
-fn content_width(frame_width: usize) -> usize {
-    frame_width
-        .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
-        .max(1)
-}
-
 pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, text: &str) {
-    let theme = MarkdownTheme::default()
-        .with_code_highlighting()
-        .with_hyperlinks();
-    let lines = render_markdown_themed(text, &theme, markdown_width(width));
-    push_assistant_markdown_lines(rows, lines);
+    rows.extend(assistant_rows(text, width));
 }
 
-/// Build the transient transcript rows for the in-flight streamed assistant
-/// text. The transcript composites these through the shared `Component` path
-/// after committed history, then commits them once on `AssistantTextEnd`.
-pub(super) fn streaming_assistant_rows(text: &str, width: usize) -> Vec<TranscriptRow> {
-    let text = streaming_markdown_preview(text);
+/// Build assistant transcript rows for `text` laid out at the assistant content
+/// column `content_width`. Shared by the committed-history path
+/// ([`push_assistant_rows`]) and the live stream controller so a streamed line
+/// renders identically whether it is in the mutable tail or committed to
+/// scrollback.
+pub(super) fn assistant_rows(text: &str, content_width: usize) -> Vec<TranscriptRow> {
     let theme = MarkdownTheme::default()
         .with_code_highlighting()
         .with_hyperlinks();
-    // `width` is the full frame here; reduce to the assistant content column
-    // so table layout matches the width these rows are rendered into.
+    let lines = render_markdown_themed(text, &theme, markdown_width(content_width));
     let mut rows = Vec::new();
-    let lines = render_markdown_themed(&text, &theme, markdown_width(content_width(width)));
     push_assistant_markdown_lines(&mut rows, lines);
     rows
 }

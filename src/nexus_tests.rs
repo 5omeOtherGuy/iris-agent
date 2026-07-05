@@ -459,6 +459,168 @@ fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
     Ok(())
 }
 
+/// Provider that streams a scripted sequence of `ProviderEvent`s (reasoning
+/// deltas, section breaks, text deltas) ending in one `Completed` turn. Used to
+/// exercise the live-reasoning display/suppression path.
+struct ScriptedStreamProvider {
+    events: RefCell<Option<Vec<Result<ProviderEvent>>>>,
+}
+
+impl ScriptedStreamProvider {
+    fn new(events: Vec<ProviderEvent>) -> Self {
+        Self {
+            events: RefCell::new(Some(events.into_iter().map(Ok).collect())),
+        }
+    }
+}
+
+impl ChatProvider for ScriptedStreamProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let events = self.events.borrow_mut().take().unwrap_or_default();
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+fn test_origin() -> ModelOrigin {
+    ModelOrigin::new("test", "test", "test")
+}
+
+fn reasoning_display_events(events: &[AgentEvent]) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantReasoning { text, redacted } => Some((text.clone(), *redacted)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reasoning_delta_texts(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantReasoningDelta(delta) => Some(delta.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn persisted_reasoning_rows<P: ChatProvider>(harness: &Harness<P>) -> usize {
+    harness
+        .agent
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::AssistantReasoning)
+        .count()
+}
+
+#[test]
+fn streamed_reasoning_suppresses_final_display_but_persists_once() -> Result<()> {
+    // A turn that streams its reasoning summary live: the front-end already
+    // showed the thinking block via deltas, so the terminal canonical display
+    // event is suppressed -- but the persisted reasoning row is written once
+    // (ADR-0016 storage untouched).
+    let workspace = test_workspace()?;
+    let mut turn = AssistantTurn::text("Answer");
+    turn.reasoning = vec![ReasoningBlock::new(
+        "First thought",
+        Some("enc"),
+        false,
+        test_origin(),
+    )];
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::ReasoningDelta("First ".to_string()),
+        ProviderEvent::ReasoningDelta("thought".to_string()),
+        ProviderEvent::Completed(turn),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert_eq!(reasoning_delta_texts(&events), vec!["First ", "thought"]);
+    assert!(
+        reasoning_display_events(&events).is_empty(),
+        "streamed reasoning must suppress the duplicate terminal display event"
+    );
+    assert_eq!(
+        persisted_reasoning_rows(&harness),
+        1,
+        "reasoning still persisted exactly once"
+    );
+    Ok(())
+}
+
+#[test]
+fn streamed_summary_plus_redacted_block_still_shows_redacted_placeholder() -> Result<()> {
+    // A turn with a streamed summary AND a redacted block: the summary display
+    // event is suppressed (shown live), but the redacted placeholder -- which is
+    // never streamed -- is still emitted. Both blocks persist.
+    let workspace = test_workspace()?;
+    let mut turn = AssistantTurn::text("Answer");
+    turn.reasoning = vec![
+        ReasoningBlock::new("Streamed summary", Some("enc1"), false, test_origin()),
+        ReasoningBlock::new("", Some("enc2"), true, test_origin()),
+    ];
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::ReasoningDelta("Streamed summary".to_string()),
+        ProviderEvent::Completed(turn),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert_eq!(
+        reasoning_display_events(&events),
+        vec![(String::new(), true)],
+        "only the redacted placeholder is emitted; the streamed summary is suppressed"
+    );
+    assert_eq!(
+        persisted_reasoning_rows(&harness),
+        2,
+        "both blocks persisted"
+    );
+    Ok(())
+}
+
+#[test]
+fn reasoning_without_deltas_emits_final_display_event() -> Result<()> {
+    // Graceful degradation: a provider that sends no reasoning deltas still gets
+    // the block-level display event at completion, exactly as before.
+    let workspace = test_workspace()?;
+    let mut turn = AssistantTurn::text("Answer");
+    turn.reasoning = vec![ReasoningBlock::new(
+        "Block reasoning",
+        Some("enc"),
+        false,
+        test_origin(),
+    )];
+    let provider = ScriptedStreamProvider::new(vec![ProviderEvent::Completed(turn)]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert!(
+        reasoning_delta_texts(&events).is_empty(),
+        "no deltas were streamed"
+    );
+    assert_eq!(
+        reasoning_display_events(&events),
+        vec![("Block reasoning".to_string(), false)]
+    );
+    Ok(())
+}
+
 #[test]
 fn repl_reports_auth_errors_with_login_hint() -> Result<()> {
     let workspace = test_workspace()?;
@@ -3107,6 +3269,66 @@ fn oversized_tool_output_is_stored_behind_a_handle_and_compacted_in_context() ->
 }
 
 #[test]
+fn oversized_recall_output_is_offloaded_behind_a_handle() -> Result<()> {
+    // ADR-0046 x ADR-0011: a recall result that is still oversized after
+    // windowing must offload through the SAME central tool-result path as any
+    // other big output, not dump the whole covered range into context. Seed a
+    // large covered-range blob into the session store, then drive a wide recall.
+    let workspace = test_workspace()?;
+    let root = test_workspace()?;
+    let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
+    let log_path = log.path().to_path_buf();
+
+    // 100 turns of ~800 bytes each: a full-window recall exceeds the 50 KiB
+    // inline threshold, so the central offload stores it behind a handle.
+    let messages: Vec<Message> = (0..100)
+        .map(|n| Message::user(&format!("turn {n} :: {}", "detail ".repeat(120))))
+        .collect();
+    let ids: Vec<Option<String>> = (0..100).map(|n| Some(format!("{n:02x}"))).collect();
+    let blob = crate::tools::recall::serialize_covered(&messages, &ids, "00", "63");
+    let seed_store = crate::handles::HandleStore::for_session(&log_path);
+    let handle = seed_store.put(&blob)?;
+
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "recall",
+            json!({ "handle": handle, "limit": 100 }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    // The recall tool result reaching the provider is the compact preview with an
+    // outputHandle, not the full paged range.
+    let seen = harness.agent.provider.seen.borrow();
+    let tool_result = seen[1].last().unwrap();
+    assert_eq!(tool_result.role, Role::Tool);
+    assert!(
+        tool_result.content.contains("outputHandle"),
+        "oversized recall output must offload behind a handle: {}",
+        tool_result.content
+    );
+    // And the offloaded full output round-trips from the store by its handle.
+    let id = output_handle_id(&tool_result.content);
+    let store = crate::handles::HandleStore::for_session(&log_path);
+    assert!(
+        store.get(&id)?.is_some(),
+        "offloaded recall output is retrievable"
+    );
+    Ok(())
+}
+
+#[test]
 fn small_tool_output_stays_inline_unchanged() -> Result<()> {
     let workspace = test_workspace()?;
     let root = test_workspace()?;
@@ -4378,7 +4600,7 @@ fn resumed_session_feeds_prior_context_into_next_turn() -> Result<()> {
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        resumed,
+        stored.entry_ids,
         None,
     );
 
@@ -4446,7 +4668,7 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        on_disk,
+        stored.entry_ids,
         None,
     );
 
@@ -4515,7 +4737,6 @@ fn resume_repairs_all_dangling_tool_calls_before_the_next_turn() -> Result<()> {
     let store = SessionStore::with_root(dir.path.clone());
     let meta = store.find(&id)?.expect("session present");
     let stored = store.open(&meta)?;
-    let on_disk = stored.messages.len();
     let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
     let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
     let session = SessionLog::resume(&path)?;
@@ -4524,7 +4745,7 @@ fn resume_repairs_all_dangling_tool_calls_before_the_next_turn() -> Result<()> {
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        on_disk,
+        stored.entry_ids,
         None,
     );
 
@@ -4705,6 +4926,8 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
                 original_tokens_estimate,
                 summary_tokens_estimate,
                 budget,
+                generation,
+                carried_paths: _,
             } => Some((
                 compaction_id,
                 covered_from,
@@ -4713,6 +4936,7 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
                 *original_tokens_estimate,
                 *summary_tokens_estimate,
                 *budget,
+                *generation,
             )),
             _ => None,
         })
@@ -4723,6 +4947,63 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
     assert_eq!(compaction.3, 2);
     assert!(compaction.4 > compaction.5);
     assert_eq!(compaction.6, 50);
+    // First compaction in the session reports generation 1.
+    assert_eq!(compaction.7, 1);
+    Ok(())
+}
+
+/// The Nth auto-compaction in a session reports generation N on its
+/// `CompactionApplied` event. Drives several over-budget turns so the harness
+/// compacts more than once, then asserts the reported generations begin 1, 2.
+#[test]
+fn auto_compaction_reports_incrementing_generation() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    for prompt in ["P", "Q", "S", "T"] {
+        block_on(harness.submit_turn(
+            &prompt.repeat(400),
+            &frontend,
+            &frontend,
+            &CancellationToken::new(),
+        ))?;
+    }
+
+    let events = frontend.events.borrow();
+    let generations: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::CompactionApplied { generation, .. } => Some(*generation),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        generations.len() >= 2,
+        "expected at least two compactions, got {generations:?}"
+    );
+    assert_eq!(
+        &generations[..2],
+        &[1, 2],
+        "the Nth compaction must report generation N"
+    );
     Ok(())
 }
 
@@ -4894,12 +5175,15 @@ fn provider_summary_covers_only_the_range_not_the_retained_prefix() -> Result<()
     ]);
     let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
     let session = SessionLog::resume(&path)?;
+    // This test exercises the LEGACY id-less resume prefix (no durable ids), so
+    // it stays a retained prefix (`plan.start > 0`); pass an all-`None` id list
+    // explicitly rather than the read-back ids.
     let mut harness = Harness::resumed(
         agent,
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        resumed,
+        vec![None; resumed],
         Some(50),
     );
     harness.set_summarizer(crate::wayland::SummarizerKind::Provider);
@@ -5054,6 +5338,86 @@ fn manual_compact_covers_older_turns_and_keeps_recent_tail() -> Result<()> {
     Ok(())
 }
 
+/// Finding 3 (#371): the shrink/worthwhile guard must hold on EVERY summarizer
+/// path, not only the provider-summary branch. A covered range of short turns
+/// whose deterministic excerpt summary is no smaller than the originals -- and
+/// which carries non-empty touched/read paths (ADR-0044) -- must NOT produce a
+/// compaction entry: the combined summary + carry body would be larger than the
+/// range it replaces. Before the fix `compact_range` appended it anyway because
+/// the guard lived only inside the provider branch.
+#[test]
+fn deterministic_fallback_skips_non_shrinking_compaction_with_carry() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+
+    // Short covered turns: each is below the excerpt cap, so the excerpt summary
+    // reproduces them verbatim plus per-message role/header overhead -- it never
+    // shrinks. Two successful read results contribute a non-empty carry.
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let path = log.path().to_path_buf();
+    log.append(&Message::user("u"))?;
+    log.append(&Message::assistant_tool_call(&ToolCall {
+        id: "c1".to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": "a.rs" }),
+        thought_signature: None,
+    }))?;
+    log.append(&Message::tool_result(
+        "c1",
+        "read",
+        &serde_json::json!({ "ok": true, "content": "x", "metadata": { "target": "a.rs" } })
+            .to_string(),
+    ))?;
+    log.append(&Message::assistant_tool_call(&ToolCall {
+        id: "c2".to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": "b.rs" }),
+        thought_signature: None,
+    }))?;
+    log.append(&Message::tool_result(
+        "c2",
+        "read",
+        &serde_json::json!({ "ok": true, "content": "x", "metadata": { "target": "b.rs" } })
+            .to_string(),
+    ))?;
+    // A long recent tail (~999 tokens) that fills the manual keep window so the
+    // short older turns above are the coverable range, not folded into the tail.
+    log.append(&Message::assistant(&"R".repeat(3_996)))?;
+    drop(log);
+
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present in store");
+    let stored = store.open(&meta)?;
+    let resumed = stored.messages.len();
+
+    let agent = Agent::new(FakeProvider::new(vec![]), crate::tools::built_in_tools());
+    // Excerpts is the harness default summarizer (no provider round-trip), so
+    // this exercises the deterministic fallback path directly.
+    let mut harness = Harness::new(agent, dir.path.clone(), ToolState::new(), None, None);
+    let resume_log = SessionLog::resume(&path)?;
+    harness.swap_session(Some(resume_log), stored.messages, stored.entry_ids, resumed);
+
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let before = harness.context_token_estimate();
+    block_on(harness.compact_now(&frontend, &CancellationToken::new()))?;
+    let after = harness.context_token_estimate();
+
+    assert_eq!(
+        after, before,
+        "a non-shrinking summary + carry body must not replace the covered range"
+    );
+    let on_disk = fs::read_to_string(&path)?;
+    assert!(
+        !on_disk
+            .lines()
+            .any(|line| line.contains("\"type\":\"compaction\"")),
+        "the deterministic fallback must not append a non-shrinking compaction entry"
+    );
+    Ok(())
+}
+
 /// Regression (#375): resuming an id-bearing session must carry the durable
 /// message ids into the harness, so the resumed prefix is compactable. Before
 /// the fix `swap_session` set `entry_ids = vec![None; resumed]`, so
@@ -5120,6 +5484,203 @@ fn resumed_session_prefix_is_compactable() -> Result<()> {
     assert!(
         !messages.iter().any(|m| m.content == "first prompt"),
         "the covered resumed turns must not remain verbatim"
+    );
+    Ok(())
+}
+
+/// Regression (#377): a session resumed at STARTUP (`iris --continue` /
+/// `iris resume`, i.e. `Harness::resumed`) whose loaded context exceeds the
+/// budget must auto-compact its resumed range at the next turn boundary -- the
+/// startup mirror of `resumed_session_prefix_is_compactable`. Before the fix
+/// `Harness::resumed` seeded `entry_ids = vec![None; persisted]`, so
+/// `plan_compaction` never started on the resumed bulk and an over-budget
+/// startup-resumed session silently no-oped instead of reclaiming headroom.
+#[test]
+fn startup_resumed_session_prefix_auto_compacts_at_turn_boundary() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400); // ~100 tokens per assistant reply
+
+    // Persist an id-bearing session, then drop the live handle.
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let path = log.path().to_path_buf();
+    log.append(&Message::user("first prompt"))?;
+    log.append(&Message::assistant(&long))?;
+    log.append(&Message::user("second prompt"))?;
+    log.append(&Message::assistant(&long))?;
+    log.append(&Message::user("third prompt"))?;
+    log.append(&Message::assistant("tail answer"))?;
+    drop(log);
+
+    // Read the transcript back through the real rebuild path so the durable ids
+    // come from disk (every entry `Some(id)`), just like the startup caller.
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present in store");
+    let stored = store.open(&meta)?;
+    assert!(
+        stored.entry_ids.iter().all(Option::is_some),
+        "an id-bearing session must read back real ids: {:?}",
+        stored.entry_ids
+    );
+
+    // Drive through the STARTUP path (`Harness::resumed`) with a tiny budget so
+    // the first turn boundary is already over budget and auto-compaction fires
+    // before the provider request.
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("new answer"))]);
+    let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        stored.entry_ids,
+        Some(50),
+    );
+
+    run_text_session(
+        &mut harness,
+        b"next prompt\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    // The resumed prefix collapsed into a summary before the provider request.
+    let seen = harness.agent.provider.seen.borrow();
+    let first = seen.first().expect("provider was called");
+    assert!(
+        first[0].content.starts_with("[auto-compacted summary"),
+        "the resumed prefix must collapse into a summary before the turn, got: {}",
+        first[0].content
+    );
+    assert!(
+        !first.iter().any(|m| m.content == "first prompt"),
+        "the covered resumed turns must not be replayed verbatim"
+    );
+    Ok(())
+}
+
+/// Round-trip (#377): compact live -> exit -> startup-resume (`iris --continue`)
+/// -> compact again. Every coverage id the second compaction writes must stay
+/// valid, so the final `read_messages`/rebuild accepts the transcript (a stale
+/// or missing coverage id is a hard read error). The rebuilt summary rows stay
+/// non-coverable (`None`) and a prior summary is never re-covered.
+#[test]
+fn startup_resume_round_trip_keeps_coverage_ids_valid() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+
+    // Live session that auto-compacts over a tiny budget across two turns.
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+    let input = format!("{}\n{}\n/exit\n", "P".repeat(400), "Q".repeat(400));
+    run_text_session(
+        &mut harness,
+        input.as_bytes(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+    drop(harness);
+
+    // First reopen (simulating `iris --continue`): the rebuild applies the live
+    // compaction, so a summary row is present and it is non-coverable (`None`).
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present");
+    let stored = store.open(&meta)?;
+    let summary_idx = stored
+        .messages
+        .iter()
+        .position(|m| m.content.starts_with("[auto-compacted summary"))
+        .expect("first reopen must carry the live compaction summary");
+    assert_eq!(
+        stored.entry_ids[summary_idx], None,
+        "a rebuilt summary row must stay non-coverable (id None)"
+    );
+
+    // Startup-resume through `Harness::resumed`, then push over budget again so a
+    // SECOND compaction fires -- it must cover only real ids after the summary.
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text(&long))]);
+    let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        stored.entry_ids,
+        Some(50),
+    );
+    run_text_session(
+        &mut harness,
+        b"more\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+    drop(harness);
+
+    // Final reopen: `read_messages` accepts every entry id and every coverage id
+    // (an invalid/overlapping/missing coverage range is a hard error here), and
+    // the prior summary was not re-covered -- exactly one summary row remains at
+    // the front, still non-coverable.
+    let reopened = store.open(&meta)?;
+    assert_eq!(
+        reopened.entry_ids.len(),
+        reopened.messages.len(),
+        "entry ids stay parallel to messages after the round trip"
+    );
+    // Every rebuilt summary row is non-coverable (`None`).
+    let summaries: Vec<usize> = reopened
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.content.starts_with("[auto-compacted summary"))
+        .map(|(i, _)| i)
+        .collect();
+    for &i in &summaries {
+        assert_eq!(
+            reopened.entry_ids[i], None,
+            "summary row {i} must stay non-coverable"
+        );
+    }
+    // The prior summary survives at the front -- it was never re-covered by the
+    // second compaction (`plan_compaction` stops at its `None` id). The new
+    // startup-resume compaction added its own summary after it, so two distinct
+    // summary rows remain rather than a re-summarized single one.
+    assert_eq!(
+        summaries.first().copied(),
+        Some(0),
+        "the prior summary must survive at the front, not be re-covered: {:?}",
+        reopened
+            .messages
+            .iter()
+            .map(|m| m.content.chars().take(24).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        summaries.len() >= 2,
+        "the startup-resumed range must compact into its own summary (prior summary preserved): {:?}",
+        reopened
+            .messages
+            .iter()
+            .map(|m| m.content.chars().take(24).collect::<String>())
+            .collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -5196,7 +5757,7 @@ impl ChatProvider for SurfaceProbe {
     }
 }
 
-const FULL_SURFACE: [&str; 8] = [
+const FULL_SURFACE: [&str; 9] = [
     "read",
     "bash",
     "edit",
@@ -5205,6 +5766,7 @@ const FULL_SURFACE: [&str; 8] = [
     "find",
     "ls",
     "read_output",
+    "recall",
 ];
 
 #[test]
@@ -5225,7 +5787,16 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
     let visible: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
     assert_eq!(
         visible,
-        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
+        [
+            "read",
+            "bash",
+            "write",
+            "grep",
+            "find",
+            "ls",
+            "read_output",
+            "recall"
+        ]
     );
     assert!(
         !visible.contains(&"edit"),
@@ -5302,7 +5873,16 @@ fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
     let advertised = harness.agent.provider.advertised.borrow();
     assert_eq!(
         advertised[0],
-        ["read", "bash", "write", "grep", "find", "ls", "read_output"]
+        [
+            "read",
+            "bash",
+            "write",
+            "grep",
+            "find",
+            "ls",
+            "read_output",
+            "recall"
+        ]
     );
     assert!(!advertised[0].iter().any(|name| name == "edit"));
     Ok(())
@@ -6635,6 +7215,7 @@ fn run_preset_turn(
         workspace,
         state: &state,
         output_store: None,
+        session_span: None,
         output_sink: None,
         mutation_guard: guard,
     };
@@ -7106,4 +7687,206 @@ fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
         "the auto-approved write ran without a prompt"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `--dangerously-skip-permissions` (ADR-0049): every gated call is
+// auto-approved, floors included; nothing persists; the bypass is audited.
+// ---------------------------------------------------------------------------
+
+fn dangerous_approved_count(frontend: &RecordingFrontend) -> usize {
+    frontend
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolAutoApprovedDangerous(_)))
+        .count()
+}
+
+#[test]
+fn skip_permissions_defaults_off_and_only_the_builder_flips_it() {
+    // Activation isolation: a bare agent is never in skip mode, and the ONLY
+    // way to enable it is the explicit construction-time builder the host calls
+    // from the CLI flag. There is no config/env/trust-store/live-setter path.
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    assert!(!agent.skip_permissions(), "default is off");
+    let agent = agent.with_skip_permissions(true);
+    assert!(agent.skip_permissions(), "the explicit builder enables it");
+}
+
+#[test]
+fn skip_permissions_auto_approves_destructive_bash() -> Result<()> {
+    // The destructive floor (rm -rf) normally re-prompts even in auto. In skip
+    // mode it is auto-approved without consulting the gate, and the bypass is
+    // emitted as the distinct dangerous audit event.
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "rm -rf build" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_skip_permissions(true);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "clean",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "skip mode must NOT consult the gate for a destructive command"
+    );
+    assert_eq!(
+        dangerous_approved_count(&frontend),
+        1,
+        "the destructive bypass is audited as a dangerous auto-approval"
+    );
+    assert_eq!(
+        auto_approved_count(&frontend),
+        0,
+        "the dangerous bypass is not confused with an ordinary auto-approval"
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_bypasses_the_dirty_tree_floor_prompt() -> Result<()> {
+    // The dirty-tree floor normally forces an approval prompt for a pre-existing
+    // dirty file. In skip mode the approval gate is bypassed (no prompt) and the
+    // bypass is audited. Read-before-mutate and the mutation guard are separate,
+    // still-enforced safety systems (invariant 5), not the approval gate this
+    // mode skips -- so this asserts approval ROUTING, not that the file mutates.
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("out.txt"), "old\n")?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_skip_permissions(true);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::protecting(vec![PathBuf::from("out.txt")]);
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_none(),
+        "skip mode must NOT prompt for a protected dirty file"
+    );
+    assert_eq!(
+        dangerous_approved_count(&frontend),
+        1,
+        "the dirty-floor bypass is audited"
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_persists_nothing_and_later_normal_session_still_prompts() -> Result<()> {
+    // Non-persistence invariant: a skip-mode session that "approves" everything
+    // writes no grant to the project store, and a following normal (non-skip)
+    // session with the same empty policy prompts as usual.
+    let workspace = test_workspace()?;
+    let grants = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let sink = RecordingSink {
+        grants: grants.clone(),
+    };
+    // Phase 1: skip mode. Even with a frontend that WOULD grant-for-project,
+    // the gate is never consulted, so nothing is persisted.
+    let provider = FakeProvider::new(write_turn("out.txt", "one\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools())
+        .with_project_policy(ProjectPolicy::default(), Some(Box::new(sink)))
+        .with_skip_permissions(true);
+    let frontend = RecordingFrontend::new(ApprovalDecision::AllowProject);
+    let guard = FakeGuard::none();
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+    assert_eq!(dangerous_approved_count(&frontend), 1);
+    assert!(
+        grants.borrow().is_empty(),
+        "skip mode must not persist any project grant"
+    );
+
+    // Phase 2: a fresh normal session with the same empty policy prompts and,
+    // on Deny, refuses -- proving nothing was loosened for the future.
+    let provider2 = FakeProvider::new(write_turn("out2.txt", "two\n"));
+    let mut agent2 = Agent::new(provider2, crate::tools::built_in_tools())
+        .with_project_policy(ProjectPolicy::default(), None);
+    let frontend2 = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard2 = FakeGuard::none();
+    run_preset_turn(
+        &mut agent2,
+        "write it",
+        &workspace.path,
+        Some(&guard2),
+        &frontend2,
+    )?;
+    assert!(
+        frontend2.events_at_review.borrow().is_some(),
+        "the following normal session prompts as usual"
+    );
+    assert_eq!(denied_count(&frontend2), 1, "and denies when refused");
+    assert!(
+        !workspace.path.join("out2.txt").exists(),
+        "the denied write never ran"
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_off_leaves_floors_intact() -> Result<()> {
+    // Turning the flag off restores exactly today's behavior: a destructive
+    // command still consults the gate (here it is denied).
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn(
+            "bash",
+            json!({ "command": "rm -rf build" }),
+        )),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent =
+        Agent::new(provider, crate::tools::built_in_tools()).with_skip_permissions(false);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let guard = FakeGuard::none();
+
+    run_preset_turn(
+        &mut agent,
+        "clean",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    assert!(
+        frontend.events_at_review.borrow().is_some(),
+        "with skip off, the destructive floor still prompts"
+    );
+    assert_eq!(dangerous_approved_count(&frontend), 0);
+    Ok(())
+}
+
+#[test]
+fn skip_permissions_banner_states_all_checks_disabled() {
+    // The loud session-start banner is the single source of truth for the
+    // warning line; it must clearly say all checks are off.
+    assert!(crate::nexus::SKIP_PERMISSIONS_BANNER.contains("PERMISSION CHECKS DISABLED"));
+    assert!(crate::nexus::SKIP_PERMISSIONS_BANNER.contains("without approval"));
 }

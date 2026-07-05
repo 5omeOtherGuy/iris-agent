@@ -74,6 +74,11 @@ pub(crate) struct SessionLog {
     /// Monotonic counter backing the next entry id, so ids are unique within
     /// this session by construction (no random draws, no collision check).
     next_seq: u32,
+    /// Count of `compaction` entries in this transcript so far, seeded from the
+    /// file on resume. The next compaction's generation ordinal (ADR-0047) is
+    /// this count plus one; derived from entry order, so a session without the
+    /// persisted field still counts correctly.
+    compactions: u32,
 }
 
 impl SessionLog {
@@ -127,6 +132,7 @@ impl SessionLog {
             id: id.to_string(),
             last_id: None,
             next_seq: 0,
+            compactions: 0,
         })
     }
 
@@ -152,18 +158,31 @@ impl SessionLog {
     /// The summary text is produced by the caller, so the entry is independent
     /// of *how* it was summarized (a deterministic internal summarizer today; a
     /// provider/local/remote summarizer later). `token_estimate` records the
-    /// summary's own token estimate so the rebuild counts it instead of the
-    /// covered turns. The Tier-2 harness's auto-compaction policy is the
-    /// production trigger (issue #55).
+    /// rebuilt body's token estimate (summary plus carry) so the rebuild counts
+    /// it instead of the covered turns. The Tier-2 harness's auto-compaction
+    /// policy is the production trigger (issue #55).
+    ///
+    /// `carry_paths` is the deterministic touched/read path carry (ADR-0044),
+    /// derived from the covered range's structured tool calls, persisted as an
+    /// additive optional `carryPaths` field. It is written only when non-empty,
+    /// so an empty carry is byte-identical to a pre-carry compaction entry and
+    /// older readers ignore it either way.
     pub(crate) fn append_compaction(
         &mut self,
         covered_from: &str,
         covered_to: &str,
         summary: &str,
+        carry_paths: &[String],
         token_estimate: Option<u64>,
     ) -> Result<String> {
         let id = self.next_id();
-        let entry = json!({
+        // Generation ordinal (ADR-0047): 1-based count of compactions in this
+        // session. Compute the next generation but do not advance the counter
+        // until the entry is durably written, so a failed append never leaves
+        // the in-memory counter ahead of what is persisted (which would make a
+        // later successful append report the wrong generation).
+        let generation = self.compactions + 1;
+        let mut entry = json!({
             "type": "compaction",
             "id": id,
             "parentId": self.last_id.as_deref(),
@@ -176,13 +195,64 @@ impl SessionLog {
             // explicit null placeholder. Upgrade path = write the real estimate
             // here when auto-compaction/token budgeting lands; kind unchanged.
             "tokenEstimate": token_estimate,
+            // Additive optional field (ADR-0047): older readers ignore it and
+            // it is recomputable from compaction-entry order, so its absence
+            // never changes how a pre-ADR-0047 session rebuilds.
+            "generation": generation,
         });
+        // Additive optional carry (ADR-0044): only written when non-empty, so an
+        // empty carry leaves the serialized entry byte-identical to a pre-carry
+        // compaction and older readers are unaffected.
+        if !carry_paths.is_empty() {
+            entry["carryPaths"] = json!(carry_paths);
+        }
         write_line(&mut self.file, &entry).with_context(|| {
             format!(
                 "failed to append compaction to session {}",
                 self.path.display()
             )
         })?;
+        // Only advance the counter after the write succeeds; on failure the
+        // `?` above returns early and `self.compactions` is left unchanged.
+        self.compactions = generation;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Append a durable `fold` entry recording that the `Tool`-role result of
+    /// message `target_id` was replaced in rebuilt context by the deterministic
+    /// `stub` (ADR-0048 microcompaction). Unlike a compaction, a fold targets a
+    /// single message id and keeps the tool call/result pair intact -- only the
+    /// result's rendered content changes on rebuild, so provider pair invariants
+    /// hold trivially. Precedence at rebuild ([`rebuild_with_compactions`]):
+    /// compactions apply first, and a fold whose target lies in a covered range
+    /// is a no-op, so a fold never applies inside a range a compaction covers.
+    ///
+    /// This is a separate entry kind, not a single-message compaction, so the
+    /// compaction overlap-rejection rule keeps holding for range coverage. It is
+    /// additive-optional: older readers skip an unknown `type`, and a session
+    /// with no fold entries rebuilds byte-identically to the pre-fold behavior.
+    /// `token_estimate` records the stub's token cost so the rebuild counts the
+    /// stub instead of the folded result.
+    pub(crate) fn append_fold(
+        &mut self,
+        target_id: &str,
+        stub: &str,
+        token_estimate: Option<u64>,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "fold",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "createdAt": now_ms(),
+            "targetId": target_id,
+            "stub": stub,
+            "tokenEstimate": token_estimate,
+        });
+        write_line(&mut self.file, &entry)
+            .with_context(|| format!("failed to append fold to session {}", self.path.display()))?;
         self.last_id = Some(id.clone());
         Ok(id)
     }
@@ -283,6 +353,33 @@ impl SessionLog {
         Ok(id)
     }
 
+    /// Append a `dangerousMode` entry recording that this session ran with
+    /// `--dangerously-skip-permissions` (ADR-0049): every gated tool call was
+    /// auto-approved without a floor check. Modeled on
+    /// [`append_task_opened`](Self::append_task_opened): append-only, chained in
+    /// the leaf link, and skipped by [`read_messages`] so it never enters
+    /// provider context. It is transcript metadata for auditors -- a resumed or
+    /// audited session shows the mode was active -- not an enforcement or
+    /// recovery input, and it is only ever written from the explicit CLI flag.
+    pub(crate) fn append_dangerous_mode(&mut self) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "dangerousMode",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "mode": "dangerously-skip-permissions",
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append dangerous-mode marker to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
     /// Reopen an existing transcript file for append, so a resumed session
     /// continues the same log instead of starting a new one. Reads the header
     /// id and the existing entries to restore the leaf link (`parentId` of the
@@ -310,6 +407,7 @@ impl SessionLog {
             id: state.id,
             last_id: state.last_id,
             next_seq: state.next_seq,
+            compactions: state.compactions,
         })
     }
 
@@ -321,6 +419,15 @@ impl SessionLog {
     /// Path of the transcript file on disk.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Generation ordinal (ADR-0047) of the most recent compaction in this
+    /// session: the 1-based count of `compaction` entries written or seen so
+    /// far. `0` before the first compaction; equals the last-appended entry's
+    /// persisted `generation`. Callers read it right after `append_compaction`
+    /// to surface the ordinal on `CompactionApplied`.
+    pub(crate) fn compaction_generation(&self) -> u64 {
+        u64::from(self.compactions)
     }
 
     /// Generate the next entry id from the per-session counter.
@@ -792,6 +899,40 @@ pub(crate) fn message_token_estimate(message: &Message) -> u64 {
     estimate_tokens(&message.content).saturating_add(continuity)
 }
 
+/// Header line of the compaction carry block (ADR-0044), naming the block as
+/// the deterministic touched/read path set that rides alongside the prose
+/// summary.
+const CARRY_BLOCK_HEADER: &str = "[files touched or read in the compacted range]";
+
+/// Render the compaction carry (ADR-0044): a deterministic, compact block
+/// listing the covered range's workspace-relative touched/read paths. Empty
+/// carry renders the empty string, so [`render_compaction_body`] with no paths
+/// is byte-identical to the pre-carry summary-only body.
+pub(crate) fn render_carry_block(carry_paths: &[String]) -> String {
+    if carry_paths.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n\n{CARRY_BLOCK_HEADER}");
+    for path in carry_paths {
+        out.push_str("\n- ");
+        out.push_str(path);
+    }
+    out
+}
+
+/// The compaction message body rebuilt into context (ADR-0044): the prose
+/// summary followed by the carry block. With an empty carry this returns the
+/// summary unchanged, so an empty-carry compaction rebuilds byte-identically to
+/// the pre-carry behavior. Both the live in-process rebuild
+/// (`wayland::Harness::compact_range`) and the read-time rebuild
+/// ([`rebuild_with_compactions`]) render through this one function so live and
+/// resumed context agree.
+pub(crate) fn render_compaction_body(summary: &str, carry_paths: &[String]) -> String {
+    let mut out = summary.to_string();
+    out.push_str(&render_carry_block(carry_paths));
+    out
+}
+
 /// What [`SessionLog::resume`] needs to continue an existing transcript.
 struct ResumeState {
     /// Header session id.
@@ -806,6 +947,10 @@ struct ResumeState {
     /// Whether the file lacks a trailing newline (a truncated final fragment),
     /// so resume must terminate it before appending.
     needs_newline: bool,
+    /// Count of `compaction` entries seen, so the resumed log continues the
+    /// generation ordinal (ADR-0047) from entry order -- correct even for
+    /// sessions written before the persisted `generation` field existed.
+    compactions: u32,
 }
 
 /// Scan an existing transcript so [`SessionLog::resume`] can continue it.
@@ -832,24 +977,33 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         .to_string();
     let mut last_id = None;
     let mut count: u32 = 0;
+    let mut compactions: u32 = 0;
     let mut max_seq: Option<u32> = None;
     for line in lines {
         let Ok(text) = line else { continue };
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        // `message`, `compaction`, `modelSelection`, and `taskLifecycle` entries
-        // all occupy the leaf chain and an entry-id slot, so a resumed append
-        // must link its `parentId` past, and count its `next_seq` beyond,
-        // whichever kind is the current leaf. (`modelSelection` and
-        // `taskLifecycle` are audit records; the read/rebuild path skips them,
-        // but the chain must still flow through them or `parentId` breaks.)
+        // `message`, `compaction`, `fold`, `modelSelection`, `taskLifecycle`,
+        // and `dangerousMode` entries all occupy the leaf chain and an
+        // entry-id slot, so a resumed append must link its `parentId` past,
+        // and count its `next_seq` beyond, whichever kind is the current leaf.
+        // (`fold`, `modelSelection`, `taskLifecycle`, and `dangerousMode` are
+        // audit records; the read/rebuild path skips them, but the chain must
+        // still flow through them or `parentId` breaks -- and `append_fold`
+        // consumes a seq, so ignoring `fold` here would let the next append
+        // reuse the fold's id (issue #378).)
         match value.get("type").and_then(Value::as_str) {
             Some("message")
             | Some("compaction")
+            | Some("fold")
             | Some("modelSelection")
-            | Some("taskLifecycle") => {}
+            | Some("taskLifecycle")
+            | Some("dangerousMode") => {}
             _ => continue,
+        }
+        if value.get("type").and_then(Value::as_str) == Some("compaction") {
+            compactions += 1;
         }
         count += 1;
         if let Some(entry_id) = value.get("id").and_then(Value::as_str) {
@@ -869,6 +1023,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         last_id,
         next_seq,
         needs_newline,
+        compactions,
     })
 }
 
@@ -908,6 +1063,40 @@ fn read_meta(path: &Path) -> Result<SessionMeta> {
 /// are skipped rather than failing the whole open. Also returns the rebuilt
 /// context's estimated token total ([`RebuiltContext`]).
 fn read_messages(path: &Path) -> Result<RebuiltContext> {
+    let (entries, compactions, folds) = read_entries(path)?;
+    rebuild_with_compactions(path, entries, compactions, folds)
+}
+
+/// Read the ORIGINAL turns of a durable entry-id span from a session transcript
+/// (ADR-0046 / issue #373 standalone recall). The originals stay verbatim in
+/// the JSONL even after compaction replaced them in the rebuilt view, so this
+/// returns them with their durable ids, filtered to the inclusive numeric
+/// `[from, to]` range. Reads ONLY the given transcript path (the caller's own
+/// session), so it cannot address another session's data. Turns are returned in
+/// transcript order; the vec is empty when the span selects nothing.
+pub(crate) fn read_span(path: &Path, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
+    // Recall returns the ORIGINAL turns verbatim, so folds (which only rewrite
+    // the rebuilt result rendering) are discarded here: the folded message's
+    // original content stays verbatim in its `message` entry on disk.
+    let (entries, _compactions, _folds) = read_entries(path)?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .id
+                .as_deref()
+                .and_then(|id| u64::from_str_radix(id, 16).ok())
+                .is_some_and(|n| n >= from && n <= to)
+        })
+        .map(|entry| (entry.id, entry.message))
+        .collect())
+}
+
+/// Parse a session transcript's raw `message` and `compaction` entries in order,
+/// applying the same per-line leniency the read path needs (a truncated or
+/// garbled line is skipped, not fatal). Shared by the rebuild read path
+/// ([`read_messages`]) and the standalone-span read path ([`read_span`]).
+fn read_entries(path: &Path) -> Result<(Vec<MessageEntry>, Vec<Compaction>, Vec<Fold>)> {
     // Read raw bytes and split on '\n' so a truncated trailing fragment that
     // splits a multibyte UTF-8 char is discarded as one bad line, rather than
     // failing the whole read -- which `read_to_string` would, since invalid
@@ -933,6 +1122,7 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
     // instead of the original turns.
     let mut entries: Vec<MessageEntry> = Vec::new();
     let mut compactions: Vec<Compaction> = Vec::new();
+    let mut folds: Vec<Fold> = Vec::new();
     for line in lines {
         let Ok(text) = line else {
             tracing::warn!(path = %path.display(), "skipping non-UTF-8 session line");
@@ -970,10 +1160,16 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
                     tracing::warn!(path = %path.display(), "skipping malformed compaction entry");
                 }
             },
+            Some("fold") => match parse_fold(&value) {
+                Some(fold) => folds.push(fold),
+                None => {
+                    tracing::warn!(path = %path.display(), "skipping malformed fold entry");
+                }
+            },
             _ => continue,
         }
     }
-    rebuild_with_compactions(path, entries, compactions)
+    Ok((entries, compactions, folds))
 }
 
 /// A message entry rebuilt from disk: its durable id (for compaction coverage
@@ -995,6 +1191,10 @@ struct Compaction {
     covered_to: String,
     summary: String,
     token_estimate: Option<u64>,
+    /// Deterministic touched/read path carry (ADR-0044), rendered into the
+    /// rebuilt body alongside the summary. Empty for pre-carry entries and any
+    /// entry whose covered range touched no in-workspace files.
+    carry_paths: Vec<String>,
 }
 
 /// Parse a `compaction` entry's rebuild fields. `None` (skipped as malformed)
@@ -1009,12 +1209,47 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
         covered_to: value.get("coveredTo").and_then(Value::as_str)?.to_string(),
         summary: value.get("summary").and_then(Value::as_str)?.to_string(),
         token_estimate: value.get("tokenEstimate").and_then(Value::as_u64),
+        // Additive optional carry (ADR-0044): absent on pre-carry entries and on
+        // empty-carry entries, both of which read as no carry. Only string
+        // members are kept, so a garbled element cannot inject a non-path value.
+        carry_paths: value
+            .get("carryPaths")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// A persisted `fold` entry's rebuild-relevant fields (ADR-0048): the durable
+/// message id whose `Tool`-role result was folded, the deterministic stub that
+/// replaces its rendered content, and the stub's persisted token estimate (the
+/// stub stands in for the folded result in the context total).
+struct Fold {
+    target_id: String,
+    stub: String,
+    token_estimate: Option<u64>,
+}
+
+/// Parse a `fold` entry's rebuild fields. `None` (skipped as malformed) when a
+/// required field is missing, mirroring the line-level leniency for
+/// truncated/garbled entries.
+fn parse_fold(value: &Value) -> Option<Fold> {
+    Some(Fold {
+        target_id: value.get("targetId").and_then(Value::as_str)?.to_string(),
+        stub: value.get("stub").and_then(Value::as_str)?.to_string(),
+        token_estimate: value.get("tokenEstimate").and_then(Value::as_u64),
     })
 }
 
 /// Rebuild the provider-visible message list, replacing each compaction's
 /// covered inclusive id range with a single summary message in place of the
-/// first covered message.
+/// first covered message, then applying each fold's stub to any target message
+/// a compaction did not already cover (ADR-0048 precedence: compactions win).
 ///
 /// Coverage is keyed on durable message entry ids, not array positions, so the
 /// result is stable across reads. Multiple non-overlapping compactions apply
@@ -1031,17 +1266,20 @@ fn rebuild_with_compactions(
     path: &Path,
     entries: Vec<MessageEntry>,
     compactions: Vec<Compaction>,
+    folds: Vec<Fold>,
 ) -> Result<RebuiltContext> {
-    if compactions.is_empty() {
+    if compactions.is_empty() && folds.is_empty() {
         // saturating: tokenEstimate is read from disk; a corrupted/edited file
         // must not panic (debug) or wrap (release) the read, matching the rest
         // of this module's never-crash-on-bad-data stance.
         let context_tokens = entries
             .iter()
             .fold(0u64, |acc, e| acc.saturating_add(e.tokens));
-        // No compaction: every entry stays verbatim, so its durable id carries
-        // through 1:1 (legacy id-less entries stay `None`). Parallel to
-        // `messages` so a resumed session can compact the loaded prefix.
+        // No compaction and no fold: every entry stays verbatim, so its durable
+        // id carries through 1:1 (legacy id-less entries stay `None`). Parallel
+        // to `messages` so a resumed session can compact the loaded prefix. This
+        // is the byte-identical-when-absent path (ADR-0048): a session with no
+        // fold entries rebuilds exactly as it did before folds existed.
         let entry_ids = entries.iter().map(|e| e.id.clone()).collect();
         let messages = entries.into_iter().map(|e| e.message).collect();
         return Ok(RebuiltContext {
@@ -1085,13 +1323,43 @@ fn rebuild_with_compactions(
             }
             *slot = true;
         }
-        // Prefer the compaction's persisted estimate; recompute from the summary
-        // text when absent, so the summary contributes its own tokens to the
-        // total instead of the covered turns it replaced.
+        // The compaction message body is the prose summary plus the carry block
+        // (ADR-0044); with an empty carry it is exactly the summary, so pre-carry
+        // entries rebuild unchanged. Prefer the persisted estimate (which already
+        // counts summary + carry); recompute from the rendered body when absent,
+        // so the body contributes its own tokens instead of the covered turns.
+        let body = render_compaction_body(&compaction.summary, &compaction.carry_paths);
         let summary_tokens = compaction
             .token_estimate
-            .unwrap_or_else(|| estimate_tokens(&compaction.summary));
-        summary_at[from] = Some((compaction.summary, summary_tokens));
+            .unwrap_or_else(|| estimate_tokens(&body));
+        summary_at[from] = Some((body, summary_tokens));
+    }
+
+    // Folds apply AFTER compaction coverage (ADR-0048 precedence): a fold whose
+    // target lies in a covered range is a no-op, so a fold never overrides a
+    // range a compaction already covers. The stub (and its token estimate)
+    // replaces the folded result's rendered content at its own position; the
+    // message keeps its role/pairing and durable id, so a folded result stays
+    // coverable by a later compaction. An unknown target id is skipped with the
+    // same leniency the read path applies to other malformed data.
+    let mut fold_at: Vec<Option<(String, u64)>> = vec![None; entries.len()];
+    for fold in folds {
+        let Some(&idx) = index_of.get(&fold.target_id) else {
+            tracing::warn!(
+                target = %fold.target_id,
+                path = %path.display(),
+                "skipping fold for unknown message id"
+            );
+            continue;
+        };
+        // Compaction wins: a fold inside a covered range is a no-op.
+        if covered[idx] {
+            continue;
+        }
+        let stub_tokens = fold
+            .token_estimate
+            .unwrap_or_else(|| estimate_tokens(&fold.stub));
+        fold_at[idx] = Some((fold.stub, stub_tokens));
     }
 
     let mut messages = Vec::new();
@@ -1117,9 +1385,20 @@ fn rebuild_with_compactions(
             context_tokens = context_tokens.saturating_add(summary_tokens);
         }
         if !covered[i] {
-            context_tokens = context_tokens.saturating_add(entry.tokens);
-            messages.push(entry.message);
-            entry_ids.push(entry.id);
+            if let Some((stub, stub_tokens)) = fold_at[i].take() {
+                // Fold: replace only the result's rendered content with the
+                // deterministic stub, keeping the role/tool pairing and durable
+                // id so the pair invariant holds and the message stays coverable.
+                context_tokens = context_tokens.saturating_add(stub_tokens);
+                let mut folded = entry.message;
+                folded.content = stub;
+                messages.push(folded);
+                entry_ids.push(entry.id);
+            } else {
+                context_tokens = context_tokens.saturating_add(entry.tokens);
+                messages.push(entry.message);
+                entry_ids.push(entry.id);
+            }
         }
     }
     Ok(RebuiltContext {
@@ -1426,6 +1705,48 @@ mod tests {
     }
 
     #[test]
+    fn append_dangerous_mode_writes_an_audit_entry() {
+        // ADR-0049: the skip-permissions mode is recorded as transcript
+        // metadata so a resumed/audited session shows it was active.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append_dangerous_mode().unwrap();
+        let entries = lines(log.path());
+        assert_eq!(entries.len(), 2); // header + marker
+        assert_eq!(entries[1]["type"], "dangerousMode");
+        assert_eq!(entries[1]["mode"], "dangerously-skip-permissions");
+        assert!(entries[1]["parentId"].is_null());
+    }
+
+    #[test]
+    fn resume_chains_through_the_dangerous_mode_entry() {
+        // The audit marker occupies the leaf chain, so a resumed append must
+        // link its parentId to it (not fork past it) and never reuse its id.
+        let dir = temp_dir();
+        let path = {
+            let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+            log.append_dangerous_mode().unwrap();
+            log.append(&Message::user("hi")).unwrap();
+            log.path().to_path_buf()
+        };
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        resumed.append(&Message::assistant("there")).unwrap();
+        let entries = lines(&path);
+        assert_eq!(entries.len(), 4); // header + marker + user + assistant
+        let marker_id = entries[1]["id"].as_str().unwrap();
+        let user_id = entries[2]["id"].as_str().unwrap();
+        let asst_id = entries[3]["id"].as_str().unwrap();
+        assert_eq!(
+            entries[2]["parentId"], marker_id,
+            "user links to the marker"
+        );
+        assert_eq!(entries[3]["parentId"], user_id, "resumed append chains on");
+        // Ids are unique: the resumed append did not collide with the marker.
+        assert_ne!(asst_id, marker_id);
+        assert_ne!(asst_id, user_id);
+    }
+
+    #[test]
     fn append_writes_one_message_line_per_entry() {
         let dir = temp_dir();
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
@@ -1555,6 +1876,251 @@ mod tests {
         store.open(&meta).unwrap()
     }
 
+    /// A successful `read` tool-result the way Nexus persists it (ADR-0021): the
+    /// content is the success envelope naming the workspace-relative target.
+    fn read_result(call_id: &str, target: &str, body: &str) -> Message {
+        Message::tool_result(
+            call_id,
+            "read",
+            &json!({
+                "ok": true,
+                "content": body,
+                "metadata": { "target": target }
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn fold_replaces_result_content_but_keeps_the_call_pairing_and_id() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "SECRET-NEEDLE payload"))
+            .unwrap();
+        log.append_fold(
+            &result_id,
+            "[folded] superseded read of `a.rs`; re-read to recover.",
+            None,
+        )
+        .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        // No message is removed: the user turn and the (folded) tool result both
+        // remain, so the tool call/result pairing is intact.
+        assert_eq!(session.messages.len(), 2);
+        let folded = &session.messages[1];
+        assert_eq!(folded.role, Role::Tool);
+        assert_eq!(folded.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(folded.tool_name.as_deref(), Some("read"));
+        // The result content is the deterministic stub, not the original payload.
+        assert_eq!(
+            folded.content,
+            "[folded] superseded read of `a.rs`; re-read to recover."
+        );
+        assert!(!folded.content.contains("SECRET-NEEDLE"));
+        // The folded message keeps its durable id, so it stays coverable by a
+        // later compaction.
+        assert_eq!(session.entry_ids[1].as_deref(), Some(result_id.as_str()));
+    }
+
+    #[test]
+    fn needle_from_a_folded_read_survives_verbatim_behind_the_named_reference() {
+        // ADR-0045/0048 needle contract: a load-bearing needle from a folded
+        // read must survive either in context or behind a named reference that
+        // survives rebuild verbatim. The rebuilt stub NAMES the path (the named
+        // reference); the ORIGINAL turn stays verbatim in the transcript and is
+        // recoverable through the standalone-span reader (the #373 recall tool).
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read src/lib.rs")).unwrap();
+        let result_id = log
+            .append(&read_result(
+                "call_9",
+                "src/lib.rs",
+                "fn load_bearing_NEEDLE() {}",
+            ))
+            .unwrap();
+        log.append_fold(
+            &result_id,
+            "[folded] The `read` result for `src/lib.rs` was superseded and folded; \
+             re-read the file or recall the original.",
+            None,
+        )
+        .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Rebuilt context: the needle is gone from the result, but the stub names
+        // the recoverable path (the named reference).
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert!(!session.messages[1].content.contains("NEEDLE"));
+        assert!(session.messages[1].content.contains("src/lib.rs"));
+
+        // Recovery: the ORIGINAL turn survives verbatim in the transcript, so the
+        // recall span reader returns the needle unchanged.
+        let target_num = u64::from_str_radix(&result_id, 16).unwrap();
+        let span = read_span(&path, target_num, target_num).unwrap();
+        assert_eq!(span.len(), 1);
+        assert!(span[0].1.content.contains("fn load_bearing_NEEDLE() {}"));
+    }
+
+    #[test]
+    fn fold_outside_any_compacted_range_applies() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages[1].content, "[folded] stub for a.rs");
+    }
+
+    #[test]
+    fn fold_then_compact_over_the_same_range_lets_compaction_win() {
+        // Order (a): the fold is written FIRST, then a compaction covers a range
+        // that includes the folded target. The compaction must win: the covered
+        // range collapses to the summary and the fold stub never appears.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let first = log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        // Fold first.
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+            .unwrap();
+        // Then compact the range [first, result_id], covering the folded target.
+        log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        let joined = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("SUMMARY of the range"));
+        assert!(
+            !joined.contains("FOLD-STUB"),
+            "compaction must block the fold inside its covered range"
+        );
+        // The covered range collapsed to the single summary message.
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn compact_blocks_a_fold_written_inside_an_already_covered_range() {
+        // Order (b): the compaction is written FIRST, then a fold targets a
+        // message inside the already-covered range. Same outcome as order (a) --
+        // the compaction wins and the stub never appears -- proving precedence
+        // is order-independent.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let first = log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        // Compact first.
+        log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
+            .unwrap();
+        // Then attempt to fold a target inside the covered range.
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        let joined = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("SUMMARY of the range"));
+        assert!(
+            !joined.contains("FOLD-STUB"),
+            "a fold inside an already-compacted range must be a no-op"
+        );
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_honors_persisted_folds_regardless_of_current_setting() {
+        // The setting gates fold WRITING, not reading: a transcript that already
+        // carries fold entries rebuilds through them on every open, so a session
+        // folded under one setting reads identically under another. Rebuild has
+        // no access to the live setting -- it always applies persisted folds.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "original body"))
+            .unwrap();
+        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+            .unwrap();
+        drop(log);
+
+        // Reopen twice: the persisted fold is honored both times.
+        for _ in 0..2 {
+            let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+            assert_eq!(session.messages[1].content, "[folded] stub for a.rs");
+        }
+    }
+
+    #[test]
+    fn a_session_with_no_folds_rebuilds_unchanged() {
+        // Additive-optional persistence: with no fold entries the rebuild is
+        // byte-identical to the pre-fold behavior -- every message stays verbatim
+        // and no fold key touches the message/compaction entries on disk.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("hello")).unwrap();
+        log.append(&read_result("call_1", "a.rs", "verbatim body"))
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages[0].content, "hello");
+        assert!(session.messages[1].content.contains("verbatim body"));
+        // No `fold` line is present in the transcript.
+        let raw = lines(&session.meta.path);
+        assert!(raw.iter().all(|entry| entry["type"] != "fold"));
+    }
+
+    #[test]
+    fn a_fold_for_an_unknown_target_id_is_skipped_leniently() {
+        // A fold naming a message id that is not present must not crash the read
+        // (matching the read path's never-crash-on-bad-data stance) and must not
+        // alter any message.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        log.append(&Message::user("hello")).unwrap();
+        log.append_fold("deadbeef", "[folded] orphan stub", None)
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "hello");
+    }
+
     #[test]
     fn store_opens_a_session_by_id_and_reads_messages_in_order() {
         let dir = temp_dir();
@@ -1653,6 +2219,45 @@ mod tests {
         // The continued entry links to the prior leaf and gets a fresh id.
         assert_eq!(entries[3]["parentId"], second_id);
         assert_ne!(third_id, second_id);
+    }
+
+    #[test]
+    fn resume_after_a_fold_keeps_the_fold_in_the_durable_id_chain() {
+        // Regression (issue #378): `append_fold` writes an id, advances the leaf,
+        // and consumes a seq. If `scan_for_resume` ignores `fold`, the next
+        // append after resuming a folded transcript reuses the fold's id and
+        // parent-links around it, corrupting the durable id chain. The resumed
+        // append must chain PAST the fold: fresh id (no collision) and a
+        // `parentId` pointing at the fold leaf.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        log.append(&Message::user("read a.rs")).unwrap();
+        let result_id = log
+            .append(&read_result("call_1", "a.rs", "payload"))
+            .unwrap();
+        let fold_id = log
+            .append_fold(&result_id, "[folded] superseded read of `a.rs`.", None)
+            .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Resume the folded transcript and continue it.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        resumed.append(&Message::user("next turn")).unwrap();
+        drop(resumed);
+
+        let entries = lines(&path);
+        // header + user + result + fold + new message.
+        assert_eq!(entries.len(), 5);
+        let persisted_fold_id = entries[3]["id"].as_str().unwrap();
+        assert_eq!(entries[3]["type"], "fold");
+        assert_eq!(persisted_fold_id, fold_id);
+        let new_id = entries[4]["id"].as_str().unwrap();
+        assert_eq!(entries[4]["message"]["content"], "next turn");
+        // The continued entry must not reuse the fold's id...
+        assert_ne!(new_id, fold_id);
+        // ...and must parent-link to the fold leaf, not around it.
+        assert_eq!(entries[4]["parentId"], fold_id);
     }
 
     #[test]
@@ -2146,7 +2751,7 @@ mod tests {
         let from = log.append(&Message::user("alpha")).unwrap();
         let to = log.append(&Message::assistant("beta")).unwrap();
         let compaction_id = log
-            .append_compaction(&from, &to, "summary text", None)
+            .append_compaction(&from, &to, "summary text", &[], None)
             .unwrap();
 
         let entries = lines(log.path());
@@ -2162,6 +2767,137 @@ mod tests {
         // Token estimate is an explicit upgrade-safe placeholder until a token
         // convention exists.
         assert!(entry["tokenEstimate"].is_null());
+        // The first compaction in the session persists generation 1 (ADR-0047).
+        assert_eq!(entry["generation"], 1);
+    }
+
+    #[test]
+    fn append_compaction_increments_the_generation_ordinal() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let a = log.append(&Message::user("a")).unwrap();
+        let b = log.append(&Message::assistant("b")).unwrap();
+        let c = log.append(&Message::user("c")).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
+        assert_eq!(log.compaction_generation(), 1);
+        log.append_compaction(&b, &c, "S2", &[], None).unwrap();
+        assert_eq!(log.compaction_generation(), 2);
+
+        let entries = lines(log.path());
+        let generations: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["type"] == "compaction")
+            .map(|e| &e["generation"])
+            .collect();
+        assert_eq!(generations, [&Value::from(1), &Value::from(2)]);
+    }
+
+    // Injecting a write failure needs a writable path whose writes always fail;
+    // `/dev/full` (Linux) accepts opens but returns ENOSPC on every write, so it
+    // is the cleanest failure seam without a fake writer trait.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_compaction_append_does_not_advance_the_generation() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let path = log.path().to_path_buf();
+        let a = log.append(&Message::user("a")).unwrap();
+
+        // Redirect writes to /dev/full so the next append fails mid-write while
+        // the in-memory counter is still 0.
+        log.file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        assert!(
+            log.append_compaction(&a, &a, "S1", &[], None).is_err(),
+            "write to /dev/full must fail"
+        );
+        // The failed append must not have advanced the counter.
+        assert_eq!(log.compaction_generation(), 0);
+
+        // Restore a real writable handle; the first durable compaction after a
+        // failed attempt must still report generation 1, not 2.
+        log.file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
+        assert_eq!(log.compaction_generation(), 1);
+
+        let entries = lines(log.path());
+        let generations: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["type"] == "compaction")
+            .map(|e| &e["generation"])
+            .collect();
+        // Exactly one durable compaction entry, persisting generation 1.
+        assert_eq!(generations, [&Value::from(1)]);
+    }
+
+    #[test]
+    fn resume_continues_the_compaction_generation_count() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let a = log.append(&Message::user("a")).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
+        assert_eq!(log.compaction_generation(), 1);
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Resume seeds the counter from the one prior compaction entry, so the
+        // next compaction continues at generation 2 rather than restarting.
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        let b = resumed.append(&Message::user("b")).unwrap();
+        resumed.append_compaction(&b, &b, "S2", &[], None).unwrap();
+        assert_eq!(resumed.compaction_generation(), 2);
+        drop(resumed);
+
+        let generations: Vec<Value> = lines(&path)
+            .into_iter()
+            .filter(|e| e["type"] == "compaction")
+            .map(|e| e["generation"].clone())
+            .collect();
+        assert_eq!(generations, [Value::from(1), Value::from(2)]);
+    }
+
+    #[test]
+    fn legacy_compaction_without_generation_rebuilds_unchanged() {
+        // A session written before ADR-0047 has no `generation` field on its
+        // compaction entry. Rebuild must be byte-for-byte unaffected by the new
+        // optional field: same messages, and the read never rewrites the file.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let leaf = log.append(&Message::user("gamma")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        // Hand-append a legacy compaction entry with no `generation` field.
+        let legacy = json!({
+            "type": "compaction",
+            "id": "deadbeef",
+            "parentId": leaf,
+            "timestamp": 1,
+            "createdAt": 1,
+            "coveredFrom": from,
+            "coveredTo": to,
+            "summary": "LEGACY",
+            "tokenEstimate": Value::Null,
+        });
+        let mut line = serde_json::to_string(&legacy).unwrap();
+        line.push('\n');
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+
+        let store = SessionStore::with_root(dir.path.clone());
+        let session = open_by_id(&store, &id);
+        assert_eq!(contents(&session), ["LEGACY", "gamma"]);
+        // Reading the legacy session did not rewrite it.
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -2173,7 +2909,8 @@ mod tests {
         let to = log.append(&Message::assistant("beta")).unwrap();
         log.append(&Message::user("gamma")).unwrap();
         log.append(&Message::assistant("delta")).unwrap();
-        log.append_compaction(&from, &to, "SUMMARY", None).unwrap();
+        log.append_compaction(&from, &to, "SUMMARY", &[], None)
+            .unwrap();
         drop(log);
 
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
@@ -2191,6 +2928,145 @@ mod tests {
     }
 
     #[test]
+    fn append_compaction_writes_carry_paths_when_present() {
+        // ADR-0044: the carry is an additive optional `carryPaths` field; the
+        // prose `summary` stays carry-free, and the existing fields are unchanged.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let carry = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        log.append_compaction(&from, &to, "prose only", &carry, Some(9))
+            .unwrap();
+
+        let entry = lines(log.path()).pop().unwrap();
+        assert_eq!(entry["summary"], "prose only");
+        assert_eq!(entry["carryPaths"], json!(["src/a.rs", "src/b.rs"]));
+        assert_eq!(entry["tokenEstimate"], json!(9));
+        assert_eq!(entry["generation"], 1);
+    }
+
+    #[test]
+    fn empty_carry_writes_no_field_and_stays_byte_identical() {
+        // ADR-0044 item 5: an empty carry writes no `carryPaths` key, so the
+        // serialized compaction entry is byte-identical to the pre-carry entry
+        // and older readers are unaffected.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        log.append_compaction(&from, &to, "SUMMARY", &[], None)
+            .unwrap();
+        drop(log);
+
+        // The raw persisted line carries no carry field at all.
+        let raw = fs::read_to_string(
+            SessionStore::with_root(dir.path.clone())
+                .find(&id)
+                .unwrap()
+                .unwrap()
+                .path,
+        )
+        .unwrap();
+        assert!(
+            !raw.contains("carryPaths"),
+            "empty carry must not serialize a carryPaths field"
+        );
+        let entry: Value = raw
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["type"] == "compaction")
+            .unwrap();
+        assert!(
+            !entry.as_object().unwrap().contains_key("carryPaths"),
+            "empty carry must not add a carryPaths key"
+        );
+
+        // Rebuild is unchanged: summary in, no carry block.
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(contents(&session), ["SUMMARY"]);
+    }
+
+    #[test]
+    fn rebuild_renders_summary_and_carry_and_counts_the_carry_tokens() {
+        // ADR-0044 item 3: rebuild renders summary + carry, and the carry's
+        // tokens are counted in the entry estimate the rebuilt total uses.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let carry = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        // Mirror the live path: the persisted estimate is the rendered body's.
+        let body = render_compaction_body("SUMMARY", &carry);
+        log.append_compaction(&from, &to, "SUMMARY", &carry, Some(estimate_tokens(&body)))
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        // One rebuilt message: the summary plus the carry block verbatim.
+        assert_eq!(session.messages.len(), 1);
+        let rebuilt = &session.messages[0].content;
+        assert!(rebuilt.starts_with("SUMMARY"));
+        assert!(rebuilt.contains("src/a.rs") && rebuilt.contains("src/b.rs"));
+        assert_eq!(*rebuilt, body);
+        // The total counts the summary + carry body, not the covered turns.
+        assert_eq!(session.context_tokens, estimate_tokens(&body));
+    }
+
+    #[test]
+    fn carry_paths_survive_a_summary_that_omits_them() {
+        // ADR-0044 item 4 (retention contract that retires ADR-0041's named
+        // risk): a load-bearing path dropped from the prose summary still
+        // survives in the carry through rebuild.
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        // The summary deliberately omits the load-bearing path.
+        let summary = "the agent finished the task";
+        let carry = vec!["src/load_bearing.rs".to_string()];
+        assert!(!summary.contains("load_bearing"));
+        let body = render_compaction_body(summary, &carry);
+        log.append_compaction(&from, &to, summary, &carry, Some(estimate_tokens(&body)))
+            .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert!(
+            session.messages[0].content.contains("src/load_bearing.rs"),
+            "the carried path must survive a summary that dropped it"
+        );
+    }
+
+    #[test]
+    fn compaction_entry_without_carry_field_rebuilds() {
+        // ADR-0044 item 2 (backward compat): a pre-carry compaction entry with
+        // no carryPaths field rebuilds exactly as before.
+        let dir = temp_dir();
+        let cwd_dir = dir.path.join("w");
+        fs::create_dir(&cwd_dir).unwrap();
+        let path = cwd_dir.join("legacy.jsonl");
+        let legacy = concat!(
+            r#"{"type":"session","version":2,"id":"nocarry1","timestamp":1700000000000,"cwd":"/w"}"#,
+            "\n",
+            r#"{"type":"message","id":"00000000","parentId":null,"timestamp":1700000000001,"tokenEstimate":1,"message":{"role":"user","content":"alpha"}}"#,
+            "\n",
+            r#"{"type":"message","id":"00000001","parentId":"00000000","timestamp":1700000000002,"tokenEstimate":1,"message":{"role":"assistant","content":"beta"}}"#,
+            "\n",
+            // A compaction entry as written before ADR-0044: no carryPaths key.
+            r#"{"type":"compaction","id":"00000002","parentId":"00000001","timestamp":1700000000003,"createdAt":1700000000003,"coveredFrom":"00000000","coveredTo":"00000001","summary":"OLD SUMMARY","tokenEstimate":3}"#,
+            "\n",
+        );
+        fs::write(&path, legacy).unwrap();
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), "nocarry1");
+        assert_eq!(contents(&session), ["OLD SUMMARY"]);
+    }
+
+    #[test]
     fn rebuild_applies_multiple_non_overlapping_compactions() {
         let dir = temp_dir();
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
@@ -2199,8 +3075,8 @@ mod tests {
         log.append(&Message::assistant("b")).unwrap();
         let c = log.append(&Message::user("c")).unwrap();
         log.append(&Message::assistant("d")).unwrap();
-        log.append_compaction(&a, &a, "S1", None).unwrap();
-        log.append_compaction(&c, &c, "S2", None).unwrap();
+        log.append_compaction(&a, &a, "S1", &[], None).unwrap();
+        log.append_compaction(&c, &c, "S2", &[], None).unwrap();
         drop(log);
 
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
@@ -2217,8 +3093,8 @@ mod tests {
         let b = log.append(&Message::assistant("b")).unwrap();
         let c = log.append(&Message::user("c")).unwrap();
         // Two compactions whose covered ranges overlap on `b`.
-        log.append_compaction(&a, &b, "S1", None).unwrap();
-        log.append_compaction(&b, &c, "S2", None).unwrap();
+        log.append_compaction(&a, &b, "S1", &[], None).unwrap();
+        log.append_compaction(&b, &c, "S2", &[], None).unwrap();
         drop(log);
 
         let store = SessionStore::with_root(dir.path.clone());
@@ -2236,7 +3112,7 @@ mod tests {
         let id = log.id().to_string();
         log.append(&Message::user("a")).unwrap();
         // `ffffffff` is not an entry id in this session.
-        log.append_compaction("ffffffff", "ffffffff", "S", None)
+        log.append_compaction("ffffffff", "ffffffff", "S", &[], None)
             .unwrap();
         drop(log);
 
@@ -2252,7 +3128,7 @@ mod tests {
         let id = log.id().to_string();
         let from = log.append(&Message::user("a")).unwrap();
         let to = log.append(&Message::assistant("b")).unwrap();
-        let compaction_id = log.append_compaction(&from, &to, "SUM", None).unwrap();
+        let compaction_id = log.append_compaction(&from, &to, "SUM", &[], None).unwrap();
         let path = log.path().to_path_buf();
         drop(log);
 
@@ -2370,7 +3246,7 @@ mod tests {
             .unwrap();
         let tail = Message::user("short tail");
         log.append(&tail).unwrap();
-        log.append_compaction(&from, &to, "sum", None).unwrap();
+        log.append_compaction(&from, &to, "sum", &[], None).unwrap();
         drop(log);
 
         let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);

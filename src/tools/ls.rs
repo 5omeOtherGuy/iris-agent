@@ -48,7 +48,10 @@ pub(super) fn parameters() -> Value {
 pub(super) fn execute(root: &Path, args: &Value, _reduce: bool) -> Result<super::ToolOutput> {
     let input: LsInput =
         serde_json::from_value(args.clone()).context("ls tool arguments are invalid")?;
-    ls(root, &input)
+    // Record the listed directory for the compaction carry (ADR-0044); the
+    // workspace root itself renders empty and is not carried.
+    let target = input.path.clone().unwrap_or_else(|| ".".to_string());
+    Ok(ls(root, &input)?.with_workspace_target(root, &target))
 }
 
 #[derive(Debug, Deserialize)]

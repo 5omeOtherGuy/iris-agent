@@ -89,6 +89,7 @@ pub(crate) enum Field {
     Theme,
     DefaultApproval,
     ContextTokenBudget,
+    Microcompaction,
     MaxToolRoundtrips,
     PromptCacheRetention,
     VerifyCommand,
@@ -120,9 +121,10 @@ impl Field {
                 Category::Display
             }
             Field::DefaultApproval => Category::Approvals,
-            Field::ContextTokenBudget | Field::MaxToolRoundtrips | Field::PromptCacheRetention => {
-                Category::Runtime
-            }
+            Field::ContextTokenBudget
+            | Field::Microcompaction
+            | Field::MaxToolRoundtrips
+            | Field::PromptCacheRetention => Category::Runtime,
             Field::VerifyCommand | Field::VerifyMaxAttempts => Category::Verification,
             Field::WorktreeRoot => Category::Providers,
         }
@@ -136,6 +138,7 @@ impl Field {
             Field::Theme => "Theme",
             Field::DefaultApproval => "Default approval",
             Field::ContextTokenBudget => "Context token budget",
+            Field::Microcompaction => "Microcompaction",
             Field::MaxToolRoundtrips => "Max tool round-trips",
             Field::PromptCacheRetention => "Prompt cache retention",
             Field::VerifyCommand => "Verify command",
@@ -179,7 +182,7 @@ impl Field {
                 allow_empty: false,
             },
             Field::VerifyCommand | Field::WorktreeRoot => FieldKind::Text { allow_empty: true },
-            Field::ReducedMotion => FieldKind::Bool,
+            Field::ReducedMotion | Field::Microcompaction => FieldKind::Bool,
         }
     }
 }
@@ -197,6 +200,7 @@ pub(crate) struct Snapshot {
     pub(crate) reduced_motion: bool,
     pub(crate) default_approval: String,
     pub(crate) context_token_budget: u64,
+    pub(crate) microcompaction: bool,
     pub(crate) max_tool_roundtrips: Option<usize>,
     pub(crate) prompt_cache_retention: String,
     pub(crate) verify_command: Option<String>,
@@ -216,6 +220,7 @@ impl Snapshot {
             Field::Theme => self.theme.clone(),
             Field::DefaultApproval => self.default_approval.clone(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
+            Field::Microcompaction => on_off(self.microcompaction),
             Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
                 Some(cap) => cap.to_string(),
                 None => "unbounded".to_string(),
@@ -272,7 +277,11 @@ struct Row {
 fn field_row(field: Field, snapshot: &Snapshot) -> Row {
     let action = match field.kind() {
         FieldKind::Bool => {
-            let current = matches!(field, Field::ReducedMotion if snapshot.reduced_motion);
+            let current = match field {
+                Field::ReducedMotion => snapshot.reduced_motion,
+                Field::Microcompaction => snapshot.microcompaction,
+                _ => false,
+            };
             ModalAction::SaveSetting {
                 field,
                 value: Some((!current).to_string()),
@@ -330,6 +339,7 @@ fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
         ],
         Category::Runtime => vec![
             field_row(Field::ContextTokenBudget, snapshot),
+            field_row(Field::Microcompaction, snapshot),
             field_row(Field::MaxToolRoundtrips, snapshot),
             field_row(Field::PromptCacheRetention, snapshot),
         ],
@@ -684,6 +694,7 @@ mod tests {
             reduced_motion: false,
             default_approval: "strict".to_string(),
             context_token_budget: 128_000,
+            microcompaction: false,
             max_tool_roundtrips: None,
             prompt_cache_retention: "short".to_string(),
             verify_command: None,
