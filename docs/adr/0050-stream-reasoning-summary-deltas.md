@@ -35,7 +35,11 @@ instead of) the persisted reasoning row and the terminal block-level event.
   `response.reasoning_summary_text.delta` is forwarded. `response.reasoning_text.delta`
   (raw reasoning content) is deliberately not mapped. Summary deltas are never
   accumulated into the stored reasoning text or the assistant answer; the
-  persisted block still comes from the completed turn.
+  persisted block still comes from the completed turn. The completion fallback
+  is summary-only too: `extract_reasoning_text` reads the `summary` parts only,
+  so raw `content` never reaches display or storage on any path (it is normally
+  absent under Iris's encrypted-reasoning request, which carries the raw
+  reasoning as opaque continuity).
 - **Storage is untouched (ADR-0016).** The `Role::AssistantReasoning` row, its
   `continuity`, `redacted` flag, and `ModelOrigin` are written exactly as before,
   exactly once. Emission stays additive.
@@ -98,6 +102,3 @@ instead of) the persisted reasoning row and the terminal block-level event.
   visible summaries in one turn would need a per-block match instead of the
   `saw_reasoning_delta` boolean. Covered for the current provider by the
   streamed-summary + redacted-block regression test.
-- Raw `content` remains joined into the *terminal block's* display text
-  (pre-existing behavior, ADR-0025); it is unreachable under Iris's
-  encrypted-reasoning request and out of this decision's scope.

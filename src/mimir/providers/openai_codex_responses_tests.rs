@@ -797,11 +797,13 @@ fn visible_reasoning_summary_disables_silent_retry() -> Result<()> {
 }
 
 #[test]
-fn reasoning_summary_and_content_text_are_separated() {
+fn reasoning_display_text_is_summary_only_never_raw_content() {
+    // Display/stored reasoning text is the human-readable summary ONLY; the raw
+    // `content` chain-of-thought is never surfaced (ADR-0049).
     let text = extract_reasoning_text(&json!({
         "type": "reasoning",
         "summary": [{ "type": "summary_text", "text": "summary" }],
-        "content": [{ "type": "reasoning_text", "text": "content" }]
+        "content": [{ "type": "reasoning_text", "text": "raw cot" }]
     }));
-    assert_eq!(text, "summary\ncontent");
+    assert_eq!(text, "summary");
 }

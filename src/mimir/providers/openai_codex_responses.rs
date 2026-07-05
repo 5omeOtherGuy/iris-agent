@@ -841,22 +841,21 @@ fn extract_reasoning_block(value: &Value, origin: &ModelOrigin) -> Option<Reason
     })
 }
 
+/// Extract the display-safe reasoning text: the human-readable `summary` only.
+/// The raw `content` (chain-of-thought) is deliberately excluded from anything
+/// shown or stored as visible text (ADR-0049). It is normally absent anyway
+/// because Iris always requests encrypted reasoning, which is carried
+/// separately as opaque continuity, never rendered.
 fn extract_reasoning_text(value: &Value) -> String {
-    let mut groups = Vec::new();
-    for key in ["summary", "content"] {
-        let mut group = String::new();
-        if let Some(parts) = value.get(key).and_then(Value::as_array) {
-            for part in parts {
-                if let Some(part_text) = part.get("text").and_then(Value::as_str) {
-                    group.push_str(part_text);
-                }
+    let mut summary = String::new();
+    if let Some(parts) = value.get("summary").and_then(Value::as_array) {
+        for part in parts {
+            if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+                summary.push_str(part_text);
             }
         }
-        if !group.is_empty() {
-            groups.push(group);
-        }
     }
-    groups.join("\n")
+    summary
 }
 
 fn extract_openai_usage(value: &Value, model: &str) -> Option<ProviderUsage> {
