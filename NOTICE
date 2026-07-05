@@ -1,0 +1,25 @@
+Iris
+Copyright 2025 The Iris authors
+
+This product includes software developed at Iris (MIT-licensed; see LICENSE).
+
+------------------------------------------------------------------------------
+
+This product includes code derived from OpenAI Codex
+(https://github.com/openai/codex), Copyright 2025 OpenAI, licensed under the
+Apache License, Version 2.0 (see LICENSE-APACHE).
+
+The following files are copied from or derived from OpenAI Codex and are
+distributed under the Apache License, Version 2.0. Each carries an
+SPDX-License-Identifier header and a note describing what changed:
+
+  - src/ui/tui/streaming/chunking.rs
+      derived from codex-rs/tui/src/streaming/chunking.rs
+  - src/ui/tui/streaming/collector.rs
+      derived from codex-rs/tui/src/markdown_stream.rs
+  - src/ui/tui/streaming/table_holdback.rs
+      derived from codex-rs/tui/src/streaming/table_holdback.rs and
+      codex-rs/tui/src/table_detect.rs
+  - src/ui/tui/streaming/controller.rs
+      derived from codex-rs/tui/src/streaming/controller.rs and
+      codex-rs/tui/src/streaming/commit_tick.rs

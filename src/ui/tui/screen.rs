@@ -1245,6 +1245,18 @@ impl Screen {
         self.spinner.tick()
     }
 
+    /// Drive one paced assistant-stream commit tick: migrate newly-stable
+    /// streamed lines into scrollback. Returns `true` when rows were committed
+    /// (a redraw is due). Called from the render loop's tick while a turn runs.
+    pub(crate) fn commit_stream_tick(&mut self, now: std::time::Instant) -> bool {
+        self.transcript.commit_stream_tick(now)
+    }
+
+    /// Whether the assistant stream still has content to pace into scrollback.
+    pub(crate) fn has_stream_work(&self) -> bool {
+        self.transcript.has_stream_work()
+    }
+
     // --- approval ---
 
     /// Show a gated tool's approval prompt in the status row. The transcript

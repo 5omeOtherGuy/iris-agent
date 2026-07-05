@@ -50,6 +50,7 @@ mod screen;
 mod session_menu;
 mod shell_command;
 mod startup;
+mod streaming;
 mod text;
 mod tool_render;
 mod transcript;
@@ -98,7 +99,6 @@ const EDITOR_BOTTOM_PADDING_ROWS: u16 = 1;
 /// transcript state bounded. The terminal's own scrollback already contains
 /// earlier emitted rows; Iris keeps the recent tail for resize replay.
 const MAX_TRANSCRIPT_ROWS: usize = 10_000;
-const MAX_STREAMING_MARKDOWN_BYTES: usize = 64 * 1024;
 
 /// Flood guard: cap a tool result at this many physical (wrapped) rows in the
 /// transcript so a few very long lines cannot flood the viewport/scrollback.
@@ -943,7 +943,7 @@ mod tests {
 
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["Hello".to_string(), String::new()]);
-        assert!(screen.transcript.streaming.is_none());
+        assert!(!screen.transcript.stream.is_active());
     }
 
     #[test]
@@ -1074,6 +1074,245 @@ mod tests {
         assert!(
             narrow.iter().all(|l| display_width(&line_text(l)) <= 12),
             "memoized streaming lines not re-wrapped for the narrower width"
+        );
+    }
+
+    // --- Slice 1: assistant-message stream controller (issue #87) ---
+
+    #[test]
+    fn streamed_block_commits_to_scrollback_before_end() {
+        // DoD: a completed streamed line enters transcript scrollback BEFORE
+        // `AssistantTextEnd`, and the in-progress tail is not committed until
+        // finalize.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "First paragraph.\n\n".to_string(),
+        ));
+        // Pacing happens on the commit tick, not on the delta.
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "nothing commits before a commit tick"
+        );
+        let now = std::time::Instant::now();
+        assert!(
+            screen.commit_stream_tick(now),
+            "a completed block commits on the tick"
+        );
+        let committed: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert!(
+            committed.iter().any(|t| t.contains("First paragraph.")),
+            "first block in scrollback before End: {committed:?}"
+        );
+        assert!(screen.transcript.stream.is_active(), "stream still active");
+
+        // An in-progress second block stays in the mutable tail, not scrollback,
+        // but is visible in the rendered frame.
+        screen.apply(UiEvent::AssistantTextDelta(
+            "Second in progress".to_string(),
+        ));
+        let committed2: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert!(
+            !committed2.iter().any(|t| t.contains("Second in progress")),
+            "open tail not committed: {committed2:?}"
+        );
+        let frame = rendered_text(&mut screen, 80, 16);
+        assert!(
+            frame.contains("Second in progress"),
+            "tail visible: {frame}"
+        );
+
+        // Finalize commits the remainder exactly once.
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+        let full = screen
+            .transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(full.matches("Second in progress").count(), 1);
+        assert!(!screen.transcript.stream.is_active());
+    }
+
+    #[test]
+    fn stream_never_commits_before_newline_utf8_safe() {
+        // DoD: no commit before a newline; a multibyte grapheme is never torn.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta("汉".to_string()));
+        screen.commit_stream_tick(std::time::Instant::now());
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "no commit before a newline"
+        );
+        let frame = rendered_text(&mut screen, 80, 8);
+        assert!(
+            frame.contains('汉'),
+            "partial multibyte visible in tail: {frame}"
+        );
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+        let committed: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            committed.iter().filter(|t| t.contains('汉')).count(),
+            1,
+            "final partial line committed exactly once: {committed:?}"
+        );
+    }
+
+    #[test]
+    fn streamed_markdown_table_does_not_snap_on_finalize() {
+        // DoD / issue #87: a streamed markdown table must not reflow ("snap")
+        // when the stream finalizes. The whole table is held in the mutable
+        // tail (never committed row-by-row) so it renders exactly once.
+        let deltas = [
+            "| Col A | Col B |\n",
+            "| --- | --- |\n",
+            "| 1 | 2 |\n",
+            "| 33333 | 4 |\n",
+        ];
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        let base = std::time::Instant::now();
+        for (i, delta) in deltas.iter().enumerate() {
+            screen.apply(UiEvent::AssistantTextDelta((*delta).to_string()));
+            let _ =
+                screen.commit_stream_tick(base + std::time::Duration::from_millis(i as u64 * 100));
+        }
+        // No table row is committed while the table is still open.
+        let committed_mid: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert!(
+            committed_mid.iter().all(|t| !t.contains("Col A")),
+            "table committed incrementally would snap: {committed_mid:?}"
+        );
+        // The live (tail) render already shows the complete table.
+        let before: Vec<_> = screen
+            .wrapped_lines(80)
+            .iter()
+            .filter(|l| !line_text(l).trim().is_empty())
+            .cloned()
+            .collect();
+        assert!(
+            before.iter().any(|l| line_text(l).contains("Col A")),
+            "table visible in the live tail before finalize"
+        );
+        // Finalize: the committed render must be byte-identical to the live one.
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+        let after: Vec<_> = screen
+            .wrapped_lines(80)
+            .iter()
+            .filter(|l| !line_text(l).trim().is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(
+            line_signature(&before),
+            line_signature(&after),
+            "streamed table reflowed on finalize (issue #87)"
+        );
+    }
+
+    #[test]
+    fn commit_tick_catches_up_on_backlog() {
+        // DoD: the adaptive drain enters CatchUp under queue pressure and drains
+        // the backlog (Smooth=1/tick is proven by the chunking unit tests).
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        let mut src = String::new();
+        for i in 0..20 {
+            src.push_str(&format!("Para {i}.\n\n"));
+        }
+        screen.apply(UiEvent::AssistantTextDelta(src));
+        // A single tick with a deep backlog (>= depth threshold) enters CatchUp
+        // and drains it, rather than committing one line.
+        assert!(screen.commit_stream_tick(std::time::Instant::now()));
+        let committed = screen
+            .transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>();
+        let paras = committed.iter().filter(|t| t.contains("Para ")).count();
+        assert!(
+            paras >= 10,
+            "catch-up should drain the backlog in one tick, got {paras}: {committed:?}"
+        );
+    }
+
+    #[test]
+    fn incremental_stream_matches_full_replay() {
+        // DoD: incremental render output == full replay of the same deltas.
+        let deltas = [
+            "# Title\n\n",
+            "A paragraph with `code` and ",
+            "**bold**.\n\n",
+            "- item one\n- item two\n\n",
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n",
+            "Final line.\n",
+        ];
+        // Incremental path: stream deltas with ticks, then finalize.
+        let mut inc = Screen::new();
+        let _ = inc.wrapped_lines(80);
+        let base = std::time::Instant::now();
+        for (i, d) in deltas.iter().enumerate() {
+            inc.apply(UiEvent::AssistantTextDelta((*d).to_string()));
+            inc.commit_stream_tick(base + std::time::Duration::from_millis(i as u64 * 100));
+        }
+        inc.apply(UiEvent::AssistantTextEnd(String::new()));
+
+        // Full replay: one non-streamed assistant message with the whole text.
+        let full_text: String = deltas.concat();
+        let mut full = Screen::new();
+        let _ = full.wrapped_lines(80);
+        full.apply(UiEvent::AssistantText(full_text));
+
+        let inc_rows: Vec<String> = inc.transcript.rows.iter().map(row_text).collect();
+        let full_rows: Vec<String> = full.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            inc_rows, full_rows,
+            "committed rows differ from full replay"
+        );
+        assert_eq!(
+            line_signature(&inc.wrapped_lines(80)),
+            line_signature(&full.wrapped_lines(80)),
+            "rendered signature differs from full replay"
+        );
+    }
+
+    #[test]
+    fn reasoning_splices_above_already_committed_answer() {
+        // Production ordering: answer text streams and is paced into scrollback
+        // during the turn; reasoning arrives only at completion. The thinking
+        // block must still render ABOVE the already-committed answer.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "The answer paragraph.\n\n".to_string(),
+        ));
+        assert!(screen.commit_stream_tick(std::time::Instant::now()));
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| r.text.contains("The answer paragraph.")),
+            "answer committed before reasoning arrives"
+        );
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "deliberating".to_string(),
+            redacted: false,
+        });
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+        let out = rendered_text(&mut screen, 80, 20);
+        let thinking_at = out.find("THINKING").expect("thinking label");
+        let answer_at = out.find("The answer paragraph.").expect("answer");
+        assert!(
+            thinking_at < answer_at,
+            "reasoning must render above the committed answer: {out}"
+        );
+        assert_eq!(
+            out.matches("The answer paragraph.").count(),
+            1,
+            "answer rendered exactly once: {out}"
         );
     }
 
