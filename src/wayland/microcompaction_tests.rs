@@ -394,6 +394,240 @@ fn compaction_boundary_flush_is_tagged_class_a1() {
     );
 }
 
+/// A profile with no cold threshold and no minimum, so only the armed break
+/// flags (A2/A3) and the watermark can trigger -- isolates the flag logic.
+fn neutral_profile() -> super::CacheProfile {
+    super::CacheProfile::default()
+}
+
+/// Rewrite every entry timestamp in a transcript to `ts_ms`, simulating a
+/// session whose prior activity is old (cold resume, trigger A4).
+fn rewrite_timestamps(path: &Path, ts_ms: u64) {
+    let rewritten: String = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(line).unwrap();
+            if value.get("timestamp").is_some() {
+                value["timestamp"] = json!(ts_ms);
+            }
+            format!("{value}\n")
+        })
+        .collect();
+    std::fs::write(path, rewritten).unwrap();
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[test]
+fn a_selection_switch_flushes_pending_folds_and_is_tagged_a2() {
+    // A2 (issue #400): a model/provider switch is a full prefix-cache break,
+    // so pending folds flush before the next request even far below the
+    // watermark -- and the flag is boundary-scoped (consumed once).
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    h.set_cache_profile(neutral_profile());
+    h.note_active_selection("prov-a", "model-a", None);
+    h.record_selection_event("prov-a", "model-b", None).unwrap();
+    let recorder = FoldRecorder::default();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::SelectionSwitch);
+    let entries = fold_entries(&path);
+    assert_eq!(entries[0]["trigger"], "A2");
+}
+
+#[test]
+fn a_reasoning_only_switch_is_tagged_a3_and_an_identical_reselection_holds() {
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    h.set_cache_profile(neutral_profile());
+    // An identical re-selection changes no request bytes: nothing is armed.
+    h.note_active_selection("prov-a", "model-a", Some("medium"));
+    h.record_selection_event("prov-a", "model-a", Some("medium"))
+        .unwrap();
+    let recorder = FoldRecorder::default();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 0);
+    assert_eq!(fold_count(&path), 0);
+
+    // A reasoning-only change is a message-level break: folds are covered.
+    h.record_selection_event("prov-a", "model-a", Some("high"))
+        .unwrap();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::ReasoningSwitch);
+    assert_eq!(fold_entries(&path)[0]["trigger"], "A3");
+}
+
+#[test]
+fn a_cold_resume_flushes_at_the_first_boundary_and_is_tagged_a4() {
+    // A4: the transcript's last activity is far past the profile's cold
+    // threshold, so the cache is expired and the first boundary flushes free.
+    let (root, workspace, path) = seed_session();
+    // Two hours idle vs a 6-minute cold threshold.
+    rewrite_timestamps(&path, unix_now_ms().saturating_sub(2 * 60 * 60 * 1000));
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    h.set_cache_profile(super::CacheProfile {
+        cold_after: Some(std::time::Duration::from_secs(6 * 60)),
+        ..neutral_profile()
+    });
+    let recorder = FoldRecorder::default();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::ColdResume);
+    assert_eq!(fold_entries(&path)[0]["trigger"], "A4");
+}
+
+#[test]
+fn a_warm_resume_holds_and_the_a4_check_is_first_boundary_only() {
+    // The seeded timestamps are fresh (now), so the resume is warm: no A4.
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    h.set_cache_profile(super::CacheProfile {
+        cold_after: Some(std::time::Duration::from_secs(6 * 60)),
+        ..neutral_profile()
+    });
+    let recorder = FoldRecorder::default();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 0);
+    assert_eq!(fold_count(&path), 0, "warm resume holds the pending folds");
+}
+
+#[test]
+fn a_context_below_the_minimum_cacheable_prefix_flushes_and_is_tagged_a5() {
+    // A5: below the provider's minimum cacheable prefix nothing is cached,
+    // so a fold breaks nothing and pending folds flush free.
+    let (root, workspace, path) = seed_session();
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    h.set_cache_profile(super::CacheProfile {
+        min_cacheable_tokens: total.saturating_mul(2),
+        ..neutral_profile()
+    });
+    let recorder = FoldRecorder::default();
+    assert_eq!(h.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::BelowMinCacheable);
+    assert_eq!(fold_entries(&path)[0]["trigger"], "A5");
+}
+
+#[test]
+fn manual_compact_flushes_pending_folds_tagged_a6_before_compacting() {
+    // A6, through the production seam: `/compact` is a user-initiated break;
+    // pending folds ride it (fold-then-compact order), tagged A6. The seed
+    // carries bulky old text turns so the covered range still shrinks after
+    // the fold reclaimed the superseded read.
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    let bulk = "long-standing project discussion detail. ".repeat(200);
+    let big = format!("{NEEDLE} :: {}", "reconciliation detail. ".repeat(300));
+    let big2 = "current contents. ".repeat(800);
+    for message in [
+        Message::user(&bulk),
+        Message::assistant(&bulk),
+        Message::user("read a.rs"),
+        ok_read("c1", "a.rs", &big),
+        Message::assistant("ok"),
+        Message::user("read a.rs again"),
+        ok_read("c2", "a.rs", &big2),
+        Message::assistant("done"),
+    ] {
+        log.append(&message).unwrap();
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+    let probe = resume(&root.path, &workspace.path, &path, None, true);
+    let total = probe.context_token_estimate();
+    drop(probe);
+
+    // Watermark far above the total: only the manual break can flush.
+    let mut h = resume(
+        &root.path,
+        &workspace.path,
+        &path,
+        Some(total.saturating_mul(4)),
+        true,
+    );
+    h.set_cache_profile(neutral_profile());
+    let recorder = FoldRecorder::default();
+    let token = CancellationToken::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(h.compact_now(&recorder, &token))
+        .unwrap();
+    let entries = fold_entries(&path);
+    assert_eq!(
+        entries.len(),
+        1,
+        "the pending fold flushed with the compact"
+    );
+    assert_eq!(entries[0]["trigger"], "A6");
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::ManualCompact);
+    // And the compaction itself still ran (a durable compaction entry exists).
+    let compactions = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["type"] == "compaction")
+        .count();
+    assert_eq!(
+        compactions, 1,
+        "manual compaction proceeded after the flush"
+    );
+}
+
 #[test]
 fn fold_event_reaches_the_ui_layer_with_its_tag() {
     // The nexus fold event maps into the UI event stream carrying its trigger
