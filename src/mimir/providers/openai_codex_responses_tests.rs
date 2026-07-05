@@ -529,7 +529,10 @@ fn reasoning_level_adds_effort_and_off_omits() {
         None,
         PromptCacheRetention::Short,
     );
-    assert_eq!(high["reasoning"], json!({ "effort": "high" }));
+    assert_eq!(
+        high["reasoning"],
+        json!({ "effort": "high", "summary": "auto" })
+    );
     assert_eq!(high["include"], json!(["reasoning.encrypted_content"]));
     // The rest of the body is unchanged from the None case.
     assert_eq!(high["text"], json!({ "verbosity": "low" }));
@@ -544,7 +547,10 @@ fn reasoning_level_adds_effort_and_off_omits() {
         None,
         PromptCacheRetention::Short,
     );
-    assert_eq!(xhigh["reasoning"], json!({ "effort": "xhigh" }));
+    assert_eq!(
+        xhigh["reasoning"],
+        json!({ "effort": "xhigh", "summary": "auto" })
+    );
 
     // Off has no disable field on gpt-5.5, so it omits reasoning entirely.
     let off = build_codex_request(
@@ -558,6 +564,30 @@ fn reasoning_level_adds_effort_and_off_omits() {
         PromptCacheRetention::Short,
     );
     assert!(off.get("reasoning").is_none(), "Off omits reasoning");
+}
+
+/// The request must ask for a reasoning summary; without it the Responses API
+/// streams no summary deltas and the live thinking rail never fires (ADR-0050).
+#[test]
+fn reasoning_request_asks_for_summary_so_live_thinking_can_stream() {
+    let instructions = test_system_prompt();
+    let messages = [Message::user("hello")];
+    let req = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &crate::tools::built_in_tools(),
+        Some(ReasoningEffort::Medium),
+        Some("session-1"),
+        None,
+        PromptCacheRetention::Short,
+    );
+    // Drives the live thinking rail: the summary deltas only stream when asked.
+    assert_eq!(
+        req["reasoning"]["summary"],
+        json!("auto"),
+        "the request must ask for a reasoning summary, or the Responses API streams no summary deltas and the live thinking rail never fires (ADR-0050)"
+    );
 }
 
 #[test]
