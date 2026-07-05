@@ -28,6 +28,12 @@ rebuilt context. The needles are asserted to survive verbatim in the rebuilt
 context, and to be absent from the retained tail — so retention is proven
 through the summary, not leftover context.
 
+The fake provider does not hard-code the handoff: on a summarization request it
+receives the covered range the production seam passed, asserts each needle is
+present in that covered input, and only then echoes it. A seam that passes the
+wrong covered range or drops the opener fails the fake's assertion rather than
+producing a self-fulfilling pass.
+
 | class | tokens before | tokens after | reduction | via |
 |---|---|---|---|---|
 | compaction/excerpts | 405 | 55 | 86% | excerpts |
@@ -52,6 +58,14 @@ Auto-compactions fired: excerpts = 1, provider = 1.
   regression guard, not a tight fit.
 - **Forced compaction** (`scenario_forces_at_least_one_auto_compaction_on_both_arms`):
   at least one auto-compaction fires through the production seam on each arm.
+- **Genuine provider arm** (`provider_arm_uses_the_provider_summarizer_not_the_excerpts_fallback`,
+  plus an in-`run_scenario` guard on every arm): the provider arm must invoke
+  the provider summarizer (`summary_calls >= 1`) and emit the provider marker
+  (`[compacted summary ...]`); the excerpts arm must never call the provider
+  (`summary_calls == 0`) and must emit the excerpts marker
+  (`[auto-compacted summary ...]`). If provider summarization silently fell
+  back to excerpts, the provider/excerpts ratio would be an
+  excerpts-vs-excerpts comparison — this guard fails it instead.
 - Both arms report an identical 86% here because the covered range is a single
   large message: the `excerpts` arm truncates it to a bounded excerpt and the
   `provider` arm returns a short structured handoff of comparable size. The

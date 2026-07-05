@@ -33,7 +33,8 @@ use crate::tools::bench_support::{
 use crate::wayland::{Harness, SummarizerKind};
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
@@ -87,25 +88,47 @@ impl Drop for TempDir {
 
 /// Fake provider for the compaction lane. It answers two request shapes:
 /// normal turns get a fixed short text; a summarization request (last message
-/// begins with the summarizer instruction) gets a deterministic handoff summary
-/// that echoes every needle verbatim and is small enough to clear the shrink
-/// guard. No live calls -- this is the CI-safe lane ADR-0045 requires.
+/// begins with the summarizer instruction) gets a handoff summary DERIVED from
+/// the covered range the production seam actually passed, asserting each needle
+/// is present in that covered input before echoing it. No live calls -- this is
+/// the CI-safe lane ADR-0045 requires.
 struct CompactionFakeProvider {
-    summary_calls: RefCell<usize>,
+    /// Shared with `run_scenario` so the scenario can prove the provider
+    /// summarizer actually ran for the provider arm (vs. a silent fallback to
+    /// excerpts).
+    summary_calls: Arc<AtomicUsize>,
 }
 
 impl CompactionFakeProvider {
-    fn new() -> Self {
-        Self {
-            summary_calls: RefCell::new(0),
-        }
+    fn new(summary_calls: Arc<AtomicUsize>) -> Self {
+        Self { summary_calls }
     }
 
-    fn handoff_summary() -> String {
-        // A structured handoff a takeover model could resume from, carrying the
-        // exact identifiers. Kept short so `estimate_tokens(framed) <
-        // original_tokens` (the wayland shrink guard) holds for the covered
-        // range.
+    /// Build the handoff by DERIVING it from the covered range the production
+    /// seam passed to summarization (`provider_summary` sends the covered
+    /// messages followed by the summary instruction, so `covered` is every
+    /// message before that final instruction). Each needle is asserted present
+    /// in that covered input before it is echoed: a seam that passes the wrong
+    /// covered range, drops the opener, or otherwise breaks retention fails
+    /// here instead of the fake silently echoing hard-coded facts. Kept short
+    /// so `estimate_tokens(framed) < original_tokens` (the wayland shrink
+    /// guard) holds for the covered range.
+    fn derive_handoff(covered: &[Message]) -> String {
+        let covered_text = covered
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in NEEDLES {
+            assert!(
+                covered_text.contains(needle),
+                "fake provider: needle {needle:?} absent from the covered range the seam passed \
+                 to summarization; the summary cannot be derived from covered content, so \
+                 retention through this arm is not actually proven"
+            );
+        }
+        // Echo only facts confirmed present in the covered input above, as a
+        // short structured handoff a takeover model could resume from.
         format!(
             "Goal: land {NEEDLE_TASK}. State: edits started. Key facts: path {NEEDLE_PATH}, \
              symbol {NEEDLE_SYMBOL}, decision {NEEDLE_DECISION}. Next: finish the wiring."
@@ -124,8 +147,11 @@ impl ChatProvider for CompactionFakeProvider {
             .last()
             .is_some_and(|m| m.content.starts_with(SUMMARY_INSTRUCTION_PREFIX));
         let turn = if is_summary {
-            *self.summary_calls.borrow_mut() += 1;
-            AssistantTurn::text(&Self::handoff_summary())
+            self.summary_calls.fetch_add(1, Ordering::Relaxed);
+            // Covered range = every message before the final summary
+            // instruction the seam appends.
+            let covered = &messages[..messages.len() - 1];
+            AssistantTurn::text(&Self::derive_handoff(covered))
         } else {
             AssistantTurn::text("ok")
         };
@@ -189,6 +215,10 @@ struct ArmResult {
     covered_original: String,
     /// How many auto-compactions fired.
     compactions: usize,
+    /// How many times the fake provider's summarization path ran. Zero on the
+    /// excerpts arm; >= 1 on the provider arm proves it did not silently fall
+    /// back to excerpts.
+    summary_calls: usize,
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -215,7 +245,11 @@ fn run_scenario(summarizer: SummarizerKind) -> ArmResult {
     let root = TempDir::new();
     let log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
 
-    let agent = Agent::new(CompactionFakeProvider::new(), Tools::new(Vec::new()));
+    let summary_calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(
+        CompactionFakeProvider::new(summary_calls.clone()),
+        Tools::new(Vec::new()),
+    );
     let mut harness = Harness::new(
         agent,
         workspace.path.clone(),
@@ -239,7 +273,9 @@ fn run_scenario(summarizer: SummarizerKind) -> ArmResult {
     let token = CancellationToken::new();
 
     // Three turns: the opener plus two smaller follow-ups. Compaction fires at
-    // the start of turn 3.
+    // the start of turn 2 (the oversized opener persisted on turn 1 already
+    // exceeds the budget, and `submit_turn` runs `maybe_auto_compact` before
+    // each provider request).
     let prompts = [
         opener.as_str(),
         "Follow-up one: keep going on the wiring described above; \
@@ -272,12 +308,46 @@ fn run_scenario(summarizer: SummarizerKind) -> ArmResult {
         .collect::<Vec<_>>()
         .join("\n");
 
+    let summary_calls = summary_calls.load(Ordering::Relaxed);
+
+    // Arm integrity: the provider/excerpts comparison is only meaningful if
+    // each arm actually used its own summarizer. Assert it here so every test
+    // and the report row inherit the guard -- a provider arm that silently
+    // falls back to excerpts (provider summary failed or failed to shrink)
+    // would otherwise pass as an excerpts-vs-excerpts comparison.
+    match summarizer {
+        SummarizerKind::Provider => {
+            assert!(
+                summary_calls >= 1,
+                "provider arm did not invoke the provider summarizer (summary_calls=0); it \
+                 silently fell back to excerpts, so provider/excerpts would not be a genuine \
+                 provider-vs-excerpts comparison"
+            );
+            assert!(
+                summary.starts_with("[compacted summary"),
+                "provider arm produced an excerpts-shaped summary ({summary:?}); expected the \
+                 provider marker, so the arm fell back to excerpts"
+            );
+        }
+        SummarizerKind::Excerpts => {
+            assert_eq!(
+                summary_calls, 0,
+                "excerpts arm unexpectedly invoked the provider summarizer ({summary_calls})"
+            );
+            assert!(
+                summary.starts_with("[auto-compacted summary"),
+                "excerpts arm produced a non-excerpts summary ({summary:?})"
+            );
+        }
+    }
+
     ArmResult {
         rebuilt_context,
         summary,
         retained_tail,
         covered_original,
         compactions: *counter.compactions.borrow(),
+        summary_calls,
     }
 }
 
@@ -321,6 +391,36 @@ fn needles_survive_verbatim_in_rebuilt_context_provider_arm() {
              proves retention through compaction"
         );
     }
+}
+
+#[test]
+fn provider_arm_uses_the_provider_summarizer_not_the_excerpts_fallback() {
+    // Guards the degenerate-arm failure (FINDING 2): if provider summarization
+    // stops working but excerpts still carry the needles, the provider arm and
+    // the provider/excerpts ratio must NOT quietly pass as excerpts-vs-excerpts.
+    // The provider arm must have run the provider summarizer and produced the
+    // provider-shaped marker; the excerpts arm must never call the provider.
+    let provider = run_scenario(SummarizerKind::Provider);
+    assert!(
+        provider.summary_calls >= 1,
+        "provider arm never invoked the provider summarizer; it fell back to excerpts"
+    );
+    assert!(
+        provider.summary.starts_with("[compacted summary"),
+        "provider arm did not produce the provider summary marker: {:?}",
+        provider.summary
+    );
+
+    let excerpts = run_scenario(SummarizerKind::Excerpts);
+    assert_eq!(
+        excerpts.summary_calls, 0,
+        "excerpts arm unexpectedly invoked the provider summarizer"
+    );
+    assert!(
+        excerpts.summary.starts_with("[auto-compacted summary"),
+        "excerpts arm did not produce the excerpts summary marker: {:?}",
+        excerpts.summary
+    );
 }
 
 #[test]
