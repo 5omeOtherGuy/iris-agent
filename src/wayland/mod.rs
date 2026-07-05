@@ -12,11 +12,12 @@ pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::Result;
 use futures::StreamExt;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -26,7 +27,10 @@ use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderEvent, Role,
     SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
 };
-use crate::session::{SessionLog, estimate_tokens, message_token_estimate, preview_line};
+use crate::session::{
+    SessionLog, estimate_tokens, message_token_estimate, preview_line, render_carry_block,
+    render_compaction_body,
+};
 use crate::tools::ToolState;
 
 /// Maximum characters in an auto-compaction summary, so compacting a large
@@ -830,21 +834,51 @@ impl<P: ChatProvider> Harness<P> {
         token: &CancellationToken,
     ) -> Result<Option<CompactionOutcome>> {
         let covered = plan.end - plan.start;
-        let original_tokens = context_tokens(&messages[plan.start..plan.end]);
+        let covered_slice = &messages[plan.start..plan.end];
+        let original_tokens = context_tokens(covered_slice);
+        // Deterministic touched/read path carry (ADR-0044), derived from the
+        // covered range's structured tool calls before the mutable session
+        // borrow below. Independent of the summarizer, so it survives any summary.
+        let carry_paths = derive_carry_paths(covered_slice, self.workspace());
+        let carry_tokens = estimate_tokens(&render_carry_block(&carry_paths));
         let Some(summary) = self
-            .summarize_range(messages, &plan, original_tokens, token)
+            .summarize_range(messages, &plan, original_tokens, carry_tokens, token)
             .await
         else {
             return Ok(None);
         };
-        let summary_tokens = estimate_tokens(&summary);
+        // The rebuilt body is the prose summary plus the carry block; count its
+        // tokens so the persisted estimate and the in-memory total both cover the
+        // carry. With an empty carry the body is exactly the summary.
+        let body = render_compaction_body(&summary, &carry_paths);
+        let body_tokens = estimate_tokens(&body);
+
+        // Shrink/worthwhile guard on EVERY summarizer path (ADR-0044, DoD item
+        // 3). The provider branch guards its own summary, but the deterministic
+        // excerpt fallback and manual `/compact` reach here without one, and a
+        // non-empty carry can push the combined summary + carry body back over
+        // the covered range. A compaction that does not shrink is worse than
+        // leaving the range intact: skip rather than append it.
+        if body_tokens >= original_tokens {
+            tracing::warn!(
+                body_tokens,
+                original_tokens,
+                "compaction summary + carry did not shrink the covered range; skipping"
+            );
+            return Ok(None);
+        }
 
         let log = self
             .session
             .as_mut()
             .expect("compaction callers check the session first");
-        let compaction_id =
-            log.append_compaction(&plan.from_id, &plan.to_id, &summary, Some(summary_tokens))?;
+        let compaction_id = log.append_compaction(
+            &plan.from_id,
+            &plan.to_id,
+            &summary,
+            &carry_paths,
+            Some(body_tokens),
+        )?;
         // Generation ordinal (ADR-0047), read right after the append that
         // incremented it: the Nth compaction in this session reports N.
         let generation = log.compaction_generation();
@@ -878,7 +912,7 @@ impl<P: ChatProvider> Harness<P> {
             new_messages.push(message.clone());
             new_entry_ids.push(id.clone());
         }
-        new_messages.push(Message::user(&summary));
+        new_messages.push(Message::user(&body));
         new_entry_ids.push(None);
         for (offset, message) in messages[plan.end..].iter().enumerate() {
             new_messages.push(message.clone());
@@ -900,14 +934,18 @@ impl<P: ChatProvider> Harness<P> {
             covered_to: plan.to_id,
             covered_messages: covered,
             original_tokens_estimate: original_tokens,
-            summary_tokens_estimate: summary_tokens,
+            summary_tokens_estimate: body_tokens,
             budget: self.budget.unwrap_or(0),
             generation,
+            // Additive observability (ADR-0044): how many touched/read paths the
+            // carry retained for this compaction; 0 for a range with no
+            // in-workspace tool targets.
+            carried_paths: carry_paths.len(),
         })?;
         Ok(Some(CompactionOutcome {
             covered,
             original_tokens,
-            summary_tokens,
+            summary_tokens: body_tokens,
         }))
     }
 
@@ -922,6 +960,7 @@ impl<P: ChatProvider> Harness<P> {
         messages: &[Message],
         plan: &CompactionPlan,
         original_tokens: u64,
+        carry_tokens: u64,
         token: &CancellationToken,
     ) -> Option<String> {
         if self.summarizer == SummarizerKind::Provider {
@@ -939,9 +978,11 @@ impl<P: ChatProvider> Harness<P> {
                         plan.end - plan.start,
                         text.trim()
                     );
-                    // Shrink guard: a summary that fails to compress is worse
-                    // than the deterministic floor.
-                    if estimate_tokens(&framed) < original_tokens {
+                    // Shrink guard: the summary plus the carry block (ADR-0044)
+                    // must compress the covered range; a summary that only shrinks
+                    // once the carry is ignored is worse than the deterministic
+                    // floor.
+                    if combined_shrinks(estimate_tokens(&framed), carry_tokens, original_tokens) {
                         return Some(framed);
                     }
                     tracing::warn!(
@@ -1059,6 +1100,78 @@ async fn provider_summary<P: ChatProvider>(
     }
 }
 
+/// Cap on distinct carry paths persisted per compaction entry (ADR-0044): keeps
+/// the carry token-cheap and bounded even when a covered range touches many
+/// files. The most-recent `MAX_CARRY_PATHS` distinct paths are retained.
+const MAX_CARRY_PATHS: usize = 32;
+
+/// Derive the compaction carry (ADR-0044): the bounded, deduped, order-stable
+/// set of workspace-relative paths the covered range read or mutated, taken
+/// from the covered range's SUCCESSFUL structured tool results (ADR-0021),
+/// never from raw tool-call arguments. Each successful `read`/`write`/`ls`/
+/// `edit` result records its workspace-relative `metadata.target`
+/// ([`ToolOutput::with_workspace_target`]); a denied, cancelled, tool-error, or
+/// malformed result has `ok != true` (or no `target`) and never contributes a
+/// path, so the carry cannot retain a file the model never actually touched.
+///
+/// Security boundary: the persisted `target` is already workspace-relative, but
+/// each candidate is re-checked through [`crate::tools::path::workspace_relative`]
+/// so a crafted or legacy transcript carrying an absolute or `..`-escaping
+/// target is still dropped.
+///
+/// Dedup keeps the most-recent occurrence of each path and orders by that
+/// occurrence (least-recent first), so a re-touched path advances to the tail
+/// and the cap retains the most-recent `MAX_CARRY_PATHS` distinct paths.
+fn derive_carry_paths(covered: &[Message], workspace: &Path) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for message in covered {
+        if message.role != Role::Tool {
+            continue;
+        }
+        if !matches!(
+            message.tool_name.as_deref(),
+            Some("read" | "write" | "ls" | "edit")
+        ) {
+            continue;
+        }
+        // The tool-result content is the ADR-0021 wire envelope JSON.
+        let Ok(result) = serde_json::from_str::<Value>(&message.content) else {
+            continue;
+        };
+        // Successful results only: denied/cancelled/tool-error envelopes have
+        // `ok: false` (and no `target`), so their paths are never carried.
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(target) = result
+            .get("metadata")
+            .and_then(|metadata| metadata.get("target"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(rel) = crate::tools::path::workspace_relative(workspace, target) else {
+            continue;
+        };
+        if let Some(pos) = paths.iter().position(|p| *p == rel) {
+            paths.remove(pos);
+        }
+        paths.push(rel);
+    }
+    if paths.len() > MAX_CARRY_PATHS {
+        paths.drain(0..paths.len() - MAX_CARRY_PATHS);
+    }
+    paths
+}
+
+/// Whether a compaction is worthwhile: the summary plus the carry block
+/// (ADR-0044) must be smaller than the covered range it replaces. Counting the
+/// carry here stops a summary that only shrinks once the carry is ignored from
+/// slipping past the guard.
+fn combined_shrinks(summary_tokens: u64, carry_tokens: u64, original_tokens: u64) -> bool {
+    summary_tokens.saturating_add(carry_tokens) < original_tokens
+}
+
 /// Sum the per-message token estimates of a context, saturating so a corrupted
 /// or extreme value never panics/wraps.
 fn context_tokens(messages: &[Message]) -> u64 {
@@ -1143,4 +1256,141 @@ fn verification_feedback(command: &str, exit_code: Option<i32>, output: &str) ->
          diagnose the failure.\n\n```\n$ {command}\n{body}\n```\n\nFix the problems reported \
          above by editing files. The verification command will run again after your changes."
     )
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::{MAX_CARRY_PATHS, combined_shrinks, derive_carry_paths};
+    use crate::nexus::Message;
+    use crate::tools::test_support::{root_of, temp_dir};
+    use serde_json::json;
+
+    /// A successful `tool` result message the way Nexus persists it (ADR-0021):
+    /// content is the success envelope `{ "ok": true, ... }` whose
+    /// `metadata.target` names the touched/read workspace-relative path derived
+    /// at the tool boundary (ADR-0044). The carry is derived from these
+    /// successful results, not from raw tool-call arguments.
+    fn tool_result_ok(name: &str, target: &str) -> Message {
+        Message::tool_result(
+            "call_1",
+            name,
+            &json!({
+                "ok": true,
+                "content": "done",
+                "metadata": { "target": target }
+            })
+            .to_string(),
+        )
+    }
+
+    /// A non-successful `tool` result (denied/cancelled/error): `ok` is false and
+    /// no `target` is present, so its path must never enter the carry.
+    fn tool_result_failed(name: &str, flag: &str) -> Message {
+        Message::tool_result(
+            "call_2",
+            name,
+            &json!({ "ok": false, "error": "no", flag: true }).to_string(),
+        )
+    }
+
+    #[test]
+    fn derive_carry_paths_dedups_and_orders_by_most_recent() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // read a, read b, edit a, ls c -> distinct {a, b, c}; a re-touched last of
+        // the pair moves ahead of b, ordered by most-recent occurrence.
+        let covered = [
+            tool_result_ok("read", "a.rs"),
+            tool_result_ok("read", "b.rs"),
+            tool_result_ok("edit", "a.rs"),
+            tool_result_ok("ls", "c"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["b.rs", "a.rs", "c"]);
+    }
+
+    #[test]
+    fn derive_carry_paths_carries_only_successful_results() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // Only successful (ok:true) results contribute paths. A denied, a
+        // cancelled, and a tool-error result in the covered range -- each naming
+        // a path the model never actually read/touched -- are dropped.
+        let covered = [
+            tool_result_ok("read", "a.rs"),
+            tool_result_failed("read", "denied"),
+            tool_result_failed("edit", "cancelled"),
+            // A tool error: ok:false, no target field at all.
+            Message::tool_result(
+                "call_3",
+                "write",
+                &json!({ "ok": false, "error": "boom" }).to_string(),
+            ),
+            tool_result_ok("edit", "b.rs"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn derive_carry_paths_bounds_to_the_most_recent_n() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        // More distinct paths than the cap: only the most-recent MAX_CARRY_PATHS
+        // survive, in order.
+        let n = MAX_CARRY_PATHS + 2;
+        let covered: Vec<Message> = (0..n)
+            .map(|i| tool_result_ok("read", &format!("f{i}.rs")))
+            .collect();
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry.len(), MAX_CARRY_PATHS);
+        // The two oldest (f0, f1) dropped; the tail is f2..fN in order.
+        assert_eq!(carry.first().unwrap(), "f2.rs");
+        assert_eq!(carry.last().unwrap(), &format!("f{}.rs", n - 1));
+    }
+
+    #[test]
+    fn derive_carry_paths_drops_paths_outside_the_workspace() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let covered = [
+            tool_result_ok("read", "src/a.rs"),
+            // Absolute path (even one pointing inside): the carry floor drops it.
+            tool_result_ok("read", "/etc/passwd"),
+            // Traversal escape above the workspace root: must never enter it.
+            tool_result_ok("edit", "../../etc/shadow"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn derive_carry_paths_ignores_non_target_tools_and_text_turns() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let covered = [
+            Message::user("read the file please"),
+            Message::assistant("sure"),
+            // Non-target tools that (hypothetically) carry a target field: still
+            // ignored, only read/write/ls/edit targets are collected.
+            tool_result_ok("bash", "a.rs"),
+            tool_result_ok("grep", "b.rs"),
+            tool_result_ok("read", "real.rs"),
+        ];
+        let carry = derive_carry_paths(&covered, &root);
+        assert_eq!(carry, vec!["real.rs"]);
+    }
+
+    #[test]
+    fn combined_shrinks_counts_summary_plus_carry() {
+        // Summary alone shrinks (10 < 20), but summary + carry does not (10 + 12
+        // >= 20): the guard rejects a compaction that only shrinks when the carry
+        // is ignored.
+        assert!(!combined_shrinks(10, 12, 20));
+        // Summary + carry together still shrink: worthwhile.
+        assert!(combined_shrinks(10, 5, 20));
+        // Empty carry reduces to the summary-only guard.
+        assert!(combined_shrinks(10, 0, 20));
+        assert!(!combined_shrinks(20, 0, 20));
+    }
 }
