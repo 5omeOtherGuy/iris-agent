@@ -1505,6 +1505,13 @@ async fn run_harness_op<P: ChatProvider>(
                     if tui.screen.tick() {
                         request_render(&mut sched, tui)?;
                     }
+                    // Paced commit tick: migrate newly-stable streamed assistant
+                    // lines from the mutable tail into scrollback (issue #87).
+                    if tui.screen.has_stream_work()
+                        && tui.screen.commit_stream_tick(std::time::Instant::now())
+                    {
+                        request_render(&mut sched, tui)?;
+                    }
                     // A landed git refresh repaints the bar (readout dropdowns
                     // keep painting last-known values while the turn runs).
                     if sync_git_status(tui, git_cache, git_generation) {

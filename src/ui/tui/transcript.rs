@@ -17,13 +17,13 @@ use super::panel::{
     edit_footer_extras, join_meta_fields, panel_state,
 };
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
+use super::streaming::StreamController;
 use super::text::ansi_spans;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
 use super::wrap::line_text;
 use super::{
-    MAX_EXEC_STREAM_BYTES, MAX_STREAMING_MARKDOWN_BYTES, MAX_TRANSCRIPT_ROWS,
-    TEXT_COLUMN_X_PADDING, dim_style, err_style, format_elapsed_compact, ok_style, panel_style,
-    tool_header_style, turn_divider_label,
+    MAX_EXEC_STREAM_BYTES, MAX_TRANSCRIPT_ROWS, TEXT_COLUMN_X_PADDING, dim_style, err_style,
+    format_elapsed_compact, ok_style, panel_style, tool_header_style, turn_divider_label,
 };
 
 /// Reasoning-rail label. Uppercase like the other structural labels; the rail
@@ -187,13 +187,12 @@ impl WrappedTranscriptCache {
     }
 }
 
-/// Memoized render of the in-flight streaming preview. The stream buffer only
-/// ever grows for a given stream and the memo is dropped on every stream
-/// start/end transition, so `(len, width)` uniquely identifies the rendered
-/// output. This keeps spinner ticks and typing-while-streaming frames from
-/// re-parsing the whole markdown preview when the stream did not change.
+/// Memoized wrapped physical lines of the stream controller's mutable active
+/// tail. Keyed by the controller's `(buffered_len, emitted)` tail signature and
+/// the frame width, so spinner ticks and typing-while-streaming frames only
+/// re-wrap the tail when it actually changed.
 struct StreamingRender {
-    len: usize,
+    key: (usize, usize),
     width: usize,
     lines: Vec<Line<'static>>,
 }
@@ -217,9 +216,14 @@ impl Deref for TranscriptRender {
 #[derive(Default)]
 pub(super) struct Transcript {
     pub(super) rows: Vec<TranscriptRow>,
-    /// Live assistant text being streamed; rendered after committed rows and
-    /// committed exactly once on `AssistantTextEnd`.
-    pub(super) streaming: Option<String>,
+    /// Live assistant-message stream: newline-gated collection, block-safe
+    /// incremental commit to scrollback, and a single mutable active tail
+    /// (issue #87). Committed rows land in `rows`; the tail renders after them.
+    pub(super) stream: StreamController,
+    /// Row index where the current turn's streamed answer block begins (after
+    /// its opening separator). A late `AssistantReasoning` block is spliced here
+    /// so reasoning renders above an already-committed answer.
+    stream_answer_start: Option<usize>,
     /// The open live exec cell, if a streaming tool is running.
     active_exec: Option<ActiveExec>,
     active_explorations: Vec<ActiveExploration>,
@@ -242,7 +246,7 @@ pub(super) struct Transcript {
     /// uses a realistic column count. Zero until the first render.
     last_width: usize,
     wrapped_cache: WrappedTranscriptCache,
-    /// Memoized wrapped lines for the current streaming preview; see
+    /// Memoized wrapped lines for the current active-tail preview; see
     /// [`StreamingRender`].
     streaming_render: Option<StreamingRender>,
     /// Row indices where a committed user prompt starts (first content row of
@@ -340,15 +344,11 @@ impl Transcript {
     /// whole and is not foldable. A `redacted` block has no recoverable text, so
     /// a placeholder is shown and the original reasoning is never rendered.
     fn push_thinking_block(&mut self, text: &str, redacted: bool) {
-        // Intentionally do NOT finish the live stream here. Reasoning is emitted
-        // at completion, after the answer's text deltas have already streamed
-        // into `self.streaming` but before `AssistantTextEnd` commits them.
-        // Committing the stream now (via `begin_block`) would render the answer
-        // *above* the thinking block and double-commit it when `AssistantTextEnd`
-        // arrives. Adding the rail rows while the stream stays pending keeps the
-        // reasoning above the answer, which is committed afterwards.
-        self.push_blank();
-        self.mark_append_dirty();
+        // Reasoning is emitted at completion, after the answer's text deltas.
+        // Some of the answer may already have been paced into scrollback, so the
+        // rail block is spliced ABOVE the current turn's answer rows (tracked by
+        // `stream_answer_start`) rather than appended; that keeps reasoning above
+        // the answer without finishing or double-committing the live stream.
         let elapsed = self
             .provider_turn_started
             .map(|started| format_elapsed_compact(started.elapsed()));
@@ -381,9 +381,11 @@ impl Transcript {
             groups
         };
         let foldable = groups.len() > 1;
-        self.thinking_header_row = Some(self.rows.len());
         self.thinking_elapsed = elapsed.clone();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
+        // Build the rail rows into a detached block; the header is always at
+        // local index 0.
+        let mut block: Vec<TranscriptRow> = Vec::new();
+        block.push(TranscriptRow::chrome(ChromeRow::RailHeader {
             expanded: false,
             label: THINKING_LABEL.to_string(),
             right: elapsed.unwrap_or_default(),
@@ -392,8 +394,7 @@ impl Transcript {
         let hidden = groups.len().saturating_sub(1);
         for (index, group) in groups.into_iter().enumerate() {
             if index > 0 {
-                self.rows
-                    .push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
+                block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
             }
             let fold = if index == 0 {
                 FoldVis::Always
@@ -401,7 +402,7 @@ impl Transcript {
                 FoldVis::WhenExpanded
             };
             for line in group {
-                self.rows.push(rail_body_row(line).with_fold(fold));
+                block.push(rail_body_row(line).with_fold(fold));
             }
         }
         if foldable {
@@ -414,10 +415,28 @@ impl Transcript {
                 2,
                 super::rows::Overflow::KeepLeft,
             );
-            self.rows
-                .push(TranscriptRow::new(text, dim_style()).with_fold(FoldVis::WhenCollapsed));
+            block.push(TranscriptRow::new(text, dim_style()).with_fold(FoldVis::WhenCollapsed));
         }
-        self.rows.push(TranscriptRow::chrome(ChromeRow::RailEnd));
+        block.push(TranscriptRow::chrome(ChromeRow::RailEnd));
+
+        match self.stream_answer_start {
+            Some(start) => {
+                // Splice above the (possibly already-committed) answer, with a
+                // trailing blank separating the rail from the answer below.
+                block.push(TranscriptRow::new(String::new(), Style::default()));
+                let n = block.len();
+                self.thinking_header_row = Some(start);
+                self.mark_dirty_from(start);
+                self.rows.splice(start..start, block);
+                self.stream_answer_start = Some(start + n);
+            }
+            None => {
+                self.push_blank();
+                self.mark_append_dirty();
+                self.thinking_header_row = Some(self.rows.len());
+                self.rows.extend(block);
+            }
+        }
     }
 
     /// Patch the current turn's thinking header with the provider-reported
@@ -488,15 +507,45 @@ impl Transcript {
         self.push_blank();
     }
 
-    /// Commit any in-flight streamed assistant text into the transcript.
+    /// Commit any in-flight streamed assistant text into the transcript. The
+    /// controller renders the complete accumulated source once (so a streamed
+    /// markdown table never reflows on finalize) and returns only the rendered
+    /// lines not already paced into scrollback.
     fn finish_stream(&mut self) {
         self.streaming_render = None;
-        if let Some(text) = self.streaming.take()
-            && !text.is_empty()
-        {
-            self.push_assistant_text(&text);
-            self.push_blank();
+        if self.stream.is_active() {
+            let width = self.markdown_content_width();
+            let rows = self.stream.finalize(width);
+            if !rows.is_empty() {
+                self.mark_append_dirty();
+                self.rows.extend(rows);
+                self.push_blank();
+            }
         }
+        self.stream_answer_start = None;
+    }
+
+    /// Drive one paced commit tick: move any newly-stable streamed lines into
+    /// scrollback. Returns `true` when rows were committed (a redraw is due).
+    /// Called from the render loop's tick while a turn runs.
+    pub(super) fn commit_stream_tick(&mut self, now: Instant) -> bool {
+        if !self.stream.is_active() {
+            return false;
+        }
+        let width = self.markdown_content_width();
+        let rows = self.stream.commit_tick(now, width);
+        if rows.is_empty() {
+            return false;
+        }
+        self.mark_append_dirty();
+        self.rows.extend(rows);
+        true
+    }
+
+    /// Whether the stream has not-yet-committed content, so the loop should keep
+    /// driving commit ticks.
+    pub(super) fn has_stream_work(&self) -> bool {
+        self.stream.has_work()
     }
 
     pub(super) fn record_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
@@ -1798,28 +1847,28 @@ impl Transcript {
             | UiEvent::ToolLifecycle { .. }
             | UiEvent::OutputHandleStored { .. } => {}
             UiEvent::AssistantTextDelta(delta) => {
-                if self.streaming.is_none() {
-                    // A fresh stream starts here: drop any memoized render of a
-                    // prior stream so its `(len, width)` key can never collide.
+                if !self.stream.is_active() {
+                    // A fresh stream starts here: drop any memoized tail render
+                    // of a prior stream, open the block with a separator, and
+                    // remember where the answer begins so a late reasoning block
+                    // can be spliced above it.
                     self.streaming_render = None;
                     self.push_blank();
+                    self.stream_answer_start = Some(self.rows.len());
                 }
-                self.streaming
-                    .get_or_insert_with(String::new)
-                    .push_str(&delta);
+                let width = self.markdown_content_width();
+                self.stream.push_delta(&delta, width);
             }
             UiEvent::AssistantTextEnd(text) => {
-                // A non-empty end event is authoritative. Some providers only
-                // send deltas and finish with an empty end marker; in that case
-                // commit the accumulated stream instead of dropping it.
                 self.streaming_render = None;
-                let text = if text.is_empty() {
-                    self.streaming.take().unwrap_or_default()
-                } else {
-                    self.streaming = None;
-                    text
-                };
-                if !text.is_empty() {
+                if self.stream.is_active() {
+                    // Prefer the accumulated deltas: the controller renders the
+                    // complete source once and commits only what is not already
+                    // in scrollback (ADR: streamed answer committed exactly once).
+                    self.finish_stream();
+                } else if !text.is_empty() {
+                    // Some providers send only a terminal text event with no
+                    // deltas; commit it directly.
                     self.push_blank();
                     self.push_assistant_text(&text);
                     self.push_blank();
@@ -2015,7 +2064,7 @@ impl Transcript {
 
     pub(super) fn trim_history(&mut self) {
         if self.rows.len() <= MAX_TRANSCRIPT_ROWS
-            || self.streaming.is_some()
+            || self.stream.is_active()
             || self.active_exec.is_some()
             || self.active_tool.is_some()
             || self.active_edit.is_some()
@@ -2438,29 +2487,30 @@ impl Transcript {
     /// did not grow). Shared by the full render and the pager's windowed
     /// render so both see the same transient stream rows.
     fn refresh_streaming_memo(&mut self, width: usize) {
-        let Some(text) = self.streaming.as_ref() else {
+        if !self.stream.is_active() {
+            self.streaming_render = None;
             return;
-        };
+        }
+        let key = self.stream.tail_signature();
         let fresh = self
             .streaming_render
             .as_ref()
-            .is_some_and(|memo| memo.len == text.len() && memo.width == width);
+            .is_some_and(|memo| memo.key == key && memo.width == width);
         if !fresh {
+            let content_width = width
+                .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+                .max(1);
             let mut lines = Vec::new();
-            for row in &pane::streaming_assistant_rows(text, width) {
+            for row in &self.stream.tail_rows(content_width) {
                 row.render_rows(width, &mut lines);
             }
-            self.streaming_render = Some(StreamingRender {
-                len: text.len(),
-                width,
-                lines,
-            });
+            self.streaming_render = Some(StreamingRender { key, width, lines });
         }
     }
 
     /// Number of transient streaming-preview lines at `width` (0 when idle).
     fn streaming_lines(&self) -> usize {
-        if self.streaming.is_some() {
+        if self.stream.is_active() {
             self.streaming_render
                 .as_ref()
                 .map_or(0, |memo| memo.lines.len())
@@ -2595,7 +2645,7 @@ impl Transcript {
         // `(len, width)` so only frames where the stream actually grew pay the
         // markdown re-parse.
         self.refresh_streaming_memo(width);
-        if self.streaming.is_some()
+        if self.stream.is_active()
             && let Some(memo) = self.streaming_render.as_ref()
         {
             out.extend(memo.lines.iter().cloned());
@@ -2607,17 +2657,6 @@ impl Transcript {
             total_lines,
         }
     }
-}
-
-pub(super) fn streaming_markdown_preview(text: &str) -> String {
-    if text.len() <= MAX_STREAMING_MARKDOWN_BYTES {
-        return text.to_string();
-    }
-    let start = text.ceil_char_boundary(text.len() - MAX_STREAMING_MARKDOWN_BYTES);
-    format!(
-        "… streaming preview truncated; showing latest content …\n{}",
-        &text[start..]
-    )
 }
 
 /// The APPROVAL body line: the authorized action (with a `$ ` prompt for shell
