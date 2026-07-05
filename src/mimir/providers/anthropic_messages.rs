@@ -319,17 +319,17 @@ impl AnthropicProvider {
                 // protocol anomaly: only when this attempt streamed no visible
                 // text, so a retry cannot duplicate user-visible output. If text
                 // was already shown, or the turn was cancelled, surface it.
-                if !cancel.is_cancelled() && !parser.emitted_visible_text {
+                if !cancel.is_cancelled() && !parser.emitted_visible_output() {
                     return Attempt::Retry(error, None);
                 }
                 return Attempt::Fatal(error);
             }
             let last = parser.last_event_type.clone();
             // Whether this attempt streamed any visible text to the consumer.
-            // Only `text_delta` is forwarded live (tool input and reasoning are
-            // buffered), so this gates whether a malformed stream can be safely
+            // Assistant text AND non-redacted reasoning summaries are forwarded
+            // live, so either gates whether a malformed stream can be safely
             // retried without duplicating user-visible output.
-            let emitted_visible_text = parser.emitted_visible_text;
+            let emitted_visible_output = parser.emitted_visible_output();
             return match parser.finish() {
                 Ok(turn) => {
                     if let Some(usage) = &turn.usage {
@@ -339,7 +339,7 @@ impl AnthropicProvider {
                     Attempt::Done(Box::new(turn))
                 }
                 Err(error) => {
-                    let retryable = protocol_anomaly_retryable(&error, emitted_visible_text);
+                    let retryable = protocol_anomaly_retryable(&error, emitted_visible_output);
                     // Attach safe diagnostics; downcast already happened above so
                     // wrapping does not lose the classification.
                     let error = error.context(diag(last).to_string());
@@ -536,17 +536,18 @@ impl std::error::Error for StreamProtocolAnomaly {}
 /// Other finish failures (incomplete tool JSON, empty turn) and any anomaly that
 /// arrived after visible output are non-retryable.
 ///
-/// INVARIANT: `emitted_visible_text` must be `true` whenever this attempt has
-/// pushed ANYTHING to the user-visible stream. Today only `text_delta` is
-/// forwarded live (`AnthropicStreamParser` sets `emitted_visible_text` there);
-/// tool input (`input_json_delta`) and reasoning (`thinking_delta` /
-/// `signature_delta`) are buffered and only surface in the terminal
-/// `AssistantTurn`, so they cannot duplicate on a retry. If reasoning or tool
-/// deltas ever become live UI events, they MUST set the same
-/// `emitted_visible_text` gate, or this retry policy must change -- otherwise a
-/// retry could replay already-shown reasoning/tool output.
-fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_text: bool) -> bool {
-    !emitted_visible_text && error.downcast_ref::<StreamProtocolAnomaly>().is_some()
+/// INVARIANT: the gate passed here must be `true` whenever this attempt has
+/// pushed ANYTHING to the user-visible stream. Assistant `text_delta` and
+/// non-redacted reasoning summaries (`thinking_delta`) are forwarded live and
+/// each set their own flag (`emitted_visible_text` / `emitted_visible_reasoning`),
+/// which `emitted_visible_output` ORs together. Tool input (`input_json_delta`)
+/// and redacted thinking are buffered and only surface in the terminal
+/// `AssistantTurn`, so they cannot duplicate on a retry. If tool-input deltas
+/// ever become live UI events, they MUST also fold into `emitted_visible_output`,
+/// or this retry policy must change -- otherwise a retry could replay
+/// already-shown output.
+fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_output: bool) -> bool {
+    !emitted_visible_output && error.downcast_ref::<StreamProtocolAnomaly>().is_some()
 }
 
 /// Map an Anthropic `stop_reason` wire token onto the provider-neutral
@@ -1132,10 +1133,17 @@ struct AnthropicStreamParser {
     usage_seen: bool,
     message_stopped: bool,
     /// Whether a non-empty `text_delta` was forwarded to the sink this attempt.
-    /// Only visible text is streamed live (tool input and reasoning are
-    /// buffered), so this gates whether a malformed stream can be retried
-    /// without duplicating user-visible output.
+    /// Assistant text and non-redacted reasoning summaries are streamed live;
+    /// tool input and redacted thinking are buffered. This flag together with
+    /// `emitted_visible_reasoning` gates whether a malformed stream can be
+    /// retried without duplicating user-visible output.
     emitted_visible_text: bool,
+    /// Whether a non-redacted reasoning (thinking) delta was forwarded live to
+    /// the sink this attempt. Like `emitted_visible_text`, it disables silent
+    /// retry: the user has already seen live reasoning, so a replay would
+    /// duplicate visible output. Redacted thinking never counts here -- its text
+    /// is never forwarded (ADR-0016).
+    emitted_visible_reasoning: bool,
     /// Fable can switch to Opus mid-stream through a server-side fallback marker.
     /// Until the marker arrives (or the turn ends without one), pre-boundary text
     /// is buffered rather than streamed so a safety-refusal preface can be
@@ -1182,11 +1190,20 @@ impl AnthropicStreamParser {
             usage_seen: false,
             message_stopped: false,
             emitted_visible_text: false,
+            emitted_visible_reasoning: false,
             server_side_fallback_possible,
             fallback_boundary_seen: false,
             completion_reason: None,
             last_event_type: None,
         }
+    }
+
+    /// Whether any visible output (assistant text or a live, non-redacted
+    /// reasoning summary) was forwarded to the front-end this attempt. Once
+    /// true, a mid-stream protocol anomaly is fatal rather than silently
+    /// retried, so a replay cannot duplicate shown output.
+    fn emitted_visible_output(&self) -> bool {
+        self.emitted_visible_text || self.emitted_visible_reasoning
     }
 
     fn ingest_event(&mut self, data: &str, sink: &mut dyn TurnSink) -> Result<()> {
@@ -1231,6 +1248,15 @@ impl AnthropicStreamParser {
                 if let Some(block) = value.get("content_block") {
                     match block.get("type").and_then(Value::as_str) {
                         Some("thinking") => {
+                            // A new thinking block after reasoning was already
+                            // shown this attempt: separate it with a section
+                            // break (a blank line between paragraphs), mirroring
+                            // the OpenAI adapter's summary-part breaks.
+                            let past_boundary =
+                                !self.server_side_fallback_possible || self.fallback_boundary_seen;
+                            if past_boundary && self.emitted_visible_reasoning {
+                                sink.on_reasoning_section_break()?;
+                            }
                             self.open_reasoning.insert(
                                 index,
                                 ReasoningBlock::new(
@@ -1313,11 +1339,31 @@ impl AnthropicStreamParser {
                             }
                         }
                         Some("thinking_delta") => {
-                            if let (Some(block), Some(thinking)) = (
+                            // Same gate as `text_delta`: for a refusal-fallback
+                            // model, withhold live output until the fallback
+                            // boundary is seen, so reasoning a fallback would
+                            // discard is never shown.
+                            let past_boundary =
+                                !self.server_side_fallback_possible || self.fallback_boundary_seen;
+                            let forwarded = if let (Some(block), Some(thinking)) = (
                                 self.open_reasoning.get_mut(&index),
                                 delta.get("thinking").and_then(Value::as_str),
                             ) {
                                 block.text.push_str(thinking);
+                                // Forward the display-safe summary live, but
+                                // never a redacted block's text (ADR-0016) and
+                                // never an empty delta.
+                                if past_boundary && !block.redacted && !thinking.is_empty() {
+                                    sink.on_reasoning_delta(thinking)?;
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            if forwarded {
+                                self.emitted_visible_reasoning = true;
                             }
                         }
                         Some("signature_delta") => {
@@ -2321,6 +2367,174 @@ data: {\"type\":\"message_stop\"}\n\n";
             .unwrap();
         assert_eq!(sink.deltas, ["live"]);
         assert!(parser.emitted_visible_text);
+    }
+
+    #[test]
+    fn thinking_deltas_stream_live_and_persist_once() {
+        // Anthropic extended-thinking summary deltas are forwarded live to the
+        // reasoning rail AND the final block is still persisted exactly once.
+        #[derive(Default)]
+        struct RecordingSink {
+            reasoning: Vec<String>,
+            section_breaks: usize,
+        }
+        impl TurnSink for RecordingSink {
+            fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+                Ok(())
+            }
+            fn on_reasoning_delta(&mut self, delta: &str) -> Result<()> {
+                self.reasoning.push(delta.to_string());
+                Ok(())
+            }
+            fn on_reasoning_section_break(&mut self) -> Result<()> {
+                self.section_breaks += 1;
+                Ok(())
+            }
+        }
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Plan: \"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"inspect then edit\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let mut parser = AnthropicStreamParser::new(anthropic_origin("claude-opus-4-8"), false);
+        let mut sink = RecordingSink::default();
+        for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
+            parser.ingest_event(data, &mut sink)
+        })
+        .expect("stream parses");
+        assert_eq!(sink.reasoning, ["Plan: ", "inspect then edit"]);
+        assert_eq!(sink.section_breaks, 0);
+        assert!(parser.emitted_visible_output());
+        assert!(
+            !parser.emitted_visible_text,
+            "reasoning is not assistant text"
+        );
+        let turn = parser.finish().expect("finish");
+        assert_eq!(turn.reasoning.len(), 1);
+        assert_eq!(turn.reasoning[0].text, "Plan: inspect then edit");
+        assert!(!turn.reasoning[0].redacted);
+    }
+
+    #[test]
+    fn redacted_thinking_is_never_streamed_live() {
+        // ADR-0016: a redacted thinking block's text is never forwarded live,
+        // even if a (synthetic) thinking_delta targets its index.
+        #[derive(Default)]
+        struct RecordingSink {
+            reasoning: Vec<String>,
+        }
+        impl TurnSink for RecordingSink {
+            fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+                Ok(())
+            }
+            fn on_reasoning_delta(&mut self, delta: &str) -> Result<()> {
+                self.reasoning.push(delta.to_string());
+                Ok(())
+            }
+        }
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"ENC\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"must not leak\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let mut parser = AnthropicStreamParser::new(anthropic_origin("claude-opus-4-8"), false);
+        let mut sink = RecordingSink::default();
+        for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
+            parser.ingest_event(data, &mut sink)
+        })
+        .expect("stream parses");
+        assert!(
+            sink.reasoning.is_empty(),
+            "redacted reasoning is never streamed (ADR-0016)"
+        );
+        assert!(!parser.emitted_visible_reasoning);
+        let turn = parser.finish().expect("finish");
+        assert_eq!(turn.reasoning.len(), 1);
+        assert!(turn.reasoning[0].redacted);
+    }
+
+    #[test]
+    fn visible_reasoning_delta_disables_silent_retry() {
+        // A shown reasoning summary is visible output, so a later truncated
+        // stream (protocol anomaly) is fatal, not silently retried.
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning shown\"}}
+
+";
+        // No content_block_stop / message_stop -> truncated (anomalous) stream.
+        let parser = parser_after(body, "claude-opus-4-8");
+        let emitted = parser.emitted_visible_output();
+        assert!(emitted, "reasoning was shown");
+        assert!(!parser.emitted_visible_text, "but not via assistant text");
+        let err = parser.finish().unwrap_err();
+        assert!(
+            !protocol_anomaly_retryable(&err, emitted),
+            "a protocol anomaly after visible reasoning must not be silently retried"
+        );
+    }
+
+    #[test]
+    fn pre_fallback_reasoning_is_withheld_until_the_boundary() {
+        // A refusal-fallback model buffers reasoning like text until the
+        // fallback boundary: pre-boundary thinking a fallback would discard is
+        // never streamed; post-boundary reasoning streams normally.
+        #[derive(Default)]
+        struct RecordingSink {
+            reasoning: Vec<String>,
+        }
+        impl TurnSink for RecordingSink {
+            fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+                Ok(())
+            }
+            fn on_reasoning_delta(&mut self, delta: &str) -> Result<()> {
+                self.reasoning.push(delta.to_string());
+                Ok(())
+            }
+        }
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"discarded preface\"}}
+
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\",\"to\":{\"model\":\"claude-opus-4-8\"}}}
+
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"real reasoning\"}}
+
+data: {\"type\":\"content_block_stop\",\"index\":2}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        // `true` marks the model refusal-fallback-capable, so pre-boundary
+        // output is buffered rather than streamed.
+        let mut parser = AnthropicStreamParser::new(anthropic_origin("claude-fable-5"), true);
+        let mut sink = RecordingSink::default();
+        for_each_sse_event(body.as_bytes(), &CancellationToken::new(), |data| {
+            parser.ingest_event(data, &mut sink)
+        })
+        .expect("stream parses");
+        assert_eq!(
+            sink.reasoning,
+            ["real reasoning"],
+            "only post-boundary reasoning streams; the discarded preface never does"
+        );
+        assert!(parser.emitted_visible_reasoning);
     }
 
     #[test]
