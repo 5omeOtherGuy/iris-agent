@@ -4704,6 +4704,7 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
                 original_tokens_estimate,
                 summary_tokens_estimate,
                 budget,
+                generation,
             } => Some((
                 compaction_id,
                 covered_from,
@@ -4712,6 +4713,7 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
                 *original_tokens_estimate,
                 *summary_tokens_estimate,
                 *budget,
+                *generation,
             )),
             _ => None,
         })
@@ -4722,6 +4724,63 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
     assert_eq!(compaction.3, 2);
     assert!(compaction.4 > compaction.5);
     assert_eq!(compaction.6, 50);
+    // First compaction in the session reports generation 1.
+    assert_eq!(compaction.7, 1);
+    Ok(())
+}
+
+/// The Nth auto-compaction in a session reports generation N on its
+/// `CompactionApplied` event. Drives several over-budget turns so the harness
+/// compacts more than once, then asserts the reported generations begin 1, 2.
+#[test]
+fn auto_compaction_reports_incrementing_generation() -> Result<()> {
+    use crate::session::SessionLog;
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    for prompt in ["P", "Q", "S", "T"] {
+        block_on(harness.submit_turn(
+            &prompt.repeat(400),
+            &frontend,
+            &frontend,
+            &CancellationToken::new(),
+        ))?;
+    }
+
+    let events = frontend.events.borrow();
+    let generations: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::CompactionApplied { generation, .. } => Some(*generation),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        generations.len() >= 2,
+        "expected at least two compactions, got {generations:?}"
+    );
+    assert_eq!(
+        &generations[..2],
+        &[1, 2],
+        "the Nth compaction must report generation N"
+    );
     Ok(())
 }
 

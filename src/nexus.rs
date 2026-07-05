@@ -289,6 +289,10 @@ pub(crate) enum AgentEvent {
         original_tokens_estimate: u64,
         summary_tokens_estimate: u64,
         budget: u64,
+        /// 1-based compaction generation ordinal (ADR-0047): the Nth compaction
+        /// in the session reports N. Instrumentation of compaction depth; does
+        /// not affect range selection or summary content.
+        generation: u64,
     },
     AssistantText(String),
     AssistantTextDelta(String),

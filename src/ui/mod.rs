@@ -300,6 +300,10 @@ impl UiEvent {
                 original_tokens_estimate,
                 summary_tokens_estimate,
                 budget,
+                // Generation ordinal (ADR-0047) is instrumentation for the
+                // event/benchmark, not a display field; the UI does not surface
+                // it, so drop it in the display mapping.
+                generation: _,
             } => UiEvent::CompactionApplied {
                 compaction_id,
                 covered_from,
