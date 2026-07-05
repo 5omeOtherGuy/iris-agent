@@ -559,6 +559,10 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
     })?;
     let stored = store.open(&meta)?;
     let resumed = stored.messages.len();
+    // Durable message ids parallel to the loaded messages (#377): thread them
+    // into the harness so a near-budget startup-resumed prefix stays compactable
+    // by auto-compaction and `/compact`, instead of being seeded id-less.
+    let entry_ids = stored.entry_ids;
     // The rebuilt context's token total from the reconstruction path -- the same
     // number the live session reports via `session::context_tokens`, so it is
     // stable across resume. The harness compares it against the budget at the
@@ -596,7 +600,7 @@ fn resume_agent(session_id: &str, force_plain: bool) -> Result<()> {
         cwd.clone(),
         tools::ToolState::new(),
         session,
-        resumed,
+        entry_ids,
         budget,
     );
     harness.set_verification(settings.verification());

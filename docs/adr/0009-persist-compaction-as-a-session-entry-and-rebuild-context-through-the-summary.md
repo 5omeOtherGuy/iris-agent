@@ -47,7 +47,7 @@ The first auto-trigger lives in the Wayland harness. Before a provider request, 
 
 ### Negative
 - The current summarizer is deterministic bounded excerpts, not a provider-quality summary.
-- Already-loaded resumed history is tracked id-less in the harness, so only post-resume turns are re-coverable until the read path surfaces per-message entry ids.
+- Resolved (#375, #377): both resume paths now thread durable per-message entry ids into the harness -- the in-session `/resume` swap (`swap_session`) and the startup path (`Harness::resumed`, `iris --continue` / `iris resume`). A resumed prefix is therefore coverable, so a near-budget resumed session auto-compacts and `/compact`s its loaded history instead of being tracked id-less. Summary positions stay `None`, so a prior summary is never re-covered.
 
 ### Risks
 - A covered range that splits a tool-call/tool-result pair could leave a dangling half; mitigate by keeping range choice pair-aware in the harness and adding the same validation to any future manual/provider compaction entry point.

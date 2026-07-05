@@ -4378,7 +4378,7 @@ fn resumed_session_feeds_prior_context_into_next_turn() -> Result<()> {
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        resumed,
+        stored.entry_ids,
         None,
     );
 
@@ -4446,7 +4446,7 @@ fn resume_repairs_a_dangling_tool_call_before_the_next_turn() -> Result<()> {
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        on_disk,
+        stored.entry_ids,
         None,
     );
 
@@ -4515,7 +4515,6 @@ fn resume_repairs_all_dangling_tool_calls_before_the_next_turn() -> Result<()> {
     let store = SessionStore::with_root(dir.path.clone());
     let meta = store.find(&id)?.expect("session present");
     let stored = store.open(&meta)?;
-    let on_disk = stored.messages.len();
     let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
     let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
     let session = SessionLog::resume(&path)?;
@@ -4524,7 +4523,7 @@ fn resume_repairs_all_dangling_tool_calls_before_the_next_turn() -> Result<()> {
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        on_disk,
+        stored.entry_ids,
         None,
     );
 
@@ -4894,12 +4893,15 @@ fn provider_summary_covers_only_the_range_not_the_retained_prefix() -> Result<()
     ]);
     let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
     let session = SessionLog::resume(&path)?;
+    // This test exercises the LEGACY id-less resume prefix (no durable ids), so
+    // it stays a retained prefix (`plan.start > 0`); pass an all-`None` id list
+    // explicitly rather than the read-back ids.
     let mut harness = Harness::resumed(
         agent,
         dir.path.clone(),
         ToolState::new(),
         Some(session),
-        resumed,
+        vec![None; resumed],
         Some(50),
     );
     harness.set_summarizer(crate::wayland::SummarizerKind::Provider);
@@ -5120,6 +5122,203 @@ fn resumed_session_prefix_is_compactable() -> Result<()> {
     assert!(
         !messages.iter().any(|m| m.content == "first prompt"),
         "the covered resumed turns must not remain verbatim"
+    );
+    Ok(())
+}
+
+/// Regression (#377): a session resumed at STARTUP (`iris --continue` /
+/// `iris resume`, i.e. `Harness::resumed`) whose loaded context exceeds the
+/// budget must auto-compact its resumed range at the next turn boundary -- the
+/// startup mirror of `resumed_session_prefix_is_compactable`. Before the fix
+/// `Harness::resumed` seeded `entry_ids = vec![None; persisted]`, so
+/// `plan_compaction` never started on the resumed bulk and an over-budget
+/// startup-resumed session silently no-oped instead of reclaiming headroom.
+#[test]
+fn startup_resumed_session_prefix_auto_compacts_at_turn_boundary() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400); // ~100 tokens per assistant reply
+
+    // Persist an id-bearing session, then drop the live handle.
+    let mut log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let path = log.path().to_path_buf();
+    log.append(&Message::user("first prompt"))?;
+    log.append(&Message::assistant(&long))?;
+    log.append(&Message::user("second prompt"))?;
+    log.append(&Message::assistant(&long))?;
+    log.append(&Message::user("third prompt"))?;
+    log.append(&Message::assistant("tail answer"))?;
+    drop(log);
+
+    // Read the transcript back through the real rebuild path so the durable ids
+    // come from disk (every entry `Some(id)`), just like the startup caller.
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present in store");
+    let stored = store.open(&meta)?;
+    assert!(
+        stored.entry_ids.iter().all(Option::is_some),
+        "an id-bearing session must read back real ids: {:?}",
+        stored.entry_ids
+    );
+
+    // Drive through the STARTUP path (`Harness::resumed`) with a tiny budget so
+    // the first turn boundary is already over budget and auto-compaction fires
+    // before the provider request.
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("new answer"))]);
+    let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        stored.entry_ids,
+        Some(50),
+    );
+
+    run_text_session(
+        &mut harness,
+        b"next prompt\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+
+    // The resumed prefix collapsed into a summary before the provider request.
+    let seen = harness.agent.provider.seen.borrow();
+    let first = seen.first().expect("provider was called");
+    assert!(
+        first[0].content.starts_with("[auto-compacted summary"),
+        "the resumed prefix must collapse into a summary before the turn, got: {}",
+        first[0].content
+    );
+    assert!(
+        !first.iter().any(|m| m.content == "first prompt"),
+        "the covered resumed turns must not be replayed verbatim"
+    );
+    Ok(())
+}
+
+/// Round-trip (#377): compact live -> exit -> startup-resume (`iris --continue`)
+/// -> compact again. Every coverage id the second compaction writes must stay
+/// valid, so the final `read_messages`/rebuild accepts the transcript (a stale
+/// or missing coverage id is a hard read error). The rebuilt summary rows stay
+/// non-coverable (`None`) and a prior summary is never re-covered.
+#[test]
+fn startup_resume_round_trip_keeps_coverage_ids_valid() -> Result<()> {
+    use crate::session::{SessionLog, SessionStore};
+
+    let dir = crate::tools::test_support::temp_dir();
+    let long = "R".repeat(400);
+
+    // Live session that auto-compacts over a tiny budget across two turns.
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn::text(&long)),
+        Ok(AssistantTurn::text(&long)),
+    ]);
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let log = SessionLog::create_in(&dir.path, Path::new("/w"))?;
+    let id = log.id().to_string();
+    let path = log.path().to_path_buf();
+    let mut harness = Harness::new(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Some(50),
+    );
+    let input = format!("{}\n{}\n/exit\n", "P".repeat(400), "Q".repeat(400));
+    run_text_session(
+        &mut harness,
+        input.as_bytes(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+    drop(harness);
+
+    // First reopen (simulating `iris --continue`): the rebuild applies the live
+    // compaction, so a summary row is present and it is non-coverable (`None`).
+    let store = SessionStore::with_root(dir.path.clone());
+    let meta = store.find(&id)?.expect("session present");
+    let stored = store.open(&meta)?;
+    let summary_idx = stored
+        .messages
+        .iter()
+        .position(|m| m.content.starts_with("[auto-compacted summary"))
+        .expect("first reopen must carry the live compaction summary");
+    assert_eq!(
+        stored.entry_ids[summary_idx], None,
+        "a rebuilt summary row must stay non-coverable (id None)"
+    );
+
+    // Startup-resume through `Harness::resumed`, then push over budget again so a
+    // SECOND compaction fires -- it must cover only real ids after the summary.
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn::text(&long))]);
+    let agent = Agent::resumed(provider, crate::tools::built_in_tools(), stored.messages);
+    let session = SessionLog::resume(&path)?;
+    let mut harness = Harness::resumed(
+        agent,
+        dir.path.clone(),
+        ToolState::new(),
+        Some(session),
+        stored.entry_ids,
+        Some(50),
+    );
+    run_text_session(
+        &mut harness,
+        b"more\n/exit\n",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+    drop(harness);
+
+    // Final reopen: `read_messages` accepts every entry id and every coverage id
+    // (an invalid/overlapping/missing coverage range is a hard error here), and
+    // the prior summary was not re-covered -- exactly one summary row remains at
+    // the front, still non-coverable.
+    let reopened = store.open(&meta)?;
+    assert_eq!(
+        reopened.entry_ids.len(),
+        reopened.messages.len(),
+        "entry ids stay parallel to messages after the round trip"
+    );
+    // Every rebuilt summary row is non-coverable (`None`).
+    let summaries: Vec<usize> = reopened
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.content.starts_with("[auto-compacted summary"))
+        .map(|(i, _)| i)
+        .collect();
+    for &i in &summaries {
+        assert_eq!(
+            reopened.entry_ids[i], None,
+            "summary row {i} must stay non-coverable"
+        );
+    }
+    // The prior summary survives at the front -- it was never re-covered by the
+    // second compaction (`plan_compaction` stops at its `None` id). The new
+    // startup-resume compaction added its own summary after it, so two distinct
+    // summary rows remain rather than a re-summarized single one.
+    assert_eq!(
+        summaries.first().copied(),
+        Some(0),
+        "the prior summary must survive at the front, not be re-covered: {:?}",
+        reopened
+            .messages
+            .iter()
+            .map(|m| m.content.chars().take(24).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        summaries.len() >= 2,
+        "the startup-resumed range must compact into its own summary (prior summary preserved): {:?}",
+        reopened
+            .messages
+            .iter()
+            .map(|m| m.content.chars().take(24).collect::<String>())
+            .collect::<Vec<_>>()
     );
     Ok(())
 }
