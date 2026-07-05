@@ -108,3 +108,15 @@ global/user-only.
   reading repo config directly.
 - Provider usage metadata may be incomplete or absent; UI and benchmarks must
   treat missing usage as unknown, not zero savings.
+
+## Addendum (2026-07-05, issue #400)
+
+`anthropicContextManagement.clearToolUses` and local microcompaction
+(ADR-0048) are mutually exclusive: the server drops tool results Iris still
+models as present, so context accounting and fold plans diverge (two reducers
+fighting over the same mass). Enforced at selection load
+(`ContextManagement::validate_compatible_with_microcompaction`) and at the
+`/settings` save boundary (`save_microcompaction`). `clearThinking` remains
+compatible: folds never touch thinking blocks, and recall reads Iris's own
+log. This discharges epic #379's unfiled "anthropicContextManagement
+interplay" gap.

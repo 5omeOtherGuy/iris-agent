@@ -461,7 +461,33 @@ pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {
 /// Persist the opt-in microcompaction toggle in the global settings file
 /// (ADR-0048, #378). A boolean, so no clamping is needed; the `/settings` toggle
 /// and config parsing both validate at the boundary.
+///
+/// Enabling is rejected while `anthropicContextManagement.clearToolUses` is
+/// configured (issue #400, ADR-0022 addendum): server-side tool-result
+/// clearing and local microcompaction are mutually exclusive (the server
+/// drops content Iris still models as present). The raw-key check mirrors
+/// `ContextManagement::validate_compatible_with_microcompaction`, which
+/// enforces the same rule over the MERGED settings at selection load;
+/// `anthropicContextManagement` is global-only, so the global file is the
+/// complete truth for the key this save guards against.
 pub(crate) fn save_microcompaction(enabled: bool) -> Result<()> {
+    if enabled {
+        let path = global_path()
+            .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
+        let object = read_object(&path)?;
+        let clears_tool_uses = object
+            .get("anthropicContextManagement")
+            .and_then(|value| value.get("clearToolUses"))
+            .is_some();
+        if clears_tool_uses {
+            anyhow::bail!(
+                "anthropicContextManagement.clearToolUses and microcompaction cannot be enabled \
+                 together: the server drops tool results Iris still models as present, so \
+                 context accounting and fold plans diverge. Disable one of them \
+                 (clearThinking remains compatible with microcompaction)."
+            );
+        }
+    }
     update_global(&[("microcompaction", Value::Bool(enabled))])
 }
 
@@ -1208,6 +1234,41 @@ mod tests {
                 None => unsafe { env::remove_var("IRIS_CONFIG_PATH") },
             }
         }
+    }
+
+    #[test]
+    fn save_microcompaction_rejects_enabling_beside_clear_tool_uses() {
+        // Mutual exclusion at the /settings save boundary (issue #400,
+        // ADR-0022 addendum): enabling microcompaction while the global file
+        // configures anthropicContextManagement.clearToolUses is rejected;
+        // disabling stays allowed, and clearThinking does not block.
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        fs::write(
+            &path,
+            r#"{ "anthropicContextManagement": { "clearToolUses": { "triggerInputTokens": 50000 } } }"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+
+        let error = format!("{:#}", save_microcompaction(true).unwrap_err());
+        assert!(error.contains("clearToolUses"), "names the edit: {error}");
+        assert!(
+            error.contains("microcompaction"),
+            "names the toggle: {error}"
+        );
+        // Disabling is always allowed (it resolves the conflict).
+        save_microcompaction(false).unwrap();
+
+        // clearThinking alone does not block enabling.
+        fs::write(
+            &path,
+            r#"{ "anthropicContextManagement": { "clearThinking": { "triggerInputTokens": 50000 } } }"#,
+        )
+        .unwrap();
+        save_microcompaction(true).unwrap();
+        let settings = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert!(settings.microcompaction());
     }
 
     #[test]
