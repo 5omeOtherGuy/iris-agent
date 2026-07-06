@@ -233,6 +233,15 @@ pub(super) enum PanelState {
     Cancelled,
     /// A pending mutation awaiting apply/approval (`◇ PREVIEW`, no elapsed).
     Preview,
+    /// A gated call awaiting the user's decision (`▲ REVIEW`, orange, no
+    /// elapsed). The affordance (`y approve ┊ n deny ┊ …`) rides the footer;
+    /// the block transitions in place to `Running` on approve or `Denied` on
+    /// deny — approval lives inside the tool block, not a separate panel.
+    Review,
+    /// A gated call the user refused (`■ DENIED`, red, no elapsed). Terminal:
+    /// the tool never ran, so the block is the honest record of what was
+    /// proposed and declined.
+    Denied,
 }
 
 impl PanelState {
@@ -246,14 +255,18 @@ impl PanelState {
             Self::Error => "ERROR",
             Self::Cancelled => "CANCELLED",
             Self::Preview => "PREVIEW",
+            Self::Review => "REVIEW",
+            Self::Denied => "DENIED",
         }
     }
 
     pub(super) fn dot_style(self) -> Style {
         match self {
-            Self::Running => prompt_style(),
+            // Review is the orange warning/accent role (`▲`); Done stays green,
+            // Denied joins Error on the danger role.
+            Self::Running | Self::Review => prompt_style(),
             Self::Done => ok_style(),
-            Self::Error => err_style(),
+            Self::Error | Self::Denied => err_style(),
             Self::Cancelled | Self::Preview => dim_style(),
         }
     }
@@ -271,6 +284,8 @@ impl PanelState {
             Self::Error => "✗ Ran",
             Self::Cancelled => "• Cancelled",
             Self::Preview => "• Preview",
+            Self::Review => "• Review",
+            Self::Denied => "✗ Denied",
         }
     }
 }
@@ -542,6 +557,28 @@ pub(super) fn edit_footer_extras(
     }
     if let Some(note) = note {
         fields.push(FooterField::styled(note.to_string(), dim_style()));
+    }
+    fields
+}
+
+/// The in-block approval affordance (`y approve ┊ n deny ┊ a always ┊ p
+/// project`) as `┊`-joined footer fields — the key in ink, the action muted.
+/// Only the choices the loop actually offers are shown; deny (`n`/Enter/Esc) is
+/// always available. Replaces the former docked gate's hint row.
+pub(super) fn review_footer_extras(allow_always: bool, allow_project: bool) -> Vec<FooterField> {
+    let field = |key: &str, action: &str| FooterField {
+        spans: vec![
+            Span::styled(key.to_string(), Style::default()),
+            Span::styled(format!(" {action}"), dim_style()),
+        ],
+        plain: format!("{key} {action}"),
+    };
+    let mut fields = vec![field("y", "approve"), field("n", "deny")];
+    if allow_always {
+        fields.push(field("a", "always"));
+    }
+    if allow_project {
+        fields.push(field("p", "project"));
     }
     fields
 }

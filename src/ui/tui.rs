@@ -29,7 +29,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::crossterm::{execute, queue};
 use ratatui::layout::Size;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 #[cfg(test)]
 use ratatui::text::{Line, Span};
 
@@ -58,7 +58,7 @@ mod transcript;
 mod wrap;
 
 pub(crate) use component::Component;
-pub(crate) use overlay::{FocusTarget, overlay_box};
+pub(crate) use overlay::{FocusTarget, overlay_menu};
 #[cfg(test)]
 use panel::PanelState;
 #[cfg(test)]
@@ -122,7 +122,7 @@ const PANEL_FOOTER_INDENT: usize = 2;
 // themed accessors are imported here so the whole `tui` module tree resolves
 // them as `border()`, `orange()`, … (and its child modules as
 // `super::border()`), reading the active theme at render time (ADR-0042).
-use crate::ui::palette::{border, diff_add_bg, diff_del_bg, green, orange, red};
+use crate::ui::palette::{border, diff_add_bg, diff_del_bg, green, muted, orange, red, stdout};
 
 const X_PADDING: usize = 2;
 const BOX_X_PADDING: usize = X_PADDING;
@@ -158,8 +158,18 @@ fn ok_style() -> Style {
 fn err_style() -> Style {
     Style::default().fg(red())
 }
+/// The recessive-text role (`muted`): metadata, hints, markers, elisions, and
+/// the `┊`/`─` separators. A real themed color (see `palette::muted`) rather
+/// than the `Modifier::DIM` attribute it replaced — so muted survives DIM-blind
+/// terminals and adopts each named theme's own grey (§2.1). Name retained to
+/// keep the change a single body edit across its ~140 call sites.
 fn dim_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
+    Style::default().fg(muted())
+}
+/// SHELL program output (`stdout` role): lighter than `muted`, recessive to the
+/// bright command line above it.
+fn stdout_style() -> Style {
+    Style::default().fg(stdout())
 }
 fn prompt_style() -> Style {
     Style::default().fg(orange())
@@ -530,10 +540,10 @@ impl Drop for TuiUi {
 mod tests {
     use super::panel::{footer_rule_line, inset_rule_line, panel_body_line, panel_header_line};
     use super::*;
-    use crate::nexus::{ApprovalDecision, ReviewContext, ToolCall};
+    use crate::nexus::{ApprovalDecision, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::terminal_surface::{RenderKind, TerminalSurface};
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
     use serde_json::json;
 
     fn call(name: &str) -> ToolCall {
@@ -1898,8 +1908,10 @@ mod tests {
         assert!(line_text(output).contains("red plain"), "{output:?}");
         let red = span_matching(output, |span| span.content.as_ref() == "red");
         assert_eq!(red.style, Style::default().fg(Color::Red));
+        // Program-coloured text is preserved verbatim; text the program left
+        // uncoloured falls to the recessive `stdout` role, not default ink.
         let plain = span_matching(output, |span| span.content.as_ref() == " plain");
-        assert_eq!(plain.style.fg, Some(Color::Reset));
+        assert_eq!(plain.style.fg, Some(stdout()));
     }
 
     #[test]
@@ -2107,70 +2119,69 @@ mod tests {
     }
 
     #[test]
-    fn approval_hint_names_tool_target() {
+    fn shell_review_renders_in_block_with_affordance() {
+        // A gated SHELL call renders its review INSIDE its own tool block: the
+        // `REVIEW` state, the `$ command` body, and the decision affordance on
+        // the block's footer — never a separate approval panel or docked box.
         let mut screen = Screen::new();
-        screen.show_approval(
-            &call_args("bash", json!({ "command": "echo hi" })),
-            false,
-            false,
-            &ReviewContext::default(),
-        );
+        screen.apply(UiEvent::ToolReview {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
         let rendered = rendered_text(&mut screen, 80, 14);
         assert!(rendered.contains("REVIEW"), "{rendered}");
-        assert!(rendered.contains("bash"), "{rendered}");
+        assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
-        // The explanatory reason line and the new `┊`-separated decision hints.
-        assert!(
-            rendered.contains("Runs a shell command in the workspace."),
-            "{rendered}"
-        );
         assert!(rendered.contains("y approve"), "{rendered}");
         assert!(rendered.contains("n deny"), "{rendered}");
+        // The approval lives in the tool block: no separate APPROVAL panel.
+        assert!(!rendered.contains("APPROVAL"), "{rendered}");
     }
 
     #[test]
-    fn approval_panel_renders_above_composer_and_keeps_editor_visible() {
-        // The approval docks in the overlay region ABOVE the composer; the
-        // composer body (placeholder) stays visible below it, and the approval
-        // is not painted into the editor text rows.
+    fn review_block_renders_above_composer_and_keeps_editor_visible() {
+        // The review block sits in the transcript ABOVE the composer; the
+        // composer body (placeholder) stays visible below it.
         let mut screen = Screen::new();
-        screen.show_approval(
-            &call_args("bash", json!({ "command": "echo hi" })),
-            false,
-            false,
-            &ReviewContext::default(),
-        );
+        screen.apply(UiEvent::ToolReview {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
         let lines = rendered_lines(&mut screen, 80, 16);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let review_row = texts
             .iter()
-            .position(|t| t.contains("\u{25b2} REVIEW"))
-            .expect("REVIEW header row present");
+            .position(|t| t.contains("REVIEW"))
+            .expect("REVIEW footer row present");
         let placeholder_row = texts
             .iter()
             .position(|t| t.contains("Give Iris a task..."))
             .expect("composer placeholder still visible");
         assert!(
             review_row < placeholder_row,
-            "approval must render above the composer: {texts:?}"
+            "the review block must render above the composer: {texts:?}"
         );
     }
 
     #[test]
-    fn approval_prompt_renders_above_composer_and_wraps() {
+    fn review_block_wraps_at_narrow_width() {
         let mut screen = Screen::new();
-        screen.show_approval(
-            &call_args(
+        screen.apply(UiEvent::ToolReview {
+            call: call_args(
                 "bash",
                 json!({
                     "command": "printf 'global:\\n'; find \"$HOME/.iris/fragments\" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null",
                     "timeout": 120
                 }),
             ),
-            false,
-            false,
-            &ReviewContext::default(),
-        );
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
         let lines = rendered_lines(&mut screen, 48, 16);
         assert!(
             lines
@@ -2179,14 +2190,10 @@ mod tests {
             "{lines:?}"
         );
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("$ printf 'global:"));
-        assert!(rendered.contains("120s)"), "{rendered}");
+        assert!(rendered.contains("$ printf 'global:"), "{rendered}");
+        // Timeout is right-bound invocation metadata in the SHELL body.
+        assert!(rendered.contains("timeout 120s"), "{rendered}");
         assert!(rendered.contains("n deny"), "{rendered}");
-        assert!(!rendered.contains("\u{21b5} to send"), "{rendered}");
-        assert!(
-            !rendered.contains("Ask the agent anything..."),
-            "{rendered}"
-        );
     }
 
     #[test]
@@ -2227,72 +2234,185 @@ mod tests {
     }
 
     #[test]
-    fn approval_record_renders_as_approval_panel_with_green_marker() {
+    fn approved_shell_call_folds_note_into_its_own_block_footer() {
+        // A manually-approved SHELL call stays ONE block through its whole
+        // lifecycle: the `approved this time` note folds into that block's own
+        // footer (a muted aside), never a separate APPROVAL panel.
         let mut screen = Screen::new();
-        screen.record_approval(
-            &call_args("bash", json!({ "command": "echo hi" })),
-            ApprovalDecision::Allow,
-        );
-        assert!(screen.transcript.rows.iter().any(|row| matches!(
-            row.chrome.as_ref(),
-            Some(ChromeRow::Header {
-                title: "APPROVAL",
-                ..
-            })
-        )));
-        let rendered = rendered_text(&mut screen, 80, 12);
-        assert!(rendered.contains("APPROVAL"), "{rendered}");
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolReview {
+            call: call.clone(),
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
+        screen.note_approval(&call, ApprovalDecision::Allow);
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(0)),
+        });
+
+        // Compact by default: expand to inspect the settled block.
+        screen.toggle_all_panels();
+        let rendered = rendered_text(&mut screen, 80, 16);
+        assert!(rendered.contains("DONE"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
-        assert!(rendered.contains("┊ approved this time"), "{rendered}");
-        // The decision is the footer state label; no frame anywhere.
-        assert!(rendered.contains("APPROVED"), "{rendered}");
+        assert!(rendered.contains("approved this time"), "{rendered}");
+        // One tool block, no separate APPROVAL panel, no frame anywhere.
+        assert_eq!(rendered.matches("SHELL").count(), 1, "{rendered}");
+        assert!(!rendered.contains("APPROVAL"), "{rendered}");
         for frame in ['┌', '┐', '└', '┘', '│'] {
             assert!(!rendered.contains(frame), "{rendered}");
         }
 
+        // The note is a muted footer aside, not the decision-carrying label.
         let lines = screen.wrapped_lines(80);
         let line = line_matching(&lines, |line| {
             line_text(line).contains("approved this time")
         });
-        // The reason is a muted aside; the decision itself lives in the header.
         let marker = span_matching(line, |span| span.content.as_ref().contains("approved"));
         assert_eq!(marker.style, dim_style());
     }
 
     #[test]
-    fn tool_denial_renders_as_approval_panel_with_red_marker() {
+    fn denied_shell_call_flips_its_block_to_denied() {
+        // A refused SHELL call flips its own review block to `DENIED` in place:
+        // the honest record of what was proposed and declined, one block, no
+        // separate APPROVAL panel.
         let mut screen = Screen::new();
-        screen.apply(UiEvent::ToolDenied(call_args(
-            "bash",
-            json!({ "command": "echo hi" }),
-        )));
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolReview {
+            call: call.clone(),
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
+        screen.apply(UiEvent::ToolDenied(call));
 
         let rendered = rendered_text(&mut screen, 80, 12);
-        assert!(rendered.contains("APPROVAL"), "{rendered}");
         assert!(rendered.contains("DENIED"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
-        assert!(rendered.contains("┊ denied"), "{rendered}");
+        assert_eq!(rendered.matches("SHELL").count(), 1, "{rendered}");
+        assert!(!rendered.contains("APPROVAL"), "{rendered}");
+        assert!(!rendered.contains("RUNNING"), "{rendered}");
+
+        // The DENIED label carries the danger role (shared with ERROR).
         let lines = screen.wrapped_lines(80);
-        let line = line_matching(&lines, |line| line_text(line).contains("┊ denied"));
-        let marker = span_matching(line, |span| span.content.as_ref().contains("denied"));
-        assert_eq!(marker.style, err_style());
+        let line = line_matching(&lines, |line| line_text(line).contains("DENIED"));
+        let marker = span_matching(line, |span| span.content.as_ref().contains("DENIED"));
+        assert_eq!(marker.style.fg, err_style().fg);
     }
 
     #[test]
-    fn approval_record_preserves_ansi_target_style() {
+    fn reviewed_command_sanitizes_ansi_in_its_block() {
+        // The SHELL review body strips ANSI from the command it echoes, so an
+        // escape embedded in the proposed command cannot colour or corrupt the
+        // review surface — `red` renders as plain command text on the `$` row,
+        // never a styled red span.
         let mut screen = Screen::new();
-        screen.record_approval(
-            &call_args("bash", json!({ "command": "\u{1b}[31mred\u{1b}[0m" })),
-            ApprovalDecision::Allow,
+        screen.apply(UiEvent::ToolReview {
+            call: call_args("bash", json!({ "command": "\u{1b}[31mred\u{1b}[0m" })),
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
+        let lines = rendered_lines(&mut screen, 80, 14);
+        let cmd_row = line_matching(&lines, |line| line_text(line).contains("$ red"));
+        assert!(
+            !cmd_row
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Red)),
+            "ANSI colour must be stripped from the command: {cmd_row:?}"
         );
+        assert!(
+            line_text(cmd_row).contains("red"),
+            "command text preserved: {}",
+            line_text(cmd_row)
+        );
+    }
+
+    #[test]
+    fn approved_review_adopted_by_toolstarted_drops_affordance_without_a_note() {
+        // ToolStarted adopts a pending review block in place: `REVIEW` becomes
+        // the running block and the decision affordance is gone. With no manual
+        // approval recorded, no `approved …` note appears — the running block
+        // alone is the record.
+        let mut screen = Screen::new();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolReview {
+            call: call.clone(),
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
+        screen.apply(UiEvent::ToolStarted(call));
+        let rendered = rendered_text(&mut screen, 80, 14);
+        assert!(rendered.contains("RUNNING"), "{rendered}");
+        assert!(rendered.contains("$ echo hi"), "{rendered}");
+        assert!(
+            !rendered.contains("y approve"),
+            "affordance gone: {rendered}"
+        );
+        assert!(!rendered.contains("REVIEW"), "no stale REVIEW: {rendered}");
+        assert!(!rendered.contains("approved this"), "no note: {rendered}");
+        assert_eq!(rendered.matches("SHELL").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn edit_preview_flips_to_review_in_place() {
+        // A mutation whose diff already arrived (DiffPreview) keeps that block:
+        // `PREVIEW` flips to `REVIEW` in place — the diff IS the review body,
+        // never a second block.
+        let mut screen = Screen::new();
+        let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
+        screen.apply(UiEvent::DiffPreview {
+            call: call.clone(),
+            diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        });
+        screen.apply(UiEvent::ToolReview {
+            call,
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
+        let rendered = rendered_text(&mut screen, 100, 20);
+        assert!(rendered.contains("REVIEW"), "{rendered}");
+        assert!(rendered.contains("y approve"), "{rendered}");
+        // The review arrives expanded: the diff body IS the review surface.
+        assert!(rendered.contains("new"), "diff body kept: {rendered}");
+        assert_eq!(
+            rendered.matches("EDIT").count(),
+            1,
+            "one EDIT block: {rendered}"
+        );
+        assert!(
+            !rendered.contains("PREVIEW"),
+            "flipped in place: {rendered}"
+        );
+    }
+
+    #[test]
+    fn review_reason_shows_danger_toned_caution() {
+        // A danger-toned caution (destructive / pre-existing changes /
+        // unsandboxed) rides the review footer in the danger role, ahead of the
+        // decision affordance, so the safety fact survives the decision point.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolReview {
+            call: call_args("bash", json!({ "command": "rm -rf build" })),
+            allow_always: false,
+            allow_project: false,
+            reason: Some("destructive".to_string()),
+        });
         let lines = screen.wrapped_lines(80);
-        let line = line_matching(&lines, |line| line_text(line).contains("red"));
-        let red = line
-            .spans
-            .iter()
-            .find(|span| span.content.as_ref() == "red")
-            .expect("red span");
-        assert_eq!(red.style, Style::default().fg(Color::Red));
+        let line = line_matching(&lines, |line| line_text(line).contains("destructive"));
+        let marker = span_matching(line, |span| span.content.as_ref().contains("destructive"));
+        assert_eq!(marker.style.fg, err_style().fg, "danger-toned reason");
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("y approve"), "{rendered}");
     }
 
     #[test]
@@ -2850,7 +2970,7 @@ mod tests {
             "~/repo".to_string(),
         );
         screen.apply(UiEvent::SessionStarted);
-        screen.show_start_page();
+        screen.show_start_page(0);
         render_perf_cycle(&mut screen, &mut surface, size).expect("start-page frame");
         // New session selected / first prompt submitted -> start page dismissed.
         screen.leave_start_page();
@@ -2983,7 +3103,7 @@ mod tests {
             ..Default::default()
         }));
         screen.apply(UiEvent::SessionStarted);
-        screen.show_start_page();
+        screen.show_start_page(0);
 
         let height = 24u16;
         let lines = rendered_lines(&mut screen, 80, height);
@@ -3006,7 +3126,7 @@ mod tests {
             .position(|line| line.contains("New session"))
             .expect("launcher menu");
         assert!(mark_idx < menu_idx, "{texts:?}");
-        // All four rows, in order, with their key hints and the house idiom:
+        // All five rows, in order, with their key hints and the house idiom:
         // ◉ marker on the selected row, dotted leaders, no hairline dividers.
         assert!(texts[menu_idx].contains("◉ New session"), "{texts:?}");
         assert!(texts[menu_idx].trim_end().ends_with("ctrl-n"), "{texts:?}");
@@ -3015,12 +3135,17 @@ mod tests {
             texts[menu_idx + 1].trim_end().ends_with("ctrl-r"),
             "{texts:?}"
         );
+        assert!(texts[menu_idx + 2].contains("Tasks"), "{texts:?}");
         assert!(
-            texts[menu_idx + 2].trim_end().ends_with("ctrl-,"),
+            texts[menu_idx + 2].trim_end().ends_with("ctrl-t"),
             "{texts:?}"
         );
         assert!(
-            texts[menu_idx + 3].trim_end().ends_with("ctrl-q"),
+            texts[menu_idx + 3].trim_end().ends_with("ctrl-,"),
+            "{texts:?}"
+        );
+        assert!(
+            texts[menu_idx + 4].trim_end().ends_with("ctrl-q"),
             "{texts:?}"
         );
         // The composer chrome stays live below the launcher.
@@ -4577,8 +4702,8 @@ mod tests {
     #[test]
     fn footer_state_label_shares_one_column_across_families() {
         // The frameless footer is the state's only home: EXPLORE, SHELL, EDIT,
-        // and APPROVAL footers all start the label at the shared body indent,
-        // with no state glyph anywhere in the block.
+        // and a refused (DENIED) block all start the label at the shared body
+        // indent, with no state glyph anywhere in the block.
         let mut screen = Screen::new();
         // EXPLORE (grouped explore path).
         screen.apply(UiEvent::ToolResult {
@@ -4599,14 +4724,18 @@ mod tests {
             call: call_args("edit", json!({ "file_path": "src/b.rs" })),
             diff: "--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
         });
-        // APPROVAL (approval panel path).
-        screen.apply(UiEvent::ToolAutoApproved(call_args(
-            "bash",
-            json!({ "command": "ls" }),
-        )));
+        // DENIED (in-block review lifecycle: a refused call flips to DENIED).
+        let denied = call_args_id("call_deny", "bash", json!({ "command": "ls" }));
+        screen.apply(UiEvent::ToolReview {
+            call: denied.clone(),
+            allow_always: false,
+            allow_project: false,
+            reason: None,
+        });
+        screen.apply(UiEvent::ToolDenied(denied));
 
         let lines = screen.wrapped_lines(99);
-        let labels = ["DONE", "PREVIEW", "APPROVED"];
+        let labels = ["DONE", "PREVIEW", "DENIED"];
         let mut columns = Vec::new();
         for line in lines.iter() {
             let text = line_text(line);
@@ -4847,10 +4976,21 @@ mod tests {
         });
         screen.apply(UiEvent::ToolDenied(call));
 
+        // The preview block flips to `DENIED` in place: one EDIT block, the
+        // honest record of the refused mutation — no stale PREVIEW or RUNNING
+        // panel left behind, and no duplicate block.
         let rendered = rendered_text(&mut screen, 100, 16);
-        assert!(rendered.contains("PREVIEW"), "{rendered}");
         assert!(rendered.contains("DENIED"), "{rendered}");
         assert!(!rendered.contains("RUNNING"), "{rendered}");
+        assert!(
+            !rendered.contains("PREVIEW"),
+            "flipped in place: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("EDIT").count(),
+            1,
+            "one EDIT block, no duplicate: {rendered}"
+        );
     }
 
     #[test]
@@ -5053,33 +5193,44 @@ mod tests {
             redacted: false,
         });
         let collapsed = rendered_text(&mut screen, 80, 18);
-        // Collapsed: label + collapsed arrow, the first-paragraph preview, and
-        // the paragraph-count fold affordance; later paragraphs hidden.
+        // Collapsed = header only, same binary disclosure as a tool block: the
+        // `▸` arrow, no body, no bespoke `… N more paragraphs` hint. The whole
+        // trace (including the first paragraph) is unmounted until expanded.
         assert!(collapsed.contains("THINKING"), "{collapsed}");
         assert!(collapsed.contains("▸"), "{collapsed}");
-        assert!(collapsed.contains("First I check"), "{collapsed}");
-        assert!(collapsed.contains("… 2 more paragraphs"), "{collapsed}");
-        assert!(collapsed.contains("ctrl+o to expand"), "{collapsed}");
+        assert!(!collapsed.contains("more paragraph"), "{collapsed}");
+        assert!(!collapsed.contains("ctrl+o to expand"), "{collapsed}");
+        assert!(
+            !collapsed.contains("First I check"),
+            "collapsed thinking unmounts its whole body: {collapsed}"
+        );
         assert!(
             !collapsed.contains("Then the cache"),
-            "later paragraphs should be hidden while collapsed: {collapsed}"
+            "later paragraphs stay hidden while collapsed: {collapsed}"
         );
     }
 
     #[test]
-    fn short_reasoning_is_shown_whole_and_not_foldable() {
+    fn short_reasoning_is_foldable_and_arrives_collapsed() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
             text: "One short thought.".to_string(),
             redacted: false,
         });
-        let rendered = rendered_text(&mut screen, 80, 14);
-        assert!(rendered.contains("THINKING"), "{rendered}");
-        assert!(rendered.contains("One short thought."), "{rendered}");
-        assert!(!rendered.contains("more paragraph"), "{rendered}");
-        // Nothing hidden: ctrl+o has nothing to toggle.
-        assert!(!screen.toggle_latest_panel());
+        // Even a one-paragraph thought folds now — the disclosure indicator is
+        // universal. It arrives collapsed (body hidden) and ctrl+o reveals it.
+        let collapsed = rendered_text(&mut screen, 80, 14);
+        assert!(collapsed.contains("THINKING"), "{collapsed}");
+        assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(
+            !collapsed.contains("One short thought."),
+            "short reasoning arrives collapsed: {collapsed}"
+        );
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 14);
+        assert!(expanded.contains("▾"), "{expanded}");
+        assert!(expanded.contains("One short thought."), "{expanded}");
     }
 
     #[test]
@@ -5158,10 +5309,21 @@ mod tests {
             .expect("THINKING rail header");
         assert!(header.contains('\u{25b8}'), "collapsed arrow ▸: {header}");
         assert!(!header.contains('\u{2502}'), "no box side │: {header}");
-        let body = lines
+        // Body is unmounted while collapsed (binary disclosure); expand and
+        // confirm it hangs on the muted `┊` rail, never box chrome.
+        assert!(
+            !lines.iter().any(|t| t.contains("Weigh the options.")),
+            "collapsed thinking unmounts its body: {lines:?}"
+        );
+        assert!(screen.toggle_latest_panel());
+        let expanded: Vec<String> = rendered_lines(&mut screen, 80, 14)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect();
+        let body = expanded
             .iter()
             .find(|t| t.contains("Weigh the options."))
-            .expect("preview body row");
+            .expect("expanded body row");
         assert!(body.contains('\u{250a}'), "rail glyph ┊ on body: {body}");
     }
 
@@ -5175,14 +5337,20 @@ mod tests {
             text: String::new(),
             redacted: true,
         });
-        // A redacted block is a single placeholder paragraph: shown whole,
-        // nothing foldable.
-        assert!(!screen.toggle_latest_panel());
-        let rendered = rendered_text(&mut screen, 80, 14);
-        assert!(rendered.contains("THINKING"), "{rendered}");
+        // Redacted reasoning folds like any other block: it arrives collapsed to
+        // the header, and expanding reveals only the placeholder — never trace
+        // text (there is none to leak).
+        let collapsed = rendered_text(&mut screen, 80, 14);
+        assert!(collapsed.contains("THINKING"), "{collapsed}");
         assert!(
-            rendered.contains("withheld"),
-            "redacted placeholder missing: {rendered}"
+            !collapsed.contains("withheld"),
+            "placeholder is unmounted while collapsed: {collapsed}"
+        );
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 14);
+        assert!(
+            expanded.contains("withheld"),
+            "redacted placeholder missing when expanded: {expanded}"
         );
     }
 
@@ -6208,9 +6376,12 @@ mod tests {
         let lines = rendered_lines(&mut screen, 80, 18);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("/exit"));
-        // The palette is a bordered overlay box (SlashMenu idiom).
-        assert!(rendered.contains('┌'), "{rendered}");
-        assert!(rendered.contains('└'), "{rendered}");
+        // The palette is a frameless overlay list (SlashMenu idiom): no
+        // box-drawing frame anywhere.
+        assert!(
+            !rendered.chars().any(|c| "┌┐└┘├┤│".contains(c)),
+            "no frame chars: {rendered}"
+        );
         let exit = line_matching(&lines, |line| line_text(line).contains("/exit"));
         // The selected row carries the surface fill + a bold name; the
         // description stays muted — never a cyan foreground accent.

@@ -32,7 +32,7 @@ use crate::ui::slash::{self, Palette, SlashCommand};
 
 use super::component::Component;
 use super::wrap::{display_width, line_text, truncate_line};
-use super::{TEXT_COLUMN_X_PADDING_U16, border_style, dim_style};
+use super::{TEXT_COLUMN_X_PADDING_U16, dim_style};
 
 /// Which layer currently owns keyboard input.
 ///
@@ -53,18 +53,28 @@ pub(crate) enum FocusTarget {
     Modal,
 }
 
-/// Build a bordered top-layer overlay box (the `Picker`/`SlashMenu` idiom): an
-/// optional uppercase title row, selectable rows (the highlighted row gets the
-/// `surface` fill — never a colored border), and an optional dim footer of key
-/// hints, all inside one square box-drawing frame. Content-fit width, clamped
-/// to the available column.
-pub(crate) fn overlay_box(
+/// Build a **frameless** docked menu — the shared `Picker` / `SlashMenu` /
+/// settings idiom. No box-drawing frame: structure comes from weight, a fill
+/// band, and spacing, exactly like the transcript's tool blocks (§8) and the
+/// start-page launcher (§12.5), so every overlay reads as part of the same
+/// grammar instead of a heavier bordered dialog.
+///
+/// - `title` (optional): a **bold uppercase** header row.
+/// - `rows`: selectable content; the highlighted row carries the `surface` fill
+///   across the menu measure — never a border, never a colored accent.
+/// - `footer` (optional): a dim key-hint row, set off by one blank row.
+///
+/// Content-fit width, clamped to the available column.
+pub(crate) fn overlay_menu(
     title: Option<&str>,
     rows: Vec<(Line<'static>, bool)>,
     footer: Option<&str>,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let max_inner = width.saturating_sub(4).max(8);
+    let avail = width.max(1);
+    // The selection fill spans the widest content row (title/footer included),
+    // clamped to the column, so a highlighted row reads as an even band rather
+    // than a ragged one. A small floor keeps a short menu from looking pinched.
     let content_max = rows
         .iter()
         .map(|(line, _)| display_width(&line_text(line)))
@@ -72,60 +82,40 @@ pub(crate) fn overlay_box(
         .chain(footer.map(display_width))
         .max()
         .unwrap_or(0);
-    let inner = content_max.clamp(max_inner.min(16), max_inner);
-    let rule = |left: char, right: char| {
-        Line::from(Span::styled(
-            format!("{left}{}{right}", "─".repeat(inner + 2)),
-            border_style(),
-        ))
-    };
-    let boxed_row = |mut line: Line<'static>, selected: bool| {
-        truncate_line(&mut line, inner);
-        let used = display_width(&line_text(&line));
+    let fill_width = content_max.clamp(16.min(avail), avail);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if let Some(title) = title {
+        let mut line = Line::from(Span::styled(
+            title.to_uppercase(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        truncate_line(&mut line, avail);
+        out.push(line);
+    }
+    for (mut line, selected) in rows {
+        truncate_line(&mut line, fill_width);
         if selected {
+            // Patch the surface bg onto every span (preserving fg/weight) and
+            // pad the tail so the fill is an even band, not ragged to the text.
+            let used = display_width(&line_text(&line));
+            let fill = Style::default().bg(crate::ui::palette::surface());
             for span in &mut line.spans {
-                span.style = span.style.bg(crate::ui::palette::surface());
+                span.style = span.style.patch(fill);
+            }
+            if used < fill_width {
+                line.spans
+                    .push(Span::styled(" ".repeat(fill_width - used), fill));
             }
         }
-        let pad_style = if selected {
-            Style::default().bg(crate::ui::palette::surface())
-        } else {
-            Style::default()
-        };
-        let mut spans = vec![
-            Span::styled("│".to_string(), border_style()),
-            Span::styled(" ".to_string(), pad_style),
-        ];
-        spans.extend(line.spans);
-        if used < inner {
-            spans.push(Span::styled(" ".repeat(inner - used), pad_style));
-        }
-        spans.push(Span::styled(" ".to_string(), pad_style));
-        spans.push(Span::styled("│".to_string(), border_style()));
-        Line::from(spans)
-    };
-    let mut out = vec![rule('┌', '┐')];
-    if let Some(title) = title {
-        out.push(boxed_row(
-            Line::from(Span::styled(
-                title.to_uppercase(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            false,
-        ));
-        out.push(rule('├', '┤'));
-    }
-    for (line, selected) in rows {
-        out.push(boxed_row(line, selected));
+        out.push(line);
     }
     if let Some(footer) = footer {
-        out.push(rule('├', '┤'));
-        out.push(boxed_row(
-            Line::from(Span::styled(footer.to_string(), dim_style())),
-            false,
-        ));
+        out.push(Line::default());
+        let mut line = Line::from(Span::styled(footer.to_string(), dim_style()));
+        truncate_line(&mut line, avail);
+        out.push(line);
     }
-    out.push(rule('└', '┘'));
     out
 }
 
@@ -180,7 +170,7 @@ impl Component for PaletteView<'_> {
             .take(PALETTE_WINDOW)
             .map(|(i, cmd)| {
                 let selected_row = i == self.selected;
-                // The highlighted row gets the surface fill (overlay_box) plus
+                // The highlighted row gets the surface fill (overlay_menu) plus
                 // a bold command name; the description stays muted. Never a
                 // color-only selection accent.
                 let name_style = if selected_row {
@@ -210,7 +200,7 @@ impl Component for PaletteView<'_> {
                 false,
             ));
         }
-        overlay_box(None, rows, None, width)
+        overlay_menu(None, rows, None, width)
     }
 }
 
@@ -248,24 +238,37 @@ mod tests {
     }
 
     #[test]
-    fn palette_view_renders_framed_rows_with_surface_selection() {
+    fn palette_view_renders_frameless_rows_with_surface_selection() {
         let mut palette = Palette::default();
         palette.sync("/re");
         palette.down("/re"); // select row 1 (/resume)
         let view = PaletteView::for_palette(&palette, "/re");
         let lines = view.render(80);
-        // One boxed row per match, plus the top and bottom frame rules.
-        assert_eq!(lines.len(), slash::matches("/re").len() + 2);
-        // The selected row uses the surface fill + a bold command name — never
-        // a color-only (cyan) accent.
-        let selected = &lines[2];
-        assert!(
-            selected
-                .spans
-                .iter()
-                .any(|s| s.style.bg == Some(crate::ui::palette::surface())),
-            "selected row should carry the surface fill: {selected:?}"
-        );
+        // Frameless: one row per match, no top/bottom frame rules.
+        assert_eq!(lines.len(), slash::matches("/re").len());
+        // No box-drawing frame characters anywhere.
+        let text = |line: &Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        for line in &lines {
+            let t = text(line);
+            assert!(
+                !t.chars().any(|c| "┌┐└┘├┤│─".contains(c)),
+                "no frame chars: {t:?}"
+            );
+        }
+        // Exactly one row carries the surface fill: the selected one, with a
+        // bold command name and never a color-only (cyan) accent.
+        let filled: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.style.bg == Some(crate::ui::palette::surface()))
+            })
+            .collect();
+        assert_eq!(filled.len(), 1, "one selected band");
+        let selected = filled[0];
         assert!(
             selected
                 .spans
@@ -279,15 +282,6 @@ mod tests {
                 .iter()
                 .all(|s| s.style.fg != Some(Color::Cyan)),
             "no cyan selection accent: {selected:?}"
-        );
-        // A non-selected row has no fill.
-        let other = &lines[1];
-        assert!(
-            other
-                .spans
-                .iter()
-                .all(|s| s.style.bg != Some(crate::ui::palette::surface())),
-            "unselected rows are unfilled: {other:?}"
         );
     }
 
@@ -312,13 +306,13 @@ mod tests {
                 .collect()
         };
 
-        // Unscrolled top: window rows + position row + two frame rules, with a
-        // complete bottom frame (the docked menu budget stays honest).
+        // Unscrolled top: frameless — window rows + the dim position row, no
+        // frame rules. The last row is the `(1/total)` position label.
         let mut palette = Palette::default();
         palette.sync("/");
         let lines = PaletteView::for_palette(&palette, "/").render(80);
-        assert_eq!(lines.len(), PALETTE_WINDOW + 3);
-        assert!(text(lines.last().unwrap()).contains('└'));
+        assert_eq!(lines.len(), PALETTE_WINDOW + 1);
+        assert!(text(lines.last().unwrap()).contains(&format!("(1/{total})")));
         let rendered = lines.iter().map(&text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("/exit"), "{rendered}");
         assert!(rendered.contains(&format!("(1/{total})")), "{rendered}");
@@ -330,7 +324,7 @@ mod tests {
             palette.down("/");
         }
         let lines = PaletteView::for_palette(&palette, "/").render(80);
-        assert_eq!(lines.len(), PALETTE_WINDOW + 3);
+        assert_eq!(lines.len(), PALETTE_WINDOW + 1);
         let rendered = lines.iter().map(&text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("/checkpoint"), "{rendered}");
         assert!(!rendered.contains("/exit "), "{rendered}");

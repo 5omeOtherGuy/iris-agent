@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::ui::palette;
@@ -37,14 +37,18 @@ const MENU_WIDTH: usize = 44;
 pub(crate) enum StartAction {
     NewSession,
     ResumeSession,
+    Tasks,
     Settings,
     Quit,
 }
 
-/// Launcher rows in display order: action label + key-chord hint.
-const MENU_ITEMS: [(StartAction, &str, &str); 4] = [
+/// Launcher rows in display order: action label + key-chord hint. `Tasks` is a
+/// first-class home entry (its own menu point) rather than a modal that pops on
+/// startup: recoverable Iris tasks are reached from here, not forced in the face.
+const MENU_ITEMS: [(StartAction, &str, &str); 5] = [
     (StartAction::NewSession, "New session", "ctrl-n"),
     (StartAction::ResumeSession, "Resume session", "ctrl-r"),
+    (StartAction::Tasks, "Tasks", "ctrl-t"),
     (StartAction::Settings, "Settings", "ctrl-,"),
     (StartAction::Quit, "Quit", "ctrl-q"),
 ];
@@ -61,16 +65,21 @@ pub(crate) struct StartPage {
     last_advance: Option<Instant>,
     /// `IRIS_REDUCED_MOTION`: hold a single static lit dot at the center.
     reduced_motion: bool,
+    /// Recoverable Iris tasks in this workspace at launch (ADR-0031). Surfaced
+    /// as a dim badge on the `Tasks` row instead of force-opening a picker, so
+    /// the count is visible without a modal popping over the home menu.
+    recoverable: usize,
 }
 
 impl StartPage {
-    pub(crate) fn new(reduced_motion: bool) -> Self {
+    pub(crate) fn new(reduced_motion: bool, recoverable: usize) -> Self {
         Self {
             selected: 0,
             head: 0,
             forward: true,
             last_advance: None,
             reduced_motion,
+            recoverable,
         }
     }
 
@@ -146,7 +155,10 @@ impl StartPage {
     fn mark_spans(&self) -> Vec<Span<'static>> {
         let head_style = prompt_style().add_modifier(Modifier::BOLD);
         let trail_1_style = prompt_style();
-        let trail_2_style = Style::default().fg(Color::DarkGray);
+        // The comet fades in its own hue: trail-2 is a dim orange, not grey, so
+        // it stays part of the orange sweep and never collapses into the muted
+        // `○` empty dots behind it.
+        let trail_2_style = prompt_style().add_modifier(Modifier::DIM);
         let (head, trail_1, trail_2) = if self.reduced_motion {
             (Some(MARK_DOTS / 2), None, None)
         } else {
@@ -185,7 +197,7 @@ impl StartPage {
     /// the `surface` fill across the full menu width -- the single permitted
     /// tonal fill. No hairline dividers between rows.
     fn menu_row(&self, index: usize, menu_width: usize) -> Vec<Span<'static>> {
-        let (_, label, hint) = MENU_ITEMS[index];
+        let (action, label, hint) = MENU_ITEMS[index];
         let selected = index == self.selected;
         let marker = if selected {
             Span::styled(format!("{} ", symbols::ACTIVE), prompt_style())
@@ -197,20 +209,29 @@ impl StartPage {
         } else {
             Style::default()
         };
-        // marker(2) + label + space + leader + space + hint.
+        // A dim recoverable-task badge (`· N to recover`) sits between the label
+        // and the leader on the Tasks row, so the count is legible from the home
+        // menu without a modal. It counts toward the leader budget below.
+        let badge = (action == StartAction::Tasks && self.recoverable > 0)
+            .then(|| format!(" · {} to recover", self.recoverable));
+        let badge_width = badge.as_deref().map(str::len).unwrap_or(0);
+        // marker(2) + label + badge + space + leader + space + hint.
         let leader_width = menu_width
             .saturating_sub(2)
             .saturating_sub(label.len())
+            .saturating_sub(badge_width)
             .saturating_sub(hint.len())
             .saturating_sub(2);
-        let mut spans = vec![
-            marker,
-            Span::styled(label.to_string(), label_style),
+        let mut spans = vec![marker, Span::styled(label.to_string(), label_style)];
+        if let Some(badge) = badge {
+            spans.push(Span::styled(badge, dim_style()));
+        }
+        spans.extend([
             Span::raw(" "),
             Span::styled("·".repeat(leader_width), dim_style()),
             Span::raw(" "),
             Span::styled(hint.to_string(), dim_style()),
-        ];
+        ]);
         if selected {
             let fill = Style::default().bg(palette::surface());
             for span in &mut spans {
@@ -265,7 +286,7 @@ mod tests {
 
     #[test]
     fn ping_pong_reverses_at_both_ends_and_never_wraps() {
-        let mut page = StartPage::new(false);
+        let mut page = StartPage::new(false, 0);
         let mut seen = vec![page.head()];
         for _ in 0..(MARK_DOTS * 4) {
             page.advance_for_test();
@@ -290,7 +311,7 @@ mod tests {
 
     #[test]
     fn reduced_motion_holds_a_static_center_dot() {
-        let mut page = StartPage::new(true);
+        let mut page = StartPage::new(true, 0);
         assert!(!page.tick(), "reduced motion never animates");
         let lines = page.render(80);
         let mark = line_text(&lines[0]);
@@ -304,7 +325,7 @@ mod tests {
     #[test]
     fn launcher_never_renders_over_width_at_narrow_panes() {
         use super::super::wrap::display_width;
-        let page = StartPage::new(false);
+        let page = StartPage::new(false, 0);
         for width in 1..=(MENU_WIDTH + 4) {
             for line in page.render(width) {
                 let text = line_text(&line);
@@ -315,7 +336,7 @@ mod tests {
 
     #[test]
     fn launcher_selection_wraps_both_ways() {
-        let mut page = StartPage::new(true);
+        let mut page = StartPage::new(true, 0);
         assert_eq!(page.selected_action(), StartAction::NewSession);
         page.up();
         assert_eq!(page.selected_action(), StartAction::Quit);
@@ -324,16 +345,18 @@ mod tests {
         page.down();
         assert_eq!(page.selected_action(), StartAction::ResumeSession);
         page.down();
+        assert_eq!(page.selected_action(), StartAction::Tasks);
+        page.down();
         assert_eq!(page.selected_action(), StartAction::Settings);
-        assert_eq!(page.selected(), 2);
+        assert_eq!(page.selected(), 3);
     }
 
     #[test]
     fn launcher_rows_carry_marker_leader_and_key_hints() {
-        let page = StartPage::new(true);
+        let page = StartPage::new(true, 0);
         let lines = page.render(80);
-        // Mark, blank, then the four menu rows.
-        assert_eq!(lines.len(), 2 + 4);
+        // Mark, blank, then the five menu rows.
+        assert_eq!(lines.len(), 2 + 5);
         let first = line_text(&lines[2]);
         assert!(first.contains("◉ New session"), "{first:?}");
         assert!(first.contains("···"), "dotted leader: {first:?}");
@@ -342,13 +365,40 @@ mod tests {
         assert!(!second.contains('◉'), "only the selected row is marked");
         assert!(second.contains("Resume session"), "{second:?}");
         assert!(second.trim_end().ends_with("ctrl-r"), "{second:?}");
-        assert!(line_text(&lines[4]).trim_end().ends_with("ctrl-,"));
-        assert!(line_text(&lines[5]).trim_end().ends_with("ctrl-q"));
+        let tasks = line_text(&lines[4]);
+        assert!(tasks.contains("Tasks"), "{tasks:?}");
+        assert!(tasks.trim_end().ends_with("ctrl-t"), "{tasks:?}");
+        assert!(line_text(&lines[5]).trim_end().ends_with("ctrl-,"));
+        assert!(line_text(&lines[6]).trim_end().ends_with("ctrl-q"));
+    }
+
+    #[test]
+    fn tasks_row_shows_a_recoverable_badge_only_when_nonzero() {
+        // No recoverable tasks: the Tasks row is a plain launcher row.
+        let none = StartPage::new(true, 0);
+        let tasks = line_text(&none.render(80)[4]);
+        assert!(!tasks.contains("to recover"), "{tasks:?}");
+
+        // With recoverable tasks: a dim `· N to recover` badge, still ending in
+        // the key hint, and the row never renders over width.
+        let some = StartPage::new(true, 2);
+        let tasks = line_text(&some.render(80)[4]);
+        assert!(tasks.contains("· 2 to recover"), "{tasks:?}");
+        assert!(tasks.trim_end().ends_with("ctrl-t"), "{tasks:?}");
+        for width in 1..=(MENU_WIDTH + 4) {
+            for line in some.render(width) {
+                let text = line_text(&line);
+                assert!(
+                    super::super::wrap::display_width(&text) <= width,
+                    "width {width}: {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
     fn selected_row_uses_the_surface_fill_and_bold_label() {
-        let page = StartPage::new(true);
+        let page = StartPage::new(true, 0);
         let lines = page.render(80);
         let selected = &lines[2];
         assert!(
@@ -375,7 +425,7 @@ mod tests {
 
     #[test]
     fn trail_follows_behind_the_travel_direction() {
-        let mut page = StartPage::new(false);
+        let mut page = StartPage::new(false, 0);
         page.advance_for_test();
         page.advance_for_test();
         page.advance_for_test();
@@ -393,6 +443,8 @@ mod tests {
         assert_eq!(cell_style(3).fg, Some(palette::orange()));
         assert_eq!(cell_style(2).fg, Some(palette::orange()));
         assert!(!cell_style(2).add_modifier.contains(Modifier::BOLD));
-        assert_eq!(cell_style(1).fg, Some(Color::DarkGray));
+        // trail-2 is a dim orange (the comet fades in its own hue), not grey.
+        assert_eq!(cell_style(1).fg, Some(palette::orange()));
+        assert!(cell_style(1).add_modifier.contains(Modifier::DIM));
     }
 }

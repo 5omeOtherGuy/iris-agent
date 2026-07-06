@@ -31,6 +31,10 @@ pub(crate) trait Theme: Sync {
 
     /// `border` — panel & composer frames.
     fn border(&self) -> Color;
+    /// `muted` — recessive text: metadata, hints, markers, elisions, separators.
+    fn muted(&self) -> Color;
+    /// `stdout` — SHELL program output (lighter than `muted`, recessive to `ink`).
+    fn stdout(&self) -> Color;
     /// `accent` — active mode, running, meter edge dot, warnings.
     fn accent(&self) -> Color;
     /// `interactive` — selection focus, inline code.
@@ -61,6 +65,12 @@ impl Theme for TerminalTheme {
     fn border(&self) -> Color {
         palette::BORDER
     }
+    fn muted(&self) -> Color {
+        palette::MUTED
+    }
+    fn stdout(&self) -> Color {
+        palette::STDOUT
+    }
     fn accent(&self) -> Color {
         palette::ORANGE
     }
@@ -89,6 +99,8 @@ struct FixedTheme {
     id: &'static str,
     name: &'static str,
     border: Color,
+    muted: Color,
+    stdout: Color,
     accent: Color,
     interactive: Color,
     success: Color,
@@ -107,6 +119,12 @@ impl Theme for FixedTheme {
     }
     fn border(&self) -> Color {
         self.border
+    }
+    fn muted(&self) -> Color {
+        self.muted
+    }
+    fn stdout(&self) -> Color {
+        self.stdout
     }
     fn accent(&self) -> Color {
         self.accent
@@ -141,6 +159,8 @@ static GRUVBOX: FixedTheme = FixedTheme {
     id: "gruvbox",
     name: "Gruvbox Dark",
     border: rgb(0x92, 0x83, 0x74),
+    muted: rgb(0x7c, 0x6f, 0x64),  // bg4 — recessive grey
+    stdout: rgb(0xa8, 0x99, 0x84), // fg4 — readable program-output grey
     accent: rgb(0xfa, 0xbd, 0x2f),
     interactive: rgb(0x8e, 0xc0, 0x7c),
     success: rgb(0xb8, 0xbb, 0x26),
@@ -156,7 +176,9 @@ static GRUVBOX: FixedTheme = FixedTheme {
 static CATPPUCCIN_MOCHA: FixedTheme = FixedTheme {
     id: "catppuccin-mocha",
     name: "Catppuccin Mocha",
-    border: rgb(0x6c, 0x70, 0x86),
+    border: rgb(0x6c, 0x70, 0x86), // Overlay0
+    muted: rgb(0x58, 0x5b, 0x70),  // Surface2
+    stdout: rgb(0xa6, 0xad, 0xc8), // Subtext0
     accent: rgb(0xfa, 0xb3, 0x87),
     interactive: rgb(0x94, 0xe2, 0xd5),
     success: rgb(0xa6, 0xe3, 0xa1),
@@ -169,7 +191,9 @@ static CATPPUCCIN_MOCHA: FixedTheme = FixedTheme {
 static CATPPUCCIN_MACCHIATO: FixedTheme = FixedTheme {
     id: "catppuccin-macchiato",
     name: "Catppuccin Macchiato",
-    border: rgb(0x6e, 0x73, 0x8d),
+    border: rgb(0x6e, 0x73, 0x8d), // Overlay0
+    muted: rgb(0x5b, 0x60, 0x78),  // Surface2
+    stdout: rgb(0xa5, 0xad, 0xcb), // Subtext0
     accent: rgb(0xf5, 0xa9, 0x7f),
     interactive: rgb(0x8b, 0xd5, 0xca),
     success: rgb(0xa6, 0xda, 0x95),
@@ -182,7 +206,9 @@ static CATPPUCCIN_MACCHIATO: FixedTheme = FixedTheme {
 static CATPPUCCIN_FRAPPE: FixedTheme = FixedTheme {
     id: "catppuccin-frappe",
     name: "Catppuccin Frappe",
-    border: rgb(0x73, 0x79, 0x94),
+    border: rgb(0x73, 0x79, 0x94), // Overlay0
+    muted: rgb(0x62, 0x68, 0x80),  // Surface2
+    stdout: rgb(0xa5, 0xad, 0xce), // Subtext0
     accent: rgb(0xef, 0x9f, 0x76),
     interactive: rgb(0x81, 0xc8, 0xbe),
     success: rgb(0xa6, 0xd1, 0x89),
@@ -198,7 +224,9 @@ static CATPPUCCIN_FRAPPE: FixedTheme = FixedTheme {
 static CATPPUCCIN_LATTE: FixedTheme = FixedTheme {
     id: "catppuccin-latte",
     name: "Catppuccin Latte",
-    border: rgb(0x9c, 0xa0, 0xb0),
+    border: rgb(0x9c, 0xa0, 0xb0), // Overlay0
+    muted: rgb(0x8c, 0x8f, 0xa1),  // Overlay1 — mid grey, readable on the light Base
+    stdout: rgb(0x5c, 0x5f, 0x77), // Subtext1 — darker, so output stays legible on white
     accent: rgb(0xfe, 0x64, 0x0b),
     interactive: rgb(0x17, 0x92, 0x99),
     success: rgb(0x40, 0xa0, 0x2b),
@@ -211,7 +239,9 @@ static CATPPUCCIN_LATTE: FixedTheme = FixedTheme {
 static NORD: FixedTheme = FixedTheme {
     id: "nord",
     name: "Nord",
-    border: rgb(0x4c, 0x56, 0x6a),
+    border: rgb(0x4c, 0x56, 0x6a), // nord3
+    muted: rgb(0x61, 0x6e, 0x88),  // brighter than nord3 so it stays legible on nord0
+    stdout: rgb(0x97, 0xa1, 0xb5), // light snowstorm grey
     accent: rgb(0xd0, 0x87, 0x70),
     interactive: rgb(0x88, 0xc0, 0xd0),
     success: rgb(0xa3, 0xbe, 0x8c),
@@ -225,6 +255,8 @@ static TOKYO_NIGHT: FixedTheme = FixedTheme {
     id: "tokyo-night",
     name: "Tokyo Night",
     border: rgb(0x41, 0x48, 0x68),
+    muted: rgb(0x56, 0x5f, 0x89),  // comment
+    stdout: rgb(0xa9, 0xb1, 0xd6), // fg-dark
     accent: rgb(0xff, 0x9e, 0x64),
     interactive: rgb(0x7a, 0xa2, 0xf7),
     success: rgb(0x9e, 0xce, 0x6a),
@@ -237,7 +269,9 @@ static TOKYO_NIGHT: FixedTheme = FixedTheme {
 static DRACULA: FixedTheme = FixedTheme {
     id: "dracula",
     name: "Dracula",
-    border: rgb(0x62, 0x72, 0xa4),
+    border: rgb(0x62, 0x72, 0xa4), // comment
+    muted: rgb(0x62, 0x72, 0xa4),  // dracula's one blue-grey serves frame and muted
+    stdout: rgb(0xbd, 0xc3, 0xde), // light — between comment and fg
     accent: rgb(0xff, 0xb8, 0x6c),
     interactive: rgb(0x8b, 0xe9, 0xfd),
     success: rgb(0x50, 0xfa, 0x7b),
@@ -250,7 +284,9 @@ static DRACULA: FixedTheme = FixedTheme {
 static ROSE_PINE: FixedTheme = FixedTheme {
     id: "rose-pine",
     name: "Rose Pine",
-    border: rgb(0x6e, 0x6a, 0x86),
+    border: rgb(0x6e, 0x6a, 0x86), // muted
+    muted: rgb(0x6e, 0x6a, 0x86),  // Rose Pine's "muted" role
+    stdout: rgb(0x90, 0x8c, 0xaa), // subtle — lighter output grey
     accent: rgb(0xf6, 0xc1, 0x77),
     interactive: rgb(0x9c, 0xcf, 0xd8),
     success: rgb(0x31, 0x74, 0x8f),
@@ -263,7 +299,9 @@ static ROSE_PINE: FixedTheme = FixedTheme {
 static SOLARIZED: FixedTheme = FixedTheme {
     id: "solarized",
     name: "Solarized Dark",
-    border: rgb(0x58, 0x6e, 0x75),
+    border: rgb(0x58, 0x6e, 0x75), // base01
+    muted: rgb(0x58, 0x6e, 0x75),  // base01 — Solarized's emphasised-comment grey
+    stdout: rgb(0x83, 0x94, 0x96), // base0 — body-text grey
     accent: rgb(0xb5, 0x89, 0x00),
     interactive: rgb(0x2a, 0xa1, 0x98),
     success: rgb(0x85, 0x99, 0x00),
@@ -276,7 +314,9 @@ static SOLARIZED: FixedTheme = FixedTheme {
 static EVERFOREST: FixedTheme = FixedTheme {
     id: "everforest",
     name: "Everforest Dark",
-    border: rgb(0x85, 0x92, 0x89),
+    border: rgb(0x85, 0x92, 0x89), // grey1
+    muted: rgb(0x7a, 0x84, 0x78),  // grey0
+    stdout: rgb(0x9d, 0xa9, 0xa0), // grey2
     accent: rgb(0xdb, 0xbc, 0x7f),
     interactive: rgb(0x83, 0xc0, 0x92),
     success: rgb(0xa7, 0xc0, 0x80),
@@ -416,6 +456,8 @@ mod tests {
     fn terminal_theme_matches_palette_roles() {
         let t = resolve("terminal").unwrap();
         assert_eq!(t.border(), palette::BORDER);
+        assert_eq!(t.muted(), palette::MUTED);
+        assert_eq!(t.stdout(), palette::STDOUT);
         assert_eq!(t.accent(), palette::ORANGE);
         assert_eq!(t.interactive(), palette::CYAN);
         assert_eq!(t.success(), palette::GREEN);

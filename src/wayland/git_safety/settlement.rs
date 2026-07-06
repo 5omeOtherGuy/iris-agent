@@ -125,6 +125,18 @@ pub(crate) enum RecoveryOutcome {
     Picker(Vec<RecoverableTask>),
 }
 
+impl RecoveryOutcome {
+    /// How many recoverable tasks require explicit selection (the `Picker` case).
+    /// `None`/`Notice` (nothing, or the single auto-adopted orphan) count zero.
+    /// Feeds the start page's `Tasks` badge instead of forcing a picker open.
+    pub(crate) fn recoverable_count(&self) -> usize {
+        match self {
+            RecoveryOutcome::Picker(tasks) => tasks.len(),
+            RecoveryOutcome::None | RecoveryOutcome::Notice(_) => 0,
+        }
+    }
+}
+
 impl GitSafety {
     /// Restore points offered by the rollback UI (Tier 3): the pre-task baseline
     /// first (seq 0), then each intermediate checkpoint oldest-to-newest. Empty
@@ -669,4 +681,23 @@ pub(super) fn checkpoint_label(changes: &[IrisChange]) -> String {
 /// tasks and sessions.
 pub(super) fn new_task_id() -> String {
     format!("{:032x}", rand::random::<u128>())
+}
+
+#[cfg(test)]
+mod recovery_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn recoverable_count_only_counts_the_picker_case() {
+        assert_eq!(RecoveryOutcome::None.recoverable_count(), 0);
+        assert_eq!(
+            RecoveryOutcome::Notice("adopted".to_string()).recoverable_count(),
+            0
+        );
+        let tasks = vec![
+            RecoverableTask::for_test("a", Duration::from_secs(60), Some("x"), &[]),
+            RecoverableTask::for_test_legacy("b", Duration::from_secs(60)),
+        ];
+        assert_eq!(RecoveryOutcome::Picker(tasks).recoverable_count(), 2);
+    }
 }
