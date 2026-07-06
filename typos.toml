@@ -16,6 +16,7 @@ extend-exclude = [
   "src/tools/ls_corpus/",
   # Task-scaffold fixtures for the end-to-end tokens-per-task benchmark
   # (issue #210): mini source trees and captured-style test logs, not prose.
+  "iris-bench/fixtures/",
   "src/bench_fixtures/tokens_per_task/",
 ]
 [default.extend-identifiers]
