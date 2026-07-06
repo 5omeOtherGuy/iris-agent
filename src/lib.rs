@@ -852,7 +852,15 @@ fn build_provider(
 
 const COMMAND_NAME: &str = "iris";
 const UPDATE_REPO: &str = "https://github.com/5omeOtherGuy/iris-agent.git";
-const UPDATE_ARGS: &[&str] = &["install", "--git", UPDATE_REPO, "--locked", "--force"];
+const UPDATE_PACKAGE: &str = "iris-agent";
+const UPDATE_ARGS: &[&str] = &[
+    "install",
+    "--git",
+    UPDATE_REPO,
+    UPDATE_PACKAGE,
+    "--locked",
+    "--force",
+];
 
 fn command_name() -> &'static str {
     COMMAND_NAME
@@ -1108,9 +1116,17 @@ mod tests {
             UPDATE_REPO,
             "https://github.com/5omeOtherGuy/iris-agent.git"
         );
+        assert_eq!(UPDATE_PACKAGE, "iris-agent");
         assert_eq!(
             update_args(),
-            &["install", "--git", UPDATE_REPO, "--locked", "--force"]
+            &[
+                "install",
+                "--git",
+                UPDATE_REPO,
+                UPDATE_PACKAGE,
+                "--locked",
+                "--force"
+            ]
         );
     }
 
