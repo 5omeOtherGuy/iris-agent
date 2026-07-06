@@ -2577,8 +2577,8 @@ mod tests {
             .find(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Footer { .. })))
             .expect("block footer row");
         assert!(
-            footer.text.starts_with("PREVIEW  +1 \u{2212}1"),
-            "state label then counts field: {}",
+            footer.text.starts_with("\u{25c7} PREVIEW  +1 \u{2212}1"),
+            "state glyph + label then counts field: {}",
             footer.text
         );
         let Some(ChromeRow::Footer { left, .. }) = footer.chrome.as_ref() else {
@@ -4164,7 +4164,7 @@ mod tests {
     #[test]
     fn shell_block_reproduces_the_frameless_mockup() {
         // DESIGN spec §2, SHELL — success: header (▾ SHELL  <command> … elapsed),
-        // hanging body, hairline rule, footer `DONE  EXIT 0 ┊ <meta>` with the
+        // hanging body, hairline rule, footer `◆ DONE  EXIT 0 ┊ <meta>` with the
         // right-bound diagnostics cluster. Exact rows, exact rails.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(90);
@@ -4210,11 +4210,11 @@ mod tests {
         // Hairline rule from the footer indent to the block's right edge.
         assert!(texts[4].starts_with("    ─"), "{:?}", texts[4]);
         assert_eq!(display_width(&texts[4]), rail, "{:?}", texts[4]);
-        // Footer: state label (no glyph), EXIT + meta fields, diagnostics
+        // Footer: state glyph + label, EXIT + meta fields, diagnostics
         // right-bound at the shared rail.
         let footer = &texts[5];
         assert!(
-            footer.starts_with("    DONE  EXIT 0 ┊ 142 passed · 0 failed"),
+            footer.starts_with("    \u{25c6} DONE  EXIT 0 ┊ 142 passed · 0 failed"),
             "{footer:?}"
         );
         assert!(
@@ -4660,13 +4660,12 @@ mod tests {
             duration: Some(Duration::from_millis(4100)),
         });
         let rendered = rendered_text(&mut screen, 90, 14);
-        // The exit status is a footer field after the state label: no glyph,
-        // `┊` only between sibling fields.
+        // The exit status is a footer field after the state token (the green
+        // `◆ DONE` glyph + label); `┊` only between sibling fields.
         assert!(
-            rendered.contains("DONE  EXIT 0 ┊ 142 passed · 0 failed"),
+            rendered.contains("\u{25c6} DONE  EXIT 0 ┊ 142 passed · 0 failed"),
             "{rendered}"
         );
-        assert!(!rendered.contains("◆"), "{rendered}");
     }
 
     #[test]
@@ -4710,8 +4709,9 @@ mod tests {
     #[test]
     fn footer_state_label_shares_one_column_across_families() {
         // The frameless footer is the state's only home: EXPLORE, SHELL, EDIT,
-        // and a refused (DENIED) block all start the label at the shared body
-        // indent, with no state glyph anywhere in the block.
+        // and a refused (DENIED) block all start the state token — the colored
+        // glyph then the label — at the shared footer indent. The glyph lives in
+        // the footer, never the header.
         let mut screen = Screen::new();
         // EXPLORE (grouped explore path).
         screen.apply(UiEvent::ToolResult {
@@ -4743,25 +4743,28 @@ mod tests {
         screen.apply(UiEvent::ToolDenied(denied));
 
         let lines = screen.wrapped_lines(99);
-        let labels = ["DONE", "PREVIEW", "DENIED"];
+        // Each family's footer opens with its state token: the colored glyph
+        // then the label (proportional-prominence footer). The header never
+        // carries a glyph — that is asserted in the header-only tests.
+        let tokens = [("DONE", '◆'), ("PREVIEW", '◇'), ("DENIED", '■')];
         let mut columns = Vec::new();
         for line in lines.iter() {
             let text = line_text(line);
-            for glyph in ['◆', '■', '◇', '▲'] {
-                assert!(!text.contains(glyph), "no state glyphs anywhere: {text:?}");
-            }
-            if let Some(label) = labels
-                .iter()
-                .find(|label| text.trim_start().starts_with(**label))
-            {
-                let idx = text.find(label).expect("label index");
-                columns.push(display_width(&text[..idx]));
+            for (label, glyph) in tokens {
+                let token = format!("{glyph} {label}");
+                if let Some(idx) = text.find(&token) {
+                    assert!(
+                        text[..idx].trim().is_empty(),
+                        "the state token starts the footer content: {text:?}"
+                    );
+                    columns.push(display_width(&text[..idx]));
+                }
             }
         }
         assert!(columns.len() >= 4, "expected a footer per family");
         assert!(
             columns.iter().all(|col| *col == columns[0]),
-            "footer state labels share one column: {columns:?}"
+            "footer state tokens share one column: {columns:?}"
         );
     }
 
@@ -6558,12 +6561,12 @@ mod tests {
         // Body hangs at the block indent (2ch pane indent + 3ch hang), no frame.
         assert!(rendered.contains("     $ cargo test"), "{rendered}");
         assert!(rendered.contains("     test result"), "{rendered}");
-        // The exit status closes the block as a footer field, glyph-free.
+        // The exit status closes the block as a footer field, after the green
+        // `◆ DONE` state token.
         assert!(
-            rendered.contains("DONE  EXIT 0 ┊ 142 passed · 0 failed"),
+            rendered.contains("\u{25c6} DONE  EXIT 0 ┊ 142 passed · 0 failed"),
             "{rendered}"
         );
-        assert!(!rendered.contains("\u{25c6}"), "{rendered}");
     }
 
     #[test]

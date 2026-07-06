@@ -456,17 +456,24 @@ another family; never render standalone `READ` / `GREP` / `LS` panels.
 ▾ TOOL  meta                                                        ELAPSED
     <body — hangs one 2-cell step under the label, unmounts when collapsed>
    ─────────────────────────────────────────────────────────────
-   STATE  [family extras]              ↑sent ↓recv ┊ cache <n> ┊ ctx <Δ%>
+   ◆ DONE  [family extras]             ↑sent ↓recv ┊ cache <n> ┊ ctx <Δ%>
 ```
 **Header** — disclosure `▾`/`▸` (muted) · bold uppercase family label · muted
 meta (a path, scope, or the shell command), truncating with `…` · right edge
 carries **only the elapsed time** (omitted for a pending `preview`). No state
-symbol in the header.
+symbol in the header — the state lives in the footer.
 
 **Footer** — the block's last row, always visible, opened by a muted hairline
-rule from the body indent to the right rail. Left edge: the **state as label
-only** (`DONE` / `ERROR` / `PREVIEW` / `RUNNING` / `CANCELLED` / `REVIEW` /
-`DENIED`), bold uppercase, colored by state — **no glyph**. After it, `┊`-joined
+rule from the body indent to the right rail. Left edge: the **state token** — the
+state glyph (`◆ DONE` · `■ ERROR` · `◇ PREVIEW` · `● RUNNING` · `□ CANCELLED` ·
+`▲ REVIEW` · `■ DENIED`), colored by state, then the uppercase label. Prominence
+is **proportional**: the consequential states — `ERROR`, `DENIED`, `REVIEW` —
+keep a **bold** label (news the user must read or act on); the settled-success
+and transient states — `DONE`, `RUNNING`, `CANCELLED`, `PREVIEW` — recede, the
+colored glyph carrying the state while the label stays **muted, un-bold**, so a
+transcript that is mostly successful calls does not shout a column of bold
+labels. The glyph is deliberately lossy — `Error` and `Denied` share `■` — and
+the **label carries the distinction the shape cannot**. After it, `┊`-joined
 family extras (EDIT counts + note, SHELL `EXIT <code>` + result meta, or an
 in-review block's danger-toned reason + decision affordance / approval note). Right-bound:
 the optional token diagnostics cluster, all muted, honest (rendered only when

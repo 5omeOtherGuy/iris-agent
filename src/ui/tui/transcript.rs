@@ -37,15 +37,23 @@ const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
 /// separates), then `┊`-joined family extras, then the right-bound dim
 /// diagnostics cluster.
 fn block_footer_row(
-    label: &str,
-    label_style: Style,
+    state: PanelState,
     extras: Vec<FooterField>,
     diag: Option<&ToolDiag>,
     diag_call: Option<&str>,
 ) -> TranscriptRow {
     let (extra_spans, extra_plain) = join_meta_fields(extras);
-    let mut spans = vec![Span::styled(label.to_string(), label_style)];
-    let mut plain = label.to_string();
+    // The footer state token: the colored state glyph, then the label. The glyph
+    // is the at-a-glance semantic mark (green `◆` / red `■` / orange `▲`); the
+    // label's weight is proportional — bold for the consequential states, muted
+    // for settled-success and transient ones (see `PanelState::label_style`).
+    let glyph = state.glyph();
+    let label = state.label();
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), state.glyph_style()),
+        Span::styled(label.to_string(), state.label_style()),
+    ];
+    let mut plain = format!("{glyph} {label}");
     if !extra_plain.is_empty() {
         spans.push(Span::raw("  "));
         spans.extend(extra_spans);
@@ -64,7 +72,7 @@ fn block_footer_row(
             diag_call: diag_call.map(str::to_string),
         },
         plain,
-        label_style,
+        state.label_style(),
     )
 }
 
@@ -788,13 +796,7 @@ impl Transcript {
         let mut extras = renderer.footer_extras(call, &outcome);
         extras.extend(self.approval_footer_fields(&call.id, state));
         let diag = self.tool_diags.get(&call.id).cloned();
-        self.push_block_footer(
-            state.label(),
-            state.label_style(),
-            extras,
-            diag.as_ref(),
-            Some(&call.id),
-        );
+        self.push_block_footer(state, extras, diag.as_ref(), Some(&call.id));
     }
 
     /// Collect the rows of a standard tool panel without committing them, for
@@ -844,20 +846,14 @@ impl Transcript {
     /// end-of-block marker. The footer never folds.
     fn push_block_footer(
         &mut self,
-        label: &str,
-        label_style: Style,
+        state: PanelState,
         extras: Vec<FooterField>,
         diag: Option<&ToolDiag>,
         diag_call: Option<&str>,
     ) {
         self.rows.push(TranscriptRow::chrome(ChromeRow::FooterRule));
-        self.rows.push(block_footer_row(
-            label,
-            label_style,
-            extras,
-            diag,
-            diag_call,
-        ));
+        self.rows
+            .push(block_footer_row(state, extras, diag, diag_call));
         self.rows.push(TranscriptRow::chrome(ChromeRow::BlockEnd));
     }
 
@@ -1469,13 +1465,7 @@ impl Transcript {
         let diag = self.tool_diags.get(&call.id).cloned();
         let mut extras = edit_footer_extras(added, removed, note);
         extras.extend(self.approval_footer_fields(&call.id, state));
-        self.push_block_footer(
-            state.label(),
-            state.label_style(),
-            extras,
-            diag.as_ref(),
-            Some(&call.id),
-        );
+        self.push_block_footer(state, extras, diag.as_ref(), Some(&call.id));
     }
 
     /// Render the final task diff (issue #264) as a bordered panel: a `DIFF`
@@ -1512,8 +1502,7 @@ impl Transcript {
         }
         let (added, removed) = diff_counts(diff);
         self.push_block_footer(
-            PanelState::Done.label(),
-            PanelState::Done.label_style(),
+            PanelState::Done,
             edit_footer_extras(added, removed, None),
             None,
             None,
@@ -1933,13 +1922,8 @@ impl Transcript {
             .iter()
             .position(|row| matches!(row.chrome.as_ref(), Some(ChromeRow::Footer { .. })))
         {
-            self.rows[header + offset] = block_footer_row(
-                state.label(),
-                state.label_style(),
-                Vec::new(),
-                diag.as_ref(),
-                Some(&call.id),
-            );
+            self.rows[header + offset] =
+                block_footer_row(state, Vec::new(), diag.as_ref(), Some(&call.id));
         }
     }
 
@@ -2010,13 +1994,7 @@ impl Transcript {
         self.rows.push(row.with_fold(FoldVis::WhenExpanded));
         let state = panel_state(false, false);
         let diag = self.tool_diags.get(&call.id).cloned();
-        self.push_block_footer(
-            state.label(),
-            state.label_style(),
-            Vec::new(),
-            diag.as_ref(),
-            Some(&call.id),
-        );
+        self.push_block_footer(state, Vec::new(), diag.as_ref(), Some(&call.id));
         if self.exploring_open {
             self.set_explore_header(call, state, duration);
         }
@@ -2058,13 +2036,7 @@ impl Transcript {
         }
         let row = self.rows.len();
         self.rows.push(body.with_fold(FoldVis::WhenExpanded));
-        self.push_block_footer(
-            PanelState::Running.label(),
-            PanelState::Running.label_style(),
-            Vec::new(),
-            None,
-            Some(&call.id),
-        );
+        self.push_block_footer(PanelState::Running, Vec::new(), None, Some(&call.id));
         self.exploring_open = true;
         self.active_explorations.push(ActiveExploration {
             call_id: call.id.clone(),

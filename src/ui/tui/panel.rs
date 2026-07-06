@@ -258,9 +258,27 @@ pub(super) enum PanelState {
 }
 
 impl PanelState {
-    /// Footer state label — label only, no glyph (`◆`/`■` are NOT rendered in
-    /// the frameless footer). The text carries the state in monochrome; color
-    /// reinforces it.
+    /// Footer state glyph — the settled/live mark from the canonical vocabulary
+    /// (`symbols.rs`), colored by [`Self::glyph_style`]. The glyph is lossy
+    /// across the 7-state set *by design*: `Error` and `Denied` share `■` (the
+    /// danger mark) and are told apart by the [`Self::label`], not the shape. So
+    /// the footer keeps both — the glyph is the at-a-glance color read, the word
+    /// is the precise state the shape alone cannot carry.
+    pub(super) fn glyph(self) -> &'static str {
+        match self {
+            Self::Running => symbols::RUNNING,
+            Self::Done => symbols::DONE,
+            Self::Error | Self::Denied => symbols::ERROR,
+            Self::Cancelled => symbols::CANCELLED,
+            Self::Preview => symbols::PREVIEW,
+            Self::Review => symbols::REVIEW,
+        }
+    }
+
+    /// Footer state label — the precise state word, paired with [`Self::glyph`]
+    /// in the frameless footer. The word carries the state in monochrome and
+    /// disambiguates the glyphs the vocabulary collapses (`■ ERROR` vs
+    /// `■ DENIED`); color and weight reinforce it.
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Running => "RUNNING",
@@ -273,7 +291,10 @@ impl PanelState {
         }
     }
 
-    pub(super) fn dot_style(self) -> Style {
+    /// The glyph's color — the state's semantic hue, always shown so success
+    /// reads green (`◆`), failure red (`■`), and a gated action orange (`▲`) at
+    /// a glance, even when the label itself recedes to muted.
+    pub(super) fn glyph_style(self) -> Style {
         match self {
             // Review is the orange warning/accent role (`▲`); Done stays green,
             // Denied joins Error on the danger role.
@@ -284,10 +305,21 @@ impl PanelState {
         }
     }
 
-    /// Footer label style: the state color plus BOLD, matching the uppercase
-    /// tracked label treatment of the design's footer actor.
+    /// Footer label style — *proportional prominence* (DESIGN-LANGUAGE §8.1).
+    /// The consequential states — `ERROR`, `DENIED`, `REVIEW` — keep the bold,
+    /// state-colored word: they are news the user must read or act on. The
+    /// settled-success and transient states — `DONE`, `RUNNING`, `CANCELLED`,
+    /// `PREVIEW` — recede: the colored glyph carries the state and the word
+    /// stays muted (dim, un-bold), so a transcript that is mostly successful
+    /// calls does not shout a column of bold labels. Same restraint as Codex,
+    /// which receds success to a quiet marker and reserves emphasis for failure.
     pub(super) fn label_style(self) -> Style {
-        self.dot_style().add_modifier(Modifier::BOLD)
+        match self {
+            Self::Error | Self::Denied | Self::Review => {
+                self.glyph_style().add_modifier(Modifier::BOLD)
+            }
+            Self::Running | Self::Done | Self::Cancelled | Self::Preview => dim_style(),
+        }
     }
 
     pub(super) fn plain_prefix(self) -> &'static str {
