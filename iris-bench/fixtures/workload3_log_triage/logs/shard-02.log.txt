@@ -1,0 +1,33 @@
+   Compiling parsecrate v1.4.0 (/build/parsecrate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.02s
+     Running unittests src/lib.rs (target/debug/deps/parsecrate-9f8e7d6c5b4a3021)
+
+running 7 tests
+test lexer::tests::skips_whitespace ... ok
+test lexer::tests::keeps_strings ... ok
+test grammar::tests::parses_nested ... FAILED
+test grammar::tests::parses_empty ... ok
+test emit::tests::stable_order ... ok
+test emit::tests::escapes_control ... ok
+test span::tests::merges_adjacent ... ok
+
+failures:
+
+---- grammar::tests::parses_nested stdout ----
+
+thread 'grammar::tests::parses_nested' (60312) panicked at src/grammar.rs:210:13:
+assertion failed: depth <= MAX_DEPTH
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    grammar::tests::parses_nested
+
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/bin/cli.rs (target/debug/deps/cli-2b3c4d5e6f708192)
+
+running 2 tests
+test opts::tests::parses_flags ... ok
+test opts::tests::rejects_unknown ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

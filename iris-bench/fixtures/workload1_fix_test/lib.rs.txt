@@ -1,0 +1,23 @@
+//! workload1 fixture (issue #210 tokens-per-task benchmark).
+//!
+//! A small multi-file library with one failing unit test. The bug lives in
+//! `parser::parse_len`; `parse_len` is referenced from every module so locating
+//! it is a multi-file search (the grep/find reduction lever). The benchmark
+//! harness compiles this with `rustc --test`; success = the test goes green.
+#![allow(dead_code)]
+
+mod counter;
+mod parser;
+mod tokenizer;
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::parse_len;
+
+    #[test]
+    fn parse_len_counts_all_tokens() {
+        // Four whitespace-separated tokens; the off-by-one bug reports three.
+        assert_eq!(parse_len("iris token deliberate agent"), 4);
+        assert_eq!(parse_len("single"), 1);
+    }
+}

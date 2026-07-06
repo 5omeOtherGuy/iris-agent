@@ -109,13 +109,12 @@ impl ToolState {
 
     /// Benchmark-only arm switch (issue #210): build a state with output
     /// reductions forced on (arm A) or off (arm B). This is the ONLY way to
-    /// select the baseline arm and it is test-only, so a normal `ToolState`
-    /// always keeps every default-on reduction (bash filter, grep/find
-    /// grouping) active. It is an explicit per-run value, never a process
-    /// global or env var, so parallel tests never race on it and it cannot
-    /// leak into a real session. The tokens-per-task harness constructs both
-    /// the replay and in-process real-provider arms with it.
-    #[cfg(test)]
+    /// select the baseline arm. It stays `pub(crate)` and harness-only (used by
+    /// `crate::harness` and the replay bench), never surfaced to the CLI, so a
+    /// normal `ToolState` always keeps every default-on reduction (bash filter,
+    /// grep/find grouping) active. It is an explicit per-run value, never a
+    /// process global or env var, so parallel runs never race on it and it
+    /// cannot leak into a real session.
     pub(crate) fn with_reduce_output(mut self, reduce: bool) -> Self {
         self.reduce_output = reduce;
         self

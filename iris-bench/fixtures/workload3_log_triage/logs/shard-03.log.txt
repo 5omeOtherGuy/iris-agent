@@ -1,0 +1,28 @@
+   Compiling budgetcrate v0.9.2 (/build/budgetcrate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.47s
+     Running unittests src/lib.rs (target/debug/deps/budgetcrate-3c4d5e6f70819243)
+
+running 6 tests
+test caps::tests::floor_is_zero ... ok
+test caps::tests::ceiling_is_exact ... FAILED
+test caps::tests::rejects_negative ... ok
+test window::tests::slides_forward ... ok
+test window::tests::clamps_to_budget ... ok
+test window::tests::reports_overflow ... ok
+
+failures:
+
+---- caps::tests::ceiling_is_exact stdout ----
+
+thread 'caps::tests::ceiling_is_exact' (70443) panicked at src/caps.rs:64:9:
+assertion `left == right` failed: token budget ceiling drifted by one
+  left: 8192
+ right: 8191
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    caps::tests::ceiling_is_exact
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--lib`
