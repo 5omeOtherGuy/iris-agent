@@ -591,16 +591,31 @@ impl Transcript {
     /// A quiet unboxed notice row (the `Notice` design-system component):
     /// glyph + message, with an optional right-aligned dim hint. State is the
     /// glyph + message, never color alone.
-    fn push_notice_row(&mut self, glyph: &str, glyph_style: Style, message: &str, hint: &str) {
-        self.begin_block();
-        self.mark_append_dirty();
+    fn push_notice_row(&mut self, glyph: &str, glyph_style: Style, message: &str) {
+        // Coalesce a run of notices onto one rail: the first notice of a run
+        // opens a block (one blank separator above); each subsequent notice
+        // reclaims the previous notice's trailing blank so siblings sit directly
+        // under it, sharing the `┊` rail with no interior gap — one quiet system
+        // aside, not scattered ticks. A trailing blank always closes the run.
+        let continues_run = self.rows.len() >= 2
+            && is_separator_row(&self.rows[self.rows.len() - 1])
+            && matches!(
+                self.rows[self.rows.len() - 2].chrome,
+                Some(ChromeRow::Notice { .. })
+            );
+        if continues_run {
+            self.rows.pop();
+            self.mark_append_dirty();
+        } else {
+            self.begin_block();
+            self.mark_append_dirty();
+        }
         let left = format!("{glyph} {message}");
         self.rows.push(TranscriptRow::chrome_with_text(
             ChromeRow::Notice {
                 glyph: glyph.to_string(),
                 glyph_style,
                 message: message.to_string(),
-                hint: hint.to_string(),
             },
             left,
             dim_style(),
@@ -2188,7 +2203,6 @@ impl Transcript {
                         super::screen::compact_count(original_tokens_estimate),
                         super::screen::compact_count(summary_tokens_estimate),
                     ),
-                    "",
                 );
             }
             UiEvent::FoldApplied {
@@ -2209,7 +2223,6 @@ impl Transcript {
                         super::screen::compact_count(reclaimed_tokens_estimate),
                         trigger.code(),
                     ),
-                    "",
                 );
             }
             UiEvent::ProviderTurnCancelled { .. }
@@ -2442,7 +2455,7 @@ impl Transcript {
                 self.commit_user(&text);
             }
             UiEvent::Notice(message) => {
-                self.push_notice_row(crate::ui::symbols::SEP, dim_style(), &message, "");
+                self.push_notice_row(crate::ui::symbols::SEP, dim_style(), &message);
             }
             UiEvent::TaskDiff { summary, diff } => {
                 self.push_task_diff_panel(&summary, &diff);
@@ -2453,7 +2466,6 @@ impl Transcript {
                         crate::ui::symbols::ERROR,
                         err_style(),
                         &format!("auth error: {message}"),
-                        "",
                     );
                     self.push(
                         "authentication required; re-run the login command",
@@ -2465,7 +2477,6 @@ impl Transcript {
                         crate::ui::symbols::ERROR,
                         err_style(),
                         &format!("provider error: {message}"),
-                        "",
                     );
                 }
             },

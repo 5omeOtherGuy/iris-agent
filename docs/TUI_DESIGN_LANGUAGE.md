@@ -391,11 +391,33 @@ step may carry a muted trailing note.
 
 ### 7.6 Notice (system message)
 A runtime event that is neither a tool call nor the assistant: context
-compaction, interrupt, undo, connection retry, rate-limit, model switch.
-Unboxed and quiet. State is a glyph + optional label: `┊` info (muted text) ·
-`◆` success · `▲` warning · `■` error · `□` cancelled. Prefer one line; use a
-muted `meta` for counts and a caption `hint` for a keybind (e.g. `ctrl+r to
-undo`).
+compaction, interrupt, undo, connection retry, rate-limit, model switch. Unboxed
+and quiet. State is a glyph: `┊` info (muted) · `■` error (red) — the info glyph
+is the same soft rail the reasoning trace uses, never a color alone.
+
+A notice is a **left-rail aside**, not a floating tick. It renders on the text
+column (`┊` at col 4, message at col 6), **word-wraps** (never truncates), and an
+info notice re-emits the `┊` rail on every continuation row — byte-for-byte the
+reasoning body rail (§"reasoning rail"). An error leads its first line with `■`
+and hangs its continuation under the message.
+
+**A run of notices shares one rail.** When several fire back-to-back (a
+compaction's runtime event plus the `/compact` command's own lines; a fold's
+itemized reclaim), they coalesce: one blank separator opens the run, siblings sit
+directly under one another with **no interior blank**, and one blank closes it.
+The rail connects them into a single quiet aside instead of scattering ticks
+through whitespace. No caption `hint` / keybind is rendered unless a real binding
+exists (keymap honesty — there is no undo, so compaction shows none).
+
+```
+› /compact
+
+┊ Context compacted — 82.6k → 726 tokens
+┊ compacted 155 earlier message(s): ~82581 tokens replaced by a
+┊ ~726-token summary
+┊ Folded 3 spent tool result(s) — reclaimed ~12.4k tokens [B]
+
+```
 
 ### 7.7 Working indicator
 An **inline** LED-chase readout shown while the agent runs. Never framed, never

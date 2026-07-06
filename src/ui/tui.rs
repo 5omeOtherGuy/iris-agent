@@ -2444,6 +2444,52 @@ mod tests {
     }
 
     #[test]
+    fn a_run_of_notices_shares_one_rail_without_interior_blanks() {
+        // Several notices firing back-to-back (e.g. a compaction's runtime event
+        // plus the `/compact` command's own lines) coalesce onto one `┊` rail:
+        // one blank above the run, one below, and NO blank between siblings.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::AssistantText("hi".to_string()));
+        screen.apply(UiEvent::Notice("first".to_string()));
+        screen.apply(UiEvent::Notice("second".to_string()));
+        screen.apply(UiEvent::Notice("third".to_string()));
+        let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "hi".to_string(),
+                String::new(),
+                "┊ first".to_string(),
+                "┊ second".to_string(),
+                "┊ third".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_notice_carries_the_rail_onto_continuation_rows() {
+        // A long info notice wraps (instead of truncating) and re-emits the `┊`
+        // rail at col 4 on every physical row, exactly like the reasoning trace.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::Notice(
+            "Context compacted and folded a great many spent tool results across \
+             the whole session history to reclaim room"
+                .to_string(),
+        ));
+        let rail_rows: Vec<String> = screen
+            .wrapped_lines(48)
+            .iter()
+            .map(line_text)
+            .filter(|t| t.trim_start().starts_with('\u{250a}'))
+            .collect();
+        assert!(rail_rows.len() >= 2, "notice should wrap: {rail_rows:?}");
+        for row in &rail_rows {
+            assert!(row.starts_with("    \u{250a} "), "rail at col 4: {row:?}");
+        }
+    }
+
+    #[test]
     fn diff_preview_drops_file_headers_and_colors_changes() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::DiffPreview {
