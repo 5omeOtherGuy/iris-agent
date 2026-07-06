@@ -44,10 +44,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
+pub(super) fn execute(root: &Path, args: &Value, reduce: bool) -> Result<super::ToolOutput> {
     let input: FindInput =
         serde_json::from_value(args.clone()).context("find tool arguments must include pattern")?;
-    Ok(super::ToolOutput::text(find(root, &input)?))
+    Ok(super::ToolOutput::text(find(root, &input, reduce)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,7 +59,11 @@ struct FindInput {
     limit: Option<usize>,
 }
 
-fn find(root: &Path, input: &FindInput) -> Result<String> {
+/// `group` (issue #210 benchmark arm): `true` picks the shipped group-by-
+/// directory compaction when it is smaller; `false` forces the flat listing
+/// baseline that grouping is compared against. Only the tokens-per-task
+/// benchmark's baseline arm passes `false`.
+fn find(root: &Path, input: &FindInput, group: bool) -> Result<String> {
     if matches!(input.limit, Some(0)) {
         bail!("`limit` must be greater than 0");
     }
@@ -138,6 +142,7 @@ fn find(root: &Path, input: &FindInput) -> Result<String> {
         user_limit,
         DEFAULT_MAX_LINES,
         DEFAULT_MAX_BYTES,
+        group,
     ))
 }
 
@@ -152,6 +157,7 @@ fn render_results(
     user_limit: bool,
     max_lines: usize,
     max_bytes: usize,
+    group: bool,
 ) -> String {
     let candidates = &all_rel[..total.min(limit)];
     let flat_all = candidates.join("\n");
@@ -168,7 +174,7 @@ fn render_results(
         }
         return out;
     }
-    render_compact(all_rel, total, limit, max_lines, max_bytes)
+    render_compact(all_rel, total, limit, max_lines, max_bytes, group)
 }
 
 /// A representation fitted to the byte/line budget: how many leading paths it
@@ -187,6 +193,7 @@ fn render_compact(
     limit: usize,
     max_lines: usize,
     max_bytes: usize,
+    group: bool,
 ) -> String {
     let candidates = &all_rel[..total.min(limit)];
     let flat = fit_flat(candidates, max_lines, max_bytes);
@@ -194,8 +201,11 @@ fn render_compact(
     // Grouping wins only when it shows strictly more paths, or the same paths in
     // fewer bytes. Ties and "grouped is larger" keep the flat form (the
     // one-file-per-directory case, where `dir/ name` costs more than `dir/name`).
-    let use_grouped =
-        grouped.shown > flat.shown || (grouped.shown == flat.shown && grouped.bytes < flat.bytes);
+    // The benchmark baseline arm (`group == false`) forces flat regardless, so
+    // grouping's contribution to the token delta can be measured.
+    let use_grouped = group
+        && (grouped.shown > flat.shown
+            || (grouped.shown == flat.shown && grouped.bytes < flat.bytes));
     let (body, shown) = if use_grouped {
         (grouped.body, grouped.shown)
     } else {
@@ -359,7 +369,7 @@ mod tests {
         fs::create_dir(dir.path.join("src")).unwrap();
         fs::write(dir.path.join("top.rs"), "x").unwrap();
         fs::write(dir.path.join("src/nested.rs"), "x").unwrap();
-        let out = find(&root, &input("*.rs", None)).unwrap();
+        let out = find(&root, &input("*.rs", None), true).unwrap();
         assert!(out.contains("top.rs"), "{out}");
         assert!(out.contains("src/nested.rs"), "{out}");
     }
@@ -371,7 +381,7 @@ mod tests {
         fs::create_dir(dir.path.join("src")).unwrap();
         fs::write(dir.path.join("top.rs"), "x").unwrap();
         fs::write(dir.path.join("src/nested.rs"), "x").unwrap();
-        let out = find(&root, &input("src/*.rs", None)).unwrap();
+        let out = find(&root, &input("src/*.rs", None), true).unwrap();
         assert!(out.contains("src/nested.rs"), "{out}");
         assert!(!out.contains("top.rs"), "{out}");
     }
@@ -383,7 +393,7 @@ mod tests {
         fs::write(dir.path.join(".gitignore"), "ignored.rs\n").unwrap();
         fs::write(dir.path.join("ignored.rs"), "x").unwrap();
         fs::write(dir.path.join("kept.rs"), "x").unwrap();
-        let out = find(&root, &input("*.rs", None)).unwrap();
+        let out = find(&root, &input("*.rs", None), true).unwrap();
         assert!(out.contains("kept.rs"), "{out}");
         assert!(!out.contains("ignored.rs"), "{out}");
     }
@@ -399,7 +409,7 @@ mod tests {
         let base = SystemTime::now();
         set_mtime(&old, base - Duration::from_secs(60));
         set_mtime(&new, base);
-        let out = find(&root, &input("*.rs", None)).unwrap();
+        let out = find(&root, &input("*.rs", None), true).unwrap();
         let new_pos = out.find("new.rs").unwrap();
         let old_pos = out.find("old.rs").unwrap();
         assert!(new_pos < old_pos, "newest first expected: {out}");
@@ -416,7 +426,7 @@ mod tests {
             set_mtime(&p, base - Duration::from_secs(i as u64 * 60));
         }
         // a.rs is newest, c.rs oldest; limit 2 keeps the two newest.
-        let out = find(&root, &input("*.rs", Some(2))).unwrap();
+        let out = find(&root, &input("*.rs", Some(2)), true).unwrap();
         assert_eq!(out.lines().count(), 2, "{out}");
         assert!(out.contains("a.rs") && out.contains("b.rs"), "{out}");
         assert!(!out.contains("c.rs"), "{out}");
@@ -429,13 +439,13 @@ mod tests {
         fs::write(dir.path.join("lower.rs"), "x").unwrap();
         fs::write(dir.path.join("UPPER.RS"), "x").unwrap();
         // All-lowercase pattern is case-insensitive (matches fd's smart-case).
-        let any = find(&root, &input("*.rs", None)).unwrap();
+        let any = find(&root, &input("*.rs", None), true).unwrap();
         assert!(
             any.contains("lower.rs") && any.contains("UPPER.RS"),
             "{any}"
         );
         // A pattern with an uppercase char is case-sensitive.
-        let exact = find(&root, &input("*.RS", None)).unwrap();
+        let exact = find(&root, &input("*.RS", None), true).unwrap();
         assert!(
             exact.contains("UPPER.RS") && !exact.contains("lower.rs"),
             "{exact}"
@@ -450,7 +460,7 @@ mod tests {
         fs::write(dir.path.join("src/top.rs"), "x").unwrap();
         fs::write(dir.path.join("src/deep/low.rs"), "x").unwrap();
         // `*` must not cross `/`: src/*.rs matches src/top.rs but not src/deep/low.rs.
-        let out = find(&root, &input("src/*.rs", None)).unwrap();
+        let out = find(&root, &input("src/*.rs", None), true).unwrap();
         assert!(out.contains("src/top.rs"), "{out}");
         assert!(!out.contains("src/deep/low.rs"), "{out}");
     }
@@ -460,7 +470,7 @@ mod tests {
         let dir = temp_dir();
         let root = root_of(&dir);
         fs::write(dir.path.join("a.rs"), "x").unwrap();
-        let out = find(&root, &input("*.zzz", None)).unwrap();
+        let out = find(&root, &input("*.zzz", None), true).unwrap();
         assert_eq!(out, "No files found matching pattern");
     }
 
@@ -468,7 +478,7 @@ mod tests {
     fn find_rejects_zero_limit() {
         let dir = temp_dir();
         let root = root_of(&dir);
-        let err = find(&root, &input("*.rs", Some(0)))
+        let err = find(&root, &input("*.rs", Some(0)), true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("limit"), "{err}");
@@ -512,7 +522,7 @@ mod tests {
     fn under_cap_result_is_byte_identical_flat() {
         // No omission and within caps => exactly the historical flat listing.
         let paths = owned(&["z.rs", "src/a.rs", "src/b.rs"]);
-        let out = render_results(&paths, paths.len(), 1000, false, 2000, 50 * 1024);
+        let out = render_results(&paths, paths.len(), 1000, false, 2000, 50 * 1024, true);
         assert_eq!(out, paths.join("\n"));
     }
 
@@ -521,7 +531,7 @@ mod tests {
         // Mirrors find_limit_keeps_newest: an explicit user limit that fits the
         // byte/line caps prints the flat prefix with no summary.
         let paths = owned(&["a.rs", "b.rs", "c.rs"]);
-        let out = render_results(&paths[..2], 3, 2, true, 2000, 50 * 1024);
+        let out = render_results(&paths[..2], 3, 2, true, 2000, 50 * 1024, true);
         assert_eq!(out, "a.rs\nb.rs");
     }
 
@@ -532,7 +542,7 @@ mod tests {
         // correct top-directory-by-omitted-count.
         let all = concentrated();
         let total = all.len();
-        let out = render_compact(&all, total, total, 2000, 400);
+        let out = render_compact(&all, total, total, 2000, 400, true);
         let summary = out
             .lines()
             .find(|l| l.starts_with('[') && l.contains("matches,"))
@@ -583,11 +593,35 @@ mod tests {
             grouped.bytes,
             flat.bytes
         );
-        let out = render_compact(&all, all.len(), 200, 2000, 50 * 1024);
+        let out = render_compact(&all, all.len(), 200, 2000, 50 * 1024, true);
         assert!(
             out.lines().next().unwrap().contains("/ "),
             "grouped body expected: {}",
             out.lines().next().unwrap()
+        );
+    }
+
+    #[test]
+    fn benchmark_baseline_arm_forces_flat_even_when_grouping_would_win() {
+        // Issue #210 arm switch: on a tree where grouping is measurably smaller,
+        // the baseline arm (`group == false`) still renders the flat listing, so
+        // grouping's token contribution can be isolated. The baseline is never
+        // smaller than the grouped arm on the same set.
+        let all = concentrated();
+        let grouped = render_compact(&all, all.len(), 200, 2000, 50 * 1024, true);
+        let flat = render_compact(&all, all.len(), 200, 2000, 50 * 1024, false);
+        // Grouped picks the `dir/ a b` body; flat keeps one path per line.
+        assert!(grouped.lines().next().unwrap().contains("/ "));
+        let first = flat.lines().next().unwrap();
+        assert!(
+            !first.contains("/ ") && first == all[0],
+            "baseline arm must render flat, got {first}"
+        );
+        assert!(
+            flat.len() >= grouped.len(),
+            "flat baseline ({} bytes) must not beat grouped ({} bytes)",
+            flat.len(),
+            grouped.len(),
         );
     }
 
@@ -606,7 +640,7 @@ mod tests {
             flat.bytes
         );
         // render_compact picks flat: first line is a single path, not `dir/ a b`.
-        let out = render_compact(&all, all.len(), 5, 2000, 50 * 1024);
+        let out = render_compact(&all, all.len(), 5, 2000, 50 * 1024, true);
         let first = out.lines().next().unwrap();
         assert_eq!(first, all[0], "flat body expected, got {first}");
     }

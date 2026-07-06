@@ -755,6 +755,15 @@ impl ClassifiedError {
         self
     }
 
+    /// The stable machine-readable class token (ADR-0040), e.g. `not-found`,
+    /// `not-unique`, or `stale-file`. Read-only accessor used by the
+    /// tokens-per-task edit result-class probe to assert outcome classes
+    /// against the stable token instead of matching on error prose.
+    #[cfg(test)]
+    pub(crate) fn class(&self) -> &str {
+        &self.class
+    }
+
     /// The model-facing `metadata` object: `{ "class": ..., ...fields }`.
     fn to_metadata(&self) -> serde_json::Map<String, Value> {
         let mut obj = serde_json::Map::new();
@@ -2978,6 +2987,14 @@ fn compact_preview(
 #[cfg(test)]
 #[path = "nexus_tests.rs"]
 mod tests;
+
+// End-to-end tokens-per-completed-task benchmark harness (issue #210). Sibling
+// test module (crate-private access to the Nexus loop, ApprovalMode, and the
+// tool env) driving the deterministic replay arms and the opt-in real-provider
+// headline. See `docs/BENCHMARK_PLAN.md`.
+#[cfg(test)]
+#[path = "bench_tokens_per_task.rs"]
+mod bench_tokens_per_task;
 
 // Compaction retention-needle benchmark scaffold (ADR-0045, issue #372). Lives
 // beside the Nexus test module so it can reuse the in-crate provider/message

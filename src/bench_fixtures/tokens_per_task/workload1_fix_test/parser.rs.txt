@@ -1,0 +1,10 @@
+//! Token-length parsing. See `counter::density` and `tokenizer` for the other
+//! `parse_len` references that spread this symbol across the fixture.
+
+/// Return the number of whitespace-separated tokens in `s`.
+pub fn parse_len(s: &str) -> usize {
+    // BUG (issue #210 fixture): off-by-one. The trailing `- 1` drops one token,
+    // so a four-token input reports three and `parse_len_counts_all_tokens`
+    // fails. The fix is to count the tokens without the decrement.
+    s.split_whitespace().count() - 1
+}

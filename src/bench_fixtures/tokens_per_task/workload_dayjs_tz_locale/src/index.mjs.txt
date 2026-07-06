@@ -1,0 +1,97 @@
+// Minimal date library reproducing iamkun/dayjs PR #2420.
+// A wrapper holds a UTC timestamp, an offset (minutes) for a fixed tz,
+// and an optional locale that defines weekStart. startOf('week') uses
+// the locale's weekStart. The tz/reconstruction path rebuilds an
+// intermediate instance and (buggily) drops the locale.
+
+const MS_PER_DAY = 86400000;
+const MS_PER_MIN = 60000;
+
+// Two-digit zero pad.
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+class IDate {
+  // ts: epoch millis of the underlying instant.
+  // offset: fixed tz offset in minutes (added to UTC to get local wall time).
+  // locale: { name, weekStart } or null.
+  constructor(ts, offset = 0, locale = null) {
+    this.$ts = ts;
+    this.$offset = offset;
+    this.$L = locale;
+  }
+
+  // Wall-clock Date in this instance's fixed tz.
+  $wall() {
+    return new Date(this.$ts + this.$offset * MS_PER_MIN);
+  }
+
+  // Attach a locale (name + weekStart). Returns a new instance.
+  locale(loc) {
+    return new IDate(this.$ts, this.$offset, loc);
+  }
+
+  // Which weekday the week starts on (0 = Sunday). Default 0.
+  weekStart() {
+    return this.$L && typeof this.$L.weekStart === "number"
+      ? this.$L.weekStart
+      : 0;
+  }
+
+  // Reconstruct this instance in a fixed tz offset. This mirrors dayjs's
+  // timezone plugin rebuilding an intermediate instance. THE BUG: the
+  // locale is dropped when the intermediate instance is created.
+  tz(offsetMinutes) {
+    const target = this.$ts;
+    // BUG: reconstruction drops the locale (equivalent of d(target)).
+    const rebuilt = d(target, offsetMinutes);
+    return rebuilt;
+  }
+
+  startOf(unit) {
+    if (unit !== "week") {
+      throw new Error(`unsupported unit: ${unit}`);
+    }
+    const wall = this.$wall();
+    const dow = wall.getUTCDay();
+    const ws = this.weekStart();
+    // Days to subtract to reach the most recent weekStart day.
+    const diff = (dow < ws ? dow + 7 : dow) - ws;
+    const startWallMs =
+      Date.UTC(
+        wall.getUTCFullYear(),
+        wall.getUTCMonth(),
+        wall.getUTCDate()
+      ) - diff * MS_PER_DAY;
+    const startTs = startWallMs - this.$offset * MS_PER_MIN;
+    return new IDate(startTs, this.$offset, this.$L);
+  }
+
+  format(fmt) {
+    const wall = this.$wall();
+    const map = {
+      YYYY: String(wall.getUTCFullYear()),
+      MM: pad2(wall.getUTCMonth() + 1),
+      DD: pad2(wall.getUTCDate()),
+    };
+    return fmt.replace(/YYYY|MM|DD/g, (t) => map[t]);
+  }
+}
+
+// Factory. Accepts a date string (YYYY-MM-DD) or epoch millis, plus a
+// fixed tz offset in minutes.
+export function d(input, offset = 0) {
+  let ts;
+  if (typeof input === "number") {
+    ts = input;
+  } else {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input);
+    if (!m) throw new Error(`bad date: ${input}`);
+    const wallMs = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    ts = wallMs - offset * MS_PER_MIN;
+  }
+  return new IDate(ts, offset, null);
+}
+
+export default d;

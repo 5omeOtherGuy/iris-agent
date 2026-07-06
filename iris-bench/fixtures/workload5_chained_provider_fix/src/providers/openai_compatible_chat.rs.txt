@@ -1,0 +1,7 @@
+pub fn supports_reasoning_summary() -> bool {
+    false
+}
+
+pub fn provider_label() -> &'static str {
+    "openai-compatible-chat"
+}

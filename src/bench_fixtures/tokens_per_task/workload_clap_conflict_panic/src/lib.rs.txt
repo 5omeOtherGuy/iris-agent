@@ -1,0 +1,598 @@
+//! A tiny, self-contained argument parser.
+//!
+//! This is a deliberately compact re-implementation of the handful of concepts
+//! a real CLI parser needs: an argument registry, argument groups, subcommands,
+//! value matching, conflict rules, and human-readable usage/error rendering.
+//!
+//! The public surface is intentionally small:
+//!
+//! * [`Command`] is the builder. You register [`Arg`]s, [`ArgGroup`]s, and
+//!   subcommands, then declare conflict rules between any two identifiers.
+//! * [`Command::parse`] consumes an argv-like token stream and returns
+//!   [`ArgMatches`] on success or a [`ParseError`] on failure.
+//! * [`ArgMatches`] records which identifiers were seen, including the *group*
+//!   identifiers implied by matching a group member.
+//!
+//! Conflicts are reported through [`ParseError::ArgumentConflict`], which
+//! carries a rendered usage snippet so the caller can print something useful.
+
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::fmt;
+
+/// A stable identifier for an argument, group, or subcommand.
+///
+/// Identifiers live in a single flat namespace. That is what makes groups
+/// convenient (a group id can stand in for any of its members) and also what
+/// makes id handling subtle: not every id in that namespace resolves to a
+/// concrete [`Arg`].
+pub type Id = String;
+
+/// How many values an argument consumes from the token stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueHint {
+    /// A boolean flag; presence is the whole signal (e.g. `--verbose`).
+    Flag,
+    /// Exactly one trailing value (e.g. `--color always`).
+    Single,
+    /// One or more trailing values until the next option-looking token.
+    Multiple,
+}
+
+/// A single declared argument.
+#[derive(Debug, Clone)]
+pub struct Arg {
+    id: Id,
+    long: Option<String>,
+    short: Option<char>,
+    hint: ValueHint,
+    help: Option<String>,
+    required: bool,
+}
+
+impl Arg {
+    /// Start a new argument with the given identifier.
+    pub fn new(id: impl Into<Id>) -> Self {
+        Arg {
+            id: id.into(),
+            long: None,
+            short: None,
+            hint: ValueHint::Flag,
+            help: None,
+            required: false,
+        }
+    }
+
+    /// Attach a `--long` spelling.
+    pub fn long(mut self, long: impl Into<String>) -> Self {
+        self.long = Some(long.into());
+        self
+    }
+
+    /// Attach a `-s` short spelling.
+    pub fn short(mut self, short: char) -> Self {
+        self.short = Some(short);
+        self
+    }
+
+    /// Set how many values this argument consumes.
+    pub fn value_hint(mut self, hint: ValueHint) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// Attach a one-line help string.
+    pub fn help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+
+    /// Mark the argument as required.
+    pub fn required(mut self, yes: bool) -> Self {
+        self.required = yes;
+        self
+    }
+
+    /// The argument's identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Render the argument the way it should appear in usage text.
+    ///
+    /// Prefers the long spelling, falls back to the short spelling, and finally
+    /// to the raw identifier. This is the exact string the error renderer wants
+    /// when it lists the arguments involved in a conflict.
+    fn to_display(&self) -> String {
+        if let Some(long) = &self.long {
+            format!("--{long}")
+        } else if let Some(short) = self.short {
+            format!("-{short}")
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+impl fmt::Display for Arg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_display())
+    }
+}
+
+/// A named set of argument identifiers.
+///
+/// Matching any member of a group causes the group's own id to be recorded in
+/// [`ArgMatches`]. Groups therefore participate in conflict rules exactly like
+/// arguments do, but a group id never resolves through [`Command::find`].
+#[derive(Debug, Clone)]
+pub struct ArgGroup {
+    id: Id,
+    members: Vec<Id>,
+}
+
+impl ArgGroup {
+    /// Start a new, empty group.
+    pub fn new(id: impl Into<Id>) -> Self {
+        ArgGroup {
+            id: id.into(),
+            members: Vec::new(),
+        }
+    }
+
+    /// Add a member argument id to the group.
+    pub fn arg(mut self, id: impl Into<Id>) -> Self {
+        self.members.push(id.into());
+        self
+    }
+
+    /// Add several member argument ids to the group.
+    pub fn args<I, S>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Id>,
+    {
+        self.members.extend(ids.into_iter().map(Into::into));
+        self
+    }
+
+    /// The group's identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The member argument identifiers.
+    pub fn members(&self) -> &[Id] {
+        &self.members
+    }
+}
+
+/// A minimal subcommand: a name plus its own recorded id.
+#[derive(Debug, Clone)]
+pub struct Subcommand {
+    name: String,
+    id: Id,
+}
+
+impl Subcommand {
+    /// Declare a subcommand by name; its id defaults to the name.
+    pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Subcommand {
+            id: name.clone(),
+            name,
+        }
+    }
+
+    /// The subcommand's identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The result of a successful parse.
+///
+/// Records the concrete argument values that were captured plus the full set of
+/// identifiers that were matched. The identifier set intentionally includes
+/// group ids and subcommand ids, not just concrete argument ids.
+#[derive(Debug, Default, Clone)]
+pub struct ArgMatches {
+    values: BTreeMap<Id, Vec<String>>,
+    matched: BTreeSet<Id>,
+}
+
+impl ArgMatches {
+    /// Whether the given identifier was matched during parsing.
+    pub fn contains(&self, id: &str) -> bool {
+        self.matched.contains(id)
+    }
+
+    /// The captured values for an argument id, if any.
+    pub fn values_of(&self, id: &str) -> Option<&[String]> {
+        self.values.get(id).map(|v| v.as_slice())
+    }
+
+    /// All matched identifiers, in stable order.
+    pub fn ids(&self) -> impl Iterator<Item = &Id> {
+        self.matched.iter()
+    }
+
+    fn record(&mut self, id: &str) {
+        self.matched.insert(id.to_string());
+    }
+
+    fn push_value(&mut self, id: &str, value: String) {
+        self.values.entry(id.to_string()).or_default().push(value);
+    }
+}
+
+/// The kind of failure produced by [`Command::parse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Two mutually exclusive identifiers were both matched.
+    ArgumentConflict,
+    /// A token did not correspond to any known argument or subcommand.
+    UnknownArgument,
+    /// An argument that requires a value was given none.
+    MissingValue,
+    /// A required argument was absent.
+    MissingRequired,
+}
+
+/// A parse failure with a rendered, user-facing message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    kind: ErrorKind,
+    message: String,
+}
+
+impl ParseError {
+    /// The machine-readable category of the failure.
+    pub fn kind(&self) -> &ErrorKind {
+        &self.kind
+    }
+
+    /// The rendered, user-facing message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Convenience: a `ParseError` marker constructor mirroring the public kinds.
+///
+/// Provided so callers and tests can compare against a kind without building a
+/// full message: `err.kind() == &ErrorKind::ArgumentConflict`.
+pub type ParseResult = Result<ArgMatches, ParseError>;
+
+/// A declared conflict rule between two identifiers.
+#[derive(Debug, Clone)]
+struct ConflictRule {
+    first: Id,
+    second: Id,
+}
+
+/// The command builder and parser.
+#[derive(Debug, Clone, Default)]
+pub struct Command {
+    name: String,
+    args: Vec<Arg>,
+    groups: Vec<ArgGroup>,
+    subcommands: Vec<Subcommand>,
+    conflicts: Vec<ConflictRule>,
+}
+
+impl Command {
+    /// Start a new command with the given program name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Command {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Register an argument.
+    pub fn arg(mut self, arg: Arg) -> Self {
+        self.args.push(arg);
+        self
+    }
+
+    /// Register an argument group.
+    pub fn group(mut self, group: ArgGroup) -> Self {
+        self.groups.push(group);
+        self
+    }
+
+    /// Register a subcommand.
+    pub fn subcommand(mut self, sub: Subcommand) -> Self {
+        self.subcommands.push(sub);
+        self
+    }
+
+    /// Declare that two identifiers may not both appear.
+    ///
+    /// Either side may be an argument id, a group id, or a subcommand id.
+    pub fn conflict(mut self, first: impl Into<Id>, second: impl Into<Id>) -> Self {
+        self.conflicts.push(ConflictRule {
+            first: first.into(),
+            second: second.into(),
+        });
+        self
+    }
+
+    /// Look up a concrete argument by id.
+    ///
+    /// Returns `None` for identifiers that are not concrete arguments, such as
+    /// group ids or subcommand ids. This asymmetry is the whole point: the id
+    /// namespace is shared, but only argument ids resolve here.
+    pub fn find(&self, id: &str) -> Option<&Arg> {
+        self.args.iter().find(|a| a.id == id)
+    }
+
+    /// Look up a group by id.
+    fn find_group(&self, id: &str) -> Option<&ArgGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    /// Look up a subcommand by name.
+    fn find_subcommand(&self, name: &str) -> Option<&Subcommand> {
+        self.subcommands.iter().find(|s| s.name == name)
+    }
+
+    /// Find the argument whose long or short spelling matches a token.
+    fn match_token(&self, token: &str) -> Option<&Arg> {
+        if let Some(long) = token.strip_prefix("--") {
+            self.args.iter().find(|a| a.long.as_deref() == Some(long))
+        } else if let Some(rest) = token.strip_prefix('-') {
+            let mut chars = rest.chars();
+            let (first, second) = (chars.next(), chars.next());
+            match (first, second) {
+                (Some(c), None) => self.args.iter().find(|a| a.short == Some(c)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Every group that lists `arg_id` as a member.
+    fn groups_for(&self, arg_id: &str) -> Vec<&ArgGroup> {
+        self.groups
+            .iter()
+            .filter(|g| g.members.iter().any(|m| m == arg_id))
+            .collect()
+    }
+
+    /// Parse an argv-like token stream.
+    ///
+    /// Tokens are matched to arguments and subcommands in order. Matching a
+    /// group member also records the group id. Once matching is complete, all
+    /// declared conflict rules are checked.
+    pub fn parse<I, S>(&self, argv: I) -> ParseResult
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let tokens: Vec<String> = argv.into_iter().map(Into::into).collect();
+        let mut matches = ArgMatches::default();
+
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = &tokens[i];
+
+            if let Some(sub) = self.find_subcommand(token) {
+                matches.record(sub.id());
+                i += 1;
+                continue;
+            }
+
+            if let Some(arg) = self.match_token(token) {
+                let arg_id = arg.id.clone();
+                matches.record(&arg_id);
+                for group in self.groups_for(&arg_id) {
+                    matches.record(group.id());
+                }
+
+                match arg.hint {
+                    ValueHint::Flag => {
+                        i += 1;
+                    }
+                    ValueHint::Single => {
+                        if i + 1 >= tokens.len() {
+                            return Err(self.missing_value(arg));
+                        }
+                        matches.push_value(&arg_id, tokens[i + 1].clone());
+                        i += 2;
+                    }
+                    ValueHint::Multiple => {
+                        i += 1;
+                        let mut took = false;
+                        while i < tokens.len() && !tokens[i].starts_with('-') {
+                            matches.push_value(&arg_id, tokens[i].clone());
+                            i += 1;
+                            took = true;
+                        }
+                        if !took {
+                            return Err(self.missing_value(arg));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            return Err(self.unknown_argument(token));
+        }
+
+        self.check_conflicts(&matches)?;
+        self.check_required(&matches)?;
+        Ok(matches)
+    }
+
+    /// Check every declared conflict rule against the matched id set.
+    fn check_conflicts(&self, matches: &ArgMatches) -> Result<(), ParseError> {
+        for rule in &self.conflicts {
+            let both = matches.contains(&rule.first) && matches.contains(&rule.second);
+            if both {
+                return Err(self.argument_conflict(matches, &rule.first, &rule.second));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure every required argument was supplied.
+    fn check_required(&self, matches: &ArgMatches) -> Result<(), ParseError> {
+        for arg in &self.args {
+            if arg.required && !matches.contains(&arg.id) {
+                return Err(ParseError {
+                    kind: ErrorKind::MissingRequired,
+                    message: format!(
+                        "error: the following required argument was not provided:\n  {}",
+                        arg.to_display()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn missing_value(&self, arg: &Arg) -> ParseError {
+        ParseError {
+            kind: ErrorKind::MissingValue,
+            message: format!(
+                "error: a value is required for '{}' but none was supplied",
+                arg.to_display()
+            ),
+        }
+    }
+
+    fn unknown_argument(&self, token: &str) -> ParseError {
+        ParseError {
+            kind: ErrorKind::UnknownArgument,
+            message: format!("error: unexpected argument '{token}' found"),
+        }
+    }
+
+    /// Build an [`ErrorKind::ArgumentConflict`] error.
+    ///
+    /// The message names the two identifiers that clashed and then, for
+    /// context, lists every argument that was seen during this parse so the
+    /// user can tell what combination tripped the rule. That context list is
+    /// gathered by [`Self::used_arg_context`].
+    fn argument_conflict(&self, matches: &ArgMatches, first: &str, second: &str) -> ParseError {
+        let a = self.render_id(first);
+        let b = self.render_id(second);
+        let context = self.used_arg_context(matches);
+        let usage = self.render_usage();
+        let message = format!(
+            "error: the argument '{a}' cannot be used with '{b}'\n\n\
+             arguments seen: {context}\n\n{usage}"
+        );
+        ParseError {
+            kind: ErrorKind::ArgumentConflict,
+            message,
+        }
+    }
+
+    /// Render an identifier for a conflict headline.
+    ///
+    /// Groups and subcommands do not resolve as concrete args, so fall back to
+    /// the raw id for those; concrete args use their preferred spelling.
+    fn render_id(&self, id: &str) -> String {
+        if let Some(arg) = self.find(id) {
+            arg.to_display()
+        } else if let Some(group) = self.find_group(id) {
+            format!("<{}>", group.id())
+        } else {
+            id.to_string()
+        }
+    }
+
+    /// Gather the display strings for every argument that was matched.
+    ///
+    /// The matched-id set is the union of concrete argument ids, group ids, and
+    /// subcommand ids. This context list turns each matched id back into the
+    /// argument it names so the error can echo the offending combination.
+    fn used_arg_context(&self, matches: &ArgMatches) -> String {
+        let rendered: Vec<String> = matches
+            .ids()
+            .map(|id| self.find(id).unwrap().to_string())
+            .collect();
+        rendered.join(", ")
+    }
+
+    /// Render a one-line usage summary.
+    fn render_usage(&self) -> String {
+        let mut parts = vec![format!("Usage: {}", self.name)];
+        if !self.args.is_empty() {
+            parts.push("[OPTIONS]".to_string());
+        }
+        if !self.subcommands.is_empty() {
+            parts.push("[COMMAND]".to_string());
+        }
+        parts.join(" ")
+    }
+
+    /// Render the full help text (unused by the hot path, kept for realism).
+    pub fn render_help(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.render_usage());
+        out.push_str("\n\nOptions:\n");
+        for arg in &self.args {
+            let help = arg.help.clone().unwrap_or_default();
+            out.push_str(&format!("  {:<20} {}\n", arg.to_display(), help));
+        }
+        if !self.subcommands.is_empty() {
+            out.push_str("\nCommands:\n");
+            for sub in &self.subcommands {
+                out.push_str(&format!("  {}\n", sub.name));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> Command {
+        Command::new("demo")
+            .arg(Arg::new("verbose").long("verbose").short('v'))
+            .arg(
+                Arg::new("color")
+                    .long("color")
+                    .value_hint(ValueHint::Single),
+            )
+    }
+
+    #[test]
+    fn matches_flag_and_value() {
+        let m = base()
+            .parse(["--verbose", "--color", "always"])
+            .expect("parse");
+        assert!(m.contains("verbose"));
+        assert_eq!(m.values_of("color"), Some(["always".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn unknown_argument_errors() {
+        let err = base().parse(["--nope"]).unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn plain_arg_conflict_reports() {
+        let cmd = base()
+            .arg(Arg::new("quiet").long("quiet"))
+            .conflict("verbose", "quiet");
+        let err = cmd.parse(["--verbose", "--quiet"]).unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::ArgumentConflict);
+    }
+}

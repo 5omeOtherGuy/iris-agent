@@ -1,0 +1,12 @@
+//! Payments core. Decoy module with no deadline references, so a grep for
+//! `deadline` must not match here (keeps the probe's match set tight).
+
+pub mod gateway {
+    pub mod config;
+    pub mod retry_policy;
+}
+
+/// Sum two amounts in the smallest currency unit.
+pub fn add_minor_units(a: u64, b: u64) -> u64 {
+    a.saturating_add(b)
+}

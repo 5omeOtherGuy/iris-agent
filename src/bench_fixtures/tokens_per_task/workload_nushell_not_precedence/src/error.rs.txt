@@ -1,0 +1,83 @@
+//! Error types for the boolean-expression engine.
+//!
+//! Kept in its own module so the public surface (`ParseError`) can grow
+//! independently of the tokenizer/parser internals in `lib.rs`.
+
+use std::fmt;
+
+/// Where in the source string an error occurred.
+///
+/// Byte offset into the original `&str`. `Span::EOF` is used for errors that
+/// are reported at the very end of input (for example, a dangling operator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    /// Inclusive start byte offset.
+    pub start: usize,
+    /// Exclusive end byte offset.
+    pub end: usize,
+}
+
+impl Span {
+    /// A zero-width span used for end-of-input diagnostics.
+    pub const EOF: Span = Span { start: 0, end: 0 };
+
+    /// Build a span from a start offset and a length.
+    pub fn new(start: usize, len: usize) -> Span {
+        Span {
+            start,
+            end: start + len,
+        }
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.start, self.end)
+    }
+}
+
+/// The set of errors that parsing or lexing can produce.
+///
+/// The engine is intentionally strict: any malformed input yields a
+/// `ParseError` rather than a best-effort partial parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// A character that is not part of any recognized token.
+    UnexpectedChar { ch: char, span: Span },
+    /// A bare identifier that is not one of the known keywords.
+    UnknownWord { word: String, span: Span },
+    /// The parser wanted a value (`true`, `false`, `not`, `(`) but found
+    /// something else.
+    ExpectedValue { found: String, span: Span },
+    /// A `(` was opened but never closed.
+    UnclosedParen { span: Span },
+    /// Trailing tokens remained after a complete expression was parsed.
+    TrailingTokens { found: String, span: Span },
+    /// The input was empty or contained only whitespace.
+    EmptyInput,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::UnexpectedChar { ch, span } => {
+                write!(f, "unexpected character {:?} at {}", ch, span)
+            }
+            ParseError::UnknownWord { word, span } => {
+                write!(f, "unknown word {:?} at {}", word, span)
+            }
+            ParseError::ExpectedValue { found, span } => {
+                write!(f, "expected a value but found {:?} at {}", found, span)
+            }
+            ParseError::UnclosedParen { span } => {
+                write!(f, "unclosed '(' at {}", span)
+            }
+            ParseError::TrailingTokens { found, span } => {
+                write!(f, "unexpected trailing token {:?} at {}", found, span)
+            }
+            ParseError::EmptyInput => write!(f, "empty input"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}

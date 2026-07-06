@@ -1,0 +1,15 @@
+//! Gateway configuration knobs.
+
+use super::retry_policy::CHECKOUT_DEADLINE_MS;
+
+/// Default deadline applied when a caller does not request one.
+pub fn default_deadline_ms() -> u64 {
+    // The default deadline is the full checkout deadline.
+    CHECKOUT_DEADLINE_MS
+}
+
+/// Whether a caller-supplied deadline is inside the legal band.
+pub fn deadline_is_legal(deadline_ms: u64) -> bool {
+    // A legal deadline is at most the checkout deadline.
+    deadline_ms <= CHECKOUT_DEADLINE_MS
+}

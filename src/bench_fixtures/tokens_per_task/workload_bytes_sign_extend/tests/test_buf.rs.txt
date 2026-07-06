@@ -1,0 +1,31 @@
+use workload_bytes_sign_extend::Buf;
+
+#[test]
+fn test_get_u8() {
+    let mut buf = &b"\x2a"[..];
+    assert_eq!(42, buf.get_u8());
+}
+
+#[test]
+fn test_get_uint() {
+    let mut buf = &b"\xfe\x1d\xc0zomg"[..];
+    assert_eq!(0xfe1dc0, buf.get_uint(3));
+
+    let mut buf = &b"\xfe\x1d\xc0zomg"[..];
+    assert_eq!(0xc01dfe, buf.get_uint_le(3));
+}
+
+#[test]
+fn test_get_int() {
+    let mut buf = &b"\xd6zomg"[..];
+    assert_eq!(-42, buf.get_int(1));
+
+    let mut buf = &b"\xd6zomg"[..];
+    assert_eq!(-42, buf.get_int_le(1));
+
+    let mut buf = &b"\xfe\x1d\xc0zomg"[..];
+    assert_eq!(0xffffffffffc01dfeu64 as i64, buf.get_int_le(3));
+
+    let mut buf = &b"\xfe\x1d\xc0zomg"[..];
+    assert_eq!(0xfffffffffffe1dc0u64 as i64, buf.get_int(3));
+}

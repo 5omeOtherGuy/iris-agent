@@ -1,0 +1,8 @@
+# Retry notes
+
+The retry ceiling is controlled by `MAX_RETRIES` in `config/retry.rs`. Every
+network path (`net/client.rs`, `net/pool.rs`) and the background `worker/runner.rs`
+reads `MAX_RETRIES` rather than hard-coding a number, so changing the policy is a
+single-constant edit plus a tree-wide rename of the identifier.
+
+When renaming `MAX_RETRIES`, update this note too so the docs and code agree.

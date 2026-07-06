@@ -936,15 +936,25 @@ Potential scope:
   ([#339](https://github.com/5omeOtherGuy/iris-agent/issues/339)). [Open: not
   yet started.]
 
-End-to-end measurement pending: the per-result reductions above (read skim,
-bash filtering, grep caps, find summaries) are asserted as minimum bars on
-committed corpora, but the tokens-per-task benchmark -- does the model still
-complete a realistic workflow from the reduced context -- is not yet run. It
-follows the first Git-Centered Workflow slice (see the sequencing note above).
+End-to-end measurement partially landed (issue #210): the plan
+(`docs/BENCHMARK_PLAN.md`), the benchmark-only arm switch, three committed
+workload fixtures with mechanical success checks, and a re-runnable replay
+harness are in tree, reported in `docs/benchmarks/tokens-per-task.md`. The
+deterministic replay proves the token plumbing on the search/log workflows --
+arm A (defaults) spends fewer prompt tokens than arm B (baseline) with 100%
+success and zero approval prompts (3.4-9.1% on the current fixtures, a
+grep/find-grouping lever). It does NOT yet prove the hard half of the acceptance
+signal -- that a real model still completes the task from the reduced context --
+because the real-provider headline run (>= 3 real runs per cell) is opt-in and
+not yet run (it costs money; the harness and repro command are committed). The
+gate stays OPEN until that run lands and shows arm A winning with no success
+regression; only then does the README claim ship.
 
 Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
 prompt tokens without reducing task success on at least one realistic workflow
-such as large search results, large test logs, or multi-file inspection.
+such as large search results, large test logs, or multi-file inspection. (Replay
+evidence committed; real-provider confirmation pending -- see
+`docs/benchmarks/tokens-per-task.md`.)
 
 Gate before Milestone 3: token accounting and the handle/result shape must be
 stable enough that the context engine can build on them rather than replace them.

@@ -112,7 +112,9 @@ fn workspace(sample: &Sample) -> (crate::tools::test_support::TestDir, std::path
 /// both uncapped, plus the exact total match count.
 fn grouped_and_flat(sample: &Sample) -> (String, String, usize) {
     let (_dir, root) = workspace(sample);
-    let grouped = grep(&root, &mk_input(sample.pattern, None)).unwrap().0;
+    let grouped = grep(&root, &mk_input(sample.pattern, None), true)
+        .unwrap()
+        .0;
     let (files, total) = collect_for_bench(&root, &mk_input(sample.pattern, None));
     (grouped, render_flat(&files), total)
 }
@@ -154,10 +156,16 @@ fn corpus_reports_exact_total_and_every_file_path() {
 fn corpus_per_file_cap_shrinks_and_accounts_for_every_match() {
     for sample in samples() {
         let (_dir, root) = workspace(&sample);
-        let uncapped = grep(&root, &mk_input(sample.pattern, None)).unwrap().0;
-        let capped = grep(&root, &mk_input(sample.pattern, Some(sample.per_file_cap)))
+        let uncapped = grep(&root, &mk_input(sample.pattern, None), true)
             .unwrap()
             .0;
+        let capped = grep(
+            &root,
+            &mk_input(sample.pattern, Some(sample.per_file_cap)),
+            true,
+        )
+        .unwrap()
+        .0;
 
         // The cap never enlarges output, and both forms report the same total.
         assert!(
@@ -194,12 +202,12 @@ fn corpus_overhead_under_10ms_per_call() {
         let (_dir, root) = workspace(&sample);
         let input = mk_input(sample.pattern, None);
         // Warm the OS page cache.
-        let _ = grep(&root, &input).unwrap();
+        let _ = grep(&root, &input, true).unwrap();
         bench_support::assert_call_overhead_under(
             sample.class,
             std::time::Duration::from_millis(10),
             || {
-                let _ = grep(&root, &input).unwrap();
+                let _ = grep(&root, &input, true).unwrap();
             },
         );
     }
@@ -223,10 +231,16 @@ fn grep_benchmark_report() {
     println!("{}", bench_support::report_header());
     for sample in samples() {
         let (_dir, root) = workspace(&sample);
-        let uncapped = grep(&root, &mk_input(sample.pattern, None)).unwrap().0;
-        let capped = grep(&root, &mk_input(sample.pattern, Some(sample.per_file_cap)))
+        let uncapped = grep(&root, &mk_input(sample.pattern, None), true)
             .unwrap()
             .0;
+        let capped = grep(
+            &root,
+            &mk_input(sample.pattern, Some(sample.per_file_cap)),
+            true,
+        )
+        .unwrap()
+        .0;
         let via = format!("cap={}", sample.per_file_cap);
         println!(
             "{}",
@@ -240,7 +254,7 @@ fn grep_benchmark_report() {
     for ctx in [0usize, 1, 2, 3] {
         let mut input = mk_input(sample.pattern, None);
         input.context = Some(ctx);
-        let out = grep(&root, &input).unwrap().0;
+        let out = grep(&root, &input, true).unwrap().0;
         println!(
             "context={ctx}: {} est tokens",
             bench_support::est_tokens(&out)

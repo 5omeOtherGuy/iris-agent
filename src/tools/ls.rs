@@ -42,7 +42,10 @@ pub(super) fn parameters() -> Value {
     })
 }
 
-pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
+// `_reduce` (issue #210 benchmark arm): `ls` ships no default-on output
+// reduction (issue #339 is not started), so the switch is accepted for a
+// uniform `run_off_thread` body signature and ignored.
+pub(super) fn execute(root: &Path, args: &Value, _reduce: bool) -> Result<super::ToolOutput> {
     let input: LsInput =
         serde_json::from_value(args.clone()).context("ls tool arguments are invalid")?;
     // Record the listed directory for the compaction carry (ADR-0044); the

@@ -1,0 +1,28 @@
+   Compiling storecrate v2.0.0 (/build/storecrate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.20s
+     Running unittests src/lib.rs (target/debug/deps/storecrate-4d5e6f7081924354)
+
+running 8 tests
+test wal::tests::appends_in_order ... ok
+test wal::tests::fsync_on_commit ... ok
+test wal::tests::replays_after_crash ... FAILED
+test index::tests::finds_by_key ... ok
+test index::tests::range_scan ... ok
+test index::tests::handles_duplicates ... ok
+test gc::tests::reclaims_tombstones ... ok
+test gc::tests::preserves_live ... ok
+
+failures:
+
+---- wal::tests::replays_after_crash stdout ----
+
+thread 'wal::tests::replays_after_crash' (80517) panicked at src/wal.rs:301:9:
+assertion `left == right` failed: replayed length does not match committed length
+  left: 1024
+ right: 1017
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    wal::tests::replays_after_crash
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s

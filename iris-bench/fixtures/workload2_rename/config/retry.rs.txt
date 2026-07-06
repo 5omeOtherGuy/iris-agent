@@ -1,0 +1,13 @@
+//! Retry policy constants. The benchmark task renames MAX_RETRIES to
+//! MAX_ATTEMPTS across the whole tree; this is the definition site.
+
+/// Maximum number of retry attempts before a request is failed.
+pub const MAX_RETRIES: u32 = 5;
+
+/// Backoff base in milliseconds, unrelated to the rename.
+pub const BACKOFF_MS: u64 = 100;
+
+pub fn retry_budget() -> u32 {
+    // MAX_RETRIES gates the retry loop below.
+    MAX_RETRIES
+}

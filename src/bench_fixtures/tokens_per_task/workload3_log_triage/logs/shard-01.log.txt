@@ -1,0 +1,37 @@
+   Compiling netcrate v0.3.1 (/build/netcrate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.11s
+     Running unittests src/lib.rs (target/debug/deps/netcrate-1a2b3c4d5e6f7089)
+
+running 9 tests
+test client::tests::builds_default ... ok
+test client::tests::honors_timeout ... ok
+test pool::tests::grows_under_load ... ok
+test pool::tests::shrinks_when_idle ... FAILED
+test retry::tests::backoff_is_monotonic ... ok
+test retry::tests::caps_at_limit ... ok
+test codec::tests::roundtrip_ascii ... ok
+test codec::tests::roundtrip_utf8 ... FAILED
+test codec::tests::rejects_truncated ... ok
+
+failures:
+
+---- pool::tests::shrinks_when_idle stdout ----
+
+thread 'pool::tests::shrinks_when_idle' (51201) panicked at src/pool.rs:88:9:
+assertion `left == right` failed: idle pool did not shrink to the floor
+  left: 4
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- codec::tests::roundtrip_utf8 stdout ----
+
+thread 'codec::tests::roundtrip_utf8' (51204) panicked at src/codec.rs:142:9:
+assertion `left == right` failed: multibyte sequence corrupted on roundtrip
+  left: "caf\u{e9}"
+ right: "caf?"
+
+failures:
+    codec::tests::roundtrip_utf8
+    pool::tests::shrinks_when_idle
+
+test result: FAILED. 7 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
