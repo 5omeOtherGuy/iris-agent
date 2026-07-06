@@ -9,7 +9,9 @@
 //!
 //! The text front-end calls these helpers after Nexus emits semantic UI events.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+
+use regex::Regex;
 
 use serde_json::Value;
 
@@ -177,7 +179,8 @@ pub(crate) fn bash_timeout_secs(call: &ToolCall) -> Option<u64> {
 /// `MAX_SUMMARY_CHARS`. Shared by `run_target` and `command_display`.
 fn bash_command_line(command: &str) -> String {
     let (line, hidden) = bash_display_line(command);
-    let mut target = truncate_inline(line, MAX_SUMMARY_CHARS);
+    let line = shorten_paths_in_text(line);
+    let mut target = truncate_inline(&line, MAX_SUMMARY_CHARS);
     if hidden > 0 {
         let plural = if hidden == 1 { "" } else { "s" };
         target.push_str(&format!(" (+{hidden} more line{plural})"));
@@ -251,13 +254,96 @@ pub(crate) fn fold(content: &str) -> Folded {
 /// real workspace root through instead.
 pub(crate) fn display_path(raw: &str) -> String {
     let path = Path::new(raw);
-    if path.is_absolute()
-        && let Ok(cwd) = std::env::current_dir()
-        && let Ok(rel) = path.strip_prefix(&cwd)
-    {
-        return rel.to_string_lossy().into_owned();
+    if path.is_absolute() {
+        return shorten_absolute_path(path);
     }
     raw.strip_prefix("./").unwrap_or(raw).to_string()
+}
+
+/// Shorten absolute paths embedded in a shell command for display only. Paths in
+/// the current workspace are rendered relative to it; other paths under `$HOME`
+/// are rendered relative when useful, then with `~` as the fallback so the UI
+/// never shows `/home/<user>`.
+pub(crate) fn shorten_paths_in_text(text: &str) -> String {
+    let Ok(re) = Regex::new(r#"/[A-Za-z0-9._~+%:@=,/-]+"#) else {
+        return text.to_string();
+    };
+    re.replace_all(text, |caps: &regex::Captures<'_>| {
+        shorten_absolute_path(Path::new(&caps[0]))
+    })
+    .into_owned()
+}
+
+fn shorten_absolute_path(path: &Path) -> String {
+    let display = |path: &Path| path.to_string_lossy().into_owned();
+    let Ok(cwd) = std::env::current_dir() else {
+        return home_relative_path(path).unwrap_or_else(|| display(path));
+    };
+    if let Ok(rel) = path.strip_prefix(&cwd) {
+        return display_relative(rel);
+    }
+    if let Some(home_rel) = home_relative_path(path) {
+        if let Some(rel) = relative_path(path, &cwd)
+            && !rel.starts_with("../../../")
+            && rel.len() < home_rel.len()
+        {
+            return rel;
+        }
+        return home_rel;
+    }
+    display(path)
+}
+
+fn home_relative_path(path: &Path) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let rel = path.strip_prefix(home).ok()?;
+    Some(if rel.as_os_str().is_empty() {
+        "~".to_string()
+    } else {
+        format!("~/{}", rel.to_string_lossy())
+    })
+}
+
+fn relative_path(path: &Path, base: &Path) -> Option<String> {
+    let target = normalized_components(path)?;
+    let base = normalized_components(base)?;
+    let common = target
+        .iter()
+        .zip(&base)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = Vec::new();
+    for _ in 0..base.len().saturating_sub(common) {
+        parts.push("..".to_string());
+    }
+    parts.extend(target[common..].iter().cloned());
+    Some(if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    })
+}
+
+fn normalized_components(path: &Path) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => out.push(String::new()),
+            Component::Normal(part) => out.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+fn display_relative(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 /// File tools: `"{name} {path}"`. Falls back to a redacted compact-arg summary if
@@ -291,7 +377,8 @@ fn bash_summary(call: &ToolCall) -> String {
         return fallback_summary(call);
     };
     let (line, hidden) = bash_display_line(command);
-    let mut summary = format!("bash {}", truncate_inline(line, MAX_SUMMARY_CHARS));
+    let line = shorten_paths_in_text(line);
+    let mut summary = format!("bash {}", truncate_inline(&line, MAX_SUMMARY_CHARS));
     if hidden > 0 {
         let plural = if hidden == 1 { "" } else { "s" };
         summary.push_str(&format!(" (+{hidden} more line{plural})"));
@@ -495,6 +582,28 @@ mod tests {
         ));
         assert_eq!(edit, "edit tmp_x/subdir/sample.txt");
         assert_eq!(write, "write tmp_x/subdir/sample.txt");
+    }
+
+    #[test]
+    fn bash_display_shortens_workspace_and_home_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let sibling = cwd.parent().unwrap().join("iris-other");
+        let summary = run_target(&call(
+            "bash",
+            json!({ "command": format!("cd {} && cargo test", sibling.display()) }),
+        ));
+        assert_eq!(summary, "cd ../iris-other && cargo test");
+        assert!(!summary.contains("/home/"), "{summary}");
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let home_path = PathBuf::from(home).join("Downloads/archive.txt");
+            let summary = run_target(&call(
+                "bash",
+                json!({ "command": format!("cat {}", home_path.display()) }),
+            ));
+            assert_eq!(summary, "cat ~/Downloads/archive.txt");
+            assert!(!summary.contains("/home/"), "{summary}");
+        }
     }
 
     #[test]
