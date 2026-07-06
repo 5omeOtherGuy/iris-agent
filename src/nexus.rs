@@ -227,6 +227,57 @@ pub(crate) enum VerificationOutcome {
     SkippedApprovalDenied,
 }
 
+/// Why a microcompaction fold flush ran (issue #400, cache-aware scheduling).
+/// Detection recomputes the pending fold set at every turn boundary; a flush
+/// waits for one of these triggers. Classes follow the design's taxonomy:
+/// `A*` = piggyback on a prefix-cache break that happens anyway (marginal
+/// cache-write cost ~0), `B` = inferred-cold cache, `C` = the shipped
+/// token-watermark pressure backstop. Carried on the persisted `fold` entry
+/// and the [`AgentEvent::FoldApplied`] observer event; provider-neutral
+/// metadata only (never affects whether or how compaction runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldTrigger {
+    /// A1: a compaction will fire at this same boundary; the fold rides it.
+    CompactionBoundary,
+    /// A2: the model/provider selection changed since the last request (a
+    /// full prefix-cache break on every lane -- caches are model-scoped).
+    SelectionSwitch,
+    /// A3: the reasoning-effort preference changed since the last request (a
+    /// message-level break; folds live in messages, so they are covered).
+    ReasoningSwitch,
+    /// A4: resumed after an idle gap past the provider's cold threshold, so
+    /// the prefix cache is expired and the suffix re-bills regardless.
+    ColdResume,
+    /// A5: the context is below the provider's minimum cacheable prefix, so
+    /// nothing is cached yet and a fold breaks nothing.
+    BelowMinCacheable,
+    /// A6: the user requested compaction manually (`/compact`); pending folds
+    /// ride the user-initiated break.
+    ManualCompact,
+    /// B: mid-session idle gap past the provider's cold threshold -- the
+    /// cache has expired (or provably will have) with no break pending, so
+    /// the next request re-bills the suffix regardless.
+    InferredCold,
+    /// C: the context reached the micro-watermark (pressure backstop).
+    Watermark,
+}
+
+impl FoldTrigger {
+    /// The short class code recorded on fold entries and shown in the UI.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            FoldTrigger::CompactionBoundary => "A1",
+            FoldTrigger::SelectionSwitch => "A2",
+            FoldTrigger::ReasoningSwitch => "A3",
+            FoldTrigger::ColdResume => "A4",
+            FoldTrigger::BelowMinCacheable => "A5",
+            FoldTrigger::ManualCompact => "A6",
+            FoldTrigger::InferredCold => "B",
+            FoldTrigger::Watermark => "C",
+        }
+    }
+}
+
 /// The semantic events the loop emits during a turn. Provider- and UI-neutral:
 /// a front-end maps these onto its own rendering. Mirrors pi's `AgentEvent`
 /// union (`packages/agent/src/types.ts`).
@@ -305,6 +356,17 @@ pub(crate) enum AgentEvent {
         /// when the covered range had no in-workspace tool targets.
         carried_paths: usize,
     },
+    /// The harness flushed a batch of microcompaction folds at a safe turn
+    /// boundary (ADR-0048, issue #400). Counts and estimates only, tagged with
+    /// the trigger class that released the batch; never carries folded content.
+    FoldApplied {
+        /// Folds applied in this batch.
+        folds: usize,
+        /// Estimated context tokens reclaimed (original bodies minus stubs).
+        reclaimed_tokens_estimate: u64,
+        /// Why the flush ran (design §4.4 trigger taxonomy).
+        trigger: FoldTrigger,
+    },
     AssistantText(String),
     AssistantTextDelta(String),
     AssistantTextEnd(String),
@@ -363,6 +425,22 @@ pub(crate) enum AgentEvent {
         exit_code: Option<i32>,
         /// Wall-clock execution time, when the tool reports it.
         duration: Option<Duration>,
+    },
+    /// One incremental fragment of a *freeform/custom* tool call's input, streamed
+    /// while the model is still constructing the call (ADR-0039). Carries the
+    /// streaming correlation id so a front-end could attach a live preview to the
+    /// right call. Display-only and provably inert: the fragment is NEVER pushed
+    /// to `self.messages`, never accumulated into `partial`/assistant text, and
+    /// never merged into `AssistantTurn.tool_calls`. Approval and execution
+    /// consume only the completed, validated `ToolCall` assembled at turn
+    /// completion, so tampering with or dropping these deltas cannot change what
+    /// runs. JSON-argument (`function`) tools do not emit this -- their arguments
+    /// stay buffered until completion. No provider surfaces it in Iris today (no
+    /// freeform tool is declared); the live preview UI is deferred until a
+    /// freeform tool (`apply_patch`, V4A) exists to render.
+    ToolInputDelta {
+        call_id: String,
+        delta: String,
     },
     /// A display-only chunk of a running tool's live output (issue #90 sub-item
     /// 1). Carries the originating call id so a front-end attaches it to the
@@ -433,6 +511,12 @@ pub(crate) enum ProviderEvent {
     ReasoningDelta(String),
     /// A boundary between two reasoning-summary parts (blank line in the trace).
     ReasoningSectionBreak,
+    /// One incremental fragment of a *freeform/custom* tool call's input
+    /// (ADR-0039). Forwarded display-only and provably inert: never accumulated
+    /// into the assembled turn's text or tool calls. Only freeform-tool adapters
+    /// (currently the OpenAI Responses adapter, for `custom_tool_call` input)
+    /// emit it; JSON-argument tool deltas stay buffered until completion.
+    ToolInputDelta { call_id: String, delta: String },
     /// Terminal event: the fully assembled assistant turn.
     Completed(AssistantTurn),
 }
@@ -1675,6 +1759,15 @@ impl<P: ChatProvider> Agent<P> {
                     }
                     Some(Ok(ProviderEvent::ReasoningSectionBreak)) => {
                         obs.on_event(AgentEvent::AssistantReasoningSectionBreak)?;
+                    }
+                    Some(Ok(ProviderEvent::ToolInputDelta { call_id, delta })) => {
+                        // Display-only (ADR-0039): forwarded for a live preview
+                        // but NEVER accumulated into `partial` (the persisted
+                        // assistant text), `self.messages`, or the assembled
+                        // turn's tool calls. Approval and execution use only the
+                        // completed `ToolCall`, so these deltas cannot change what
+                        // runs even if tampered with or dropped.
+                        obs.on_event(AgentEvent::ToolInputDelta { call_id, delta })?;
                     }
                     Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {

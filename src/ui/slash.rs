@@ -92,6 +92,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/context",
+        description: "Show the context breakdown (system, conversation, summaries, folds, headroom)",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/debug",
         description: "Write a debug snapshot (screen + transcript) to a file",
         action: SlashAction::Submit,

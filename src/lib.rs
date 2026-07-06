@@ -415,6 +415,16 @@ fn run_agent_inner(
     harness.set_summarizer(settings.compaction_summarizer());
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
+    // Prompt-cache profile + selection identity for the fold scheduler
+    // (issue #400): resolved here so wayland consumes only profile fields.
+    harness.set_cache_profile(mimir::selection::cache_profile(&selection));
+    harness.note_active_selection(
+        selection.provider.as_str(),
+        &selection.model,
+        selection
+            .reasoning
+            .map(mimir::selection::ReasoningEffort::as_str),
+    );
     // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
     // preference; absent/invalid leaves the built-in default (`strict`). The live
     // `/approval` command stays session-only and is unaffected.
@@ -548,6 +558,16 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     harness.set_summarizer(settings.compaction_summarizer());
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
+    // Prompt-cache profile + selection identity for the fold scheduler
+    // (issue #400): resolved here so wayland consumes only profile fields.
+    harness.set_cache_profile(mimir::selection::cache_profile(&selection));
+    harness.note_active_selection(
+        selection.provider.as_str(),
+        &selection.model,
+        selection
+            .reasoning
+            .map(mimir::selection::ReasoningEffort::as_str),
+    );
 
     // Merge piped stdin (when not a TTY) into the prompt before the turn.
     let piped = print::read_piped_stdin()?;
@@ -660,6 +680,16 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     harness.set_summarizer(settings.compaction_summarizer());
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
+    // Prompt-cache profile + selection identity for the fold scheduler
+    // (issue #400): resolved here so wayland consumes only profile fields.
+    harness.set_cache_profile(mimir::selection::cache_profile(&selection));
+    harness.note_active_selection(
+        selection.provider.as_str(),
+        &selection.model,
+        selection
+            .reasoning
+            .map(mimir::selection::ReasoningEffort::as_str),
+    );
     // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
     // preference; absent/invalid leaves the built-in default (`strict`).
     harness.set_approval_mode(nexus::ApprovalMode::from_startup_setting(

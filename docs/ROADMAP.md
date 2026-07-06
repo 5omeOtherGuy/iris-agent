@@ -831,15 +831,36 @@ Potential scope:
   (verbatim in rebuilt context, e.g. carry paths) versus
   recoverable-behind-reference (folded or compacted, reachable via a stub path or
   recall handle), each asserted separately. Reported dimensions: compaction
-  generation, covered-range size, and cache economics -- the cache-hit-eligible
-  covered-range start (only generation 1 rides the live cached prefix) and the
-  retained-tail rewrite mass are measured, while the ProviderUsage-derived
-  cache-hit rate and cache-write amplification are documented methodology with
-  measurement pending a recorded live lane (never fabricated). Report:
-  `docs/benchmarks/issue-372-compaction-retention-slice-b.md`. Deferred (still
-  open, outside #372): the over-budget-no-coverable-range floor,
-  estimate-vs-actual token calibration, and provider-native context-management
-  interplay.]
+  generation, covered-range size, and cache economics -- modeled deterministically
+  (prefix-divergence, estimated tokens) and anchored by an env-gated live
+  Anthropic Claude Code OAuth capture: the post-compaction cache-WRITE side is
+  realized (1758/1761 input tokens, 5m tier), the summarization request's
+  cache-HIT realized 0 on the short synthetic seed (recorded honestly, not
+  fabricated). Report: `docs/benchmarks/issue-372-compaction-retention-slice-b.md`.
+  The fold-flush price is measured separately
+  ([#400](https://github.com/5omeOtherGuy/iris-agent/issues/400),
+  `docs/benchmarks/issue-400-fold-flush-cost.md`): a fold-only flush on a warm
+  cache re-bills everything below the fold point (realized 2129
+  provider-reported write tokens) against a per-turn saving of the folded body
+  -- break-even tens-to-hundreds of turns -- while the same fold at a compaction
+  boundary is free (marginal write <= 0, asserted) and a cold cache makes it
+  free and immediately profitable. The cache-aware fold scheduler shipped on
+  that evidence ([#400](https://github.com/5omeOtherGuy/iris-agent/issues/400),
+  [ADR-0051](adr/0051-cache-aware-fold-flush-scheduling.md), PRs #405-#409):
+  detection recomputes a pending-fold set every boundary; flushes ride free
+  breaks (compaction A1, selection/reasoning switch A2/A3, cold resume A4,
+  below-minimum prefix A5, manual `/compact` A6, inferred mid-session cold B
+  from a provider-neutral `CacheProfile` seam in mimir) with the watermark as
+  the Class C backstop; every flush is trigger-tagged on the fold entry, the
+  observer event, and the `/context` breakdown. Per-trigger marginal write <= 0
+  is CI-asserted; the Class-B live pair realized a -355-token write delta
+  (Anthropic, real 390s idle) and a 317-token input saving (Codex, read-side).
+  `clearToolUses` + microcompaction are now mutually exclusive (ADR-0022
+  addendum), discharging the provider-native context-management interplay gap.
+  Phase 3 calibration (persisted per-turn usage, watermark retuning) is
+  [#395](https://github.com/5omeOtherGuy/iris-agent/issues/395). Deferred
+  (still open, outside #372): the over-budget-no-coverable-range floor and
+  estimate-vs-actual token calibration.]
 - Comparison against naive transcript-passing.
 - Native bash output filtering
   ([#336](https://github.com/5omeOtherGuy/iris-agent/issues/336),
@@ -1215,6 +1236,81 @@ contract, tmux probe lifetime deadline).
 Open design question: pager scrollbar vs text indicators
 ([#326](https://github.com/5omeOtherGuy/iris-agent/issues/326)) — decision
 before code.
+
+## Live-streaming — Codex-grade TUI streaming
+
+**Status: shipped (2026-07-05, PRs
+[#390](https://github.com/5omeOtherGuy/iris-agent/pull/390),
+[#396](https://github.com/5omeOtherGuy/iris-agent/pull/396),
+[#398](https://github.com/5omeOtherGuy/iris-agent/pull/398),
+[#399](https://github.com/5omeOtherGuy/iris-agent/pull/399),
+[#402](https://github.com/5omeOtherGuy/iris-agent/pull/402)).**
+Five slices, each worktree → gate → pre-merge review → squash-merge. Closes
+[#87](https://github.com/5omeOtherGuy/iris-agent/issues/87) (streamed markdown
+snapped to formatted on finalize); the deferred #90 session-path advances by its
+tool-input seam only — the live patch-preview UI stays deferred.
+
+**Goal:** the TUI streams assistant text, reasoning, and tool-call construction
+smoothly — no raw-then-snap reflow, never a blank status line — while keeping the
+single authoritative commit-to-scrollback and the security invariants.
+
+Slices, in order:
+
+- **Assistant-message stream controller**
+  ([#87](https://github.com/5omeOtherGuy/iris-agent/issues/87), PR
+  [#390](https://github.com/5omeOtherGuy/iris-agent/pull/390)) — newline-gated
+  collector + adaptive paced drain + one mutable active tail + table holdback,
+  in `src/ui/tui/streaming/`. A streamed markdown table no longer reflows on
+  finalize. The chunking policy is lifted from Codex (Apache-2.0, attributed in
+  `NOTICE` + per-file SPDX).
+- **Provider-neutral live reasoning deltas**
+  ([ADR-0050](adr/0050-stream-reasoning-summary-deltas.md), PR
+  [#396](https://github.com/5omeOtherGuy/iris-agent/pull/396)) — reasoning
+  *summary* deltas stream into a live thinking rail; redacted reasoning text is
+  never rendered or reconstructed
+  ([ADR-0016](adr/0016-preserve-provider-reasoning-continuity-in-flattened-transcripts.md));
+  the final block is persisted exactly once; degrades to the block rail when a
+  provider streams no deltas. Nexus + Mimir (OpenAI Codex Responses) + TUI.
+- **Freeform tool-input delta seam**
+  ([ADR-0039](adr/0039-freeform-tool-input-deltas-are-display-only.md), PR
+  [#398](https://github.com/5omeOtherGuy/iris-agent/pull/398)) — display-only
+  tool-input deltas that never enter provider context; approval and execution
+  use only the completed canonical `ToolCall`. Inert until a freeform tool
+  (`apply_patch`/V4A) exists to render, so the live patch-preview UI stays
+  deferred ([#90](https://github.com/5omeOtherGuy/iris-agent/issues/90)).
+- **Always-visible work-phase state machine** (PR
+  [#399](https://github.com/5omeOtherGuy/iris-agent/pull/399)) — a UI-owned
+  `WorkPhase` (`src/ui/tui/activity.rs`) drives a provider-neutral status label
+  from turn start through thinking / answering / running tool / approval /
+  finishing, so the header is never blank or misleading. The approval prompt
+  stays the primary surface (no competing working animation).
+- **Ordering, cancellation, pager hardening** (PR
+  [#402](https://github.com/5omeOtherGuy/iris-agent/pull/402)) — regression tests
+  locking the invariants: a tool never renders before the preceding streamed
+  lines (FIFO), cancellation commits the partial exactly once and clears the
+  tail/queue, the pager visible total counts the active tail, and history trim is
+  held while a stream or tool is active. Test-only.
+
+Follow-ups (post-wrap-up, 2026-07-05):
+
+- **Live thinking actually streams on OpenAI** (PR
+  [#404](https://github.com/5omeOtherGuy/iris-agent/pull/404)) — the Codex
+  Responses request now asks for `reasoning.summary: "auto"`, so the API emits
+  the summary deltas the reasoning rail consumes. Slice 3's tests injected SSE
+  directly, so the missing request field went unnoticed until end-to-end use.
+- **Anthropic reasoning joins the rail** (PR
+  [#410](https://github.com/5omeOtherGuy/iris-agent/pull/410)) — Anthropic
+  Messages forwards non-redacted `thinking_delta` summaries live through the
+  same provider-neutral rail. Redacted thinking is never streamed
+  ([ADR-0016](adr/0016-preserve-provider-reasoning-continuity-in-flattened-transcripts.md)),
+  the retry gate treats shown reasoning as visible output, and reasoning a
+  refusal fallback would discard is withheld until the fallback boundary. Nexus
+  dedup is provider-agnostic, so no core/TUI change was needed. Live reasoning
+  now covers OpenAI Codex Responses and Anthropic Messages.
+
+Gate: every pane-rendering change carries frame assertions; the `--plain` path is
+unaffected; Codex-derived files carry Apache-2.0 SPDX + `NOTICE` while the repo
+stays MIT.
 
 ## Architecture work — Tier-Boundary Enforcement
 

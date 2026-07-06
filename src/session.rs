@@ -79,6 +79,14 @@ pub(crate) struct SessionLog {
     /// this count plus one; derived from entry order, so a session without the
     /// persisted field still counts correctly.
     compactions: u32,
+    /// Highest entry `timestamp` (unix ms) at resume time, approximating the
+    /// prior process's last activity for the cold-resume fold trigger (#400).
+    /// `None` for a freshly created log or a transcript without timestamps.
+    resumed_last_activity_ms: Option<u64>,
+    /// Unix ms of the most recent entry appended by THIS process, for the
+    /// mid-session inferred-cold fold trigger (#400 Class B). `None` until
+    /// the first append after create/resume.
+    appended_activity_ms: Option<u64>,
 }
 
 impl SessionLog {
@@ -133,6 +141,8 @@ impl SessionLog {
             last_id: None,
             next_seq: 0,
             compactions: 0,
+            resumed_last_activity_ms: None,
+            appended_activity_ms: None,
         })
     }
 
@@ -233,12 +243,16 @@ impl SessionLog {
     /// additive-optional: older readers skip an unknown `type`, and a session
     /// with no fold entries rebuilds byte-identically to the pre-fold behavior.
     /// `token_estimate` records the stub's token cost so the rebuild counts the
-    /// stub instead of the folded result.
+    /// stub instead of the folded result. `trigger` is the scheduler's trigger
+    /// class code (issue #400, e.g. `"C"` for the watermark backstop):
+    /// additive-optional audit metadata -- rebuild ignores it, and entries
+    /// written before it existed simply lack the field.
     pub(crate) fn append_fold(
         &mut self,
         target_id: &str,
         stub: &str,
         token_estimate: Option<u64>,
+        trigger: &str,
     ) -> Result<String> {
         let id = self.next_id();
         let entry = json!({
@@ -250,6 +264,7 @@ impl SessionLog {
             "targetId": target_id,
             "stub": stub,
             "tokenEstimate": token_estimate,
+            "trigger": trigger,
         });
         write_line(&mut self.file, &entry)
             .with_context(|| format!("failed to append fold to session {}", self.path.display()))?;
@@ -408,7 +423,17 @@ impl SessionLog {
             last_id: state.last_id,
             next_seq: state.next_seq,
             compactions: state.compactions,
+            resumed_last_activity_ms: state.last_activity_ms,
+            appended_activity_ms: None,
         })
+    }
+
+    /// Highest entry timestamp (unix ms) observed when this log was resumed,
+    /// approximating the prior process's last activity for the cold-resume
+    /// fold trigger (#400). `None` for a freshly created log or a transcript
+    /// whose entries carry no timestamps.
+    pub(crate) fn resumed_last_activity_ms(&self) -> Option<u64> {
+        self.resumed_last_activity_ms
     }
 
     /// Session id (header `id`), used to open this session back later.
@@ -436,9 +461,22 @@ impl SessionLog {
     // if entry ids ever need to be globally unique across sessions or survive a
     // fork that copies entries.
     fn next_id(&mut self) -> String {
+        // Every entry append allocates its id here, so this is the single
+        // choke point that refreshes the live activity clock (#400 Class B):
+        // the entry about to be written carries `now_ms()` as its timestamp.
+        self.appended_activity_ms = Some(now_ms() as u64);
         let id = format!("{:08x}", self.next_seq);
         self.next_seq += 1;
         id
+    }
+
+    /// Unix ms of the most recent transcript activity: the last entry this
+    /// process appended, falling back to the resume-time scan. The
+    /// mid-session inferred-cold fold trigger (#400 Class B) compares an
+    /// idle gap against the provider profile's cold threshold. `None` for a
+    /// fresh, never-appended log.
+    pub(crate) fn last_activity_ms(&self) -> Option<u64> {
+        self.appended_activity_ms.or(self.resumed_last_activity_ms)
     }
 }
 
@@ -947,6 +985,9 @@ struct ResumeState {
     /// Whether the file lacks a trailing newline (a truncated final fragment),
     /// so resume must terminate it before appending.
     needs_newline: bool,
+    /// Highest entry `timestamp` (unix ms) seen in the file, approximating the
+    /// prior process's last activity for the cold-resume fold trigger (#400).
+    last_activity_ms: Option<u64>,
     /// Count of `compaction` entries seen, so the resumed log continues the
     /// generation ordinal (ADR-0047) from entry order -- correct even for
     /// sessions written before the persisted `generation` field existed.
@@ -979,6 +1020,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
     let mut count: u32 = 0;
     let mut compactions: u32 = 0;
     let mut max_seq: Option<u32> = None;
+    let mut last_activity_ms: Option<u64> = None;
     for line in lines {
         let Ok(text) = line else { continue };
         let Ok(value) = serde_json::from_str::<Value>(text) else {
@@ -1006,6 +1048,9 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
             compactions += 1;
         }
         count += 1;
+        if let Some(ts) = value.get("timestamp").and_then(Value::as_u64) {
+            last_activity_ms = Some(last_activity_ms.map_or(ts, |m: u64| m.max(ts)));
+        }
         if let Some(entry_id) = value.get("id").and_then(Value::as_str) {
             last_id = Some(entry_id.to_string());
             // Entry ids are hex of the seq counter; track the max so the next id
@@ -1024,6 +1069,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         next_seq,
         needs_newline,
         compactions,
+        last_activity_ms,
     })
 }
 
@@ -1904,6 +1950,7 @@ mod tests {
             &result_id,
             "[folded] superseded read of `a.rs`; re-read to recover.",
             None,
+            "C",
         )
         .unwrap();
         drop(log);
@@ -1950,6 +1997,7 @@ mod tests {
             "[folded] The `read` result for `src/lib.rs` was superseded and folded; \
              re-read the file or recall the original.",
             None,
+            "C",
         )
         .unwrap();
         let path = log.path().to_path_buf();
@@ -1978,7 +2026,7 @@ mod tests {
         let result_id = log
             .append(&read_result("call_1", "a.rs", "original body"))
             .unwrap();
-        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+        log.append_fold(&result_id, "[folded] stub for a.rs", None, "C")
             .unwrap();
         drop(log);
 
@@ -1999,7 +2047,7 @@ mod tests {
             .append(&read_result("call_1", "a.rs", "original body"))
             .unwrap();
         // Fold first.
-        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None, "C")
             .unwrap();
         // Then compact the range [first, result_id], covering the folded target.
         log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
@@ -2039,7 +2087,7 @@ mod tests {
         log.append_compaction(&first, &result_id, "SUMMARY of the range", &[], None)
             .unwrap();
         // Then attempt to fold a target inside the covered range.
-        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None)
+        log.append_fold(&result_id, "[folded] FOLD-STUB for a.rs", None, "C")
             .unwrap();
         drop(log);
 
@@ -2071,7 +2119,7 @@ mod tests {
         let result_id = log
             .append(&read_result("call_1", "a.rs", "original body"))
             .unwrap();
-        log.append_fold(&result_id, "[folded] stub for a.rs", None)
+        log.append_fold(&result_id, "[folded] stub for a.rs", None, "C")
             .unwrap();
         drop(log);
 
@@ -2112,7 +2160,7 @@ mod tests {
         let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
         let id = log.id().to_string();
         log.append(&Message::user("hello")).unwrap();
-        log.append_fold("deadbeef", "[folded] orphan stub", None)
+        log.append_fold("deadbeef", "[folded] orphan stub", None, "C")
             .unwrap();
         drop(log);
 
@@ -2236,7 +2284,7 @@ mod tests {
             .append(&read_result("call_1", "a.rs", "payload"))
             .unwrap();
         let fold_id = log
-            .append_fold(&result_id, "[folded] superseded read of `a.rs`.", None)
+            .append_fold(&result_id, "[folded] superseded read of `a.rs`.", None, "C")
             .unwrap();
         let path = log.path().to_path_buf();
         drop(log);

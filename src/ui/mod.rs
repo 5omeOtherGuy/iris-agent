@@ -180,6 +180,13 @@ pub(crate) enum UiEvent {
         summary_tokens_estimate: u64,
         budget: u64,
     },
+    /// A microcompaction fold batch was flushed (ADR-0048, issue #400). Counts
+    /// and estimates only, tagged with the trigger class that released it.
+    FoldApplied {
+        folds: usize,
+        reclaimed_tokens_estimate: u64,
+        trigger: crate::nexus::FoldTrigger,
+    },
     AssistantText(String),
     AssistantTextDelta(String),
     AssistantTextEnd(String),
@@ -198,6 +205,16 @@ pub(crate) enum UiEvent {
     /// A boundary between two reasoning-summary parts (a blank line in the live
     /// thinking trace). Display-only; carries no text.
     AssistantReasoningSectionBreak,
+    /// One incremental fragment of a *freeform/custom* tool call's input, streamed
+    /// while the model is still constructing the call (ADR-0039). Display-only and
+    /// inert: it never affects approval, execution, or transcript state. No
+    /// freeform tool is declared in Iris today, so this does not fire in practice;
+    /// the live preview UI is deferred until `apply_patch` (V4A) exists to render.
+    /// See [`AgentEvent::ToolInputDelta`].
+    ToolInputDelta {
+        call_id: String,
+        delta: String,
+    },
     ToolProposed(ToolCall),
     /// A tool is about to execute; lets the front-end open a live progress cell.
     ToolStarted(ToolCall),
@@ -324,6 +341,15 @@ impl UiEvent {
                 summary_tokens_estimate,
                 budget,
             },
+            AgentEvent::FoldApplied {
+                folds,
+                reclaimed_tokens_estimate,
+                trigger,
+            } => UiEvent::FoldApplied {
+                folds,
+                reclaimed_tokens_estimate,
+                trigger,
+            },
             AgentEvent::AssistantText(text) => UiEvent::AssistantText(text),
             AgentEvent::AssistantTextDelta(delta) => UiEvent::AssistantTextDelta(delta),
             AgentEvent::AssistantTextEnd(text) => UiEvent::AssistantTextEnd(text),
@@ -332,6 +358,9 @@ impl UiEvent {
             }
             AgentEvent::AssistantReasoningDelta(delta) => UiEvent::AssistantReasoningDelta(delta),
             AgentEvent::AssistantReasoningSectionBreak => UiEvent::AssistantReasoningSectionBreak,
+            AgentEvent::ToolInputDelta { call_id, delta } => {
+                UiEvent::ToolInputDelta { call_id, delta }
+            }
             AgentEvent::ToolProposed(call) => UiEvent::ToolProposed(call),
             AgentEvent::ToolStarted(call) => UiEvent::ToolStarted(call),
             AgentEvent::ToolAutoApproved(call) => UiEvent::ToolAutoApproved(call),

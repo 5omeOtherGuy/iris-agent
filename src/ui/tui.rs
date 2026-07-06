@@ -39,6 +39,7 @@ use crate::ui::terminal_surface::TerminalSurface;
 use frame_stats::FrameStats;
 use pager::PagerSurface;
 
+mod activity;
 mod component;
 mod frame_stats;
 mod overlay;
@@ -62,7 +63,7 @@ pub(crate) use overlay::{FocusTarget, overlay_box};
 use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
-pub(crate) use screen::{ApprovalPolicy, Screen};
+pub(crate) use screen::{ApprovalPolicy, ContextAccounting, Screen};
 pub(crate) use screen::{BarSegment, session_bar_hit};
 use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
@@ -1313,6 +1314,235 @@ mod tests {
             out.matches("The answer paragraph.").count(),
             1,
             "answer rendered exactly once: {out}"
+        );
+    }
+
+    // --- Slice 5: ordering, cancellation, pager hardening ---
+
+    #[test]
+    fn a_tool_event_commits_streamed_lines_before_the_tool_renders() {
+        // DoD: a tool event never renders before the preceding streamed
+        // assistant lines. Each tool arm finishes the stream first, so every
+        // committed answer line precedes the tool panel in the frame (FIFO).
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
+        // Two complete blocks are streamed but NOT yet paced into scrollback.
+        screen.apply(UiEvent::AssistantTextDelta(
+            "Alpha answer line.\n\nBeta answer line.\n\n".to_string(),
+        ));
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "nothing is committed before a tick or a tool event"
+        );
+        // A tool starts while the streamed answer is still un-committed.
+        let tool = call_args("bash", json!({ "command": "echo SENTINEL_TOOL" }));
+        screen.apply(UiEvent::ToolStarted(tool));
+        assert!(
+            !screen.transcript.stream.is_active(),
+            "the tool event flushed the stream"
+        );
+        let frame = rendered_text(&mut screen, 100, 40);
+        let alpha = frame.find("Alpha answer line.").expect("alpha committed");
+        let beta = frame.find("Beta answer line.").expect("beta committed");
+        let tool_at = frame.find("SENTINEL_TOOL").expect("tool rendered");
+        assert!(
+            alpha < beta && beta < tool_at,
+            "streamed answer lines must precede the tool, in order: {frame}"
+        );
+    }
+
+    #[test]
+    fn cancellation_commits_partial_text_once_and_clears_the_tail() {
+        // DoD: cancellation commits the partial assistant text EXACTLY once and
+        // clears the tail/queues. On cancel Nexus emits `AssistantTextEnd(partial)`
+        // (deltas were seen) then `ProviderTurnCancelled`; the End finalizes the
+        // accumulated stream once and resets the controller.
+        let partial = "Committed answer.\n\nOpen tail still typing";
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(partial.to_string()));
+        // Pace the first complete block into scrollback; the last line stays in
+        // the mutable tail.
+        screen.commit_stream_tick(std::time::Instant::now());
+        assert!(screen.transcript.stream.is_active(), "stream is mid-flight");
+
+        screen.apply(UiEvent::AssistantTextEnd(partial.to_string()));
+        screen.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+
+        let full = screen
+            .transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            full.matches("Open tail still typing").count(),
+            1,
+            "the partial tail is committed exactly once: {full}"
+        );
+        assert_eq!(
+            full.matches("Committed answer.").count(),
+            1,
+            "the already-paced block is not duplicated on finalize: {full}"
+        );
+        assert!(
+            !screen.transcript.stream.is_active() && !screen.has_stream_work(),
+            "the tail and paced queue are cleared after cancellation"
+        );
+    }
+
+    #[test]
+    fn pager_visible_total_counts_the_active_stream_tail() {
+        // DoD: the pager visible total includes the active tail, so a scrollback
+        // that is entirely in-flight is still reachable/visible.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        // Three complete blocks, held in the tail (no commit tick).
+        screen.apply(UiEvent::AssistantTextDelta(
+            "Tail A.\n\nTail B.\n\nTail C.\n\n".to_string(),
+        ));
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "the tail is not committed without a tick"
+        );
+        // The pager sizes its scrollable range from `transcript_visible_total`
+        // (committed rows + streaming preview), not `render().total_lines`.
+        // With nothing committed, the whole visible total is the active tail, so
+        // a regression that dropped the tail from the pager total would read 0.
+        let visible_total = screen.transcript_visible_total(80);
+        assert!(
+            visible_total >= 3,
+            "the uncommitted tail is counted in the pager visible total: {visible_total}"
+        );
+        let frame: String = screen
+            .transcript
+            .render(80)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            frame.contains("Tail A.") && frame.contains("Tail C."),
+            "the tail rows are part of the rendered document: {frame}"
+        );
+    }
+
+    #[test]
+    fn history_trim_is_held_while_a_stream_or_tool_is_active() {
+        // DoD: history trim does not run while a stream (or tool) is active, so
+        // an in-flight tail/queue is never dropped by a mid-turn trim.
+        let mut screen = Screen::new();
+        for i in 0..(MAX_TRANSCRIPT_ROWS + 32) {
+            screen.transcript.rows.push(TranscriptRow::new(
+                format!("history row {i}"),
+                Style::default(),
+            ));
+        }
+        let over_cap = screen.transcript.rows.len();
+        assert!(over_cap > MAX_TRANSCRIPT_ROWS);
+
+        // A stream in flight holds the trim.
+        screen.apply(UiEvent::AssistantTextDelta("streaming tail...".to_string()));
+        assert!(screen.transcript.stream.is_active());
+        screen.transcript.trim_history();
+        assert!(
+            screen.transcript.rows.len() > MAX_TRANSCRIPT_ROWS,
+            "no trim while a stream is active"
+        );
+
+        // Finalizing the stream releases the trim on the next event.
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+        assert!(!screen.transcript.stream.is_active(), "stream finalized");
+        assert!(
+            screen.transcript.rows.len() <= MAX_TRANSCRIPT_ROWS,
+            "trim runs once the stream is done: {}",
+            screen.transcript.rows.len()
+        );
+
+        // A running tool likewise holds the trim.
+        for i in 0..(MAX_TRANSCRIPT_ROWS + 32) {
+            screen.transcript.rows.push(TranscriptRow::new(
+                format!("more row {i}"),
+                Style::default(),
+            ));
+        }
+        assert!(screen.transcript.rows.len() > MAX_TRANSCRIPT_ROWS);
+        screen.apply(UiEvent::ToolStarted(call_args(
+            "bash",
+            json!({ "command": "sleep 1" }),
+        )));
+        screen.transcript.trim_history();
+        assert!(
+            screen.transcript.rows.len() > MAX_TRANSCRIPT_ROWS,
+            "no trim while a tool is running"
+        );
+    }
+
+    #[test]
+    fn full_replay_parity_across_stream_then_tool_then_cancellation() {
+        // DoD: after a stream + tool + cancellation sequence, the incrementally
+        // paced transcript matches a full replay of the same logical events
+        // (no duplication, no lost partial, identical ordering).
+        let one = "Answer part one.\n\n";
+        let two = "Answer part two, interrupted";
+        let tool = call_args("bash", json!({ "command": "echo hi" }));
+
+        // Incremental: deltas with paced ticks, a tool between, then a cancel
+        // (End carries the accumulated partial, as Nexus emits it).
+        let mut inc = Screen::new();
+        let _ = inc.wrapped_lines(80);
+        let base = std::time::Instant::now();
+        inc.apply(UiEvent::AssistantTextDelta(one.to_string()));
+        inc.commit_stream_tick(base);
+        inc.apply(UiEvent::ToolStarted(tool.clone()));
+        inc.apply(UiEvent::ToolResult {
+            call: tool.clone(),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            // Deterministic elapsed so the finalized tool header cannot derive a
+            // wall-clock duration from `Instant::now()` (avoids a 0.0s/0.1s flake
+            // between the two sides of the parity comparison).
+            duration: Some(std::time::Duration::ZERO),
+        });
+        inc.apply(UiEvent::AssistantTextDelta(two.to_string()));
+        inc.apply(UiEvent::AssistantTextEnd(two.to_string()));
+        inc.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+
+        // Full replay: the same logical events without streaming/pacing. The
+        // cancelled partial commits as a whole non-streamed assistant message,
+        // mirroring Nexus's no-delta commit path.
+        let mut full = Screen::new();
+        let _ = full.wrapped_lines(80);
+        full.apply(UiEvent::AssistantText(one.to_string()));
+        full.apply(UiEvent::ToolStarted(tool.clone()));
+        full.apply(UiEvent::ToolResult {
+            call: tool.clone(),
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(std::time::Duration::ZERO),
+        });
+        full.apply(UiEvent::AssistantText(two.to_string()));
+        full.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+
+        let inc_rows: Vec<String> = inc.transcript.rows.iter().map(row_text).collect();
+        let full_rows: Vec<String> = full.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            inc_rows, full_rows,
+            "paced stream+tool+cancel must match a full replay of the same events"
+        );
+        // And the rendered documents agree line-for-line.
+        assert_eq!(
+            line_signature(&inc.wrapped_lines(80)),
+            line_signature(&full.wrapped_lines(80)),
+            "rendered signature differs from full replay"
         );
     }
 

@@ -26,8 +26,9 @@ use crate::config::VerificationConfig;
 use crate::handles::HandleStore;
 use crate::nexus::ToolOutputStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, Message, ProviderEvent, Role,
-    SessionSpanReader, SteeringSource, ToolEnv, Tools, VerificationOutcome, VerifyRun,
+    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, FoldTrigger, Message,
+    ProviderEvent, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools, VerificationOutcome,
+    VerifyRun,
 };
 use crate::session::{
     SessionLog, estimate_tokens, message_token_estimate, preview_line, read_span,
@@ -85,6 +86,51 @@ const MICRO_FOLD_KEEP_TOKENS: u64 = 2_000;
 /// total at or above which a fold batch runs. Always strictly below `budget`.
 fn micro_watermark(budget: u64) -> u64 {
     budget.saturating_mul(MICRO_WATERMARK_NUM) / MICRO_WATERMARK_DEN
+}
+
+/// Provider-neutral prompt-cache economics the fold scheduler consumes
+/// (issue #400, design §4.3). The harness never sees provider names: Tier 3
+/// resolves the active selection to one of these profiles (the table lives in
+/// mimir beside the selection) and installs it here. The [`Default`] profile
+/// is the safe unknown: no cold threshold (inferred-cold triggers off), no
+/// read discount, no minimum (the below-minimum trigger never fires) -- break
+/// events remain valid triggers and the watermark backstop is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CacheProfile {
+    /// Idle duration after which the prefix is guaranteed cold, when the
+    /// provider documents one. `None` = unknown/no caching: cold-based
+    /// triggers stay off.
+    pub(crate) cold_after: Option<std::time::Duration>,
+    /// Optional earlier, probabilistic cold threshold (documented typical
+    /// eviction). Reserved for an operator-opt-in aggressive timing mode;
+    /// not consumed by the scheduler yet.
+    #[allow(dead_code)]
+    pub(crate) probably_cold_after: Option<std::time::Duration>,
+    /// Cache-write premium over base input (1.0 = writes bill at base rate).
+    /// Report/benchmark economics input; not a scheduling input.
+    pub(crate) write_premium: f64,
+    /// Cached-read rate vs base input. Report/benchmark economics input.
+    pub(crate) read_rate: f64,
+    /// Whether the provider reports the write side of cache usage
+    /// (calibration quality, Phase 3). Not consumed by the scheduler yet.
+    #[allow(dead_code)]
+    pub(crate) reports_writes: bool,
+    /// Minimum cacheable prefix in tokens; below it nothing is cached, so
+    /// every flush is free (trigger class A5).
+    pub(crate) min_cacheable_tokens: u64,
+}
+
+impl Default for CacheProfile {
+    fn default() -> Self {
+        Self {
+            cold_after: None,
+            probably_cold_after: None,
+            write_premium: 1.0,
+            read_rate: 1.0,
+            reports_writes: false,
+            min_cacheable_tokens: 0,
+        }
+    }
 }
 
 /// Instruction appended after the carried context for the provider-backed
@@ -172,6 +218,25 @@ pub(crate) struct Harness<P> {
     // installs the configured value. Gates fold WRITING only -- rebuild always
     // honors persisted fold entries regardless of this flag.
     microcompaction: bool,
+    // Prompt-cache economics of the active provider lane (issue #400),
+    // installed by Tier 3 from the resolved selection. Default = safe unknown.
+    cache_profile: CacheProfile,
+    // A prefix-cache break pending for the NEXT request (issue #400 Class A):
+    // set when the recorded selection changes (A2/A3), consumed at the next
+    // fold boundary whether or not anything flushes -- the request that
+    // follows re-establishes the cache, so a stale flag would mislabel a
+    // warm flush as free.
+    pending_break: Option<FoldTrigger>,
+    // The last selection identity recorded (provider, model, reasoning),
+    // stored opaquely for change classification only -- the harness never
+    // interprets the strings. Seeded at startup by Tier 3; updated by
+    // `record_selection_event`.
+    last_selection: Option<(String, String, Option<String>)>,
+    // Last transcript activity (unix ms) at resume/swap time, consumed at the
+    // FIRST fold boundary after the resume: an idle gap past the profile's
+    // cold threshold means the cache is expired and pending folds are free
+    // (trigger class A4).
+    resume_last_activity_ms: Option<u64>,
 }
 
 /// A chosen compaction: the half-open index range `[start, end)` of covered
@@ -241,6 +306,11 @@ impl<P: ChatProvider> Harness<P> {
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
         let git_safety = git_safety::GitSafety::new(&workspace);
+        // Prior activity of a resumed transcript (issue #400 trigger A4);
+        // `None` for a freshly created log or an in-memory session.
+        let resume_last_activity_ms = session
+            .as_ref()
+            .and_then(SessionLog::resumed_last_activity_ms);
         // Stamp the current session id onto the guard up front (ADR-0031), so a
         // task adopted during startup recovery (before the first turn) records
         // this session in its opaque `sessions` join.
@@ -261,6 +331,12 @@ impl<P: ChatProvider> Harness<P> {
             verify: None,
             summarizer: SummarizerKind::default(),
             microcompaction: false,
+            cache_profile: CacheProfile::default(),
+            pending_break: None,
+            last_selection: None,
+            // A freshly created log has no prior activity; a resumed log
+            // carries its highest entry timestamp for the A4 cold check.
+            resume_last_activity_ms,
         }
     }
 
@@ -285,6 +361,31 @@ impl<P: ChatProvider> Harness<P> {
     /// so a `/settings` toggle applies to the following turn, not the current one.
     pub(crate) fn set_microcompaction(&mut self, enabled: bool) {
         self.microcompaction = enabled;
+    }
+
+    /// Install the prompt-cache profile of the active provider lane (issue
+    /// #400). Tier 3 resolves the selection to a [`CacheProfile`] (the table
+    /// lives in mimir) and installs it at startup and on every runtime switch;
+    /// the harness consumes only the profile fields, never provider names.
+    pub(crate) fn set_cache_profile(&mut self, profile: CacheProfile) {
+        self.cache_profile = profile;
+    }
+
+    /// Seed the selection identity the fold scheduler compares against
+    /// (issue #400, triggers A2/A3), without recording an audit entry or
+    /// arming a trigger. Called once at startup by Tier 3 so the first
+    /// runtime switch is classified against the real starting selection.
+    pub(crate) fn note_active_selection(
+        &mut self,
+        provider: &str,
+        model: &str,
+        reasoning: Option<&str>,
+    ) {
+        self.last_selection = Some((
+            provider.to_string(),
+            model.to_string(),
+            reasoning.map(str::to_string),
+        ));
     }
 
     /// Install the mid-run steering/follow-up source (the Tier-3 app's typed
@@ -359,6 +460,12 @@ impl<P: ChatProvider> Harness<P> {
         self.output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
+        // A swapped-in resumed log carries its prior activity for the A4
+        // cold-resume fold trigger (issue #400); `/new` swaps in a fresh log
+        // (or none), which has none.
+        self.resume_last_activity_ms = session
+            .as_ref()
+            .and_then(SessionLog::resumed_last_activity_ms);
         self.session = session;
         self.persisted = resumed;
         // Carry the resumed messages' durable ids (parallel to `messages`, #375)
@@ -546,6 +653,24 @@ impl<P: ChatProvider> Harness<P> {
         model: &str,
         reasoning: Option<&str>,
     ) -> Result<()> {
+        // Classify the switch for the fold scheduler (issue #400): a
+        // provider/model change is a full prefix-cache break (A2); a
+        // reasoning-only change breaks at the message level, which still
+        // covers folds (A3). The comparison is opaque string equality --
+        // the harness never interprets provider names. With no seeded
+        // selection the switch is conservatively a full break: mislabeling
+        // costs at most one warm flush. An identical re-selection changes
+        // no request bytes and arms nothing.
+        let armed = match &self.last_selection {
+            Some((p, m, _)) if p != provider || m != model => Some(FoldTrigger::SelectionSwitch),
+            Some((_, _, r)) if r.as_deref() != reasoning => Some(FoldTrigger::ReasoningSwitch),
+            Some(_) => None,
+            None => Some(FoldTrigger::SelectionSwitch),
+        };
+        if armed.is_some() {
+            self.pending_break = armed;
+        }
+        self.note_active_selection(provider, model, reasoning);
         let Some(log) = self.session.as_mut() else {
             return Ok(());
         };
@@ -599,7 +724,7 @@ impl<P: ChatProvider> Harness<P> {
         // first so reclaimed mass can defer a full compaction. The prior turn's
         // transcript is complete here (every tool call answered), so neither the
         // fold pass nor the covered range splits a pending tool-call/result pair.
-        self.maybe_microcompact()?;
+        self.maybe_microcompact(obs)?;
         self.maybe_auto_compact(obs, token).await?;
         // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
         // the current session id to the guard before the turn. The guard stamps
@@ -823,79 +948,211 @@ impl<P: ChatProvider> Harness<P> {
     /// boundary: append a `compaction` entry covering an older message range and
     /// replace the in-memory context with `summary + retained tail`, so the
     /// next provider request uses the summary instead of the covered messages.
-    /// No-op when auto-compaction is disabled, no log is attached, the context
-    /// is within budget, nothing coverable remains, or the summary request was
-    /// cancelled (the turn's own cancellation handling takes over).
-    /// Opt-in microcompaction fold pass (ADR-0048, #378), run at the safe turn
-    /// boundary before the provider request. When enabled and the context has
-    /// reached the micro-watermark (below the compaction budget), fold every
-    /// spent tool result the V1 policy detects (superseded reads, latest-read-
-    /// wins) to a deterministic stub: append a durable `fold` entry AND rewrite
-    /// the in-memory result content, so live and resumed context agree. Returns
-    /// the number of folds applied (0 = disabled, below the watermark, no
-    /// durable session, or nothing spent).
+    /// Recompute the pending fold set (issue #400, design §4.1): the fold
+    /// plans the V1 policy detects over the current context, before the
+    /// protected tail. Pure derived state -- in-memory only, recomputed at
+    /// every turn boundary and on resume from the transcript alone (no new
+    /// persistence). Empty when microcompaction is off or no durable session
+    /// is attached (a fold has nowhere to be recorded), so detection is gated
+    /// exactly like flushing.
+    fn pending_folds(&self) -> Vec<fold::FoldPlan> {
+        if !self.microcompaction || self.session.is_none() {
+            return Vec::new();
+        }
+        let messages = self.agent.messages();
+        // Protect the recent tail: the fold engine never folds at or after this
+        // index (the model's immediate working set stays verbatim).
+        let tail_start = fold_tail_start(messages, MICRO_FOLD_KEEP_TOKENS);
+        fold::plan_folds(
+            messages,
+            &self.entry_ids,
+            tail_start,
+            &self.workspace,
+            fold::V1_POLICIES,
+        )
+    }
+
+    /// Detected-but-unflushed folds at the current boundary, for the context
+    /// accounting surface (`/context`) and hold-path tests (issue #400):
+    /// `(count, reclaimable token estimate)` -- the mass the pending stubs
+    /// would free (original bodies minus stubs). Derived state: recomputed,
+    /// never stored.
+    pub(crate) fn pending_fold_stats(&self) -> (usize, u64) {
+        let messages = self.agent.messages();
+        let plans = self.pending_folds();
+        let reclaimable = plans
+            .iter()
+            .map(|plan| {
+                estimate_tokens(&messages[plan.index].content)
+                    .saturating_sub(estimate_tokens(&plan.stub))
+            })
+            .fold(0u64, u64::saturating_add);
+        (plans.len(), reclaimable)
+    }
+
+    /// Detected-but-unflushed fold count (see [`Self::pending_fold_stats`]).
+    #[cfg(test)]
+    pub(crate) fn pending_fold_count(&self) -> usize {
+        self.pending_folds().len()
+    }
+
+    /// The trigger releasing a fold flush at this boundary, or `None` to hold
+    /// (issue #400, design §4.4). Holding is free: the pending set is derived
+    /// state. Priority order per the design: A1 (a compaction will fire at
+    /// this same boundary, so the prefix re-bills anyway), then the armed
+    /// break flags (A2/A3 selection, A4 cold resume), then A5 (below the
+    /// minimum cacheable prefix -- nothing cached yet), then the shipped
+    /// Class C watermark backstop (`budget/2`, unchanged behavior). The
+    /// break flags arrive pre-consumed by the caller: they are valid only
+    /// for the boundary immediately before the next request.
+    fn fold_trigger(
+        &self,
+        total: u64,
+        pending_break: Option<FoldTrigger>,
+        resume_activity_ms: Option<u64>,
+    ) -> Option<FoldTrigger> {
+        if let Some(budget) = self.budget
+            && total > budget
+        {
+            return Some(FoldTrigger::CompactionBoundary);
+        }
+        if pending_break.is_some() {
+            return pending_break;
+        }
+        // A4: resumed past the profile's cold threshold -- the prior process's
+        // last activity is old enough that the prefix cache is expired, so the
+        // first request re-bills everything regardless of folding.
+        if let (Some(last_ms), Some(cold_after)) =
+            (resume_activity_ms, self.cache_profile.cold_after)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if now.saturating_sub(last_ms) > cold_after.as_millis() as u64 {
+                return Some(FoldTrigger::ColdResume);
+            }
+        }
+        // A5: below the minimum cacheable prefix nothing is cached, so a fold
+        // breaks nothing (free in the session's opening turns).
+        if total < self.cache_profile.min_cacheable_tokens {
+            return Some(FoldTrigger::BelowMinCacheable);
+        }
+        // B (Phase 2): mid-session idle gap past the profile's cold threshold
+        // -- the transcript's last activity (live appends, falling back to the
+        // resume scan) is old enough that the prefix cache has expired, so the
+        // next request re-bills the suffix regardless. The threshold comes
+        // from the profile table (margins included there), never a hardcoded
+        // constant; a wrong inference costs one warm flush, bounded by the
+        // measured numbers.
+        if let (Some(last_ms), Some(cold_after)) = (
+            self.session.as_ref().and_then(SessionLog::last_activity_ms),
+            self.cache_profile.cold_after,
+        ) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if now.saturating_sub(last_ms) > cold_after.as_millis() as u64 {
+                return Some(FoldTrigger::InferredCold);
+            }
+        }
+        let budget = self.budget?;
+        if total >= micro_watermark(budget) {
+            return Some(FoldTrigger::Watermark);
+        }
+        None
+    }
+
+    /// Opt-in microcompaction fold pass (ADR-0048, #378, #400), run at the safe
+    /// turn boundary before the provider request. Detection and flushing are
+    /// split (design §4.1): the pending fold set is recomputed every boundary,
+    /// and flushes only when a trigger fires -- today the compaction boundary
+    /// (A1) or the micro-watermark backstop (C). Returns the number of folds
+    /// applied (0 = disabled, holding, no durable session, or nothing spent).
     ///
     /// The setting gates fold WRITING only; rebuild always honors persisted
     /// folds. No provider round-trip and no summary-quality risk: folding is
     /// deterministic and every folded result stays recoverable (the stub names
     /// the workspace-relative path; the original turn survives verbatim for the
     /// #373 recall tool).
-    fn maybe_microcompact(&mut self) -> Result<usize> {
-        if !self.microcompaction {
-            return Ok(0);
-        }
-        // A fold is a durable read-time view; without a log there is nowhere to
-        // record it, so skip rather than diverge live from resumed context.
-        if self.session.is_none() {
-            return Ok(0);
-        }
-        // Batch at the micro-watermark: no per-turn folding. Below the watermark
-        // the accumulated spent mass is not yet worth a prefix-cache break.
-        let Some(budget) = self.budget else {
-            return Ok(0);
-        };
-        let total = context_tokens(self.agent.messages());
-        if total < micro_watermark(budget) {
-            return Ok(0);
-        }
-
-        let messages = self.agent.messages().to_vec();
-        // Protect the recent tail: the fold engine never folds at or after this
-        // index (the model's immediate working set stays verbatim).
-        let tail_start = fold_tail_start(&messages, MICRO_FOLD_KEEP_TOKENS);
-        let plans = fold::plan_folds(
-            &messages,
-            &self.entry_ids,
-            tail_start,
-            &self.workspace,
-            fold::V1_POLICIES,
-        );
+    fn maybe_microcompact(&mut self, obs: &dyn AgentObserver) -> Result<usize> {
+        // Break flags are boundary-scoped: the request that follows this
+        // boundary re-establishes the cache, so consume them here whether or
+        // not anything flushes -- a stale flag would mislabel a later warm
+        // flush as free.
+        let pending_break = self.pending_break.take();
+        let resume_activity_ms = self.resume_last_activity_ms.take();
+        let plans = self.pending_folds();
         if plans.is_empty() {
             return Ok(0);
         }
+        let total = context_tokens(self.agent.messages());
+        let Some(trigger) = self.fold_trigger(total, pending_break, resume_activity_ms) else {
+            // Hold: folds are detected but the cache is presumed warm and no
+            // break is pending. The pending set is derived, so holding costs
+            // nothing and survives resume by recomputation.
+            return Ok(0);
+        };
+        self.flush_folds(&plans, trigger, obs)
+    }
 
-        // Apply each fold durably (a `fold` entry naming the target id) and in
-        // memory (rewrite the result content) in the same step. The folded
-        // message keeps its role/pairing and durable id, so the pair invariant
-        // holds and it stays coverable by a later compaction; `persisted` and
-        // `entry_ids` are unchanged (no message entry is added or removed).
+    /// Apply a batch of fold plans: durably (a `fold` entry naming the target
+    /// id, tagged with the trigger class) and in memory (rewrite the result
+    /// content) in the same step. The folded message keeps its role/pairing and
+    /// durable id, so the pair invariant holds and it stays coverable by a
+    /// later compaction; `persisted` and `entry_ids` are unchanged (no message
+    /// entry is added or removed). Emits one [`AgentEvent::FoldApplied`] per
+    /// batch carrying counts, the reclaimed-token estimate, and the trigger.
+    fn flush_folds(
+        &mut self,
+        plans: &[fold::FoldPlan],
+        trigger: FoldTrigger,
+        obs: &dyn AgentObserver,
+    ) -> Result<usize> {
         let log = self
             .session
             .as_mut()
-            .expect("microcompaction callers check the session first");
-        let mut folded = messages;
+            .expect("fold flush callers check the session first");
+        let mut folded = self.agent.messages().to_vec();
         let mut applied = 0usize;
-        for plan in &plans {
+        let mut reclaimed = 0u64;
+        for plan in plans {
             let stub_tokens = estimate_tokens(&plan.stub);
-            log.append_fold(&plan.entry_id, &plan.stub, Some(stub_tokens))?;
+            log.append_fold(
+                &plan.entry_id,
+                &plan.stub,
+                Some(stub_tokens),
+                trigger.code(),
+            )?;
+            reclaimed = reclaimed.saturating_add(
+                estimate_tokens(&folded[plan.index].content).saturating_sub(stub_tokens),
+            );
             folded[plan.index].content = plan.stub.clone();
             applied += 1;
         }
-        tracing::info!(folds = applied, "microcompacted spent tool results");
+        tracing::info!(
+            folds = applied,
+            reclaimed,
+            trigger = trigger.code(),
+            "microcompacted spent tool results"
+        );
         self.agent.replace_messages(folded);
+        obs.on_event(AgentEvent::FoldApplied {
+            folds: applied,
+            reclaimed_tokens_estimate: reclaimed,
+            trigger,
+        })?;
         Ok(applied)
     }
 
+    /// If the current context exceeds the budget, compact at this safe turn
+    /// boundary: append a `compaction` entry covering an older message range and
+    /// replace the in-memory context with `summary + retained tail`, so the
+    /// next provider request uses the summary instead of the covered messages.
+    /// No-op when auto-compaction is disabled, no log is attached, the context
+    /// is within budget, nothing coverable remains, or the summary request was
+    /// cancelled (the turn's own cancellation handling takes over).
     async fn maybe_auto_compact(
         &mut self,
         obs: &dyn AgentObserver,
@@ -954,6 +1211,15 @@ impl<P: ChatProvider> Harness<P> {
             return obs.on_event(AgentEvent::Notice(
                 "compaction needs a persisted session; this one is in-memory.".to_string(),
             ));
+        }
+        // A6 (issue #400): a manual compaction is a user-initiated prefix
+        // break -- the summary rewrite re-bills the suffix anyway, so pending
+        // folds ride it for free. Flush BEFORE planning, mirroring the
+        // fold-then-compact order of the automatic boundary, so the covered
+        // range compacts stubs instead of spent bodies.
+        let pending = self.pending_folds();
+        if !pending.is_empty() {
+            self.flush_folds(&pending, FoldTrigger::ManualCompact, obs)?;
         }
         let messages = self.agent.messages().to_vec();
         let Some(plan) = self.plan_compaction(&messages, MANUAL_COMPACT_KEEP_TOKENS) else {

@@ -45,9 +45,13 @@ const LIVE_SYSTEM_PROMPT: &str = "You are a coding assistant. Keep answers short
 const SUMMARY_INSTRUCTION_PREFIX: &str = "Summarize this coding session";
 
 /// One provider round-trip's realized usage, tagged summarization vs normal.
+/// `tag` is the first bytes of the request's LAST message content, so a run
+/// can select a specific turn's request by its prompt without relying on
+/// positional order (a spurious model tool-call would shift positions).
 #[derive(Clone)]
 struct CapturedUsage {
     is_summary: bool,
+    tag: String,
     usage: Option<ProviderUsage>,
 }
 
@@ -71,12 +75,17 @@ impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
         let is_summary = messages
             .last()
             .is_some_and(|m| m.content.starts_with(SUMMARY_INSTRUCTION_PREFIX));
+        let tag = messages
+            .last()
+            .map(|m| m.content.chars().take(32).collect::<String>())
+            .unwrap_or_default();
         let usages = self.usages.clone();
         let stream = self.inner.respond_stream(messages, tools, cancel)?;
         let mapped = stream.map(move |item| {
             if let Ok(ProviderEvent::Completed(turn)) = &item {
                 usages.lock().expect("usages lock").push(CapturedUsage {
                     is_summary,
+                    tag: tag.clone(),
                     usage: turn.usage.clone(),
                 });
             }
@@ -338,5 +347,512 @@ fn compaction_cache_economics_live_anthropic() {
             );
         }
         None => println!("first post-compaction request: no usage captured"),
+    }
+}
+
+// --- Fold-flush cost, realized (issue #400). ---
+
+/// The superseded-read path in the live fold seed (mirrors the modeled
+/// `FOLD_PATH` scenario in `compaction_bench.rs`).
+const LIVE_FOLD_PATH: &str = "crates/orbit/src/telemetry/buffer.rs";
+
+/// A successful ADR-0021 `read` result envelope, as the fold engine's
+/// `successful_target` expects (ok + `metadata.target`).
+fn live_read_result(call: &str, body: &str) -> Message {
+    Message::tool_result(
+        call,
+        "read",
+        &serde_json::json!({
+            "ok": true,
+            "content": body,
+            "metadata": { "target": LIVE_FOLD_PATH },
+        })
+        .to_string(),
+    )
+}
+
+/// An assistant `read` tool call for `LIVE_FOLD_PATH`. The Anthropic Messages
+/// API validates tool_use/tool_result pairing, so unlike the fake lane the
+/// live seed must carry the calls the results answer.
+fn live_read_call(id: &str) -> Message {
+    Message::assistant_tool_call(&ToolCall {
+        id: id.to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": LIVE_FOLD_PATH }),
+        thought_signature: None,
+    })
+}
+
+/// Fold-cost seed: an early needle-bearing `read` of `LIVE_FOLD_PATH` that a
+/// later, much larger read of the same path supersedes. The superseding read
+/// alone exceeds the 2000-token protected fold tail, so the earlier read sits
+/// before `fold_tail_start` and is foldable. Total ~2900 estimated tokens --
+/// comfortably above Anthropic's minimum cacheable prefix, so turn 1 writes a
+/// prefix turn 2 can realize reads against.
+fn fold_live_seed() -> Vec<Message> {
+    let fold_body = format!(
+        "LIVE-FOLD-DETAIL-4417 :: {}",
+        "spent buffer read detail for the reconciliation work. ".repeat(40)
+    );
+    let superseding = "current buffer contents after the ledger reconciliation pass. ".repeat(140);
+    vec![
+        Message::user("start: we are reconciling the ledger sink; read the buffer first."),
+        live_read_call("lf-1"),
+        live_read_result("lf-1", &fold_body),
+        Message::assistant("Noted the buffer contents."),
+        Message::user("the buffer changed; read it again before continuing"),
+        live_read_call("lf-2"),
+        live_read_result("lf-2", &superseding),
+        Message::assistant("Done; the latest buffer contents are loaded."),
+    ]
+}
+
+/// One live fold-cost run: seed, resume, drive two turns, return the captured
+/// usages, the fold count, and the seed estimate. `micro` toggles
+/// microcompaction; everything else is byte-identical between runs.
+fn run_fold_cost_live(
+    micro: bool,
+    warming_prompt: &str,
+    steady_prompt: &str,
+) -> Option<(Vec<CapturedUsage>, usize, u64)> {
+    let provider = match AnthropicProvider::new(
+        LIVE_MODEL,
+        "https://api.anthropic.com",
+        None,
+        LIVE_SYSTEM_PROMPT,
+        PromptCacheRetention::DEFAULT,
+        ContextManagement::default(),
+        RetryPolicy::default(),
+    ) {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: AnthropicProvider::new error: {error:#}");
+            return None;
+        }
+    };
+
+    let root = TempDir::new("fold-root");
+    let workspace = TempDir::new("fold-ws");
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
+    for message in fold_live_seed() {
+        log.append(&message).expect("append seed message");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list sessions")
+        .into_iter()
+        .find(|m| m.path == path)
+        .expect("seeded session is listed");
+    let stored = store.open(&meta).expect("open seeded session");
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path).expect("resume session log");
+
+    let usages = Arc::new(Mutex::new(Vec::new()));
+    let recording = RecordingProvider {
+        inner: provider,
+        usages: usages.clone(),
+    };
+    // The flush must land at the TURN-2 boundary so turn 1 warms the ORIGINAL
+    // (unfolded) prefix and turn 2's request shows the realized break. With
+    // budget = 2 * (seed + 150): the micro-watermark (budget/2 = seed + 150)
+    // sits ABOVE the bare seed (no flush at turn 1) and BELOW seed + turn-1
+    // exchange (flush at turn 2). Compaction never fires (total stays far
+    // under budget).
+    let seed_estimate = stored
+        .messages
+        .iter()
+        .map(|m| m.content.len())
+        .sum::<usize>() as u64
+        / 4;
+    let budget = 2 * (seed_estimate + 150);
+    let agent = Agent::resumed(recording, Tools::new(Vec::new()), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(budget),
+    );
+    harness.set_summarizer(SummarizerKind::Provider);
+    harness.set_microcompaction(micro);
+
+    let obs = NoopObserver;
+    let gate = NoToolGate;
+    let token = CancellationToken::new();
+    for prompt in [warming_prompt, steady_prompt] {
+        if let Err(error) = block_on(harness.submit_turn(prompt, &obs, &gate, &token)) {
+            eprintln!("LIVE RUN FAILED: submit_turn error: {error:#}");
+            return None;
+        }
+    }
+
+    let folds = super::compaction_bench::fold_count(&path);
+    let captured = usages.lock().expect("usages lock").clone();
+    Some((captured, folds, seed_estimate))
+}
+
+#[test]
+#[ignore = "live Anthropic API calls; set IRIS_BENCH_LIVE=1 to run"]
+fn fold_flush_cost_live_anthropic() {
+    if std::env::var("IRIS_BENCH_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("fold_flush_cost_live_anthropic: skipped (set IRIS_BENCH_LIVE=1 to run)");
+        return;
+    }
+    if !claude_code_credentials_available() {
+        eprintln!(
+            "LIVE RUN FAILED: no Claude Code credentials discovered \
+             (claude_code_credentials_available() == false); expected ~/.claude/.credentials.json"
+        );
+        return;
+    }
+
+    // Turn-1 prompt is large enough (~300 estimated tokens) to push the total
+    // past the micro-watermark; both prompts forbid tool use so the request
+    // stream stays two normal turns per run.
+    let warming_prompt = format!(
+        "Do not use any tools. Reply with one short sentence acknowledging the state. {}",
+        "The reconciliation status must be recorded before the next wiring step proceeds. "
+            .repeat(15)
+    );
+    let steady_prompt = "Do not use any tools. In one short sentence: is the buffer state current?";
+
+    let date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    println!("\n== LIVE fold-flush cost (Anthropic Claude Code OAuth) ==");
+    println!(
+        "lane: Anthropic Messages / Claude Code OAuth; model: {LIVE_MODEL}; unix_date: {date}"
+    );
+
+    let Some((ctrl, ctrl_folds, seed_est)) =
+        run_fold_cost_live(false, &warming_prompt, steady_prompt)
+    else {
+        return;
+    };
+    let Some((arm, arm_folds, _)) = run_fold_cost_live(true, &warming_prompt, steady_prompt) else {
+        return;
+    };
+    println!("seed estimate ~{seed_est} tokens; folds: control={ctrl_folds}, arm={arm_folds}");
+    if arm_folds == 0 {
+        println!(
+            "LIVE RUN INCONCLUSIVE: the arm wrote no fold (watermark not crossed at turn 2); \
+             no realized fold cost to report."
+        );
+        return;
+    }
+
+    // Select each run's turn-2 request by prompt tag, not position.
+    let steady_tag = |c: &CapturedUsage| c.tag.starts_with("Do not use any tools. In one sho");
+    let pick = |run: &[CapturedUsage]| -> Option<ProviderUsage> {
+        run.iter()
+            .find(|c| steady_tag(c))
+            .and_then(|c| c.usage.clone())
+    };
+    let report = |label: &str, u: &Option<ProviderUsage>| match u {
+        Some(u) => {
+            let (m5, h1) = u
+                .cache_creation
+                .as_ref()
+                .map(|c| (c.ephemeral_5m_input_tokens, c.ephemeral_1h_input_tokens))
+                .unwrap_or((0, 0));
+            println!(
+                "{label}: input_tokens={}, cache_read={}, cache_write={} (5m={m5}, 1h={h1})",
+                u.input_tokens, u.cache_read_input_tokens, u.cache_write_input_tokens,
+            );
+        }
+        None => println!("{label}: no usage captured"),
+    };
+    let ctrl_t2 = pick(&ctrl);
+    let arm_t2 = pick(&arm);
+    report("control turn-2 (no fold)", &ctrl_t2);
+    report("arm turn-2 (post-flush)  ", &arm_t2);
+    if let (Some(c), Some(a)) = (&ctrl_t2, &arm_t2) {
+        println!(
+            "realized marginal fold cost: cache_write {} - {} = {} tokens; \
+             cache_read drop: {} - {} = {} tokens",
+            a.cache_write_input_tokens,
+            c.cache_write_input_tokens,
+            a.cache_write_input_tokens as i64 - c.cache_write_input_tokens as i64,
+            c.cache_read_input_tokens,
+            a.cache_read_input_tokens,
+            c.cache_read_input_tokens as i64 - a.cache_read_input_tokens as i64,
+        );
+    }
+}
+
+// --- Phase 2 (issue #400 M5): inferred-cold (Class B) live pair. ---
+//
+// One run per lane, both double-gated. Each drives the SAME shape: turn 1
+// warms the prefix, a real idle wait past the provider TTL follows, and turn
+// 2 (whose boundary infers cold and flushes the pending fold when
+// microcompaction is on) captures the realized usage. Anthropic reports the
+// write side (realized write delta); the write-blind Codex lane reports the
+// read side (realized cached_tokens drop). Default idle: 390 s (past the
+// Anthropic 5 m tier and inside the documented OpenAI 5-10 min eviction
+// window); override with IRIS_BENCH_IDLE_SECS for a shorter smoke run -- the
+// actual wait is printed with the numbers either way.
+
+fn live_idle_wait() -> std::time::Duration {
+    let secs = std::env::var("IRIS_BENCH_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(390);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Drive one inferred-cold live run against `provider`: turn 1 warm, real
+/// idle wait, turn 2 post-gap. The cold threshold is set just below the wait
+/// so the Class-B trigger fires exactly at the turn-2 boundary when `micro`
+/// is on. Returns the captured usages and the fold count.
+fn run_inferred_cold_live<P: ChatProvider>(
+    provider: P,
+    micro: bool,
+    idle: std::time::Duration,
+) -> Option<(Vec<CapturedUsage>, usize)> {
+    let root = TempDir::new("cold-root");
+    let workspace = TempDir::new("cold-ws");
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
+    for message in fold_live_seed() {
+        log.append(&message).expect("append seed message");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list sessions")
+        .into_iter()
+        .find(|m| m.path == path)
+        .expect("seeded session is listed");
+    let stored = store.open(&meta).expect("open seeded session");
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path).expect("resume session log");
+
+    let usages = Arc::new(Mutex::new(Vec::new()));
+    let recording = RecordingProvider {
+        inner: provider,
+        usages: usages.clone(),
+    };
+    // Budget far above the running total: neither compaction nor the
+    // watermark can fire; only the inferred-cold trigger releases the fold.
+    let seed_estimate = stored
+        .messages
+        .iter()
+        .map(|m| m.content.len())
+        .sum::<usize>() as u64
+        / 4;
+    let budget = seed_estimate * 8;
+    let agent = Agent::resumed(recording, Tools::new(Vec::new()), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(budget),
+    );
+    harness.set_summarizer(SummarizerKind::Provider);
+    harness.set_microcompaction(micro);
+
+    let obs = NoopObserver;
+    let gate = NoToolGate;
+    let token = CancellationToken::new();
+    // Turn 1: warm the prefix (no cold threshold installed yet, and the
+    // resume-time A4 check sees a seconds-old transcript -> holds).
+    if let Err(error) = block_on(harness.submit_turn(
+        "Do not use any tools. Reply with one short sentence acknowledging the buffer state.",
+        &obs,
+        &gate,
+        &token,
+    )) {
+        eprintln!("LIVE RUN FAILED: submit_turn (warm) error: {error:#}");
+        return None;
+    }
+    // The real idle gap, with the profile threshold just inside it.
+    harness.set_cache_profile(crate::wayland::CacheProfile {
+        cold_after: Some(idle.saturating_sub(std::time::Duration::from_secs(10))),
+        ..Default::default()
+    });
+    std::thread::sleep(idle);
+    if let Err(error) = block_on(harness.submit_turn(
+        "Do not use any tools. In one short sentence: is the buffer state current?",
+        &obs,
+        &gate,
+        &token,
+    )) {
+        eprintln!("LIVE RUN FAILED: submit_turn (post-gap) error: {error:#}");
+        return None;
+    }
+
+    let folds = super::compaction_bench::fold_count(&path);
+    let captured = usages.lock().expect("usages lock").clone();
+    Some((captured, folds))
+}
+
+/// Post-gap (turn-2) usage: the request tagged with the steady prompt.
+fn post_gap_usage(run: &[CapturedUsage]) -> Option<ProviderUsage> {
+    run.iter()
+        .find(|c| c.tag.starts_with("Do not use any tools. In one sho"))
+        .and_then(|c| c.usage.clone())
+}
+
+#[test]
+#[ignore = "live Anthropic API calls with a real idle wait; set IRIS_BENCH_LIVE=1 to run"]
+fn inferred_cold_flush_live_anthropic() {
+    if std::env::var("IRIS_BENCH_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("inferred_cold_flush_live_anthropic: skipped (set IRIS_BENCH_LIVE=1 to run)");
+        return;
+    }
+    if !claude_code_credentials_available() {
+        eprintln!("LIVE RUN FAILED: no Claude Code credentials discovered");
+        return;
+    }
+    let idle = live_idle_wait();
+    let date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    println!("\n== LIVE inferred-cold flush (Anthropic Claude Code OAuth) ==");
+    println!(
+        "lane: Anthropic Messages / Claude Code OAuth; model: {LIVE_MODEL}; \
+         idle wait: {}s (5m-tier TTL is 300s); unix_date: {date}",
+        idle.as_secs()
+    );
+    let build = || {
+        AnthropicProvider::new(
+            LIVE_MODEL,
+            "https://api.anthropic.com",
+            None,
+            LIVE_SYSTEM_PROMPT,
+            PromptCacheRetention::DEFAULT,
+            ContextManagement::default(),
+            RetryPolicy::default(),
+        )
+    };
+    let control = match build() {
+        Ok(p) => run_inferred_cold_live(p, false, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: AnthropicProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let arm = match build() {
+        Ok(p) => run_inferred_cold_live(p, true, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: AnthropicProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let (Some((ctrl, ctrl_folds)), Some((arm, arm_folds))) = (control, arm) else {
+        return;
+    };
+    println!("folds: control={ctrl_folds}, arm={arm_folds}");
+    if arm_folds == 0 {
+        println!("LIVE RUN INCONCLUSIVE: the arm wrote no fold at the post-gap boundary.");
+        return;
+    }
+    let (ctrl_t2, arm_t2) = (post_gap_usage(&ctrl), post_gap_usage(&arm));
+    let report = |label: &str, u: &Option<ProviderUsage>| match u {
+        Some(u) => println!(
+            "{label}: input_tokens={}, cache_read={}, cache_write={}",
+            u.input_tokens, u.cache_read_input_tokens, u.cache_write_input_tokens
+        ),
+        None => println!("{label}: no usage captured"),
+    };
+    report("control post-gap (no fold)", &ctrl_t2);
+    report("arm post-gap (B flush)    ", &arm_t2);
+    if let (Some(c), Some(a)) = (&ctrl_t2, &arm_t2) {
+        println!(
+            "realized write delta (arm - control): {} tokens (past the TTL both re-write; \
+             <= 0 means the fold only shrank the cold re-write)",
+            a.cache_write_input_tokens as i64 - c.cache_write_input_tokens as i64
+        );
+    }
+}
+
+#[test]
+#[ignore = "live Codex API calls with a real idle wait; set IRIS_BENCH_LIVE=1 to run"]
+fn inferred_cold_flush_live_codex() {
+    if std::env::var("IRIS_BENCH_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("inferred_cold_flush_live_codex: skipped (set IRIS_BENCH_LIVE=1 to run)");
+        return;
+    }
+    let idle = live_idle_wait();
+    let date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    println!("\n== LIVE inferred-cold flush (OpenAI Codex Responses) ==");
+    println!(
+        "lane: Codex Responses (write-blind: cache_write is hardcoded 0; the read side is \
+         what this lane can measure); model: gpt-5.5; idle wait: {}s (documented in-memory \
+         eviction 5-10 min); unix_date: {date}",
+        idle.as_secs()
+    );
+    let build = |key: &str| {
+        crate::mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+            "gpt-5.5",
+            "https://chatgpt.com/backend-api",
+            None,
+            LIVE_SYSTEM_PROMPT,
+            key,
+            PromptCacheRetention::DEFAULT,
+            RetryPolicy::default(),
+        )
+    };
+    let control = match build("iris-bench-cold-ctrl") {
+        Ok(p) => run_inferred_cold_live(p, false, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: OpenAiCodexResponsesProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let arm = match build("iris-bench-cold-arm") {
+        Ok(p) => run_inferred_cold_live(p, true, idle),
+        Err(error) => {
+            eprintln!("LIVE RUN FAILED: OpenAiCodexResponsesProvider::new error: {error:#}");
+            return;
+        }
+    };
+    let (Some((ctrl, ctrl_folds)), Some((arm, arm_folds))) = (control, arm) else {
+        return;
+    };
+    println!("folds: control={ctrl_folds}, arm={arm_folds}");
+    if arm_folds == 0 {
+        println!("LIVE RUN INCONCLUSIVE: the arm wrote no fold at the post-gap boundary.");
+        return;
+    }
+    // The write-blind lane measures the read side: past the eviction window
+    // the post-gap request's cached_tokens collapse for BOTH runs (the drop
+    // is the gap's doing, not the fold's), and the fold costs nothing extra.
+    let warm = |run: &[CapturedUsage]| {
+        run.iter()
+            .find(|c| c.tag.starts_with("Do not use any tools. Reply with"))
+            .and_then(|c| c.usage.clone())
+    };
+    let report = |label: &str, u: &Option<ProviderUsage>| match u {
+        Some(u) => println!(
+            "{label}: input_tokens={}, cached_tokens(read)={}",
+            u.input_tokens, u.cache_read_input_tokens
+        ),
+        None => println!("{label}: no usage captured"),
+    };
+    report("control warm turn          ", &warm(&ctrl));
+    report("control post-gap (no fold) ", &post_gap_usage(&ctrl));
+    report("arm post-gap (B flush)     ", &post_gap_usage(&arm));
+    if let (Some(c), Some(a)) = (&post_gap_usage(&ctrl), &post_gap_usage(&arm)) {
+        println!(
+            "realized cached-read delta (control - arm): {} tokens; realized input delta \
+             (control - arm): {} tokens (the fold's residency saving on the cold re-bill)",
+            c.cache_read_input_tokens as i64 - a.cache_read_input_tokens as i64,
+            c.input_tokens as i64 - a.input_tokens as i64
+        );
     }
 }

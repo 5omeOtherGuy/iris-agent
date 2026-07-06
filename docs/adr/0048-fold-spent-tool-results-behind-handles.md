@@ -1,7 +1,7 @@
 # ADR-0048: Fold spent tool results behind handles (opt-in microcompaction)
 
 **Date**: 2026-07-04
-**Status**: accepted
+**Status**: accepted; flush *timing* extended by [ADR-0051](0051-cache-aware-fold-flush-scheduling.md) (cache-aware trigger classes; the watermark is now the Class C backstop)
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context
@@ -120,7 +120,12 @@ the bash `ToolOutputStore` handle it will carry.
 ### Negative
 - A new entry kind plus a precedence rule to hold in rebuild, tests, and future tooling.
 - Each fold batch is a one-time prefix cache break (bounded by batching at the
-  micro-watermark).
+  micro-watermark). Measured (`docs/benchmarks/issue-400-fold-flush-cost.md`): on a warm
+  cache a fold-only flush re-bills everything below the fold point (realized 2129
+  provider-reported write tokens on the live seed) against a per-turn saving of the folded
+  body -- break-even tens-to-hundreds of turns -- while the same fold at a compaction
+  boundary adds no marginal write and a cold cache makes the flush free. Cache-aware flush
+  timing that exploits this is #400.
 - Off by default, the benefit reaches only users who opt in until the benchmark justifies
   flipping the default.
 

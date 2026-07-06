@@ -397,7 +397,8 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             | UiEvent::ProviderTurnError { .. }
             | UiEvent::ToolLifecycle { .. }
             | UiEvent::OutputHandleStored { .. }
-            | UiEvent::CompactionApplied { .. } => {}
+            | UiEvent::CompactionApplied { .. }
+            | UiEvent::FoldApplied { .. } => {}
             UiEvent::SessionStarted => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;
@@ -478,10 +479,13 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 self.in_tool_block = false;
                 self.exploring_open = false;
             }
-            UiEvent::ToolStarted(_) | UiEvent::ToolOutputDelta { .. } => {
+            UiEvent::ToolStarted(_)
+            | UiEvent::ToolOutputDelta { .. }
+            | UiEvent::ToolInputDelta { .. } => {
                 // Non-interactive fallback: no live viewport, so a running tool
                 // stays buffered until its whole result arrives. Streaming
-                // deltas and the start signal render nothing here.
+                // deltas (output or freeform tool input) and the start signal
+                // render nothing here.
             }
             UiEvent::ToolResult {
                 call,

@@ -744,7 +744,7 @@ fn read_result(call: &str, target: &str, body: &str) -> Message {
 
 /// Count durable `fold` entries in a transcript (ADR-0048), so a seeded arm can
 /// report how many spent reads microcompaction folded.
-fn fold_count(path: &Path) -> usize {
+pub(super) fn fold_count(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .expect("read transcript")
         .lines()
@@ -843,6 +843,34 @@ fn run_seeded(
     echo: Vec<&'static str>,
     prompts: &[&str],
 ) -> SeededArm {
+    run_seeded_with(
+        seed,
+        budget,
+        micro,
+        summarizer,
+        echo,
+        prompts,
+        |_| {},
+        false,
+    )
+}
+
+/// [`run_seeded`] with two extra knobs for the cache-aware trigger arms
+/// (issue #400 M2): `prepare` runs against the resumed harness before any
+/// turn (install a cache profile, arm a selection switch), and
+/// `manual_compact` drives one `compact_now` (the `/compact` seam, trigger
+/// A6) before the driven prompts.
+#[allow(clippy::too_many_arguments)]
+fn run_seeded_with(
+    seed: &[Message],
+    budget: u64,
+    micro: bool,
+    summarizer: SummarizerKind,
+    echo: Vec<&'static str>,
+    prompts: &[&str],
+    prepare: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+    manual_compact: bool,
+) -> SeededArm {
     let root = TempDir::new();
     let workspace = TempDir::new();
     let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
@@ -882,10 +910,14 @@ fn run_seeded(
     );
     harness.set_summarizer(summarizer);
     harness.set_microcompaction(micro);
+    prepare(&mut harness);
 
     let counter = CompactionCounter::new();
     let gate = NoToolGate;
     let token = CancellationToken::new();
+    if manual_compact {
+        block_on(harness.compact_now(&counter, &token)).expect("manual compaction succeeds");
+    }
     for prompt in prompts {
         block_on(harness.submit_turn(prompt, &counter, &gate, &token)).expect("turn succeeds");
     }
@@ -1488,5 +1520,680 @@ fn compaction_slice_b_benchmark_report() {
          input_tokens - cached_tokens on the first post-compaction request vs the pre-compaction \
          baseline. The modeled divergent-suffix mass is the deterministic stand-in for that derived \
          amplification."
+    );
+}
+
+// --- Fold-flush cost (issue #400): what a fold-ONLY prefix break pays. ---
+//
+// The slice-B microcompaction arm folds inside a range compaction covers in
+// the same boundary, so the fold's own cache break is masked by the
+// compaction's. These arms isolate it: a budget high enough that compaction
+// NEVER fires, so the micro-watermark flush is the only transcript rewrite,
+// and its price and payback are measured alone.
+
+/// Stated Anthropic 5-minute-tier pricing ratios, used ONLY to illustrate the
+/// warm-cache break-even horizon in the report: cache writes bill at 1.25x
+/// base input, cache reads at 0.10x. Published-pricing assumptions, not
+/// measurements; every token mass they multiply is modeled.
+const PRICE_WRITE_5M: f64 = 1.25;
+const PRICE_READ: f64 = 0.10;
+
+/// `(read, write)` est-token split of one request payload against its
+/// predecessor: the char-exact shared prefix models the cache-READ mass, the
+/// divergent suffix the cache-WRITE mass. Boundary-free counterpart of
+/// `model_cache_economics` for runs with no summarization request.
+fn diff_payloads(pre: &str, post: &str) -> (usize, usize) {
+    let split = common_prefix_bytes(pre, post);
+    (est_tokens(&post[..split]), est_tokens(&post[split..]))
+}
+
+/// Budget for a fold-ONLY run over `seed`: at 1.5x the seed estimate the
+/// micro-watermark (budget/2 = 0.75x seed) sits below the seed, so the fold
+/// pass flushes at the very first turn boundary, while the budget stays above
+/// the running total so compaction never fires.
+fn fold_only_budget(seed: &[Message]) -> u64 {
+    let est: u64 = seed.iter().map(|m| est_tokens(&m.content) as u64).sum();
+    est + est / 2
+}
+
+/// A fold-only arm (`micro` on) or its byte-identical control (`micro` off):
+/// the carry seed under a compaction-proof budget, driven two turns so turn 1
+/// carries the flush boundary and turn 2 measures the steady-state request.
+fn run_fold_only(micro: bool) -> SeededArm {
+    let seed = carry_seed();
+    let budget = fold_only_budget(&seed);
+    run_seeded(
+        &seed,
+        budget,
+        micro,
+        SummarizerKind::Provider,
+        Vec::new(),
+        &[
+            "continue: proceed with the next small wiring step.",
+            "then: confirm the buffer state briefly.",
+        ],
+    )
+}
+
+#[test]
+fn fold_only_flush_folds_without_compacting() {
+    // Integrity gate for the isolation: the arm folds exactly the superseded
+    // read and neither run ever compacts or calls the summarizer, so every
+    // byte of divergence measured below is the fold flush and nothing else.
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    assert_eq!(arm.folds, 1, "arm must fold exactly the superseded read");
+    assert!(arm.records.is_empty(), "arm must not compact");
+    assert_eq!(arm.summary_calls, 0, "arm must not call the summarizer");
+    assert_eq!(control.folds, 0, "control must not fold");
+    assert!(control.records.is_empty(), "control must not compact");
+    assert_eq!(arm.requests.len(), 2, "one request per driven turn");
+    assert_eq!(control.requests.len(), 2, "one request per driven turn");
+    assert!(arm.requests.iter().all(|r| !r.is_summary));
+}
+
+#[test]
+fn modeled_marginal_cost_of_a_fold_only_flush() {
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    // Turn 1 carries the flush boundary. Same seed baseline, same prompt: the
+    // only difference between the two turn-1 payloads is the fold stub
+    // replacing the superseded read mid-transcript.
+    let (read_arm, write_arm) = diff_payloads(&arm.seed_baseline, &arm.requests[0].payload);
+    let (read_ctrl, write_ctrl) =
+        diff_payloads(&control.seed_baseline, &control.requests[0].payload);
+    // Control is append-only: its divergent suffix is just the new user turn.
+    assert!(
+        write_ctrl < 100,
+        "control turn-1 divergence must be the appended prompt only, got {write_ctrl}"
+    );
+    // The flush breaks the prefix at the folded read; everything after it
+    // re-bills. The ~4400-token superseding read sits after the fold point, so
+    // the marginal write dwarfs the fold's own saving.
+    let marginal = write_arm.saturating_sub(write_ctrl);
+    assert!(
+        marginal >= 1_000,
+        "fold-only flush must re-bill the suffix below the fold point \
+         (expected >= 1000 modeled write tokens, got {marginal})"
+    );
+    assert!(
+        read_arm < read_ctrl,
+        "the arm's shared prefix must shrink to the fold point \
+         (arm READ {read_arm} vs control READ {read_ctrl})"
+    );
+}
+
+#[test]
+fn fold_only_flush_shrinks_every_subsequent_request() {
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    // Steady state (turn 2): the arm's request is smaller by the folded body
+    // minus the stub, on this and every subsequent request.
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    let saving = ctrl_t2.saturating_sub(arm_t2);
+    assert!(
+        saving >= 100,
+        "fold must shrink the steady-state request by at least the folded body \
+         minus the stub, got {saving}"
+    );
+    // The stub (the recovery affordance) survives verbatim in steady state.
+    assert_survives_verbatim(
+        "fold-only steady state",
+        &arm.requests[1].payload,
+        &["[folded]", FOLD_PATH],
+    );
+    // And the break is ONE-TIME: after the flush the arm is append-only again.
+    let (_, arm_t1_to_t2_write) = diff_payloads(&arm.requests[0].payload, &arm.requests[1].payload);
+    assert!(
+        arm_t1_to_t2_write < 100,
+        "post-flush turns must be append-only (divergence {arm_t1_to_t2_write})"
+    );
+}
+
+#[test]
+fn same_boundary_fold_flush_adds_no_marginal_write() {
+    // Piggyback case (#400 trigger 1): when the flush lands on the same
+    // boundary as a compaction, the compaction rewrites the prefix anyway, so
+    // the fold adds no marginal cache-WRITE -- it can only shrink the rewrite.
+    let carry = run_carry_arm();
+    let micro = run_carry_micro_arm();
+    let carry_gen = model_cache_economics(&carry.requests, Some(&carry.seed_baseline));
+    let micro_gen = model_cache_economics(&micro.requests, Some(&micro.seed_baseline));
+    let c = carry_gen.first().expect("carry arm generation 1");
+    let m = micro_gen.first().expect("micro arm generation 1");
+    assert!(
+        m.write_tokens <= c.write_tokens,
+        "same-boundary fold must not increase the post-compaction write \
+         (micro {} > carry-only {})",
+        m.write_tokens,
+        c.write_tokens
+    );
+}
+
+/// Prints the fold-flush cost tables for
+/// `docs/benchmarks/issue-400-fold-flush-cost.md`. Regenerate with:
+/// `cargo test fold_flush_cost_benchmark_report -- --nocapture`
+#[test]
+fn fold_flush_cost_benchmark_report() {
+    let arm = run_fold_only(true);
+    let control = run_fold_only(false);
+    let (read_arm, write_arm) = diff_payloads(&arm.seed_baseline, &arm.requests[0].payload);
+    let (read_ctrl, write_ctrl) =
+        diff_payloads(&control.seed_baseline, &control.requests[0].payload);
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    let marginal = write_arm.saturating_sub(write_ctrl);
+    let saving = ctrl_t2.saturating_sub(arm_t2);
+
+    println!("\n== Fold-ONLY flush at the micro-watermark -- {MODELED_LABEL} ==");
+    println!("| run | turn-1 cache-READ | turn-1 cache-WRITE | turn-2 request tok | folds |");
+    println!("|---|---|---|---|---|");
+    println!(
+        "| control (micro off) | {read_ctrl} | {write_ctrl} | {ctrl_t2} | {} |",
+        control.folds
+    );
+    println!(
+        "| fold-only arm (micro on) | {read_arm} | {write_arm} | {arm_t2} | {} |",
+        arm.folds
+    );
+    println!("\nmarginal flush cost (arm - control turn-1 WRITE): {marginal} modeled tokens");
+    println!("steady-state saving per subsequent request: {saving} modeled tokens");
+    let breakeven =
+        (marginal as f64 * (PRICE_WRITE_5M - PRICE_READ)) / (saving as f64 * PRICE_READ);
+    println!(
+        "WARM-cache break-even under stated Anthropic 5m pricing ratios \
+         (write {PRICE_WRITE_5M}x, read {PRICE_READ}x base input): ~{:.0} turns",
+        breakeven.ceil()
+    );
+    println!(
+        "COLD-cache case (idle past TTL, cold resume): the suffix re-bills regardless, so the \
+         flush is free and the saving is immediate (#400 trigger 3)."
+    );
+
+    println!("\n== Same-boundary flush (piggyback on compaction, #400 trigger 1) ==");
+    let carry = run_carry_arm();
+    let micro = run_carry_micro_arm();
+    let carry_gen = model_cache_economics(&carry.requests, Some(&carry.seed_baseline));
+    let micro_gen = model_cache_economics(&micro.requests, Some(&micro.seed_baseline));
+    println!("| arm | generation-1 post req tok | cache-WRITE (divergent suffix) |");
+    println!("|---|---|---|");
+    if let Some(c) = carry_gen.first() {
+        println!(
+            "| provider+carry (no folds) | {} | {} |",
+            c.post_tokens, c.write_tokens
+        );
+    }
+    if let Some(m) = micro_gen.first() {
+        println!(
+            "| provider+carry+microcompaction | {} | {} |",
+            m.post_tokens, m.write_tokens
+        );
+    }
+    println!(
+        "\nSame boundary as a compaction, the fold's marginal cache-WRITE is zero or negative: \
+         the compaction rewrites the prefix anyway and the fold only shrinks the rewrite."
+    );
+}
+
+// ===========================================================================
+// Cache-aware trigger arms (issue #400 M2): each Class A trigger's flush is
+// measured against its own control on the same deterministic fake-provider
+// lane. The claim per arm is "marginal cache-WRITE ~ 0": under a full break
+// (A2 model switch), an expired cache (A4 cold resume), or an uncacheable
+// prefix (A5 below the minimum), the request mass re-bills (or was never
+// cached) regardless of folding -- the fold can only SHRINK what is billed.
+// A6 rides a manual compaction exactly like A1 rides an automatic one.
+// ===========================================================================
+
+/// A compaction-proof budget: the watermark (budget/2 = 2x seed) stays above
+/// the running total, so neither compaction (A1) nor the watermark backstop
+/// (C) can fire and the arm's flush is attributable to its trigger alone.
+fn break_arm_budget(seed: &[Message]) -> u64 {
+    let est: u64 = seed.iter().map(|m| est_tokens(&m.content) as u64).sum();
+    est.saturating_mul(4)
+}
+
+/// One Class-A break arm over the carry seed: `prepare` arms the trigger on
+/// the resumed harness, two driven turns measure the flush boundary (turn 1)
+/// and the steady state (turn 2).
+fn run_break_arm(
+    micro: bool,
+    prepare: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+) -> SeededArm {
+    let seed = carry_seed();
+    let budget = break_arm_budget(&seed);
+    run_seeded_with(
+        &seed,
+        budget,
+        micro,
+        SummarizerKind::Provider,
+        Vec::new(),
+        &[
+            "continue: proceed with the next small wiring step.",
+            "then: confirm the buffer state briefly.",
+        ],
+        prepare,
+        false,
+    )
+}
+
+/// `(arm, control, transcript fold tags)` for one break trigger: the arm and
+/// control differ ONLY in the microcompaction flag; both receive the same
+/// `prepare` so the break itself is identical.
+fn break_pair(
+    prepare_arm: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+    prepare_ctrl: impl FnOnce(&mut Harness<CompactionFakeProvider>),
+) -> (SeededArm, SeededArm) {
+    (
+        run_break_arm(true, prepare_arm),
+        run_break_arm(false, prepare_ctrl),
+    )
+}
+
+/// Assert one break arm's economics: the flush happened (tagged as expected),
+/// nothing compacted, and under the break's re-bill the folded turn-1 payload
+/// is no larger than the control's -- marginal modeled write <= 0 -- while the
+/// steady state (turn 2) is strictly smaller.
+fn assert_break_arm_is_free(tag: &str, arm: &SeededArm, control: &SeededArm) {
+    assert_eq!(arm.folds, 1, "{tag}: the arm folds the superseded read");
+    assert_eq!(control.folds, 0, "{tag}: the control must not fold");
+    assert!(arm.records.is_empty(), "{tag}: the arm must not compact");
+    assert!(
+        control.records.is_empty(),
+        "{tag}: the control must not compact"
+    );
+    // Under the break, the entire request re-bills (or was never cached)
+    // either way: the write mass IS the payload, and the fold only shrinks it.
+    let arm_t1 = est_tokens(&arm.requests[0].payload);
+    let ctrl_t1 = est_tokens(&control.requests[0].payload);
+    assert!(
+        arm_t1 <= ctrl_t1,
+        "{tag}: folded break payload must not exceed the control's \
+         (arm {arm_t1} vs control {ctrl_t1})"
+    );
+    // Steady state keeps the full per-turn saving.
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    assert!(
+        arm_t2 < ctrl_t2,
+        "{tag}: steady-state request must shrink (arm {arm_t2} vs control {ctrl_t2})"
+    );
+}
+
+#[test]
+fn selection_switch_flush_is_free_a2() {
+    // A2: caches are model-scoped, so a model switch re-bills the whole
+    // request with or without the fold.
+    let arm_prepare = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", None);
+        h.record_selection_event("prov-a", "model-b", None)
+            .expect("selection event records");
+    };
+    let ctrl_prepare = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", None);
+        h.record_selection_event("prov-a", "model-b", None)
+            .expect("selection event records");
+    };
+    let (arm, control) = break_pair(arm_prepare, ctrl_prepare);
+    assert_break_arm_is_free("A2", &arm, &control);
+}
+
+#[test]
+fn reasoning_switch_flush_is_free_a3() {
+    // A3: a reasoning change breaks at the message level; folds live in
+    // messages, so the fold's rewrite is covered by the same break.
+    let prepare = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", Some("medium"));
+        h.record_selection_event("prov-a", "model-a", Some("high"))
+            .expect("selection event records");
+    };
+    let prepare_ctrl = |h: &mut Harness<CompactionFakeProvider>| {
+        h.note_active_selection("prov-a", "model-a", Some("medium"));
+        h.record_selection_event("prov-a", "model-a", Some("high"))
+            .expect("selection event records");
+    };
+    let (arm, control) = break_pair(prepare, prepare_ctrl);
+    assert_break_arm_is_free("A3", &arm, &control);
+}
+
+#[test]
+fn cold_resume_flush_is_free_a4() {
+    // A4: the resumed transcript's last activity sits past the profile's
+    // cold threshold, so the cache is expired and the first request re-bills
+    // everything regardless. A tiny threshold plus a real wait keeps the arm
+    // deterministic without fabricating timestamps.
+    let cold = |h: &mut Harness<CompactionFakeProvider>| {
+        h.set_cache_profile(crate::wayland::CacheProfile {
+            cold_after: Some(std::time::Duration::from_millis(10)),
+            ..Default::default()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let (arm, control) = break_pair(cold, cold);
+    assert_break_arm_is_free("A4", &arm, &control);
+}
+
+#[test]
+fn below_minimum_prefix_flush_is_free_a5() {
+    // A5: a prefix below the provider's minimum cacheable length is never
+    // cached, so there is no cache to break -- the flush is free by
+    // construction (marginal write 0) and the steady state still shrinks.
+    let below_min = |h: &mut Harness<CompactionFakeProvider>| {
+        h.set_cache_profile(crate::wayland::CacheProfile {
+            min_cacheable_tokens: u64::MAX,
+            ..Default::default()
+        });
+    };
+    let (arm, control) = break_pair(below_min, below_min);
+    assert_break_arm_is_free("A5", &arm, &control);
+}
+
+#[test]
+fn manual_compact_flush_rides_the_compaction_a6() {
+    // A6 mirrors A1: the manual compaction rewrites the prefix anyway, so the
+    // fold adds no marginal write -- it can only shrink the rewrite. Driven
+    // through the production `/compact` seam (`compact_now`).
+    let run = |micro: bool| {
+        let seed = carry_seed();
+        let budget = break_arm_budget(&seed);
+        run_seeded_with(
+            &seed,
+            budget,
+            micro,
+            SummarizerKind::Provider,
+            Vec::new(),
+            &["continue: proceed with the next small wiring step."],
+            |_| {},
+            true,
+        )
+    };
+    let arm = run(true);
+    let control = run(false);
+    assert_eq!(
+        arm.folds, 1,
+        "A6: the pending fold rides the manual compact"
+    );
+    assert_eq!(arm.records.len(), 1, "A6: the manual compaction applied");
+    assert_eq!(control.records.len(), 1);
+    let arm_gen = model_cache_economics(&arm.requests, Some(&arm.seed_baseline));
+    let ctrl_gen = model_cache_economics(&control.requests, Some(&control.seed_baseline));
+    let a = arm_gen.first().expect("arm generation 1");
+    let c = ctrl_gen.first().expect("control generation 1");
+    assert!(
+        a.write_tokens <= c.write_tokens,
+        "A6: folding must not increase the post-compaction write \
+         (arm {} vs control {})",
+        a.write_tokens,
+        c.write_tokens
+    );
+}
+
+/// Prints the per-trigger flush-cost table appended to
+/// `docs/benchmarks/issue-400-fold-flush-cost.md`. Regenerate with:
+/// `cargo test trigger_class_flush_cost_benchmark_report -- --nocapture`
+#[test]
+fn trigger_class_flush_cost_benchmark_report() {
+    struct Row {
+        tag: &'static str,
+        arm: SeededArm,
+        control: SeededArm,
+    }
+    let mut rows = Vec::new();
+    {
+        let prepare = |h: &mut Harness<CompactionFakeProvider>| {
+            h.note_active_selection("prov-a", "model-a", None);
+            h.record_selection_event("prov-a", "model-b", None).unwrap();
+        };
+        let arm = run_break_arm(true, prepare);
+        let control = run_break_arm(false, |h| {
+            h.note_active_selection("prov-a", "model-a", None);
+            h.record_selection_event("prov-a", "model-b", None).unwrap();
+        });
+        rows.push(Row {
+            tag: "A2 model switch",
+            arm,
+            control,
+        });
+    }
+    {
+        let arm = run_break_arm(true, |h| {
+            h.note_active_selection("p", "m", Some("medium"));
+            h.record_selection_event("p", "m", Some("high")).unwrap();
+        });
+        let control = run_break_arm(false, |h| {
+            h.note_active_selection("p", "m", Some("medium"));
+            h.record_selection_event("p", "m", Some("high")).unwrap();
+        });
+        rows.push(Row {
+            tag: "A3 reasoning switch",
+            arm,
+            control,
+        });
+    }
+    {
+        let cold = |h: &mut Harness<CompactionFakeProvider>| {
+            h.set_cache_profile(crate::wayland::CacheProfile {
+                cold_after: Some(std::time::Duration::from_millis(10)),
+                ..Default::default()
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        rows.push(Row {
+            tag: "A4 cold resume",
+            arm: run_break_arm(true, cold),
+            control: run_break_arm(false, cold),
+        });
+    }
+    {
+        let below = |h: &mut Harness<CompactionFakeProvider>| {
+            h.set_cache_profile(crate::wayland::CacheProfile {
+                min_cacheable_tokens: u64::MAX,
+                ..Default::default()
+            });
+        };
+        rows.push(Row {
+            tag: "A5 below minimum",
+            arm: run_break_arm(true, below),
+            control: run_break_arm(false, below),
+        });
+    }
+
+    println!("\n== Class-A break-trigger flushes -- {MODELED_LABEL} ==");
+    println!(
+        "| trigger | arm t1 payload | control t1 payload | marginal write | t2 arm | t2 control | steady saving |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    for row in &rows {
+        let arm_t1 = est_tokens(&row.arm.requests[0].payload);
+        let ctrl_t1 = est_tokens(&row.control.requests[0].payload);
+        let arm_t2 = est_tokens(&row.arm.requests[1].payload);
+        let ctrl_t2 = est_tokens(&row.control.requests[1].payload);
+        println!(
+            "| {} | {arm_t1} | {ctrl_t1} | {} | {arm_t2} | {ctrl_t2} | {} |",
+            row.tag,
+            arm_t1 as i64 - ctrl_t1 as i64,
+            ctrl_t2.saturating_sub(arm_t2),
+        );
+    }
+    println!(
+        "\nUnder each break the request mass re-bills (A2/A3: model/params scoped cache; A4: \
+         expired TTL) or was never cached (A5: below the minimum cacheable prefix), with or \
+         without the fold. The negative marginal is the fold's own shrink riding the break."
+    );
+    println!(
+        "A6 (manual /compact) mirrors A1: see the same-boundary table above -- the fold only \
+         shrinks the compaction's rewrite."
+    );
+}
+
+// --- Phase 2 (issue #400 M5): inferred-cold (Class B) modeled arm. ---
+//
+// SIMULATION CAVEAT, stated honestly: the fake-provider lane has no real
+// prompt cache and no TTL. The arm simulates the cold cache by the same
+// modeling rule used everywhere in this file -- once the TTL is past, the
+// provider re-bills the entire request, so the "cost" of a request after the
+// idle gap is its full payload with or without the fold. What the arm proves
+// deterministically is (a) the trigger fires on a real idle gap measured from
+// the transcript's activity clock against the profile threshold, mid-session
+// and without any pending break, and (b) the folded payload the cold cache
+// re-bills is never larger than the unfolded one. The realized counterpart is
+// the env-gated live pair below (`compaction_live_bench`).
+
+/// One inferred-cold arm: turn 1 runs warm (neutral profile -- the resume-time
+/// A4 check is consumed and holds), then a cold threshold far below a real
+/// wall-clock wait is installed mid-session, so turn 2's boundary infers cold
+/// and flushes (Class B); turn 3 measures the steady state.
+fn run_inferred_cold_arm(micro: bool) -> SeededArm {
+    let seed = carry_seed();
+    let budget = break_arm_budget(&seed);
+    let root = TempDir::new();
+    let workspace = TempDir::new();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session log");
+    for message in &seed {
+        log.append(message).expect("append seed message");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list sessions")
+        .into_iter()
+        .find(|m| m.path == path)
+        .expect("seeded session is listed");
+    let stored = store.open(&meta).expect("open seeded session");
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path).expect("resume session log");
+
+    let summary_calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::resumed(
+        CompactionFakeProvider::new(summary_calls.clone(), requests.clone(), Vec::new()),
+        Tools::new(Vec::new()),
+        stored.messages,
+    );
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(budget),
+    );
+    harness.set_summarizer(SummarizerKind::Provider);
+    harness.set_microcompaction(micro);
+
+    let counter = CompactionCounter::new();
+    let gate = NoToolGate;
+    let token = CancellationToken::new();
+    // Turn 1: warm (no cold threshold); the resume-time check is consumed.
+    block_on(harness.submit_turn(
+        "continue: proceed with the next small wiring step.",
+        &counter,
+        &gate,
+        &token,
+    ))
+    .expect("turn succeeds");
+    // Mid-session idle gap: a real wait against a threshold far below it.
+    harness.set_cache_profile(crate::wayland::CacheProfile {
+        cold_after: Some(std::time::Duration::from_millis(10)),
+        ..Default::default()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    for prompt in [
+        "then: confirm the buffer state briefly.",
+        "finally: report the wiring status in one line.",
+    ] {
+        block_on(harness.submit_turn(prompt, &counter, &gate, &token)).expect("turn succeeds");
+    }
+
+    let folds = fold_count(&path);
+    let messages = harness.agent.messages();
+    let rebuilt_context = messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let post_context_tokens = harness.context_token_estimate();
+    SeededArm {
+        rebuilt_context,
+        summary_body: String::new(),
+        records: counter.records.borrow().clone(),
+        folds,
+        summary_calls: summary_calls.load(Ordering::Relaxed),
+        post_context_tokens,
+        requests: requests.lock().expect("requests capture lock").clone(),
+        seed_baseline: serialize_request(&seed),
+    }
+}
+
+#[test]
+fn inferred_cold_flush_fires_mid_session_and_is_free_under_a_cold_cache() {
+    let arm = run_inferred_cold_arm(true);
+    let control = run_inferred_cold_arm(false);
+    // Integrity: the flush landed at the TURN-2 boundary (mid-session, after
+    // the warm turn), not at turn 1; nothing compacted; no summarizer call.
+    assert_eq!(arm.folds, 1, "the idle gap releases exactly one fold");
+    assert_eq!(control.folds, 0);
+    assert!(arm.records.is_empty() && control.records.is_empty());
+    assert_eq!(arm.summary_calls, 0);
+    assert_eq!(arm.requests.len(), 3, "three driven turns");
+    // Turn 1 payloads are byte-identical (the arm held while warm).
+    assert_eq!(
+        est_tokens(&arm.requests[0].payload),
+        est_tokens(&control.requests[0].payload),
+        "no fold before the idle gap: the warm turn is identical"
+    );
+    // Under the expired cache, turn 2 re-bills its full payload either way;
+    // the folded payload never exceeds the control's (marginal write <= 0).
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    assert!(
+        arm_t2 <= ctrl_t2,
+        "cold re-bill with the fold must not exceed the control ({arm_t2} vs {ctrl_t2})"
+    );
+    // Steady state (turn 3) keeps the full per-turn saving.
+    let arm_t3 = est_tokens(&arm.requests[2].payload);
+    let ctrl_t3 = est_tokens(&control.requests[2].payload);
+    assert!(
+        arm_t3 < ctrl_t3,
+        "steady-state request must shrink ({arm_t3} vs {ctrl_t3})"
+    );
+}
+
+/// Prints the Class-B row for `docs/benchmarks/issue-400-fold-flush-cost.md`.
+/// Regenerate with:
+/// `cargo test inferred_cold_flush_cost_benchmark_report -- --nocapture`
+#[test]
+fn inferred_cold_flush_cost_benchmark_report() {
+    let arm = run_inferred_cold_arm(true);
+    let control = run_inferred_cold_arm(false);
+    let arm_t2 = est_tokens(&arm.requests[1].payload);
+    let ctrl_t2 = est_tokens(&control.requests[1].payload);
+    let arm_t3 = est_tokens(&arm.requests[2].payload);
+    let ctrl_t3 = est_tokens(&control.requests[2].payload);
+    println!("\n== Class-B inferred-cold flush -- {MODELED_LABEL} ==");
+    println!(
+        "| trigger | arm t2 payload (cold re-bill) | control t2 payload | marginal write | steady saving (t3) |"
+    );
+    println!("|---|---|---|---|---|");
+    println!(
+        "| B idle gap | {arm_t2} | {ctrl_t2} | {} | {} |",
+        arm_t2 as i64 - ctrl_t2 as i64,
+        ctrl_t3.saturating_sub(arm_t3),
+    );
+    println!(
+        "\nSIMULATION: the fake lane has no real TTL; the cold cache is modeled as a full \
+         re-bill of the post-gap request, which holds by definition once the provider TTL is \
+         past. The trigger firing on the real idle gap (transcript activity clock vs profile \
+         threshold, mid-session, no pending break) is what the arm proves deterministically; \
+         realized deltas come from the env-gated live pair."
+    );
+    println!(
+        "Wrong-inference cost (gap inferred cold but cache still warm): one warm flush, \
+         measured at 4485 modeled / 2129 realized write tokens on this seed -- bounded, and \
+         strictly less than what the watermark-only trigger paid on every flush."
     );
 }

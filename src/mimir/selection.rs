@@ -21,6 +21,7 @@ use anyhow::Result;
 
 use crate::config::{OpenAiCompatibleSettings, Settings};
 use crate::errors::UsageError;
+use crate::wayland::CacheProfile;
 
 /// The providers Iris supports today. Parsing keeps the "unsupported provider"
 /// error close to its only authority, so `build_provider` no longer matches on
@@ -254,6 +255,74 @@ impl PromptCacheRetention {
     }
 }
 
+/// Resolve the active selection to the provider-neutral prompt-cache profile
+/// the Tier-2 fold scheduler consumes (issue #400, design §4.3). Provider
+/// names stop here: wayland receives only [`CacheProfile`] fields. The table
+/// is static, from provider documentation and measured pricing ratios:
+///
+/// | profile | cold_after | write premium | read rate | reports writes | min |
+/// |---|---|---|---|---|---|
+/// | Anthropic `short` | 6 min | 1.25 | 0.10 | yes | 1024 (2048 Haiku-class) |
+/// | Anthropic `long` | 72 min | 2.0 | 0.10 | yes | 1024 (2048 Haiku-class) |
+/// | OpenAI Responses lanes | 60 min | 1.0 | 0.10 | no | 1024 |
+/// | unknown / caching off | none | 1.0 | 1.0 | no | 0 |
+///
+/// `cold_after` builds a margin over the documented TTL (5 min x 1.2; 60 min
+/// x 1.2 for the 1h tier) so a racing refresh is never inferred cold. The
+/// OpenAI in-memory cache documents 5-10 min typical eviction with a 1 h hard
+/// maximum: 60 min is the guaranteed-cold bound, the probabilistic 12 min
+/// option is recorded on the profile but not consumed yet. Unknown providers
+/// (and `retention: none`, which disables every cache hint) degrade to the
+/// safe default: cold-based triggers off, no minimum, break events still
+/// valid.
+pub(crate) fn cache_profile(selection: &ModelSelection) -> CacheProfile {
+    use std::time::Duration;
+    if !selection.cache_retention.caching_enabled() {
+        return CacheProfile::default();
+    }
+    match selection.provider {
+        ProviderId::Anthropic => {
+            // Anthropic documents a larger minimum cacheable prefix for the
+            // Haiku-class models (2048 tokens vs 1024).
+            let min = if selection.model.to_ascii_lowercase().contains("haiku") {
+                2048
+            } else {
+                1024
+            };
+            let (cold_after, write_premium) = match selection.cache_retention {
+                // 5-minute tier x 1.2 margin; writes bill at 1.25x base.
+                PromptCacheRetention::Short => (Duration::from_secs(6 * 60), 1.25),
+                // 1-hour tier x 1.2 margin; writes bill at 2x base.
+                PromptCacheRetention::Long => (Duration::from_secs(72 * 60), 2.0),
+                PromptCacheRetention::None => unreachable!("caching_enabled checked above"),
+            };
+            CacheProfile {
+                cold_after: Some(cold_after),
+                probably_cold_after: None,
+                write_premium,
+                read_rate: 0.10,
+                reports_writes: true,
+                min_cacheable_tokens: min,
+            }
+        }
+        ProviderId::OpenAiCodex | ProviderId::OpenAi => CacheProfile {
+            // In-memory prompt cache: 5-10 min typical inactivity eviction,
+            // hard max 1 h -- 60 min is the guaranteed-cold bound. Extended
+            // (24 h) retention is unverified on the subscription backend;
+            // until measured (#395 follow-up) the 1 h bound stands, and a
+            // wrong inference costs one warm flush on a lane with no write
+            // premium.
+            cold_after: Some(Duration::from_secs(60 * 60)),
+            probably_cold_after: Some(Duration::from_secs(12 * 60)),
+            write_premium: 1.0,
+            read_rate: 0.10,
+            reports_writes: false,
+            min_cacheable_tokens: 1024,
+        },
+        ProviderId::Antigravity | ProviderId::OpenAiCompatible => CacheProfile::default(),
+    }
+}
+
 /// Anthropic server-side context-management opt-in (`context_management.edits`),
 /// deserialized from the global `anthropicContextManagement` setting. An empty
 /// value (the default) is disabled, so no `context_management` is emitted and
@@ -311,6 +380,29 @@ impl ContextManagement {
         if self.compact.is_some() {
             return Err(UsageError::new(
                 "anthropicContextManagement.compact is not supported yet; compact responses require transcript replay support",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Reject server-side tool-result clearing combined with local
+    /// microcompaction (issue #400, ADR-0022 addendum): `clear_tool_uses`
+    /// makes the server drop tool results Iris still models as present, so
+    /// context estimates diverge and fold plans target content already gone
+    /// -- two reducers fighting over the same mass. `clear_thinking` stays
+    /// allowed: folds never touch thinking blocks and recall reads Iris's
+    /// own log, unaffected by server-side thinking clears.
+    pub(crate) fn validate_compatible_with_microcompaction(
+        &self,
+        microcompaction: bool,
+    ) -> Result<()> {
+        if microcompaction && self.clear_tool_uses.is_some() {
+            return Err(UsageError::new(
+                "anthropicContextManagement.clearToolUses and microcompaction cannot be enabled \
+                 together: the server drops tool results Iris still models as present, so \
+                 context accounting and fold plans diverge. Disable one of them \
+                 (clearThinking remains compatible with microcompaction).",
             )
             .into());
         }
@@ -400,6 +492,7 @@ impl ModelSelection {
             None => ContextManagement::default(),
         };
         context_management.validate_supported()?;
+        context_management.validate_compatible_with_microcompaction(settings.microcompaction())?;
         let retry_policy =
             crate::mimir::retry::RetryPolicy::from_settings(&settings.retry_settings());
         let open_ai_compatible =
@@ -498,6 +591,130 @@ mod tests {
             default_approval: None,
             worktree_root: None,
         }
+    }
+
+    #[test]
+    fn clear_tool_uses_and_microcompaction_are_mutually_exclusive() {
+        // Both enabled -> rejected, naming both settings (issue #400,
+        // ADR-0022 addendum).
+        let mut s = settings(Some("anthropic"), None, None, None);
+        s.anthropic_context_management = Some(serde_json::json!({
+            "clearToolUses": { "triggerInputTokens": 50000 }
+        }));
+        s.microcompaction = Some(true);
+        let error = format!("{:#}", ModelSelection::resolve(&s).unwrap_err());
+        assert!(error.contains("clearToolUses"), "names the edit: {error}");
+        assert!(
+            error.contains("microcompaction"),
+            "names the toggle: {error}"
+        );
+
+        // Either alone passes.
+        let mut clear_only = settings(Some("anthropic"), None, None, None);
+        clear_only.anthropic_context_management = Some(serde_json::json!({
+            "clearToolUses": { "triggerInputTokens": 50000 }
+        }));
+        assert!(ModelSelection::resolve(&clear_only).is_ok());
+        let mut micro_only = settings(Some("anthropic"), None, None, None);
+        micro_only.microcompaction = Some(true);
+        assert!(ModelSelection::resolve(&micro_only).is_ok());
+
+        // clear_thinking is orthogonal: folds never touch thinking blocks.
+        let mut thinking = settings(Some("anthropic"), None, None, None);
+        thinking.anthropic_context_management = Some(serde_json::json!({
+            "clearThinking": { "triggerInputTokens": 50000 }
+        }));
+        thinking.microcompaction = Some(true);
+        assert!(ModelSelection::resolve(&thinking).is_ok());
+    }
+
+    /// A selection literal for the cache-profile table tests, bypassing
+    /// settings/env resolution.
+    fn selection_for(
+        provider: ProviderId,
+        model: &str,
+        retention: PromptCacheRetention,
+    ) -> ModelSelection {
+        ModelSelection {
+            provider,
+            model: model.to_string(),
+            base_url: String::new(),
+            reasoning: None,
+            cache_retention: retention,
+            context_management: ContextManagement::default(),
+            retry_policy: crate::mimir::retry::RetryPolicy::default(),
+            open_ai_compatible: OpenAiCompatibleConfig::default(),
+        }
+    }
+
+    #[test]
+    fn cache_profile_maps_the_four_row_table() {
+        use std::time::Duration;
+        // Anthropic short: 6 min cold, 1.25x writes, 1024 minimum.
+        let short = cache_profile(&selection_for(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            PromptCacheRetention::Short,
+        ));
+        assert_eq!(short.cold_after, Some(Duration::from_secs(6 * 60)));
+        assert_eq!(short.write_premium, 1.25);
+        assert_eq!(short.read_rate, 0.10);
+        assert!(short.reports_writes);
+        assert_eq!(short.min_cacheable_tokens, 1024);
+
+        // Anthropic long: 72 min cold, 2x write premium (the 1h tier).
+        let long = cache_profile(&selection_for(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            PromptCacheRetention::Long,
+        ));
+        assert_eq!(long.cold_after, Some(Duration::from_secs(72 * 60)));
+        assert_eq!(long.write_premium, 2.0);
+
+        // Haiku-class models have the larger documented minimum.
+        let haiku = cache_profile(&selection_for(
+            ProviderId::Anthropic,
+            "claude-haiku-4",
+            PromptCacheRetention::Short,
+        ));
+        assert_eq!(haiku.min_cacheable_tokens, 2048);
+
+        // OpenAI Responses lanes: 60 min guaranteed-cold bound, no write
+        // premium, write side unreported.
+        for provider in [ProviderId::OpenAiCodex, ProviderId::OpenAi] {
+            let codex = cache_profile(&selection_for(
+                provider,
+                "gpt-5.5",
+                PromptCacheRetention::Short,
+            ));
+            assert_eq!(codex.cold_after, Some(Duration::from_secs(60 * 60)));
+            assert_eq!(codex.write_premium, 1.0);
+            assert!(!codex.reports_writes);
+            assert_eq!(codex.min_cacheable_tokens, 1024);
+        }
+    }
+
+    #[test]
+    fn cache_profile_degrades_unknown_lanes_and_disabled_caching_to_the_safe_default() {
+        // Unknown/openai-compatible lanes: cold-based triggers off, no
+        // minimum, no read discount.
+        for provider in [ProviderId::Antigravity, ProviderId::OpenAiCompatible] {
+            let profile = cache_profile(&selection_for(
+                provider,
+                "anything",
+                PromptCacheRetention::Short,
+            ));
+            assert_eq!(profile, CacheProfile::default());
+            assert_eq!(profile.cold_after, None);
+            assert_eq!(profile.min_cacheable_tokens, 0);
+        }
+        // retention `none` disables every cache hint, so every lane degrades.
+        let off = cache_profile(&selection_for(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            PromptCacheRetention::None,
+        ));
+        assert_eq!(off, CacheProfile::default());
     }
 
     /// Env vars are process-global; serialize the env-sensitive cases through one

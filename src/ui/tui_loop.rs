@@ -945,6 +945,107 @@ fn execute_menu_action<P: ChatProvider>(
 /// command; run it as a turn), or `Swap` (perform a session swap at the
 /// boundary). `/login`/`/logout` with arguments are intentionally not recognized
 /// (pi-mono parity) and fall through to a normal turn.
+/// Build the `/context` breakdown (issue #400, design §5.1): system+tools /
+/// raw conversation / summarized / folded-reclaimed / pending-fold mass /
+/// free headroom, plus per-batch fold lines tagged with their trigger class.
+/// Everything is an estimate from data that already exists (the harness
+/// message estimates, the budget, the runtime fold/compaction events and the
+/// pending set); nothing is fabricated, and the system+tools row is labeled
+/// as outside the budget estimate (the budget covers conversation messages).
+fn context_breakdown_lines<P: ChatProvider>(
+    harness: &crate::wayland::Harness<P>,
+    switch: Option<&ModelSwitch<'_, P>>,
+    accounting: &super::tui::ContextAccounting,
+) -> Vec<String> {
+    use crate::session::estimate_tokens;
+    let total = harness.context_token_estimate();
+    let mut lines = Vec::new();
+    match harness.context_budget() {
+        Some(budget) => {
+            let pct = (total.saturating_mul(100)).checked_div(budget).unwrap_or(0);
+            lines.push(format!(
+                "context: ~{total} of {budget} tokens ({pct}% of the compaction budget)"
+            ));
+            lines.push(format!(
+                "  free headroom      ~{} tokens",
+                budget.saturating_sub(total)
+            ));
+        }
+        None => lines.push(format!("context: ~{total} tokens (no compaction budget)")),
+    }
+    // System prompt + tool declarations: sent with every request but not part
+    // of the conversation estimate the budget covers.
+    if let Some(sw) = switch {
+        let system = estimate_tokens(sw.system_prompt());
+        let tools: u64 = harness
+            .agent
+            .tools()
+            .iter()
+            .map(|tool| {
+                estimate_tokens(tool.name())
+                    .saturating_add(estimate_tokens(tool.description()))
+                    .saturating_add(estimate_tokens(&tool.parameters().to_string()))
+            })
+            .fold(0, u64::saturating_add);
+        lines.push(format!(
+            "  system + tools     ~{} tokens (per request, outside the budget estimate)",
+            system.saturating_add(tools)
+        ));
+    }
+    // Split the conversation estimate into raw turns vs summary stand-ins.
+    let messages = harness.messages();
+    let summarized: u64 = messages
+        .iter()
+        .filter(|m| {
+            m.content.starts_with("[compacted summary")
+                || m.content.starts_with("[auto-compacted summary")
+        })
+        .map(|m| estimate_tokens(&m.content))
+        .fold(0, u64::saturating_add);
+    let folded_stubs = messages
+        .iter()
+        .filter(|m| m.content.starts_with("[folded]"))
+        .count();
+    lines.push(format!(
+        "  raw conversation   ~{} tokens",
+        total.saturating_sub(summarized)
+    ));
+    let (original_total, summary_total) = accounting
+        .compactions
+        .iter()
+        .fold((0u64, 0u64), |(original, summary), (o, s)| {
+            (original.saturating_add(*o), summary.saturating_add(*s))
+        });
+    if summarized > 0 || !accounting.compactions.is_empty() {
+        let mut line = format!("  summarized         ~{summarized} tokens in context");
+        if !accounting.compactions.is_empty() {
+            line.push_str(&format!(
+                " ({} compaction(s) this session: ~{original_total} -> ~{summary_total})",
+                accounting.compactions.len()
+            ));
+        }
+        lines.push(line);
+    }
+    if folded_stubs > 0 || !accounting.fold_batches.is_empty() {
+        lines.push(format!(
+            "  folded-reclaimed   {folded_stubs} stub(s) in context; ~{} tokens reclaimed this session",
+            accounting.folded_reclaimed()
+        ));
+        for (trigger, folds, reclaimed) in &accounting.fold_batches {
+            lines.push(format!(
+                "    folded {folds} result(s) \u{2014} reclaimed ~{reclaimed} tokens [{trigger}]"
+            ));
+        }
+    }
+    let (pending, reclaimable) = harness.pending_fold_stats();
+    if pending > 0 {
+        lines.push(format!(
+            "  pending folds      {pending} detected, ~{reclaimable} tokens reclaimable (holding for a free cache break)"
+        ));
+    }
+    lines
+}
+
 fn route_command<P: ChatProvider>(
     prompt: &str,
     harness: &mut Harness<P>,
@@ -1060,6 +1161,17 @@ fn route_command<P: ChatProvider>(
         "/session" if rest.is_empty() => {
             tui.screen.commit_user(prompt);
             apply_notices(tui, crate::cli::session_info_lines(harness, switch));
+            Ok(RouteOutcome::Consumed)
+        }
+        "/context" if rest.is_empty() => {
+            // Context-accounting breakdown (issue #400, design §5.1): every
+            // token attributed to a category, every reduction itemized with
+            // its trigger tag. Display-only; all numbers come from the harness
+            // estimates and the session's runtime events, never fabricated.
+            tui.screen.commit_user(prompt);
+            let lines =
+                context_breakdown_lines(harness, switch.as_ref(), &tui.screen.context_accounting);
+            apply_notices(tui, lines);
             Ok(RouteOutcome::Consumed)
         }
         "/sessions" => {
@@ -1545,7 +1657,10 @@ async fn run_harness_op<P: ChatProvider>(
     if let Err(error) = result {
         tui.screen.apply(UiEvent::from_turn_error(&error));
     }
-    tui.screen.clear_approval();
+    // The turn is unwinding on an error; not an approval-to-run. (The error
+    // event applied just above already set the Finishing phase, so this is a
+    // guarded no-op for the phase, but stays honest about the outcome.)
+    tui.screen.clear_approval(false);
     Ok(())
 }
 
@@ -2351,7 +2466,7 @@ fn resolve_input_eof(
     token.cancel();
     if let Some(p) = pending.take() {
         let _ = p.reply.send(ApprovalDecision::Deny);
-        screen.clear_approval();
+        screen.clear_approval(false);
     }
 }
 
@@ -2568,7 +2683,7 @@ fn handle_running_event(
                 steering.clear();
                 if let Some(p) = pending.take() {
                     let _ = p.reply.send(ApprovalDecision::Deny);
-                    screen.clear_approval();
+                    screen.clear_approval(false);
                 }
                 return true;
             }
@@ -2623,7 +2738,13 @@ fn handle_running_event(
                     let p = pending.take().expect("pending approval present");
                     screen.record_approval(&p.call, decision);
                     let _ = p.reply.send(decision);
-                    screen.clear_approval();
+                    let approved = matches!(
+                        decision,
+                        ApprovalDecision::Allow
+                            | ApprovalDecision::AllowAlways
+                            | ApprovalDecision::AllowProject
+                    );
+                    screen.clear_approval(approved);
                     return true;
                 }
                 return false;
@@ -2731,6 +2852,115 @@ mod tests {
         steering: &SteeringQueue,
     ) -> bool {
         super::handle_running_event(screen, event, pending, steering, &GitStatusCache::default())
+    }
+
+    #[test]
+    fn screen_accumulates_fold_and_compaction_accounting_from_events() {
+        // The /context breakdown's session-scoped totals come straight from
+        // the display-event stream (issue #400, design §5.1).
+        let mut screen = Screen::new();
+        screen.apply(crate::ui::UiEvent::FoldApplied {
+            folds: 2,
+            reclaimed_tokens_estimate: 900,
+            trigger: crate::nexus::FoldTrigger::SelectionSwitch,
+        });
+        screen.apply(crate::ui::UiEvent::FoldApplied {
+            folds: 1,
+            reclaimed_tokens_estimate: 300,
+            trigger: crate::nexus::FoldTrigger::Watermark,
+        });
+        screen.apply(crate::ui::UiEvent::CompactionApplied {
+            compaction_id: "c1".into(),
+            covered_from: "1".into(),
+            covered_to: "5".into(),
+            covered_messages: 5,
+            original_tokens_estimate: 4000,
+            summary_tokens_estimate: 400,
+            budget: 8000,
+        });
+        let accounting = &screen.context_accounting;
+        assert_eq!(accounting.fold_batches, vec![("A2", 2, 900), ("C", 1, 300)]);
+        assert_eq!(accounting.folded_reclaimed(), 1200);
+        assert_eq!(accounting.compactions, vec![(4000, 400)]);
+    }
+
+    #[test]
+    fn context_breakdown_reports_categories_and_trigger_tags() {
+        // A scripted context: a compaction summary stand-in, a folded stub, a
+        // superseded read the scheduler holds as pending, and a normal tail.
+        // The breakdown must attribute each category with accurate estimates
+        // and show trigger-tagged fold lines. In-memory harness: pending
+        // folds require a durable session, so pending is 0 here; the pending
+        // row is covered by the wayland pending_fold_stats tests.
+        use crate::nexus::{Agent, Message};
+        use crate::session::estimate_tokens;
+        let summary = "[compacted summary of 5 earlier message(s)]\nGoal: ship the fold work.";
+        let stub = "[folded] The `read` result for `a.rs` was superseded and folded.";
+        let messages = vec![
+            Message::user(summary),
+            Message::tool_result("c1", "read", stub),
+            Message::user("continue"),
+            Message::assistant("ok"),
+        ];
+        let agent = Agent::resumed(NullChat, crate::tools::built_in_tools(), messages.clone());
+        let harness = crate::wayland::Harness::new(
+            agent,
+            std::env::temp_dir(),
+            crate::tools::ToolState::new(),
+            None,
+            Some(10_000),
+        );
+        let mut accounting = crate::ui::tui::ContextAccounting::default();
+        accounting.fold_batches.push(("A4", 1, 700));
+        accounting.compactions.push((4000, 400));
+
+        let lines = context_breakdown_lines(&harness, None, &accounting).join("\n");
+        let total = harness.context_token_estimate();
+        let summarized = estimate_tokens(summary);
+        assert!(
+            lines.contains(&format!("~{total} of 10000 tokens")),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(&format!("~{} tokens", 10_000 - total)),
+            "headroom: {lines}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "raw conversation   ~{} tokens",
+                total - summarized
+            )),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(&format!("summarized         ~{summarized} tokens")),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("(1 compaction(s) this session: ~4000 -> ~400)"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("folded-reclaimed   1 stub(s) in context; ~700 tokens reclaimed"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("reclaimed ~700 tokens [A4]"),
+            "fold line carries its trigger tag: {lines}"
+        );
+    }
+
+    /// Provider stub for breakdown tests: never called (display-only path).
+    struct NullChat;
+    impl crate::nexus::ChatProvider for NullChat {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [crate::nexus::Message],
+            _tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<crate::nexus::ProviderStream<'a>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
     }
 
     #[test]

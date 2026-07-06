@@ -1,7 +1,8 @@
 # ADR-0039: Freeform tool-input deltas are display-only
 
 **Date**: 2026-07-04
-**Status**: proposed
+**Status**: accepted (event seam + display-only invariant implemented; live
+preview UI deferred until a freeform tool exists)
 **Deciders**: iris-agent maintainers
 
 ## Context
@@ -47,6 +48,30 @@ display:
   emitted-visible-text retry gating extends to tool-input deltas.
 - **Early failure surfacing.** A parse error at line N of a streaming patch is
   shown when it occurs, not after the patch completes.
+
+## Implementation status
+
+Landed as a **minimal, provably-inert seam**, not the full preview:
+
+- `ProviderEvent::ToolInputDelta { call_id, delta }` and its
+  `AgentEvent`/`UiEvent` display mirrors exist. Nexus forwards them display-only
+  and never writes them to `Agent.messages`, `partial`/assistant text, or the
+  assembled turn's tool calls; approval and execution consume only the completed
+  canonical `ToolCall`.
+- The OpenAI Responses adapter maps `response.custom_tool_call_input.delta`
+  (freeform/custom tools) to the event and counts it as visible output, so a
+  mid-stream protocol anomaly after a shown fragment is not silently retried.
+  JSON-argument (`function`) tool deltas stay buffered.
+- **Deferred until `apply_patch` (V4A, ROADMAP #10) lands:** the TUI progressive
+  preview state machine (partial / complete / parse-error / invalidated), the
+  "proposed" preview marking, the `ToolInputInvalidated` event, and early parse
+  failure. Rationale: Iris declares no freeform/custom tool today (every tool is
+  `"type": "function"`), so the provider never emits the event in production and
+  there is no line-oriented input to render. Building the preview now would be
+  speculative UI for a tool that does not exist; the security seam is built and
+  tested now so a future freeform tool inherits it. The retry-invalidation
+  behavior at the seam is the visible-output retry gate above; the preview-clear
+  half of "retry invalidation" is part of the deferred UI.
 
 ## Alternatives Considered
 

@@ -39,7 +39,7 @@
 | [0036](0036-tools-are-token-efficient-by-design.md) | Tools are token-efficient by design | accepted | 2026-07-04 |
 | [0037](0037-native-output-filtering-for-bash-pass-through.md) | Native output filtering for bash pass-through commands | proposed | 2026-07-04 |
 | [0038](0038-per-model-edit-surfaces-share-one-mutation-core.md) | Per-model edit surfaces share one mutation core | proposed | 2026-07-04 |
-| [0039](0039-freeform-tool-input-deltas-are-display-only.md) | Freeform tool-input deltas are display-only | proposed | 2026-07-04 |
+| [0039](0039-freeform-tool-input-deltas-are-display-only.md) | Freeform tool-input deltas are display-only | accepted | 2026-07-04 |
 | [0040](0040-classified-tool-errors-carry-machine-readable-metadata.md) | Classified tool errors carry machine-readable metadata | accepted | 2026-07-04 |
 | [0041](0041-token-efficient-model-switching-and-provider-summaries.md) | Token-efficient model switching and provider-backed compaction summaries | accepted | 2026-07-02 |
 | [0042](0042-opt-in-named-themes-behind-a-theme-trait.md) | Opt-in named color themes behind a Theme trait, terminal-relative by default | proposed | 2026-07-04 |
@@ -51,6 +51,7 @@
 | [0048](0048-fold-spent-tool-results-behind-handles.md) | Fold spent tool results behind handles (opt-in microcompaction) | accepted | 2026-07-04 |
 | [0049](0049-dangerously-skip-permissions-mode.md) | `--dangerously-skip-permissions` bypasses the approval gate | accepted | 2026-07-05 |
 | [0050](0050-stream-reasoning-summary-deltas.md) | Stream reasoning summary deltas as a display event | accepted | 2026-07-05 |
+| [0051](0051-cache-aware-fold-flush-scheduling.md) | Cache-aware fold flush scheduling | accepted | 2026-07-05 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.

@@ -460,16 +460,27 @@ fn streamed_deltas_render_in_order_and_commit_once() -> Result<()> {
 }
 
 /// Provider that streams a scripted sequence of `ProviderEvent`s (reasoning
-/// deltas, section breaks, text deltas) ending in one `Completed` turn. Used to
-/// exercise the live-reasoning display/suppression path.
+/// deltas, section breaks, text/tool-input deltas) per turn, each ending in one
+/// `Completed`. Used to exercise the live-reasoning and tool-input display
+/// paths. Each `respond_stream` call drains the next scripted turn, so a
+/// tool-call round-trip (turn 1 requests a tool, turn 2 answers) can be scripted.
 struct ScriptedStreamProvider {
-    events: RefCell<Option<Vec<Result<ProviderEvent>>>>,
+    turns: RefCell<Vec<Vec<Result<ProviderEvent>>>>,
 }
 
 impl ScriptedStreamProvider {
     fn new(events: Vec<ProviderEvent>) -> Self {
+        Self::with_turns(vec![events])
+    }
+
+    fn with_turns(turns: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
-            events: RefCell::new(Some(events.into_iter().map(Ok).collect())),
+            turns: RefCell::new(
+                turns
+                    .into_iter()
+                    .map(|turn| turn.into_iter().map(Ok).collect())
+                    .collect(),
+            ),
         }
     }
 }
@@ -481,7 +492,12 @@ impl ChatProvider for ScriptedStreamProvider {
         _tools: &'a Tools,
         _cancel: &'a CancellationToken,
     ) -> Result<ProviderStream<'a>> {
-        let events = self.events.borrow_mut().take().unwrap_or_default();
+        let mut turns = self.turns.borrow_mut();
+        let events = if turns.is_empty() {
+            Vec::new()
+        } else {
+            turns.remove(0)
+        };
         Ok(Box::pin(futures::stream::iter(events)))
     }
 }
@@ -617,6 +633,111 @@ fn reasoning_without_deltas_emits_final_display_event() -> Result<()> {
     assert_eq!(
         reasoning_display_events(&events),
         vec![("Block reasoning".to_string(), false)]
+    );
+    Ok(())
+}
+
+// --- Slice 4: freeform tool-input deltas are display-only (ADR-0039) ---
+
+fn tool_input_delta_texts(events: &[AgentEvent]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolInputDelta { call_id, delta } => Some((call_id.clone(), delta.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn tool_input_delta_is_forwarded_for_display() -> Result<()> {
+    // A freeform tool-input fragment is forwarded to the front-end as a display
+    // event (so a live preview could render it), carrying the streaming
+    // correlation id. It is display-only: it does not need a matching tool call.
+    let workspace = test_workspace()?;
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::ToolInputDelta {
+            call_id: "call_1".to_string(),
+            delta: "*** Begin Patch".to_string(),
+        },
+        ProviderEvent::Completed(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert_eq!(
+        tool_input_delta_texts(&events),
+        vec![("call_1".to_string(), "*** Begin Patch".to_string())],
+        "the freeform tool-input fragment is forwarded display-only"
+    );
+    Ok(())
+}
+
+#[test]
+fn tool_input_delta_never_enters_context_or_alters_execution() -> Result<()> {
+    // SECURITY (ADR-0039): a streamed tool-input fragment is display-only and
+    // provably inert. Even if its content is adversarial, it must never enter
+    // provider context (`Agent.messages`) and must never change what is approved
+    // or executed -- approval and execution consume ONLY the completed canonical
+    // `ToolCall`. Here the model streams a malicious fragment, then the actual
+    // completed tool call is a benign `read note.txt`.
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "hello")?;
+    const INJECTED: &str = "INJECTED-rm-rf-/etc/passwd";
+    let provider = ScriptedStreamProvider::with_turns(vec![
+        vec![
+            ProviderEvent::ToolInputDelta {
+                call_id: "call_1".to_string(),
+                delta: INJECTED.to_string(),
+            },
+            ProviderEvent::Completed(single_call_turn("read", json!({ "path": "note.txt" }))),
+        ],
+        vec![ProviderEvent::Completed(AssistantTurn::text("done"))],
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("read note", &frontend, &frontend, &CancellationToken::new()))?;
+
+    // The fragment reached the display seam...
+    let events = frontend.events.borrow();
+    assert_eq!(
+        tool_input_delta_texts(&events),
+        vec![("call_1".to_string(), INJECTED.to_string())]
+    );
+    // ...but NEVER entered provider context: no message (assistant text, tool
+    // call args, or tool result) carries the injected fragment.
+    assert!(
+        harness.agent.messages.iter().all(|message| {
+            !message.content.contains(INJECTED)
+                && !message
+                    .tool_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(INJECTED)
+        }),
+        "tool-input delta must never enter Agent.messages / provider context"
+    );
+    // Approval + execution used the canonical completed ToolCall: the benign
+    // `read` ran and returned the file contents; the fragment did not become a
+    // tool call of its own.
+    let executed: Vec<(&str, &str)> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult { call, content, .. } => {
+                Some((call.name.as_str(), content.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(executed.len(), 1, "exactly one tool executed");
+    assert_eq!(executed[0].0, "read", "the canonical read call executed");
+    assert!(
+        executed[0].1.contains("hello"),
+        "execution used canonical args (read note.txt), not the streamed fragment"
     );
     Ok(())
 }
@@ -3963,6 +4084,85 @@ fn cancellation_during_provider_stream_exits_promptly_with_valid_state() -> Resu
             .borrow()
             .iter()
             .any(|e| matches!(e, AgentEvent::Notice(m) if m.contains("interrupted")))
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_commits_partial_assistant_text_exactly_once() -> Result<()> {
+    // Slice 5 / DoD: a cancellation mid-stream commits the partial assistant
+    // text EXACTLY once. Deltas were seen, so the partial is flushed as a
+    // single `AssistantTextEnd` (never also an `AssistantText`), the display
+    // never sees a duplicate commit, and the transcript keeps exactly one
+    // assistant message. The `AssistantTextEnd` precedes `ProviderTurnCancelled`
+    // so the front-end finalizes the stream before the turn is torn down.
+    let workspace = test_workspace()?;
+    let mut harness = test_harness(
+        BlockingStreamProvider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+    let token = CancellationToken::new();
+
+    block_on(async {
+        let turn = harness.submit_turn("go", &frontend, &frontend, &token);
+        let canceller = async {
+            loop {
+                let saw_delta = frontend
+                    .events
+                    .borrow()
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::AssistantTextDelta(_)));
+                if saw_delta {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(turn, canceller);
+        result
+    })?;
+
+    let events = frontend.events.borrow();
+    let text_ends: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AssistantTextEnd(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_ends,
+        vec![&"partial".to_string()],
+        "cancellation flushes the partial as exactly one AssistantTextEnd"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AssistantText(_))),
+        "the delta path must not also emit a whole-text AssistantText"
+    );
+    // Ordering: the partial commit precedes the cancellation event.
+    let end_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AssistantTextEnd(_)))
+        .expect("AssistantTextEnd emitted");
+    let cancel_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ProviderTurnCancelled { .. }))
+        .expect("ProviderTurnCancelled emitted");
+    assert!(
+        end_at < cancel_at,
+        "partial text is committed before the turn is cancelled"
+    );
+    // And the persisted transcript holds exactly one assistant message.
+    let messages = harness.agent.messages();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[1],
+        Message::assistant("partial").with_provider_turn_id("turn_00000000")
     );
     Ok(())
 }

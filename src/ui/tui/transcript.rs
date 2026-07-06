@@ -1979,10 +1979,37 @@ impl Transcript {
                     "",
                 );
             }
+            UiEvent::FoldApplied {
+                folds,
+                reclaimed_tokens_estimate,
+                trigger,
+            } => {
+                // A runtime event, not the assistant speaking: a quiet info
+                // notice itemizing what the fold pass reclaimed and why it ran
+                // (issue #400, trigger-tagged so an opt-in history rewrite is
+                // always visible and priced).
+                self.finish_stream();
+                self.push_notice_row(
+                    crate::ui::symbols::SEP,
+                    dim_style(),
+                    &format!(
+                        "Folded {folds} spent tool result(s) \u{2014} reclaimed ~{} tokens [{}]",
+                        super::screen::compact_count(reclaimed_tokens_estimate),
+                        trigger.code(),
+                    ),
+                    "",
+                );
+            }
             UiEvent::ProviderTurnCancelled { .. }
             | UiEvent::ProviderTurnError { .. }
             | UiEvent::ToolLifecycle { .. }
             | UiEvent::OutputHandleStored { .. } => {}
+            // Freeform tool-input deltas (ADR-0039) are display-only. The live
+            // preview cell is deferred until a freeform tool (`apply_patch`, V4A)
+            // exists to render; until then the event is inert here. The guard
+            // above still commits any open reasoning trace, since this is a
+            // non-reasoning event.
+            UiEvent::ToolInputDelta { .. } => {}
             UiEvent::AssistantTextDelta(delta) => {
                 if !self.stream.is_active() {
                     // A fresh stream starts here: drop any memoized tail render
