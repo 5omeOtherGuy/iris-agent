@@ -309,7 +309,10 @@ pub(crate) fn open_settings<P>(_switch: &ModelSwitch<'_, P>) -> Modal {
 /// settings menus can show each field's current value as muted metadata. Reads
 /// the merged global+project config for `cwd`; a read failure degrades to
 /// built-in defaults rather than failing the menu.
-fn settings_snapshot<P>(switch: &ModelSwitch<'_, P>) -> settings_menu::Snapshot {
+fn settings_snapshot<P: ChatProvider>(
+    harness: &Harness<P>,
+    switch: &ModelSwitch<'_, P>,
+) -> settings_menu::Snapshot {
     let settings = std::env::current_dir()
         .ok()
         .and_then(|cwd| config::Settings::load(&cwd).ok())
@@ -331,6 +334,7 @@ fn settings_snapshot<P>(switch: &ModelSwitch<'_, P>) -> settings_menu::Snapshot 
             .default_approval
             .clone()
             .unwrap_or_else(|| "strict".to_string()),
+        skip_permissions: harness.skip_permissions(),
         context_token_budget: settings.context_token_budget(),
         microcompaction: settings.microcompaction(),
         max_tool_roundtrips: settings.max_tool_roundtrips(),
@@ -445,6 +449,22 @@ pub(crate) fn apply_action<P: ChatProvider>(
             }
             ActionResult::Keep(lines)
         }
+        ModalAction::ToggleSkipPermissions => {
+            let enabled = !harness.skip_permissions();
+            harness.set_skip_permissions(enabled);
+            let snap = settings_snapshot(harness, switch);
+            ActionResult::Replace(
+                Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
+                    settings_menu::Category::Approvals,
+                    &snap,
+                ))),
+                vec![if enabled {
+                    "Dangerously skip permissions enabled for this session".to_string()
+                } else {
+                    "Dangerously skip permissions disabled for this session".to_string()
+                }],
+            )
+        }
         ModalAction::EditPolicy(edit) => {
             // Wayland owns the policy store edit and live Nexus refresh; re-open
             // the modal on the refreshed policy so row states reflect it.
@@ -463,7 +483,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Replace(Box::new(open_settings(switch)), Vec::new())
         }
         ModalAction::OpenSettingsCategory(category) => {
-            let snap = settings_snapshot(switch);
+            let snap = settings_snapshot(harness, switch);
             ActionResult::Replace(
                 Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
                     category, &snap,
@@ -472,7 +492,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
             )
         }
         ModalAction::OpenSettingsEnum(field) => {
-            let snap = settings_snapshot(switch);
+            let snap = settings_snapshot(harness, switch);
             ActionResult::Replace(
                 Box::new(Modal::SettingsEnum(settings_menu::EnumMenu::new(
                     field, &snap,
@@ -481,7 +501,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
             )
         }
         ModalAction::OpenSettingsEntry(field) => {
-            let snap = settings_snapshot(switch);
+            let snap = settings_snapshot(harness, switch);
             ActionResult::Replace(
                 Box::new(Modal::SettingsEntry(settings_menu::EntryDialog::new(
                     field, &snap,
@@ -505,7 +525,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
                 Err(error) => vec![format!("could not save setting: {error:#}")],
             };
             // Re-open the parent category submenu on the refreshed values.
-            let snap = settings_snapshot(switch);
+            let snap = settings_snapshot(harness, switch);
             ActionResult::Replace(
                 Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
                     field.category(),

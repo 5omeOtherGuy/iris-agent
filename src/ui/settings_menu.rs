@@ -199,6 +199,7 @@ pub(crate) struct Snapshot {
     pub(crate) scroll_speed: u16,
     pub(crate) reduced_motion: bool,
     pub(crate) default_approval: String,
+    pub(crate) skip_permissions: bool,
     pub(crate) context_token_budget: u64,
     pub(crate) microcompaction: bool,
     pub(crate) max_tool_roundtrips: Option<usize>,
@@ -330,6 +331,16 @@ fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
         ],
         Category::Approvals => vec![
             field_row(Field::DefaultApproval, snapshot),
+            open_row(
+                "skip-permissions",
+                "Dangerously skip permissions",
+                Some(if snapshot.skip_permissions {
+                    "on"
+                } else {
+                    "off"
+                }),
+                ModalAction::ToggleSkipPermissions,
+            ),
             open_row(
                 "trust",
                 "Project permissions",
@@ -693,6 +704,7 @@ mod tests {
             scroll_speed: 3,
             reduced_motion: false,
             default_approval: "strict".to_string(),
+            skip_permissions: false,
             context_token_budget: 128_000,
             microcompaction: false,
             max_tool_roundtrips: None,
@@ -777,6 +789,17 @@ mod tests {
         assert_eq!(
             providers.handle_key(ModalKey::Enter),
             ModalOutcome::Emit(ModalAction::OpenLoginMethod)
+        );
+    }
+
+    #[test]
+    fn approvals_menu_toggles_session_skip_permissions() {
+        let snap = snapshot();
+        let mut approvals = SubMenu::new(Category::Approvals, &snap);
+        approvals.handle_key(ModalKey::Down);
+        assert_eq!(
+            approvals.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::ToggleSkipPermissions)
         );
     }
 

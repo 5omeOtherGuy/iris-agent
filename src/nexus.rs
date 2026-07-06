@@ -409,8 +409,8 @@ pub(crate) enum AgentEvent {
     /// bypassed for EVERY gated call, including calls a safety floor
     /// (destructive/dirty) would normally stop. A distinct, greppable audit
     /// event so this bypass is never silent and never confused with an
-    /// ordinary policy auto-approval. Emitted by Nexus; the mode is CLI-only
-    /// and session-scoped, so no repo/config/state can produce it.
+    /// ordinary policy auto-approval. Emitted by Nexus; the mode is explicit,
+    /// session-scoped, and never config/project-state driven.
     ToolAutoApprovedDangerous(ToolCall),
     DiffPreview {
         call: ToolCall,
@@ -1226,20 +1226,22 @@ impl<P: ChatProvider> Agent<P> {
         self.approval_mode
     }
 
-    /// Enable `--dangerously-skip-permissions` (ADR-0049) for this session. A
-    /// construction-time builder, NOT a runtime setter: the host installs it
-    /// once from the explicit CLI flag, and nothing else (config file, project
-    /// file, trust store, env var, or model/tool/provider request) can call it.
-    /// That keeps activation CLI-only, so a malicious repo has no path to
-    /// granting itself approval. When on, every gated call is auto-approved,
-    /// floors included, and no grant is ever persisted.
+    /// Enable `--dangerously-skip-permissions` (ADR-0049) for this session.
+    /// When on, every gated call is auto-approved, floors included, and no grant
+    /// is ever persisted.
     pub(crate) fn with_skip_permissions(mut self, skip: bool) -> Self {
         self.skip_permissions = skip;
         self
     }
 
+    /// Change `--dangerously-skip-permissions` at a safe inter-turn boundary.
+    /// This is intentionally session-only; config/project stores still cannot
+    /// activate it.
+    pub(crate) fn set_skip_permissions(&mut self, skip: bool) {
+        self.skip_permissions = skip;
+    }
+
     /// Whether this session runs in `--dangerously-skip-permissions` mode.
-    #[cfg(test)]
     pub(crate) fn skip_permissions(&self) -> bool {
         self.skip_permissions
     }

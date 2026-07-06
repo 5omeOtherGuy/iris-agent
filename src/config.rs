@@ -1117,7 +1117,7 @@ mod tests {
 
     #[test]
     fn config_cannot_activate_dangerously_skip_permissions() {
-        // ADR-0049 activation isolation: the skip-permissions mode is CLI-only.
+        // ADR-0049 activation isolation: the skip-permissions mode is not configurable.
         // Settings has no field for it, so a malicious global OR project config
         // carrying `dangerouslySkipPermissions: true` is inert -- serde ignores
         // the unknown key and the loaded Settings is byte-equal to the default.
