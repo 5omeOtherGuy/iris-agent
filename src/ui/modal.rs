@@ -102,6 +102,8 @@ pub(crate) enum ModalAction {
     },
     /// Settings -> open the existing `/model` picker (default model).
     OpenModelPicker,
+    /// Settings -> toggle this session's dangerous approval-gate bypass.
+    ToggleSkipPermissions,
     /// Settings -> open the existing `/trust` project-permissions modal.
     OpenTrustMenu,
     /// Settings -> open the existing `/scoped-models` picker.

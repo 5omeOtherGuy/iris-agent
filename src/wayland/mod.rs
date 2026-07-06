@@ -428,6 +428,17 @@ impl<P: ChatProvider> Harness<P> {
         self.agent.approval_mode()
     }
 
+    /// Change this session's dangerous approval-gate bypass at the inter-turn
+    /// boundary. Session-only: nothing is persisted.
+    pub(crate) fn set_skip_permissions(&mut self, skip: bool) {
+        self.agent.set_skip_permissions(skip);
+    }
+
+    /// Whether the dangerous approval-gate bypass is active for this session.
+    pub(crate) fn skip_permissions(&self) -> bool {
+        self.agent.skip_permissions()
+    }
+
     /// Swap the active provider at a safe turn boundary, delegating to the bare
     /// agent (which re-plans the model-visible tool surface). Tier 3 owns the
     /// active selection, system prompt, and provider construction; the harness
