@@ -16,7 +16,7 @@ Iris is still in pre-release. Until the first public GitHub release and crates.i
 publish are cut, install from Git with a Rust toolchain:
 
 ```bash
-cargo install --git https://github.com/5omeOtherGuy/iris-agent.git --locked
+cargo install --git https://github.com/5omeOtherGuy/iris-agent.git iris-agent --locked
 ```
 
 Or run from a source checkout:
