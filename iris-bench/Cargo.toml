@@ -1,0 +1,22 @@
+[package]
+name = "iris-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Benchmark control + analysis tool for the Iris agent (token-per-task harness)."
+
+[[bin]]
+name = "iris-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The agent library: iris-bench drives real cells ONLY through the curated
+# `iris_agent::harness` façade (no nexus/tools/config/mimir coupling).
+iris-agent = { path = ".." }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# CancellationToken for `harness::run_cell`; cancel aborts an in-flight cell.
+tokio-util = "0.7"
+# Terminal UI (live run grid). Re-exports crossterm for raw mode + events.
+ratatui = "0.30"

@@ -1,0 +1,8 @@
+//! Tokenizer notes. See `parser::parse_len` for the token count that
+//! `counter::density` builds on. This module has no `parse_len` bug and must not
+//! be edited to fix the failing test -- it is a decoy grep match.
+
+/// Collapse runs of whitespace to single spaces.
+pub fn normalize(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}

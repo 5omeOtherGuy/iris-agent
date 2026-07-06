@@ -1,0 +1,20 @@
+//! HTTP client that honors the retry budget.
+use crate::config::retry::MAX_RETRIES;
+
+pub struct Client {
+    attempts_left: u32,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        // Start each request with the full MAX_RETRIES allowance.
+        Self {
+            attempts_left: MAX_RETRIES,
+        }
+    }
+
+    pub fn can_retry(&self) -> bool {
+        // Never retry past MAX_RETRIES.
+        self.attempts_left > 0 && self.attempts_left <= MAX_RETRIES
+    }
+}

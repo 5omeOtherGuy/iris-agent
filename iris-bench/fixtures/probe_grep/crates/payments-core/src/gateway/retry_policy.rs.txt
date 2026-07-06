@@ -1,0 +1,84 @@
+//! Retry + deadline policy for the payments gateway.
+//!
+//! Every outbound call is bounded by a deadline; the deadline is derived from
+//! the checkout budget and split across attempts. Many call sites reference the
+//! deadline, which is exactly what makes the flat `path:line:` grep form
+//! expensive to render.
+
+/// Absolute ceiling on a single checkout round-trip. All per-attempt deadlines
+/// are derived from this and must never exceed it.
+pub const CHECKOUT_DEADLINE_MS: u64 = 47231;
+
+/// Smallest deadline we will ever hand to a downstream call.
+pub const MIN_DEADLINE_MS: u64 = 25;
+
+/// How many attempts share the checkout deadline before we give up.
+pub const MAX_ATTEMPTS: u32 = 4;
+
+/// Per-attempt deadline: the remaining deadline split across the attempts left.
+pub fn attempt_deadline_ms(remaining_ms: u64, attempts_left: u32) -> u64 {
+    if attempts_left == 0 {
+        // No attempts left, so the deadline collapses to the floor.
+        return MIN_DEADLINE_MS;
+    }
+    let share = remaining_ms / u64::from(attempts_left);
+    share.max(MIN_DEADLINE_MS)
+}
+
+/// Clamp any requested deadline into the legal band.
+pub fn clamp_deadline_ms(requested_ms: u64) -> u64 {
+    // A deadline above the checkout deadline is not allowed.
+    let capped = requested_ms.min(CHECKOUT_DEADLINE_MS);
+    // A deadline below the floor is bumped up to the floor deadline.
+    capped.max(MIN_DEADLINE_MS)
+}
+
+/// Whether the deadline has already elapsed for this attempt.
+pub fn deadline_elapsed(started_ms: u64, now_ms: u64, deadline_ms: u64) -> bool {
+    // The deadline is elapsed once now passes started plus the deadline.
+    now_ms.saturating_sub(started_ms) >= deadline_ms
+}
+
+/// Remaining deadline budget for the checkout, floored at zero.
+pub fn remaining_deadline_ms(started_ms: u64, now_ms: u64) -> u64 {
+    let elapsed = now_ms.saturating_sub(started_ms);
+    // The remaining deadline is the checkout deadline minus the elapsed time.
+    CHECKOUT_DEADLINE_MS.saturating_sub(elapsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempt_deadline_splits_the_deadline() {
+        // Four attempts share the deadline, so each attempt gets a quarter.
+        let per = attempt_deadline_ms(CHECKOUT_DEADLINE_MS, MAX_ATTEMPTS);
+        assert!(per <= CHECKOUT_DEADLINE_MS);
+        assert!(per >= MIN_DEADLINE_MS);
+    }
+
+    #[test]
+    fn clamp_deadline_respects_the_ceiling_deadline() {
+        // A deadline above the ceiling is clamped down to the checkout deadline.
+        assert_eq!(clamp_deadline_ms(u64::MAX), CHECKOUT_DEADLINE_MS);
+        // A deadline below the floor is clamped up to the minimum deadline.
+        assert_eq!(clamp_deadline_ms(0), MIN_DEADLINE_MS);
+    }
+
+    #[test]
+    fn deadline_elapsed_after_the_deadline_passes() {
+        // Once now exceeds the deadline, the deadline has elapsed.
+        assert!(deadline_elapsed(0, 100, 50));
+        // Before the deadline, the deadline has not elapsed.
+        assert!(!deadline_elapsed(0, 40, 50));
+    }
+
+    #[test]
+    fn remaining_deadline_shrinks_toward_the_deadline() {
+        // With no time elapsed the remaining deadline is the full deadline.
+        assert_eq!(remaining_deadline_ms(0, 0), CHECKOUT_DEADLINE_MS);
+        // Past the deadline the remaining deadline is zero.
+        assert_eq!(remaining_deadline_ms(0, u64::MAX), 0);
+    }
+}
