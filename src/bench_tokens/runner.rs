@@ -95,25 +95,39 @@ pub(crate) struct ScriptedSkipRun {
     pub(crate) outcome: Outcome,
 }
 
-fn enforce_failing_then_passing_bash(
+/// Whether a repair workload's fixture is genuinely broken BEFORE the model (or
+/// scripted provider) runs. Model-independent: it runs the workload's own
+/// mechanical check against the pristine, built-but-unmodified workspace and
+/// treats "check fails" as "starts broken".
+///
+/// This replaces gating validity on the model's recorded bash exit codes. A real
+/// model routinely pipes `cargo test` through `head`/`tail` to bound output, so
+/// the recorded process exit becomes 0 even though the test failed -- the old
+/// gate then marked a perfectly good repair invalid because no `101` was seen.
+/// That measured shell style, not the repair. Bracketing on the fixture's actual
+/// pre-state is robust to how the model chooses to invoke the tests.
+fn fixture_starts_broken(workload: &Workload, workspace: &std::path::Path) -> bool {
+    !(workload.check)(workspace, "").success
+}
+
+/// Enforce that a repair workload's fixture was genuinely broken before the run.
+/// If it was not (the task was already green -- a fixture bug), the run is
+/// invalid and cannot count as success. When it did start broken, the post-run
+/// mechanical check alone decides success, so a real-but-unfixed attempt stays
+/// VALID (a first-class safety/non-regression signal) instead of being dropped.
+fn enforce_started_broken(
     workload: &Workload,
     outcome: &mut Outcome,
-    exits: &[i32],
+    started_broken: bool,
 ) -> bool {
-    if !workload.require_failing_then_passing_bash || !outcome.success {
+    if !workload.require_failing_then_passing_bash {
         return true;
     }
-    let Some((&last, before_last)) = exits.split_last() else {
+    if !started_broken {
         outcome.success = false;
-        outcome.detail = "expected a failing cargo test before the final passing cargo test; no bash exits were recorded".to_string();
-        return false;
-    };
-    let reproduced_failure = before_last.iter().any(|&code| code != 0);
-    if last != 0 || !reproduced_failure {
-        outcome.success = false;
-        outcome.detail = format!(
-            "expected failing-then-passing bash exits for the chained repair; got {exits:?}"
-        );
+        outcome.detail =
+            "fixture did not start in a failing state before the run (workload bug); run invalid"
+                .to_string();
         return false;
     }
     true
@@ -133,6 +147,7 @@ pub(crate) fn run_scripted_skip_perms(workload: &Workload, arm: Arm) -> Scripted
         "bench workspace must be a temp dir, not the repo: {}",
         workspace.path.display()
     );
+    let started_broken = fixture_starts_broken(workload, &workspace.path);
     let provider = ScriptedProvider::new((workload.script)());
     let mut agent = Agent::new(provider, built_in_tools()).with_skip_permissions(true);
     agent.set_approval_mode(ApprovalMode::Auto);
@@ -160,7 +175,7 @@ pub(crate) fn run_scripted_skip_perms(workload: &Workload, arm: Arm) -> Scripted
 
     let bash_exit_codes = observer.bash_exit_codes.borrow().clone();
     let mut outcome = (workload.check)(&workspace.path, &observer.final_text());
-    enforce_failing_then_passing_bash(workload, &mut outcome, &bash_exit_codes);
+    enforce_started_broken(workload, &mut outcome, started_broken);
     ScriptedSkipRun {
         approvals_consulted: gate.consulted.get(),
         dangerous_approvals: observer.dangerous_approvals.get(),
@@ -183,6 +198,24 @@ pub(crate) fn bench_reasoning() -> Option<crate::mimir::selection::ReasoningEffo
         crate::mimir::selection::ReasoningEffort::parse(raw.trim())
             .expect("valid IRIS_BENCH_REASONING"),
     )
+}
+
+/// Soft cap on tool round-trips for a real bench cell. The agent loop is
+/// unbounded by default (it ends only when the model stops calling tools), so a
+/// stuck live session could loop for a long time -- and run many-way in
+/// parallel that burns tokens and can hang the whole batch. `IRIS_BENCH_MAX_ROUNDTRIPS`
+/// overrides the project/user setting; when neither is set we apply a generous
+/// bounded cap so a wedged cell ends gracefully. A completed chained repair here
+/// needs only a handful of round-trips, so this never truncates real work.
+pub(crate) fn bench_max_roundtrips(settings: &crate::config::Settings) -> Option<usize> {
+    if let Ok(raw) = std::env::var("IRIS_BENCH_MAX_ROUNDTRIPS") {
+        let parsed: usize = raw
+            .trim()
+            .parse()
+            .expect("valid IRIS_BENCH_MAX_ROUNDTRIPS (a positive integer)");
+        return Some(parsed);
+    }
+    settings.max_tool_roundtrips().or(Some(40))
 }
 
 /// Build a `ModelSelection` for a `provider:model` spec, overriding provider,
@@ -359,6 +392,10 @@ pub(crate) fn run_real_cell(
         "bench workspace escaped to the repo tree: {}",
         cwd.display()
     );
+    // Bracket the repair: confirm the fixture is genuinely broken before the
+    // model touches it (model-independent), so validity does not depend on how
+    // the model plumbs its test command's exit code.
+    let started_broken = fixture_starts_broken(workload, &cwd);
     let tools = built_in_tools();
     let system_prompt = crate::wayland::system_prompt::assemble(&cwd, &tools);
     let settings = crate::config::Settings::load(&cwd).map_err(|e| e.to_string())?;
@@ -366,7 +403,7 @@ pub(crate) fn run_real_cell(
     let provider = crate::build_provider(selection, &system_prompt, &session_id)
         .map_err(|e| format!("build provider: {e}"))?;
     let mut agent = Agent::new(provider, built_in_tools())
-        .with_max_tool_roundtrips(settings.max_tool_roundtrips());
+        .with_max_tool_roundtrips(bench_max_roundtrips(&settings));
     // Skip-permissions workloads (bash) bypass the approval gate for every
     // gated call (ADR-0049); no-bash workloads keep the deny gate.
     if matches!(workload.approval, ApprovalProfile::SkipPermissions) {
@@ -397,7 +434,7 @@ pub(crate) fn run_real_cell(
 
     let bash_exit_codes = observer.bash_exit_codes.borrow().clone();
     let mut outcome = (workload.check)(&cwd, &observer.final_text());
-    let valid = enforce_failing_then_passing_bash(workload, &mut outcome, &bash_exit_codes);
+    let valid = enforce_started_broken(workload, &mut outcome, started_broken);
     let record = RealRunRecord {
         valid,
         arm,
@@ -495,4 +532,36 @@ pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("current-thread runtime")
         .block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bench_max_roundtrips;
+    use crate::config::Settings;
+
+    /// The real-cell loop must be bounded: unset -> a generous default cap,
+    /// `IRIS_BENCH_MAX_ROUNDTRIPS` -> exactly that cap. Env is process-global, so
+    /// serialize through the shared env lock.
+    #[test]
+    fn bench_max_roundtrips_defaults_bounded_and_env_overrides() {
+        let _env = crate::mimir::test_support::env_lock();
+        let settings = Settings::default();
+        assert_eq!(settings.max_tool_roundtrips(), None);
+
+        // Unset -> bounded default (never unbounded for a live cell).
+        unsafe {
+            std::env::remove_var("IRIS_BENCH_MAX_ROUNDTRIPS");
+        }
+        assert_eq!(bench_max_roundtrips(&settings), Some(40));
+
+        // Override wins over the default.
+        unsafe {
+            std::env::set_var("IRIS_BENCH_MAX_ROUNDTRIPS", "12");
+        }
+        assert_eq!(bench_max_roundtrips(&settings), Some(12));
+
+        unsafe {
+            std::env::remove_var("IRIS_BENCH_MAX_ROUNDTRIPS");
+        }
+    }
 }

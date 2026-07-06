@@ -54,10 +54,14 @@ pub(crate) struct Workload {
     /// materialized -- for inputs too large to commit (e.g. the >1000-file tree
     /// the find probe needs). `None` for ordinary committed-fixture workloads.
     pub(crate) build: Option<fn(&Path)>,
-    /// For repair-loop bash workloads, require the model to actually reproduce
-    /// a failing test before the final passing test. This prevents a shortcut
-    /// where the model reads enough code to patch first and only runs a green
-    /// test, which would no longer exercise the intended chained workflow.
+    /// Marks a repair-loop bash workload: the fixture ships broken and the task
+    /// is to make its tests pass. The harness brackets the run by confirming the
+    /// fixture is genuinely failing BEFORE the model runs (see
+    /// `fixture_starts_broken`) and letting the post-run mechanical check decide
+    /// success. Validity is thus independent of how the model plumbs its test
+    /// command -- e.g. piping `cargo test` through `head` masks the failing exit
+    /// code, so gating on the recorded exit sequence measured shell style, not
+    /// the repair. `false` for read-only or non-repair workloads.
     pub(crate) require_failing_then_passing_bash: bool,
 }
 

@@ -1274,3 +1274,61 @@ mean (CI [-4407,-749]). The rest are small/noisy/inconclusive.
 
 Conclusion: the sharded high-N harness works and gives the right safety evidence.
 The product-level efficiency claim remains workload-dependent, not global.
+
+## Entry 28 - Reseeded real-PR suite, bounded round-trips, robust validity bracket (Sonnet 4.6 low, N=3 x 2 arms)
+
+Replaced the six synthetic Iris/ampi chained workloads with four reconstructed
+from real merged OSS PRs (Multi-SWE-bench family): `chained-clap-conflict-panic-fix`
+(clap #5298), `chained-bytes-sign-extend-fix` (bytes #732),
+`chained-nushell-not-precedence-fix` (nushell #11672),
+`chained-dayjs-tz-locale-fix` (dayjs #2420). Selection is biased toward large,
+naturally-verbose tool output (the regime reduction targets), pre-declared, not
+outcome-selected; dayjs is the small-output control. No output is padded.
+
+Two harness fixes prompted by the first live pass:
+
+1. Bounded round-trips. The real-cell agent loop was unbounded (ends only when
+   the model stops calling tools), so a wedged live session could loop and, run
+   8-way in parallel, burn tokens and hang the batch. Added
+   `IRIS_BENCH_MAX_ROUNDTRIPS` (bench_max_roundtrips); unset -> a generous
+   bounded default (40), which never truncates a real repair (they finish in a
+   handful of round-trips). Unit-tested.
+
+2. Robust validity bracket (brittle-gate fix). The old
+   `require_failing_then_passing_bash` gate keyed VALIDITY on the model's
+   recorded bash exit codes: it wanted a non-zero (failing) `cargo test` before
+   the final zero. But a real model routinely pipes `cargo test | head` to bound
+   output, which makes the recorded process exit 0 even though the test failed.
+   First live pass: clap and nushell came back 0/6 success purely because no
+   `101` was recorded (bytes/dayjs happened to run bare `cargo test`, so they
+   passed) -- the gate measured shell style, not the repair. Replaced with
+   `fixture_starts_broken` + `enforce_started_broken`: the harness runs the
+   workload's own mechanical check against the pristine (built, unmodified)
+   workspace and requires it to FAIL, then lets the post-run check alone decide
+   success. Model-independent. A genuinely-broken task the model fails to fix now
+   stays VALID+unsuccessful (a real safety signal) instead of being dropped. The
+   deterministic replay test still asserts fail-then-pass on the SCRIPTED (bare,
+   unmasked) bash exits, so that property remains guarded in the gate.
+
+Live re-run after the fix (authorized parallel batch, 4 workloads x 2 arms, N=3,
+sharded one process per cell, max round-trips 40):
+
+- 24/24 valid, 24/24 success in BOTH arms (was 12/24 valid before the fix; the
+  clap/nushell false-invalids are gone). No tool-call loops beyond one long clap
+  exploration; tool_errors only the benign "read before edit" retry.
+- Median input_tokens (defaults A vs baseline B): bytes -7.1%, nushell -9.9%,
+  dayjs -3.2%, clap +37.1%.
+- clap's +37% is a single outlier: defaults run3 took 12 model round-trips
+  (123,425 tok) vs baseline's max 9. At matched 6 round-trips clap defaults
+  (52,062) is marginally cheaper than baseline (52,891/53,232). Pooled across the
+  suite, each extra model round-trip costs ~10,400 tok (corr 0.77): token cost is
+  dominated by round-trip count (model nondeterminism), not the arm.
+
+Conclusion: N=3 is a smoke -- directional only, round-trip-variance-dominated,
+not a headline. Its real payload is validating both harness fixes end-to-end
+against a real provider: the round-trip cap holds and the validity bracket no
+longer penalizes a good repair for how the model piped its test command. A
+higher-N, round-trip-controlled run is still required before any efficiency
+claim. Consistent with Entry 27: reduction is a clean win where tool output is a
+large share of the conversation and wash otherwise; the dominant small-task cost
+driver is the number of model round-trips.
