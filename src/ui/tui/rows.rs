@@ -12,7 +12,7 @@ use super::panel::{
 use super::wrap::{
     display_width, line_text, pad_line_left, pad_line_right, push_wrapped_line,
     push_wrapped_line_wordwise, push_wrapped_line_wordwise_with_prefix, push_wrapped_row,
-    push_wrapped_row_with_prefix, truncate_line, truncate_to_width,
+    push_wrapped_row_with_prefix, truncate_to_width,
 };
 use super::{BOX_X_PADDING, TEXT_COLUMN_X_PADDING, TEXT_X_PADDING, dim_style};
 
@@ -131,6 +131,18 @@ impl TranscriptRow {
                     ));
                     return;
                 }
+            }
+            if let ChromeRow::Notice {
+                glyph,
+                glyph_style,
+                message,
+            } = chrome
+            {
+                // A notice wraps and carries its rail onto continuation rows,
+                // so `render_rows` handles it directly rather than through the
+                // single-line `chrome.render` path.
+                push_notice_rows(width, glyph, *glyph_style, message, out);
+                return;
             }
             out.push(chrome.render(width));
             return;
@@ -251,7 +263,6 @@ pub(super) enum ChromeRow {
         glyph: String,
         glyph_style: Style,
         message: String,
-        hint: String,
     },
     /// A reasoning-rail header — a chromeless fold anchor. Carries the same
     /// `expanded` flag the fold machinery reads (so `ctrl+o` and the visibility
@@ -328,8 +339,17 @@ impl ChromeRow {
                 glyph,
                 glyph_style,
                 message,
-                hint,
-            } => notice_line(width, glyph, *glyph_style, message, hint),
+            } => {
+                // The real (wrapping, coalesced-rail) rendering lives in
+                // `render_rows`; this single-line form is a defensive fallback
+                // for the generic chrome path only.
+                let mut line = Line::from(vec![
+                    Span::styled(format!("{glyph} "), *glyph_style),
+                    Span::styled(message.clone(), dim_style()),
+                ]);
+                pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
+                line
+            }
             ChromeRow::RailHeader {
                 expanded,
                 label,
@@ -416,33 +436,32 @@ fn body_rule_line(prefix: &str, rule: char, style: Style, width: usize) -> Line<
     ))
 }
 
-fn notice_line(
+/// A system notice as a quiet left-rail aside: `<glyph> <message>` on the text
+/// column (glyph col 4, message col 6), word-wrapped with the rail carried onto
+/// continuation rows — so a run of notices reads as one connected aside rather
+/// than isolated ticks floating in whitespace. An info notice leads with the
+/// `┊` rail glyph, so every wrapped line re-emits the rail exactly like the
+/// reasoning trace (§7.6); an error's `■` marks the first line and its
+/// continuation hangs under the message.
+fn push_notice_rows(
     width: usize,
     glyph: &str,
     glyph_style: Style,
     message: &str,
-    hint: &str,
-) -> Line<'static> {
-    let left = format!("{glyph} {message}");
-    let mut spans = vec![
+    out: &mut Vec<Line<'static>>,
+) {
+    let render_width = width
+        .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+        .max(1);
+    let first = Line::from(vec![
         Span::styled(format!("{glyph} "), glyph_style),
         Span::styled(message.to_string(), dim_style()),
-    ];
-    if !hint.is_empty() {
-        let content_width = width
-            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
-            .max(1);
-        let left_w = display_width(&left);
-        let hint_w = display_width(hint);
-        if left_w + 2 + hint_w <= content_width {
-            spans.push(Span::raw(" ".repeat(content_width - left_w - hint_w)));
-            spans.push(Span::styled(hint.to_string(), dim_style()));
-        }
+    ]);
+    let start = out.len();
+    push_wrapped_line_wordwise_with_prefix(&first, render_width, "\u{250a} ", out);
+    for physical in &mut out[start..] {
+        pad_line_left(physical, TEXT_COLUMN_X_PADDING);
     }
-    let mut line = Line::from(spans);
-    pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
-    truncate_line(&mut line, width.max(1));
-    line
 }
 
 const TURN_DIVIDER_LEADER_WIDTH: usize = TEXT_COLUMN_X_PADDING + 4 - BOX_X_PADDING;
