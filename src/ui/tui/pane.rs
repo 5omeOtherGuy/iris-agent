@@ -3,24 +3,27 @@
 //! This is a child module of `ui::tui`, so it can build retained transcript rows
 //! without exposing pane rendering policy outside the Iris CLI/TUI layer.
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 
+use super::panel_style;
 use super::rows::{FoldVis, TranscriptRow};
 use super::wrap::line_text;
-use super::{dim_style, panel_style};
 
-pub(super) const ASSISTANT_TEXT_PREFIX: &str = "  ";
+/// The 2-cell gutter every transcript turn hangs its body under. It holds the
+/// user's `›` marker on the first line of a user turn; the agent's gutter is
+/// blank (the agent is the transcript's default voice and speaks unmarked). The
+/// body column is the same for both — one shared text column at the gutter's
+/// right edge.
+pub(super) const TEXT_GUTTER: &str = "  ";
 
-/// Columns the markdown table layout may use: the assistant content area minus
-/// the leading marker/continuation prefix that `assistant_row` prepends, so a
-/// full-width table line plus its prefix still fits the render width.
+/// Columns the markdown table layout may use: the agent content area minus the
+/// leading gutter that `assistant_row` prepends, so a full-width table line plus
+/// its gutter still fits the render width.
 fn markdown_width(content_width: usize) -> usize {
-    content_width
-        .saturating_sub(ASSISTANT_TEXT_PREFIX.len())
-        .max(1)
+    content_width.saturating_sub(TEXT_GUTTER.len()).max(1)
 }
 
 pub(super) fn push_assistant_rows(rows: &mut Vec<TranscriptRow>, width: usize, text: &str) {
@@ -43,86 +46,63 @@ pub(super) fn assistant_rows(text: &str, content_width: usize) -> Vec<Transcript
 }
 
 pub(super) fn push_user_rows(rows: &mut Vec<TranscriptRow>, text: &str) {
+    // The `›` marks the turn, not every line: only the first non-empty line
+    // carries it, so a multi-line ask reads as one marked block hanging under
+    // one marker.
+    let mut marked = false;
     for line in text.split('\n') {
-        rows.push(user_row(line));
+        let show_marker = !marked && !line.trim().is_empty();
+        marked |= show_marker;
+        rows.push(user_row(line, show_marker));
     }
 }
 
-fn user_row(text: &str) -> TranscriptRow {
+fn user_row(text: &str, show_marker: bool) -> TranscriptRow {
     if text.is_empty() {
         return TranscriptRow::new(String::new(), panel_style());
     }
-
-    TranscriptRow {
-        text: text.to_string(),
-        style: panel_style(),
-        continuation_prefix: Some(ASSISTANT_TEXT_PREFIX),
-        line: None,
-        fold: FoldVis::Always,
-        word_wrap: true,
-        background: None,
-        hrule: false,
-        chrome: None,
-        searchable: true,
-    }
+    // `›` in ink+bold is the transcript's one scannable anchor (the eye jumps
+    // to "what did I ask?"); the body hangs under it on the shared text column.
+    // Monochrome-safe: marker + position carry it, not color.
+    let (lead, lead_style) = if show_marker {
+        (
+            format!("{} ", crate::ui::symbols::USER),
+            panel_style().add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (TEXT_GUTTER.to_string(), panel_style())
+    };
+    let line = Line::from(vec![
+        Span::styled(lead, lead_style),
+        Span::styled(text.to_string(), panel_style()),
+    ]);
+    marker_row(text.to_string(), line)
 }
 
 fn push_assistant_markdown_lines(rows: &mut Vec<TranscriptRow>, lines: Vec<Line<'static>>) {
-    let mut at_block_start = true;
     for line in lines {
-        let is_blank = line_text(&line).trim().is_empty();
-        let show_marker = at_block_start && assistant_marker_target(&line);
-        rows.push(assistant_row(line, show_marker));
-        at_block_start = is_blank;
+        rows.push(assistant_row(line));
     }
 }
 
-fn assistant_marker_target(line: &Line<'static>) -> bool {
-    let text = line_text(line);
-    let trimmed = text.trim_start();
-    !trimmed.is_empty()
-        && !text.chars().next().is_some_and(char::is_whitespace)
-        && !is_list_row(trimmed)
-        && !is_structural_markdown_row(trimmed)
-}
-
-fn is_structural_markdown_row(trimmed: &str) -> bool {
-    trimmed.starts_with(crate::ui::symbols::SEP)
-        || trimmed.starts_with('>')
-        || trimmed == "---"
-        || matches!(trimmed.chars().next(), Some('┌' | '│' | '├' | '└'))
-}
-
-fn is_list_row(trimmed: &str) -> bool {
-    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
-        return true;
-    }
-    let Some((marker, _)) = trimmed.split_once(' ') else {
-        return false;
-    };
-    marker
-        .strip_suffix('.')
-        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
-}
-
-fn assistant_row(mut line: Line<'static>, show_marker: bool) -> TranscriptRow {
+/// The agent speaks unmarked: its rendered markdown line hangs on the shared
+/// text column under a blank gutter, no `›` (the user's turn is the marked one,
+/// docs/TUI_DESIGN_LANGUAGE.md §7).
+fn assistant_row(mut line: Line<'static>) -> TranscriptRow {
     let text = line_text(&line);
-    if show_marker {
-        // The assistant marker is recessive transcript chrome, not a state dot:
-        // muted, never the active/live accent (docs/TUI_DESIGN_LANGUAGE.md §4).
-        line.spans.insert(
-            0,
-            Span::styled(format!("{} ", crate::ui::symbols::ASSISTANT), dim_style()),
-        );
-    } else {
-        line.spans
-            .insert(0, Span::styled(ASSISTANT_TEXT_PREFIX, Style::default()));
-    }
+    line.spans
+        .insert(0, Span::styled(TEXT_GUTTER, Style::default()));
+    marker_row(text, line)
+}
 
+/// A conversation row: `text` is the searchable content (no gutter) and `line`
+/// is the same content with its 2-cell gutter already prepended, laid out on the
+/// shared text column and wrapping under the gutter.
+fn marker_row(text: String, line: Line<'static>) -> TranscriptRow {
     TranscriptRow {
         text,
         style: panel_style(),
-        continuation_prefix: Some(ASSISTANT_TEXT_PREFIX),
+        continuation_prefix: Some(TEXT_GUTTER),
         line: Some(line),
         fold: FoldVis::Always,
         word_wrap: true,

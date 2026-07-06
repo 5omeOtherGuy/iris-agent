@@ -14,8 +14,10 @@
 //! stay local; single-call-site decorations that appear in exactly one file
 //! (e.g. the `◉`/`○` radio marks in `src/ui/modal.rs`) may also stay local.
 
-/// `›` — the assistant transcript marker. Never a state dot.
-pub(crate) const ASSISTANT: &str = "\u{203a}";
+/// `›` — the user transcript marker: the one turn the transcript marks, so the
+/// eye can scan back to what was asked. The agent speaks unmarked. Never a state
+/// dot.
+pub(crate) const USER: &str = "\u{203a}";
 
 /// `◉` — active / selected mode (composer top-frame mode glyph, picker rows).
 pub(crate) const ACTIVE: &str = "\u{25c9}";
