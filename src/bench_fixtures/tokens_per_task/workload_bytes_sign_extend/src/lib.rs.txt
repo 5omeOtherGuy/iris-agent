@@ -1,0 +1,19 @@
+//! A tiny, dependency-free byte-buffer reader.
+//!
+//! This crate exposes a single trait, [`Buf`], a cursor over a byte
+//! sequence with fixed-width and variable-width integer readers in both
+//! endiannesses. It is implemented for `&[u8]`, so a byte slice can be
+//! decoded directly with no allocation.
+//!
+//! # Example
+//!
+//! ```
+//! use workload_bytes_sign_extend::Buf;
+//!
+//! let mut buf = &b"\x00\x2a"[..];
+//! assert_eq!(42, buf.get_u16());
+//! ```
+
+mod buf_impl;
+
+pub use buf_impl::{Buf, SliceReader};

@@ -1,8 +1,0 @@
-//! Provider adapters. Only one adapter has the live reasoning summary bug; the
-//! benchmark builder adds many extra provider-like files next to these to force
-//! discovery instead of a one-file lookup.
-
-pub mod anthropic_messages;
-pub mod antigravity;
-pub mod openai_codex_responses;
-pub mod openai_compatible_chat;

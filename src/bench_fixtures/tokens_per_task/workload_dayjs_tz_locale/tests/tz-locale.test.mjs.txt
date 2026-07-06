@@ -1,0 +1,22 @@
+import test from "node:test";
+import assert from "node:assert";
+import { d } from "../src/index.mjs";
+
+// Mirrors iamkun/dayjs PR #2420: the timezone plugin must preserve the
+// locale (and its weekStart) when reconstructing an instance.
+test("preserves locality when tz is called", () => {
+  const OFFSET = 120; // fixed tz, +02:00
+
+  // Default locale => week starts Sunday => 2023-02-12.
+  const base = d("2023-02-17", OFFSET).tz(OFFSET);
+  assert.strictEqual(base.startOf("week").format("YYYY-MM-DD"), "2023-02-12");
+
+  // Locale weekStart=3 (Wednesday) => week starts 2023-02-15.
+  const localized = d("2023-02-17", OFFSET)
+    .locale({ name: "custom", weekStart: 3 })
+    .tz(OFFSET);
+  assert.strictEqual(
+    localized.startOf("week").format("YYYY-MM-DD"),
+    "2023-02-15"
+  );
+});

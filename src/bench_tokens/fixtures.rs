@@ -52,31 +52,6 @@ pub(crate) fn build_find_tree(root: &Path) {
     .expect("write target file");
 }
 
-/// Build decoy provider files around the chained PR-404-style workload. The
-/// target bug is committed in `openai_codex_responses.rs`; these generated files
-/// make broad `find`/`grep reasoning|summary` discovery noisy enough to exercise
-/// output reduction without committing dozens of inert fixture files.
-pub(crate) fn build_chained_provider_tree(root: &Path) {
-    let dir = root.join("src/providers/generated");
-    fs::create_dir_all(&dir).expect("create generated provider dir");
-    for i in 0..72u32 {
-        let body = format!(
-            "//! Generated provider adapter decoy {i:02}.\n\
-             //! Mentions reasoning summary routing, cache policy, and live rails,\n\
-             //! but this file is not compiled into the fixture crate.\n\n\
-             pub fn provider_{i:02}_label() -> &'static str {{\n\
-                 \"provider-{i:02}\"\n\
-             }}\n\n\
-             pub fn reasoning_summary_supported_{i:02}() -> bool {{\n\
-                 // Decoy: openai compatible summary support is negotiated elsewhere.\n\
-                 {}\n\
-             }}\n",
-            i % 3 == 0
-        );
-        fs::write(dir.join(format!("provider_{i:02}.rs")), body).expect("write decoy provider");
-    }
-}
-
 /// Add generic cargo/npm decoys around PR-seeded chained repair fixtures. The
 /// decoys are not imported by the fixture programs, but they make broad
 /// discovery (`find`, `grep auth`, `grep fold`, `grep package`) look like a real

@@ -1,7 +1,0 @@
-pub fn usage_records_supported() -> bool {
-    false
-}
-
-pub fn provider_label() -> &'static str {
-    "antigravity"
-}

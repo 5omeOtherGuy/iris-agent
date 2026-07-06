@@ -1,5 +1,0 @@
-// BUG (mirrors ampi PR #224): GH_TOKEN and GITHUB_PERSONAL_ACCESS_TOKEN are
-// common GitHub auth variables, but this resolver only accepts the older names.
-export function githubToken(env = process.env) {
-  return env.AMPI_GITHUB_TOKEN ?? env.GITHUB_TOKEN ?? null;
-}

@@ -1,8 +1,0 @@
-{
-  "name": "ampi-pack-untracked-fixture",
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "test": "node --test tests/*.test.mjs"
-  }
-}

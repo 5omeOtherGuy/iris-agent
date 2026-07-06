@@ -1,5 +1,0 @@
-// BUG (mirrors ampi PR #222): package filtering excludes dotfiles but forgets
-// the private docs tree, so docs/private can leak into the npm tarball.
-export function publishedFiles(files) {
-  return files.filter((file) => !file.startsWith('.'));
-}

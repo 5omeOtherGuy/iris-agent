@@ -1,0 +1,10 @@
+[package]
+name = "clap_conflict_min"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "clap_conflict_min"
+path = "src/lib.rs"
+
+[dependencies]

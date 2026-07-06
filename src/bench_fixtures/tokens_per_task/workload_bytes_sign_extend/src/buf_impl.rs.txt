@@ -1,0 +1,442 @@
+//! A minimal, self-contained `Buf`-like reader over byte slices.
+//!
+//! This module provides the [`Buf`] trait, a cursor-style reader for
+//! network- and file-oriented byte decoding. It mirrors the shape of a
+//! real byte-buffer abstraction: a rich set of fixed-width and
+//! variable-width integer readers in both big-endian and little-endian
+//! flavors, plus the cursor bookkeeping (`remaining`, `advance`,
+//! `has_remaining`, `chunk`) that those readers are built on.
+//!
+//! The trait is implemented for `&[u8]`, so a plain byte slice can be
+//! read from directly. Reading advances the slice in place, exactly like
+//! consuming bytes off the front of a stream.
+
+use core::mem;
+
+/// Loads a fixed-width big-endian integer of type `$typ` from `$this`.
+///
+/// Reads `size_of::<$typ>()` bytes from the front of the buffer, advances
+/// past them, and assembles them in big-endian order.
+macro_rules! load_be {
+    ($this:ident, $typ:tt) => {{
+        const SIZE: usize = mem::size_of::<$typ>();
+        assert!(
+            $this.remaining() >= SIZE,
+            concat!("load ", stringify!($typ), ": buffer underflow")
+        );
+
+        let mut buf = [0u8; SIZE];
+        $this.copy_to_slice(&mut buf);
+        $typ::from_be_bytes(buf)
+    }};
+}
+
+/// Loads a fixed-width little-endian integer of type `$typ` from `$this`.
+///
+/// Reads `size_of::<$typ>()` bytes from the front of the buffer, advances
+/// past them, and assembles them in little-endian order.
+macro_rules! load_le {
+    ($this:ident, $typ:tt) => {{
+        const SIZE: usize = mem::size_of::<$typ>();
+        assert!(
+            $this.remaining() >= SIZE,
+            concat!("load ", stringify!($typ), ": buffer underflow")
+        );
+
+        let mut buf = [0u8; SIZE];
+        $this.copy_to_slice(&mut buf);
+        $typ::from_le_bytes(buf)
+    }};
+}
+
+/// Read bytes from a buffer.
+///
+/// A `Buf` is a cursor over a sequence of bytes. Each read method pulls
+/// bytes from the front of the cursor and advances it forward, so the
+/// same reader can be threaded through a decoder that consumes a header,
+/// then a body, then a trailer.
+///
+/// The two required methods, [`remaining`] and [`chunk`], together with
+/// [`advance`], form the primitive layer. Every typed reader below is a
+/// default method implemented purely in terms of those primitives, so an
+/// implementor only has to supply the cursor mechanics.
+///
+/// [`remaining`]: Buf::remaining
+/// [`chunk`]: Buf::chunk
+/// [`advance`]: Buf::advance
+pub trait Buf {
+    /// Returns the number of bytes between the current position and the
+    /// end of the buffer.
+    ///
+    /// This value is greater than or equal to the length of the slice
+    /// returned by [`chunk`](Buf::chunk).
+    fn remaining(&self) -> usize;
+
+    /// Returns a slice starting at the current position and of length
+    /// between 0 and [`remaining`](Buf::remaining).
+    ///
+    /// A non-empty buffer must return a non-empty chunk.
+    fn chunk(&self) -> &[u8];
+
+    /// Advances the internal cursor of the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cnt > self.remaining()`.
+    fn advance(&mut self, cnt: usize);
+
+    /// Returns true if there are any more bytes to consume.
+    fn has_remaining(&self) -> bool {
+        self.remaining() > 0
+    }
+
+    /// Copies bytes from `self` into `dst`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.remaining() < dst.len()`.
+    fn copy_to_slice(&mut self, dst: &mut [u8]) {
+        let mut off = 0;
+
+        assert!(
+            self.remaining() >= dst.len(),
+            "copy_to_slice: not enough bytes remaining"
+        );
+
+        while off < dst.len() {
+            let cnt;
+
+            {
+                let src = self.chunk();
+                cnt = usize::min(src.len(), dst.len() - off);
+
+                dst[off..off + cnt].copy_from_slice(&src[..cnt]);
+                off += cnt;
+            }
+
+            self.advance(cnt);
+        }
+    }
+
+    // ---- unsigned fixed-width, big-endian ----
+
+    /// Reads an unsigned 8-bit integer from `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no more remaining data.
+    fn get_u8(&mut self) -> u8 {
+        assert!(self.remaining() >= 1, "get_u8: buffer underflow");
+        let ret = self.chunk()[0];
+        self.advance(1);
+        ret
+    }
+
+    /// Reads a signed 8-bit integer from `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no more remaining data.
+    fn get_i8(&mut self) -> i8 {
+        assert!(self.remaining() >= 1, "get_i8: buffer underflow");
+        let ret = self.chunk()[0] as i8;
+        self.advance(1);
+        ret
+    }
+
+    /// Reads an unsigned 16-bit integer in big-endian byte order.
+    fn get_u16(&mut self) -> u16 {
+        load_be!(self, u16)
+    }
+
+    /// Reads an unsigned 16-bit integer in little-endian byte order.
+    fn get_u16_le(&mut self) -> u16 {
+        load_le!(self, u16)
+    }
+
+    /// Reads a signed 16-bit integer in big-endian byte order.
+    fn get_i16(&mut self) -> i16 {
+        load_be!(self, u16) as i16
+    }
+
+    /// Reads a signed 16-bit integer in little-endian byte order.
+    fn get_i16_le(&mut self) -> i16 {
+        load_le!(self, u16) as i16
+    }
+
+    /// Reads an unsigned 32-bit integer in big-endian byte order.
+    fn get_u32(&mut self) -> u32 {
+        load_be!(self, u32)
+    }
+
+    /// Reads an unsigned 32-bit integer in little-endian byte order.
+    fn get_u32_le(&mut self) -> u32 {
+        load_le!(self, u32)
+    }
+
+    /// Reads a signed 32-bit integer in big-endian byte order.
+    fn get_i32(&mut self) -> i32 {
+        load_be!(self, u32) as i32
+    }
+
+    /// Reads a signed 32-bit integer in little-endian byte order.
+    fn get_i32_le(&mut self) -> i32 {
+        load_le!(self, u32) as i32
+    }
+
+    /// Reads an unsigned 64-bit integer in big-endian byte order.
+    fn get_u64(&mut self) -> u64 {
+        load_be!(self, u64)
+    }
+
+    /// Reads an unsigned 64-bit integer in little-endian byte order.
+    fn get_u64_le(&mut self) -> u64 {
+        load_le!(self, u64)
+    }
+
+    /// Reads a signed 64-bit integer in big-endian byte order.
+    fn get_i64(&mut self) -> i64 {
+        load_be!(self, u64) as i64
+    }
+
+    /// Reads a signed 64-bit integer in little-endian byte order.
+    fn get_i64_le(&mut self) -> i64 {
+        load_le!(self, u64) as i64
+    }
+
+    /// Reads an unsigned 128-bit integer in big-endian byte order.
+    fn get_u128(&mut self) -> u128 {
+        load_be!(self, u128)
+    }
+
+    /// Reads an unsigned 128-bit integer in little-endian byte order.
+    fn get_u128_le(&mut self) -> u128 {
+        load_le!(self, u128)
+    }
+
+    /// Reads a signed 128-bit integer in big-endian byte order.
+    fn get_i128(&mut self) -> i128 {
+        load_be!(self, u128) as i128
+    }
+
+    /// Reads a signed 128-bit integer in little-endian byte order.
+    fn get_i128_le(&mut self) -> i128 {
+        load_le!(self, u128) as i128
+    }
+
+    // ---- unsigned variable-width ----
+
+    /// Reads an unsigned n-byte integer in big-endian byte order.
+    ///
+    /// `nbytes` must be in the range `1..=8`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are fewer than `nbytes` remaining, or if `nbytes`
+    /// is greater than 8.
+    fn get_uint(&mut self, nbytes: usize) -> u64 {
+        assert!(nbytes <= 8, "get_uint: nbytes must be <= 8");
+        assert!(self.remaining() >= nbytes, "get_uint: buffer underflow");
+
+        let mut buf = [0u8; 8];
+        // Big-endian: the nbytes land in the low-order positions.
+        self.copy_to_slice(&mut buf[8 - nbytes..]);
+        u64::from_be_bytes(buf)
+    }
+
+    /// Reads an unsigned n-byte integer in little-endian byte order.
+    ///
+    /// `nbytes` must be in the range `1..=8`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are fewer than `nbytes` remaining, or if `nbytes`
+    /// is greater than 8.
+    fn get_uint_le(&mut self, nbytes: usize) -> u64 {
+        assert!(nbytes <= 8, "get_uint_le: nbytes must be <= 8");
+        assert!(self.remaining() >= nbytes, "get_uint_le: buffer underflow");
+
+        let mut buf = [0u8; 8];
+        // Little-endian: the nbytes land in the low-order positions.
+        self.copy_to_slice(&mut buf[..nbytes]);
+        u64::from_le_bytes(buf)
+    }
+
+    // ---- signed variable-width ----
+
+    /// Reads a signed n-byte integer in big-endian byte order.
+    ///
+    /// `nbytes` must be in the range `1..=8`. The value is interpreted as
+    /// a two's-complement signed integer that is `nbytes` bytes wide.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are fewer than `nbytes` remaining, or if `nbytes`
+    /// is greater than 8.
+    fn get_int(&mut self, nbytes: usize) -> i64 {
+        assert!(nbytes <= 8, "get_int: nbytes must be <= 8");
+        assert!(self.remaining() >= nbytes, "get_int: buffer underflow");
+
+        let mut buf = [0u8; 8];
+        // Big-endian: copy nbytes into the low-order positions.
+        self.copy_to_slice(&mut buf[8 - nbytes..]);
+        i64::from_be_bytes(buf)
+    }
+
+    /// Reads a signed n-byte integer in little-endian byte order.
+    ///
+    /// `nbytes` must be in the range `1..=8`. The value is interpreted as
+    /// a two's-complement signed integer that is `nbytes` bytes wide.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are fewer than `nbytes` remaining, or if `nbytes`
+    /// is greater than 8.
+    fn get_int_le(&mut self, nbytes: usize) -> i64 {
+        assert!(nbytes <= 8, "get_int_le: nbytes must be <= 8");
+        assert!(self.remaining() >= nbytes, "get_int_le: buffer underflow");
+
+        let mut buf = [0u8; 8];
+        // Little-endian: copy nbytes into the low-order positions.
+        self.copy_to_slice(&mut buf[..nbytes]);
+        i64::from_le_bytes(buf)
+    }
+
+    // ---- floating point ----
+
+    /// Reads an IEEE754 single-precision float in big-endian byte order.
+    fn get_f32(&mut self) -> f32 {
+        f32::from_bits(self.get_u32())
+    }
+
+    /// Reads an IEEE754 single-precision float in little-endian byte order.
+    fn get_f32_le(&mut self) -> f32 {
+        f32::from_bits(self.get_u32_le())
+    }
+
+    /// Reads an IEEE754 double-precision float in big-endian byte order.
+    fn get_f64(&mut self) -> f64 {
+        f64::from_bits(self.get_u64())
+    }
+
+    /// Reads an IEEE754 double-precision float in little-endian byte order.
+    fn get_f64_le(&mut self) -> f64 {
+        f64::from_bits(self.get_u64_le())
+    }
+}
+
+/// `Buf` is implemented for shared byte slices.
+///
+/// Reading from a `&[u8]` advances the slice in place: after a read, the
+/// slice references the bytes that have not yet been consumed. This makes
+/// a plain slice usable as a throwaway cursor:
+///
+/// ```
+/// use workload_bytes_sign_extend::Buf;
+///
+/// let mut buf = &b"\x01\x02\x03\x04"[..];
+/// assert_eq!(0x0102, buf.get_u16());
+/// assert_eq!(2, buf.remaining());
+/// ```
+impl Buf for &[u8] {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.len()
+    }
+
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        self
+    }
+
+    #[inline]
+    fn advance(&mut self, cnt: usize) {
+        assert!(
+            self.len() >= cnt,
+            "advance: cannot advance past the end of the buffer"
+        );
+        *self = &self[cnt..];
+    }
+
+    #[inline]
+    fn copy_to_slice(&mut self, dst: &mut [u8]) {
+        assert!(
+            self.len() >= dst.len(),
+            "copy_to_slice: not enough bytes remaining"
+        );
+        let (head, tail) = self.split_at(dst.len());
+        dst.copy_from_slice(head);
+        *self = tail;
+    }
+}
+
+/// A position-tracking reader over a borrowed byte slice.
+///
+/// Unlike reading directly from a `&[u8]` (which forgets how far it has
+/// come), `SliceReader` keeps the original slice and an offset. This makes
+/// it useful when a decoder needs to report where in the input it is, or
+/// to rewind to a previously recorded position.
+///
+/// # Example
+///
+/// ```
+/// use workload_bytes_sign_extend::{Buf, SliceReader};
+///
+/// let mut r = SliceReader::new(b"\x00\x2a\xff");
+/// assert_eq!(0, r.position());
+/// assert_eq!(42, r.get_u16());
+/// assert_eq!(2, r.position());
+/// ```
+#[derive(Clone, Debug)]
+pub struct SliceReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SliceReader<'a> {
+    /// Creates a new reader positioned at the start of `data`.
+    pub fn new(data: &'a [u8]) -> Self {
+        SliceReader { data, pos: 0 }
+    }
+
+    /// Returns the current byte offset from the start of the input.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Sets the current byte offset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pos` is beyond the end of the underlying slice.
+    pub fn set_position(&mut self, pos: usize) {
+        assert!(pos <= self.data.len(), "set_position: out of bounds");
+        self.pos = pos;
+    }
+
+    /// Returns the yet-to-be-consumed tail of the input.
+    pub fn remaining_slice(&self) -> &'a [u8] {
+        &self.data[self.pos..]
+    }
+}
+
+impl Buf for SliceReader<'_> {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        &self.data[self.pos..]
+    }
+
+    #[inline]
+    fn advance(&mut self, cnt: usize) {
+        assert!(
+            self.remaining() >= cnt,
+            "advance: cannot advance past the end of the buffer"
+        );
+        self.pos += cnt;
+    }
+}
