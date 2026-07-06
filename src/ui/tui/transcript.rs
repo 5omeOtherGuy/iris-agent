@@ -7,23 +7,21 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
-use crate::tool_display::run_target;
 use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
 use crate::ui::{TurnErrorKind, UiEvent};
 
 use super::pane;
 use super::panel::{
     FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
-    edit_footer_extras, join_meta_fields, panel_state,
+    edit_footer_extras, join_meta_fields, panel_state, review_footer_extras,
 };
 use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
 use super::streaming::StreamController;
-use super::text::ansi_spans;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
 use super::wrap::line_text;
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_TRANSCRIPT_ROWS, TEXT_COLUMN_X_PADDING, dim_style, err_style,
-    format_elapsed_compact, ok_style, panel_style, tool_header_style, turn_divider_label,
+    format_elapsed_compact, tool_header_style, turn_divider_label,
 };
 
 /// Reasoning-rail label. Uppercase like the other structural labels; the rail
@@ -97,20 +95,21 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
 
 /// Build the transient thinking-preview rows for a live reasoning summary: the
 /// `THINKING` rail header plus dim rail-body lines of the rendered markdown.
-/// Not foldable and rendered whole (a live, growing trace shows everything); it
-/// is replaced by the foldable committed block once the trace is finalized. The
-/// markdown is rendered at the same `content_width` the committed block uses, so
-/// finalizing never reflows the already-shown lines.
+/// Shown expanded (`▾ THINKING`) and whole while it streams — a live, growing
+/// trace shows everything, exactly as a running tool block stays open on its
+/// tail — then replaced by the committed block, which arrives collapsed, once
+/// the trace finalizes. The markdown is rendered at the same `content_width` the
+/// committed block uses, so finalizing never reflows the already-shown lines.
 fn live_reasoning_preview_rows(text: &str, content_width: usize) -> Vec<TranscriptRow> {
     let theme = MarkdownTheme::thinking()
         .with_code_highlighting()
         .with_hyperlinks();
     let mut rows = Vec::new();
     rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
-        expanded: false,
+        expanded: true,
         label: THINKING_LABEL.to_string(),
         right: String::new(),
-        foldable: false,
+        foldable: true,
     }));
     for line in render_markdown_themed(text, &theme, content_width) {
         rows.push(rail_body_row(line));
@@ -149,6 +148,14 @@ struct ActiveTool {
     started: Instant,
     /// Explicit user fold intent; see [`ActiveExec::user_expanded`].
     user_expanded: Option<bool>,
+}
+
+/// The offered choices for a pending in-block approval — mirrors the loop's
+/// `ApprovalRequest` so the `▲ REVIEW` footer only shows keys the loop honors.
+struct ReviewGate {
+    allow_always: bool,
+    allow_project: bool,
+    reason: Option<String>,
 }
 
 /// The open EDIT panel for a mutation whose diff arrived via `DiffPreview`.
@@ -294,6 +301,15 @@ pub(super) struct Transcript {
     /// ingests the tool results. Numbers are honest: fields exist only when the
     /// runtime measured them.
     tool_diags: std::collections::HashMap<String, ToolDiag>,
+    /// Per-call review affordance, set while a gated call is `▲ REVIEW` so its
+    /// footer can render `y approve ┊ n deny ┊ …`; dropped once it runs or is
+    /// refused. Approval lives inside the tool block — there is no separate
+    /// approval panel.
+    review_gates: std::collections::HashMap<String, ReviewGate>,
+    /// Per-call decision note (`approved this time/session/project`) for a
+    /// *manually* approved call — appended as a muted footer field on the
+    /// running/done rebuilds. Auto-approved calls carry none.
+    approval_notes: std::collections::HashMap<String, &'static str>,
     /// The proposing turn's `↓received` diagnostic (output tokens it generated),
     /// stamped onto every tool call that turn proposes. Holds only the output
     /// side; the input side (`↑/cache/ctx`) comes from the following turn.
@@ -372,11 +388,12 @@ impl Transcript {
     /// left-rail block (the `ThinkingBlock` design-system component): reasoning
     /// is internal, verbose, and secondary, so it gets **no box** — only a muted
     /// `┊` rail on its body and a `THINKING` label with honest telemetry.
-    /// Progressive disclosure: the first paragraph shows as a preview, the rest
-    /// folds behind an `… N more paragraphs   ctrl+o to expand` affordance
-    /// (`toggle_latest_panel`). Short (single-paragraph) reasoning is shown
-    /// whole and is not foldable. A `redacted` block has no recoverable text, so
-    /// a placeholder is shown and the original reasoning is never rendered.
+    /// Progressive disclosure uses the SAME binary `▾`/`▸` whole-block
+    /// disclosure as tool blocks: it always carries the indicator, arrives
+    /// collapsed to the single header line, and reveals its whole body on
+    /// `ctrl+o` / click (`toggle_latest_panel`). A `redacted` block has no
+    /// recoverable text, so a placeholder is shown and the original reasoning is
+    /// never rendered.
     fn push_thinking_block(&mut self, text: &str, redacted: bool) {
         // Reasoning is emitted at completion, after the answer's text deltas.
         // Some of the answer may already have been paced into scrollback, so the
@@ -414,7 +431,11 @@ impl Transcript {
             }
             groups
         };
-        let foldable = groups.len() > 1;
+        // Reasoning folds with the SAME binary whole-block disclosure as tool
+        // blocks (the design's one disclosure grammar): it always carries the
+        // `▾`/`▸` indicator, arrives collapsed to a single header line, and
+        // reveals its whole body on toggle (`ctrl+o` / click). No bespoke
+        // first-paragraph preview, no `… N more paragraphs` affordance.
         self.thinking_elapsed = elapsed.clone();
         // Build the rail rows into a detached block; the header is always at
         // local index 0.
@@ -423,33 +444,15 @@ impl Transcript {
             expanded: false,
             label: THINKING_LABEL.to_string(),
             right: elapsed.unwrap_or_default(),
-            foldable,
+            foldable: true,
         }));
-        let hidden = groups.len().saturating_sub(1);
         for (index, group) in groups.into_iter().enumerate() {
             if index > 0 {
                 block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
             }
-            let fold = if index == 0 {
-                FoldVis::Always
-            } else {
-                FoldVis::WhenExpanded
-            };
             for line in group {
-                block.push(rail_body_row(line).with_fold(fold));
+                block.push(rail_body_row(line).with_fold(FoldVis::WhenExpanded));
             }
-        }
-        if foldable {
-            let plural = if hidden == 1 { "" } else { "s" };
-            let left = format!("\u{2026} {hidden} more paragraph{plural}");
-            let text = super::rows::right_align(
-                &left,
-                "ctrl+o to expand",
-                self.markdown_content_width(),
-                2,
-                super::rows::Overflow::KeepLeft,
-            );
-            block.push(TranscriptRow::new(text, dim_style()).with_fold(FoldVis::WhenCollapsed));
         }
         block.push(TranscriptRow::chrome(ChromeRow::RailEnd));
 
@@ -667,47 +670,6 @@ impl Transcript {
         self.stream.has_work()
     }
 
-    pub(super) fn record_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
-        let scope = match decision {
-            ApprovalDecision::Allow => "this time",
-            ApprovalDecision::AllowAlways => "this session",
-            ApprovalDecision::AllowProject => "this project",
-            ApprovalDecision::Deny => return,
-        };
-        self.begin_block();
-        self.push_approval_panel(approval_line(call, scope), false);
-    }
-
-    fn push_approval_panel(&mut self, line: Line<'static>, failed: bool) {
-        self.mark_append_dirty();
-        self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
-        // Approval decisions have no duration: the header's elapsed field is
-        // empty, and the decision moves to the footer state label.
-        self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
-            expanded: true,
-            title: "APPROVAL",
-            meta: "decision".to_string(),
-            elapsed: String::new(),
-        }));
-        let text = line_text(&line);
-        self.rows.push(
-            TranscriptRow::chrome_with_text(
-                ChromeRow::Body { line, bg: None },
-                text,
-                panel_style(),
-            )
-            .with_fold(FoldVis::WhenExpanded),
-        );
-        let base_style = if failed { err_style() } else { ok_style() };
-        self.push_block_footer(
-            if failed { "DENIED" } else { "APPROVED" },
-            base_style.add_modifier(ratatui::style::Modifier::BOLD),
-            Vec::new(),
-            None,
-            None,
-        );
-    }
-
     /// Fallback (non-streamed) result render, used when no live exec cell was
     /// opened: exploration tools group under `Explored`; everything else gets a
     /// `• Ran`/`✗ Ran` header with the same status-colored bullet + duration as
@@ -795,13 +757,15 @@ impl Transcript {
         for row in &mut body {
             row.fold = FoldVis::WhenExpanded;
         }
-        // Compact by default: only a RUNNING block arrives expanded (its live
-        // tail is already flood-bounded). Finalized blocks arrive collapsed;
-        // an explicit user expand is reapplied by the rebuild path.
-        let expanded = matches!(outcome, ToolOutcome::Running { .. });
+        // Compact by default: a RUNNING block (live tail) and a pending REVIEW
+        // block (the user must see what they are authorizing) arrive expanded.
+        // Finalized blocks arrive collapsed; an explicit user expand is
+        // reapplied by the rebuild path.
+        let expanded = matches!(outcome, ToolOutcome::Running { .. } | ToolOutcome::Review);
         self.push_tool_header(renderer, call, state, duration, started, expanded);
         self.rows.extend(body);
-        let extras = renderer.footer_extras(call, &outcome);
+        let mut extras = renderer.footer_extras(call, &outcome);
+        extras.extend(self.approval_footer_fields(&call.id, state));
         let diag = self.tool_diags.get(&call.id).cloned();
         self.push_block_footer(
             state.label(),
@@ -874,6 +838,29 @@ impl Transcript {
             diag_call,
         ));
         self.rows.push(TranscriptRow::chrome(ChromeRow::BlockEnd));
+    }
+
+    /// Fold the approval decision into a tool block's own footer (approval lives
+    /// in the tool block, never a separate panel): the `y approve ┊ …` affordance
+    /// while the block is `▲ REVIEW`, or the muted `approved this time/session/
+    /// project` note once the user has manually allowed it. Auto-approved calls
+    /// carry neither — the tool block alone is the record.
+    fn approval_footer_fields(&self, call_id: &str, state: PanelState) -> Vec<FooterField> {
+        if let Some(note) = self.approval_notes.get(call_id) {
+            return vec![FooterField::styled(*note, dim_style())];
+        }
+        if state == PanelState::Review
+            && let Some(gate) = self.review_gates.get(call_id)
+        {
+            // The safety caution (danger-toned) leads, then the affordance.
+            let mut fields = Vec::new();
+            if let Some(reason) = &gate.reason {
+                fields.push(FooterField::styled(reason.clone(), err_style()));
+            }
+            fields.extend(review_footer_extras(gate.allow_always, gate.allow_project));
+            return fields;
+        }
+        Vec::new()
     }
 
     /// Record per-call token diagnostics for a tool call's footer. The values
@@ -1017,9 +1004,13 @@ impl Transcript {
 
     fn push_panel_header_with_expanded(&mut self, spec: PanelHeaderSpec<'_>, expanded: bool) {
         self.mark_append_dirty();
-        // A pending preview has no elapsed time by definition (`◇ PREVIEW`
-        // omits the duration; asserting one would fabricate a measurement).
-        let elapsed = if spec.state == PanelState::Preview {
+        // A pending preview/review or a refused call has no elapsed time by
+        // definition (the duration is omitted; asserting one would fabricate a
+        // measurement).
+        let elapsed = if matches!(
+            spec.state,
+            PanelState::Preview | PanelState::Review | PanelState::Denied
+        ) {
             String::new()
         } else if spec.state == PanelState::Running {
             spec.started
@@ -1153,6 +1144,216 @@ impl Transcript {
         });
     }
 
+    /// Open a pending in-block review for a gated call: the tool block itself
+    /// renders `▲ REVIEW` with the affordance on its footer, so the whole
+    /// approval lifecycle lives inside the tool block (no separate panel). The
+    /// block is adopted by `ToolStarted` (→ RUNNING) on approve, or flipped to
+    /// `DENIED` in place on deny.
+    fn begin_review(&mut self, call: ToolCall, gate: ReviewGate) {
+        self.review_gates.insert(call.id.clone(), gate);
+        match tool_render::resolve(&call).kind() {
+            ToolPanelKind::Shell => self.begin_exec_review(call),
+            ToolPanelKind::Generic => {
+                // A mutation whose diff already arrived (DiffPreview) keeps that
+                // block: `◇ PREVIEW` flips to `▲ REVIEW` in place — the diff IS
+                // the review body, never a second block.
+                if !self.rebuild_active_edit(&call, PanelState::Review, None, None, true) {
+                    self.begin_tool_review(call);
+                }
+            }
+            // Read-side tools are auto-approved in practice; if one is ever
+            // gated a generic review block still surfaces the affordance.
+            ToolPanelKind::Explore => self.begin_tool_review(call),
+        }
+    }
+
+    fn begin_exec_review(&mut self, call: ToolCall) {
+        self.begin_block();
+        let body_start = self.rows.len();
+        let started = Instant::now();
+        let renderer = tool_render::resolve(&call);
+        self.append_tool_panel(
+            renderer,
+            &call,
+            PanelState::Review,
+            None,
+            Some(started),
+            ToolOutcome::Review,
+        );
+        self.active_exec = Some(ActiveExec {
+            call,
+            output: String::new(),
+            body_start,
+            started,
+            user_expanded: None,
+        });
+    }
+
+    fn begin_tool_review(&mut self, call: ToolCall) {
+        self.begin_block();
+        let body_start = self.rows.len();
+        let started = Instant::now();
+        let renderer = tool_render::resolve(&call);
+        self.append_tool_panel(
+            renderer,
+            &call,
+            PanelState::Review,
+            None,
+            Some(started),
+            ToolOutcome::Review,
+        );
+        self.active_tool = Some(ActiveTool {
+            call,
+            body_start,
+            started,
+            user_expanded: None,
+        });
+    }
+
+    /// Record a *manual* approval on the tool block's own footer (the muted
+    /// `approved this time/session/project` note) and drop the affordance in
+    /// place — no separate approval panel. The block stays `▲ REVIEW` only until
+    /// the imminent `ToolStarted` flips it to RUNNING.
+    pub(super) fn note_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
+        let note = match decision {
+            ApprovalDecision::Allow => "approved this time",
+            ApprovalDecision::AllowAlways => "approved this session",
+            ApprovalDecision::AllowProject => "approved this project",
+            // Denial has no note; it flows through the `ToolDenied` event.
+            ApprovalDecision::Deny => return,
+        };
+        self.approval_notes.insert(call.id.clone(), note);
+        self.review_gates.remove(&call.id);
+        self.rerender_active_review(call);
+    }
+
+    /// Re-render the active REVIEW block in place (staying `▲ REVIEW`) so a
+    /// just-set approval note replaces the affordance without waiting for the
+    /// next lifecycle event.
+    fn rerender_active_review(&mut self, call: &ToolCall) {
+        if self
+            .active_exec
+            .as_ref()
+            .is_some_and(|a| a.call.id == call.id)
+        {
+            let Some(active) = self.active_exec.take() else {
+                return;
+            };
+            let rows = self.collect_tool_panel(
+                tool_render::resolve(&active.call),
+                &active.call,
+                PanelState::Review,
+                None,
+                Some(active.started),
+                ToolOutcome::Review,
+            );
+            self.replace_active_exec_panel(&active, rows);
+            self.active_exec = Some(active);
+        } else if self
+            .active_edit
+            .as_ref()
+            .is_some_and(|a| a.call_id == call.id)
+        {
+            self.rebuild_active_edit(call, PanelState::Review, None, None, true);
+        } else if self
+            .active_tool
+            .as_ref()
+            .is_some_and(|a| a.call.id == call.id)
+        {
+            let Some(active) = self.active_tool.take() else {
+                return;
+            };
+            let rows = self.collect_tool_panel(
+                tool_render::resolve(&active.call),
+                &active.call,
+                PanelState::Review,
+                None,
+                Some(active.started),
+                ToolOutcome::Review,
+            );
+            self.replace_active_tool_panel(&active, rows);
+            self.active_tool = Some(active);
+        }
+    }
+
+    /// Flip a generic active tool block RUNNING in place (adopting a `▲ REVIEW`
+    /// block once the call is approved). Generic tools do not stream, so the
+    /// body is empty until the result arrives.
+    fn relayout_active_tool_running(&mut self) {
+        let Some(active) = self.active_tool.take() else {
+            return;
+        };
+        let rows = self.collect_tool_panel(
+            tool_render::resolve(&active.call),
+            &active.call,
+            PanelState::Running,
+            None,
+            Some(active.started),
+            ToolOutcome::Running { streamed: "" },
+        );
+        self.replace_active_tool_panel(&active, rows);
+        self.active_tool = Some(active);
+    }
+
+    /// Flip the active exec block to `■ DENIED` in place (the tool never ran, so
+    /// the body is just the refused command). Returns false when the call does
+    /// not match the tracked exec.
+    fn finalize_active_denied(&mut self, call: &ToolCall) -> bool {
+        let Some(active) = self.active_exec.take() else {
+            return false;
+        };
+        if active.call.id != call.id {
+            self.active_exec = Some(active);
+            return false;
+        }
+        let rows = self.collect_tool_panel(
+            tool_render::resolve(call),
+            call,
+            PanelState::Denied,
+            None,
+            Some(active.started),
+            ToolOutcome::Review,
+        );
+        self.replace_active_exec_panel(&active, rows);
+        true
+    }
+
+    /// Flip the active generic tool block to `■ DENIED` in place.
+    fn finalize_active_tool_denied(&mut self, call: &ToolCall) -> bool {
+        let Some(active) = self.active_tool.take() else {
+            return false;
+        };
+        if active.call.id != call.id {
+            self.active_tool = Some(active);
+            return false;
+        }
+        let rows = self.collect_tool_panel(
+            tool_render::resolve(call),
+            call,
+            PanelState::Denied,
+            None,
+            Some(active.started),
+            ToolOutcome::Review,
+        );
+        self.replace_active_tool_panel(&active, rows);
+        true
+    }
+
+    /// Fallback `■ DENIED` block when a denial arrives with no pending review
+    /// block to adopt (e.g. a read-side tool, or a decision that raced ahead of
+    /// its review event).
+    fn push_denied_block(&mut self, call: &ToolCall) {
+        self.begin_block();
+        self.append_tool_panel(
+            tool_render::resolve(call),
+            call,
+            PanelState::Denied,
+            None,
+            Some(Instant::now()),
+            ToolOutcome::Review,
+        );
+    }
+
     /// Push a complete EDIT block whose body is the canonical block diff
     /// (`DiffBlock` rows verbatim) and whose footer carries the `+n −n` counts
     /// and note as fields after the state label. The body folds whole behind
@@ -1170,11 +1371,14 @@ impl Transcript {
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
         let diff_rows = diff_table_rows(diff);
-        // EXCEPTION to compact-by-default: a pending EDIT preview exists to be
-        // reviewed, so it (and the running edit) arrives EXPANDED; it collapses
-        // once the edit is finalized (state Done/Error). An explicit user fold
-        // is reapplied by the rebuild path.
-        let expanded = matches!(state, PanelState::Preview | PanelState::Running);
+        // EXCEPTION to compact-by-default: a pending EDIT preview/review exists
+        // to be reviewed, so it (and the running edit) arrives EXPANDED; it
+        // collapses once the edit is finalized (state Done/Error). An explicit
+        // user fold is reapplied by the rebuild path.
+        let expanded = matches!(
+            state,
+            PanelState::Preview | PanelState::Review | PanelState::Running
+        );
         self.push_panel_header_with_expanded(
             PanelHeaderSpec {
                 title: "EDIT",
@@ -1242,10 +1446,12 @@ impl Transcript {
         let (added, removed) = diff_counts(diff);
         let note = diff.contains("--- /dev/null").then_some("new file");
         let diag = self.tool_diags.get(&call.id).cloned();
+        let mut extras = edit_footer_extras(added, removed, note);
+        extras.extend(self.approval_footer_fields(&call.id, state));
         self.push_block_footer(
             state.label(),
             state.label_style(),
-            edit_footer_extras(added, removed, note),
+            extras,
             diag.as_ref(),
             Some(&call.id),
         );
@@ -2062,6 +2268,8 @@ impl Transcript {
                 // patches, and the ctx baseline so a new conversation never
                 // inherits stale numbers.
                 self.tool_diags.clear();
+                self.review_gates.clear();
+                self.approval_notes.clear();
                 self.current_turn_diag = None;
                 self.awaiting_input_calls.clear();
                 self.last_turn_input_tokens = None;
@@ -2077,11 +2285,33 @@ impl Transcript {
                 self.assign_turn_diag(&call.id);
                 match tool_render::resolve(&call).kind() {
                     ToolPanelKind::Explore => self.push_explored_start(&call),
-                    ToolPanelKind::Shell => self.begin_exec(call),
+                    ToolPanelKind::Shell => {
+                        // Adopt a pending `▲ REVIEW` block (approved): flip it to
+                        // `● RUNNING` in place instead of opening a second block.
+                        if self
+                            .active_exec
+                            .as_ref()
+                            .is_some_and(|a| a.call.id == call.id)
+                        {
+                            self.review_gates.remove(&call.id);
+                            self.relayout_active_running();
+                        } else {
+                            self.begin_exec(call);
+                        }
+                    }
                     ToolPanelKind::Generic => {
-                        // A mutation whose diff already arrived keeps its EDIT
-                        // panel: the preview flips to `● RUNNING` in place.
-                        if !self.rebuild_active_edit(&call, PanelState::Running, None, None, true) {
+                        // A mutation whose diff/review block already exists keeps
+                        // it: the preview/review flips to `● RUNNING` in place.
+                        if self.rebuild_active_edit(&call, PanelState::Running, None, None, true) {
+                            self.review_gates.remove(&call.id);
+                        } else if self
+                            .active_tool
+                            .as_ref()
+                            .is_some_and(|a| a.call.id == call.id)
+                        {
+                            self.review_gates.remove(&call.id);
+                            self.relayout_active_tool_running();
+                        } else {
                             self.begin_tool(call);
                         }
                     }
@@ -2107,28 +2337,45 @@ impl Transcript {
                     self.relayout_active_running();
                 }
             }
-            UiEvent::ToolAutoApproved(call) => {
-                self.record_approval(&call, ApprovalDecision::AllowAlways);
+            UiEvent::ToolReview {
+                call,
+                allow_always,
+                allow_project,
+                reason,
+            } => {
+                self.assign_turn_diag(&call.id);
+                self.begin_review(
+                    call,
+                    ReviewGate {
+                        allow_always,
+                        allow_project,
+                        reason,
+                    },
+                );
+            }
+            UiEvent::ToolAutoApproved(_call) => {
+                // Auto-approval is implicit in the policy; the tool block alone
+                // is the record. No approval chrome, no separate panel.
             }
             UiEvent::DiffPreview { call, diff } => {
                 self.assign_turn_diag(&call.id);
                 self.begin_edit_preview(&call, diff);
             }
             UiEvent::ToolDenied(call) => {
-                // The pending EDIT panel (if any) stays as the `◇ PREVIEW`
-                // record of what was proposed; the decision is its own block.
-                self.active_edit = None;
-                self.begin_block();
-                let mut spans = Vec::new();
-                if call.name == "bash" {
-                    spans.push(Span::styled("$ ", dim_style()));
+                // The decision lives in the tool block: flip the pending review
+                // (or edit preview) to `■ DENIED` in place — never a second
+                // block, never a duplicated command.
+                self.review_gates.remove(&call.id);
+                // Flip the first matching pending block (exec review, edit
+                // preview, or generic tool review) to `■ DENIED` in place,
+                // short-circuiting on the first adopter; fall back to a
+                // standalone denied block when none matches.
+                let adopted = self.finalize_active_denied(&call)
+                    || self.rebuild_active_edit(&call, PanelState::Denied, None, None, false)
+                    || self.finalize_active_tool_denied(&call);
+                if !adopted {
+                    self.push_denied_block(&call);
                 }
-                spans.extend(ansi_spans(&run_target(&call), Style::default()));
-                spans.push(Span::styled(
-                    format!("  {} denied", crate::ui::symbols::SEP),
-                    err_style(),
-                ));
-                self.push_approval_panel(Line::from(spans), true);
             }
             UiEvent::ToolResult {
                 call,
@@ -2855,20 +3102,4 @@ impl Transcript {
             total_lines,
         }
     }
-}
-
-/// The APPROVAL body line: the authorized action (with a `$ ` prompt for shell
-/// commands) plus a muted `┊ approved <scope>` reason. The decision itself is
-/// carried by the header (`◆ APPROVED`); the body never repeats a state glyph.
-fn approval_line(call: &ToolCall, scope: &str) -> Line<'static> {
-    let mut spans = Vec::new();
-    if call.name == "bash" {
-        spans.push(Span::styled("$ ", dim_style()));
-    }
-    spans.extend(ansi_spans(&run_target(call), Style::default()));
-    spans.push(Span::styled(
-        format!("  {} approved {scope}", crate::ui::symbols::SEP),
-        dim_style(),
-    ));
-    Line::from(spans)
 }

@@ -43,7 +43,7 @@ use super::text::{ansi_spans, strip_ansi_for_text};
 use super::wrap::{clamp_output_line, display_width, truncate_chars, wrapped_row_estimate};
 use super::{
     MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, PANEL_BODY_CHROME_WIDTH, dim_style,
-    err_style, panel_style,
+    err_style, panel_style, stdout_style,
 };
 
 /// The panel family a tool renders as. Selects the stateful dispatch path in
@@ -87,6 +87,12 @@ pub(super) enum ToolOutcome<'a> {
     Error { message: &'a str, streamed: &'a str },
     /// Cancelled. `streamed` is whatever streamed before cancellation.
     Cancelled { streamed: &'a str },
+    /// Awaiting the user's approval decision (`▲ REVIEW`) or refused (`■
+    /// DENIED`). The body shows only what is being authorized (the command /
+    /// target) — no output, no live `$█` cursor; the affordance and any decision
+    /// note ride the footer. Denial reuses this body: a refused call has no
+    /// output either.
+    Review,
 }
 
 /// A built-in tool renderer. Adopted from pi-mono's `ToolDefinition` render
@@ -343,6 +349,9 @@ impl ToolRenderer for ShellRenderer {
                 }
                 body.line(&format!("error: {message}"), err_style());
             }
+            // Review/Denied: the command block above is the whole body — no live
+            // `$█` cursor, no output (the call has not run).
+            ToolOutcome::Review => {}
             ToolOutcome::Cancelled { streamed } => {
                 if !streamed.is_empty() {
                     body.output_tail(streamed);
@@ -388,8 +397,10 @@ fn generic_body(ctx: &RenderCtx, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
         ToolOutcome::Error { message, .. } => {
             body.line(&format!("error: {message}"), err_style());
         }
-        // Cancelled generic/edit panels are header-only (no body rows).
-        ToolOutcome::Cancelled { .. } => {}
+        // Cancelled generic/edit panels are header-only (no body rows). A
+        // pending/refused review is likewise header-only — the header meta
+        // carries the target being authorized.
+        ToolOutcome::Cancelled { .. } | ToolOutcome::Review => {}
     }
     body.into_rows()
 }
@@ -467,16 +478,18 @@ pub(super) fn render_body(
 
 // --- Panel body builder -----------------------------------------------------
 
-/// Free helper used by the gutter output lines: a dim, ANSI-preserving line with
-/// an optional leading prefix span.
-fn tool_output_line(prefix: &'static str, line: &str) -> Line<'static> {
+/// Free helper used by the gutter output lines: an ANSI-preserving line with an
+/// optional leading prefix span. `base` styles any text the program didn't
+/// colour itself — `stdout_style()` for SHELL output, so unstyled program text
+/// sits in the readable stdout grey rather than the darker `muted`.
+fn tool_output_line(prefix: &'static str, line: &str, base: Style) -> Line<'static> {
     let mut spans = vec![Span::styled(prefix, dim_style())];
     // Linkify conservative workspace `file:line` references in tool output so
     // they become clickable OSC 8 targets. Applied per parsed ANSI span (styling
     // preserved); a reference split across ANSI style runs is left untouched.
     // The workspace root is only resolved when a line actually holds a match.
     let mut root: Option<std::path::PathBuf> = None;
-    for span in ansi_spans(line, dim_style()) {
+    for span in ansi_spans(line, base) {
         let content = span.content.as_ref();
         if crate::ui::hyperlink::find_file_refs(content).is_empty() {
             spans.push(span);
@@ -711,9 +724,9 @@ impl PanelBody {
             format!("    {line}")
         };
         self.push_line(
-            tool_output_line("", &line),
+            tool_output_line("", &line, stdout_style()),
             strip_ansi_for_text(&legacy),
-            dim_style(),
+            stdout_style(),
         );
     }
 

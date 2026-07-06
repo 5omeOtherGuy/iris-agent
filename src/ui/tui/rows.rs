@@ -346,7 +346,11 @@ pub(super) enum Overflow {
     /// Drop `left` entirely, keep `right` hugging the right edge (tool-panel
     /// fold affordances / metadata).
     DropLeft,
-    /// Keep `left` in full, drop `right` (the transcript fold hint).
+    /// Keep `left` in full, drop `right`. Retained as the symmetric `right_align`
+    /// overflow policy (exercised by its unit tests); the transcript fold hint
+    /// that used it went away when THINKING adopted the tool-block `▾`/`▸`
+    /// disclosure (no `… N more paragraphs` row).
+    #[allow(dead_code)]
     KeepLeft,
 }
 

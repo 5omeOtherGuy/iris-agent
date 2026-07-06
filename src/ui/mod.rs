@@ -222,6 +222,19 @@ pub(crate) enum UiEvent {
     /// chose "always" for this tool earlier). Emitted by Nexus, never inferred
     /// by the UI, so the policy stays Nexus-owned.
     ToolAutoApproved(ToolCall),
+    /// A gated tool is awaiting the user's decision. Drives the in-block
+    /// `▲ REVIEW` state (the affordance lives on the tool block's footer, not a
+    /// separate panel); emitted by the loop's approval bridge before the
+    /// blocking gate so the review block exists while the composer is frozen.
+    ToolReview {
+        call: ToolCall,
+        allow_always: bool,
+        allow_project: bool,
+        /// A short danger-toned caution (`destructive`, `N pre-existing
+        /// changes`, `unsandboxed`) surfaced on the review footer so the safety
+        /// facts survive the decision point. `None` when the call is unremarkable.
+        reason: Option<String>,
+    },
     DiffPreview {
         call: ToolCall,
         diff: String,

@@ -411,7 +411,7 @@ impl SettingsMenu {
 
     pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
         let rows = selector_rows(&self.selector, "No settings");
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Settings"),
             rows,
             Some("\u{2191}\u{2193} move \u{00b7} \u{21b5} open \u{00b7} esc close"),
@@ -472,7 +472,7 @@ impl SubMenu {
 
     pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
         let rows = selector_rows(&self.selector, "No settings");
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some(self.category.title()),
             rows,
             Some(
@@ -546,7 +546,7 @@ impl EnumMenu {
             self.field.category().title(),
             self.field.label()
         );
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some(&title),
             rows,
             Some("\u{2191}\u{2193} move \u{00b7} \u{21b5} select \u{00b7} \u{2190} back"),
@@ -677,7 +677,7 @@ impl EntryDialog {
             self.field.category().title(),
             self.field.label()
         );
-        crate::ui::tui::overlay_box(Some(&title), rows, Some(footer), usize::from(width))
+        crate::ui::tui::overlay_menu(Some(&title), rows, Some(footer), usize::from(width))
     }
 }
 
