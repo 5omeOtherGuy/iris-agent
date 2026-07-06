@@ -114,7 +114,7 @@ jobs:
       - name: Install dist
         run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Download per-target artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: artifacts-build-*
           path: target/distrib
