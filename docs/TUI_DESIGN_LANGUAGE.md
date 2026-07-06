@@ -623,6 +623,36 @@ Height caps at 16 rows or ⅓ of the pane.
 - These are **disclosures, not sidebars**: invariant #1 stands — nothing
   persistent, nothing beside the transcript.
 
+#### 9.1.2 Pinned prompt band (the governing prompt)
+
+When the newest user prompt has scrolled above the viewport, its text is pinned
+as a quiet **band** directly under the session bar, so the reader always knows
+which prompt the visible content answers (grok `sticky_headers`). It reads as an
+extension of the top chrome — **not** a card floating in the transcript.
+
+```
+~/iris-agent ┊ git main                      CTX 94k/300k ●●●○○○○○○○
+────────────────────────────────────────────────────────────────────  ← session bar hairline
+
+  › the prompt the visible answer belongs to, dimmed…
+────────────────────────────────────────────────────────────────────  ← band hairline (SAME rule)
+```
+
+- **Same columns as the transcript.** The `›` marker sits on the user column
+  (col 4) and the body hangs at col 6 — a prompt looks identical whether pinned
+  or scrolled into view (§7.1). Continuation lines hang unmarked at col 6.
+- **Dim throughout.** The band is a pinned *reference*, not the live turn: the
+  whole prompt is `dim`, the differentiator from the ink transcript below. The
+  marker keeps its `›`+bold glyph; only the tone changes. Not orange, no fill.
+- **Closed by the session bar's own hairline.** The band's bottom rule is the
+  **same** inset dim `─` the session bar draws (col 2 → width−2), byte-for-byte —
+  never the composer's full-width border weight. Two matching hairlines bracket
+  the band as one top-chrome region.
+- **Capped.** A long prompt is truncated to three physical lines with a trailing
+  `…`; the full text is one scroll away. The band never grows to eat the view.
+- Yields the top row to an interactive overlay (a selection or search match
+  revealed exactly at the viewport top keeps its highlight).
+
 ### 9.2 The composer
 
 **Always present at the bottom. Never hidden, revealed, or collapsed** — there
