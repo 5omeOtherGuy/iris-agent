@@ -277,6 +277,14 @@ fn review_reason(call: &ToolCall, ctx: &ReviewContext) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+fn effective_approval_policy<P: ChatProvider>(harness: &Harness<P>) -> ApprovalPolicy {
+    if harness.skip_permissions() {
+        ApprovalPolicy::SkipPermissions
+    } else {
+        ApprovalPolicy::from(harness.approval_mode())
+    }
+}
+
 async fn session_loop<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
@@ -299,9 +307,10 @@ async fn session_loop<P: ChatProvider>(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     tui.screen.apply(UiEvent::SessionStarted);
-    // The interactive loop gates every non-allowlisted tool through the
-    // approval prompt: the effective policy posture is `on-request`.
-    tui.screen.set_approval_policy(ApprovalPolicy::OnRequest);
+    // Show the effective approval posture: skip-permissions overrides the
+    // normal approval preset because it bypasses every prompt.
+    tui.screen
+        .set_approval_policy(effective_approval_policy(harness));
     // Async git-status snapshots for the session bar + dropdowns: kick the
     // first capture at session start; last-known values paint until it lands.
     let git_cache = GitStatusCache::default();
@@ -1138,7 +1147,8 @@ fn route_command<P: ChatProvider>(
                 match crate::nexus::ApprovalMode::parse(rest) {
                     Some(mode) => {
                         harness.set_approval_mode(mode);
-                        tui.screen.set_approval_policy(ApprovalPolicy::from(mode));
+                        tui.screen
+                            .set_approval_policy(effective_approval_policy(harness));
                         vec![format!("approval mode set to {}", mode.as_token())]
                     }
                     None => vec![format!(
@@ -3039,6 +3049,26 @@ mod tests {
         ) -> Result<crate::nexus::ProviderStream<'a>> {
             Ok(Box::pin(futures::stream::empty()))
         }
+    }
+
+    #[test]
+    fn skip_permissions_overrides_statusline_approval_policy() {
+        use crate::nexus::{Agent, ApprovalMode};
+        let mut agent =
+            Agent::new(NullChat, crate::tools::built_in_tools()).with_skip_permissions(true);
+        agent.set_approval_mode(ApprovalMode::Strict);
+        let harness = crate::wayland::Harness::new(
+            agent,
+            std::env::temp_dir(),
+            crate::tools::ToolState::new(),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            effective_approval_policy(&harness),
+            ApprovalPolicy::SkipPermissions
+        );
     }
 
     #[test]
