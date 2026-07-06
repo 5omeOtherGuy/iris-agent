@@ -249,7 +249,7 @@ pub(crate) fn dim() -> Style {
 }
 
 /// Render the shared search line + windowed rows for a [`Selector`] as overlay
-/// rows: `(line, selected)` pairs for [`overlay_box`], which gives the selected
+/// rows: `(line, selected)` pairs for [`overlay_menu`], which gives the selected
 /// row the surface fill (never a colored accent). The selected label is bold;
 /// metadata stays muted; an enabled/disabled mark uses the `◉`/`○` glyphs from
 /// the closed vocabulary (never `[x]`). `empty` is the no-match message.
@@ -474,7 +474,7 @@ impl ModelPicker {
             "↑↓ move · ←→ effort ({}) · ↵ select · s session · esc cancel",
             self.display_effort().as_str()
         );
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Select model"),
             rows,
             Some(&footer),
@@ -786,7 +786,7 @@ impl ScopedModels {
         let footer = format!(
             "↵ toggle · ctrl+a all · ctrl+x clear · ctrl+p provider · alt+↑↓ reorder · ctrl+s save · {count}{unsaved}"
         );
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Scoped models"),
             rows,
             Some(&footer),
@@ -850,7 +850,7 @@ impl EffortPicker {
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
         let rows = selector_rows(&self.selector, "No levels");
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Reasoning effort"),
             rows,
             Some("↑↓ move · ↵ select · esc cancel"),
@@ -964,7 +964,7 @@ impl TrustMenu {
             Some(posture) => format!("sandbox: {posture} · ↑↓ move · ↵ toggle/revoke · esc close"),
             None => "↑↓ move · ↵ toggle/revoke · esc close".to_string(),
         };
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Project permissions"),
             rows,
             Some(hint.as_str()),
@@ -1052,7 +1052,7 @@ impl SessionPicker {
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
         let rows = selector_rows(&self.selector, "No sessions to resume");
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Resume session"),
             rows,
             Some("↑↓ move · type to filter · ↵ resume · esc cancel"),
@@ -1207,7 +1207,7 @@ impl TaskPicker {
                 .iter()
                 .map(|line| (Line::from(Span::styled(line.clone(), dim())), false))
                 .collect();
-            return crate::ui::tui::overlay_box(
+            return crate::ui::tui::overlay_menu(
                 Some(&format!("Sessions \u{00b7} task {}", detail.task_short)),
                 rows,
                 Some("\u{2190} back \u{00b7} esc close"),
@@ -1222,7 +1222,7 @@ impl TaskPicker {
             }
         }
         rows.extend(selector_rows(&self.selector, "No recoverable tasks"));
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Tasks"),
             rows,
             Some(self.footer_hint()),
@@ -1325,7 +1325,7 @@ impl MethodSelect {
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
         let rows = selector_rows(&self.selector, "No methods");
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some("Login"),
             rows,
             Some("↑↓ move · ↵ select · esc cancel"),
@@ -1425,7 +1425,7 @@ impl ProviderSelect {
             ProviderPurpose::ApiKeyLogin => "Store API key",
             ProviderPurpose::Logout => "Logout",
         };
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some(title),
             rows,
             Some("↑↓ move · ↵ select · esc cancel"),
@@ -1528,7 +1528,7 @@ impl LoginDialog {
             }
         }
         let title = format!("Login — {}", self.provider_name);
-        crate::ui::tui::overlay_box(Some(&title), rows, Some("esc cancel"), usize::from(width))
+        crate::ui::tui::overlay_menu(Some(&title), rows, Some("esc cancel"), usize::from(width))
     }
 }
 
@@ -1594,7 +1594,7 @@ impl ApiKeyDialog {
             (Line::from(Span::raw(format!("> {masked}"))), false),
         ];
         let title = format!("API key — {}", self.provider_name);
-        crate::ui::tui::overlay_box(
+        crate::ui::tui::overlay_menu(
             Some(&title),
             rows,
             Some("↵ save · esc cancel"),
@@ -1677,9 +1677,13 @@ mod tests {
             ReasoningEffort::High,
         );
         let text = render_text(&picker);
-        // Bordered box, uppercase title, ◉ current marker, provider meta.
+        // Frameless: bold uppercase title, ◉ current marker, provider meta — and
+        // no box-drawing frame anywhere.
         assert!(text.contains("SELECT MODEL"), "{text}");
-        assert!(text.contains('┌') && text.contains('└'), "{text}");
+        assert!(
+            !text.chars().any(|c| "┌┐└┘├┤│".contains(c)),
+            "no frame chars: {text}"
+        );
         assert!(text.contains("◉ GPT 5.5"), "{text}");
         assert!(text.contains("OpenAI"), "{text}");
         assert!(text.contains("default"), "{text}");
@@ -2174,13 +2178,10 @@ mod tests {
         }
         // The complete URL survives wrapping (char-wrapped, contiguous), so the
         // copy/paste fallback is the full, working URL rather than a clipped one.
-        // Strip the box chrome (│ + one padding cell each side) before joining.
+        // Frameless rows carry no box chrome; just trim the row padding.
         let joined: String = texts
             .iter()
-            .filter_map(|text| {
-                let inner = text.strip_prefix('│')?.strip_suffix('│')?;
-                Some(inner.trim_matches(' ').to_string())
-            })
+            .map(|text| text.trim_matches(' ').to_string())
             .collect();
         assert!(
             joined.contains(url),

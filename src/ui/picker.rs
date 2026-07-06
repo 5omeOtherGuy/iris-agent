@@ -22,7 +22,7 @@ use crate::ui::modal::{
 use crate::ui::settings_menu::{self, SettingsMenu};
 use crate::ui::task_view::TaskCard;
 use crate::wayland::Harness;
-use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask, RecoverableTask};
+use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask};
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -219,18 +219,6 @@ fn active_card(display: &ActiveTaskDisplay, git: Option<&GitStatus>) -> TaskCard
         ),
         None => TaskCard::active(display, None, None, None),
     }
-}
-
-/// Wrap already-fetched recoverable-task rows into the unified modal (no active
-/// header), or `None` when there are none. Used by the startup/session-swap
-/// recovery sites, which already hold the rows and never have an active task
-/// (recovery runs before this process opens one).
-pub(crate) fn tasks_modal(tasks: &[RecoverableTask]) -> Option<Modal> {
-    if tasks.is_empty() {
-        return None;
-    }
-    let cards: Vec<TaskCard> = tasks.iter().map(TaskCard::from_recoverable).collect();
-    Some(Modal::Tasks(TaskPicker::new(None, cards)))
 }
 
 /// Decide the adoption UX for an adopted task (#288, ADR-0031): the notice lines

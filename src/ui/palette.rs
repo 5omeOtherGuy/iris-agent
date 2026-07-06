@@ -10,6 +10,20 @@ use ratatui::style::Color;
 /// `border` — panel & composer frames. ANSI Gray.
 pub(crate) const BORDER: Color = Color::Gray;
 
+/// `muted` — metadata, hints, markers, elisions, separators (`┊`/`─`), the bulk
+/// of the transcript's secondary text. ANSI DarkGray: the recessive text role,
+/// dimmer than `border` yet still legible, and — unlike the `DIM` *attribute* it
+/// replaces — a real color that survives DIM-blind terminals and honours each
+/// named theme's own grey (docs/TUI_DESIGN_LANGUAGE.md §2.1).
+pub(crate) const MUTED: Color = Color::DarkGray;
+
+/// `stdout` — SHELL program output (the recessive grey *below* the command). A
+/// light grey that sits between `ink` (default fg) and `muted`: it recedes
+/// beneath the bright command line but stays far more readable than `muted`.
+/// Indexed(250) approximates the `#b7b7bd` dark reference and mirrors SURFACE's
+/// fixed-index precedent (dark-tuned; named themes supply their own value).
+pub(crate) const STDOUT: Color = Color::Indexed(250);
+
 /// `accent` (orange) — active mode, running, current edge dot, warnings. The
 /// terminal's bright/yellow accent slot.
 pub(crate) const ORANGE: Color = Color::Yellow;
@@ -39,6 +53,14 @@ use super::theme;
 /// Themed `border` role: the active theme's border color.
 pub(crate) fn border() -> Color {
     theme::active().border()
+}
+/// Themed `muted` role: the active theme's muted (recessive text) color.
+pub(crate) fn muted() -> Color {
+    theme::active().muted()
+}
+/// Themed `stdout` role: the active theme's SHELL-output grey.
+pub(crate) fn stdout() -> Color {
+    theme::active().stdout()
 }
 /// Themed `accent` role: the active theme's accent (orange) color.
 pub(crate) fn orange() -> Color {
@@ -78,14 +100,20 @@ mod tests {
         // Default (adaptive terminal) theme returns the raw palette consts.
         assert_eq!(surface(), SURFACE);
         assert_eq!(border(), BORDER);
+        assert_eq!(muted(), MUTED);
+        assert_eq!(stdout(), STDOUT);
 
         // A fixed-RGB named theme overrides the ANSI slots.
         theme::set_active("gruvbox");
         assert_ne!(green(), GREEN);
         assert!(matches!(green(), Color::Rgb(..)));
+        // The recessive roles are themed too — named themes carry their own grey.
+        assert!(matches!(muted(), Color::Rgb(..)));
+        assert!(matches!(stdout(), Color::Rgb(..)));
 
         // Reset so global state does not leak to other tests.
         theme::set_active("terminal");
         assert_eq!(green(), GREEN);
+        assert_eq!(muted(), MUTED);
     }
 }

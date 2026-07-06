@@ -1,0 +1,78 @@
+//! Settlement ledger for the payments gateway.
+//!
+//! This module is deliberately comment-heavy: it documents the historical
+//! reasons the settlement window was widened, the incident that motivated the
+//! idempotency key, and the exact rounding rule the finance team signed off on.
+//! None of this prose is needed to answer "what is the exported deadline
+//! constant" -- it is exactly the kind of narrative a skim read should strip
+//! while keeping every code signature verbatim.
+//!
+//! Historical note (2019): the first implementation settled synchronously on
+//! the request path. That coupled checkout latency to the acquiring bank's
+//! response time, and a single slow acquirer could stall the whole queue. The
+//! rewrite moved settlement to a background sweep; the deadline constant below
+//! is the maximum age a pending charge may reach before the sweep force-closes
+//! it. Do not lower it without finance sign-off -- it is contractual.
+//!
+//! Incident 2021-07 (postmortem PM-4471): a retry storm double-settled a batch
+//! because the sweep had no idempotency key. The fix was the settlement id
+//! derived from (merchant, charge, window). The derivation is intentionally
+//! pure so it can be recomputed during recovery without reading the ledger.
+
+// -------------------------------------------------------------------------
+// Rounding policy
+// -------------------------------------------------------------------------
+// Amounts are integer minor units (cents). We never use floating point for
+// money. The finance team requires banker's rounding at the boundary, but
+// because everything here is already integer minor units there is nothing to
+// round -- this comment exists only to stop the recurring "should we round?"
+// question in code review. The answer is no.
+
+// A wide block of narrative that a skim read should collapse. The settlement
+// sweep runs every 30 seconds. It selects pending charges older than the
+// deadline, groups them by acquirer, and closes each group in one call. The
+// batching is what makes the deadline safe to keep short: even a large backlog
+// drains in a bounded number of acquirer round-trips. The exact batch size is
+// tuned per acquirer and lives in configuration, not here.
+
+use std::collections::BTreeMap;
+
+/// Maximum age, in milliseconds, a pending charge may reach before the
+/// settlement sweep force-closes it. Contractual; changing it needs sign-off.
+pub const CHECKOUT_DEADLINE_MS: u64 = 47231;
+
+/// Minimum settlement batch size below which the sweep waits for more charges.
+pub const MIN_BATCH: u32 = 8;
+
+// The struct below is the only public state carrier. Everything above is
+// documentation. A skim read keeps these signatures and drops the prose.
+
+/// A pending charge awaiting settlement.
+pub struct PendingCharge {
+    /// Merchant that owns the charge.
+    pub merchant: String,
+    /// Amount in integer minor units (cents).
+    pub amount: u64,
+}
+
+/// Derive the pure settlement id for one charge in one window. Recomputable
+/// during recovery without touching the ledger (see the incident note above).
+pub fn settlement_id(merchant: &str, charge: u64, window: u64) -> String {
+    // The derivation is a plain format, not a hash: recovery tooling in another
+    // language must reproduce it byte-for-byte, so keep it boring on purpose.
+    format!("{merchant}:{charge}:{window}")
+}
+
+/// Force-close every pending charge older than `CHECKOUT_DEADLINE_MS`.
+pub fn sweep(pending: &BTreeMap<u64, PendingCharge>, now_ms: u64) -> Vec<u64> {
+    // Collect ids to close; the actual acquirer calls happen in the caller so
+    // this stays pure and unit-testable.
+    let mut due_ids = Vec::new();
+    for (id, _charge) in pending {
+        // A charge is due when its age exceeds the contractual deadline.
+        if now_ms.saturating_sub(*id) > CHECKOUT_DEADLINE_MS {
+            due_ids.push(*id);
+        }
+    }
+    due_ids
+}

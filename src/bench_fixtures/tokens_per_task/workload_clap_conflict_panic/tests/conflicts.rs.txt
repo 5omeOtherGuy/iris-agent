@@ -1,0 +1,53 @@
+//! Regression coverage for conflict reporting.
+//!
+//! A conflict rule may name a *group* rather than a concrete argument. When the
+//! parser reports such a conflict it must not assume every matched identifier
+//! resolves to a concrete argument: group ids (and subcommand ids) share the id
+//! namespace but do not resolve through `Command::find`.
+
+use clap_conflict_min::{Arg, ArgGroup, Command, ErrorKind, Subcommand, ValueHint};
+
+/// Build a command whose `input` group conflicts with the `serve` subcommand.
+fn command() -> Command {
+    Command::new("demo")
+        .arg(
+            Arg::new("file")
+                .long("file")
+                .short('f')
+                .value_hint(ValueHint::Single)
+                .help("read from a file"),
+        )
+        .arg(
+            Arg::new("stdin")
+                .long("stdin")
+                .help("read from standard input"),
+        )
+        .arg(Arg::new("verbose").long("verbose").short('v'))
+        .group(ArgGroup::new("input").args(["file", "stdin"]))
+        .subcommand(Subcommand::new("serve"))
+        .conflict("input", "serve")
+}
+
+#[test]
+fn group_conflicts_with_subcommand() {
+    let cmd = command();
+
+    // `--file data.txt` matches a member of the `input` group (so the group id
+    // is recorded) and `serve` is the conflicting subcommand.
+    let result = cmd.parse(["--file", "data.txt", "serve"]);
+
+    let err = result.expect_err("conflicting input must not parse");
+    assert_eq!(
+        err.kind(),
+        &ErrorKind::ArgumentConflict,
+        "expected an argument-conflict error, got: {err}"
+    );
+}
+
+#[test]
+fn group_member_alone_is_ok() {
+    let cmd = command();
+    let m = cmd.parse(["--file", "data.txt"]).expect("no conflict");
+    assert!(m.contains("input"));
+    assert!(m.contains("file"));
+}

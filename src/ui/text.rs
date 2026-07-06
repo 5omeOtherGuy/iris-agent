@@ -466,6 +466,17 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                     ),
                 )?;
             }
+            UiEvent::ToolReview { call, .. } => {
+                // Non-interactive: the affordance can't be offered here; surface
+                // the pending review honestly. The decision resolves via the
+                // following ToolStarted/ToolDenied event.
+                self.finish_assistant_stream()?;
+                self.write_header(
+                    "33",
+                    "▲",
+                    &format!("Awaiting approval to run {}", run_target(&call)),
+                )?;
+            }
             UiEvent::DiffPreview { call, diff } => {
                 self.finish_assistant_stream()?;
                 self.start_block()?;

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect, Size};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui_textarea::{TextArea, WrapMode};
@@ -12,10 +12,7 @@ use ratatui_textarea::{TextArea, WrapMode};
 use crate::git::status::GitStatus;
 #[cfg(test)]
 use crate::mimir::model_catalog;
-use crate::nexus::{ApprovalDecision, ProviderUsage, ReviewContext, ToolCall};
-use crate::tool_display::{
-    APPROVAL_DESTRUCTIVE_NOTE, approval_dirty_note, approval_reason_lead, run_target,
-};
+use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
 use crate::ui::UiEvent;
 use crate::ui::modal::Modal;
 use crate::ui::slash::Palette;
@@ -26,11 +23,11 @@ use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
 use super::session_menu::{MAX_DROPDOWN_ROWS, SessionMenu};
 use super::startup::StartPage;
-use super::text::{ansi_spans, strip_ansi_for_text};
+use super::text::strip_ansi_for_text;
 use super::transcript::{Transcript, TranscriptRender};
 use super::wrap::{
-    display_width, line_text, pad_line_left, push_wrapped_line_wordwise, spans_width,
-    truncate_line, truncate_to_width, wrap_to_width,
+    display_width, line_text, pad_line_left, spans_width, truncate_line, truncate_to_width,
+    wrap_to_width,
 };
 use super::{
     BOX_X_PADDING_U16, EDITOR_BOTTOM_PADDING_ROWS, EDITOR_CHROME_ROWS_ABOVE,
@@ -51,40 +48,6 @@ struct Spinner {
     /// When set (`IRIS_REDUCED_MOTION`), the LED chase holds frame 0 instead of
     /// animating, so the working indicator is static while the turn runs.
     reduced_motion: bool,
-}
-
-struct ApprovalHint {
-    /// Tool name shown as the header meta (`bash`, `edit`, `write`, ...).
-    tool: String,
-    /// The action text: the run target (a `$ `-prompted command for shell).
-    target: String,
-    /// The muted base sentence of the reason line, derived deterministically
-    /// from the call in Tier 3 (never sent to the model).
-    reason_lead: String,
-    /// The call tripped the destructive floor (ADR-0010): the reason line
-    /// carries a danger-toned clause.
-    destructive: bool,
-    /// Workspace-relative display paths of uncommitted user changes the call
-    /// touches (ADR-0028). Non-empty relabels `a` to "all dirty files this
-    /// task" and appends a muted dirty clause to the reason line.
-    dirty_paths: Vec<String>,
-    /// Whether an "always" grant is on offer (`a`).
-    allow_always: bool,
-    /// Whether a per-project grant is on offer (`p`); never for a destructive
-    /// or dirty-tree call.
-    allow_project: bool,
-    /// Whether the gated action is a shell command, so the action reads with a
-    /// `$ ` prompt (per the `ApprovalOutput` design-system component).
-    shell: bool,
-    /// Whether this platform ships no kernel sandbox backend for the shell at
-    /// all (non-Linux). Surfaces an honest `unsandboxed` posture at the
-    /// decision point, rather than only a startup notice that scrolls away.
-    ///
-    /// This reflects platform capability, not per-run confinement. Its ABSENCE
-    /// is NOT a guarantee that the run is confined: on Linux the marker is
-    /// always false even when runtime enforcement is off (Landlock unavailable
-    /// or approvals not opted in). Do not treat a missing marker as sandboxed.
-    sandbox_unavailable: bool,
 }
 
 #[derive(Default)]
@@ -392,176 +355,6 @@ fn working_lines(
     )]
 }
 
-/// Content width inside the docked approval panel's frame: the given panel width
-/// less the two border cells and the one-cell padding on each side (`│ … │`).
-fn approval_content_width(width: usize) -> usize {
-    width.saturating_sub(4).max(1)
-}
-
-/// One horizontal rule of the docked approval panel (`┌─┐`/`├─┤`/`└─┘`), spanning
-/// the full panel width in the border role. Square corners, hand-drawn — never a
-/// `Block` widget (design-language §6, §13.7).
-fn approval_rule(width: usize, left: char, right: char) -> Line<'static> {
-    let n = width.max(2);
-    Line::from(Span::styled(
-        format!("{left}{}{right}", "─".repeat(n - 2)),
-        border_style(),
-    ))
-}
-
-/// Frame one already-wrapped physical content line as a panel body row: `│ ` +
-/// content padded to the inner width + ` │`, the border cells in the border role.
-fn approval_body_row(width: usize, mut content: Line<'static>) -> Line<'static> {
-    let inner = approval_content_width(width);
-    truncate_line(&mut content, inner);
-    let used = display_width(&line_text(&content));
-    let mut spans = vec![
-        Span::styled("\u{2502}".to_string(), border_style()),
-        Span::raw(" "),
-    ];
-    spans.extend(content.spans);
-    if used < inner {
-        spans.push(Span::raw(" ".repeat(inner - used)));
-    }
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled("\u{2502}".to_string(), border_style()));
-    Line::from(spans)
-}
-
-/// Wrap `content` to the panel's inner width and push one framed body row per
-/// physical line. Word-aware and token-safe (breaks at spaces, keeps paths and
-/// identifiers intact), so continuations align under the content column
-/// (design-language §3, §7).
-fn approval_body_rows(width: usize, content: Line<'static>, out: &mut Vec<Line<'static>>) {
-    let inner = approval_content_width(width);
-    let mut wrapped = Vec::new();
-    push_wrapped_line_wordwise(&content, inner, &mut wrapped);
-    for line in wrapped {
-        out.push(approval_body_row(width, line));
-    }
-}
-
-/// Header spans: `▲ REVIEW` (orange accent glyph + bold label carrying the
-/// decision state, per §8.5) with the muted tool name as meta. State is
-/// symbol + label + color, never color alone (§13.8).
-fn approval_header_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
-    let mut spans = vec![
-        Span::styled(format!("{} ", crate::ui::symbols::REVIEW), prompt_style()),
-        Span::styled(
-            "REVIEW".to_string(),
-            prompt_style().add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if !hint.tool.is_empty() {
-        spans.push(Span::styled(format!("  {}", hint.tool), dim_style()));
-    }
-    spans
-}
-
-/// Action spans: `$ <command>` for shell (dim `$ ` prompt) or the run target for
-/// other tools, keeping the honest `┊ unsandboxed` posture marker.
-fn approval_action_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    if hint.shell {
-        spans.push(Span::styled("$ ", dim_style()));
-    }
-    spans.extend(ansi_spans(&hint.target, Style::default()));
-    if hint.sandbox_unavailable {
-        spans.push(Span::styled(
-            format!("  {} unsandboxed", crate::ui::symbols::SEP),
-            dim_style(),
-        ));
-    }
-    spans
-}
-
-/// Reason spans: the muted base sentence, then the danger-toned destructive
-/// clause (red per §2.2 — the sentence itself carries the meaning so it survives
-/// the monochrome test), then the muted dirty-tree clause. `content_width` caps
-/// the dirty list so it degrades with an `…` at narrow widths.
-fn approval_reason_spans(hint: &ApprovalHint, content_width: usize) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(hint.reason_lead.clone(), dim_style())];
-    if hint.destructive {
-        spans.push(Span::styled(
-            format!(" {APPROVAL_DESTRUCTIVE_NOTE}"),
-            err_style(),
-        ));
-    }
-    if let Some(note) = approval_dirty_note(&hint.dirty_paths, content_width) {
-        spans.push(Span::styled(format!(" {note}"), dim_style()));
-    }
-    spans
-}
-
-/// Decision-affordance spans: `┊`-separated `key label` hints (keys in ink,
-/// labels muted). Only offered options appear; in the dirty-tree context `a` is
-/// relabelled to "all dirty files this task" (that is what an "always" grant
-/// means then) and `p` is never offered. `n deny` is always last (the default).
-fn approval_hint_spans(hint: &ApprovalHint) -> Vec<Span<'static>> {
-    let dirty = !hint.dirty_paths.is_empty();
-    let mut items: Vec<(&str, &str)> = vec![("y", "approve")];
-    if hint.allow_always {
-        items.push((
-            "a",
-            if dirty {
-                "all dirty files this task"
-            } else {
-                "always"
-            },
-        ));
-    }
-    if hint.allow_project {
-        items.push(("p", "project"));
-    }
-    items.push(("n", "deny"));
-
-    let mut spans = Vec::new();
-    for (index, (key, label)) in items.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(
-                format!(" {} ", crate::ui::symbols::SEP),
-                dim_style(),
-            ));
-        }
-        spans.push(Span::styled(key.to_string(), Style::default()));
-        spans.push(Span::styled(format!(" {label}"), dim_style()));
-    }
-    spans
-}
-
-/// The docked APPROVAL panel (§8.5): a hand-drawn box-drawing frame with a
-/// `▲ REVIEW` header, the action, the explanatory reason, a hairline-ruled
-/// decision affordance, and a bottom border. Rendered in the overlay region
-/// above the composer, so the composer body stays visible while input focus is
-/// on the decision.
-fn approval_panel_lines(hint: &ApprovalHint, width: usize) -> Vec<Line<'static>> {
-    let inner = approval_content_width(width);
-    let mut out = Vec::new();
-    out.push(approval_rule(width, '\u{250c}', '\u{2510}'));
-    out.push(approval_body_row(
-        width,
-        Line::from(approval_header_spans(hint)),
-    ));
-    approval_body_rows(width, Line::from(approval_action_spans(hint)), &mut out);
-    approval_body_rows(
-        width,
-        Line::from(approval_reason_spans(hint, inner)),
-        &mut out,
-    );
-    // Hairline-ruled decision affordance (§8.5).
-    out.push(approval_rule(width, '\u{251c}', '\u{2524}'));
-    approval_body_rows(width, Line::from(approval_hint_spans(hint)), &mut out);
-    out.push(approval_rule(width, '\u{2514}', '\u{2518}'));
-    // Defense in depth for very narrow panels: the frame needs a few cells to
-    // hold `│ … │`, so clamp every row to the panel width. In the real render
-    // path `render_menu_lines` also clips, but the rows must never claim more
-    // width than they were given.
-    for line in &mut out {
-        truncate_line(line, width.max(1));
-    }
-    out
-}
-
 /// Build a styled, empty editor for the bordered composer panel: dim
 /// placeholder and a reversed block cursor the widget draws itself (no hardware
 /// cursor needed). The surrounding border and hint row are painted by
@@ -570,7 +363,14 @@ pub(super) fn fresh_editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
     editor.set_cursor_line_style(Style::default());
-    editor.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    // The caret is the orange accent (§9.4): REVERSED swaps fg↔bg, so an orange
+    // fg paints a solid orange block. REVERSED is retained because
+    // `find_reversed_cell` locates the caret cell by that modifier.
+    editor.set_cursor_style(
+        Style::default()
+            .fg(crate::ui::palette::orange())
+            .add_modifier(Modifier::REVERSED),
+    );
     editor.set_placeholder_style(dim_style());
     editor.set_placeholder_text("Give Iris a task...");
     editor
@@ -605,7 +405,10 @@ pub(crate) struct Screen {
     spinner: Spinner,
     turn_divider: TurnDivider,
     /// Short status-row hint while a gated tool awaits the user's decision.
-    approval_hint: Option<ApprovalHint>,
+    /// True while a gated tool awaits the user's decision. The review renders in
+    /// the tool block (`▲ REVIEW`); this flag only gates the composer freeze, the
+    /// working-indicator suppression, and the IME-cursor hide.
+    awaiting_approval: bool,
     /// Sourced global status chrome (model / effort / cwd). The loop refreshes
     /// it from the live model selection; `None` falls back to the composer hint
     /// (e.g. before a provider is selected).
@@ -738,7 +541,7 @@ impl Screen {
                 ..Spinner::default()
             },
             turn_divider: TurnDivider::default(),
-            approval_hint: None,
+            awaiting_approval: false,
             footer: None,
             modal: None,
             queued: 0,
@@ -923,8 +726,11 @@ impl Screen {
     }
 
     /// Show the start page (IrisMark + launcher) until the session begins.
-    pub(crate) fn show_start_page(&mut self) {
-        self.start_page = Some(StartPage::new(self.reduced_motion));
+    /// `recoverable` is the count of recoverable Iris tasks in this workspace at
+    /// launch, surfaced as a dim badge on the `Tasks` row (ADR-0031) instead of
+    /// popping a picker over the home menu.
+    pub(crate) fn show_start_page(&mut self, recoverable: usize) {
+        self.start_page = Some(StartPage::new(self.reduced_motion, recoverable));
     }
 
     /// Apply the resolved reduced-motion posture (env flag OR persisted
@@ -1042,7 +848,7 @@ impl Screen {
     fn composer_focused(&self) -> bool {
         !self.spinner.active
             && self.modal.is_none()
-            && self.approval_hint.is_none()
+            && !self.awaiting_approval
             && self.session_menu.is_none()
     }
 
@@ -1251,7 +1057,7 @@ impl Screen {
         self.spinner.start();
         self.phase = WorkPhase::Starting;
         self.turn_divider = TurnDivider::default();
-        self.approval_hint = None;
+        self.awaiting_approval = false;
         self.queued = 0;
         if let Some(footer) = &mut self.footer {
             footer.usage = None;
@@ -1267,7 +1073,7 @@ impl Screen {
             self.turn_divider.usage.as_ref(),
         );
         self.spinner.stop();
-        self.approval_hint = None;
+        self.awaiting_approval = false;
     }
 
     /// Advance the spinner one frame. Returns whether anything animated (so the
@@ -1277,7 +1083,7 @@ impl Screen {
     /// An unfocused terminal likewise holds the frame: pure animation is not
     /// worth per-tick redraws in a pane the user is not looking at.
     pub(crate) fn tick(&mut self) -> bool {
-        if self.approval_hint.is_some() || !self.terminal_focused {
+        if self.awaiting_approval || !self.terminal_focused {
             return false;
         }
         // The start page's IrisMark reuses the spinner tick machinery: it
@@ -1305,35 +1111,22 @@ impl Screen {
 
     /// Show a gated tool's approval prompt in the status row. The transcript
     /// records the final approval/denial outcome, not the transient prompt.
-    pub(crate) fn show_approval(
-        &mut self,
-        call: &ToolCall,
-        allow_always: bool,
-        allow_project: bool,
-        ctx: &ReviewContext,
-    ) {
-        let shell = call.name == "bash";
-        // A docked approval takes the input surface: close any dropdown.
+    /// Enter the awaiting-approval state. The review itself renders inside the
+    /// gated tool block (the `▲ REVIEW` state, via the `ToolReview` event); this
+    /// only claims the input surface and marks the phase so the composer freezes
+    /// and the working indicator steps aside while the user decides.
+    pub(crate) fn show_approval(&mut self) {
+        // The review takes the input surface: close any dropdown.
         self.session_menu = None;
-        // The approval prompt is the primary surface; the working animation is
-        // suppressed (see `working_lines`) so it never competes with the
-        // decision, and the phase reflects that we are blocked on the user.
         self.phase = WorkPhase::AwaitingApproval;
-        self.approval_hint = Some(ApprovalHint {
-            tool: call.name.clone(),
-            target: run_target(call),
-            reason_lead: approval_reason_lead(call),
-            destructive: ctx.destructive,
-            dirty_paths: ctx.dirty_paths.clone(),
-            allow_always,
-            allow_project,
-            shell,
-            sandbox_unavailable: shell && !crate::tools::platform_can_sandbox(),
-        });
+        self.awaiting_approval = true;
     }
 
-    pub(crate) fn record_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
-        self.transcript.record_approval(call, decision);
+    /// Fold a manual approval decision into the gated tool block's own footer
+    /// (the muted `approved …` note) — approvals never render as a separate
+    /// panel. Denials flow through the `ToolDenied` event.
+    pub(crate) fn note_approval(&mut self, call: &ToolCall, decision: ApprovalDecision) {
+        self.transcript.note_approval(call, decision);
     }
 
     /// Clear the docked approval prompt. `approved` selects the phase to resume:
@@ -1344,7 +1137,7 @@ impl Screen {
     /// just before clearing (the turn-error cleanup path applies its event
     /// first) is never overwritten.
     pub(crate) fn clear_approval(&mut self, approved: bool) {
-        self.approval_hint = None;
+        self.awaiting_approval = false;
         if matches!(self.phase, WorkPhase::AwaitingApproval) {
             self.phase = if approved {
                 WorkPhase::PreparingTool
@@ -1391,7 +1184,7 @@ impl Screen {
     }
 
     pub(super) fn working_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if self.spinner.active && self.approval_hint.is_none() {
+        if self.spinner.active && !self.awaiting_approval {
             working_lines(
                 self.spinner.frame(),
                 self.spinner.elapsed(),
@@ -1629,8 +1422,11 @@ fn context_meter_filled(used: u64, window: u64) -> u64 {
 }
 
 /// Muted filled dot for already-consumed context (before the current edge).
+/// Uses the themed `muted` role so the meter follows named themes too (it hard-
+/// coded `DarkGray` before, which ignored the active theme's grey); the hollow
+/// `○`/solid `●` glyphs still carry filled-vs-empty independent of color.
 fn meter_used_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(crate::ui::palette::muted())
 }
 
 /// Render the 10-dot context meter as styled spans: muted filled dots, an orange
@@ -2183,21 +1979,19 @@ pub(super) fn render_editor_chrome(
     // so output is unchanged. A pending approval takes the region exclusively:
     // the composer is frozen while it is shown, so no modal/palette can be open.
     let menu_inner_width = content_width(usize::from(area.width));
-    let menu_lines: Option<Vec<Line<'static>>> = if let Some(hint) = &screen.approval_hint {
-        Some(approval_panel_lines(hint, menu_inner_width))
-    } else {
-        match screen.focus_for(&input_text) {
-            FocusTarget::Modal => screen
-                .modal
-                .as_ref()
-                .map(|modal| Component::render(modal, menu_inner_width)),
-            FocusTarget::Palette => Some(
-                PaletteView::for_palette(&screen.palette, &input_text).render(menu_inner_width),
-            ),
-            // A SessionMenu renders at the pane top (session bar), never in
-            // the docked menu region above the composer.
-            FocusTarget::Editor | FocusTarget::SessionMenu => None,
+    // Approvals no longer dock here — the review renders inside the gated tool
+    // block (`▲ REVIEW`). This region is the modal/palette overlay only.
+    let menu_lines: Option<Vec<Line<'static>>> = match screen.focus_for(&input_text) {
+        FocusTarget::Modal => screen
+            .modal
+            .as_ref()
+            .map(|modal| Component::render(modal, menu_inner_width)),
+        FocusTarget::Palette => {
+            Some(PaletteView::for_palette(&screen.palette, &input_text).render(menu_inner_width))
         }
+        // A SessionMenu renders at the pane top (session bar), never in
+        // the docked menu region above the composer.
+        FocusTarget::Editor | FocusTarget::SessionMenu => None,
     };
     let menu_wanted = menu_lines
         .as_ref()
@@ -2358,40 +2152,14 @@ fn buffer_to_lines(buf: &Buffer, cursor_cell: Option<(u16, u16)>) -> Vec<Line<'s
 mod tests {
     use std::time::Duration;
 
-    use ratatui::text::Line;
-
     use super::{
-        ApprovalHint, ApprovalPolicy, CONTEXT_METER_DOTS, Screen, Spinner, approval_hint_spans,
-        approval_panel_lines, composer_statusline, context_meter_filled, display_width, line_text,
-        parse_context_window, session_bar, truncate_cwd_middle, working_lines,
+        ApprovalPolicy, CONTEXT_METER_DOTS, Screen, Spinner, composer_statusline,
+        context_meter_filled, display_width, line_text, parse_context_window, session_bar,
+        truncate_cwd_middle,
     };
-    use crate::nexus::{ReviewContext, ToolCall};
+    use crate::nexus::ToolCall;
     use crate::ui::UiEvent;
     use crate::ui::tui::WORKING_FRAMES;
-
-    /// A minimal review hint for the docked-approval rendering tests.
-    fn test_hint() -> ApprovalHint {
-        ApprovalHint {
-            tool: "bash".to_string(),
-            target: "echo hi".to_string(),
-            reason_lead: "Runs a shell command in the workspace.".to_string(),
-            destructive: false,
-            dirty_paths: Vec::new(),
-            allow_always: false,
-            allow_project: false,
-            shell: true,
-            sandbox_unavailable: false,
-        }
-    }
-
-    /// The joined plain text of a rendered approval panel.
-    fn panel_text(hint: &ApprovalHint, width: usize) -> String {
-        approval_panel_lines(hint, width)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
 
     fn footer_screen(cwd: &str) -> Screen {
         let mut screen = Screen::new();
@@ -2939,12 +2707,7 @@ mod tests {
         // Approval is its own phase and, while shown, suppresses the working
         // animation so it never competes with the decision (the approval panel
         // is the primary surface).
-        screen.show_approval(
-            &bash_call("rm -rf build"),
-            false,
-            false,
-            &ReviewContext::default(),
-        );
+        screen.show_approval();
         assert_eq!(screen.work_phase_label(), "Awaiting approval");
         assert!(
             screen.working_lines(80).is_empty(),
@@ -2987,12 +2750,7 @@ mod tests {
         // misleading "Preparing tool" label, since no tool is about to run.
         let mut screen = Screen::new();
         screen.start_turn();
-        screen.show_approval(
-            &bash_call("rm -rf build"),
-            false,
-            false,
-            &ReviewContext::default(),
-        );
+        screen.show_approval();
         assert_eq!(screen.work_phase_label(), "Awaiting approval");
         screen.clear_approval(false);
         assert_eq!(
@@ -3135,136 +2893,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn approval_and_working_lines_stay_bounded_at_tiny_widths() {
-        let mut hint = test_hint();
-        hint.target = "run an extremely long command".to_string();
-        hint.sandbox_unavailable = true;
-        hint.dirty_paths = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
-        hint.destructive = true;
-        for width in 1..=6 {
-            for line in approval_panel_lines(&hint, width) {
-                assert!(
-                    display_width(&line_text(&line)) <= width,
-                    "width {width}: {line:?}"
-                );
-            }
-            for line in working_lines(
-                WORKING_FRAMES[0],
-                Some(Duration::from_secs(1)),
-                None,
-                None,
-                0,
-                width,
-            ) {
-                assert!(
-                    display_width(&line_text(&line)) <= width,
-                    "width {width}: {line:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn approval_panel_header_action_and_shell_prompt() {
-        // The docked panel leads with `▲ REVIEW` + the tool meta, then the
-        // action row: `$ <command>` for shell, prose otherwise.
-        let shell = test_hint();
-        let mut non_shell = test_hint();
-        non_shell.tool = "edit".to_string();
-        non_shell.target = "edit src/x.rs".to_string();
-        non_shell.reason_lead = "Modifies src/x.rs.".to_string();
-        non_shell.shell = false;
-
-        let shell_text = panel_text(&shell, 60);
-        let non_shell_text = panel_text(&non_shell, 60);
-        assert!(shell_text.contains("\u{25b2} REVIEW"), "{shell_text}");
-        assert!(shell_text.contains("bash"), "{shell_text}");
-        assert!(shell_text.contains("$ echo hi"), "{shell_text}");
-        // The explanatory reason line is present.
-        assert!(
-            shell_text.contains("Runs a shell command in the workspace."),
-            "{shell_text}"
-        );
-        assert!(
-            non_shell_text.contains("\u{25b2} REVIEW"),
-            "{non_shell_text}"
-        );
-        assert!(non_shell_text.contains("edit src/x.rs"), "{non_shell_text}");
-        assert!(
-            non_shell_text.contains("Modifies src/x.rs."),
-            "{non_shell_text}"
-        );
-        // The `$ ` prompt is shell-only (the action row has no `$ `).
-        assert!(!non_shell_text.contains("$ "), "{non_shell_text}");
-    }
-
-    #[test]
-    fn approval_panel_hints_are_sep_separated_and_offer_only_options() {
-        // Decision affordance: `┊`-separated `key label` hints, only offered
-        // options, `n deny` last.
-        let hint = ApprovalHint {
-            allow_always: true,
-            allow_project: true,
-            ..test_hint()
-        };
-        let hints = line_text(&Line::from(approval_hint_spans(&hint)));
-        assert_eq!(
-            hints,
-            "y approve \u{250a} a always \u{250a} p project \u{250a} n deny"
-        );
-
-        // y/N-only when nothing else is offered.
-        let plain = line_text(&Line::from(approval_hint_spans(&test_hint())));
-        assert_eq!(plain, "y approve \u{250a} n deny");
-    }
-
-    #[test]
-    fn approval_panel_destructive_and_dirty_reason() {
-        // Destructive appends the danger clause; a non-empty dirty set appends
-        // the dirty clause and relabels `a`; `p` is never offered.
-        let hint = ApprovalHint {
-            destructive: true,
-            dirty_paths: vec!["src/main.rs".to_string()],
-            allow_always: true,
-            allow_project: false,
-            ..test_hint()
-        };
-        // The reason wraps across body rows, so assert the individual clauses
-        // are present (a wrap boundary may fall between words).
-        let text = panel_text(&hint, 110);
-        assert!(text.contains("Flagged destructive"), "{text}");
-        assert!(text.contains("uncommitted user changes"), "{text}");
-        assert!(text.contains("src/main.rs"), "{text}");
-        assert!(text.contains("a all dirty files this task"), "{text}");
-        assert!(!text.contains("p project"), "{text}");
-    }
-
-    #[test]
-    fn approval_panel_marks_platform_without_sandbox() {
-        // On a platform with no kernel sandbox backend the shell runs
-        // unconfined; the action row states that posture at the decision point.
-        // The marker reflects platform capability, not per-run confinement.
-        let unavailable = ApprovalHint {
-            sandbox_unavailable: true,
-            ..test_hint()
-        };
-        let has_backend = test_hint();
-        let unavailable_text = panel_text(&unavailable, 60);
-        let has_backend_text = panel_text(&has_backend, 60);
-        assert!(
-            unavailable_text.contains("unsandboxed"),
-            "{unavailable_text}"
-        );
-        assert!(
-            unavailable_text.contains(crate::ui::symbols::SEP),
-            "{unavailable_text}"
-        );
-        assert!(
-            !has_backend_text.contains("unsandboxed"),
-            "{has_backend_text}"
-        );
     }
 }

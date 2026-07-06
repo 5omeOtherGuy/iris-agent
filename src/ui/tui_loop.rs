@@ -205,6 +205,8 @@ enum IdleOutcome {
     CycleEffort,
     /// Start-page launcher: open the resume-session picker.
     OpenResumePicker,
+    /// Start-page launcher (`ctrl-t`): open the unified task surface (`/tasks`).
+    OpenTasks,
     /// Start-page launcher: open the settings picker.
     OpenSettings,
     /// Toggle the git console dropdown (ctrl-g / click / `/git`).
@@ -228,6 +230,7 @@ enum IdleKey {
     CycleModel(bool),
     CycleEffort,
     OpenResumePicker,
+    OpenTasks,
     OpenSettings,
     ToggleGitMenu,
     ToggleTreeMenu(bool),
@@ -248,10 +251,30 @@ struct ApprovalRequest {
     call: ToolCall,
     allow_always: bool,
     allow_project: bool,
-    /// Structured review facts (destructive floor, dirty-tree paths) the screen
-    /// renders into the docked approval surface's reason line.
-    ctx: ReviewContext,
     reply: oneshot::Sender<ApprovalDecision>,
+}
+
+/// A short, danger-toned caution for the in-block `▲ REVIEW` footer, built from
+/// the structured review facts (never model-authored copy): the destructive
+/// floor (ADR-0010), pre-existing dirty-tree changes the call would touch
+/// (ADR-0028), and — for a shell call on a platform with no kernel sandbox — an
+/// `unsandboxed` posture. `None` when the call is unremarkable.
+fn review_reason(call: &ToolCall, ctx: &ReviewContext) -> Option<String> {
+    let mut parts = Vec::new();
+    if ctx.destructive {
+        parts.push("destructive".to_string());
+    }
+    let dirty = ctx.dirty_paths.len();
+    if dirty > 0 {
+        parts.push(format!(
+            "{dirty} pre-existing change{}",
+            if dirty == 1 { "" } else { "s" }
+        ));
+    }
+    if call.name == "bash" && !crate::tools::platform_can_sandbox() {
+        parts.push("unsandboxed".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 async fn session_loop<P: ChatProvider>(
@@ -284,25 +307,25 @@ async fn session_loop<P: ChatProvider>(
     let git_cache = GitStatusCache::default();
     let mut git_generation = 0u64;
     git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
+    // On startup, reconcile any crashed/unsettled Iris task in this repo and
+    // expire stale ones (issue #263, ADR-0028): auto-adopt the single orphan
+    // (notice) or note the >1/legacy case (#288, ADR-0031). The recoverable
+    // count feeds the start page's `Tasks` badge; a picker is never forced over
+    // the home menu -- the user opens Tasks (or `/tasks`) to review or adopt.
+    let recovery = harness.recover_checkpoints();
+    let recoverable = recovery.recoverable_count();
     // The start page (IrisMark + launcher) shows only for an interactive launch
     // with no task and no resume target; a startup resume picker supersedes it.
     if start_page && startup_modal.is_none() {
-        tui.screen.show_start_page();
+        tui.screen.show_start_page(recoverable);
     }
     refresh_footer(tui, switch);
-    // On startup, reconcile any crashed/unsettled Iris task in this repo and
-    // expire stale ones (issue #263, ADR-0028): print the single-orphan notice
-    // or open the resume-task picker for the >1/legacy case (#288, ADR-0031).
-    let recovery_picker_open = apply_recovery(harness.recover_checkpoints(), tui);
+    apply_recovery(recovery, tui);
     // `iris resume` (no id) on a rich TTY opens the resume picker on start by
     // handing a pre-built modal here. Open it before the first draw and before
     // the blocking input reader starts, so the first key acts on a visible
-    // picker. But the recovery task-picker (>1/legacy: explicit task selection
-    // required, #288/ADR-0031) takes priority -- do not overwrite it with the
-    // session-resume picker.
-    if let Some(modal) = startup_modal
-        && !recovery_picker_open
-    {
+    // picker.
+    if let Some(modal) = startup_modal {
         tui.screen.open_modal(modal);
     }
     tui.draw()?;
@@ -385,6 +408,18 @@ async fn session_loop<P: ChatProvider>(
                     None => apply_notices(
                         tui,
                         vec!["No prior sessions to resume for this directory.".to_string()],
+                    ),
+                }
+            }
+            IdleOutcome::OpenTasks => {
+                // The unified task surface (ADR-0031): the active (unsettled) task
+                // plus this workspace's recoverable Iris tasks. Reached from the
+                // `Tasks` home entry / `ctrl-t` as well as `/tasks`.
+                match picker::build_tasks_modal(harness, tui.screen.footer_git()) {
+                    Some(modal) => tui.screen.open_modal(modal),
+                    None => apply_notices(
+                        tui,
+                        vec!["No active or recoverable Iris tasks in this workspace.".to_string()],
                     ),
                 }
             }
@@ -533,24 +568,24 @@ fn perform_swap<P: ChatProvider>(
 }
 
 /// Apply a [`RecoveryOutcome`] at a safe boundary (#288, ADR-0031): nothing for
-/// `None`, the single-orphan auto-adopt notice for `Notice`, and the resume-task
-/// picker for `Picker` (the >1/legacy case that requires explicit selection).
-/// Returns whether it opened a recovery picker modal, so a caller that also has
-/// a pending startup modal can let the recovery picker win.
-fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) -> bool {
+/// `None`, the single-orphan auto-adopt notice for `Notice`, and a muted pointer
+/// notice for `Picker` (the >1/legacy case). The task surface is never forced
+/// open over the home menu or mid-session: recoverable tasks are reached from
+/// the `Tasks` home entry (badged with the count) or `/tasks`.
+fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
     match outcome {
-        RecoveryOutcome::None => false,
-        RecoveryOutcome::Notice(notice) => {
-            apply_notices(tui, vec![notice]);
-            false
+        RecoveryOutcome::None => {}
+        RecoveryOutcome::Notice(notice) => apply_notices(tui, vec![notice]),
+        RecoveryOutcome::Picker(tasks) => {
+            let n = tasks.len();
+            let plural = if n == 1 { "task" } else { "tasks" };
+            apply_notices(
+                tui,
+                vec![format!(
+                    "{n} recoverable Iris {plural} in this workspace — open Tasks (/tasks) to review or adopt."
+                )],
+            );
         }
-        RecoveryOutcome::Picker(tasks) => match picker::tasks_modal(&tasks) {
-            Some(modal) => {
-                tui.screen.open_modal(modal);
-                true
-            }
-            None => false,
-        },
     }
 }
 
@@ -1421,6 +1456,7 @@ async fn idle_phase(
                         IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
                         IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
                         IdleKey::OpenResumePicker => return Ok(IdleOutcome::OpenResumePicker),
+                        IdleKey::OpenTasks => return Ok(IdleOutcome::OpenTasks),
                         IdleKey::OpenSettings => return Ok(IdleOutcome::OpenSettings),
                         IdleKey::ToggleGitMenu => return Ok(IdleOutcome::ToggleGitMenu),
                         IdleKey::ToggleTreeMenu(filter) => {
@@ -1561,7 +1597,7 @@ async fn run_harness_op<P: ChatProvider>(
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
-                    tui.screen.show_approval(&request.call, request.allow_always, request.allow_project, &request.ctx);
+                    tui.screen.show_approval();
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,
@@ -2223,6 +2259,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
                 KeyCode::Char('r') | KeyCode::Char('R') if screen.editor_is_empty() => {
                     return IdleKey::OpenResumePicker;
                 }
+                KeyCode::Char('t') | KeyCode::Char('T') => return IdleKey::OpenTasks,
                 KeyCode::Char(',') => return IdleKey::OpenSettings,
                 KeyCode::Char('q') | KeyCode::Char('Q') => return IdleKey::Exit,
                 _ => {}
@@ -2253,6 +2290,7 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
                             IdleKey::Continue
                         }
                         Some(StartAction::ResumeSession) => IdleKey::OpenResumePicker,
+                        Some(StartAction::Tasks) => IdleKey::OpenTasks,
                         Some(StartAction::Settings) => IdleKey::OpenSettings,
                         Some(StartAction::Quit) => IdleKey::Exit,
                         None => IdleKey::Continue,
@@ -2736,7 +2774,10 @@ fn handle_running_event(
                 };
                 if let Some(decision) = decision {
                     let p = pending.take().expect("pending approval present");
-                    screen.record_approval(&p.call, decision);
+                    // The decision folds into the gated tool block's own footer
+                    // (approve → muted note; deny → the block flips to DENIED via
+                    // the ToolDenied event). No separate approval panel.
+                    screen.note_approval(&p.call, decision);
                     let _ = p.reply.send(decision);
                     let approved = matches!(
                         decision,
@@ -2811,6 +2852,17 @@ impl ApprovalGate for LoopBridge {
     ) -> ApprovalFuture<'a> {
         let appr_tx = self.appr_tx.clone();
         let call = call.clone();
+        // Render the in-block `▲ REVIEW` state (with its footer affordance)
+        // before blocking on the decision, so the gated tool block is visible
+        // while the composer is frozen. Sent on `event_tx` — FIFO after any
+        // `DiffPreview` for the same call — so the review adopts the edit
+        // preview instead of racing it.
+        let _ = self.event_tx.send(UiEvent::ToolReview {
+            call: call.clone(),
+            allow_always,
+            allow_project,
+            reason: review_reason(&call, &ctx),
+        });
         Box::pin(async move {
             let (reply, rx) = oneshot::channel();
             if appr_tx
@@ -2818,7 +2870,6 @@ impl ApprovalGate for LoopBridge {
                     call,
                     allow_always,
                     allow_project,
-                    ctx,
                     reply,
                 })
                 .is_err()
@@ -3362,7 +3413,7 @@ mod tests {
     #[test]
     fn start_page_launcher_navigates_wraps_and_activates() {
         let mut screen = Screen::new();
-        screen.show_start_page();
+        screen.show_start_page(0);
 
         // ↓ moves to Resume session; ↵ activates it (opens the resume picker).
         assert!(matches!(
@@ -3390,9 +3441,31 @@ mod tests {
     }
 
     #[test]
+    fn start_page_tasks_entry_opens_the_task_surface() {
+        let mut screen = Screen::new();
+        screen.show_start_page(0);
+        // New session → Resume session → Tasks, then ↵ opens the task surface —
+        // the surface is a home entry now, not a picker forced open on launch.
+        handle_idle_event(&mut screen, key(KeyCode::Down));
+        handle_idle_event(&mut screen, key(KeyCode::Down));
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::OpenTasks
+        ));
+        // ctrl-t is the direct chord for the same entry.
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::OpenTasks
+        ));
+    }
+
+    #[test]
     fn start_page_ctrl_chords_activate_directly() {
         let mut screen = Screen::new();
-        screen.show_start_page();
+        screen.show_start_page(0);
         assert!(matches!(
             handle_idle_event(
                 &mut screen,
@@ -3436,7 +3509,7 @@ mod tests {
     #[test]
     fn start_page_ctrl_r_stays_redo_once_the_composer_has_text() {
         let mut screen = Screen::new();
-        screen.show_start_page();
+        screen.show_start_page(0);
         handle_idle_event(&mut screen, key(KeyCode::Char('x')));
         // A non-empty composer keeps ctrl-r as the editor's redo binding.
         assert!(matches!(
@@ -3452,7 +3525,7 @@ mod tests {
     #[test]
     fn start_page_composer_stays_live_and_submit_starts_the_session() {
         let mut screen = Screen::new();
-        screen.show_start_page();
+        screen.show_start_page(0);
         // Typing goes to the composer, not the launcher.
         for c in "fix the bug".chars() {
             handle_idle_event(&mut screen, key(KeyCode::Char(c)));

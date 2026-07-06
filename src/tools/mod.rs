@@ -84,6 +84,14 @@ pub(crate) struct ToolState {
     /// mutates the same registry rather than dropping every session/job on the
     /// floor. The bash tool is exclusive, so the lock never actually contends.
     pub(crate) bash: std::sync::Arc<std::sync::Mutex<bash::BashState>>,
+    /// Whether default-on tool output reductions (bash filter ADR-0037, grep
+    /// grouping #338, find grouping #340) are active. `true` is the shipped
+    /// behavior (arm A). `false` selects the pre-reduction flat/raw baseline
+    /// used only to construct the tokens-per-task benchmark's baseline arm
+    /// (arm B, issue #210). Threaded to the tool render seams via `ToolEnv`, so
+    /// it is a per-run value with no process-global mutable state -- parallel
+    /// tests each carry their own and never race on it.
+    pub(crate) reduce_output: bool,
 }
 
 impl ToolState {
@@ -91,7 +99,25 @@ impl ToolState {
         Self {
             observed: ObservedFiles::new(),
             bash: std::sync::Arc::new(std::sync::Mutex::new(bash::BashState::new())),
+            // Production is always the shipped behavior: reductions on. The
+            // benchmark baseline arm is selected only via the test-only
+            // `with_reduce_output`, so the switch is structurally incapable of
+            // leaking into a normal run -- no env var or global is consulted.
+            reduce_output: true,
         }
+    }
+
+    /// Benchmark-only arm switch (issue #210): build a state with output
+    /// reductions forced on (arm A) or off (arm B). This is the ONLY way to
+    /// select the baseline arm. It stays `pub(crate)` and harness-only (used by
+    /// `crate::harness` and the replay bench), never surfaced to the CLI, so a
+    /// normal `ToolState` always keeps every default-on reduction (bash filter,
+    /// grep/find grouping) active. It is an explicit per-run value, never a
+    /// process global or env var, so parallel runs never race on it and it
+    /// cannot leak into a real session.
+    pub(crate) fn with_reduce_output(mut self, reduce: bool) -> Self {
+        self.reduce_output = reduce;
+        self
     }
 }
 
@@ -181,6 +207,22 @@ mod tests {
         // The `unknown tool: <name>` error is produced by the loop's resolution
         // path (see nexus tests); the set itself simply has no such tool.
         assert!(built_in_tools().by_name("nope").is_none());
+    }
+
+    #[test]
+    fn output_reductions_default_active_and_switch_is_explicit() {
+        use super::ToolState;
+        // The benchmark arm switch (issue #210) never touches a normal run: a
+        // default `ToolState` always keeps every default-on reduction active
+        // (arm A). This is the "default config => filters active" contract.
+        assert!(
+            ToolState::new().reduce_output,
+            "default ToolState keeps reductions active"
+        );
+        // The baseline arm (arm B) is reachable only via the explicit test-only
+        // switch, and it does not consult any env var or global.
+        assert!(!ToolState::new().with_reduce_output(false).reduce_output);
+        assert!(ToolState::new().with_reduce_output(true).reduce_output);
     }
 
     #[test]

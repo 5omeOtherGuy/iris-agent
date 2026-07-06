@@ -1,0 +1,9 @@
+[package]
+name = "workload_bytes_sign_extend"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "workload_bytes_sign_extend"
+path = "src/lib.rs"

@@ -1,0 +1,10 @@
+//! A helper built on `parser::parse_len`. Kept inert (not under test); it exists
+//! so `parse_len` references span multiple files, making the bug a multi-file
+//! search rather than a single-file read.
+use crate::parser::parse_len;
+
+/// Token density metric. Correctness of `density` itself is not under test; it
+/// only has to compile and forward to `parse_len`.
+pub fn density(text: &str) -> usize {
+    parse_len(text).saturating_mul(2)
+}

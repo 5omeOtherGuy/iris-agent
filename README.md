@@ -258,8 +258,12 @@ slice — dirty-tree safety, task checkpoint/rollback, final diff summary, and
 the verification loop (epic
 [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), design accepted
 in ADR-0028). Per-result output reduction is measured (see
-[Token efficiency](#token-efficiency)); the end-to-end task-success benchmark
-proof follows #261.
+[Token efficiency](#token-efficiency)). The end-to-end tokens-per-task benchmark
+([#210](https://github.com/5omeOtherGuy/iris-agent/issues/210)) has a committed
+plan, replay harness, and report; deterministic replay shows the default arm
+spending fewer prompt tokens than a reductions-off baseline with equal success,
+but the real-provider confirmation that closes the Milestone-2 gate is still
+pending.
 
 Implemented:
 
@@ -284,7 +288,8 @@ Next:
 
 - Git-centered workflow slice: dirty-tree safety, checkpoint/rollback, final
   diff summary, verification loop (epic #261, ADR-0028).
-- Token-efficiency benchmark proof (follows #261).
+- Token-efficiency benchmark: real-provider tokens-per-task confirmation (#210;
+  plan, replay harness, and report already landed).
 - Persistent approval policies, modes, and subagents.
 
 ## Token efficiency
@@ -324,8 +329,18 @@ Reduction never changes semantics:
 
 Full table, bars, and the regeneration command:
 [bash filter benchmark](docs/benchmarks/adr-0037-bash-filter-tokens.md).
-End-to-end task-success benchmarking (does the model still complete the task
-from reduced context) is a separate planned gate ([roadmap](docs/ROADMAP.md)).
+
+End-to-end, does a *completed task* cost fewer tokens with reductions on? The
+[tokens-per-task benchmark](docs/benchmarks/tokens-per-task.md)
+([plan](docs/BENCHMARK_PLAN.md), issue #210) measures this. Deterministic replay
+of three workloads (fix-a-failing-test, multi-file rename, large-log triage)
+shows the default arm spending fewer prompt tokens than a reductions-off baseline
+(3.4-9.1% on the current fixtures) with identical success and zero approval
+prompts, and asserts the reduced output still carries every task-critical fact
+verbatim. Replay proves the plumbing, not that a model still completes the task
+from reduced context: the real-provider confirmation (>= 3 real runs per cell)
+is pending, so this Milestone-2 gate stays open ([roadmap](docs/ROADMAP.md)) and
+no headline efficiency number is claimed yet.
 
 ## Testing
 

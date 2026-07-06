@@ -78,6 +78,17 @@ fn state_mut<'e>(env: &'e ToolEnv<'_>) -> Result<RefMut<'e, ToolState>> {
         .map_err(|_| anyhow!("tool state is busy; concurrent mutation is not allowed"))
 }
 
+/// The benchmark arm's output-reduction flag for this run (issue #210). Read
+/// from the shared [`ToolState`] so `grep`/`find`/`bash` render the shipped
+/// (arm A) or the pre-reduction baseline (arm B) form. Defaults to enabled if
+/// the state is momentarily borrowed (never happens on the read-only path).
+fn reduce_output(env: &ToolEnv) -> bool {
+    env.state
+        .try_borrow()
+        .map(|state| state.reduce_output)
+        .unwrap_or(true)
+}
+
 /// Run a pure read-only tool body (`grep`/`find`/`ls`) on the blocking pool.
 /// The body touches no [`ToolState`], so the resolved root and owned args move
 /// into a `spawn_blocking` task: a parallel batch then runs genuinely
@@ -89,11 +100,12 @@ fn run_off_thread(
     root: Result<PathBuf>,
     args: Value,
     label: &'static str,
-    body: fn(&Path, &Value) -> Result<ToolOutput>,
+    reduce: bool,
+    body: fn(&Path, &Value, bool) -> Result<ToolOutput>,
 ) -> ToolFuture<'static> {
     Box::pin(async move {
         let root = root?;
-        match tokio::task::spawn_blocking(move || body(&root, &args)).await {
+        match tokio::task::spawn_blocking(move || body(&root, &args, reduce)).await {
             Ok(result) => result,
             Err(_join_err) => Err(anyhow!("{} tool task failed: {}", label, _join_err)),
         }
@@ -178,6 +190,10 @@ impl Tool for BashTool {
             // contends; the `Arc` clone keeps the registry alive even if this
             // future is dropped on cancel and the blocking task is detached.
             let bash_state = std::sync::Arc::clone(&state_mut(env)?.bash);
+            // Benchmark arm switch (issue #210): arm B forces raw (unfiltered)
+            // bash output. Copied out before the blocking task so no borrow of
+            // the `!Send` env crosses the thread boundary.
+            let reduce = reduce_output(env);
 
             // Bridge the live-output sink across the thread boundary: the
             // blocking body forwards each chunk over an unbounded channel and the
@@ -194,7 +210,14 @@ impl Tool for BashTool {
                 let mut guard = bash_state.lock().map_err(|_| {
                     anyhow!("bash state poisoned by a previous panic; restart the session")
                 })?;
-                bash::execute(&root, &args, &mut guard, &cancel_for_task, Some(&sink))
+                bash::execute(
+                    &root,
+                    &args,
+                    &mut guard,
+                    &cancel_for_task,
+                    Some(&sink),
+                    reduce,
+                )
             });
 
             // Keep polling the executor while the command runs: forward each
@@ -372,7 +395,13 @@ impl Tool for GrepTool {
         env: &'a ToolEnv<'_>,
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
-        run_off_thread(root(env), args.clone(), "grep", grep::execute)
+        run_off_thread(
+            root(env),
+            args.clone(),
+            "grep",
+            reduce_output(env),
+            grep::execute,
+        )
     }
     fn is_concurrency_safe(&self) -> bool {
         true
@@ -396,7 +425,13 @@ impl Tool for FindTool {
         env: &'a ToolEnv<'_>,
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
-        run_off_thread(root(env), args.clone(), "find", find::execute)
+        run_off_thread(
+            root(env),
+            args.clone(),
+            "find",
+            reduce_output(env),
+            find::execute,
+        )
     }
     fn is_concurrency_safe(&self) -> bool {
         true
@@ -477,7 +512,13 @@ impl Tool for LsTool {
         env: &'a ToolEnv<'_>,
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
-        run_off_thread(root(env), args.clone(), "ls", ls::execute)
+        run_off_thread(
+            root(env),
+            args.clone(),
+            "ls",
+            reduce_output(env),
+            ls::execute,
+        )
     }
     fn is_concurrency_safe(&self) -> bool {
         true

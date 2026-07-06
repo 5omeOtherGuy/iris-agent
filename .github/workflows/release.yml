@@ -48,7 +48,7 @@ jobs:
         id: plan
         run: dist plan --output-format=json > dist-manifest.json
       - name: Upload plan
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-plan-dist-manifest
           path: dist-manifest.json
@@ -86,7 +86,7 @@ jobs:
       - name: Build artifacts
         run: dist build --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest.json
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-build-${{ matrix.target }}
           # The shell installer is a cargo-dist "global" artifact; it is built in
@@ -114,7 +114,7 @@ jobs:
       - name: Install dist
         run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Download per-target artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: artifacts-build-*
           path: target/distrib

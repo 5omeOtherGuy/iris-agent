@@ -1,0 +1,26 @@
+//! Regression tests for the precedence of the prefix `not` operator.
+//!
+//! `not` must bind only to the value immediately to its right, so the
+//! surrounding `and`/`or` operators apply at their normal precedence
+//! afterwards. The buggy implementation lets `not` swallow the entire
+//! remaining expression, which flips these results.
+
+use boolexpr::eval;
+
+#[test]
+fn not_precedence() {
+    // (not false) and false == true and false == false
+    assert_eq!(eval("not false and false").unwrap(), false);
+}
+
+#[test]
+fn not_precedence_parens() {
+    // Explicit grouping must agree with the unparenthesized form.
+    assert_eq!(eval("(not false) and false").unwrap(), false);
+}
+
+#[test]
+fn not_precedence_double() {
+    // not not true == true, then `true and true` == true.
+    assert_eq!(eval("not not true and true").unwrap(), true);
+}

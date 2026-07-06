@@ -1,0 +1,7 @@
+//! Connection pool with per-connection retry accounting.
+use crate::config::retry::MAX_RETRIES;
+
+pub fn max_inflight_retries(connections: u32) -> u32 {
+    // Total retry ceiling across the pool is MAX_RETRIES per connection.
+    connections.saturating_mul(MAX_RETRIES)
+}

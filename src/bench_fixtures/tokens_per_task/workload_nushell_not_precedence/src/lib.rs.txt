@@ -1,0 +1,495 @@
+//! A tiny boolean-expression language: `true`, `false`, `not`, `and`, `or`,
+//! and parentheses.
+//!
+//! The grammar is deliberately small but the implementation is structured the
+//! way a "real" language front-end would be: a hand-written tokenizer feeding a
+//! Pratt (precedence-climbing) parser that produces an AST, followed by a
+//! separate tree-walking evaluator.
+//!
+//! # Example
+//!
+//! ```
+//! use boolexpr::eval;
+//! assert_eq!(eval("true and not false").unwrap(), true);
+//! assert_eq!(eval("(true or false) and false").unwrap(), false);
+//! ```
+//!
+//! # Operator precedence
+//!
+//! From loosest to tightest binding:
+//!
+//! 1. `or`
+//! 2. `and`
+//! 3. `not` (prefix)
+//! 4. parenthesized groups and literals
+//!
+//! The prefix `not` binds only to the value immediately to its right, so
+//! `not false and false` means `(not false) and false`, not
+//! `not (false and false)`.
+
+mod error;
+
+pub use error::{ParseError, Span};
+
+// ---------------------------------------------------------------------------
+// Tokens
+// ---------------------------------------------------------------------------
+
+/// A lexical token together with the source span it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    kind: TokenKind,
+    span: Span,
+}
+
+/// The kinds of token the language recognizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenKind {
+    /// The literal `true`.
+    True,
+    /// The literal `false`.
+    False,
+    /// The prefix operator `not`.
+    Not,
+    /// The infix operator `and`.
+    And,
+    /// The infix operator `or`.
+    Or,
+    /// An opening parenthesis `(`.
+    LParen,
+    /// A closing parenthesis `)`.
+    RParen,
+    /// A synthetic end-of-input marker.
+    Eof,
+}
+
+impl TokenKind {
+    /// A short human-readable name, used in error messages.
+    fn describe(&self) -> String {
+        match self {
+            TokenKind::True => "true".to_string(),
+            TokenKind::False => "false".to_string(),
+            TokenKind::Not => "not".to_string(),
+            TokenKind::And => "and".to_string(),
+            TokenKind::Or => "or".to_string(),
+            TokenKind::LParen => "(".to_string(),
+            TokenKind::RParen => ")".to_string(),
+            TokenKind::Eof => "<eof>".to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer
+// ---------------------------------------------------------------------------
+
+/// Converts a source string into a flat vector of [`Token`]s.
+///
+/// Whitespace is skipped. Alphabetic runs become keywords (`true`, `false`,
+/// `not`, `and`, `or`); anything else is either a paren or a lex error.
+struct Tokenizer<'a> {
+    src: &'a str,
+    /// Byte offset of the next unconsumed character.
+    pos: usize,
+    /// The source as a vector of (byte-offset, char) pairs for easy scanning.
+    chars: Vec<(usize, char)>,
+    /// Index into `chars`.
+    idx: usize,
+}
+
+impl<'a> Tokenizer<'a> {
+    fn new(src: &'a str) -> Tokenizer<'a> {
+        Tokenizer {
+            src,
+            pos: 0,
+            chars: src.char_indices().collect(),
+            idx: 0,
+        }
+    }
+
+    /// Peek at the current character without consuming it.
+    fn peek_char(&self) -> Option<(usize, char)> {
+        self.chars.get(self.idx).copied()
+    }
+
+    /// Consume and return the current character.
+    fn bump(&mut self) -> Option<(usize, char)> {
+        let cur = self.chars.get(self.idx).copied();
+        if let Some((off, ch)) = cur {
+            self.idx += 1;
+            self.pos = off + ch.len_utf8();
+        }
+        cur
+    }
+
+    /// Skip any run of ASCII whitespace.
+    fn skip_whitespace(&mut self) {
+        while let Some((_, ch)) = self.peek_char() {
+            if ch.is_whitespace() {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Read a maximal run of alphabetic characters starting at the cursor.
+    ///
+    /// Returns the word and the span it occupies.
+    fn read_word(&mut self) -> (String, Span) {
+        let start = self.peek_char().map(|(off, _)| off).unwrap_or(self.pos);
+        let mut word = String::new();
+        while let Some((_, ch)) = self.peek_char() {
+            if ch.is_alphabetic() {
+                word.push(ch);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        let span = Span {
+            start,
+            end: self.pos,
+        };
+        (word, span)
+    }
+
+    /// Produce the full token stream, terminated by a single `Eof` token.
+    fn tokenize(mut self) -> Result<Vec<Token>, ParseError> {
+        let mut tokens = Vec::new();
+        loop {
+            self.skip_whitespace();
+            let (off, ch) = match self.peek_char() {
+                Some(pair) => pair,
+                None => break,
+            };
+
+            if ch == '(' {
+                self.bump();
+                tokens.push(Token {
+                    kind: TokenKind::LParen,
+                    span: Span::new(off, 1),
+                });
+                continue;
+            }
+            if ch == ')' {
+                self.bump();
+                tokens.push(Token {
+                    kind: TokenKind::RParen,
+                    span: Span::new(off, 1),
+                });
+                continue;
+            }
+
+            if ch.is_alphabetic() {
+                let (word, span) = self.read_word();
+                let kind = match word.as_str() {
+                    "true" => TokenKind::True,
+                    "false" => TokenKind::False,
+                    "not" => TokenKind::Not,
+                    "and" => TokenKind::And,
+                    "or" => TokenKind::Or,
+                    _ => return Err(ParseError::UnknownWord { word, span }),
+                };
+                tokens.push(Token { kind, span });
+                continue;
+            }
+
+            return Err(ParseError::UnexpectedChar {
+                ch,
+                span: Span::new(off, ch.len_utf8()),
+            });
+        }
+
+        let eof_span = Span {
+            start: self.src.len(),
+            end: self.src.len(),
+        };
+        tokens.push(Token {
+            kind: TokenKind::Eof,
+            span: eof_span,
+        });
+        Ok(tokens)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AST
+// ---------------------------------------------------------------------------
+
+/// A binary boolean operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinOp {
+    And,
+    Or,
+}
+
+/// The parsed expression tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Expr {
+    /// A boolean literal.
+    Lit(bool),
+    /// A `not` applied to a sub-expression.
+    Not(Box<Expr>),
+    /// An `and`/`or` applied to two sub-expressions.
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Binding powers
+// ---------------------------------------------------------------------------
+
+/// Left/right binding power for the infix operators.
+///
+/// Higher numbers bind tighter. `and` binds tighter than `or`, so
+/// `a or b and c` groups as `a or (b and c)`.
+fn infix_binding_power(op: BinOp) -> (u8, u8) {
+    match op {
+        BinOp::Or => (1, 2),
+        BinOp::And => (3, 4),
+    }
+}
+
+/// Right binding power of the prefix `not`.
+///
+/// This governs how much of the expression to the right of a `not` becomes its
+/// operand. It must sit *above* every infix operator's binding power so that
+/// `not` grabs only the next value (and any directly-chained `not`s), leaving
+/// the surrounding `and`/`or` to apply afterwards.
+const NOT_BINDING_POWER: u8 = 5;
+
+// ---------------------------------------------------------------------------
+// Parser
+// ---------------------------------------------------------------------------
+
+/// A precedence-climbing (Pratt) parser over a token stream.
+struct Parser {
+    tokens: Vec<Token>,
+    /// Index of the next unconsumed token.
+    pos: usize,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Parser {
+        Parser { tokens, pos: 0 }
+    }
+
+    /// Look at the current token without consuming it.
+    fn peek(&self) -> &Token {
+        // The token stream always ends in `Eof`, so indexing the last token is
+        // safe once we clamp.
+        let i = self.pos.min(self.tokens.len() - 1);
+        &self.tokens[i]
+    }
+
+    /// Consume and return the current token.
+    fn advance(&mut self) -> Token {
+        let tok = self.peek().clone();
+        if self.pos < self.tokens.len() - 1 {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    /// Parse a complete expression and ensure all input was consumed.
+    fn parse_program(&mut self) -> Result<Expr, ParseError> {
+        if self.peek().kind == TokenKind::Eof {
+            return Err(ParseError::EmptyInput);
+        }
+        let expr = self.parse_expr(0)?;
+        let tail = self.peek();
+        if tail.kind != TokenKind::Eof {
+            return Err(ParseError::TrailingTokens {
+                found: tail.kind.describe(),
+                span: tail.span,
+            });
+        }
+        Ok(expr)
+    }
+
+    /// The core Pratt loop.
+    ///
+    /// `min_bp` is the minimum binding power an infix operator must have to be
+    /// consumed at this level. Prefix and primary forms are handled first to
+    /// produce `lhs`, then infix operators are folded in while they bind
+    /// tightly enough.
+    fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_prefix()?;
+
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::And => BinOp::And,
+                TokenKind::Or => BinOp::Or,
+                _ => break,
+            };
+            let (l_bp, r_bp) = infix_binding_power(op);
+            if l_bp < min_bp {
+                break;
+            }
+            self.advance(); // consume the operator
+            let rhs = self.parse_expr(r_bp)?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(lhs)
+    }
+
+    /// Parse a prefix form: either a `not` chain or a primary value.
+    fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
+        if self.peek().kind == TokenKind::Not {
+            self.advance(); // consume `not`
+            // BUG: `not` recursively parses the ENTIRE remaining expression as
+            // its operand (`parse_expr(0)`), so `not false and false` becomes
+            // `not (false and false)`. The prefix should bind only to the next
+            // value; see `NOT_BINDING_POWER`.
+            let operand = self.parse_expr(0)?;
+            return Ok(Expr::Not(Box::new(operand)));
+        }
+        self.parse_primary()
+    }
+
+    /// Parse a primary value: a literal or a parenthesized expression.
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::True => {
+                self.advance();
+                Ok(Expr::Lit(true))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Expr::Lit(false))
+            }
+            TokenKind::LParen => {
+                self.advance(); // consume `(`
+                let inner = self.parse_expr(0)?;
+                if self.peek().kind != TokenKind::RParen {
+                    return Err(ParseError::UnclosedParen { span: tok.span });
+                }
+                self.advance(); // consume `)`
+                Ok(inner)
+            }
+            _ => Err(ParseError::ExpectedValue {
+                found: tok.kind.describe(),
+                span: tok.span,
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Evaluator
+// ---------------------------------------------------------------------------
+
+/// Walk the AST and fold it down to a single boolean.
+fn evaluate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Lit(value) => *value,
+        Expr::Not(inner) => !evaluate(inner),
+        Expr::Binary { op, lhs, rhs } => {
+            let l = evaluate(lhs);
+            let r = evaluate(rhs);
+            match op {
+                BinOp::And => l && r,
+                BinOp::Or => l || r,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Parse `src` into an expression tree without evaluating it.
+///
+/// Exposed mostly for tests and tooling that want to inspect structure.
+fn parse(src: &str) -> Result<Expr, ParseError> {
+    let tokens = Tokenizer::new(src).tokenize()?;
+    let mut parser = Parser::new(tokens);
+    parser.parse_program()
+}
+
+/// Parse and evaluate a boolean expression.
+///
+/// Returns `Ok(bool)` for well-formed input, or a [`ParseError`] describing the
+/// first problem encountered.
+///
+/// # Examples
+///
+/// ```
+/// use boolexpr::eval;
+/// assert_eq!(eval("not false").unwrap(), true);
+/// assert_eq!(eval("true and false").unwrap(), false);
+/// assert_eq!(eval("true or false").unwrap(), true);
+/// ```
+pub fn eval(src: &str) -> Result<bool, ParseError> {
+    let expr = parse(src)?;
+    Ok(evaluate(&expr))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (in-module smoke tests; the precedence regression lives in
+// tests/precedence.rs).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literals() {
+        assert_eq!(eval("true").unwrap(), true);
+        assert_eq!(eval("false").unwrap(), false);
+    }
+
+    #[test]
+    fn single_not() {
+        assert_eq!(eval("not true").unwrap(), false);
+        assert_eq!(eval("not false").unwrap(), true);
+    }
+
+    #[test]
+    fn and_or_basic() {
+        assert_eq!(eval("true and false").unwrap(), false);
+        assert_eq!(eval("true or false").unwrap(), true);
+        assert_eq!(eval("false or true").unwrap(), true);
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // or (false) or (true and false) => false
+        assert_eq!(eval("false or true and false").unwrap(), false);
+    }
+
+    #[test]
+    fn parens_group() {
+        assert_eq!(eval("(true or false) and false").unwrap(), false);
+        assert_eq!(eval("not (true and false)").unwrap(), true);
+    }
+
+    #[test]
+    fn errors() {
+        assert_eq!(eval(""), Err(ParseError::EmptyInput));
+        assert!(matches!(
+            eval("true and"),
+            Err(ParseError::ExpectedValue { .. })
+        ));
+        assert!(matches!(
+            eval("foo"),
+            Err(ParseError::UnknownWord { .. })
+        ));
+        assert!(matches!(
+            eval("(true"),
+            Err(ParseError::UnclosedParen { .. })
+        ));
+    }
+}

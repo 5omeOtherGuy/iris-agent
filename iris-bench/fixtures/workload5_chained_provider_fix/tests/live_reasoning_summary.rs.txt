@@ -1,0 +1,33 @@
+use reasoning_summary_fixture::providers::openai_codex_responses::build_request;
+use reasoning_summary_fixture::reasoning::ReasoningEffort;
+
+fn emit_provider_diagnostics() {
+    // Deliberately noisy: a real agent should run this through bash, and the
+    // bash cargo-test filter should keep the failing assertion while dropping
+    // repetitive diagnostic chatter.
+    for i in 0..180 {
+        println!(
+            "provider-diagnostic-{i:03}: openai responses reasoning summary stream pending; \
+             retry_gate=visible-summary-delta cache_slot=codex-live-rail"
+        );
+    }
+}
+
+#[test]
+fn reasoning_request_asks_for_summary_so_live_thinking_can_stream() {
+    emit_provider_diagnostics();
+    let request = build_request(Some(ReasoningEffort::Low));
+    let reasoning = request.reasoning.expect("low reasoning should be serialized");
+    assert_eq!(reasoning.effort, "low");
+    assert_eq!(
+        reasoning.summary,
+        Some("auto"),
+        "Codex Responses streams live reasoning summary deltas only when the request asks for summary:auto"
+    );
+}
+
+#[test]
+fn reasoning_off_still_omits_reasoning_block() {
+    let request = build_request(Some(ReasoningEffort::Off));
+    assert!(request.reasoning.is_none());
+}

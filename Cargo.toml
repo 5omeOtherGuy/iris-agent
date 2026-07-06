@@ -1,3 +1,7 @@
+[workspace]
+members = ["iris-bench"]
+resolver = "3"
+
 [package]
 name = "iris-agent"
 version = "0.1.0"
@@ -7,6 +11,12 @@ build = "build.rs"
 license = "MIT"
 repository = "https://github.com/5omeOtherGuy/iris-agent"
 description = "A fast, token-efficient coding agent for the terminal."
+
+# Library target: the full agent + the benchmark `harness` façade the
+# `iris-bench` crate consumes. The bin below is a thin shim over `run_cli`.
+[lib]
+name = "iris_agent"
+path = "src/lib.rs"
 
 [[bin]]
 name = "iris"
@@ -77,7 +87,7 @@ unicode-segmentation = "1"
 # canonical crates for their job; hand-rolling either is forbidden by the
 # reuse ladder.
 regex = "1"
-toml = "0.9"
+toml = "1.1"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "http2"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

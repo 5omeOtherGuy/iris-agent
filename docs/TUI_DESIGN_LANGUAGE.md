@@ -73,8 +73,9 @@ halves are never merged onto one line again:
 
 **Shared measure.** Tool panels and the composer indent **2 cells** from the
 pane edge and share **one width**. Transcript text (user + assistant) aligns to
-a single **text column** (see §7). Nothing is centred; nothing is full-bleed
-except a genuine overlay's scrim.
+a single **text column** (see §7). Nothing is full-bleed: the docked overlays
+(§10) inset to the same measure, never a full-screen scrim. The only centred
+surface is the start-page launcher (§12.5).
 
 **Max width (web).** In a browser recreation the column caps at `--pane-max`
 (900px) and centres in the viewport on the flat `bg`. In a real terminal it is
@@ -143,7 +144,7 @@ weight/case/dim instead of a hue, do.
 | Accent | `--iris-accent` | `#d78700` | orange | Active mode `◉`, running `●`, meter edge dot, warning `▲`. |
 | Interactive | `--iris-interactive` | `#00afaf` | Cyan | Selection focus, inline code. |
 | Link | `--iris-link` | `#5f87ff` | Blue | Links only. |
-| Success | `--iris-success` | `#5faf5f` | Green | `◆` DONE/APPROVED, diff additions. |
+| Success | `--iris-success` | `#5faf5f` | Green | `◆` DONE, diff additions. |
 | Danger | `--iris-danger` | `#d75f5f` | Red | `■` ERROR/DENIED, diff removals, stderr. |
 
 ### 2.3 Two laws of color
@@ -223,8 +224,8 @@ a second meaning.
 ```
 STATE / ACTIVITY
   ◉  active / selected mode (orange)        ●  running · live LED (orange)
-  ◆  done / approved (green)                ◇  preview / pending (muted)
-  ■  error / denied (red)                   ▲  warning / review (orange)
+  ◆  done / success (green)                 ◇  preview / pending (muted)
+  ■  error / denied (red)                   ▲  warning (orange)
   □  skipped / cancelled (muted)            ○  queued / empty meter slot (muted)
 
 TRANSCRIPT
@@ -284,9 +285,10 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
   transcript; structure comes from the block grammar (header · hanging body ·
   hairline footer) and its two alignment rails, not from a frame. The composer
   keeps its frame — it is the only hard chrome on screen.
-- **The one permitted shadow** is a faint cast under a genuine overlay
-  (`--overlay-shadow`), which is the real top layer. Overlays sit on a
-  low-opacity black scrim; the pane is otherwise fully opaque. No blur, no glass.
+- **No shadows anywhere.** Overlays (§10) are docked, **frameless** menus that
+  reserve rows above the composer and shift the editor down — not a floating
+  layer over the pane. No cast shadow, no scrim, no blur, no glass; the pane is
+  flat and fully opaque throughout. The composer's top edge is the only frame.
 - **Motion is almost nil.** Only two live motions exist: the **LED-chase
   working indicator** (`●··· → ·●·· → ··●· → ···●`) and the **edge-dot pulse**
   on the context meter / running symbol at high usage. No braille spinners, no
@@ -388,9 +390,9 @@ The **tool block** is Iris's primary structured-output primitive. It is
 **frameless**: no border, no background, no header/body separator — unboxed
 text, like the rest of the transcript. Every block is **header · body ·
 footer**, stacked, sharing one width at the 2-cell tool indent. The transcript
-families are **EXPLORE / SHELL / EDIT** (plus the docked APPROVAL review,
-§8.5). Never invent another; never render standalone `READ` / `GREP` / `LS`
-panels.
+families are **EXPLORE / SHELL / EDIT**. Approval is not a family — it is a
+lifecycle state a SHELL/EDIT block passes through in place (§8.5). Never invent
+another family; never render standalone `READ` / `GREP` / `LS` panels.
 
 ### 8.1 Shared block grammar
 ```
@@ -406,9 +408,10 @@ symbol in the header.
 
 **Footer** — the block's last row, always visible, opened by a muted hairline
 rule from the body indent to the right rail. Left edge: the **state as label
-only** (`DONE` / `ERROR` / `PREVIEW` / `RUNNING` / `CANCELLED`), bold
-uppercase, colored by state — **no glyph**. After it, `┊`-joined family
-extras (EDIT counts + note, SHELL `EXIT <code>` + result meta). Right-bound:
+only** (`DONE` / `ERROR` / `PREVIEW` / `RUNNING` / `CANCELLED` / `REVIEW` /
+`DENIED`), bold uppercase, colored by state — **no glyph**. After it, `┊`-joined
+family extras (EDIT counts + note, SHELL `EXIT <code>` + result meta, or an
+in-review block's danger-toned reason + decision affordance / approval note). Right-bound:
 the optional token diagnostics cluster, all muted, honest (rendered only when
 measured). The `┊` law: only BETWEEN sibling fields, one space each side,
 never leading/trailing, never after the state label — fields are joined
@@ -421,8 +424,9 @@ default**: every foldable block **arrives collapsed** regardless of body
 size (the two rows still answer *what ran · on what · how long · outcome ·
 cost*). Two exceptions: a **running** block stays expanded on its bounded
 live tail (it collapses when it finalizes unless the user explicitly
-expanded it), and a **pending EDIT preview** (`◇ PREVIEW`) arrives expanded
-for review (it collapses once applied). `ctrl+o` toggles **all** foldable
+expanded it), and a **pending preview / review** (`◇ PREVIEW`, `REVIEW`)
+arrives expanded so its body can be inspected before deciding (it collapses
+once applied/settled). `ctrl+o` toggles **all** foldable
 blocks at once — tool blocks and thinking rails: if any is collapsed it
 expands them all, otherwise it collapses them all. A **click on a block's
 header row** toggles that one block. State is per-block; an explicit user
@@ -472,17 +476,32 @@ field (`+n` add-ink, `−n` del-ink, 1ch apart) plus a muted note (`new file`).
 Use `state="preview"` (**no elapsed**) for a pending apply; `state="done"`
 once applied.
 
-### 8.5 APPROVAL — authorization review
-Compact. The **header carries the decision** (`▲ REVIEW` · `◆ APPROVED` · `■
-DENIED`). The body carries:
-1. the **action** (a `$ command` if `shell`, else prose), optionally with
-   `+add/−del` on the right;
-2. optionally the **diff** being authorized (`DiffBlock`, under a hairline);
-3. a **reason** — muted, or danger-toned when the action is denied/destructive;
-4. when `review`, a hairline-ruled **decision affordance** of `┊`-separated
-   key hints (`y approve ┊ n deny ┊ e edit ┊ a always`).
+### 8.5 Approval — the gated block's own review lifecycle
+Approval is **not a family** and never a separate panel or docked box. A gated
+call is reviewed **inside its own tool block** (SHELL or EDIT): the block's
+footer **state label walks the lifecycle** —
+`REVIEW → RUNNING → DONE`/`ERROR` when approved, or `REVIEW → DENIED` when
+refused. One block, start to finish; the tool's command/diff is never
+duplicated in a second block.
 
-### 8.6 Diff rendering (`DiffBlock`) — shared by EDIT & APPROVAL
+- **`REVIEW`** (orange, no elapsed) **arrives expanded** — you must see what
+  you authorize. The body is the block's own body: the `$ command` (SHELL) or
+  the **diff** (EDIT). The footer carries, in order: an optional **danger-toned
+  reason** (`destructive` · `N pre-existing changes` · `unsandboxed`) in the
+  danger role, then the `┊`-joined **decision affordance** — `y approve ┊ n
+  deny` plus `a always` / `p project` **only when the loop offers them**; deny
+  is always available.
+- **Manual approval** folds a muted **note** into that same footer (`approved
+  this time` / `approved this session` / `approved this project`) and drops the
+  affordance in place; the block then flips to `RUNNING` when it starts, and the
+  note rides through to `DONE`.
+- **Auto-approval carries no chrome** — the tool block alone is the record.
+- **EDIT** review reuses the preview block: `◇ PREVIEW → REVIEW` flips **in
+  place** (the diff IS the review surface), then `RUNNING → DONE`, or `DENIED`.
+- **`DENIED`** (red, no elapsed) is terminal: the tool never ran, so the block
+  is the honest record of what was proposed and declined.
+
+### 8.6 Diff rendering (`DiffBlock`) — shared by EDIT & the in-block review
 Columns: **line number** (right-aligned, muted, non-selectable) · **marker**
 (1 cell) · **content** (wraps; continuations align under content). Markers:
 `+` addition (green + faint add-tone bg), `−` removal (red + faint del-tone bg,
@@ -621,13 +640,23 @@ Canonical commands: `/model` · `/diff` · `/undo` · `/compact` · `/clear` ·
 
 ## 10 · Overlays
 
-Overlays are the **genuine top layer** — the only place a shadow appears. All
-share: `frame-overlay` border, `surface-overlay` fill, `--overlay-shadow` cast,
-an optional uppercase title row, and rows whose highlight is the `surface` fill.
+Overlays are **docked, frameless menus** above the composer — the same grammar
+as the tool blocks (§8) and the start-page launcher (§12.5), never a bordered
+dialog. There is **no box-drawing frame, no shadow, no scrim.** Structure comes
+from three parts, built by one shared renderer (`overlay_menu`):
 
-- **SlashMenu** — command palette (§9.3).
-- **Picker** — model switcher, settings, scoped-models, login provider list.
-  Rows: `[◉ if active] label … meta hint`. `◉` marks the current selection.
+- a **bold uppercase title** header (omitted for the title-less SlashMenu);
+- **rows** whose highlight is the `surface` fill across the menu measure — never
+  a border, never a colored accent — with a bold label; `◉`/`○` mark a
+  current/enabled row (never `[x]`);
+- an optional **dim key-hint footer**, set off by one blank row.
+
+The composer's top edge sits directly below, so the menu needs no frame of its
+own to read as a distinct region.
+
+- **SlashMenu** — command palette (§9.5). Title-less: just the rows.
+- **Picker** — model switcher, settings, scoped-models, **tasks**, resume, login
+  provider list. Rows: `[◉ if active] label … meta hint`.
 - **HelpOverlay** — the `?` cheatsheet: grouped key→action rows (keys in ink,
   actions muted, quiet uppercase group headings). No color, no icons.
 
@@ -637,9 +666,9 @@ an optional uppercase title row, and rows whose highlight is the `surface` fill.
 
 - **Sentence case** for all prose.
 - **UPPERCASE** is reserved for structural labels: tool families
-  (`SHELL`/`EXPLORE`/`EDIT`/`APPROVAL`), states (`DONE`/`RUNNING`/`ERROR`/…),
-  mode (`CODE`), section labels (`PLAN`/`THINKING`), and `EXIT`. **Never**
-  uppercase for emphasis in prose.
+  (`SHELL`/`EXPLORE`/`EDIT`), states
+  (`DONE`/`RUNNING`/`ERROR`/`REVIEW`/`DENIED`/…), mode (`CODE`), section labels
+  (`PLAN`/`THINKING`), and `EXIT`. **Never** uppercase for emphasis in prose.
 - **Numbers are honest.** Token telemetry (`↑177k ↓5.7k`), durations (`7.6s`,
   `1:27`), counts — shown compactly and only when real. Never assert savings the
   runtime hasn't measured.
@@ -674,6 +703,12 @@ nothing else changes — that is the point of the shared chrome. On the start
 page the session bar shows the launch cwd/branch and an empty meter
 (`CTX 0/<cap>`, all `○`).
 
+The launcher **is the home menu**: `New session` · `Resume session` · `Tasks` ·
+`Settings` · `Quit`, each a keyboard row (`↑`/`↓` + `↵`, or the `ctrl-` chord).
+`Tasks` opens the unified task surface (`/tasks`, §10 Picker). Recoverable Iris
+tasks (ADR-0031) are surfaced **here** — a dim `· N to recover` badge on the
+`Tasks` row — never a picker forced open over the menu on launch.
+
 ```
 ~/demo ┊ git main                                     CTX 0/300k ○○○○○○○○○○
 
@@ -681,6 +716,7 @@ page the session bar shows the launch cwd/branch and an empty meter
 
                         ◉ New session ················ ctrl-n
                           Resume session ·············· ctrl-r
+                          Tasks · 2 to recover ········ ctrl-t
                           Settings ····················· ctrl-,
                           Quit ························· ctrl-q
 
@@ -719,9 +755,13 @@ starts the session with it.
    transcript text shares one column.
 4. **Block rows** are each exactly one of {header·body·footer rule·footer} and
    all share one width; no row overflows the block's rails.
-5. **Four tool families only.** No standalone READ/GREP/LS/DIFF panels.
+5. **Three tool families only** (EXPLORE / SHELL / EDIT). No standalone
+   READ/GREP/LS/DIFF panels; approval is an in-block lifecycle state, never a
+   separate panel.
 6. **Chrome is for tools.** Conversation, thinking, plans, and notices are never
-   boxed. Boxes are never used for prose.
+   boxed. Boxes are never used for prose. **Overlays are frameless too** — menus,
+   pickers, and the slash palette carry no box-drawing frame; selection is the
+   `surface` fill (§10).
 7. **Square corners always** (`--radius: 0`).
 8. **State = symbol + label + color**, never color alone; the pane passes the
    monochrome test.
