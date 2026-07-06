@@ -12,6 +12,8 @@
 //! is sent to the model, nor the approval / text / denied summaries (which keep
 //! using `tool_display::run_target`).
 
+use crate::tool_display::shorten_paths_in_text;
+
 /// A structured, display-only view of a shell invocation for the SHELL panel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct ShellCommand {
@@ -123,7 +125,7 @@ fn split_segments(line: &str) -> Vec<String> {
 fn push_segment(segments: &mut Vec<String>, raw: &str) {
     let trimmed = raw.trim();
     if !trimmed.is_empty() {
-        segments.push(trimmed.to_string());
+        segments.push(shorten_paths_in_text(trimmed));
     }
 }
 
@@ -296,6 +298,15 @@ mod tests {
         let cmd = build("cd \"/abs/path\" && cargo fmt");
         assert_eq!(cmd.command, vec!["cd \"/abs/path\"", "&& cargo fmt"]);
         assert!(cmd.payload.is_none());
+    }
+
+    #[test]
+    fn command_rows_shorten_absolute_home_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let sibling = cwd.parent().unwrap().join("iris-other");
+        let cmd = build(&format!("cd {} && cargo test", sibling.display()));
+        assert_eq!(cmd.command, vec!["cd ../iris-other", "&& cargo test"]);
+        assert!(!cmd.command.join(" ").contains("/home/"));
     }
 
     #[test]
