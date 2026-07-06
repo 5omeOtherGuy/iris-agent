@@ -1383,19 +1383,65 @@ Artifact: docs/benchmarks/chained-all-four-sonnet46-low-n10-2026-07-06.{md,jsonl
 
 - 20/20 success, 20/20 valid. The model reliably fixes all four in order, both
   arms. Reduction shrank tool output -15.5% (60,138 vs 71,168 B).
-- Chaining costs ~2x separate sessions: combined defaults median 547,609 billed
-  input tok vs ~282,479 for the four separate sessions summed (N=50 defaults
-  medians) = 1.94x. input_tokens is cumulative, so a long session re-sends its
-  growing context every round-trip; separate sessions each start fresh. Cache
-  does not hide it (billed share ~52%; total processed also higher for the longer
-  arm).
-- Reduction helps MORE here: raw median +10.7% for defaults is round-trip-
-  confounded (median 23 vs 21 round-trips, ~10.7k tok each); round-trip-controlled
-  weighted delta = -4.2% favoring defaults, larger than the -1.8% pooled in the
-  separate suite, because the reduced tool output is re-sent over 18-27 round-trips
-  and compounds.
+- NOTE: numbers below are COST-CORRECTED (see Entry 31). `input_tokens` is gross
+  (fresh+cache_read+cache_write); ~93% is cache_read billed at 0.1x, so gross
+  overstates cost. The earlier "billed share ~52%" here was wrong (double-counted
+  cache_read, not cost-weighted). Correct: fresh+write = 6.2% of gross;
+  cost-weighted input = 15.6% of gross.
+- Chaining costs ~1.27x separate sessions on a COST-weighted basis (not the ~1.94x
+  gross-token ratio): combined 85,329 cost units vs 66,951 for the four separate
+  sessions summed. input_tokens is cumulative, so a long session re-sends its
+  growing context every round-trip; separate sessions start fresh. The premium is
+  real but ~27%, not ~94%.
+- Reduction helps MORE here, and cost-weighting amplifies it: raw cost mean +3.2%
+  for defaults (gross +9.3%) is round-trip-confounded (median 23 vs 21 round-trips);
+  round-trip-controlled cost delta = -6.5% favoring defaults (gross -4.2%), larger
+  than the separate suite's cost-weighted pooled -2.9%, because reduction trims the
+  fresh full-price tokens and the reduced output re-sends over 18-27 round-trips.
 
-Takeaways: chaining is feasible and safe but token-expensive (batching independent
-tasks compounds context cost); reduction's advantage grows with session length.
-N=10 is directional (per-stratum n=1-2); the 1.94x chaining-cost ratio is the
-robust result. No claim, no gate closure.
+Takeaways: chaining is feasible and safe but modestly cost-expensive (~1.27x, not
+2x); reduction is net-favorable and its advantage grows with session length AND
+with cost-weighting. N=10 is directional (per-stratum n=1-2); the 1.27x cost-weighted
+chaining ratio is the robust result. No claim, no gate closure.
+
+## Entry 31 - Metric correction: input_tokens is GROSS; cost basis is ~15% of it
+
+A reviewer question exposed a metric error that runs through Entries 27, 29, 30.
+Ground truth from code (`src/mimir/providers/anthropic_messages.rs::merge_usage`):
+
+    self.usage.input_tokens = raw_input_tokens        // Anthropic's fresh (billed 1x)
+        .saturating_add(cache_read_input_tokens)       // + cache reads (billed 0.1x)
+        .saturating_add(cache_write_input_tokens);     // + cache writes (billed 1.25x/2x)
+
+So the logged `input_tokens` is GROSS input, and `cache_read_tokens` is a subset
+ALREADY inside it. `ProviderUsage`'s own doc says as much ("Already included in
+input_tokens; callers must not add them again").
+
+Consequences:
+- "billed share ~52%" (Entry 30 draft) was wrong twice: it computed
+  input_tokens/(input_tokens+cache_read), which double-counts cache_read, and it
+  was not cost-weighted. Correct denominators on the combined run: cache_read =
+  93.4% of gross; fresh+cache_write = 6.2% of gross; cost-weighted input = 15.6%
+  of gross.
+- Gross-token ratios overstate cost by ~6-7x when the cache hit rate is high,
+  because ~90% of gross is cache_read billed at 0.1x. The combined-vs-separate
+  chaining ratio drops from 1.94x (gross) to 1.27x (cost-weighted).
+- Cost weighting AMPLIFIES the reduction advantage (reduction trims fresh,
+  full-price tokens, not cheap cache reads): separate-suite pooled round-trip-
+  controlled goes from -1.8% (gross) to -2.9% (cost); combined from -4.2% to -6.5%.
+  Per-workload cost-weighted mean deltas (separate N=50, A vs B): bytes -0.4%,
+  clap -6.6%, nushell -1.1%, dayjs +7.6%.
+
+Cost model used (base-input-token-equivalent units): fresh 1.0x, cache_read 0.1x,
+cache_write 1.25x (5m)/2x (1h), output 5.0x (Sonnet $3/$15 per MTok, cache read
+$0.30, cache write $3.75). The qualitative conclusions are UNCHANGED (reduction is
+safe and net-favorable; effect concentrated on large-output/many-round-trip work;
+round-trips dominate), but every token delta should be read cost-weighted, and any
+COST claim must be.
+
+Data gap / top follow-up: the bench JSONL logs gross `input_tokens` and
+`cache_read_tokens` but NOT cache-creation (write) tokens, so cost-weighted figures
+fold writes into the fresh 1.0x bucket and are a slight LOWER bound. Add a
+`cache_write_tokens` field to observer + runner + schema so future runs compute
+exact cost (fresh separated from writes) and so output/reasoning cost can be
+weighted too.

@@ -51,6 +51,15 @@ confounded by round-trip composition; the honest comparison stratifies by round-
 **Pooled round-trip-controlled delta (all 4 workloads): -1,308 tok = -1.8%** of the overall
 baseline mean (73,855 tok). Small favorable tilt, concentrated almost entirely in clap.
 
+> **Metric note (cost basis).** The deltas above are on GROSS `input_tokens` (fresh +
+> cache_read + cache_write; see notebook Entry 31). Prompt-cache hit rate is high here, so
+> ~85% of gross is cache_read billed at 0.1x -- gross deltas overstate cost. Cost-weighted
+> (fresh 1x + cache_read 0.1x; cache_write not logged, so a lower bound), the effect is
+> LARGER, not smaller, because reduction trims fresh full-price tokens: pooled round-trip-
+> controlled = **-2.9%** (vs -1.8% gross); per-workload cost-weighted mean A vs B = bytes
+> -0.4%, clap -6.6%, nushell -1.1%, dayjs +7.6%. Conclusions are unchanged (clap wins, rest
+> wash), but any cost claim should use the cost-weighted figures.
+
 ### clap is the one clear, significant effect
 
 Consistent across strata and significant at the modal round-trip count:
