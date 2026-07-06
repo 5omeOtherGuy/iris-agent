@@ -485,6 +485,9 @@ pub(crate) struct Screen {
     prompt_history: Vec<String>,
     /// Current prompt-history cursor while browsing; `None` means editing a fresh draft.
     prompt_history_cursor: Option<usize>,
+    /// Pager sticky prompt disclosure state. A newly pinned prompt starts
+    /// collapsed so it names the governing turn without taking over the pane.
+    pub(crate) sticky_prompt_expanded: bool,
     /// Session-scoped fold/compaction accounting for the `/context` breakdown
     /// (issue #400, design §5.1): accumulated from the display-event stream in
     /// [`Screen::apply`]. Covers THIS process's events only -- reductions from
@@ -565,6 +568,7 @@ impl Screen {
             pager_links: Vec::new(),
             prompt_history: Vec::new(),
             prompt_history_cursor: None,
+            sticky_prompt_expanded: false,
             context_accounting: ContextAccounting::default(),
         }
     }
@@ -908,6 +912,9 @@ impl Screen {
         if let Some(phase) = WorkPhase::on_event(&event) {
             self.phase = phase;
         }
+        if matches!(event, UiEvent::UserMessage(_)) {
+            self.sticky_prompt_expanded = false;
+        }
         // `UiEvent::UserMessage` (a mid-run injected steering/follow-up message)
         // is committed as a user row inside `transcript.apply`, so order matches
         // provider context; the initial prompt is committed by the session
@@ -917,7 +924,19 @@ impl Screen {
 
     /// Commit a submitted prompt into the transcript as a user line.
     pub(crate) fn commit_user(&mut self, text: &str) {
+        self.sticky_prompt_expanded = false;
         self.transcript.commit_user(text);
+    }
+
+    /// Toggle the pager's sticky prompt between its one-line collapsed header and
+    /// expanded body. Returns false when no sticky prompt is currently visible.
+    pub(crate) fn toggle_sticky_prompt(&mut self) -> bool {
+        let top = self.scroll.top();
+        if top == 0 || self.transcript.sticky_prompt_text(top).is_none() {
+            return false;
+        }
+        self.sticky_prompt_expanded = !self.sticky_prompt_expanded;
+        true
     }
 
     /// Render all transcript rows plus any in-flight stream, wrapped to `width`.

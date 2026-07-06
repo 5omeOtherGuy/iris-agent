@@ -41,7 +41,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 use super::screen::{Screen, filler_lines, render_editor_chrome, session_bar_lines};
-use super::wrap::{display_width, pad_line_left};
+use super::wrap::pad_line_left;
 use super::{BOX_X_PADDING_U16, TEXT_COLUMN_X_PADDING, dim_style};
 
 /// Iris-owned scrollback state for pager mode (ADR-0029).
@@ -468,7 +468,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         && !top_is_interactive
         && let Some(text) = screen.transcript.sticky_prompt_text(top)
     {
-        let band = sticky_prompt_band(text, width, view_rows);
+        let band = sticky_prompt_band(text, width, view_rows, screen.sticky_prompt_expanded);
         for (dst, line) in body.iter_mut().zip(band) {
             *dst = line;
         }
@@ -514,20 +514,20 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     }
 }
 
-/// The pinned prompt band: the governing user prompt, shown on the SAME columns
-/// it occupies in the transcript (`›` marker at col 4, body hanging at col 6) so
-/// a prompt looks identical pinned or scrolled, then closed by the session bar's
-/// own hairline — an inset dim `─`, NEVER the composer's border weight (§9.1).
-/// The whole band is dim: it is a pinned reference, not the live turn. A long
-/// prompt is capped at [`STICKY_PROMPT_MAX_LINES`] with a trailing `…` so the
-/// band stays a few quiet rows under the bar rather than eating the viewport.
-fn sticky_prompt_band(text: &str, width: u16, max_rows: usize) -> Vec<Line<'static>> {
-    const STICKY_PROMPT_MAX_LINES: usize = 3;
+/// The pinned prompt band: the governing user prompt under the session bar. It
+/// starts collapsed to one dim disclosure row, and Ctrl+O expands it to the full
+/// prompt body on the same hanging columns as transcript user turns. The whole
+/// band is dim: it is a pinned reference, not the live turn.
+fn sticky_prompt_band(
+    text: &str,
+    width: u16,
+    max_rows: usize,
+    expanded: bool,
+) -> Vec<Line<'static>> {
     let width = usize::from(width);
-    // Text wraps to the transcript's body measure (width − TEXT_COLUMN gutters);
-    // the closing rule spans the session bar's measure (width − BOX gutters).
     let text_measure = width
         .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
+        .saturating_sub(4)
         .max(1);
     let inset = usize::from(BOX_X_PADDING_U16).min(width.saturating_sub(1));
     let rule_measure = width.saturating_sub(inset.saturating_mul(2)).max(1);
@@ -539,42 +539,36 @@ fn sticky_prompt_band(text: &str, width: u16, max_rows: usize) -> Vec<Line<'stat
     if wrapped.is_empty() {
         wrapped.push(String::new());
     }
-    if wrapped.len() > STICKY_PROMPT_MAX_LINES {
-        wrapped.truncate(STICKY_PROMPT_MAX_LINES);
-        if let Some(last) = wrapped.last_mut() {
-            while display_width(last) + 1 > text_measure && !last.is_empty() {
-                last.pop();
-            }
-            last.push('…');
+
+    let dim = dim_style();
+    let arrow = if expanded {
+        crate::ui::symbols::EXPANDED
+    } else {
+        crate::ui::symbols::COLLAPSED
+    };
+    let mut rows = Vec::new();
+    let mut first = Line::from(vec![
+        Span::styled(format!("{arrow} "), dim.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ", crate::ui::symbols::USER),
+            dim.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(wrapped[0].clone(), dim),
+    ]);
+    pad_line_left(&mut first, TEXT_COLUMN_X_PADDING);
+    rows.push(first);
+
+    if expanded {
+        for part in wrapped.into_iter().skip(1) {
+            let mut line = Line::from(vec![Span::raw("    "), Span::styled(part, dim)]);
+            pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
+            rows.push(line);
         }
+        let mut rule = Line::from(Span::styled("─".repeat(rule_measure), dim));
+        pad_line_left(&mut rule, inset);
+        rows.push(rule);
     }
 
-    // The band is dim throughout; the marker keeps the transcript's `›`+bold so
-    // the glyph and column are identical — the dim is the only differentiator.
-    let dim = dim_style();
-    let mut rows = vec![Line::default()];
-    for (i, part) in wrapped.into_iter().enumerate() {
-        let mut line = if i == 0 {
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", crate::ui::symbols::USER),
-                    dim.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(part, dim),
-            ])
-        } else {
-            // Continuation hangs under the marker's text (the transcript's
-            // 2-cell gutter) before the shared column inset is applied.
-            Line::from(vec![Span::raw("  "), Span::styled(part, dim)])
-        };
-        pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
-        rows.push(line);
-    }
-    rows.push(Line::default());
-    let mut rule = Line::from(Span::styled("─".repeat(rule_measure), dim));
-    pad_line_left(&mut rule, inset);
-    rows.push(rule);
-    rows.push(Line::default());
     rows.truncate(max_rows);
     rows
 }
@@ -1307,29 +1301,35 @@ mod tests {
         let frame = compose_frame(&mut screen, size).lines;
         let rows = frame_rows(&frame, 80, 24);
         assert!(
-            rows[2].trim().is_empty(),
-            "band starts with padding: {:?}",
+            rows[2].starts_with("    \u{25b8} \u{203a} second question about oranges"),
+            "collapsed band pins the governing prompt in one row: {:?}",
             rows[2]
         );
-        // The pinned prompt sits on the transcript's own user column: `›` at
-        // col 4, body at col 6 — identical whether pinned or scrolled.
         assert!(
-            rows[3].starts_with("    \u{203a} second question about oranges"),
-            "band pins the governing prompt on the transcript column: {:?}",
+            !rows[3].contains("second question"),
+            "collapsed band does not consume extra prompt rows: {:?}",
             rows[3]
         );
-        // The band closes with the session bar's OWN hairline: inset dim `─`,
-        // never the full-width composer border. rows[1] is the session bar rule.
+        assert!(screen.toggle_sticky_prompt(), "ctrl+o target is available");
+        let frame = compose_frame(&mut screen, size).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        assert!(
+            rows[2].starts_with("    \u{25be} \u{203a} second question about oranges"),
+            "expanded band shows the disclosure and prompt: {:?}",
+            rows[2]
+        );
+        // The expanded band closes with the session bar's OWN hairline: inset dim
+        // `─`, never the full-width composer border. rows[1] is the session bar rule.
         assert_eq!(
-            rows[5], rows[1],
+            rows[3], rows[1],
             "band rule is byte-identical to the session bar rule (inset, dim, \
              not a full-width border): band {:?} vs bar {:?}",
-            rows[5], rows[1]
+            rows[3], rows[1]
         );
         assert!(
-            rows[5].starts_with("  \u{2500}") && !rows[5].starts_with('\u{2500}'),
+            rows[3].starts_with("  \u{2500}") && !rows[3].starts_with('\u{2500}'),
             "band rule is inset by the box padding, not full-width: {:?}",
-            rows[5]
+            rows[3]
         );
 
         // Scrolled into the first answer: the FIRST prompt is the sticky one.
@@ -1338,9 +1338,9 @@ mod tests {
         let frame = compose_frame(&mut screen, size).lines;
         let rows = frame_rows(&frame, 80, 24);
         assert!(
-            rows[3].contains("\u{203a} first question about apples"),
+            rows[2].contains("\u{203a} first question about apples"),
             "older region pins the older prompt: {:?}",
-            rows[3]
+            rows[2]
         );
 
         // At the very top nothing has scrolled past: no sticky overlay (the
@@ -1367,24 +1367,26 @@ mod tests {
         for i in 0..80 {
             screen.apply(UiEvent::Notice(format!("detail {i}")));
         }
+        let _ = compose_frame(&mut screen, Size::new(72, 24));
+        assert!(screen.toggle_sticky_prompt());
         let frame = compose_frame(&mut screen, Size::new(72, 24)).lines;
         let rows = frame_rows(&frame, 72, 24);
-        // Marker row on the transcript column (`›` at col 4).
+        // Header row on the transcript column with a disclosure and `›` marker.
         assert!(
-            rows[3].starts_with("    \u{203a} We have symbols"),
-            "first band row has the marker on the user column: {:?}",
-            rows[3]
+            rows[2].starts_with("    \u{25be} \u{203a} We have symbols"),
+            "first band row has the disclosure and user marker: {:?}",
+            rows[2]
         );
-        // Continuation hangs under the marker's text at col 6, unmarked.
+        // Continuation hangs under the disclosure+marker text, unmarked.
         assert!(
-            rows[4].starts_with("      ") && !rows[4].contains('\u{203a}'),
-            "wrapped continuation hangs at the body column without the marker: {:?}",
-            rows[4]
+            rows[3].starts_with("        ") && !rows[3].contains('\u{203a}'),
+            "wrapped continuation hangs under the body without the marker: {:?}",
+            rows[3]
         );
     }
 
     #[test]
-    fn sticky_prompt_band_caps_a_long_prompt_with_an_ellipsis() {
+    fn sticky_prompt_band_collapses_long_prompt_to_one_row() {
         let mut screen = footer_screen();
         screen.pager_active = true;
         let long = "word ".repeat(120);
@@ -1394,18 +1396,24 @@ mod tests {
         }
         let frame = compose_frame(&mut screen, Size::new(72, 24)).lines;
         let rows = frame_rows(&frame, 72, 24);
-        // The band body is capped at three physical lines (rows 3..=5), the last
-        // marked with a trailing ellipsis; then a blank and the closing rule
-        // (row 7) that still matches the session bar rule.
         assert!(
-            rows[5].trim_end().ends_with('…'),
-            "the capped final prompt line ends with an ellipsis: {:?}",
-            rows[5]
+            rows[2].starts_with("    \u{25b8} \u{203a} word word"),
+            "collapsed prompt is a single disclosure row: {:?}",
+            rows[2]
         );
-        assert_eq!(
-            rows[7], rows[1],
-            "the closing rule still matches the session bar rule after capping: {:?}",
-            rows[7]
+        assert!(
+            !rows[3].contains("word word"),
+            "collapsed prompt does not spill into a second row: {:?}",
+            rows[3]
+        );
+
+        assert!(screen.toggle_sticky_prompt());
+        let frame = compose_frame(&mut screen, Size::new(72, 24)).lines;
+        let rows = frame_rows(&frame, 72, 24);
+        assert!(
+            rows[3].contains("word word"),
+            "expanded prompt reveals continuation rows: {:?}",
+            rows[3]
         );
     }
 
