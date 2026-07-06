@@ -212,7 +212,8 @@ and it steps in units of 2 cells, the same everywhere:
 - **col 2 — the gutter:** a row's identity glyph. A foldable block's disclosure
   `▾`/`▸` (tool *and* thinking) and a user turn's `›` live here; nothing else.
 - **col 4 — the label/marker column:** tool & thinking **labels**, tool footers,
-  the thinking `┊` body rail, and the user's `›` marker.
+  the tool block's `┊` body spine (§8.1) and the thinking `┊` body rail, and the
+  user's `›` marker.
 - **col 6 — the text column:** *every* body — user prose, agent prose, tool
   output, reasoning — hangs here, one step under its header/marker.
 
@@ -454,14 +455,25 @@ another family; never render standalone `READ` / `GREP` / `LS` panels.
 ### 8.1 Shared block grammar
 ```
 ▾ TOOL  meta                                                        ELAPSED
-    <body — hangs one 2-cell step under the label, unmounts when collapsed>
-   ─────────────────────────────────────────────────────────────
+   ┊ <body — rides the `┊` spine, one 2-cell step under the label; unmounts collapsed>
+   ┊─────────────────────────────────────────────────────────────
    ◆ DONE  [family extras]             ↑sent ↓recv ┊ cache <n> ┊ ctx <Δ%>
 ```
 **Header** — disclosure `▾`/`▸` (muted) · bold uppercase family label · muted
 meta (a path, scope, or the shell command), truncating with `…` · right edge
 carries **only the elapsed time** (omitted for a pending `preview`). No state
 symbol in the header — the state lives in the footer.
+
+**Spine** — an expanded block reads as ONE unit because a **dim `┊` rail** fills
+the label/marker column (col 4, one 2-cell step left of the shared text column)
+on every body row: a continuous left edge running from under the header label,
+down the body, into the footer hairline and the footer state token. It is the
+same soft-rail grammar the reasoning rail and the coalesced notices use — a
+**rail, not a frame** (no top edge, no right edge, no box); tool output stays
+primary (full-ink content, bold label), reasoning stays recessive (dim). A
+**collapsed** block unmounts its body, so the spine shows only when expanded —
+exactly when the header and footer are pulled apart and the block would
+otherwise float. The rail sits *outside* any diff-row background fill.
 
 **Footer** — the block's last row, always visible, opened by a muted hairline
 rule from the body indent to the right rail. Left edge: the **state token** — the
