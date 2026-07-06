@@ -1371,3 +1371,31 @@ both reduced and re-sent over many round-trips (clap), wash otherwise. Not a
 global "fewer tokens per task" claim; a -1.8% pooled, one-of-four-clear,
 round-trip-confounded result. Consistent with Entry 27: size-gated, report
 output-conditioned. No README claim; no ROADMAP gate closure.
+
+## Entry 30 - Combined chained-all-four workload (one session fixes all 4), Sonnet 4.6 low, N=10/arm
+
+New workload `chained-all-four-fix`: a single session fixes bytes -> clap ->
+nushell -> dayjs in order, each in its own subdir of one workspace (subprojects
+assembled by build_chained_all_tree, reusing the committed single-bug fixtures;
+Rust via `--manifest-path`, dayjs via `--prefix`). Deterministic replay + gate
+green before the live run. Run: 5 shards/arm x N=2 = 10 processes, cap 80.
+Artifact: docs/benchmarks/chained-all-four-sonnet46-low-n10-2026-07-06.{md,jsonl}.
+
+- 20/20 success, 20/20 valid. The model reliably fixes all four in order, both
+  arms. Reduction shrank tool output -15.5% (60,138 vs 71,168 B).
+- Chaining costs ~2x separate sessions: combined defaults median 547,609 billed
+  input tok vs ~282,479 for the four separate sessions summed (N=50 defaults
+  medians) = 1.94x. input_tokens is cumulative, so a long session re-sends its
+  growing context every round-trip; separate sessions each start fresh. Cache
+  does not hide it (billed share ~52%; total processed also higher for the longer
+  arm).
+- Reduction helps MORE here: raw median +10.7% for defaults is round-trip-
+  confounded (median 23 vs 21 round-trips, ~10.7k tok each); round-trip-controlled
+  weighted delta = -4.2% favoring defaults, larger than the -1.8% pooled in the
+  separate suite, because the reduced tool output is re-sent over 18-27 round-trips
+  and compounds.
+
+Takeaways: chaining is feasible and safe but token-expensive (batching independent
+tasks compounds context cost); reduction's advantage grows with session length.
+N=10 is directional (per-stratum n=1-2); the 1.94x chaining-cost ratio is the
+robust result. No claim, no gate closure.

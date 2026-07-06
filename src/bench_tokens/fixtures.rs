@@ -88,6 +88,26 @@ pub(crate) fn build_repair_noise_tree(root: &Path) {
     }
 }
 
+/// Assemble the four PR-seeded single-bug fixtures into ONE workspace, each
+/// under its own subdirectory (`bytes/`, `clap/`, `nushell/`, `dayjs/`), by
+/// reusing the committed fixtures instead of duplicating their files. Backs the
+/// combined `chained-all-four-fix` workload, where a single session fixes all
+/// four bugs in order. Each subdir stays an independent cargo/npm project (no
+/// root workspace manifest), so `cargo test --manifest-path <sub>/Cargo.toml`
+/// and `npm test --prefix dayjs` build and test them in isolation.
+pub(crate) fn build_chained_all_tree(root: &Path) {
+    for (sub, fixture) in [
+        ("bytes", "workload_bytes_sign_extend"),
+        ("clap", "workload_clap_conflict_panic"),
+        ("nushell", "workload_nushell_not_precedence"),
+        ("dayjs", "workload_dayjs_tz_locale"),
+    ] {
+        let dst = root.join(sub);
+        fs::create_dir_all(&dst).expect("create combined subdir");
+        copy_stripping_txt(&fixtures_root().join(fixture), &dst);
+    }
+}
+
 fn copy_stripping_txt(src: &Path, dst: &Path) {
     for entry in fs::read_dir(src).expect("fixture dir readable") {
         let entry = entry.expect("dir entry");

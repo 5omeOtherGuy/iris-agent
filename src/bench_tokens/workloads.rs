@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::nexus::{AssistantTurn, CompletionReason, ToolCall};
 
-use super::fixtures::{build_find_tree, build_repair_noise_tree};
+use super::fixtures::{build_chained_all_tree, build_find_tree, build_repair_noise_tree};
 
 /// The result of a workload's mechanical success check.
 pub(crate) struct Outcome {
@@ -228,6 +228,35 @@ pub(crate) fn bash_workloads() -> Vec<Workload> {
             approval: ApprovalProfile::SkipPermissions,
             needles: &["d(target, offsetMinutes)", "weekStart"],
             build: Some(build_repair_noise_tree),
+            require_failing_then_passing_bash: true,
+        },
+        Workload {
+            name: "chained-all-four-fix",
+            fixture: "workload_chained_all",
+            prompt: "This workspace holds four independent bug fixtures in subdirectories: \
+                     `bytes/`, `clap/`, `nushell/`, `dayjs/`. Fix all four, IN THIS ORDER: \
+                     (1) bytes, (2) clap, (3) nushell, (4) dayjs. For each, first reproduce \
+                     the failure by running its tests, then use find/grep/read to locate the \
+                     bug, fix it without weakening tests, and re-run its tests until they pass \
+                     before moving to the next. Run the Rust subprojects with \
+                     `cargo test --manifest-path <sub>/Cargo.toml` and dayjs with \
+                     `npm test --prefix dayjs`. The bugs: bytes -- signed variable-width int \
+                     reads decode negatives as large positives (need sign extension); clap -- \
+                     a conflict rule naming an argument group panics instead of erroring; \
+                     nushell -- the prefix `not` operator has the wrong precedence \
+                     (`not false and false` is true); dayjs -- timezone reconstruction drops \
+                     the instance locale so startOf('week') ignores weekStart. When all four \
+                     pass, summarize each fix.",
+            script: script_chained_all_fix,
+            check: check_chained_all_fix,
+            approval: ApprovalProfile::SkipPermissions,
+            needles: &[
+                "i64::from_be_bytes(buf)",
+                "self.find(id).unwrap()",
+                "self.parse_expr(0)",
+                "d(target, offsetMinutes)",
+            ],
+            build: Some(build_chained_all_tree),
             require_failing_then_passing_bash: true,
         },
     ]
@@ -488,6 +517,134 @@ fn script_chained_dayjs_tz_locale_fix() -> Vec<AssistantTurn> {
         call_turn("b2", "bash", json!({ "command": "npm test" })),
         answer_turn(
             "Fixed the timezone reconstruction to preserve the instance locale (weekStart); npm test passes.",
+        ),
+    ]
+}
+
+/// Combined workload: fix all four bugs in order (bytes, clap, nushell, dayjs),
+/// each in its own subdirectory, reproducing then repairing then re-verifying
+/// before the next. Subproject tests run via `--manifest-path` / `--prefix` so
+/// no `cd`/chaining is needed. Produces a genuine failing-then-passing sequence
+/// per subproject.
+fn script_chained_all_fix() -> Vec<AssistantTurn> {
+    vec![
+        // (1) bytes
+        call_turn(
+            "by1",
+            "bash",
+            json!({ "command": "cargo test --manifest-path bytes/Cargo.toml" }),
+        ),
+        call_turn(
+            "byg",
+            "grep",
+            json!({ "pattern": "from_be_bytes", "path": "bytes/src" }),
+        ),
+        call_turn("byr", "read", json!({ "path": "bytes/src/buf_impl.rs" })),
+        call_turn(
+            "bye1",
+            "edit",
+            json!({
+                "file_path": "bytes/src/buf_impl.rs",
+                "old_string": "        let mut buf = [0u8; 8];\n        // Big-endian: copy nbytes into the low-order positions.\n        self.copy_to_slice(&mut buf[8 - nbytes..]);\n        i64::from_be_bytes(buf)",
+                "new_string": "        let mut buf = [0u8; 8];\n        // Big-endian: copy nbytes into the low-order positions.\n        self.copy_to_slice(&mut buf[8 - nbytes..]);\n        let shift = (8 - nbytes) * 8;\n        ((u64::from_be_bytes(buf) << shift) as i64) >> shift",
+            }),
+        ),
+        call_turn(
+            "bye2",
+            "edit",
+            json!({
+                "file_path": "bytes/src/buf_impl.rs",
+                "old_string": "        let mut buf = [0u8; 8];\n        // Little-endian: copy nbytes into the low-order positions.\n        self.copy_to_slice(&mut buf[..nbytes]);\n        i64::from_le_bytes(buf)",
+                "new_string": "        let mut buf = [0u8; 8];\n        // Little-endian: copy nbytes into the low-order positions.\n        self.copy_to_slice(&mut buf[..nbytes]);\n        let shift = (8 - nbytes) * 8;\n        ((u64::from_le_bytes(buf) << shift) as i64) >> shift",
+            }),
+        ),
+        call_turn(
+            "by2",
+            "bash",
+            json!({ "command": "cargo test --manifest-path bytes/Cargo.toml" }),
+        ),
+        // (2) clap
+        call_turn(
+            "cl1",
+            "bash",
+            json!({ "command": "cargo test --manifest-path clap/Cargo.toml" }),
+        ),
+        call_turn(
+            "clg",
+            "grep",
+            json!({ "pattern": "unwrap", "path": "clap/src" }),
+        ),
+        call_turn("clr", "read", json!({ "path": "clap/src/lib.rs" })),
+        call_turn(
+            "cle",
+            "edit",
+            json!({
+                "file_path": "clap/src/lib.rs",
+                "old_string": "            .map(|id| self.find(id).unwrap().to_string())",
+                "new_string": "            .filter_map(|id| self.find(id).map(|a| a.to_string()))",
+            }),
+        ),
+        call_turn(
+            "cl2",
+            "bash",
+            json!({ "command": "cargo test --manifest-path clap/Cargo.toml" }),
+        ),
+        // (3) nushell
+        call_turn(
+            "nu1",
+            "bash",
+            json!({ "command": "cargo test --manifest-path nushell/Cargo.toml" }),
+        ),
+        call_turn(
+            "nug",
+            "grep",
+            json!({ "pattern": "parse_expr", "path": "nushell/src" }),
+        ),
+        call_turn("nur", "read", json!({ "path": "nushell/src/lib.rs" })),
+        call_turn(
+            "nue",
+            "edit",
+            json!({
+                "file_path": "nushell/src/lib.rs",
+                "old_string": "            let operand = self.parse_expr(0)?;",
+                "new_string": "            let operand = self.parse_expr(NOT_BINDING_POWER)?;",
+            }),
+        ),
+        call_turn(
+            "nu2",
+            "bash",
+            json!({ "command": "cargo test --manifest-path nushell/Cargo.toml" }),
+        ),
+        // (4) dayjs
+        call_turn(
+            "dj1",
+            "bash",
+            json!({ "command": "npm test --prefix dayjs" }),
+        ),
+        call_turn(
+            "djg",
+            "grep",
+            json!({ "pattern": "rebuilt", "path": "dayjs/src" }),
+        ),
+        call_turn("djr", "read", json!({ "path": "dayjs/src/index.mjs" })),
+        call_turn(
+            "dje",
+            "edit",
+            json!({
+                "file_path": "dayjs/src/index.mjs",
+                "old_string": "    const rebuilt = d(target, offsetMinutes);",
+                "new_string": "    const rebuilt = d(target, offsetMinutes).locale(this.$L);",
+            }),
+        ),
+        call_turn(
+            "dj2",
+            "bash",
+            json!({ "command": "npm test --prefix dayjs" }),
+        ),
+        answer_turn(
+            "Fixed all four: bytes sign-extends signed int reads; clap skips group ids in the \
+             conflict context; nushell binds `not` to the next value only; dayjs preserves the \
+             instance locale across the tz rebuild. All subproject tests pass.",
         ),
     ]
 }
@@ -761,6 +918,75 @@ fn check_chained_dayjs_tz_locale_fix(workspace: &Path, _final_text: &str) -> Out
             success: false,
             detail,
         },
+    }
+}
+
+/// Combined workload: every one of the four subprojects must pass its tests AND
+/// keep its regression test intact. Fails on the first subproject that is broken
+/// or weakened, so on a pristine workspace (bytes still buggy) this returns
+/// unsuccessful -- which is exactly what `fixture_starts_broken` needs.
+fn check_chained_all_fix(workspace: &Path, _final_text: &str) -> Outcome {
+    let subprojects: [(&str, &str, &str, &[&str]); 4] = [
+        (
+            "bytes",
+            "cargo",
+            "tests/test_buf.rs",
+            &[
+                "fn test_get_int",
+                "assert_eq!(-42, buf.get_int(1))",
+                "buf.get_int_le(3)",
+            ],
+        ),
+        (
+            "clap",
+            "cargo",
+            "tests/conflicts.rs",
+            &[
+                "fn group_conflicts_with_subcommand",
+                "ErrorKind::ArgumentConflict",
+                "expect_err(",
+            ],
+        ),
+        (
+            "nushell",
+            "cargo",
+            "tests/precedence.rs",
+            &[
+                "fn not_precedence",
+                "eval(\"not false and false\")",
+                "assert_eq!",
+            ],
+        ),
+        (
+            "dayjs",
+            "npm",
+            "tests/tz-locale.test.mjs",
+            &[
+                "preserves locality when tz is called",
+                "2023-02-15",
+                "weekStart: 3",
+            ],
+        ),
+    ];
+    for (sub, program, test_file, needles) in subprojects {
+        let dir = workspace.join(sub);
+        let tests = fs::read_to_string(dir.join(test_file)).unwrap_or_default();
+        if !needles.iter().all(|n| tests.contains(n)) {
+            return Outcome {
+                success: false,
+                detail: format!("{sub}: regression test {test_file} changed, weakened, or missing"),
+            };
+        }
+        if let Err(detail) = command_success(&dir, program, &["test"]) {
+            return Outcome {
+                success: false,
+                detail: format!("{sub}: {detail}"),
+            };
+        }
+    }
+    Outcome {
+        success: true,
+        detail: "all four subprojects pass with their regression tests intact".to_string(),
     }
 }
 
