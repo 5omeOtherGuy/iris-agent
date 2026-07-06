@@ -2341,7 +2341,9 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
                 return IdleKey::Continue;
             }
             KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
-                screen.toggle_all_panels();
+                if !screen.toggle_sticky_prompt() {
+                    screen.toggle_all_panels();
+                }
                 return IdleKey::Continue;
             }
             KeyCode::Char('g') | KeyCode::Char('G') if ctrl => {
@@ -2737,7 +2739,9 @@ fn handle_running_event(
             let alt = key.modifiers.contains(KeyModifiers::ALT);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-                screen.toggle_all_panels();
+                if !screen.toggle_sticky_prompt() {
+                    screen.toggle_all_panels();
+                }
                 return true;
             }
             if ctrl
