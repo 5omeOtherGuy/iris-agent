@@ -197,6 +197,12 @@ pub(super) struct SearchMatch {
     pub(super) sub: usize,
 }
 
+#[derive(Clone)]
+struct UserPromptAnchor {
+    row: usize,
+    text: String,
+}
+
 #[derive(Default)]
 struct WrappedTranscriptCache {
     width: usize,
@@ -290,10 +296,10 @@ pub(super) struct Transcript {
     /// Memoized wrapped lines for the current active-tail preview; see
     /// [`StreamingRender`].
     streaming_render: Option<StreamingRender>,
-    /// Row indices where a committed user prompt starts (first content row of
-    /// each `commit_user`), maintained incrementally so the pager's sticky
-    /// prompt header is an O(prompts-above-view) lookup, never a row scan.
-    user_prompt_starts: Vec<usize>,
+    /// Row indices and raw text for committed user prompts, maintained
+    /// incrementally so the pager's sticky prompt card is an O(prompts-above-view)
+    /// lookup, never a row scan.
+    user_prompts: Vec<UserPromptAnchor>,
     /// Per-tool-call token diagnostics (`↑sent ↓received ┊ cache ┊ ctx`),
     /// keyed by call id and rendered right-bound in the block footer. Forward
     /// attribution: `↓received` is stamped from the proposing turn; `↑sent`,
@@ -534,9 +540,9 @@ impl Transcript {
     /// stream (tools run after the turn's text), but shifting them is correct
     /// and cheap, and makes the insert self-consistent.
     fn shift_row_anchors(&mut self, at: usize, delta: usize) {
-        for anchor in &mut self.user_prompt_starts {
-            if *anchor >= at {
-                *anchor += delta;
+        for prompt in &mut self.user_prompts {
+            if prompt.row >= at {
+                prompt.row += delta;
             }
         }
         if let Some(exec) = self.active_exec.as_mut()
@@ -2489,12 +2495,17 @@ impl Transcript {
         self.thinking_header_row = self
             .thinking_header_row
             .and_then(|index| index.checked_sub(remove));
-        // Prompt-start anchors shift with the trimmed head; trimmed-away
-        // prompts are dropped.
-        self.user_prompt_starts = self
-            .user_prompt_starts
+        // Prompt anchors shift with the trimmed head; trimmed-away prompts are
+        // dropped.
+        self.user_prompts = self
+            .user_prompts
             .iter()
-            .filter_map(|&index| index.checked_sub(remove))
+            .filter_map(|prompt| {
+                Some(UserPromptAnchor {
+                    row: prompt.row.checked_sub(remove)?,
+                    text: prompt.text.clone(),
+                })
+            })
             .collect();
         self.exploring_open = self.trailing_explore_panel_open();
     }
@@ -2807,23 +2818,28 @@ impl Transcript {
     pub(super) fn commit_user(&mut self, text: &str) {
         self.mark_append_dirty();
         self.push_blank();
-        self.user_prompt_starts.push(self.rows.len());
+        self.user_prompts.push(UserPromptAnchor {
+            row: self.rows.len(),
+            text: text.to_string(),
+        });
         pane::push_user_rows(&mut self.rows, text);
         self.trim_history();
     }
 
-    /// Visible line of the newest user prompt that begins strictly above the
-    /// viewport top -- the pager's sticky header anchor. Requires a warm wrap
-    /// cache (compose refreshes it every frame). Binary search over the
-    /// sorted anchors (prompt rows are always visible and line positions are
-    /// monotone in row order), so the per-frame cost is O(log prompts), never
-    /// a prompt walk.
-    pub(super) fn sticky_prompt_line(&self, top: usize) -> Option<usize> {
-        let above = self
-            .user_prompt_starts
-            .partition_point(|&row| self.visible_line_of_row(row).is_some_and(|line| line < top));
-        let row = *self.user_prompt_starts.get(above.checked_sub(1)?)?;
-        self.visible_line_of_row(row).filter(|&line| line < top)
+    /// Text of the newest user prompt that begins strictly above the viewport top
+    /// -- the pager's sticky prompt-card anchor. Requires a warm wrap cache
+    /// (compose refreshes it every frame). Binary search over the sorted anchors
+    /// (prompt rows are always visible and line positions are monotone in row
+    /// order), so the per-frame cost is O(log prompts), never a prompt walk.
+    pub(super) fn sticky_prompt_text(&self, top: usize) -> Option<&str> {
+        let above = self.user_prompts.partition_point(|prompt| {
+            self.visible_line_of_row(prompt.row)
+                .is_some_and(|line| line < top)
+        });
+        let prompt = self.user_prompts.get(above.checked_sub(1)?)?;
+        self.visible_line_of_row(prompt.row)
+            .filter(|&line| line < top)
+            .map(|_| prompt.text.as_str())
     }
 
     fn ensure_wrapped_cache(&mut self, width: usize) {

@@ -452,25 +452,22 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
             span.style = span.style.bg(crate::ui::palette::surface());
         }
     }
-    // Sticky user-prompt header (grok `sticky_headers`): when the newest
-    // prompt above the viewport has scrolled past the top, pin its first line
-    // (dimmed) on the first transcript row so the reader always knows which
-    // prompt the visible content answers. Interactive overlays win the row:
-    // a selection or search match revealed exactly at the viewport top keeps
-    // its highlight instead of being covered.
+    // Sticky user-prompt card (grok `sticky_headers`): when the newest prompt
+    // above the viewport has scrolled past the top, pin it as a quoted card under
+    // the session bar so the reader always knows which prompt the visible content
+    // answers. Interactive overlays win the row: a selection or search match
+    // revealed exactly at the viewport top keeps its highlight instead of being
+    // covered.
     let top_is_interactive = selected_line == Some(top)
         || screen.search.as_ref().and_then(|state| state.line) == Some(top);
-    if view_rows >= 2
+    if view_rows >= 5
         && top > 0
         && !top_is_interactive
-        && let Some(line) = screen.transcript.sticky_prompt_line(top)
+        && let Some(text) = screen.transcript.sticky_prompt_text(top)
     {
-        let mut header = screen.transcript_window(width, line, 1);
-        if let Some(mut header_line) = header.pop() {
-            for span in &mut header_line.spans {
-                span.style = span.style.add_modifier(Modifier::DIM);
-            }
-            body[0] = header_line;
+        let card = sticky_prompt_card(text, width, view_rows);
+        for (dst, line) in body.iter_mut().zip(card) {
+            *dst = line;
         }
     }
     // Bottom overlay row: an active search shows its position indicator;
@@ -512,6 +509,45 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
         lines: frame,
         cursor,
     }
+}
+
+fn sticky_prompt_card(text: &str, width: u16, max_rows: usize) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    let quote_style = Style::default();
+    let marker_style = Style::default().fg(crate::ui::palette::orange());
+    let border_style = Style::default().fg(crate::ui::palette::border());
+    let content_width = width.saturating_sub(4).max(1);
+    let mut rows = Vec::new();
+    rows.push(Line::default());
+    let mut first = true;
+    for logical in text.split('\n') {
+        let wrapped = crate::ui::textengine::wrap_to_width(logical, content_width);
+        let wrapped = if wrapped.is_empty() {
+            vec![String::new()]
+        } else {
+            wrapped
+        };
+        for part in wrapped {
+            if first {
+                rows.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{} ", crate::ui::symbols::USER), marker_style),
+                    Span::styled(part, quote_style),
+                ]));
+                first = false;
+            } else {
+                rows.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(part, quote_style),
+                ]));
+            }
+        }
+    }
+    rows.push(Line::default());
+    rows.push(Line::from(Span::styled("─".repeat(width), border_style)));
+    rows.push(Line::default());
+    rows.truncate(max_rows);
+    rows
 }
 
 /// Dim centered search indicator: `find "query" k/N ; n older ; N newer`
@@ -1225,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_prompt_header_pins_the_newest_prompt_scrolled_past() {
+    fn sticky_prompt_card_pins_the_newest_prompt_scrolled_past() {
         let mut screen = footer_screen();
         screen.pager_active = true;
         screen.commit_user("first question about apples");
@@ -1238,13 +1274,23 @@ mod tests {
         }
         let size = Size::new(80, 24);
         // Following at the bottom: the second prompt has scrolled past the
-        // top, so it is pinned (dimmed) on the first transcript row.
+        // top, so it is pinned as a quoted card under the session bar.
         let frame = compose_frame(&mut screen, size).lines;
         let rows = frame_rows(&frame, 80, 24);
         assert!(
-            rows[2].contains("second question about oranges"),
-            "sticky header pins the governing prompt: {:?}",
+            rows[2].trim().is_empty(),
+            "card starts with padding: {:?}",
             rows[2]
+        );
+        assert!(
+            rows[3].contains("› second question about oranges"),
+            "sticky card pins the governing prompt: {:?}",
+            rows[3]
+        );
+        assert!(
+            rows[5].trim_start().starts_with('─'),
+            "card has a bottom rule: {:?}",
+            rows[5]
         );
 
         // Scrolled into the first answer: the FIRST prompt is the sticky one.
@@ -1253,9 +1299,9 @@ mod tests {
         let frame = compose_frame(&mut screen, size).lines;
         let rows = frame_rows(&frame, 80, 24);
         assert!(
-            rows[2].contains("first question about apples"),
+            rows[3].contains("› first question about apples"),
             "older region pins the older prompt: {:?}",
-            rows[2]
+            rows[3]
         );
 
         // At the very top nothing has scrolled past: no sticky overlay (the
@@ -1268,6 +1314,31 @@ mod tests {
             !rows[2].contains("second question"),
             "no sticky at the top: {:?}",
             rows[2]
+        );
+    }
+
+    #[test]
+    fn sticky_prompt_card_wraps_prompt_with_continuation_indent() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.commit_user(
+            "We have symbols and glyphs defined in our design system / language. Currently the \
+             footer of tool output shows DONE RUNNING ERROR.",
+        );
+        for i in 0..80 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let frame = compose_frame(&mut screen, Size::new(72, 24)).lines;
+        let rows = frame_rows(&frame, 72, 24);
+        assert!(
+            rows[3].contains("› We have symbols"),
+            "first card row has marker: {:?}",
+            rows[3]
+        );
+        assert!(
+            rows[4].starts_with("    ") && !rows[4].contains('›'),
+            "wrapped continuation is indented without repeating the marker: {:?}",
+            rows[4]
         );
     }
 
