@@ -127,17 +127,15 @@ fn reduced_motion() -> bool {
 /// Effective approval-policy posture shown on the composer's bottom
 /// statusline. State is always symbol + label, never color alone. The mapping
 /// follows the runtime's real approval surface: the interactive loop gates
-/// every non-allowlisted tool through the approval prompt (`on-request`);
-/// `always-approve` mirrors the auto-approving print gate, and `read-only` /
-/// `off` are reserved postures for gates that deny or skip approvals entirely.
+/// every non-allowlisted tool through the approval prompt (`on-request`) unless
+/// `--dangerously-skip-permissions` bypasses the gate; `read-only` / `off` are
+/// reserved postures for gates that deny or skip approvals entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApprovalPolicy {
-    /// Gated tools are auto-approved (the print gate's `--approve` posture).
-    /// Not constructed by the interactive loop today; kept so the statusline
-    /// vocabulary covers every runtime posture. Distinct from `Auto`: this is
-    /// blanket approval, not the ADR-0032 preset's floor-guarded auto policy.
-    #[allow(dead_code)]
-    AlwaysApprove,
+    /// Gated tools are auto-approved (`--dangerously-skip-permissions`).
+    /// Distinct from `Auto`: this bypasses every approval prompt, floors
+    /// included, and is activated only by the explicit CLI flag.
+    SkipPermissions,
     /// `on-request` (strict): gated tools prompt for a decision — the default
     /// interactive posture. Maps to [`nexus::ApprovalMode::Strict`].
     OnRequest,
@@ -170,7 +168,7 @@ impl ApprovalPolicy {
     /// State glyph from the symbol vocabulary (`◆`/`▲`/`■`/`○`).
     fn symbol(self) -> &'static str {
         match self {
-            Self::AlwaysApprove => crate::ui::symbols::DONE,
+            Self::SkipPermissions => crate::ui::symbols::DONE,
             Self::Auto => crate::ui::symbols::ACTIVE,
             Self::OnRequest => crate::ui::symbols::REVIEW,
             Self::NeverAsk => crate::ui::symbols::CANCELLED,
@@ -181,7 +179,7 @@ impl ApprovalPolicy {
 
     fn label(self) -> &'static str {
         match self {
-            Self::AlwaysApprove => "always-approve",
+            Self::SkipPermissions => "skip-permissions",
             Self::Auto => "auto",
             Self::OnRequest => "on-request",
             Self::NeverAsk => "never-ask",
@@ -193,7 +191,7 @@ impl ApprovalPolicy {
     /// Symbol color role: green done / orange review / red error / dim empty.
     fn symbol_style(self) -> Style {
         match self {
-            Self::AlwaysApprove | Self::Auto => Style::default().fg(crate::ui::palette::green()),
+            Self::SkipPermissions | Self::Auto => Style::default().fg(crate::ui::palette::green()),
             Self::OnRequest => prompt_style(),
             Self::NeverAsk => dim_style(),
             Self::ReadOnly => Style::default().fg(crate::ui::palette::red()),
@@ -2547,7 +2545,7 @@ mod tests {
     fn bottom_statusline_policy_segment_carries_symbol_and_label() {
         let mut screen = footer_screen("~/repo");
         for (policy, expected) in [
-            (ApprovalPolicy::AlwaysApprove, "◆ always-approve"),
+            (ApprovalPolicy::SkipPermissions, "◆ skip-permissions"),
             (ApprovalPolicy::Auto, "◉ auto"),
             (ApprovalPolicy::OnRequest, "▲ on-request"),
             (ApprovalPolicy::NeverAsk, "□ never-ask"),
@@ -2566,18 +2564,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_policy_label_is_distinct_from_always_approve() {
-        // ADR-0032: the `auto` preset must never be shown as `always-approve`.
+    fn auto_policy_label_is_distinct_from_skip_permissions() {
+        // ADR-0032/0049: the `auto` preset must never be shown as the
+        // dangerous skip-permissions bypass.
         // Different label AND different glyph so neither color nor text confuses
         // a floor-guarded auto policy with blanket approval.
         assert_ne!(
             ApprovalPolicy::Auto.label(),
-            ApprovalPolicy::AlwaysApprove.label()
+            ApprovalPolicy::SkipPermissions.label()
         );
         assert_eq!(ApprovalPolicy::Auto.label(), "auto");
         assert_ne!(
             ApprovalPolicy::Auto.symbol(),
-            ApprovalPolicy::AlwaysApprove.symbol()
+            ApprovalPolicy::SkipPermissions.symbol()
         );
         // The nexus preset maps onto the distinct statusline posture.
         assert_eq!(
