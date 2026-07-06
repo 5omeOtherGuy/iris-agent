@@ -1332,3 +1332,42 @@ higher-N, round-trip-controlled run is still required before any efficiency
 claim. Consistent with Entry 27: reduction is a clean win where tool output is a
 large share of the conversation and wash otherwise; the dominant small-task cost
 driver is the number of model round-trips.
+
+## Entry 29 - Reseeded real-PR suite at N=50 per workload/arm (Sonnet 4.6 low, 400 runs)
+
+Full high-N run of the four real-PR chained workloads after the Entry 28 harness
+fixes. 5 shards x N=10 x 2 arms = 10 parallel processes, N=50 per workload/arm,
+max round-trips 40. Artifact:
+`docs/benchmarks/chained-suite-sonnet46-low-n50-2026-07-06.{md,jsonl}` (400 rows).
+
+Safety: 400/400 success, 400/400 valid, identical median turns/calls per workload
+across arms. The bounded round-trips and the model-independent validity bracket
+both held at scale (0 invalid, 0 errors). Reduction never reduced success or
+changed how much work the model did. Tool errors were the benign read-before-edit
+retry only, slightly MORE frequent in baseline (clap 25 vs 18, nushell 16 vs 13).
+
+Tokens (round-trip-stratified, since input_tokens scales ~10k/round-trip and
+round-trip count is model nondeterminism):
+
+- clap: round-trip-controlled -5.8%; significant at the modal 8-round-trip
+  stratum (-13.9%, Welch t=-3.17); tool output -9.5%. The one clear win.
+- bytes: -0.0% at matched 7 round-trips (wash) despite -5.3% tool output -- the
+  reducible share is too small against an ~87k context.
+- nushell: -2.1% weighted but driven by a single stratum; tool output +2%. Noise.
+- dayjs: raw +11.5% (Welch t=2.28) is a round-trip-composition artifact (defaults
+  made slightly more tool calls, 6.6 vs 6.3, and landed more high-round-trip
+  runs); controlled it is +1.4%, a wash on a 97-line-source task.
+- POOLED round-trip-controlled delta (all 4) = -1,308 tok = -1.8% of the overall
+  baseline mean. Small favorable tilt, almost all of it clap.
+
+This REVISES the N=3 smoke read (Entry 28), which had bytes/nushell as the
+apparent winners and clap as a +37% outlier -- all N=3 artifacts of round-trip
+variance. At N=50 clap is the winner and bytes is a wash. Lesson restated: never
+read a raw median at low N; stratify by round-trips.
+
+Verdict: reduction is SAFE (no success/turn/loop regression, both arms 100%) and
+NET-FAVORABLE but modest and concentrated -- a clear win only where tool output is
+both reduced and re-sent over many round-trips (clap), wash otherwise. Not a
+global "fewer tokens per task" claim; a -1.8% pooled, one-of-four-clear,
+round-trip-confounded result. Consistent with Entry 27: size-gated, report
+output-conditioned. No README claim; no ROADMAP gate closure.
