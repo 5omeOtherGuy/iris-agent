@@ -108,10 +108,11 @@ const MAX_TRANSCRIPT_ROWS: usize = 10_000;
 /// The model still receives the full output; only the terminal preview is
 /// bounded, and the omitted logical-line count is reported.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
-/// Frameless body hang: the block body indents under the header so it aligns
-/// under the TOOL label, past the disclosure glyph (the spec's `2.5ch` hang
-/// snapped to the terminal cell grid).
-const PANEL_BODY_INDENT: usize = 3;
+/// Frameless body hang: the block body hangs one 2-cell step under the header
+/// label — the same step the reasoning rail's `┊` body and a user turn's `›`
+/// body take, so every block's body lands on ONE shared text column. (Was a
+/// `2.5ch`→3 snap that left the tool body one cell shy of that column.)
+const PANEL_BODY_INDENT: usize = 4;
 const PANEL_BODY_CHROME_WIDTH: usize = PANEL_BODY_INDENT;
 /// Footer hang: the hairline rule and state-label row sit one cell left of the
 /// body (the spec's `2.5ch` hang rounded DOWN), while their right edge stays on
@@ -958,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_renders_with_marker_without_role_label() {
+    fn assistant_text_renders_unmarked_without_role_label() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText(
             "# Title\n\nuse `cargo test` and:\n- one\n- two".to_string(),
@@ -969,8 +970,14 @@ mod tests {
 
         assert!(!joined.contains("AGENT"), "{joined}");
         assert!(!joined.contains("USER"), "{joined}");
+        // The agent speaks unmarked on the shared text column — no `›` (that
+        // marks the user's turn now), no role label.
         assert!(
-            rendered.iter().any(|line| line.starts_with("    › Title")),
+            !joined.contains('\u{203a}'),
+            "agent stays unmarked: {joined}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.starts_with("      Title")),
             "{rendered:?}"
         );
         let title = line_matching(&lines, |line| line_text(line).contains("Title"));
@@ -1010,7 +1017,8 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(live_document.contains("› Title"), "{live_document}");
+        assert!(live_document.contains("Title"), "{live_document}");
+        assert!(!live_document.contains('\u{203a}'), "{live_document}");
         assert!(!live_document.contains("AGENT"), "{live_document}");
         assert!(live.iter().any(|l| line_text(l).contains("Title")));
         assert!(!live.iter().any(|l| line_text(l).contains("# Title")));
@@ -1809,15 +1817,16 @@ mod tests {
     }
 
     #[test]
-    fn assistant_reply_gets_marker_text_padding_and_blank_rows() {
+    fn assistant_reply_gets_text_column_and_blank_rows() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("alpha beta".to_string()));
         let lines = screen.wrapped_lines(16);
 
+        // Unmarked, on the shared text column (col 6); wrapped rows align there.
         assert_eq!(
             lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "    › alpha".to_string(),
+                "      alpha".to_string(),
                 "      beta".to_string(),
                 String::new()
             ]
@@ -1838,7 +1847,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.starts_with("    › Second paragraph")),
+                .any(|line| line.starts_with("      Second paragraph")),
             "paragraph start lost assistant text-column alignment: {rendered:?}"
         );
         assert!(
@@ -1862,13 +1871,15 @@ mod tests {
 
         assert!(!joined.contains("USER"), "{joined}");
         assert!(!joined.contains("AGENT"), "{joined}");
+        // The user turn is the marked one (`›`); the agent replies unmarked.
+        // Neither is boxed, and both bodies share one text column.
         assert!(
-            rendered.iter().any(|line| line == "      HI"),
+            rendered.iter().any(|line| line == "    \u{203a} HI"),
             "{rendered:?}"
         );
         let user_idx = rendered
             .iter()
-            .position(|line| line.trim_start() == "HI")
+            .position(|line| line.trim_start() == "\u{203a} HI")
             .expect("user prompt");
         let reply_idx = rendered
             .iter()
@@ -1886,7 +1897,7 @@ mod tests {
             "user text and assistant text should share a column: {rendered:?}"
         );
         assert!(
-            rendered[reply_idx].starts_with("    › Hi! What"),
+            rendered[reply_idx].starts_with("      Hi! What"),
             "{rendered:?}"
         );
         assert_eq!(lines[reply_idx].style.bg, None);
@@ -2715,7 +2726,7 @@ mod tests {
 
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert!(replay.contains("hello there"), "{replay:?}");
-        assert!(replay.contains("› Done"), "{replay:?}");
+        assert!(replay.contains("Done"), "{replay:?}");
         assert!(replay.contains("SHELL"), "{replay:?}");
         assert!(replay.contains("$ echo hi"), "{replay:?}");
         assert!(replay.contains("Give Iris a task"), "{replay:?}");
@@ -3677,25 +3688,30 @@ mod tests {
     }
 
     #[test]
-    fn assistant_paragraphs_keep_marker_before_following_user_message() {
+    fn user_turn_is_marked_and_agent_paragraphs_are_not() {
+        // The transcript marks exactly one voice: the user's. The agent — the
+        // default, dominant voice — speaks unmarked, so the `›` stays a
+        // scannable "what did I ask?" anchor rather than decorating every line.
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextEnd(
-            "First assistant paragraph.\n\nSecond assistant paragraph.".to_string(),
+            "First agent paragraph.\n\nSecond agent paragraph.".to_string(),
         ));
         screen.apply(UiEvent::UserMessage("Next user message.".to_string()));
 
         let lines = rendered_lines(&mut screen, 100, 24);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        let second_assistant = lines
-            .iter()
-            .map(line_text)
-            .find(|line| line.contains("Second assistant paragraph."))
-            .expect("second assistant paragraph");
-        assert!(
-            second_assistant.trim_start().starts_with("› "),
-            "assistant paragraphs need the visible marker before user text: {rendered}"
-        );
+        for needle in ["First agent paragraph.", "Second agent paragraph."] {
+            let line = lines
+                .iter()
+                .map(line_text)
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing agent paragraph {needle:?}: {rendered}"));
+            assert!(
+                !line.trim_start().starts_with("\u{203a} "),
+                "agent paragraphs stay unmarked: {rendered}"
+            );
+        }
 
         let next_user = lines
             .iter()
@@ -3703,63 +3719,8 @@ mod tests {
             .find(|line| line.contains("Next user message."))
             .expect("next user message");
         assert!(
-            !next_user.trim_start().starts_with("› "),
-            "user message must stay unmarked: {rendered}"
-        );
-    }
-
-    #[test]
-    fn assistant_marker_skips_structural_markdown_block_starts() {
-        let markdown = "Intro paragraph.\n\n```rust\nlet answer = 42;\n```\n\n> quoted note\n\n| left | right |\n| --- | --- |\n| one | two |\n\nOutro paragraph.\n\n---";
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::AssistantTextEnd(markdown.to_string()));
-
-        let rendered = rendered_lines(&mut screen, 100, 32)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
-
-        let structural_needles = ["let answer = 42;", "> quoted note", "┌", "---"];
-        for needle in structural_needles {
-            let line = rendered
-                .iter()
-                .find(|line| line.contains(needle))
-                .unwrap_or_else(|| panic!("missing structural line {needle:?}: {rendered:?}"));
-            assert!(
-                !line.trim_start().starts_with("› "),
-                "structural markdown line must stay unmarked: {rendered:?}"
-            );
-        }
-
-        let outro = rendered
-            .iter()
-            .find(|line| line.contains("Outro paragraph."))
-            .expect("outro paragraph");
-        assert!(
-            outro.trim_start().starts_with("› "),
-            "prose after structural markdown still needs assistant marker: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn assistant_marker_allows_prose_containing_pipe() {
-        let mut screen = Screen::new();
-        screen.apply(UiEvent::AssistantTextEnd(
-            "First paragraph.\n\nUse foo | bar when choosing a mode.".to_string(),
-        ));
-
-        let rendered = rendered_lines(&mut screen, 100, 24)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
-        let pipe_prose = rendered
-            .iter()
-            .find(|line| line.contains("Use foo | bar"))
-            .expect("pipe prose paragraph");
-
-        assert!(
-            pipe_prose.trim_start().starts_with("› "),
-            "ordinary prose with a pipe should still get the assistant marker: {rendered:?}"
+            next_user.trim_start().starts_with("\u{203a} "),
+            "the user turn carries the `›` marker: {rendered}"
         );
     }
 
@@ -4147,8 +4108,8 @@ mod tests {
         let grep_line = line_text(line_matching(&lines, |line| {
             line_text(line).contains("Grep  \"fn emit\" in src/context")
         }));
-        assert!(read_line.starts_with("     Read"), "{read_line:?}");
-        assert!(grep_line.starts_with("     Grep"), "{grep_line:?}");
+        assert!(read_line.starts_with("      Read"), "{read_line:?}");
+        assert!(grep_line.starts_with("      Grep"), "{grep_line:?}");
         let rail = display_width(header_line.trim_end());
         assert_eq!(display_width(read_line.trim_end()), rail, "{read_line:?}");
         assert_eq!(display_width(grep_line.trim_end()), rail, "{grep_line:?}");
@@ -4195,10 +4156,11 @@ mod tests {
         );
         assert!(header.trim_end().ends_with("3.2s"), "{header:?}");
         assert_eq!(display_width(header.trim_end()), rail, "{header:?}");
-        // Body hangs at 2ch + 3ch, under the TOOL label.
-        assert_eq!(texts[1], "     $ cargo test -p context");
-        assert_eq!(texts[2], "        Compiling context v0.4.1");
-        assert_eq!(texts[3], "     test result: ok. 142 passed; 0 failed");
+        // Body hangs at 2ch + 4ch — one 2-cell step under the TOOL label, on
+        // the shared text column.
+        assert_eq!(texts[1], "      $ cargo test -p context");
+        assert_eq!(texts[2], "         Compiling context v0.4.1");
+        assert_eq!(texts[3], "      test result: ok. 142 passed; 0 failed");
         // Hairline rule from the footer indent to the block's right edge.
         assert!(texts[4].starts_with("    ─"), "{:?}", texts[4]);
         assert_eq!(display_width(&texts[4]), rail, "{:?}", texts[4]);
@@ -4924,8 +4886,10 @@ mod tests {
 
         assert!(!rendered.contains("TASK"));
         assert!(!rendered.contains("USER"), "{rendered}");
+        // Marked with `›` in the gutter, unboxed — the marker is the whole
+        // treatment (no border, no role card).
         assert!(
-            rendered.contains("      Add rate limiting to the login endpoint."),
+            rendered.contains("    \u{203a} Add rate limiting to the login endpoint."),
             "{rendered}"
         );
         assert!(!rendered.contains("│  Add rate limiting"));
@@ -5898,10 +5862,16 @@ mod tests {
         let joined = lines.join("\n");
 
         assert!(!joined.contains("USER"), "{joined}");
+        // The paste is the user's turn: marked with `›`, then wrapped as plain
+        // text — never re-interpreted into a real SHELL panel.
         assert!(
             lines
                 .first()
-                .is_some_and(|line| line.starts_with("      ┌")),
+                .is_some_and(|line| line.starts_with("    \u{203a}")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("      ┌")),
             "{lines:?}"
         );
         for line in &lines {
@@ -5910,7 +5880,10 @@ mod tests {
                 "user prompt row exceeds width: {line:?}"
             );
             if !line.is_empty() {
-                assert!(line.starts_with("      "), "{line:?}");
+                assert!(
+                    line.starts_with("      ") || line.starts_with("    \u{203a}"),
+                    "{line:?}"
+                );
             }
         }
     }

@@ -14,8 +14,8 @@ use super::wrap::{
     take_spans_to_width, truncate_line,
 };
 use super::{
-    BOX_X_PADDING, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT, TEXT_COLUMN_X_PADDING, diff_add_bg,
-    diff_del_bg, dim_style, err_style, ok_style, panel_style, prompt_style,
+    BOX_X_PADDING, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT, diff_add_bg, diff_del_bg, dim_style,
+    err_style, ok_style, panel_style, prompt_style,
 };
 use crate::ui::{is_diff_file_header, symbols};
 
@@ -43,41 +43,43 @@ pub(super) fn panel_footer_content_width(width: usize) -> usize {
         .max(1)
 }
 
-/// The frameless block header (`FramelessHeader`):
-/// `▾ TOOL  meta …spacer… elapsed` — disclosure glyph (muted), bold uppercase
-/// family label, muted meta truncating with `…`, and the elapsed time as the
-/// only right-edge content. No state symbol, no frame.
-pub(super) fn panel_header_line(
+/// The shared frameless-header geometry for BOTH the tool block and the
+/// reasoning rail: `<gutter> LABEL  meta …spacer… right`. The disclosure glyph
+/// (or a blank slot) fills the 2-cell gutter so the label always lands on the
+/// text column; the right field right-aligns to the block's right rail
+/// (`outer + inner_width`, one column shared with the footer diagnostics and the
+/// rail telemetry). One function so the two headers cannot drift apart — the
+/// reason the thinking readout used to sit two cells inside the tool elapsed.
+fn frameless_header_line(
     width: usize,
-    expanded: bool,
-    title: &'static str,
+    arrow: Option<&str>,
+    label: &str,
+    label_style: Style,
     meta: &str,
-    elapsed: &str,
+    right: &str,
 ) -> Line<'static> {
     let inner_width = panel_width(width);
-    let arrow = if expanded {
-        symbols::EXPANDED
-    } else {
-        symbols::COLLAPSED
+    let gutter = match arrow {
+        Some(arrow) => format!("{arrow} "),
+        // A non-foldable rail drops the arrow but keeps the 2-cell gutter, so a
+        // short trace's label stays on the same column as a foldable one.
+        None => "  ".to_string(),
     };
     let mut left = vec![
-        Span::styled(format!("{arrow} "), dim_style()),
-        // The tool family is the block's identity. With no type-scale axis,
-        // weight is the hierarchy lever (DESIGN-LANGUAGE: label = bold).
-        Span::styled(
-            title.to_string(),
-            panel_style().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(gutter, dim_style()),
+        // The label is the block's identity. With no type-scale axis, weight is
+        // the hierarchy lever (DESIGN-LANGUAGE: label = bold).
+        Span::styled(label.to_string(), label_style),
     ];
     let meta = strip_ansi_for_text(meta);
     if !meta.is_empty() {
         left.push(Span::styled(format!("  {meta}"), dim_style()));
     }
-    let elapsed = strip_ansi_for_text(elapsed);
-    let right = if elapsed.is_empty() {
+    let right = strip_ansi_for_text(right);
+    let right = if right.is_empty() {
         Vec::new()
     } else {
-        vec![Span::styled(elapsed, dim_style())]
+        vec![Span::styled(right, dim_style())]
     };
     let right = take_spans_to_width(right, inner_width / 2);
     let right_width = spans_width(&right);
@@ -95,6 +97,32 @@ pub(super) fn panel_header_line(
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     line
+}
+
+/// The frameless block header (`FramelessHeader`):
+/// `▾ TOOL  meta …spacer… elapsed` — disclosure glyph (muted), bold uppercase
+/// family label, muted meta truncating with `…`, and the elapsed time as the
+/// only right-edge content. No state symbol, no frame.
+pub(super) fn panel_header_line(
+    width: usize,
+    expanded: bool,
+    title: &'static str,
+    meta: &str,
+    elapsed: &str,
+) -> Line<'static> {
+    let arrow = if expanded {
+        symbols::EXPANDED
+    } else {
+        symbols::COLLAPSED
+    };
+    frameless_header_line(
+        width,
+        Some(arrow),
+        title,
+        panel_style().add_modifier(Modifier::BOLD),
+        meta,
+        elapsed,
+    )
 }
 
 /// The hairline rule that opens every block footer: starts at the footer indent
@@ -158,10 +186,12 @@ pub(super) fn panel_body_lines(
 }
 
 /// A reasoning-rail header: `▾ THINKING` (expanded) / `▸ THINKING` (collapsed),
-/// muted, bold label, indented to the transcript text column, with optional
-/// right-aligned telemetry (`↓2.4k 12s`). No box — reasoning is recessive; the
-/// `┊` rail on its body rows is the only chrome it gets (ThinkingBlock). A
-/// non-foldable (short) block drops the disclosure arrow.
+/// muted, bold label, with optional right-aligned telemetry (`↓2.4k 12s`). It
+/// shares the tool header's geometry ([`frameless_header_line`]) — same gutter
+/// column for the disclosure, same right rail for the readout — so reasoning and
+/// tools scan on one grid; only the muted label tone and the `┊` body rail
+/// (ThinkingBlock) mark it as recessive. No box. A non-foldable (short) block
+/// drops the disclosure arrow but keeps the gutter, so its label stays put.
 pub(super) fn rail_header_line(
     width: usize,
     expanded: bool,
@@ -169,36 +199,19 @@ pub(super) fn rail_header_line(
     label: &str,
     right: &str,
 ) -> Line<'static> {
-    let left = if foldable {
-        let arrow = if expanded {
-            symbols::EXPANDED
-        } else {
-            symbols::COLLAPSED
-        };
-        format!("{arrow} {label}")
+    let arrow = foldable.then_some(if expanded {
+        symbols::EXPANDED
     } else {
-        label.to_string()
-    };
-    let mut spans = vec![Span::styled(
-        left.clone(),
+        symbols::COLLAPSED
+    });
+    frameless_header_line(
+        width,
+        arrow,
+        label,
         dim_style().add_modifier(Modifier::BOLD),
-    )];
-    if !right.is_empty() {
-        let content_width = width
-            .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
-            .max(1);
-        let gap = content_width
-            .saturating_sub(display_width(&left))
-            .saturating_sub(display_width(right));
-        if gap >= 1 {
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(right.to_string(), dim_style()));
-        }
-    }
-    let mut line = Line::from(spans);
-    pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
-    truncate_line(&mut line, width.max(1));
-    line
+        "",
+        right,
+    )
 }
 
 pub(super) fn inset_rule_line(width: usize, label: &str) -> Line<'static> {
@@ -801,5 +814,25 @@ mod tests {
             "0.0s",
         ));
         assert!(collapsed.starts_with("  ▸ EXPLORE"), "{collapsed:?}");
+    }
+
+    #[test]
+    fn rail_and_tool_headers_share_the_gutter_and_right_rail() {
+        // Regression (the reported bug): the reasoning readout used to sit two
+        // cells inside the tool elapsed — a different left indent AND a different
+        // right inset. Both headers now flow through `frameless_header_line`, so
+        // the disclosure gutter (col 2), the label column (col 4), and the right
+        // rail (width−2) line up exactly.
+        let tool = line_text(&panel_header_line(80, true, "EXPLORE", "", "1.2s"));
+        let rail = line_text(&rail_header_line(80, true, true, "THINKING", "↓2.4k 12s"));
+        assert!(tool.starts_with("  \u{25be} EXPLORE"), "{tool:?}");
+        assert!(rail.starts_with("  \u{25be} THINKING"), "{rail:?}");
+        assert_eq!(display_width(tool.trim_end()), 78, "{tool:?}");
+        assert_eq!(display_width(rail.trim_end()), 78, "{rail:?}");
+        assert!(tool.trim_end().ends_with("1.2s"), "{tool:?}");
+        assert!(rail.trim_end().ends_with("12s"), "{rail:?}");
+        // A non-foldable short trace keeps the gutter, so its label stays put.
+        let short = line_text(&rail_header_line(80, true, false, "THINKING", ""));
+        assert!(short.starts_with("    THINKING"), "{short:?}");
     }
 }

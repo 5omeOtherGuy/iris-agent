@@ -54,9 +54,9 @@ halves are never merged onto one line again:
 │  ~/iris-agent ┊ git main                      CTX 94k/300k ●●●○○○○○○○        │
 │  ────────────────────────────────────────────  (session bar + soft hairline) │
 │  <transcript — scrolls>                                                      │
-│    user text                                                                 │
-│    › assistant text                                                          │
-│    THINKING ▸ …                                                              │
+│    › user text                          (the one marked turn — §7.1)         │
+│    assistant text                       (the agent speaks unmarked — §7.2)   │
+│    ▸ THINKING                           ↓2.4k 12s   (rail — shares the grid) │
 │    ▾ EXPLORE  src                       0.0s   (tool block — frameless)      │
 │       Read  src/lib.rs           142 lines                                   │
 │       ─────────────────────────────────────  (hairline footer rule)    │
@@ -201,16 +201,33 @@ marker (see §7, §8).
 |---|---|---|
 | `--cell` | `1ch` | One character width — the grid unit. |
 | `--pane-indent` | `2ch` | Tool blocks & composer indent from the pane edge. |
-| `--marker-gap` | `2ch` | Assistant `›` marker → its text. |
-| body hang | `3ch` | Tool-block body/footer indent under the header (the spec's `2.5ch` snapped to the cell grid). |
+| `--marker-gap` | `2ch` | User `›` marker → its text (the marker occupies the gutter; the body hangs on the text column). |
+| body hang | `4ch` | Body indent: one 2-cell step under the header **label**. Every block's body — tool, thinking rail, and a user turn's own text — lands on this ONE shared text column. |
 | `--block-rhythm` | `1.5rem` | The one blank line between top-level blocks. |
 | `--line` | `1.5em` | One line of vertical rhythm. |
 
+**The indentation ladder (one rule, three steps).** Indentation is hierarchy,
+and it steps in units of 2 cells, the same everywhere:
+
+- **col 2 — the gutter:** a row's identity glyph. A foldable block's disclosure
+  `▾`/`▸` (tool *and* thinking) and a user turn's `›` live here; nothing else.
+- **col 4 — the label/marker column:** tool & thinking **labels**, tool footers,
+  the thinking `┊` body rail, and the user's `›` marker.
+- **col 6 — the text column:** *every* body — user prose, agent prose, tool
+  output, reasoning — hangs here, one step under its header/marker.
+
+**One right rail.** All right-aligned readouts — tool `elapsed`, footer
+diagnostics, and the thinking-rail telemetry (`↓tokens elapsed`) — align to a
+single vertical at the block's right edge (`width − pane-indent`). The reasoning
+readout is not inset further than the tool elapsed; if they don't line up, it is
+a bug. Tool headers and the reasoning rail share ONE geometry builder so the two
+cannot drift.
+
 **Golden rule:** inside a tool block every row is exactly **one** of
 { header · body · footer rule · footer } and **all rows share one width**. The
-column discipline is the design: left edges (disclosure · TOOL · body indent ·
-state label) and right edges (elapsed · op metas · diagnostics) form the two
-rails that make the transcript scan as a table without drawing one.
+column discipline is the design: left edges (disclosure · label · body · state
+label) and the single right rail (elapsed · op metas · diagnostics) make the
+transcript scan as a table without drawing one.
 
 ---
 
@@ -229,7 +246,8 @@ STATE / ACTIVITY
   □  skipped / cancelled (muted)            ○  queued / empty meter slot (muted)
 
 TRANSCRIPT
-  ›  assistant message marker (muted)       ▋  live caret (orange, thinking)
+  ›  user message marker (ink) — the one   ▋  live caret (orange, thinking)
+     marked turn; the agent is unmarked
   ▾  expanded disclosure                    ▸  collapsed disclosure
   •  markdown list bullet (muted)           1. ordered list marker (muted)
 
@@ -304,17 +322,27 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
 ## 7 · Transcript grammar — conversation
 
 Natural-language conversation is **unboxed and light.** Chrome (frames) is
-reserved for mechanical tool events (§8). The transcript text column is defined
-by the assistant marker: marker width (`1ch`) + `--marker-gap` (`2ch`).
+reserved for mechanical tool events (§8). The transcript text column is the
+shared body column (§4): the `›` marker width (`1ch`) + `--marker-gap` (`2ch`)
+past the pane indent — the same column tool and reasoning bodies hang on.
 
 ### 7.1 User message
-Plain transcript text on the text column. **No `›` marker, no USER label, no
-border, no role card, no bubble, no avatar.** One blank line separates turns.
+**The one turn the transcript marks.** An ink-weight `›` sits in the gutter (col
+2) on the first line of the turn; the body hangs on the shared text column, and
+**wrapped lines align under the text, not the marker.** Only the first line is
+marked — a multi-line ask reads as one block under one `›`. The marker is the
+whole treatment: **no USER label, no border, no role card, no bubble, no
+avatar.** Monochrome-safe — marker + position carry it, never color. Why mark the
+user and not the agent? The agent is the transcript's dominant voice (messages,
+tools, reasoning); marking *it* would decorate the default. The user's turns are
+sparse, and the `›` is the anchor the eye jumps to — "what did I ask?" One blank
+line separates turns.
 
 ### 7.2 Assistant message
-The muted `›` marker sits one column left of its text; **wrapped lines align
-under the text, not the marker.** Never boxed; never an "AGENT" label. Content
-is rendered through the **markdown grammar** (§7.3).
+**The agent speaks unmarked.** Its body sits on the shared text column with a
+blank gutter — no `›`, never boxed, never an "AGENT" label. Content is rendered
+through the **markdown grammar** (§7.3). (Historically the `›` marked the
+assistant; it now marks the user, §7.1.)
 
 Voice inside: terse, factual, present-tense reports of *what happened* — "Done;
 emit() now budgets before sending. The diff is above." Never "I think", "I'll go
@@ -342,10 +370,17 @@ hierarchy from weight/case/color/marker, **never a size jump**:
 The agent's raw reasoning. Reasoning is internal, secondary, verbose, and **not
 a mechanical event**, so it gets **no chrome.** It is the most recessive thing in
 the pane: a muted `THINKING` label, dim-grey body behind a quiet **left rail**
-(a rule, never a box), and generated-token telemetry. Folds by default
-(progressive disclosure); `ctrl+o` / header toggles `▾`⇄`▸`. Live reasoning
-pulses (`●` in the label, `▋` caret at the tail); finished reasoning may collapse
-to a line + token count. Short reasoning is shown whole and is not foldable.
+(the `┊`, never a box), and generated-token telemetry. Its **header shares the
+tool block's geometry** (§4, §8.1): the disclosure `▾`/`▸` sits in the gutter
+(col 2), the label on the label column (col 4), and the telemetry
+(`↓tokens elapsed`) on the single right rail — so reasoning and tools scan on one
+grid, and the readout is never inset further than a tool's elapsed. Only the
+muted label tone and the `┊` body rail (at col 4, its text hanging at col 6) mark
+it as recessive. Folds by default (progressive disclosure); `ctrl+o` / header
+toggles `▾`⇄`▸`. Live reasoning pulses (`●` in the label, `▋` caret at the tail);
+finished reasoning may collapse to a line + token count. Short reasoning is shown
+whole and is not foldable (the arrow drops, but the gutter stays so the label
+holds its column).
 
 ### 7.5 Plan list
 The agent's task checklist. **Unboxed** (narration, not a tool event): a muted
@@ -397,7 +432,7 @@ another family; never render standalone `READ` / `GREP` / `LS` panels.
 ### 8.1 Shared block grammar
 ```
 ▾ TOOL  meta                                                        ELAPSED
-   <body — hangs 3 cells under the header, unmounts when collapsed>
+    <body — hangs one 2-cell step under the label, unmounts when collapsed>
    ─────────────────────────────────────────────────────────────
    STATE  [family extras]              ↑sent ↓recv ┊ cache <n> ┊ ctx <Δ%>
 ```
@@ -752,9 +787,14 @@ starts the session with it.
    statusline lives on the session bar and inside the composer).
 2. **One blank line** between every top-level block. No other gap value.
 3. **Shared measure.** Panels + composer share one width and a 2-cell indent;
-   transcript text shares one column.
+   every body (prose, tool, reasoning) hangs on ONE text column, and every
+   right-aligned readout (elapsed, telemetry, diagnostics) aligns to ONE right
+   rail. Indentation is hierarchy, stepped in 2-cell units (gutter · label ·
+   body, §4) — never an ad-hoc indent.
 4. **Block rows** are each exactly one of {header·body·footer rule·footer} and
    all share one width; no row overflows the block's rails.
+   4a. **One marked voice.** The transcript marks the user's turn with a `›` in
+   the gutter and nothing else; the agent speaks unmarked (§7.1–7.2).
 5. **Three tool families only** (EXPLORE / SHELL / EDIT). No standalone
    READ/GREP/LS/DIFF panels; approval is an in-block lifecycle state, never a
    separate panel.
@@ -777,6 +817,8 @@ starts the session with it.
 ## 14 · Anti-patterns (do NOT)
 
 - ✗ A role card / bubble / avatar for user or assistant messages.
+- ✗ Marking the **agent** with a `›` (it decorates the dominant voice); mark the user's turn instead (§7.1).
+- ✗ An ad-hoc indent that doesn't land on the gutter/label/body ladder, or a right-aligned readout inset differently from the tool elapsed (§4).
 - ✗ A colored left-border accent on active rows (use the `surface` fill).
 - ✗ Boxing a code block, a plan, a notice, or tool output — nothing in the transcript is boxed.
 - ✗ A braille spinner, a rainbow/percentage meter, or an animated progress bar.
