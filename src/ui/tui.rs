@@ -4154,8 +4154,10 @@ mod tests {
         let grep_line = line_text(line_matching(&lines, |line| {
             line_text(line).contains("Grep  \"fn emit\" in src/context")
         }));
-        assert!(read_line.starts_with("      Read"), "{read_line:?}");
-        assert!(grep_line.starts_with("      Grep"), "{grep_line:?}");
+        // Body rows ride the block spine: a dim `┊` rail at the label column
+        // (col 4), content on the shared text column (col 6).
+        assert!(read_line.starts_with("    \u{250a} Read"), "{read_line:?}");
+        assert!(grep_line.starts_with("    \u{250a} Grep"), "{grep_line:?}");
         let rail = display_width(header_line.trim_end());
         assert_eq!(display_width(read_line.trim_end()), rail, "{read_line:?}");
         assert_eq!(display_width(grep_line.trim_end()), rail, "{grep_line:?}");
@@ -4202,11 +4204,12 @@ mod tests {
         );
         assert!(header.trim_end().ends_with("3.2s"), "{header:?}");
         assert_eq!(display_width(header.trim_end()), rail, "{header:?}");
-        // Body hangs at 2ch + 4ch — one 2-cell step under the TOOL label, on
-        // the shared text column.
-        assert_eq!(texts[1], "      $ cargo test -p context");
-        assert_eq!(texts[2], "         Compiling context v0.4.1");
-        assert_eq!(texts[3], "      test result: ok. 142 passed; 0 failed");
+        // Body rides the block spine: a dim `┊` rail at the label column (col
+        // 4), content on the shared text column (col 6) — one continuous left
+        // edge from the header label down to the footer rule.
+        assert_eq!(texts[1], "    ┊ $ cargo test -p context");
+        assert_eq!(texts[2], "    ┊    Compiling context v0.4.1");
+        assert_eq!(texts[3], "    ┊ test result: ok. 142 passed; 0 failed");
         // Hairline rule from the footer indent to the block's right edge.
         assert!(texts[4].starts_with("    ─"), "{:?}", texts[4]);
         assert_eq!(display_width(&texts[4]), rail, "{:?}", texts[4]);
@@ -6558,9 +6561,10 @@ mod tests {
         // Compact by default: expand the finalized block to inspect its body.
         screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 80, 12);
-        // Body hangs at the block indent (2ch pane indent + 3ch hang), no frame.
-        assert!(rendered.contains("     $ cargo test"), "{rendered}");
-        assert!(rendered.contains("     test result"), "{rendered}");
+        // Body rides the block spine: a dim `┊` rail at the label column, body
+        // text on the shared text column — no frame, just a soft left edge.
+        assert!(rendered.contains("\u{250a} $ cargo test"), "{rendered}");
+        assert!(rendered.contains("\u{250a} test result"), "{rendered}");
         // The exit status closes the block as a footer field, after the green
         // `◆ DONE` state token.
         assert!(

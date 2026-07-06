@@ -164,7 +164,18 @@ pub(super) fn panel_body_line(
         apply_width_bg(&mut line, bg, body_width);
     }
     let outer = panel_outer_padding(width);
-    let mut spans = vec![Span::raw(" ".repeat(outer + PANEL_BODY_INDENT))];
+    // The block spine: a dim `┊` rail fills the label/marker column (one 2-cell
+    // step left of the shared text column) on every body row. A collapsed block
+    // unmounts its body, so the rail only shows when the block is expanded —
+    // exactly when the header and footer are pulled apart and the block needs a
+    // continuous left edge to read as one unit. The rail runs from under the
+    // header label, down the body, into the footer hairline: the same soft-rail
+    // grammar the reasoning rail and the coalesced notices already use. The rail
+    // sits outside any diff-row background fill; body text keeps its column.
+    let mut spans = vec![
+        Span::raw(" ".repeat(outer + PANEL_BODY_INDENT.saturating_sub(2))),
+        Span::styled(format!("{} ", symbols::SEP), dim_style()),
+    ];
     spans.extend(line.spans);
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
