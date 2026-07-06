@@ -2140,11 +2140,25 @@ fn is_ctrl_c(event: &Event) -> bool {
 /// Insert pasted text as real lines (the multiline editor keeps newlines now,
 /// unlike the old single-row flatten). `\r\n` is normalized to `\n`.
 fn insert_paste(screen: &mut Screen, text: &str) {
+    screen.reset_prompt_history_cursor();
     for (i, line) in text.split('\n').enumerate() {
         if i > 0 {
             screen.editor.insert_newline();
         }
         screen.editor.insert_str(line.trim_end_matches('\r'));
+    }
+}
+
+fn prompt_history_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    if ctrl || alt {
+        return false;
+    }
+    match code {
+        KeyCode::Up if screen.editor_is_empty() || screen.browsing_prompt_history() => {
+            screen.prompt_history_previous()
+        }
+        KeyCode::Down if screen.browsing_prompt_history() => screen.prompt_history_next(),
+        _ => false,
     }
 }
 
@@ -2359,8 +2373,11 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         }
     }
 
+    if prompt_history_key(screen, key.code, ctrl, alt) {
+        return IdleKey::Continue;
+    }
+
     match key.code {
-        // --- control flow (idle-only: exit / submit a prompt) ---
         KeyCode::Char('c') if ctrl => {
             if screen.editor_is_empty() {
                 return IdleKey::Exit;
@@ -2377,7 +2394,10 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         }
         // Transcript scrolling is handled natively by the terminal over its
         // scrollback (no in-app scroll offset), so PageUp/PageDown fall through.
-        KeyCode::Enter if shift || ctrl => screen.editor.insert_newline(),
+        KeyCode::Enter if shift || ctrl => {
+            screen.reset_prompt_history_cursor();
+            screen.editor.insert_newline();
+        }
         KeyCode::Enter => {
             let text = screen.submit();
             if text.trim().is_empty() {
@@ -2408,6 +2428,9 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
 /// resolved by the callers before they delegate here. Returns whether the key
 /// was an editing key (and thus a redraw is warranted).
 fn apply_editor_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    if !matches!(code, KeyCode::Up | KeyCode::Down) {
+        screen.reset_prompt_history_cursor();
+    }
     // Several `TextArea` edit methods return a bool (whether they mutated); the
     // arms are wrapped in blocks so every arm evaluates to `()` and the caller's
     // redraw flag is driven by whether a key matched, not by that return.
@@ -2795,6 +2818,9 @@ fn handle_running_event(
             if scrollback_focus_key(screen, key.code, ctrl, alt) {
                 return true;
             }
+            if prompt_history_key(screen, key.code, ctrl, alt) {
+                return true;
+            }
             // No approval pending: the composer is live for steering. Enter
             // queues a steering message (injected before the next provider
             // request), Alt+Enter a follow-up (injected when the agent would
@@ -2808,6 +2834,7 @@ fn handle_running_event(
                     true
                 }
                 KeyCode::Enter if shift || ctrl => {
+                    screen.reset_prompt_history_cursor();
                     screen.editor.insert_newline();
                     true
                 }
@@ -3179,6 +3206,85 @@ mod tests {
         plain.set_footer_with_context("m".to_string(), None, None, "~/x".to_string());
         assert!(toggle_git_menu(&mut plain, &cache));
         assert!(plain.session_menu.is_none());
+    }
+
+    #[test]
+    fn up_down_recall_submitted_prompt_history() {
+        let mut screen = git_screen();
+        screen.editor.insert_str("first");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::Submit(_)
+        ));
+        screen.editor.insert_str("second");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::Submit(_)
+        ));
+
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "second");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "first");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Down)),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "second");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Down)),
+            IdleKey::Continue
+        ));
+        assert!(screen.editor_is_empty());
+    }
+
+    #[test]
+    fn typing_after_recall_exits_prompt_history_browsing() {
+        let mut screen = git_screen();
+        screen.editor.insert_str("first");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::Submit(_)
+        ));
+
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "first");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Char('!'))),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "first!");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Down)),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "first!");
+    }
+
+    #[test]
+    fn up_in_nonempty_fresh_editor_keeps_normal_cursor_motion() {
+        let mut screen = git_screen();
+        screen.editor.insert_str("first");
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Enter)),
+            IdleKey::Submit(_)
+        ));
+        screen.editor.insert_str("draft");
+
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Up)),
+            IdleKey::Continue
+        ));
+        assert_eq!(screen.editor_text(), "draft");
     }
 
     #[test]

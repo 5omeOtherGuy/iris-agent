@@ -483,6 +483,10 @@ pub(crate) struct Screen {
     /// since it cannot carry OSC 8), so a mouse click resolves to a target via
     /// [`Screen::pager_link_at`].
     pub(crate) pager_links: Vec<crate::ui::hyperlink::LinkRegion>,
+    /// Previously submitted prompts for shell-style Up/Down recall (newest at end).
+    prompt_history: Vec<String>,
+    /// Current prompt-history cursor while browsing; `None` means editing a fresh draft.
+    prompt_history_cursor: Option<usize>,
     /// Session-scoped fold/compaction accounting for the `/context` breakdown
     /// (issue #400, design §5.1): accumulated from the display-event stream in
     /// [`Screen::apply`]. Covers THIS process's events only -- reductions from
@@ -561,6 +565,8 @@ impl Screen {
             search: None,
             reveal_line: None,
             pager_links: Vec::new(),
+            prompt_history: Vec::new(),
+            prompt_history_cursor: None,
             context_accounting: ContextAccounting::default(),
         }
     }
@@ -961,9 +967,13 @@ impl Screen {
         self.palette.sync(&text);
     }
 
-    /// Take the current editor text and reset to a fresh empty editor.
+    /// Take the current editor text, record it for recall, and reset to a fresh empty editor.
     pub(crate) fn submit(&mut self) -> String {
         let text = self.editor_text();
+        if !text.trim().is_empty() && self.prompt_history.last() != Some(&text) {
+            self.prompt_history.push(text.clone());
+        }
+        self.prompt_history_cursor = None;
         self.editor = fresh_editor();
         self.palette.sync("");
         text
@@ -971,12 +981,62 @@ impl Screen {
 
     /// Clear the editor without submitting (Ctrl-C on non-empty input).
     pub(crate) fn clear_editor(&mut self) {
+        self.prompt_history_cursor = None;
         self.editor = fresh_editor();
         self.palette.sync("");
     }
 
     /// Replace the editor contents with `text` (palette command completion).
     pub(crate) fn set_editor(&mut self, text: &str) {
+        self.prompt_history_cursor = None;
+        let mut editor = fresh_editor();
+        editor.insert_str(text);
+        self.editor = editor;
+        self.sync_palette();
+    }
+
+    pub(crate) fn browsing_prompt_history(&self) -> bool {
+        self.prompt_history_cursor.is_some()
+    }
+
+    pub(crate) fn reset_prompt_history_cursor(&mut self) {
+        self.prompt_history_cursor = None;
+    }
+
+    pub(crate) fn prompt_history_previous(&mut self) -> bool {
+        let Some(next) = self
+            .prompt_history_cursor
+            .map(|cursor| cursor.saturating_sub(1))
+            .or_else(|| self.prompt_history.len().checked_sub(1))
+        else {
+            return false;
+        };
+        if self.prompt_history_cursor == Some(0) {
+            return false;
+        }
+        self.prompt_history_cursor = Some(next);
+        let text = self.prompt_history[next].clone();
+        self.replace_editor_from_history(&text);
+        true
+    }
+
+    pub(crate) fn prompt_history_next(&mut self) -> bool {
+        let Some(cursor) = self.prompt_history_cursor else {
+            return false;
+        };
+        if cursor + 1 >= self.prompt_history.len() {
+            self.prompt_history_cursor = None;
+            self.replace_editor_from_history("");
+            return true;
+        }
+        let next = cursor + 1;
+        self.prompt_history_cursor = Some(next);
+        let text = self.prompt_history[next].clone();
+        self.replace_editor_from_history(&text);
+        true
+    }
+
+    fn replace_editor_from_history(&mut self, text: &str) {
         let mut editor = fresh_editor();
         editor.insert_str(text);
         self.editor = editor;
