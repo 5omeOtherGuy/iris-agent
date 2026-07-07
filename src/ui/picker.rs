@@ -905,6 +905,8 @@ mod tests {
             task_id: "activetask01".to_string(),
             body: Some("do the thing".to_string()),
             sessions: vec!["s1".to_string()],
+            approved_paths: vec!["src/main.rs".to_string()],
+            all_dirty_approved: false,
         };
         // Matching snapshot id: counts + age come from the git status snapshot.
         let matching = GitStatus {

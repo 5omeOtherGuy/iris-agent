@@ -230,9 +230,12 @@ pub(crate) enum UiEvent {
         call: ToolCall,
         allow_always: bool,
         allow_project: bool,
-        /// A short danger-toned caution (`destructive`, `N pre-existing
-        /// changes`, `unsandboxed`) surfaced on the review footer so the safety
-        /// facts survive the decision point. `None` when the call is unremarkable.
+        /// Whether the allow-always key is the dirty-tree escalation (`all dirty
+        /// files (this task)`) rather than a reusable session grant.
+        dirty_gate: bool,
+        /// A short danger-toned caution (`destructive`, dirty-path note,
+        /// `unsandboxed`) surfaced on the review footer so the safety facts
+        /// survive the decision point. `None` when the call is unremarkable.
         reason: Option<String>,
     },
     DiffPreview {

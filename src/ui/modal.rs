@@ -1312,11 +1312,20 @@ fn active_header_rows(active: &TaskCard) -> Vec<(Line<'static>, bool)> {
         meta_parts.push(age);
     }
     let meta = Line::from(Span::styled(meta_parts.join(" \u{00b7} "), dim()));
+    let approved = Line::from(Span::styled(
+        format!("approved: {}", active.approved_scope_label()),
+        dim(),
+    ));
     let hint = Line::from(Span::styled(
         "settle: /git \u{00b7} /diff \u{00b7} /accept \u{00b7} /rollback".to_string(),
         dim(),
     ));
-    vec![(identity, false), (meta, false), (hint, false)]
+    vec![
+        (identity, false),
+        (meta, false),
+        (approved, false),
+        (hint, false),
+    ]
 }
 
 // --- login method selector ---
@@ -2306,6 +2315,8 @@ mod tests {
                 task_id: "activeee1".to_string(),
                 body: Some("refactor the loop".to_string()),
                 sessions: vec!["live-session".to_string()],
+                approved_paths: vec!["src/main.rs".to_string()],
+                all_dirty_approved: false,
             },
             Some(Duration::from_secs(60)),
             Some(2),
@@ -2435,6 +2446,10 @@ mod tests {
             "counts: {text}"
         );
         assert!(text.contains("1 session"), "linked-session count: {text}");
+        assert!(
+            text.contains("approved: src/main.rs"),
+            "approved scope shown: {text}"
+        );
         assert!(
             text.contains("/accept"),
             "settlement hint points at existing paths: {text}"

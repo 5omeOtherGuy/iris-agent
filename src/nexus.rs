@@ -630,7 +630,7 @@ pub(crate) struct ReviewContext {
     pub(crate) destructive: bool,
     /// Workspace-relative display paths of pre-existing uncommitted changes the
     /// call would touch (ADR-0028 dirty-tree gate). Non-empty means the dirty
-    /// gate fired, so "always" here means "all dirty files this task" and no
+    /// gate fired, so "always" here means "all dirty files (this task)" and no
     /// per-project grant is offered.
     pub(crate) dirty_paths: Vec<String>,
 }
@@ -2041,7 +2041,7 @@ impl<P: ChatProvider> Agent<P> {
                         _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
                         // A project grant is never offered for a destructive
                         // call: it must not be persistable (ADR-0010 floor). A
-                        // dirty-tree gate offers the "all dirty files this task"
+                        // dirty-tree gate offers the "all dirty files (this task)"
                         // escalation via allow-always and suppresses the project
                         // grant (a dirty file cannot be pre-approved for a
                         // project).

@@ -23,6 +23,10 @@ use crate::nexus::ToolCall;
 pub(crate) const APPROVAL_DESTRUCTIVE_NOTE: &str =
     "Flagged destructive: may delete or overwrite data.";
 
+/// Dirty-tree escalation label shared by the text prompt and TUI review footer.
+/// It deliberately names the task scope: this is not a reusable session grant.
+pub(crate) const APPROVAL_ALL_DIRTY_LABEL: &str = "all dirty files (this task)";
+
 /// The base explanatory sentence for an approval prompt, derived deterministically
 /// from the call — the muted lead of the reason line. Presentation-only Tier-3
 /// copy (never sent to the model): `bash` runs a shell command, `edit`/`write`

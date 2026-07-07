@@ -138,6 +138,10 @@ fn dirty_file_is_protected_and_index_captured() {
         .note_mutation()
         .expect("dirty tree surfaces a summary");
     assert!(summary.contains("dirty"), "summary: {summary}");
+    assert!(
+        summary.contains("committed.txt") && summary.contains("staged.txt"),
+        "summary names protected files: {summary}"
+    );
 
     // Test 8: the baseline captured the index (staged.txt shows in ls-files).
     let index = guard.baseline_index().expect("baseline present");
@@ -169,6 +173,11 @@ fn approval_is_per_task_and_expires_on_settlement() {
 
     // Approve just this file: no longer flagged.
     guard.approve(std::slice::from_ref(&target), false);
+    let display = guard
+        .active_task_display()
+        .expect("active workflow task display");
+    assert_eq!(display.approved_paths, vec!["committed.txt".to_string()]);
+    assert!(!display.all_dirty_approved);
     assert!(
         guard
             .unapproved_protected(std::slice::from_ref(&target))
@@ -184,7 +193,7 @@ fn approval_is_per_task_and_expires_on_settlement() {
     );
 }
 
-// Test 9: the "all dirty files this task" escalation covers subsequent files.
+// Test 9: the "all dirty files (this task)" escalation covers subsequent files.
 #[test]
 fn escalation_covers_all_dirty_files() {
     let repo = init_repo();
@@ -196,6 +205,10 @@ fn escalation_covers_all_dirty_files() {
     guard.note_mutation();
     // Escalate on the first file.
     guard.approve(&[repo.path.join("committed.txt")], true);
+    let display = guard
+        .active_task_display()
+        .expect("active workflow task display");
+    assert!(display.all_dirty_approved);
     // A different dirty file is now already covered.
     assert!(
         guard
@@ -215,6 +228,10 @@ fn untracked_file_is_protected() {
     let guard = guard(&repo.path);
     let summary = guard.note_mutation().expect("untracked surfaces a summary");
     assert!(summary.contains("untracked"), "summary: {summary}");
+    assert!(
+        summary.contains("scratch.txt"),
+        "summary names protected files: {summary}"
+    );
     assert!(
         !guard
             .unapproved_protected(&[repo.path.join("scratch.txt")])
@@ -932,7 +949,7 @@ fn escalation_in_loop_covers_second_dirty_file() -> Result<()> {
     // away, the base write approval no longer prompts either -- isolating the
     // dirty-gate escalation as the only thing that could re-prompt.
     grant_write(&mut harness);
-    // AllowAlways in the dirty context escalates to "all dirty files this task".
+    // AllowAlways in the dirty context escalates to "all dirty files (this task)".
     let frontend = CountingFrontend::new(ApprovalDecision::AllowAlways);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;

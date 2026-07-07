@@ -2140,6 +2140,7 @@ mod tests {
             call: call_args("bash", json!({ "command": "echo hi" })),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         let rendered = rendered_text(&mut screen, 80, 14);
@@ -2161,6 +2162,7 @@ mod tests {
             call: call_args("bash", json!({ "command": "echo hi" })),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         let lines = rendered_lines(&mut screen, 80, 16);
@@ -2192,6 +2194,7 @@ mod tests {
             ),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         let lines = rendered_lines(&mut screen, 48, 16);
@@ -2256,6 +2259,7 @@ mod tests {
             call: call.clone(),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         screen.note_approval(&call, ApprovalDecision::Allow);
@@ -2300,6 +2304,7 @@ mod tests {
             call: call.clone(),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         screen.apply(UiEvent::ToolDenied(call));
@@ -2329,6 +2334,7 @@ mod tests {
             call: call_args("bash", json!({ "command": "\u{1b}[31mred\u{1b}[0m" })),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         let lines = rendered_lines(&mut screen, 80, 14);
@@ -2359,6 +2365,7 @@ mod tests {
             call: call.clone(),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         screen.apply(UiEvent::ToolStarted(call));
@@ -2389,6 +2396,7 @@ mod tests {
             call,
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         let rendered = rendered_text(&mut screen, 100, 20);
@@ -2409,7 +2417,7 @@ mod tests {
 
     #[test]
     fn review_reason_shows_danger_toned_caution() {
-        // A danger-toned caution (destructive / pre-existing changes /
+        // A danger-toned caution (destructive / dirty paths /
         // unsandboxed) rides the review footer in the danger role, ahead of the
         // decision affordance, so the safety fact survives the decision point.
         let mut screen = Screen::new();
@@ -2417,6 +2425,7 @@ mod tests {
             call: call_args("bash", json!({ "command": "rm -rf build" })),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: Some("destructive".to_string()),
         });
         let lines = screen.wrapped_lines(80);
@@ -2425,6 +2434,27 @@ mod tests {
         assert_eq!(marker.style.fg, err_style().fg, "danger-toned reason");
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("y approve"), "{rendered}");
+    }
+
+    #[test]
+    fn dirty_review_renders_paths_and_all_dirty_scope() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolReview {
+            call: call_args("write", json!({ "file_path": "src/main.rs" })),
+            allow_always: true,
+            allow_project: false,
+            dirty_gate: true,
+            reason: Some("Touches uncommitted user changes: src/main.rs.".to_string()),
+        });
+        let rendered = rendered_text(&mut screen, 140, 14);
+        assert!(
+            rendered.contains("Touches uncommitted user changes: src/main.rs"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("a all dirty files (this task)"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -4742,6 +4772,7 @@ mod tests {
             call: denied.clone(),
             allow_always: false,
             allow_project: false,
+            dirty_gate: false,
             reason: None,
         });
         screen.apply(UiEvent::ToolDenied(denied));

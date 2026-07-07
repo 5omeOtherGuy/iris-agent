@@ -136,7 +136,7 @@ struct Task {
     ledger: Ledger,
     /// Per-file approvals granted this task (normalized absolute paths).
     approved: BTreeSet<PathBuf>,
-    /// The "all dirty files this task" escalation.
+    /// The "all dirty files (this task)" escalation.
     all_dirty_approved: bool,
     /// Pre-call byte snapshot of the protected set + this call's targets
     /// (refreshed each call).
@@ -395,10 +395,9 @@ impl GitSafety {
     }
 
     /// Read-only display payload of the ACTIVE (live, unsettled) task, for the
-    /// unified task UI (ADR-0031): its id plus the opaque `body`/`sessions`
-    /// copy, mapped exactly as the recovery DTOs surface them. `None` when no
-    /// task is open. Display-only observation -- no enforcement path reads it,
-    /// and reading it never mutates task state.
+    /// unified task UI (ADR-0031): its id plus opaque display copy and live
+    /// approval scope. `None` when no task is open. Display-only observation --
+    /// no enforcement path reads it, and reading it never mutates task state.
     pub(crate) fn active_task_display(&self) -> Option<ActiveTaskDisplay> {
         let state = self.state.lock().unwrap();
         let task = state.task.as_ref()?;
@@ -409,6 +408,12 @@ impl GitSafety {
             task_id: task.task_id.clone(),
             body: task.body.clone(),
             sessions: task.sessions.clone(),
+            approved_paths: task
+                .approved
+                .iter()
+                .map(|path| self.workspace_display_path(path))
+                .collect(),
+            all_dirty_approved: task.all_dirty_approved,
         })
     }
 
@@ -494,6 +499,22 @@ impl GitSafety {
             },
             _ => absolute,
         }
+    }
+
+    fn workspace_display_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn protected_path_summary(&self, baseline: &Baseline, max: usize) -> String {
+        let paths: Vec<String> = baseline
+            .protected
+            .keys()
+            .map(|path| self.workspace_display_path(path))
+            .collect();
+        bounded_path_summary(&paths, max)
     }
 
     /// Join the in-flight attribution scan (if any) and fold its entries into
@@ -701,13 +722,16 @@ fn detect_mode(workspace: &Path) -> Mode {
 
 /// Read-only display payload of the active (live, unsettled) task, surfaced to
 /// the unified task UI (ADR-0031). Mirrors [`AdoptedTask`](settlement::AdoptedTask):
-/// opaque `body`/`sessions` display copy only, so the private [`Task`] never
-/// leaks past the harness. No enforcement or recovery path reads these fields.
+/// opaque `body`/`sessions` display copy plus the live approval scope, so the
+/// private [`Task`] never leaks past the harness. No enforcement or recovery
+/// path reads these fields.
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveTaskDisplay {
     pub(crate) task_id: String,
     pub(crate) body: Option<String>,
     pub(crate) sessions: Vec<String>,
+    pub(crate) approved_paths: Vec<String>,
+    pub(crate) all_dirty_approved: bool,
 }
 
 /// Read-only view of one persisted (unsettled) Iris task, for the session-bar
@@ -753,6 +777,18 @@ pub(crate) fn unsettled_tasks(workspace: &Path) -> Vec<UnsettledTaskView> {
             task_id: task.task_id,
         })
         .collect()
+}
+
+fn bounded_path_summary(paths: &[String], max: usize) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let shown = paths.len().min(max);
+    let mut summary = paths[..shown].join(", ");
+    if shown < paths.len() {
+        summary.push_str(&format!(", +{} more", paths.len() - shown));
+    }
+    summary
 }
 
 /// Attribution scan body (runs on a background thread): re-capture status and
@@ -842,10 +878,16 @@ impl MutationGuard for GitSafety {
                 Ok(baseline) => {
                     let announce = baseline.dirty_count > 0 || baseline.untracked_count > 0;
                     let summary = announce.then(|| {
-                        format!(
+                        let mut summary = format!(
                             "{} dirty and {} untracked file(s) present before this change",
                             baseline.dirty_count, baseline.untracked_count
-                        )
+                        );
+                        let protected = self.protected_path_summary(&baseline, 5);
+                        if !protected.is_empty() {
+                            summary.push_str(": ");
+                            summary.push_str(&protected);
+                        }
+                        summary
                     });
                     if !self.workflow_enabled {
                         state.task = Some(Task::guard_only(task_id, baseline));

@@ -621,7 +621,16 @@ pub(super) fn edit_footer_extras(
 /// project`) as `┊`-joined footer fields — the key in ink, the action muted.
 /// Only the choices the loop actually offers are shown; deny (`n`/Enter/Esc) is
 /// always available. Replaces the former docked gate's hint row.
-pub(super) fn review_footer_extras(allow_always: bool, allow_project: bool) -> Vec<FooterField> {
+pub(super) fn review_footer_extras(
+    allow_always: bool,
+    allow_project: bool,
+    dirty_gate: bool,
+) -> Vec<FooterField> {
+    let always_label = if dirty_gate {
+        crate::tool_display::APPROVAL_ALL_DIRTY_LABEL
+    } else {
+        "always"
+    };
     let field = |key: &str, action: &str| FooterField {
         spans: vec![
             Span::styled(key.to_string(), Style::default()),
@@ -631,7 +640,7 @@ pub(super) fn review_footer_extras(allow_always: bool, allow_project: bool) -> V
     };
     let mut fields = vec![field("y", "approve"), field("n", "deny")];
     if allow_always {
-        fields.push(field("a", "always"));
+        fields.push(field("a", always_label));
     }
     if allow_project {
         fields.push(field("p", "project"));

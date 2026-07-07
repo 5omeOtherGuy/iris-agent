@@ -41,6 +41,7 @@ use crate::nexus::{
     AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ReviewContext,
     ToolCall,
 };
+use crate::tool_display::approval_dirty_note;
 use crate::ui::UiEvent;
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
@@ -257,7 +258,7 @@ struct ApprovalRequest {
 
 /// A short, danger-toned caution for the in-block `▲ REVIEW` footer, built from
 /// the structured review facts (never model-authored copy): the destructive
-/// floor (ADR-0010), pre-existing dirty-tree changes the call would touch
+/// floor (ADR-0010), pre-existing dirty-tree paths the call would touch
 /// (ADR-0028), and — for a shell call on a platform with no kernel sandbox — an
 /// `unsandboxed` posture. `None` when the call is unremarkable.
 fn review_reason(call: &ToolCall, ctx: &ReviewContext) -> Option<String> {
@@ -265,12 +266,8 @@ fn review_reason(call: &ToolCall, ctx: &ReviewContext) -> Option<String> {
     if ctx.destructive {
         parts.push("destructive".to_string());
     }
-    let dirty = ctx.dirty_paths.len();
-    if dirty > 0 {
-        parts.push(format!(
-            "{dirty} pre-existing change{}",
-            if dirty == 1 { "" } else { "s" }
-        ));
+    if let Some(note) = approval_dirty_note(&ctx.dirty_paths, 96) {
+        parts.push(note);
     }
     if call.name == "bash" && !crate::tools::platform_can_sandbox() {
         parts.push("unsandboxed".to_string());
@@ -3018,6 +3015,7 @@ impl ApprovalGate for LoopBridge {
     ) -> ApprovalFuture<'a> {
         let appr_tx = self.appr_tx.clone();
         let call = call.clone();
+        let dirty_gate = !ctx.dirty_paths.is_empty();
         // Render the in-block `▲ REVIEW` state (with its footer affordance)
         // before blocking on the decision, so the gated tool block is visible
         // while the composer is frozen. Sent on `event_tx` — FIFO after any
@@ -3027,6 +3025,7 @@ impl ApprovalGate for LoopBridge {
             call: call.clone(),
             allow_always,
             allow_project,
+            dirty_gate,
             reason: review_reason(&call, &ctx),
         });
         Box::pin(async move {

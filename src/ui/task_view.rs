@@ -40,15 +40,18 @@ pub(crate) fn body_preview(body: Option<&str>) -> String {
 }
 
 /// A read-only projection of one task for the unified task UI. `body`/`sessions`
-/// are opaque display copy (ADR-0031). `iris_files`/`user_files`/`age` are
-/// populated "where available" -- from the git-status snapshot for the active
-/// task, `None` on recovery rows whose counts are not surfaced.
+/// are opaque display copy (ADR-0031). Active rows also carry the live approval
+/// scope. `iris_files`/`user_files`/`age` are populated "where available" --
+/// from the git-status snapshot for the active task, `None` on recovery rows
+/// whose counts are not surfaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaskCard {
     pub(crate) task_id: String,
     pub(crate) kind: TaskKind,
     pub(crate) body: Option<String>,
     pub(crate) sessions: Vec<String>,
+    pub(crate) approved_paths: Vec<String>,
+    pub(crate) all_dirty_approved: bool,
     pub(crate) age: Option<Duration>,
     pub(crate) iris_files: Option<u32>,
     pub(crate) user_files: Option<u32>,
@@ -67,6 +70,8 @@ impl TaskCard {
             },
             body: task.body.clone(),
             sessions: task.sessions.clone(),
+            approved_paths: Vec::new(),
+            all_dirty_approved: false,
             age: Some(task.age),
             iris_files: None,
             user_files: None,
@@ -86,6 +91,8 @@ impl TaskCard {
             kind: TaskKind::Active,
             body: display.body.clone(),
             sessions: display.sessions.clone(),
+            approved_paths: display.approved_paths.clone(),
+            all_dirty_approved: display.all_dirty_approved,
             age,
             iris_files,
             user_files,
@@ -121,12 +128,33 @@ impl TaskCard {
             .unwrap_or_default()
     }
 
+    /// The active task's approved scope, as a compact display label for
+    /// `/tasks`. Recovery rows have no live approval state and return `none`.
+    pub(crate) fn approved_scope_label(&self) -> String {
+        if self.all_dirty_approved {
+            return "all dirty files".to_string();
+        }
+        bounded_path_list(&self.approved_paths, 4).unwrap_or_else(|| "none".to_string())
+    }
+
     /// Whether this card can be adopted: only recoverable/legacy rows. The
     /// active task is already owned by this process, so it is shown but never
     /// adoptable (ADR-0031: adoption is for crashed orphans).
     pub(crate) fn is_adoptable(&self) -> bool {
         !matches!(self.kind, TaskKind::Active)
     }
+}
+
+fn bounded_path_list(paths: &[String], max: usize) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let shown = paths.len().min(max);
+    let mut label = paths[..shown].join(", ");
+    if shown < paths.len() {
+        label.push_str(&format!(", +{} more", paths.len() - shown));
+    }
+    Some(label)
 }
 
 #[cfg(test)]
@@ -187,6 +215,8 @@ mod tests {
             task_id: "activetask01".to_string(),
             body: Some("investigate the leak".to_string()),
             sessions: vec!["only-session".to_string()],
+            approved_paths: vec!["src/main.rs".to_string()],
+            all_dirty_approved: false,
         };
         let card = TaskCard::active(&display, Some(Duration::from_secs(120)), Some(3), Some(1));
         assert_eq!(card.kind, TaskKind::Active);
@@ -194,7 +224,21 @@ mod tests {
         assert_eq!(card.body_preview(), "investigate the leak");
         assert_eq!(card.session_summary(), "1 session");
         assert_eq!(card.age_label(), "2m ago");
+        assert_eq!(card.approved_scope_label(), "src/main.rs");
         assert_eq!(card.iris_files, Some(3));
         assert_eq!(card.user_files, Some(1));
+    }
+
+    #[test]
+    fn approved_scope_prefers_all_dirty_escalation() {
+        let display = ActiveTaskDisplay {
+            task_id: "activetask01".to_string(),
+            body: None,
+            sessions: Vec::new(),
+            approved_paths: vec!["src/a.rs".to_string()],
+            all_dirty_approved: true,
+        };
+        let card = TaskCard::active(&display, None, None, None);
+        assert_eq!(card.approved_scope_label(), "all dirty files");
     }
 }
