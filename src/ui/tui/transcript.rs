@@ -163,6 +163,7 @@ struct ActiveTool {
 struct ReviewGate {
     allow_always: bool,
     allow_project: bool,
+    dirty_gate: bool,
     reason: Option<String>,
 }
 
@@ -874,7 +875,11 @@ impl Transcript {
             if let Some(reason) = &gate.reason {
                 fields.push(FooterField::styled(reason.clone(), err_style()));
             }
-            fields.extend(review_footer_extras(gate.allow_always, gate.allow_project));
+            fields.extend(review_footer_extras(
+                gate.allow_always,
+                gate.allow_project,
+                gate.dirty_gate,
+            ));
             return fields;
         }
         Vec::new()
@@ -2332,6 +2337,7 @@ impl Transcript {
                 call,
                 allow_always,
                 allow_project,
+                dirty_gate,
                 reason,
             } => {
                 self.assign_turn_diag(&call.id);
@@ -2340,6 +2346,7 @@ impl Transcript {
                     ReviewGate {
                         allow_always,
                         allow_project,
+                        dirty_gate,
                         reason,
                     },
                 );

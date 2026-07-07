@@ -5,8 +5,8 @@ use anyhow::Result;
 use crate::approval::parse_decision;
 use crate::nexus::{ApprovalDecision, ReviewContext, ToolCall};
 use crate::tool_display::{
-    APPROVAL_DESTRUCTIVE_NOTE, approval_dirty_note, approval_reason_lead, exploration_summary,
-    fold, is_exploration_tool, run_target, summarize,
+    APPROVAL_ALL_DIRTY_LABEL, APPROVAL_DESTRUCTIVE_NOTE, approval_dirty_note, approval_reason_lead,
+    exploration_summary, fold, is_exploration_tool, run_target, summarize,
 };
 use crate::ui::{TurnErrorKind, Ui, UiEvent};
 
@@ -610,12 +610,12 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             reason.push_str(&note);
         }
         writeln!(self.out, "{}", sgr(self.ansi, "2", &reason))?;
-        // In the dirty-tree context "always" means "all dirty files this task"
-        // (ADR-0028), and no per-project grant is offered.
+        // In the dirty-tree context "always" means "all dirty files (this
+        // task)" (ADR-0028), and no per-project grant is offered.
         let always_label = if dirty_gate {
-            "[a] all dirty files this task"
+            format!("[a] {APPROVAL_ALL_DIRTY_LABEL}")
         } else {
-            "[a] always this session"
+            "[a] always this session".to_string()
         };
         let prompt = match (allow_always, allow_project) {
             (true, true) => {
@@ -812,7 +812,10 @@ mod tests {
             rendered.contains("Touches uncommitted user changes: src/main.rs"),
             "{rendered}"
         );
-        assert!(rendered.contains("all dirty files this task"), "{rendered}");
+        assert!(
+            rendered.contains("all dirty files (this task)"),
+            "{rendered}"
+        );
         Ok(())
     }
 
