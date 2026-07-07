@@ -154,6 +154,15 @@ pub(crate) struct LoadedSource {
 /// log, and load messages; the loop only asks for the swap.
 pub(crate) type SessionLoader<'a> = dyn Fn(&SessionSource) -> Result<LoadedSource> + 'a;
 
+/// Startup-only TUI state: an optional modal to show before the first input
+/// event, whether the home/start page should render, and the session id when
+/// this process already resumed a transcript before entering the loop.
+pub(crate) struct StartupUi {
+    pub(crate) modal: Option<crate::ui::modal::Modal>,
+    pub(crate) start_page: bool,
+    pub(crate) resumed_session: Option<String>,
+}
+
 /// Route a submitted line through the shared `/model` / `/reasoning` handler.
 /// Returns `None` when the line is not one of those commands (the caller then
 /// submits it as a normal prompt) or when no switch state is available;
@@ -779,8 +788,7 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     force_plain: bool,
     tui_settings: Option<&crate::config::TuiSettings>,
     swap: &SessionLoader<'_>,
-    startup_modal: Option<crate::ui::modal::Modal>,
-    start_page: bool,
+    startup: StartupUi,
 ) -> Result<()> {
     if !prefers_text_ui(force_plain) {
         // Screen-mode policy (ADR-0029): pager vs inline, resolved once per
@@ -810,10 +818,10 @@ pub(crate) fn run_interactive<P: ChatProvider>(
                 for notice in resolution.notices {
                     tui.screen.apply(crate::ui::UiEvent::Notice(notice));
                 }
-                return run_tui(harness, tui, switch, swap, startup_modal, start_page);
+                return run_tui(harness, tui, switch, swap, startup);
             }
             Err(error) => {
-                if startup_modal.is_some() {
+                if startup.modal.is_some() {
                     bail!(
                         "could not open resume picker because the TUI is unavailable: {error:#}; run `iris resume --plain` to list sessions"
                     );
@@ -860,19 +868,10 @@ fn run_tui<P: ChatProvider>(
     tui: TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
-    startup_modal: Option<crate::ui::modal::Modal>,
-    start_page: bool,
+    startup: StartupUi,
 ) -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    let result = crate::ui::tui_loop::run(
-        harness,
-        &runtime,
-        tui,
-        switch,
-        swap,
-        startup_modal,
-        start_page,
-    );
+    let result = crate::ui::tui_loop::run(harness, &runtime, tui, switch, swap, startup);
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
 }

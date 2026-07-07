@@ -32,7 +32,7 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource};
+use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource, StartupUi};
 use crate::git::status::GitStatusCache;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
@@ -168,9 +168,13 @@ pub(crate) fn run<P: ChatProvider>(
     mut tui: TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
-    startup_modal: Option<Modal>,
-    start_page: bool,
+    startup: StartupUi,
 ) -> Result<()> {
+    let StartupUi {
+        modal: startup_modal,
+        start_page,
+        resumed_session,
+    } = startup;
     let result = runtime.block_on(session_loop(
         harness,
         &mut tui,
@@ -178,6 +182,7 @@ pub(crate) fn run<P: ChatProvider>(
         swap,
         startup_modal,
         start_page,
+        resumed_session.as_deref(),
     ));
     tui.shutdown();
     result
@@ -290,6 +295,7 @@ async fn session_loop<P: ChatProvider>(
     swap: &SessionLoader<'_>,
     startup_modal: Option<Modal>,
     start_page: bool,
+    startup_resumed_session: Option<&str>,
 ) -> Result<()> {
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
@@ -319,7 +325,10 @@ async fn session_loop<P: ChatProvider>(
     // (notice) or note the >1/legacy case (#288, ADR-0031). The recoverable
     // count feeds the start page's `Tasks` badge; a picker is never forced over
     // the home menu -- the user opens Tasks (or `/tasks`) to review or adopt.
-    let recovery = harness.recover_checkpoints();
+    let recovery = startup_resumed_session.map_or_else(
+        || harness.recover_checkpoints(),
+        |session_id| harness.recover_checkpoints_for_resumed_session(session_id),
+    );
     let recoverable = recovery.recoverable_count();
     // The start page (IrisMark + launcher) shows only for an interactive launch
     // with no task and no resume target; a startup resume picker supersedes it.
@@ -586,9 +595,15 @@ fn perform_swap<P: ChatProvider>(
     };
     apply_notices(tui, vec![notice]);
     // A session swap is a safe boundary to reconcile a crashed/unsettled task in
-    // this repo and expire stale ones (issue #263, ADR-0028): surface the notice
-    // or open the resume-task picker if more than one task needs attention.
-    apply_recovery(harness.recover_checkpoints(), tui);
+    // this repo and expire stale ones (issue #263, ADR-0028). When the swap
+    // explicitly resumes a session, prefer the session-linked task offer if
+    // exactly one recoverable task points at that session; otherwise fall back
+    // to the normal workspace recovery policy.
+    let recovery = match source {
+        SessionSource::Resume(id) => harness.recover_checkpoints_for_resumed_session(id),
+        SessionSource::Fresh => harness.recover_checkpoints(),
+    };
+    apply_recovery(recovery, tui);
     Ok(())
 }
 
@@ -601,6 +616,13 @@ fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
     match outcome {
         RecoveryOutcome::None => {}
         RecoveryOutcome::Notice(notice) => apply_notices(tui, vec![notice]),
+        RecoveryOutcome::ResumeLinked(task) => {
+            apply_notices(
+                tui,
+                vec!["This session has one linked Iris task to resume.".to_string()],
+            );
+            tui.screen.open_modal(picker::linked_task_offer(&task));
+        }
         RecoveryOutcome::Picker(tasks) => {
             let n = tasks.len();
             let plural = if n == 1 { "task" } else { "tasks" };

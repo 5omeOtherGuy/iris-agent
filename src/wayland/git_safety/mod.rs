@@ -312,6 +312,25 @@ impl GitSafety {
         }
     }
 
+    /// Display-only join index for the resume picker: every session id recorded
+    /// on an unsettled task in this workspace. Unlike recovery classification,
+    /// this does not probe leases or branch on task metadata; it only projects
+    /// the opaque ADR-0031 `sessions` payload for UI markers.
+    pub(crate) fn task_linked_session_ids(&self) -> BTreeSet<String> {
+        if !self.workflow_enabled || !matches!(self.mode, Mode::Git) {
+            return BTreeSet::new();
+        }
+        let Some(git_dir) = task_state::git_dir(&self.workspace) else {
+            return BTreeSet::new();
+        };
+        let workspace = self.workspace.to_string_lossy().into_owned();
+        task_state::load_all(&git_dir)
+            .into_iter()
+            .filter(|task| task.workspace == workspace)
+            .flat_map(|task| task.sessions)
+            .collect()
+    }
+
     /// Flip the durable workflow flag at an inter-turn boundary. Disabling is
     /// refused while a durable task is active because hiding it would knowingly
     /// orphan review/rollback state. Enabling while a guard-only task is active
