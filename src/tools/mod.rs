@@ -47,7 +47,7 @@ mod write;
 pub(crate) use crate::nexus::ToolOutput;
 pub(crate) use bash::platform_can_sandbox;
 pub(crate) use observe::ObservedFiles;
-pub(crate) use registry::built_in_tools;
+pub(crate) use registry::{built_in_tools, built_in_tools_for};
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 1024 * 1024;
 
@@ -303,6 +303,26 @@ mod tests {
                 "recall"
             ]
         );
+    }
+
+    #[test]
+    fn bash_tool_mode_keeps_only_bash_edit_and_session_plumbing() {
+        use super::built_in_tools_for;
+        // Off is byte-identical to the default surface.
+        let off_tools = built_in_tools_for(false);
+        let full_tools = built_in_tools();
+        let off: Vec<&str> = off_tools.iter().map(|t| t.name()).collect();
+        let full: Vec<&str> = full_tools.iter().map(|t| t.name()).collect();
+        assert_eq!(off, full);
+        // On deactivates the shell-replaceable filesystem tools entirely: they
+        // are absent from the registry (`by_name`), not merely hidden, so a
+        // stray call fails as an unknown tool.
+        let on = built_in_tools_for(true);
+        let names: Vec<&str> = on.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["bash", "edit", "read_output", "recall"]);
+        for gone in ["read", "write", "grep", "find", "ls"] {
+            assert!(on.by_name(gone).is_none(), "{gone} should be deactivated");
+        }
     }
 
     #[test]

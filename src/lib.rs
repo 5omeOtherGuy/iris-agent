@@ -371,7 +371,7 @@ fn run_agent_inner(
     // from the in-binary shipped fragments plus dynamic context (project docs,
     // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
     // the same function.
-    let tools = tools::built_in_tools();
+    let tools = tools::built_in_tools_for(settings.bash_tool_mode());
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
@@ -527,7 +527,7 @@ fn load_session_source(
 fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
-    let tools = tools::built_in_tools();
+    let tools = tools::built_in_tools_for(settings.bash_tool_mode());
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
@@ -644,7 +644,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     let budget = Some(settings.context_token_budget());
     // Resume assembles instructions through the same harness-owned baukasten as
     // a fresh session, so a resumed turn gets identical fragment/context output.
-    let tools = tools::built_in_tools();
+    let tools = tools::built_in_tools_for(settings.bash_tool_mode());
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;

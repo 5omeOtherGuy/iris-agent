@@ -90,6 +90,7 @@ pub(crate) enum Field {
     DefaultApproval,
     ContextTokenBudget,
     Microcompaction,
+    BashToolMode,
     MaxToolRoundtrips,
     PromptCacheRetention,
     VerifyCommand,
@@ -123,6 +124,7 @@ impl Field {
             Field::DefaultApproval => Category::Approvals,
             Field::ContextTokenBudget
             | Field::Microcompaction
+            | Field::BashToolMode
             | Field::MaxToolRoundtrips
             | Field::PromptCacheRetention => Category::Runtime,
             Field::VerifyCommand | Field::VerifyMaxAttempts => Category::Verification,
@@ -139,6 +141,7 @@ impl Field {
             Field::DefaultApproval => "Default approval",
             Field::ContextTokenBudget => "Context token budget",
             Field::Microcompaction => "Microcompaction",
+            Field::BashToolMode => "Bash tool mode",
             Field::MaxToolRoundtrips => "Max tool round-trips",
             Field::PromptCacheRetention => "Prompt cache retention",
             Field::VerifyCommand => "Verify command",
@@ -182,7 +185,7 @@ impl Field {
                 allow_empty: false,
             },
             Field::VerifyCommand | Field::WorktreeRoot => FieldKind::Text { allow_empty: true },
-            Field::ReducedMotion | Field::Microcompaction => FieldKind::Bool,
+            Field::ReducedMotion | Field::Microcompaction | Field::BashToolMode => FieldKind::Bool,
         }
     }
 }
@@ -202,6 +205,7 @@ pub(crate) struct Snapshot {
     pub(crate) skip_permissions: bool,
     pub(crate) context_token_budget: u64,
     pub(crate) microcompaction: bool,
+    pub(crate) bash_tool_mode: bool,
     pub(crate) max_tool_roundtrips: Option<usize>,
     pub(crate) prompt_cache_retention: String,
     pub(crate) verify_command: Option<String>,
@@ -222,6 +226,7 @@ impl Snapshot {
             Field::DefaultApproval => self.default_approval.clone(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
             Field::Microcompaction => on_off(self.microcompaction),
+            Field::BashToolMode => on_off(self.bash_tool_mode),
             Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
                 Some(cap) => cap.to_string(),
                 None => "unbounded".to_string(),
@@ -281,6 +286,7 @@ fn field_row(field: Field, snapshot: &Snapshot) -> Row {
             let current = match field {
                 Field::ReducedMotion => snapshot.reduced_motion,
                 Field::Microcompaction => snapshot.microcompaction,
+                Field::BashToolMode => snapshot.bash_tool_mode,
                 _ => false,
             };
             ModalAction::SaveSetting {
@@ -351,6 +357,7 @@ fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
         Category::Runtime => vec![
             field_row(Field::ContextTokenBudget, snapshot),
             field_row(Field::Microcompaction, snapshot),
+            field_row(Field::BashToolMode, snapshot),
             field_row(Field::MaxToolRoundtrips, snapshot),
             field_row(Field::PromptCacheRetention, snapshot),
         ],
@@ -707,6 +714,7 @@ mod tests {
             skip_permissions: false,
             context_token_budget: 128_000,
             microcompaction: false,
+            bash_tool_mode: false,
             max_tool_roundtrips: None,
             prompt_cache_retention: "short".to_string(),
             verify_command: None,
@@ -933,6 +941,8 @@ mod tests {
             Field::ReducedMotion,
             Field::DefaultApproval,
             Field::ContextTokenBudget,
+            Field::Microcompaction,
+            Field::BashToolMode,
             Field::MaxToolRoundtrips,
             Field::PromptCacheRetention,
             Field::VerifyCommand,

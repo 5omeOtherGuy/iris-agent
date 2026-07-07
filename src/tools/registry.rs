@@ -41,6 +41,29 @@ use super::{
 /// the provider-declaration order (`read, bash, edit, write, grep, find, ls`),
 /// with the Iris-specific `read_output` (issue #205) appended last.
 pub(crate) fn built_in_tools() -> Tools {
+    built_in_tools_for(false)
+}
+
+/// Construct the tool set for the configured bash-tool-mode setting
+/// (`bashToolMode`). Off (`false`) is the full built-in surface. On (`true`)
+/// deactivates the workspace filesystem tools whose job the shell can do
+/// (`read`, `write`, `grep`, `find`, `ls`), so the model drives those
+/// operations through `bash`; `edit` stays registered because exact-string
+/// edits are too delicate to route through ad-hoc shell rewrites. The
+/// session-plumbing tools `read_output` and `recall` also stay: they page
+/// offloaded oversized outputs (which `bash` results can still produce) and
+/// compacted transcript turns back in -- neither is reachable via the shell.
+/// The system prompt's generated tool blocks adapt automatically (the
+/// guidelines fall back to the bash-only file-operations bullet).
+pub(crate) fn built_in_tools_for(bash_tool_mode: bool) -> Tools {
+    if bash_tool_mode {
+        return Tools::new(vec![
+            Box::new(BashTool),
+            Box::new(EditTool),
+            Box::new(ReadOutputTool),
+            Box::new(RecallTool),
+        ]);
+    }
     Tools::new(vec![
         Box::new(ReadTool),
         Box::new(BashTool),
