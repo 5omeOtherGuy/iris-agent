@@ -1096,6 +1096,12 @@ Later slices (not in #261):
   Enforcement never reads the new metadata; the session log is never a
   recovery input. Deferred to Milestone 4 (#216): subagent-backed session
   summarization and model-generated task titles.
+- Task workflow v2 follow-up: adopt-while-active false success
+  ([#443](https://github.com/5omeOtherGuy/iris-agent/issues/443)) — adoption
+  from `/tasks` must be rejected before claiming an orphan lease or appending a
+  recovery checkpoint when this process already owns an active task. Recovery
+  rows remain visible but non-adoptable until the current task is accepted or
+  rolled back.
 - Per-hunk staging
   ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
 - Optional auto-commit behind explicit approval

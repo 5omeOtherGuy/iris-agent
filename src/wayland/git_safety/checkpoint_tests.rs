@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::checkpoint::{CheckpointChain, Mode};
-use super::settlement::TaskClass;
+use super::settlement::{AdoptError, TaskClass};
 use super::{GitSafety, RecoveryOutcome, lock, task_state};
 
 /// Extract the single-orphan auto-adopt notice from a [`RecoveryOutcome`],
@@ -1156,7 +1156,7 @@ fn recoverable_tasks_skips_live_foreign_lease() {
 
     // Adopting the foreign live task is refused (its lease is held).
     assert!(
-        guard.adopt_task(&foreign).is_none(),
+        matches!(guard.adopt_task(&foreign), Err(AdoptError::Unavailable)),
         "a live foreign task is never adopted"
     );
 
@@ -1354,7 +1354,7 @@ fn adopt_serializes_on_mutation_lock() {
     killer.join().unwrap();
 
     assert!(
-        adopted.is_some(),
+        adopted.is_ok(),
         "adopt still succeeds once the lock is free"
     );
     assert!(
@@ -1789,6 +1789,55 @@ fn multiple_recoverable_tasks_open_picker_and_adopt_only_chosen() {
     assert!(
         remaining.contains(&first),
         "the unchosen task is untouched and still recoverable: {remaining:?}"
+    );
+}
+
+// B2 / Issue 4: adopting a recoverable task while this process already has an
+// active task must fail before it claims the orphan's lease or appends recovery
+// checkpoints. The old path returned success after side effects because
+// `rehydrate_task` silently no-oped when a task was active.
+#[test]
+fn adopt_while_active_returns_error_and_leaves_orphan_untouched() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    let orphan = create_unsettled_task(&repo.path, "orphan.txt");
+    fs::write(repo.path.join("orphan.txt"), b"diverged orphan\n").unwrap();
+    let orphan_record = git_dir
+        .join("iris")
+        .join("tasks")
+        .join(format!("{orphan}.json"));
+    let record_before = fs::read(&orphan_record).unwrap();
+    let refs_before = task_ref_count(&repo.path, &orphan);
+    let lease_path = lock::lease_path(&git_dir, &orphan);
+    assert!(
+        lock::is_lease_free(&lease_path),
+        "the orphan starts adoptable"
+    );
+
+    let guard = GitSafety::new(&repo.path);
+    guard.note_mutation();
+    iris_write(&guard, &repo.path.join("active.txt"), b"active task\n");
+    assert!(guard.has_task(), "this process has an active task");
+
+    let err = guard
+        .adopt(&orphan)
+        .expect_err("adoption is refused while active");
+    assert_eq!(err, AdoptError::TaskActive);
+    assert!(guard.has_task(), "the current active task remains active");
+    assert_eq!(
+        task_ref_count(&repo.path, &orphan),
+        refs_before,
+        "no recovery checkpoint was appended to the orphan"
+    );
+    assert_eq!(
+        fs::read(&orphan_record).unwrap(),
+        record_before,
+        "the orphan record was not rewritten"
+    );
+    assert!(
+        lock::is_lease_free(&lease_path),
+        "the orphan lease was not claimed or retained"
     );
 }
 

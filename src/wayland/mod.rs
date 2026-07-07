@@ -559,8 +559,10 @@ impl<P: ChatProvider> Harness<P> {
     /// `/checkpoint` operates on the real chain. Never implicitly resumes a
     /// session -- the returned [`AdoptedTask`](git_safety::AdoptedTask) carries
     /// the body + linked sessions so the caller can offer an explicit resume.
-    /// `None` when the record is gone or now leased.
-    pub(crate) fn adopt_task(&self, task_id: &str) -> Option<git_safety::AdoptedTask> {
+    pub(crate) fn adopt_task(
+        &self,
+        task_id: &str,
+    ) -> Result<git_safety::AdoptedTask, git_safety::AdoptError> {
         self.git_safety.adopt(task_id)
     }
 
