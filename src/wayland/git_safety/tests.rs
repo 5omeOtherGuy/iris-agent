@@ -255,6 +255,95 @@ fn bash_violation_detected_and_restored() {
     );
 }
 
+#[test]
+fn approved_dirty_bash_change_is_ledgered_and_rollbackable() {
+    let repo = init_repo();
+    let dirty = repo.path.join("committed.txt");
+    fs::write(&dirty, "user work\n").unwrap();
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.approve(std::slice::from_ref(&dirty), false);
+
+    guard.before_exec(&[]);
+    fs::write(&dirty, "formatted by bash\n").unwrap();
+
+    let violations = guard.after_exec(&[], None);
+    assert!(
+        violations.is_empty(),
+        "an approved dirty path changed by bash is Iris-attributed"
+    );
+    assert_eq!(guard.ledger_len(), 1, "approved bash change is ledgered");
+
+    guard.rollback(0).unwrap();
+    assert_eq!(
+        fs::read_to_string(&dirty).unwrap(),
+        "user work\n",
+        "rollback restores the pre-bash dirty bytes"
+    );
+}
+
+#[test]
+fn approve_all_dirty_files_covers_bash_attribution() {
+    let repo = init_repo();
+    let one = repo.path.join("committed.txt");
+    let two = repo.path.join("second.txt");
+    fs::write(&one, "user one\n").unwrap();
+    fs::write(&two, "user two\n").unwrap();
+    run_git(&repo.path, &["add", "second.txt"]);
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.approve(&[], true);
+
+    guard.before_exec(&[]);
+    fs::write(&one, "formatted one\n").unwrap();
+    fs::write(&two, "formatted two\n").unwrap();
+
+    let violations = guard.after_exec(&[], None);
+    assert!(
+        violations.is_empty(),
+        "approve-all covers bash changes to all baseline dirty paths"
+    );
+    assert_eq!(guard.ledger_len(), 2);
+}
+
+#[test]
+fn unapproved_dirty_bash_path_still_violates_and_restores() {
+    let repo = init_repo();
+    let approved = repo.path.join("committed.txt");
+    let unapproved = repo.path.join("second.txt");
+    fs::write(&approved, "approved user work\n").unwrap();
+    fs::write(&unapproved, "unapproved user work\n").unwrap();
+    run_git(&repo.path, &["add", "second.txt"]);
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.approve(std::slice::from_ref(&approved), false);
+
+    guard.before_exec(&[]);
+    fs::write(&approved, "approved bash change\n").unwrap();
+    fs::write(&unapproved, "unapproved bash change\n").unwrap();
+
+    let violations = guard.after_exec(&[], None);
+    assert_eq!(violations, vec![unapproved.clone()]);
+    assert_eq!(
+        guard.ledger_len(),
+        1,
+        "only the approved bash change is ledgered"
+    );
+
+    guard.restore(&violations).unwrap();
+    assert_eq!(
+        fs::read_to_string(&approved).unwrap(),
+        "approved bash change\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&unapproved).unwrap(),
+        "unapproved user work\n"
+    );
+}
+
 // Test 7: a non-git cwd degrades -- a one-line notice, tools work, no gating.
 #[test]
 fn non_git_directory_degrades_without_gating() {
