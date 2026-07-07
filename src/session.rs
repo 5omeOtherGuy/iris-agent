@@ -177,12 +177,32 @@ impl SessionLog {
     /// additive optional `carryPaths` field. It is written only when non-empty,
     /// so an empty carry is byte-identical to a pre-carry compaction entry and
     /// older readers ignore it either way.
+    #[cfg(test)]
     pub(crate) fn append_compaction(
         &mut self,
         covered_from: &str,
         covered_to: &str,
         summary: &str,
         carry_paths: &[String],
+        token_estimate: Option<u64>,
+    ) -> Result<String> {
+        self.append_compaction_with_task_state(
+            covered_from,
+            covered_to,
+            summary,
+            carry_paths,
+            None,
+            token_estimate,
+        )
+    }
+
+    pub(crate) fn append_compaction_with_task_state(
+        &mut self,
+        covered_from: &str,
+        covered_to: &str,
+        summary: &str,
+        carry_paths: &[String],
+        task_state: Option<&CompactionTaskState>,
         token_estimate: Option<u64>,
     ) -> Result<String> {
         let id = self.next_id();
@@ -215,6 +235,12 @@ impl SessionLog {
         // compaction and older readers are unaffected.
         if !carry_paths.is_empty() {
             entry["carryPaths"] = json!(carry_paths);
+        }
+        if let Some(task_state) = task_state.filter(|state| !state.is_empty()) {
+            entry["taskState"] = json!({
+                "taskBody": task_state.task_body.as_deref(),
+                "ledgerPaths": &task_state.ledger_paths,
+            });
         }
         write_line(&mut self.file, &entry).with_context(|| {
             format!(
@@ -941,11 +967,24 @@ pub(crate) fn message_token_estimate(message: &Message) -> u64 {
 /// the deterministic touched/read path set that rides alongside the prose
 /// summary.
 const CARRY_BLOCK_HEADER: &str = "[files touched or read in the compacted range]";
+const TASK_STATE_BLOCK_HEADER: &str = "[open task state]";
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CompactionTaskState {
+    pub(crate) task_body: Option<String>,
+    pub(crate) ledger_paths: Vec<String>,
+}
+
+impl CompactionTaskState {
+    fn is_empty(&self) -> bool {
+        self.task_body.is_none() && self.ledger_paths.is_empty()
+    }
+}
 
 /// Render the compaction carry (ADR-0044): a deterministic, compact block
 /// listing the covered range's workspace-relative touched/read paths. Empty
-/// carry renders the empty string, so [`render_compaction_body`] with no paths
-/// is byte-identical to the pre-carry summary-only body.
+/// carry renders the empty string, so a full compaction body with no paths is
+/// byte-identical to the pre-carry summary-only body.
 pub(crate) fn render_carry_block(carry_paths: &[String]) -> String {
     if carry_paths.is_empty() {
         return String::new();
@@ -958,16 +997,51 @@ pub(crate) fn render_carry_block(carry_paths: &[String]) -> String {
     out
 }
 
+pub(crate) fn render_task_state_block(task_state: Option<&CompactionTaskState>) -> String {
+    let Some(task_state) = task_state.filter(|state| !state.is_empty()) else {
+        return String::new();
+    };
+    let mut out = format!(
+        "\n\n{TASK_STATE_BLOCK_HEADER}\n- Iris has unreviewed changes in the current task."
+    );
+    if let Some(body) = task_state
+        .task_body
+        .as_deref()
+        .filter(|body| !body.is_empty())
+    {
+        out.push_str("\n- task: ");
+        out.push_str(body);
+    }
+    if !task_state.ledger_paths.is_empty() {
+        out.push_str("\n- ledger paths:");
+        for path in &task_state.ledger_paths {
+            out.push_str("\n  - ");
+            out.push_str(path);
+        }
+    }
+    out
+}
+
 /// The compaction message body rebuilt into context (ADR-0044): the prose
-/// summary followed by the carry block. With an empty carry this returns the
-/// summary unchanged, so an empty-carry compaction rebuilds byte-identically to
-/// the pre-carry behavior. Both the live in-process rebuild
+/// summary followed by deterministic carry blocks. With no carry this returns
+/// the summary unchanged, so an empty-carry compaction rebuilds byte-identically
+/// to the pre-carry behavior. Both the live in-process rebuild
 /// (`wayland::Harness::compact_range`) and the read-time rebuild
 /// ([`rebuild_with_compactions`]) render through this one function so live and
 /// resumed context agree.
+#[cfg(test)]
 pub(crate) fn render_compaction_body(summary: &str, carry_paths: &[String]) -> String {
+    render_compaction_body_with_task_state(summary, carry_paths, None)
+}
+
+pub(crate) fn render_compaction_body_with_task_state(
+    summary: &str,
+    carry_paths: &[String],
+    task_state: Option<&CompactionTaskState>,
+) -> String {
     let mut out = summary.to_string();
     out.push_str(&render_carry_block(carry_paths));
+    out.push_str(&render_task_state_block(task_state));
     out
 }
 
@@ -1241,6 +1315,9 @@ struct Compaction {
     /// rebuilt body alongside the summary. Empty for pre-carry entries and any
     /// entry whose covered range touched no in-workspace files.
     carry_paths: Vec<String>,
+    /// Additive task-state carry (ADR-0052): old compaction entries omit this
+    /// field and therefore rebuild exactly as summary + carry did before.
+    task_state: Option<CompactionTaskState>,
 }
 
 /// Parse a `compaction` entry's rebuild fields. `None` (skipped as malformed)
@@ -1268,7 +1345,30 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
                     .collect()
             })
             .unwrap_or_default(),
+        task_state: value.get("taskState").and_then(parse_compaction_task_state),
     })
+}
+
+fn parse_compaction_task_state(value: &Value) -> Option<CompactionTaskState> {
+    let task_body = value
+        .get("taskBody")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let ledger_paths = value
+        .get("ledgerPaths")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let state = CompactionTaskState {
+        task_body,
+        ledger_paths,
+    };
+    (!state.is_empty()).then_some(state)
 }
 
 /// A persisted `fold` entry's rebuild-relevant fields (ADR-0048): the durable
@@ -1374,7 +1474,11 @@ fn rebuild_with_compactions(
         // entries rebuild unchanged. Prefer the persisted estimate (which already
         // counts summary + carry); recompute from the rendered body when absent,
         // so the body contributes its own tokens instead of the covered turns.
-        let body = render_compaction_body(&compaction.summary, &compaction.carry_paths);
+        let body = render_compaction_body_with_task_state(
+            &compaction.summary,
+            &compaction.carry_paths,
+            compaction.task_state.as_ref(),
+        );
         let summary_tokens = compaction
             .token_estimate
             .unwrap_or_else(|| estimate_tokens(&body));
@@ -2995,6 +3099,39 @@ mod tests {
     }
 
     #[test]
+    fn append_compaction_writes_task_state_when_present() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let task_state = CompactionTaskState {
+            task_body: Some("fix the parser".to_string()),
+            ledger_paths: vec!["src/parser.rs".to_string(), "tests/parser.rs".to_string()],
+        };
+        log.append_compaction_with_task_state(
+            &from,
+            &to,
+            "summary",
+            &[],
+            Some(&task_state),
+            Some(11),
+        )
+        .unwrap();
+
+        let entry = lines(log.path()).pop().unwrap();
+        assert_eq!(entry["summary"], "summary");
+        assert_eq!(entry["taskState"]["taskBody"], "fix the parser");
+        assert_eq!(
+            entry["taskState"]["ledgerPaths"],
+            json!(["src/parser.rs", "tests/parser.rs"])
+        );
+        assert!(
+            !entry.as_object().unwrap().contains_key("carryPaths"),
+            "task carry should not force an empty carryPaths field"
+        );
+    }
+
+    #[test]
     fn empty_carry_writes_no_field_and_stays_byte_identical() {
         // ADR-0044 item 5: an empty carry writes no `carryPaths` key, so the
         // serialized compaction entry is byte-identical to the pre-carry entry
@@ -3060,6 +3197,39 @@ mod tests {
         assert!(rebuilt.contains("src/a.rs") && rebuilt.contains("src/b.rs"));
         assert_eq!(*rebuilt, body);
         // The total counts the summary + carry body, not the covered turns.
+        assert_eq!(session.context_tokens, estimate_tokens(&body));
+    }
+
+    #[test]
+    fn rebuild_renders_task_state_and_counts_its_tokens() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let id = log.id().to_string();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let task_state = CompactionTaskState {
+            task_body: Some("fix the parser".to_string()),
+            ledger_paths: vec!["src/parser.rs".to_string()],
+        };
+        let body = render_compaction_body_with_task_state("SUMMARY", &[], Some(&task_state));
+        log.append_compaction_with_task_state(
+            &from,
+            &to,
+            "SUMMARY",
+            &[],
+            Some(&task_state),
+            Some(estimate_tokens(&body)),
+        )
+        .unwrap();
+        drop(log);
+
+        let session = open_by_id(&SessionStore::with_root(dir.path.clone()), &id);
+        assert_eq!(session.messages.len(), 1);
+        let rebuilt = &session.messages[0].content;
+        assert!(rebuilt.contains("[open task state]"));
+        assert!(rebuilt.contains("fix the parser"));
+        assert!(rebuilt.contains("src/parser.rs"));
+        assert_eq!(*rebuilt, body);
         assert_eq!(session.context_tokens, estimate_tokens(&body));
     }
 

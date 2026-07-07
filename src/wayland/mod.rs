@@ -32,8 +32,8 @@ use crate::nexus::{
     VerifyRun,
 };
 use crate::session::{
-    SessionLog, estimate_tokens, message_token_estimate, preview_line, read_span,
-    render_carry_block, render_compaction_body,
+    CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
+    read_span, render_carry_block, render_compaction_body_with_task_state, render_task_state_block,
 };
 use crate::tools::ToolState;
 use crate::tools::recall;
@@ -625,6 +625,18 @@ impl<P: ChatProvider> Harness<P> {
             return Vec::new();
         }
         self.git_safety.recoverable_tasks()
+    }
+
+    fn compaction_task_state(&self) -> Option<CompactionTaskState> {
+        if !self.task_workflow_enabled {
+            return None;
+        }
+        self.git_safety
+            .active_task_compaction_state(MAX_CARRY_PATHS)
+            .map(|(task_body, ledger_paths)| CompactionTaskState {
+                task_body,
+                ledger_paths,
+            })
     }
 
     /// Adopt a recoverable task by id at the safe inter-turn boundary (#288,
@@ -1376,7 +1388,10 @@ impl<P: ChatProvider> Harness<P> {
         // covered range's structured tool calls before the mutable session
         // borrow below. Independent of the summarizer, so it survives any summary.
         let carry_paths = derive_carry_paths(covered_slice, self.workspace());
-        let carry_tokens = estimate_tokens(&render_carry_block(&carry_paths));
+        let task_state = self.compaction_task_state();
+        let carry_tokens = estimate_tokens(&render_carry_block(&carry_paths)).saturating_add(
+            estimate_tokens(&render_task_state_block(task_state.as_ref())),
+        );
         let Some(mut summary) = self
             .summarize_range(messages, &plan, original_tokens, carry_tokens, token)
             .await
@@ -1406,23 +1421,24 @@ impl<P: ChatProvider> Harness<P> {
                 ),
             }
         }
-        // The rebuilt body is the prose summary plus the carry block; count its
-        // tokens so the persisted estimate and the in-memory total both cover the
-        // carry. With an empty carry the body is exactly the summary.
-        let body = render_compaction_body(&summary, &carry_paths);
+        // The rebuilt body is the prose summary plus deterministic carry blocks;
+        // count its tokens so the persisted estimate and the in-memory total
+        // both cover the carry. With empty carry the body is exactly the summary.
+        let body =
+            render_compaction_body_with_task_state(&summary, &carry_paths, task_state.as_ref());
         let body_tokens = estimate_tokens(&body);
 
         // Shrink/worthwhile guard on EVERY summarizer path (ADR-0044, DoD item
         // 3). The provider branch guards its own summary, but the deterministic
-        // excerpt fallback and manual `/compact` reach here without one, and a
-        // non-empty carry can push the combined summary + carry body back over
-        // the covered range. A compaction that does not shrink is worse than
-        // leaving the range intact: skip rather than append it.
+        // excerpt fallback and manual `/compact` reach here without one, and
+        // deterministic carry/task-state blocks can push the combined body back
+        // over the covered range. A compaction that does not shrink is worse
+        // than leaving the range intact: skip rather than append it.
         if body_tokens >= original_tokens {
             tracing::warn!(
                 body_tokens,
                 original_tokens,
-                "compaction summary + carry did not shrink the covered range; skipping"
+                "compaction summary + deterministic carry did not shrink the covered range; skipping"
             );
             return Ok(None);
         }
@@ -1431,11 +1447,12 @@ impl<P: ChatProvider> Harness<P> {
             .session
             .as_mut()
             .expect("compaction callers check the session first");
-        let compaction_id = log.append_compaction(
+        let compaction_id = log.append_compaction_with_task_state(
             &plan.from_id,
             &plan.to_id,
             &summary,
             &carry_paths,
+            task_state.as_ref(),
             Some(body_tokens),
         )?;
         // Generation ordinal (ADR-0047), read right after the append that
@@ -1848,6 +1865,10 @@ mod recall_tests;
 #[cfg(test)]
 #[path = "microcompaction_tests.rs"]
 mod microcompaction_tests;
+
+#[cfg(test)]
+#[path = "compaction_task_tests.rs"]
+mod compaction_task_tests;
 
 #[cfg(test)]
 mod carry_tests {
