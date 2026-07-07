@@ -61,6 +61,13 @@ binary built from source instead re-runs `cargo install`.
 search in-process via the ripgrep library crates (`grep`, `ignore`, `globset`),
 so no `rg` or `fd` binary needs to be on `PATH`.
 
+## Documentation
+
+OpenWiki-generated agent docs live in `openwiki/` and are prepared with
+[docs/OPENWIKI.md](docs/OPENWIKI.md). The docs website is intentionally kept in a
+separate repository so the Rust CLI release path does not depend on a frontend
+stack.
+
 ## Platforms
 
 | Platform | Status | `bash` sandbox |
