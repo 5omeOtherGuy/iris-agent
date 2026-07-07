@@ -119,6 +119,11 @@ enum Chain {
 
 /// Per-task state, created lazily at the first mutating call.
 struct Task {
+    /// Whether this in-memory guard state is backed by the durable task
+    /// workflow (records, leases, checkpoint refs, lifecycle UI). Guard-only
+    /// tasks still protect dirty files and keep an in-memory ledger, but are not
+    /// user-facing workflow tasks.
+    durable: bool,
     /// `true` for a degraded task: no baseline, no gating.
     degraded: bool,
     /// Stable id anchoring the `refs/iris/checkpoints/<task-id>/` namespace and
@@ -170,6 +175,7 @@ impl Task {
         lease: Option<lock::FlockGuard>,
     ) -> Self {
         Self {
+            durable: true,
             degraded: false,
             task_id,
             baseline,
@@ -188,8 +194,30 @@ impl Task {
         }
     }
 
-    fn degraded(task_id: String) -> Self {
+    fn guard_only(task_id: String, baseline: Baseline) -> Self {
         Self {
+            durable: false,
+            degraded: false,
+            task_id,
+            baseline,
+            ledger: Ledger::default(),
+            approved: BTreeSet::new(),
+            all_dirty_approved: false,
+            snapshot: Snapshot::default(),
+            pre_modes: BTreeMap::new(),
+            turn: 0,
+            chain: Chain::Fallback(FallbackStore::default()),
+            git_dir: None,
+            created_ms: task_state::now_ms(),
+            _lease: None,
+            body: None,
+            sessions: Vec::new(),
+        }
+    }
+
+    fn degraded(task_id: String, durable: bool) -> Self {
+        Self {
+            durable,
             degraded: true,
             task_id,
             baseline: Baseline {
@@ -243,6 +271,7 @@ pub(crate) struct GitSafety {
     /// Canonicalized workspace root; the anchor for path normalization.
     workspace: PathBuf,
     mode: Mode,
+    workflow_enabled: bool,
     state: Mutex<State>,
     /// In-flight async attribution scan, joined at every sync barrier.
     scan: Mutex<Option<JoinHandle<Vec<LedgerEntry>>>>,
@@ -251,6 +280,13 @@ pub(crate) struct GitSafety {
 impl GitSafety {
     /// Build the guard for `workspace`, detecting git vs degraded mode once.
     pub(crate) fn new(workspace: &Path) -> Self {
+        Self::new_with_workflow(workspace, true)
+    }
+
+    /// Build the guard with the durable task workflow explicitly enabled or
+    /// disabled. The dirty-tree guard runs in both modes; this flag gates only
+    /// records, leases, refs, recovery, and user-facing task UI.
+    pub(crate) fn new_with_workflow(workspace: &Path, workflow_enabled: bool) -> Self {
         let canonical = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf());
@@ -258,6 +294,7 @@ impl GitSafety {
         Self {
             workspace: canonical,
             mode,
+            workflow_enabled,
             state: Mutex::new(State {
                 task: None,
                 pending_body: None,
@@ -265,6 +302,30 @@ impl GitSafety {
             }),
             scan: Mutex::new(None),
         }
+    }
+
+    /// Flip the durable workflow flag at an inter-turn boundary. Disabling is
+    /// refused while a durable task is active because hiding it would knowingly
+    /// orphan review/rollback state. Enabling while a guard-only task is active
+    /// starts the durable workflow at the next mutation; prior guard-only
+    /// changes remain protected by the safety floor but never gain retroactive
+    /// rollback history.
+    pub(crate) fn set_workflow_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> std::result::Result<(), &'static str> {
+        self.sync_barrier();
+        if !enabled && self.has_active_workflow_task() {
+            return Err("finish the current task before disabling task workflow");
+        }
+        if enabled && !self.workflow_enabled {
+            let mut state = self.state.lock().unwrap();
+            if state.task.as_ref().is_some_and(|task| !task.durable) {
+                state.task = None;
+            }
+        }
+        self.workflow_enabled = enabled;
+        Ok(())
     }
 
     /// Settle the current task (ADR-0028 settlement boundary): join any pending
@@ -321,6 +382,7 @@ impl GitSafety {
             .unwrap()
             .task
             .as_ref()
+            .filter(|task| task.durable)
             .map(|task| task.task_id.clone())
     }
 
@@ -332,6 +394,9 @@ impl GitSafety {
     pub(crate) fn active_task_display(&self) -> Option<ActiveTaskDisplay> {
         let state = self.state.lock().unwrap();
         let task = state.task.as_ref()?;
+        if !task.durable {
+            return None;
+        }
         Some(ActiveTaskDisplay {
             task_id: task.task_id.clone(),
             body: task.body.clone(),
@@ -349,6 +414,24 @@ impl GitSafety {
             .as_ref()
             .map(|task| task.ledger.entries.len())
             .unwrap_or(0)
+    }
+
+    pub(crate) fn has_ledger_entries(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.ledger.entries.is_empty())
+    }
+
+    pub(crate) fn has_active_workflow_task(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .is_some_and(|task| task.durable)
     }
 
     /// The captured index (`git ls-files --stage`) of the current baseline
@@ -438,7 +521,7 @@ impl GitSafety {
     /// Persist the current task's minimal recovery record (git tasks only).
     /// Best-effort: a persistence failure is logged, never fatal to the turn.
     fn persist_task(&self, task: &Task) {
-        if task.degraded {
+        if !task.durable || task.degraded {
             return;
         }
         let Some(git_dir) = task.git_dir.as_ref() else {
@@ -631,7 +714,7 @@ impl MutationGuard for GitSafety {
         let session_id = state.session_id.clone();
         match &self.mode {
             Mode::Degraded(reason) => {
-                let mut task = Task::degraded(task_id);
+                let mut task = Task::degraded(task_id, self.workflow_enabled);
                 task.body = body;
                 if let Some(id) = session_id {
                     push_session_deduped(&mut task.sessions, &id);
@@ -648,6 +731,10 @@ impl MutationGuard for GitSafety {
                             baseline.dirty_count, baseline.untracked_count
                         )
                     });
+                    if !self.workflow_enabled {
+                        state.task = Some(Task::guard_only(task_id, baseline));
+                        return summary;
+                    }
                     let git_dir = task_state::git_dir(&self.workspace);
                     // Acquire the per-task lease for the task's lifetime: it
                     // proves this process owns and is live on the task, so
@@ -675,7 +762,7 @@ impl MutationGuard for GitSafety {
                 }
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "git baseline capture failed; degrading dirty-tree safety this task");
-                    let mut task = Task::degraded(task_id);
+                    let mut task = Task::degraded(task_id, self.workflow_enabled);
                     task.body = body;
                     if let Some(id) = session_id {
                         push_session_deduped(&mut task.sessions, &id);

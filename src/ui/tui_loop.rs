@@ -314,7 +314,7 @@ async fn session_loop<P: ChatProvider>(
         .set_approval_policy(effective_approval_policy(harness));
     // Async git-status snapshots for the session bar + dropdowns: kick the
     // first capture at session start; last-known values paint until it lands.
-    let git_cache = GitStatusCache::default();
+    let git_cache = GitStatusCache::with_task_workflow(harness.task_workflow_enabled());
     let mut git_generation = 0u64;
     git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
     // On startup, reconcile any crashed/unsettled Iris task in this repo and
@@ -436,6 +436,10 @@ async fn session_loop<P: ChatProvider>(
                 }
             }
             IdleOutcome::OpenTasks => {
+                if !harness.task_workflow_enabled() {
+                    apply_notices(tui, vec![crate::cli::TASK_WORKFLOW_OFF_NOTICE.to_string()]);
+                    continue;
+                }
                 // The unified task surface (ADR-0031): the active (unsettled) task
                 // plus this workspace's recoverable Iris tasks. Reached from the
                 // `Tasks` home entry / `ctrl-t` as well as `/tasks`.
@@ -477,7 +481,7 @@ async fn session_loop<P: ChatProvider>(
                 }
                 // Picker/model/reasoning/session commands are handled at this
                 // safe inter-turn boundary and never start a turn.
-                match route_command(&prompt, harness, tui, switch)? {
+                match route_command(&prompt, harness, tui, switch, &git_cache)? {
                     RouteOutcome::Swap(source) => {
                         perform_swap(&source, swap, harness, tui, switch)?;
                     }
@@ -1170,6 +1174,7 @@ fn route_command<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
+    git_cache: &GitStatusCache,
 ) -> Result<RouteOutcome> {
     let trimmed = prompt.trim();
     let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
@@ -1260,13 +1265,19 @@ fn route_command<P: ChatProvider>(
             }
             Ok(RouteOutcome::Consumed)
         }
-        "/tasks" if rest.is_empty() => {
+        "/tasks" => {
             // Open the unified task surface (ADR-0031): the active (unsettled)
             // task as a header plus this workspace's recoverable Iris tasks.
             // Selection adopts a recoverable task at the inter-turn boundary;
             // adoption never implicitly resumes a session. The active card is
             // enriched with the git-status snapshot the session bar already holds.
             tui.screen.commit_user(prompt);
+            if let Some(lines) = crate::cli::handle_tasks_command(prompt, harness) {
+                git_cache.set_task_workflow_enabled(harness.task_workflow_enabled());
+                git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
+                apply_notices(tui, lines);
+                return Ok(RouteOutcome::Consumed);
+            }
             match picker::build_tasks_modal(harness, tui.screen.footer_git()) {
                 Some(modal) => tui.screen.open_modal(modal),
                 None => apply_notices(

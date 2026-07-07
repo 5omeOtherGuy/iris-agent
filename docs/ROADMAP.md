@@ -1102,6 +1102,11 @@ Later slices (not in #261):
   recovery checkpoint when this process already owns an active task. Recovery
   rows remain visible but non-adoptable until the current task is accepted or
   rolled back.
+- Task workflow v2 spine: guard/workflow split and opt-in config
+  ([#444](https://github.com/5omeOtherGuy/iris-agent/issues/444)) — dirty-tree
+  protection stays always on, while durable task records, checkpoint refs,
+  recovery, badges, lifecycle entries, and task slash surfaces require the
+  project `tasks` opt-in.
 - Per-hunk staging
   ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
 - Optional auto-commit behind explicit approval

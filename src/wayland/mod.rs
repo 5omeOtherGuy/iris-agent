@@ -203,6 +203,10 @@ pub(crate) struct Harness<P> {
     // Spans turns like the session (a task continues across turns), so it lives
     // on the harness rather than being rebuilt each turn.
     git_safety: git_safety::GitSafety,
+    // Durable task workflow (ADR-0052, issue #444). When false the dirty-tree
+    // guard still runs, but records, checkpoint refs, recovery, badges, diffs,
+    // and lifecycle entries are disabled.
+    task_workflow_enabled: bool,
     // Post-change verification config (issue #265). `None` = feature off: the
     // harness runs no post-change checks and emits nothing (the default, so
     // every caller that does not opt in is unchanged). `Some` = engaged; a
@@ -328,6 +332,7 @@ impl<P: ChatProvider> Harness<P> {
             output_store,
             steering: None,
             git_safety,
+            task_workflow_enabled: true,
             verify: None,
             summarizer: SummarizerKind::default(),
             microcompaction: false,
@@ -361,6 +366,19 @@ impl<P: ChatProvider> Harness<P> {
     /// so a `/settings` toggle applies to the following turn, not the current one.
     pub(crate) fn set_microcompaction(&mut self, enabled: bool) {
         self.microcompaction = enabled;
+    }
+
+    pub(crate) fn task_workflow_enabled(&self) -> bool {
+        self.task_workflow_enabled
+    }
+
+    pub(crate) fn set_task_workflow_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> std::result::Result<(), &'static str> {
+        self.git_safety.set_workflow_enabled(enabled)?;
+        self.task_workflow_enabled = enabled;
+        Ok(())
     }
 
     /// Install the prompt-cache profile of the active provider lane (issue
@@ -504,6 +522,9 @@ impl<P: ChatProvider> Harness<P> {
     /// Restore points offered for `/rollback` (Tier 3 renders them). Base first,
     /// then each auto-checkpoint. Empty when no unsettled Iris task is active.
     pub(crate) fn checkpoint_restore_points(&self) -> Vec<git_safety::RestorePoint> {
+        if !self.task_workflow_enabled {
+            return Vec::new();
+        }
         self.git_safety.restore_points()
     }
 
@@ -512,6 +533,9 @@ impl<P: ChatProvider> Harness<P> {
     /// append a `TaskSettled` audit entry to the transcript so the task<->session
     /// join survives record deletion (ADR-0031, display only).
     pub(crate) fn accept_checkpoint(&mut self) -> Option<String> {
+        if !self.task_workflow_enabled {
+            return None;
+        }
         let settled = self.git_safety.accept()?;
         self.record_task_settled(&settled.task_id, "accepted");
         Some(settled.summary)
@@ -520,6 +544,9 @@ impl<P: ChatProvider> Harness<P> {
     /// Record an explicit checkpoint and settle the task (`/checkpoint`), then
     /// append a `TaskSettled` audit entry (ADR-0031).
     pub(crate) fn save_checkpoint(&mut self) -> Option<String> {
+        if !self.task_workflow_enabled {
+            return None;
+        }
         let settled = self.git_safety.checkpoint_now()?;
         self.record_task_settled(&settled.task_id, "checkpointed");
         Some(settled.summary)
@@ -529,6 +556,14 @@ impl<P: ChatProvider> Harness<P> {
     /// Iris-authored ledger paths and the user's index are affected. On a
     /// settling rollback, append a `TaskSettled` audit entry (ADR-0031).
     pub(crate) fn rollback_checkpoint(&mut self, seq: u64) -> Result<git_safety::RollbackOutcome> {
+        if !self.task_workflow_enabled {
+            return Ok(git_safety::RollbackOutcome {
+                summary: "no active Iris task to roll back".to_string(),
+                settled_task_id: None,
+                index_warning: None,
+                preserved_notices: Vec::new(),
+            });
+        }
         let outcome = self.git_safety.rollback(seq)?;
         if let Some(task_id) = &outcome.settled_task_id {
             self.record_task_settled(task_id, "rolledback");
@@ -542,6 +577,9 @@ impl<P: ChatProvider> Harness<P> {
     /// so Tier 3 prints the single-orphan auto-adopt notice (unchanged UX) or
     /// opens the resume-task picker for the >1/legacy case (#288, ADR-0031).
     pub(crate) fn recover_checkpoints(&self) -> git_safety::RecoveryOutcome {
+        if !self.task_workflow_enabled {
+            return git_safety::RecoveryOutcome::None;
+        }
         self.git_safety.recover_and_expire()
     }
 
@@ -550,6 +588,9 @@ impl<P: ChatProvider> Harness<P> {
     /// are already excluded by the git-safety seam. `body`/`sessions` on each row
     /// are opaque display payload -- the picker only renders them.
     pub(crate) fn recoverable_tasks(&self) -> Vec<git_safety::RecoverableTask> {
+        if !self.task_workflow_enabled {
+            return Vec::new();
+        }
         self.git_safety.recoverable_tasks()
     }
 
@@ -563,6 +604,9 @@ impl<P: ChatProvider> Harness<P> {
         &self,
         task_id: &str,
     ) -> Result<git_safety::AdoptedTask, git_safety::AdoptError> {
+        if !self.task_workflow_enabled {
+            return Err(git_safety::AdoptError::Unavailable);
+        }
         self.git_safety.adopt(task_id)
     }
 
@@ -574,7 +618,8 @@ impl<P: ChatProvider> Harness<P> {
     /// Iris left unsettled.
     pub(crate) fn reanchor_workspace(&mut self, path: &std::path::Path) {
         self.workspace = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.git_safety = git_safety::GitSafety::new(&self.workspace);
+        self.git_safety =
+            git_safety::GitSafety::new_with_workflow(&self.workspace, self.task_workflow_enabled);
         // The rebuilt guard starts with no session id; re-stamp it (ADR-0031) so
         // recovery in the new worktree records this session on any task it adopts.
         if let Some(log) = self.session.as_ref() {
@@ -592,6 +637,9 @@ impl<P: ChatProvider> Harness<P> {
     /// returned, never swallowed into an empty diff, so callers surface an honest
     /// error instead of a misleading "no changes".
     pub(crate) fn task_diff(&self) -> Result<git_safety::TaskNetDiff> {
+        if !self.task_workflow_enabled {
+            return Ok(git_safety::TaskNetDiff::default());
+        }
         self.git_safety.task_diff(None)
     }
 
@@ -627,6 +675,9 @@ impl<P: ChatProvider> Harness<P> {
     /// `/sessions` route default to the current task when the user gives no id.
     /// Display-only observation; never an enforcement or recovery input.
     pub(crate) fn current_task_id(&self) -> Option<String> {
+        if !self.task_workflow_enabled {
+            return None;
+        }
         self.git_safety.current_task_id()
     }
 
@@ -636,6 +687,9 @@ impl<P: ChatProvider> Harness<P> {
     /// snapshot (file counts, age) it already holds. Display-only; never an
     /// enforcement or recovery input.
     pub(crate) fn active_task(&self) -> Option<git_safety::ActiveTaskDisplay> {
+        if !self.task_workflow_enabled {
+            return None;
+        }
         self.git_safety.active_task_display()
     }
 
@@ -794,9 +848,27 @@ impl<P: ChatProvider> Harness<P> {
         // never settles the task, so a failure leaves the tree inspectable and
         // rollbackable (ADR-0028).
         if result.is_ok() && !token.is_cancelled() && self.agent.mutated_this_turn() {
+            self.maybe_emit_task_workflow_discovery(obs)?;
             self.run_verification_loop(obs, gate, token).await?;
         }
         result
+    }
+
+    fn maybe_emit_task_workflow_discovery(&self, obs: &dyn AgentObserver) -> Result<()> {
+        if self.task_workflow_enabled || !self.git_safety.has_ledger_entries() {
+            return Ok(());
+        }
+        match trust::mark_task_workflow_notice_shown(&self.workspace) {
+            Ok(true) => obs.on_event(AgentEvent::Notice(
+                "Iris can checkpoint its changes for undo/review (`tasks = true`, or `/tasks enable`)."
+                    .to_string(),
+            )),
+            Ok(false) => Ok(()),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "could not record task-workflow discovery notice");
+                Ok(())
+            }
+        }
     }
 
     /// Run the post-change verification loop against the configured command

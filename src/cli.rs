@@ -18,6 +18,9 @@ use crate::ui::tui::TuiUi;
 use crate::ui::{Ui, UiBridge, UiEvent, slash};
 use crate::wayland::Harness;
 
+pub(crate) const TASK_WORKFLOW_OFF_NOTICE: &str =
+    "task workflow is off - enable with `tasks = true` or `/tasks enable`";
+
 /// Tier-3 runtime mode-switch state: the active [`ModelSelection`], the
 /// assembled system prompt, and a builder that rebuilds a provider for a new
 /// selection. Tier 3 owns this (not the harness): a `/model` `/reasoning` switch
@@ -192,6 +195,9 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
     };
     match cmd {
         "/accept" => Some({
+            if !harness.task_workflow_enabled() {
+                return Some(vec![TASK_WORKFLOW_OFF_NOTICE.to_string()]);
+            }
             // Compute the net-diff summary BEFORE accepting settles the task
             // (issue #264): show what is being accepted, per file. Fail closed
             // (finding 2): a diff read error must NOT settle the task as if there
@@ -213,12 +219,68 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
                 }
             }
         }),
-        "/checkpoint" => Some(match harness.save_checkpoint() {
-            Some(summary) => vec![summary],
-            None => vec!["no Iris changes to checkpoint".to_string()],
+        "/checkpoint" => Some(if !harness.task_workflow_enabled() {
+            vec![TASK_WORKFLOW_OFF_NOTICE.to_string()]
+        } else {
+            match harness.save_checkpoint() {
+                Some(summary) => vec![summary],
+                None => vec!["no Iris changes to checkpoint".to_string()],
+            }
         }),
-        "/rollback" => Some(handle_rollback(rest, harness)),
+        "/rollback" => Some(if !harness.task_workflow_enabled() {
+            vec![TASK_WORKFLOW_OFF_NOTICE.to_string()]
+        } else {
+            handle_rollback(rest, harness)
+        }),
         _ => None,
+    }
+}
+
+/// Shared `/tasks` routing. Returns `None` only for bare `/tasks` while the
+/// workflow is enabled, so the interactive TUI can open the task surface.
+/// Text mode treats that `None` as a TUI-only status line.
+pub(crate) fn handle_tasks_command<P: ChatProvider>(
+    line: &str,
+    harness: &mut Harness<P>,
+) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if cmd != "/tasks" {
+        return None;
+    }
+    match rest {
+        "" => {
+            if harness.task_workflow_enabled() {
+                None
+            } else {
+                Some(vec![TASK_WORKFLOW_OFF_NOTICE.to_string()])
+            }
+        }
+        "enable" => match config::save_project_tasks(harness.workspace(), true) {
+            Ok(()) => match harness.set_task_workflow_enabled(true) {
+                Ok(()) => Some(vec!["task workflow enabled for this project".to_string()]),
+                Err(error) => Some(vec![error.to_string()]),
+            },
+            Err(error) => Some(vec![format!("could not enable task workflow: {error:#}")]),
+        },
+        "disable" => {
+            if harness.current_task_id().is_some() {
+                return Some(vec![
+                    "finish the current task before disabling task workflow".to_string(),
+                ]);
+            }
+            match config::save_project_tasks(harness.workspace(), false) {
+                Ok(()) => match harness.set_task_workflow_enabled(false) {
+                    Ok(()) => Some(vec!["task workflow disabled for this project".to_string()]),
+                    Err(error) => Some(vec![error.to_string()]),
+                },
+                Err(error) => Some(vec![format!("could not disable task workflow: {error:#}")]),
+            }
+        }
+        _ => Some(vec!["usage: /tasks [enable|disable]".to_string()]),
     }
 }
 
@@ -227,6 +289,9 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
 /// Iris changes (or no unsettled task). Shared by the TUI and text drivers so
 /// both render the same computation.
 pub(crate) fn task_diff_event<P: ChatProvider>(harness: &Harness<P>) -> UiEvent {
+    if !harness.task_workflow_enabled() {
+        return UiEvent::Notice(TASK_WORKFLOW_OFF_NOTICE.to_string());
+    }
     // Fail closed (issue #264 finding 2): a checkpoint/blob read error surfaces
     // as an honest error notice, never a misleading "no Iris changes".
     let diff = match harness.task_diff() {
@@ -920,6 +985,15 @@ fn run_session_inner<P: ChatProvider>(
             ui.emit(UiEvent::Notice(line))?;
             continue;
         }
+        if prompt == "/tasks" || prompt.starts_with("/tasks ") {
+            let lines = handle_tasks_command(prompt, harness).unwrap_or_else(|| {
+                vec!["/tasks is only available in the interactive TUI".to_string()]
+            });
+            for line in lines {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
         // The final task diff (issue #264): render the net diff on demand at this
         // safe boundary. Emits a colorized/plain diff event, not just notices.
         if prompt.trim() == "/diff" {
@@ -1207,6 +1281,33 @@ mod tests {
             handle_checkpoint_command("/checkpoint", &mut harness).unwrap(),
             vec!["no Iris changes to checkpoint".to_string()]
         );
+    }
+
+    #[test]
+    fn task_commands_surface_workflow_off_hint_and_enable_project_setting() {
+        let (mut harness, dir) = fake_harness();
+        harness.set_task_workflow_enabled(false).unwrap();
+
+        assert_eq!(
+            handle_tasks_command("/tasks", &mut harness).unwrap(),
+            vec![TASK_WORKFLOW_OFF_NOTICE.to_string()]
+        );
+        assert_eq!(
+            handle_checkpoint_command("/accept", &mut harness).unwrap(),
+            vec![TASK_WORKFLOW_OFF_NOTICE.to_string()]
+        );
+        assert!(matches!(
+            task_diff_event(&harness),
+            UiEvent::Notice(message) if message == TASK_WORKFLOW_OFF_NOTICE
+        ));
+
+        assert_eq!(
+            handle_tasks_command("/tasks enable", &mut harness).unwrap(),
+            vec!["task workflow enabled for this project".to_string()]
+        );
+        assert!(harness.task_workflow_enabled());
+        let saved = config::Settings::load(&dir.path).unwrap();
+        assert!(saved.tasks());
     }
 
     #[test]

@@ -58,6 +58,11 @@ pub(crate) struct ProjectPolicyRecord {
     /// is an explicit user action, never automatic -- invariant 3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sandbox: Option<String>,
+    /// One-time discovery marker for ADR-0052's opt-in task workflow notice.
+    /// It grants no permission and is written only after Iris has locally
+    /// changed files while the durable workflow is disabled.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) task_workflow_notice_shown: bool,
 }
 
 /// One project-permission edit requested by the `/trust` modal. This lives in
@@ -88,6 +93,7 @@ impl ProjectPolicyRecord {
             && self.allow_bash.is_empty()
             && self.allow_bash_prefix.is_empty()
             && self.sandbox.is_none()
+            && !self.task_workflow_notice_shown
     }
 
     fn apply_grant(&mut self, grant: &PolicyGrant) {
@@ -149,6 +155,20 @@ pub(crate) fn apply_grant(dir: &Path, grant: &PolicyGrant) -> Result<()> {
 pub(crate) fn set_policy(dir: &Path, record: &ProjectPolicyRecord) -> Result<()> {
     let store = resolve_store(dir)?;
     write_record(&store, dir, record)
+}
+
+/// Mark ADR-0052's task-workflow discovery notice as shown for this project.
+/// Returns `true` only on the first successful mark, so callers can emit the
+/// notice once without spamming when the store is unavailable.
+pub(crate) fn mark_task_workflow_notice_shown(dir: &Path) -> Result<bool> {
+    let store = resolve_store(dir)?;
+    let mut record = read_record(&store, dir);
+    if record.task_workflow_notice_shown {
+        return Ok(false);
+    }
+    record.task_workflow_notice_shown = true;
+    write_record(&store, dir, &record)?;
+    Ok(true)
 }
 
 /// Tier-2 persistence sink handed to the Nexus agent: persists a grant for the
@@ -220,6 +240,10 @@ fn read_map(store: &Path) -> Map<String, Value> {
         Ok(Value::Object(object)) => object,
         _ => Map::new(),
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Write the policy map via temp-file + fsync + rename so a crash never leaves
@@ -391,6 +415,32 @@ mod tests {
         let policy = reread.to_policy();
         assert!(policy.tools.contains("write"));
         assert!(policy.bash_exact.contains("cargo test"));
+    }
+
+    #[test]
+    fn task_workflow_discovery_marker_round_trips_without_grants() {
+        let _env = EnvGuard::new();
+        let home = temp_dir();
+        let project = temp_dir();
+        unsafe {
+            env::set_var("HOME", &home.path);
+            env::remove_var("IRIS_TRUST_PATH");
+        }
+
+        assert!(
+            mark_task_workflow_notice_shown(&project.path).unwrap(),
+            "first mark should be observable"
+        );
+        assert!(
+            !mark_task_workflow_notice_shown(&project.path).unwrap(),
+            "subsequent marks are suppressed"
+        );
+
+        let record = policy_for(&project.path);
+        assert!(record.task_workflow_notice_shown);
+        assert!(record.allow_tools.is_empty());
+        assert!(record.allow_bash.is_empty());
+        assert!(record.allow_bash_prefix.is_empty());
     }
 
     #[test]

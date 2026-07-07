@@ -11,12 +11,12 @@
 //! | `~/.iris/settings.json`   | Global (all projects)       |
 //! | `<cwd>/.iris/settings.json` | Project (current directory) |
 //!
-//! Project settings override the model only. Provider/base-url are intentionally
-//! user-global so a cloned repository cannot redirect OAuth bearer tokens to a
-//! malicious endpoint. Explicit runtime input still wins over the file where a
-//! provider supports env overrides. Unknown keys are ignored so older binaries
-//! tolerate newer config. A malformed file is a hard error -- a silently-ignored
-//! config is a footgun.
+//! Project settings may tune local, non-credential behavior. Provider/base-url
+//! are intentionally user-global so a cloned repository cannot redirect OAuth
+//! bearer tokens to a malicious endpoint. Explicit runtime input still wins over
+//! the file where a provider supports env overrides. Unknown keys are ignored so
+//! older binaries tolerate newer config. A malformed file is a hard error -- a
+//! silently-ignored config is a footgun.
 //!
 //! Live tool/approval policy is not configured here: the session approval mode
 //! (`/approval`) and project permission grants (`/trust`) are session/project
@@ -90,6 +90,11 @@ pub(crate) struct Settings {
     /// never redirect requests, so a project file may tune it. Gates fold
     /// WRITING only; a persisted fold always rebuilds regardless of this value.
     pub(crate) microcompaction: Option<bool>,
+    /// Opt-in durable task workflow (ADR-0052, issue #444): checkpoint refs,
+    /// recovery/adoption, task lifecycle entries, badges, task diffs, and
+    /// rollback across restarts. Absent/false -> off; the dirty-tree guard
+    /// remains always on and non-configurable.
+    pub(crate) tasks: Option<bool>,
     /// Opt-in bash tool mode: the model-visible tool set shrinks to `bash` and
     /// `edit` (plus the session-plumbing `read_output`/`recall`), so the model
     /// drives file inspection, listing, search, and file creation through the
@@ -272,6 +277,10 @@ impl Settings {
             // trades in-context detail for recoverable detail, never redirects a
             // request), so a project may tune it; project value wins, else global.
             microcompaction: project.microcompaction.or(self.microcompaction),
+            // Durable task workflow is opt-in product surface, not the safety
+            // floor. Project config may enable it for a repo; absent defaults
+            // off via the accessor.
+            tasks: project.tasks.or(self.tasks),
             // Bash tool mode only removes tools from the model-visible surface
             // and bash stays approval-per-call, so a project may tune it;
             // project value wins, else global.
@@ -403,6 +412,12 @@ impl Settings {
         self.microcompaction.unwrap_or(false)
     }
 
+    /// Whether the durable task workflow is enabled. Default off; the dirty-tree
+    /// guard still runs regardless of this value.
+    pub(crate) fn tasks(&self) -> bool {
+        self.tasks.unwrap_or(false)
+    }
+
     /// Whether bash tool mode is enabled: only `bash` and `edit` (plus the
     /// session-plumbing `read_output`/`recall`) are registered, so the model
     /// uses the shell for file operations. Default off (full tool surface).
@@ -519,6 +534,14 @@ pub(crate) fn save_bash_tool_mode(enabled: bool) -> Result<()> {
     update_global(&[("bashToolMode", Value::Bool(enabled))])
 }
 
+/// Persist the durable task workflow toggle in the project settings file for
+/// `cwd`. This is intentionally project-scoped: teams may opt a repository into
+/// the review/rollback workflow, while the dirty-tree safety floor stays
+/// non-configurable.
+pub(crate) fn save_project_tasks(cwd: &Path, enabled: bool) -> Result<()> {
+    update_project(cwd, &[("tasks", Value::Bool(enabled))])
+}
+
 /// Persist (or clear) the tool round-trip soft cap in the global settings file.
 /// `None` removes `maxToolRoundtrips` (unbounded loop); a value is clamped to a
 /// sane positive range.
@@ -597,6 +620,22 @@ fn string_or_null(value: Option<&str>) -> Value {
 fn update_global(updates: &[(&str, Value)]) -> Result<()> {
     let path = global_path()
         .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
+    let mut object = read_object(&path)?;
+    for (key, value) in updates {
+        if value.is_null() {
+            object.remove(*key);
+        } else {
+            object.insert((*key).to_string(), value.clone());
+        }
+    }
+    write_object_atomically(&path, &object)
+}
+
+/// Apply top-level updates to this workspace's project settings file,
+/// preserving unknown keys exactly like [`update_global`]. Used only for
+/// project-safe knobs.
+fn update_project(cwd: &Path, updates: &[(&str, Value)]) -> Result<()> {
+    let path = project_path(cwd);
     let mut object = read_object(&path)?;
     for (key, value) in updates {
         if value.is_null() {
@@ -854,6 +893,23 @@ mod tests {
         fs::write(&project, r#"{ "microcompaction": true }"#).unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert!(settings.microcompaction());
+    }
+
+    #[test]
+    fn task_workflow_defaults_off_and_a_project_may_opt_in() {
+        assert!(!Settings::default().tasks());
+
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "tasks": false }"#).unwrap();
+        fs::write(&project, r#"{ "tasks": true }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert!(settings.tasks());
+
+        save_project_tasks(&dir.path, true).unwrap();
+        let saved = Settings::load_from(None, &project_path(&dir.path)).unwrap();
+        assert!(saved.tasks());
     }
 
     #[test]
