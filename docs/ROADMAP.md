@@ -1037,9 +1037,9 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — Done. Op-log-shaped
   git checkpoint chain under `refs/iris/checkpoints/<task-id>/` (plumbing only,
   temporary index), auto-checkpoint over the unsettled diff, rollback of ledger
-  paths + user index, durable-workflow settlement cleanup, crash-recovery
-  reconciliation, 30-day expiry, non-git content-snapshot fallback, and
-  `/rollback`/`/accept`/`/checkpoint` slash commands.
+  paths + user index, durable-workflow settlement ref teardown with orphan-ref
+  repair, crash-recovery reconciliation, 30-day expiry, non-git content-snapshot
+  fallback, and `/rollback`/`/accept`/`/checkpoint` slash commands.
 - Final diff summary as the task deliverable
   ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)) — Done.
   Ledger-scoped net diff (one hunk set per file, pre-task baseline → current,

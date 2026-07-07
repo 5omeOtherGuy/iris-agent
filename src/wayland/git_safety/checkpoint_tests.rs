@@ -97,6 +97,26 @@ fn task_ref_count(dir: &Path, task_id: &str) -> usize {
     out.lines().filter(|l| !l.is_empty()).count()
 }
 
+/// Count every Iris-owned ref.
+fn iris_ref_count(dir: &Path) -> usize {
+    let out = git_out(dir, &["for-each-ref", "--format=%(refname)", "refs/iris/"]);
+    out.lines().filter(|l| !l.is_empty()).count()
+}
+
+/// Create one checkpoint-looking ref for `task_id` pointing at HEAD. The tests
+/// use this to simulate repos polluted by the old accept/checkpoint leak.
+fn write_checkpoint_ref(dir: &Path, task_id: &str) {
+    let head = git_out(dir, &["rev-parse", "HEAD"]);
+    run_git(
+        dir,
+        &[
+            "update-ref",
+            &format!("refs/iris/checkpoints/{task_id}/0000000000"),
+            &head,
+        ],
+    );
+}
+
 /// Drive an Iris-authored write of `content` to `path` through the guard's
 /// targeted (edit/write) path, asserting it is not flagged as a violation.
 fn iris_write(guard: &GitSafety, path: &Path, content: &[u8]) {
@@ -178,15 +198,16 @@ fn engine_round_trips_create_edit_delete_rename_binary() {
     assert_eq!(fs::read(&binary).unwrap(), bin_before);
 }
 
-// Test 5: settlement GC keeps the last N intermediate checkpoints (plus base)
-// and never touches a foreign ref (a branch, or another task's namespace).
+// Test 5: settlement teardown destroys only the task namespace and never touches
+// a foreign ref (a branch, or another task's namespace).
 #[test]
-fn engine_gc_keeps_last_n_and_spares_foreign_refs() {
+fn engine_destroy_removes_task_refs_and_spares_foreign_refs() {
     let repo = init_repo();
     let root = repo.path.clone();
     let file = root.join("committed.txt");
 
-    // A foreign branch and a foreign task's checkpoint ref, both must survive GC.
+    // A foreign branch and a foreign task's checkpoint ref, both must survive
+    // this task's teardown.
     run_git(&root, &["branch", "keep-me"]);
     let head = git_out(&root, &["rev-parse", "HEAD"]);
     run_git(
@@ -208,10 +229,9 @@ fn engine_gc_keeps_last_n_and_spares_foreign_refs() {
     }
     assert_eq!(chain.len(), 6);
 
-    chain.gc(3).unwrap();
-    // base + 3 kept intermediates.
-    assert_eq!(task_ref_count(&root, "gc-task"), 4);
-    assert_eq!(chain.len(), 3);
+    chain.destroy().unwrap();
+    assert_eq!(task_ref_count(&root, "gc-task"), 0);
+    assert_eq!(chain.len(), 0);
 
     // Foreign refs untouched.
     assert_eq!(
@@ -381,10 +401,10 @@ fn crash_resume_reconciles_and_notifies() {
 }
 
 // Test 7: an unsettled task past the expiry window auto-settles as accepted and
-// its checkpoint refs are GC'd (no rollback offered for code the user has lived
-// with).
+// its checkpoint refs are deleted (no rollback offered for code the user has
+// lived with).
 #[test]
-fn expired_task_auto_settles_accepted_and_gcs_refs() {
+fn expired_task_auto_settles_accepted_and_deletes_refs() {
     let repo = init_repo();
     let file = repo.path.join("committed.txt");
 
@@ -412,9 +432,150 @@ fn expired_task_auto_settles_accepted_and_gcs_refs() {
     assert_eq!(
         task_ref_count(&repo.path, &task_id),
         0,
-        "refs GC'd on expiry"
+        "refs deleted on expiry"
     );
     assert!(task_state::load_all(&git_dir).is_empty(), "record removed");
+}
+
+#[test]
+fn accept_destroys_checkpoint_refs_and_record() {
+    let repo = init_repo();
+    let file = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"accepted once\n");
+    iris_write(&guard, &file, b"accepted twice\n");
+    let task_id = task_state::load_all(&git_dir).pop().unwrap().task_id;
+    assert!(task_ref_count(&repo.path, &task_id) > 0);
+
+    guard.accept().expect("a task was active to accept");
+
+    assert_eq!(
+        task_ref_count(&repo.path, &task_id),
+        0,
+        "accepted tasks leave no rollback refs behind"
+    );
+    assert_eq!(
+        iris_ref_count(&repo.path),
+        0,
+        "refs/iris/ is empty after accept settlement"
+    );
+    assert!(task_state::load_all(&git_dir).is_empty(), "record removed");
+}
+
+#[test]
+fn checkpoint_now_destroys_checkpoint_refs_and_record() {
+    let repo = init_repo();
+    let file = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"checkpointed\n");
+    let task_id = task_state::load_all(&git_dir).pop().unwrap().task_id;
+    assert!(task_ref_count(&repo.path, &task_id) > 0);
+
+    guard
+        .checkpoint_now()
+        .expect("a task was active to checkpoint");
+
+    assert_eq!(
+        task_ref_count(&repo.path, &task_id),
+        0,
+        "explicit checkpoint settlement leaves no rollback refs behind"
+    );
+    assert!(task_state::load_all(&git_dir).is_empty(), "record removed");
+}
+
+#[test]
+fn orphan_ref_sweep_removes_recordless_free_namespace() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let task_id = "recordlessfree";
+    write_checkpoint_ref(&repo.path, task_id);
+    assert_eq!(task_ref_count(&repo.path, task_id), 1);
+
+    let guard = GitSafety::new(&repo.path);
+    guard.expire_stale(&git_dir, SystemTime::now());
+
+    assert_eq!(
+        task_ref_count(&repo.path, task_id),
+        0,
+        "recordless checkpoint namespaces are swept"
+    );
+}
+
+#[test]
+fn orphan_ref_sweep_skips_leased_recordless_namespace() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let task_id = "recordlessleased";
+    write_checkpoint_ref(&repo.path, task_id);
+    let lease = lock::try_exclusive(&lock::lease_path(&git_dir, task_id))
+        .unwrap()
+        .expect("lease acquired");
+
+    let guard = GitSafety::new(&repo.path);
+    guard.expire_stale(&git_dir, SystemTime::now());
+    assert_eq!(
+        task_ref_count(&repo.path, task_id),
+        1,
+        "a held stale lease blocks orphan cleanup"
+    );
+
+    drop(lease);
+    guard.expire_stale(&git_dir, SystemTime::now());
+    assert_eq!(
+        task_ref_count(&repo.path, task_id),
+        0,
+        "cleanup resumes once the stale lease is free"
+    );
+}
+
+#[test]
+fn orphan_ref_sweep_keeps_linked_worktree_recorded_namespace() {
+    let repo = init_repo();
+    let primary_git_dir = task_state::git_dir(&repo.path).unwrap();
+    let linked = temp_dir();
+    fs::remove_dir(&linked.path).unwrap();
+    run_git(
+        &repo.path,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked-sweep",
+            linked.path.to_str().unwrap(),
+        ],
+    );
+
+    let (task_id, linked_git_dir) = {
+        let guard = GitSafety::new(&linked.path);
+        guard.note_mutation();
+        iris_write(&guard, &linked.path.join("linked.txt"), b"linked work\n");
+        let linked_git_dir = task_state::git_dir(&linked.path).unwrap();
+        let task_id = task_state::load_all(&linked_git_dir).pop().unwrap().task_id;
+        (task_id, linked_git_dir)
+    };
+    assert!(task_ref_count(&repo.path, &task_id) > 0);
+
+    let primary_guard = GitSafety::new(&repo.path);
+    primary_guard.expire_stale(&primary_git_dir, SystemTime::now());
+    assert!(
+        task_ref_count(&repo.path, &task_id) > 0,
+        "a namespace recorded by a linked worktree is not an orphan"
+    );
+
+    task_state::remove(&linked_git_dir, &task_id);
+    primary_guard.expire_stale(&primary_git_dir, SystemTime::now());
+    assert_eq!(
+        task_ref_count(&repo.path, &task_id),
+        0,
+        "once every linked-worktree record is gone, the leaked namespace is swept"
+    );
 }
 
 // Test 8: in a non-git directory the guard degrades to content-snapshot restore

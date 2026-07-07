@@ -359,8 +359,9 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
   [#262](https://github.com/5omeOtherGuy/iris-agent/issues/262). [Implemented]
 - **Checkpoint / rollback** — op-log-shaped checkpoint chain under
   `refs/iris/*`; task-scoped rollback restoring only Iris-authored changes, plus
-  the user index; settlement GC, crash-recovery reconciliation, 30-day expiry,
-  non-git content-snapshot fallback, and `/rollback`/`/accept`/`/checkpoint`.
+  the user index; settlement ref teardown, crash-recovery reconciliation, 30-day
+  expiry, non-git content-snapshot fallback, and
+  `/rollback`/`/accept`/`/checkpoint`.
   Spec: ADR-0028; issue
   [#263](https://github.com/5omeOtherGuy/iris-agent/issues/263). [Implemented]
 - **Final diff summary** — net task diff (Iris-authored paths only, one hunk set

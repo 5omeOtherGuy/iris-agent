@@ -66,11 +66,6 @@ type PreImage = Option<(Vec<u8>, FileMode)>;
 /// its captured pre-task image.
 type IrisChange = (PathBuf, PreImage);
 
-/// Checkpoints kept per task after a settlement GC (ADR-0028 "keep last N").
-/// Small by design: intermediate restore points are a safety buffer, not
-/// history, so a handful covers the realistic "undo the last few steps" need.
-const KEEP_CHECKPOINTS: usize = 3;
-
 /// A restore point offered to the user by the rollback UI (Tier 3 renders it).
 /// `seq` names the checkpoint (0 = pre-task baseline); `label` is the op-log
 /// description.

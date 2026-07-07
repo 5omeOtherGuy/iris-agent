@@ -176,13 +176,6 @@ impl FallbackStore {
         Ok(())
     }
 
-    /// Keep only the newest `keep` op restore points (base always kept),
-    /// mirroring the git chain's settlement GC.
-    pub(super) fn gc(&mut self, keep: usize) {
-        let drop = self.points.len().saturating_sub(keep);
-        self.points.drain(0..drop);
-    }
-
     /// Net-diff inputs (issue #264) for the degraded (non-git) fallback: each
     /// touched path's pre-task bytes and its current bytes read from `root`,
     /// with the same ledger-path-only scoping as the git chain. `workspace`

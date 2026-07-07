@@ -13,7 +13,7 @@
 //! restore semantics for free (ADR-0028).
 //!
 //! Nothing here reads `HEAD`, the working index, or any ref outside the task's
-//! own namespace; GC on settlement is likewise scoped to that namespace only.
+//! own namespace; settlement teardown is likewise scoped to that namespace only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -24,9 +24,9 @@ use anyhow::{Context, Result, bail};
 
 use super::git::{git_env_stdout, git_io, git_stdout};
 
-/// The hidden namespace prefix all checkpoint refs live under. GC and listing
-/// are scoped to `<PREFIX>/<task-id>/` so foreign refs (branches, tags, another
-/// task's checkpoints) are never enumerated, moved, or deleted.
+/// The hidden namespace prefix all checkpoint refs live under. Listing and
+/// teardown are scoped to `<PREFIX>/<task-id>/` so foreign refs (branches, tags,
+/// another task's checkpoints) are never enumerated, moved, or deleted.
 const PREFIX: &str = "refs/iris/checkpoints";
 
 /// The base (pre-task) checkpoint's sequence number. Every intermediate
@@ -401,27 +401,6 @@ impl CheckpointChain {
         Ok(())
     }
 
-    /// GC the task's intermediate checkpoints, keeping the newest `keep` (the
-    /// base ref is always kept). Deletes refs *only* under this task's namespace;
-    /// foreign refs are never enumerated. Called at settlement.
-    pub(super) fn gc(&mut self, keep: usize) -> Result<()> {
-        let refs = list_task_refs(&self.workspace, &self.task_id)?;
-        // Intermediate seqs present in git, sorted ascending.
-        let mut seqs: Vec<u64> = refs.keys().copied().filter(|&s| s != BASE_SEQ).collect();
-        seqs.sort_unstable();
-        let drop_count = seqs.len().saturating_sub(keep);
-        for &seq in seqs.iter().take(drop_count) {
-            self.delete_ref(seq)?;
-        }
-        self.points = self
-            .points
-            .iter()
-            .filter(|p| !seqs.iter().take(drop_count).any(|&s| s == p.seq))
-            .cloned()
-            .collect();
-        Ok(())
-    }
-
     /// Delete every ref in the task namespace (full settlement teardown, e.g.
     /// accept). Scoped to `<PREFIX>/<task-id>/` only.
     pub(super) fn destroy(&mut self) -> Result<()> {
@@ -666,6 +645,28 @@ pub(super) fn destroy_task_refs(workspace: &Path, task_id: &str) -> Result<()> {
         git_stdout(workspace, &["update-ref", "-d", &name])?;
     }
     Ok(())
+}
+
+/// Enumerate checkpoint task namespaces under `refs/iris/checkpoints/`. This
+/// lists task ids only; callers still use task-scoped helpers to delete refs so
+/// a malformed or foreign namespace cannot widen the teardown scope.
+pub(super) fn list_checkpoint_task_ids(workspace: &Path) -> Result<BTreeSet<String>> {
+    let prefix = format!("{PREFIX}/");
+    let out = git_stdout(workspace, &["for-each-ref", "--format=%(refname)", &prefix])?;
+    let text = String::from_utf8_lossy(&out);
+    let mut task_ids = BTreeSet::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((task_id, _seq)) = rest.split_once('/') else {
+            continue;
+        };
+        if !task_id.is_empty() {
+            task_ids.insert(task_id.to_string());
+        }
+    }
+    Ok(task_ids)
 }
 
 /// Enumerate the task's checkpoint refs as `seq -> commit`. Scoped to the task
