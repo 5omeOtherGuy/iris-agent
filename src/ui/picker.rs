@@ -238,14 +238,14 @@ pub(crate) fn adopt_notice(adopted: &AdoptedTask) -> (Vec<String>, Option<String
         }
         [one] => {
             lines.push(format!(
-                "1 linked session ({}) -- adopt only; confirm to also resume it.",
+                "1 linked session ({}) -- task resumed; confirm to also resume it.",
                 short_id(one)
             ));
             Some(one.clone())
         }
         many => {
             lines.push(format!(
-                "{} linked sessions -- adopt only; resume one explicitly with /resume.",
+                "{} linked sessions -- task resumed; resume one explicitly with /resume.",
                 many.len()
             ));
             None
@@ -886,7 +886,7 @@ mod tests {
             lines
                 .iter()
                 .any(|l| l.contains("(no description recorded)")),
-            "unknown body placeholder shown for a legacy adopt: {lines:?}"
+            "unknown body placeholder shown for a legacy resumed task: {lines:?}"
         );
 
         // Multiple linked sessions: never guessed between, so no resume offer.

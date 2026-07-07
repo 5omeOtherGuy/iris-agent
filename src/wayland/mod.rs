@@ -510,12 +510,12 @@ impl<P: ChatProvider> Harness<P> {
         }
         self.agent.reset_session(messages);
         // A session swap (`/new`, `/resume`) is a PASSIVE boundary: ADR-0028
-        // forbids passive actions from settling a task (settlement is accept,
-        // rollback, or an explicit checkpoint only), so it must not mark the
-        // dirty task accepted or drop the baseline's protection. Keep the
-        // baseline/ledger and only drop the per-file approvals (judged against
-        // the prior conversation) so the next touch of a still-dirty file
-        // re-prompts. The resume/recovery notice is #263.
+        // forbids passive actions from finishing a task (accept/rollback do
+        // that), so it must not mark the dirty task accepted or drop the
+        // baseline's protection. Keep the baseline/ledger and only drop the
+        // per-file approvals (judged against the prior conversation) so the
+        // next touch of a still-dirty file re-prompts. The resume/recovery
+        // notice is #263.
         self.git_safety.discard_approvals();
     }
 
@@ -561,15 +561,13 @@ impl<P: ChatProvider> Harness<P> {
         Ok(())
     }
 
-    /// Record an explicit checkpoint and settle the task (`/checkpoint`), then
-    /// append a `TaskSettled` audit entry (ADR-0031).
+    /// Record an explicit checkpoint (`/checkpoint`) without finishing the
+    /// task. Keeps rollback depth, approvals, and recovery record alive.
     pub(crate) fn save_checkpoint(&mut self) -> Option<String> {
         if !self.task_workflow_enabled {
             return None;
         }
-        let settled = self.git_safety.checkpoint_now()?;
-        self.record_task_settled(&settled.task_id, "checkpointed");
-        Some(settled.summary)
+        self.git_safety.checkpoint_now()
     }
 
     /// Roll back Iris's own work to restore point `seq` (`/rollback <seq>`). Only

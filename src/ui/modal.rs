@@ -128,6 +128,12 @@ pub(crate) enum ModalAction {
     /// bounded, cwd-scoped extraction and re-opens the modal in its detail view.
     /// Display-only audit; never affects adoption, recovery, or enforcement.
     ViewTaskSessions(String),
+    /// Active `/tasks` card: accept Iris's current task changes.
+    AcceptTask,
+    /// Active `/tasks` card: render Iris's current task diff.
+    ShowTaskDiff,
+    /// Active `/tasks` card: list rollback points.
+    ListTaskRollback,
     /// `/login` method chosen -> open the matching provider selector.
     ChooseLoginMethod(LoginMethod),
     /// Begin an OAuth/subscription login for this provider.
@@ -1189,6 +1195,15 @@ impl TaskPicker {
                 Some(id) => ModalOutcome::Emit(ModalAction::ViewTaskSessions(id)),
                 None => ModalOutcome::Ignore,
             },
+            ModalKey::Char('a') | ModalKey::Char('A') if self.active.is_some() => {
+                ModalOutcome::Emit(ModalAction::AcceptTask)
+            }
+            ModalKey::Char('d') | ModalKey::Char('D') if self.active.is_some() => {
+                ModalOutcome::Emit(ModalAction::ShowTaskDiff)
+            }
+            ModalKey::Char('r') | ModalKey::Char('R') if self.active.is_some() => {
+                ModalOutcome::Emit(ModalAction::ListTaskRollback)
+            }
             ModalKey::Esc => ModalOutcome::Close,
             ModalKey::CtrlC => {
                 if self.selector.clear_search() {
@@ -1234,7 +1249,7 @@ impl TaskPicker {
             }
         }
         if self.blocked_recoverable.is_empty() {
-            rows.extend(selector_rows(&self.selector, "No recoverable tasks"));
+            rows.extend(selector_rows(&self.selector, "No tasks to resume"));
         } else {
             rows.extend(blocked_recoverable_rows(&self.blocked_recoverable));
         }
@@ -1248,8 +1263,10 @@ impl TaskPicker {
 
     /// Footer key hints, adapting to whether any recoverable row is selectable.
     fn footer_hint(&self) -> &'static str {
-        if self.has_recoverable {
-            "\u{2191}\u{2193} move \u{00b7} type to filter \u{00b7} \u{21b5} adopt \u{00b7} \u{2192} sessions \u{00b7} esc cancel"
+        if self.active.is_some() {
+            "a accept \u{00b7} d diff \u{00b7} r undo \u{00b7} \u{2192} sessions \u{00b7} esc close"
+        } else if self.has_recoverable {
+            "\u{2191}\u{2193} move \u{00b7} type to filter \u{00b7} \u{21b5} resume task \u{00b7} \u{2192} sessions \u{00b7} esc cancel"
         } else {
             "\u{2192} sessions \u{00b7} esc close"
         }
@@ -1259,7 +1276,7 @@ impl TaskPicker {
 fn blocked_recoverable_rows(cards: &[TaskCard]) -> Vec<(Line<'static>, bool)> {
     let mut rows = vec![(
         Line::from(Span::styled(
-            "finish the current task first (/accept or /rollback)",
+            "accept or undo the active task before resuming another",
             dim(),
         )),
         false,
@@ -1317,7 +1334,8 @@ fn active_header_rows(active: &TaskCard) -> Vec<(Line<'static>, bool)> {
         dim(),
     ));
     let hint = Line::from(Span::styled(
-        "settle: /git \u{00b7} /diff \u{00b7} /accept \u{00b7} /rollback".to_string(),
+        "actions: a accept \u{00b7} d diff \u{00b7} r undo \u{00b7} /checkpoint saves rollback points"
+            .to_string(),
         dim(),
     ));
     vec![
@@ -2399,7 +2417,7 @@ mod tests {
         assert_eq!(
             picker.handle_key(ModalKey::Enter),
             ModalOutcome::Ignore,
-            "recoverable rows are not adoptable while a task is active"
+            "resume rows are not selectable while a task is active"
         );
         let text: String = picker
             .render(80)
@@ -2413,17 +2431,29 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("finish the current task first"),
+            text.contains("accept or undo the active task"),
             "blocked rows explain the active-task requirement: {text}"
         );
         assert!(
             !text.contains("adopt"),
-            "footer omits the adopt action while adoption is blocked: {text}"
+            "footer omits the old adopt action while resume is blocked: {text}"
+        );
+        assert_eq!(
+            picker.handle_key(ModalKey::Char('a')),
+            ModalOutcome::Emit(ModalAction::AcceptTask)
+        );
+        assert_eq!(
+            picker.handle_key(ModalKey::Char('d')),
+            ModalOutcome::Emit(ModalAction::ShowTaskDiff)
+        );
+        assert_eq!(
+            picker.handle_key(ModalKey::Char('r')),
+            ModalOutcome::Emit(ModalAction::ListTaskRollback)
         );
     }
 
     #[test]
-    fn active_header_renders_identity_meta_and_settlement_hint() {
+    fn active_header_renders_identity_meta_and_task_actions() {
         let picker = TaskPicker::new(Some(active_card()), recoverable_cards());
         let text: String = picker
             .render(80)
@@ -2451,18 +2481,15 @@ mod tests {
             "approved scope shown: {text}"
         );
         assert!(
-            text.contains("/accept"),
-            "settlement hint points at existing paths: {text}"
+            text.contains("a accept") && text.contains("d diff") && text.contains("r undo"),
+            "active task actions shown: {text}"
         );
-        // The recoverable list is shown below the active header.
-        assert!(
-            text.contains("fix the parser"),
-            "recoverable row shown: {text}"
-        );
+        // The resumable list is shown below the active header.
+        assert!(text.contains("fix the parser"), "resume row shown: {text}");
         assert!(text.contains("(legacy)"), "legacy marker shown: {text}");
         assert!(
-            text.contains("finish the current task first"),
-            "recoverable rows are blocked while active: {text}"
+            text.contains("accept or undo the active task"),
+            "resume rows are blocked while active: {text}"
         );
     }
 }

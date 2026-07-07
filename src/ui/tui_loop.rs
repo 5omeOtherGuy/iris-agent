@@ -444,7 +444,7 @@ async fn session_loop<P: ChatProvider>(
                     Some(modal) => tui.screen.open_modal(modal),
                     None => apply_notices(
                         tui,
-                        vec!["No active or recoverable Iris tasks in this workspace.".to_string()],
+                        vec!["No active task or tasks to resume in this workspace.".to_string()],
                     ),
                 }
             }
@@ -607,7 +607,7 @@ fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
             apply_notices(
                 tui,
                 vec![format!(
-                    "{n} recoverable Iris {plural} in this workspace — open Tasks (/tasks) to review or adopt."
+                    "{n} Iris {plural} to resume in this workspace — open Tasks (/tasks) to review or resume."
                 )],
             );
         }
@@ -901,7 +901,7 @@ fn execute_menu_action<P: ChatProvider>(
         MenuAction::Accept => {
             let notice = match harness.accept_checkpoint() {
                 Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
-                None => "no unsettled Iris changes to accept".to_string(),
+                None => "no unreviewed Iris changes to accept".to_string(),
             };
             apply_notices(tui, vec![notice]);
             tui.screen.close_session_menu();
@@ -909,7 +909,7 @@ fn execute_menu_action<P: ChatProvider>(
         MenuAction::AcceptThenCheckout { branch } => {
             let notice = match harness.accept_checkpoint() {
                 Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
-                None => "no unsettled Iris changes to accept".to_string(),
+                None => "no unreviewed Iris changes to accept".to_string(),
             };
             apply_notices(tui, vec![notice]);
             checkout(tui, &branch);
@@ -1279,8 +1279,15 @@ fn route_command<P: ChatProvider>(
                 Some(modal) => tui.screen.open_modal(modal),
                 None => apply_notices(
                     tui,
-                    vec!["No active or recoverable Iris tasks in this workspace.".to_string()],
+                    vec!["No active task or tasks to resume in this workspace.".to_string()],
                 ),
+            }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/task" => {
+            tui.screen.commit_user(prompt);
+            if let Some(lines) = crate::cli::handle_task_command(prompt, harness) {
+                apply_notices(tui, lines);
             }
             Ok(RouteOutcome::Consumed)
         }
@@ -1418,7 +1425,7 @@ fn route_command<P: ChatProvider>(
             Ok(RouteOutcome::Consumed)
         }
         "/rollback" | "/accept" | "/checkpoint" => {
-            // Checkpoint/rollback settlement (issue #263) at this safe boundary.
+            // Checkpoint/accept/rollback commands at this safe boundary.
             tui.screen.commit_user(prompt);
             if let Some(lines) = crate::cli::handle_checkpoint_command(prompt, harness) {
                 apply_notices(tui, lines);
@@ -1922,15 +1929,12 @@ async fn dispatch_action<P: ChatProvider>(
                 }
                 Err(crate::wayland::git_safety::AdoptError::TaskActive) => apply_notices(
                     tui,
-                    vec![
-                        "finish the current task before adopting another one (/accept or /rollback)"
-                            .to_string(),
-                    ],
+                    vec!["accept or undo the active task before resuming another one".to_string()],
                 ),
                 Err(crate::wayland::git_safety::AdoptError::Unavailable) => apply_notices(
                     tui,
                     vec![format!(
-                        "could not adopt task {id}: it may have settled or been claimed by another process."
+                        "could not resume task {id}: it may have been accepted, undone, or claimed by another process."
                     )],
                 ),
             }
@@ -1954,6 +1958,24 @@ async fn dispatch_action<P: ChatProvider>(
                     apply_notices(tui, lines);
                 }
             }
+        }
+        ModalAction::AcceptTask => {
+            tui.screen.close_modal();
+            let notice = match harness.accept_checkpoint() {
+                Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
+                None => "no unreviewed Iris changes to accept".to_string(),
+            };
+            apply_notices(tui, vec![notice]);
+        }
+        ModalAction::ShowTaskDiff => {
+            tui.screen.close_modal();
+            tui.screen.apply(crate::cli::task_diff_event(harness));
+        }
+        ModalAction::ListTaskRollback => {
+            tui.screen.close_modal();
+            let lines = crate::cli::handle_checkpoint_command("/rollback", harness)
+                .unwrap_or_else(|| vec!["no unreviewed Iris changes to roll back".to_string()]);
+            apply_notices(tui, lines);
         }
         ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {
             Ok(auth) => match login::provider_select(method, &auth) {

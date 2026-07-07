@@ -731,11 +731,11 @@ impl GitMenu {
         let in_footer_state = !matches!(self.mode, Mode::List);
         let selecting = matches!(self.mode, Mode::List) && !readonly;
 
-        // TASK group — the settlement surface, present only while unsettled.
+        // TASK group — task action surface, present only while unreviewed.
         if let Some(task) = &status.task {
             let short: String = task.task_id.chars().take(8).collect();
             lines.push(group_label(&format!(
-                "TASK — unsettled · {short} · {}",
+                "TASK — unreviewed · {short} · {}",
                 human_age(task.age)
             )));
             if status.iris_unsettled > 0 {
@@ -833,7 +833,7 @@ impl GitMenu {
                 if let Some(badge) = &wt.unsettled {
                     meta.push(Span::styled(
                         format!(
-                            " · {} unsettled · {}",
+                            " · {} unreviewed · {}",
                             symbols::PREVIEW,
                             compact_age(badge.age)
                         ),
@@ -959,7 +959,7 @@ impl GitMenu {
                     (
                         "",
                         &format!(
-                            "{} task unsettled ({} Iris changes)",
+                            "{} task has unreviewed changes ({} Iris)",
                             symbols::REVIEW,
                             self.status.iris_unsettled
                         ),
@@ -1139,7 +1139,7 @@ mod tests {
         assert!(text.contains("±2 yours · 1 staged · 3 untracked"), "{text}");
         assert!(text.contains("3h ago"), "{text}");
         assert!(
-            text.contains("TASK — unsettled · 46b10456 · 3h ago"),
+            text.contains("TASK — unreviewed · 46b10456 · 3h ago"),
             "{text}"
         );
         assert!(text.contains("◇ 3 Iris changes"), "{text}");
@@ -1191,7 +1191,10 @@ mod tests {
         m.handle_key(MenuKey::Down, false);
         assert_eq!(m.handle_key(MenuKey::Enter, false), MenuOutcome::Redraw);
         let text = lines_text(&m.render_lines(80, 16, false));
-        assert!(text.contains("▲ task unsettled (3 Iris changes)"), "{text}");
+        assert!(
+            text.contains("▲ task has unreviewed changes (3 Iris)"),
+            "{text}"
+        );
         assert!(text.contains("carry anyway"), "{text}");
         // a = settle-first switch.
         let out = m.handle_key(MenuKey::Char('a'), false);
@@ -1278,7 +1281,7 @@ mod tests {
         let m = menu(status);
         let text = lines_text(&m.render_lines(90, 16, false));
         assert!(text.contains("WORKTREES"), "{text}");
-        assert!(text.contains("◇ unsettled · 1h"), "{text}");
+        assert!(text.contains("◇ unreviewed · 1h"), "{text}");
     }
 
     #[test]

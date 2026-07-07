@@ -205,28 +205,30 @@ impl GitSafety {
         ))
     }
 
-    /// Record an explicit user checkpoint (the `/checkpoint` command) and settle
-    /// the task like accept, so the next mutation opens a fresh baseline
-    /// (ADR-0028: an explicit checkpoint command freezes the ledger). Returns the
-    /// settled task id plus a summary, or `None` when no task is active.
-    pub(crate) fn checkpoint_now(&self) -> Option<Settlement> {
+    /// Record an explicit user checkpoint (the `/checkpoint` command) without
+    /// settling the task (ADR-0052): append a labeled restore point and keep the
+    /// task's record, approvals, and baseline alive. Returns a one-line summary,
+    /// or `None` when no task is active.
+    pub(crate) fn checkpoint_now(&self) -> Option<String> {
         self.sync_barrier();
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.task.as_ref().is_some_and(|task| !task.durable) {
-                return None;
-            }
-            if let Some(task) = state.task.as_mut()
-                && let Chain::Git(chain) = &mut task.chain
-            {
-                let turn = task.turn;
-                let _ = chain.checkpoint(turn, None, "explicit checkpoint".to_string());
-            }
+        let mut state = self.state.lock().unwrap();
+        if state.task.as_ref().is_some_and(|task| !task.durable) {
+            return None;
         }
-        self.accept().map(|settled| Settlement {
-            summary: "checkpoint saved; task settled".to_string(),
-            task_id: settled.task_id,
-        })
+        let task = state.task.as_mut()?;
+        match &mut task.chain {
+            Chain::Git(chain) => {
+                if let Err(error) =
+                    chain.checkpoint(task.turn, None, "explicit checkpoint".to_string())
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "explicit checkpoint create failed");
+                    return Some("could not save checkpoint; task is still open".to_string());
+                }
+            }
+            Chain::Fallback(store) => store.checkpoint("explicit checkpoint".to_string()),
+        }
+        self.persist_task(task);
+        Some("checkpoint saved; task is still open".to_string())
     }
 
     /// Roll back the current task to restore point `seq` (0 = pre-task baseline):

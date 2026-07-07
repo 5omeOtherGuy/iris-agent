@@ -393,7 +393,8 @@ fn crash_resume_reconciles_and_notifies() {
     // Session B: a fresh guard in the same repo reconciles on resume.
     let guard_b = GitSafety::new(&repo.path);
     let notice = expect_notice(guard_b.recover_and_expire());
-    assert!(notice.contains("unsettled"), "notice: {notice}");
+    assert!(notice.contains("unreviewed"), "notice: {notice}");
+    assert!(notice.contains("/tasks"), "notice: {notice}");
     assert!(
         task_ref_count(&repo.path, &task_id) > refs_before,
         "a recovery checkpoint is appended to the chain"
@@ -566,7 +567,7 @@ fn recovery_silently_removes_clean_orphan() {
 }
 
 #[test]
-fn checkpoint_now_destroys_checkpoint_refs_and_record() {
+fn checkpoint_now_adds_restore_point_and_keeps_task_open() {
     let repo = init_repo();
     let file = repo.path.join("committed.txt");
     let git_dir = task_state::git_dir(&repo.path).unwrap();
@@ -577,16 +578,27 @@ fn checkpoint_now_destroys_checkpoint_refs_and_record() {
     let task_id = task_state::load_all(&git_dir).pop().unwrap().task_id;
     assert!(task_ref_count(&repo.path, &task_id) > 0);
 
-    guard
+    let summary = guard
         .checkpoint_now()
         .expect("a task was active to checkpoint");
+    assert_eq!(summary, "checkpoint saved; task is still open");
 
     assert_eq!(
-        task_ref_count(&repo.path, &task_id),
-        0,
-        "explicit checkpoint settlement leaves no rollback refs behind"
+        task_state::load_all(&git_dir).len(),
+        1,
+        "checkpoint keeps the recovery record"
     );
-    assert!(task_state::load_all(&git_dir).is_empty(), "record removed");
+    assert!(
+        task_ref_count(&repo.path, &task_id) > 0,
+        "checkpoint keeps rollback refs"
+    );
+    let points = guard.restore_points();
+    assert!(
+        points
+            .iter()
+            .any(|point| point.label == "explicit checkpoint"),
+        "explicit checkpoint is listed as a rollback point: {points:?}"
+    );
 }
 
 #[test]
@@ -796,7 +808,8 @@ fn resume_rehydrates_task_and_rollback_restores() {
     // rehydrates the unsettled task.
     let guard_b = GitSafety::new(&repo.path);
     let notice = expect_notice(guard_b.recover_and_expire());
-    assert!(notice.contains("unsettled"), "notice: {notice}");
+    assert!(notice.contains("unreviewed"), "notice: {notice}");
+    assert!(notice.contains("/tasks"), "notice: {notice}");
 
     let points = guard_b.restore_points();
     assert!(

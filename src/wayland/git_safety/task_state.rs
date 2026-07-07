@@ -87,7 +87,7 @@ impl PersistedTask {
             .unwrap_or(false)
     }
 
-    /// A one-line "unsettled diff from <when>" recovery notice (ADR-0028).
+    /// A one-line "unreviewed changes from <when>" recovery notice (ADR-0028).
     pub(super) fn recovery_notice(&self, now: SystemTime) -> String {
         let updated = UNIX_EPOCH + Duration::from_millis(self.updated_ms);
         let age = now
@@ -95,7 +95,7 @@ impl PersistedTask {
             .map(human_age)
             .unwrap_or_else(|_| "moments".to_string());
         format!(
-            "unsettled Iris changes from {age} ago -- view / accept / roll back / ignore (task {})",
+            "unreviewed Iris changes from {age} ago -- open /tasks to resume, accept, or undo (task {})",
             self.task_id
         )
     }

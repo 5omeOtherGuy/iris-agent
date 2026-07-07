@@ -361,9 +361,12 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
   `refs/iris/*`; task-scoped rollback restoring only Iris-authored changes, plus
   the user index; settlement ref teardown, crash-recovery reconciliation, 30-day
   expiry, non-git content-snapshot fallback, and
-  `/rollback`/`/accept`/`/checkpoint`.
-  Spec: ADR-0028; issue
-  [#263](https://github.com/5omeOtherGuy/iris-agent/issues/263). [Implemented]
+  `/rollback`/`/accept`/`/checkpoint`. `/checkpoint` is a non-settling save
+  point; `/accept` accepts the current Iris changes and `/rollback` restores a
+  rollback point.
+  Spec: ADR-0028 + ADR-0052; issues
+  [#263](https://github.com/5omeOtherGuy/iris-agent/issues/263) and
+  [#448](https://github.com/5omeOtherGuy/iris-agent/issues/448). [Implemented]
 - **Final diff summary** — net task diff (Iris-authored paths only, one hunk set
   per file) as the deliverable, TUI + plain-text, via `/diff` and the accept-flow
   summary; fails closed on an unreadable checkpoint. Issue
@@ -375,7 +378,7 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
   go through the #262 dirty-tree guard). Failure output is fed back to the model
   for a bounded retry — each retry only after the model makes further changes,
   stopping at the cap. Honest pass / fail-after-N / skipped events; a failed loop
-  never settles the task, so it stays rollbackable. Issue
+  never accepts the task, so it stays rollbackable. Issue
   [#265](https://github.com/5omeOtherGuy/iris-agent/issues/265). [Implemented]
 - **Diff view** — present changes as git diffs. [Planned]
 - **Auto-commit** — commit changes with generated messages after explicit
