@@ -24,7 +24,7 @@ use crate::nexus::{
     ReviewContext, Tool, ToolCall, ToolEnv, ToolFuture, ToolOutput, Tools,
 };
 use crate::tools::ToolState;
-use crate::wayland::Harness;
+use crate::wayland::{Harness, ReanchorWorkspaceError};
 
 // --- scratch repo + temp dir helpers ------------------------------------
 
@@ -633,6 +633,67 @@ fn session_swap_drops_approvals_without_settling() {
             .is_empty(),
         "the swap drops per-file approvals so the next touch re-prompts"
     );
+}
+
+#[test]
+fn reanchor_with_active_task_requires_decision_and_carry_is_explicit() -> Result<()> {
+    let repo = init_repo();
+    let old_git_dir = task_state::git_dir(&repo.path).unwrap();
+    let other = init_repo();
+    let original_workspace = repo.path.canonicalize().unwrap();
+    let other_workspace = other.path.canonicalize().unwrap();
+
+    let provider = FakeProvider::new(vec![
+        write_call("c1", "new.txt", "hi\n"),
+        AssistantTurn::text("created it"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        "create the new file",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    assert!(
+        harness.reanchor_requires_task_decision(),
+        "the active durable task must force an explicit reanchor decision"
+    );
+
+    assert_eq!(
+        harness.reanchor_workspace(&other.path),
+        Err(ReanchorWorkspaceError::ActiveTask)
+    );
+    assert_eq!(
+        harness.workspace(),
+        original_workspace.as_path(),
+        "declining/blocked reanchor leaves the guard anchored to the old workspace"
+    );
+    assert!(
+        harness.current_task_id().is_some(),
+        "the active task remains live after the blocked reanchor"
+    );
+
+    harness.reanchor_workspace_carrying_task(&other.path);
+    assert_eq!(harness.workspace(), other_workspace.as_path());
+    assert!(
+        harness.current_task_id().is_none(),
+        "explicit carry starts a fresh guard in the new worktree"
+    );
+    assert_eq!(
+        task_state::load_all(&old_git_dir).len(),
+        1,
+        "explicit carry knowingly leaves the old worktree task recoverable"
+    );
+    Ok(())
 }
 
 // --- loop-level integration (fake provider + Harness) -------------------

@@ -165,6 +165,12 @@ struct CompactionOutcome {
     summary_tokens: u64,
 }
 
+/// Why a workspace reanchor was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReanchorWorkspaceError {
+    ActiveTask,
+}
+
 /// Wraps a bare [`Agent`] with the execution env it runs against and the
 /// optional transcript log it persists to.
 pub(crate) struct Harness<P> {
@@ -655,13 +661,36 @@ impl<P: ChatProvider> Harness<P> {
         self.git_safety.adopt(task_id)
     }
 
+    /// Whether an active durable task must be settled or explicitly carried
+    /// before the session can move to another worktree (ADR-0052 / issue #451).
+    pub(crate) fn reanchor_requires_task_decision(&self) -> bool {
+        self.task_workflow_enabled && self.git_safety.current_task_id().is_some()
+    }
+
     /// Re-anchor the session in another worktree (the git dropdown's
     /// open-session-there path, idle-only). Rebuilds the dirty-tree guard for
-    /// the new root so its baselines, task records, and gating apply there;
-    /// the caller changes the process working directory and then surfaces
-    /// [`Self::recover_checkpoints`] so arriving in a worktree announces what
-    /// Iris left unsettled.
-    pub(crate) fn reanchor_workspace(&mut self, path: &std::path::Path) {
+    /// the new root so its baselines, task records, and gating apply there.
+    /// Refuses to drop an active durable task unless the caller has routed
+    /// through the explicit carry path.
+    pub(crate) fn reanchor_workspace(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), ReanchorWorkspaceError> {
+        if self.reanchor_requires_task_decision() {
+            return Err(ReanchorWorkspaceError::ActiveTask);
+        }
+        self.reanchor_workspace_unchecked(path);
+        Ok(())
+    }
+
+    /// Explicit carry path: the user chose to leave the active task in the old
+    /// worktree and move the session anyway. This can orphan the old record, but
+    /// it is no longer silent.
+    pub(crate) fn reanchor_workspace_carrying_task(&mut self, path: &std::path::Path) {
+        self.reanchor_workspace_unchecked(path);
+    }
+
+    fn reanchor_workspace_unchecked(&mut self, path: &std::path::Path) {
         self.workspace = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.git_safety =
             git_safety::GitSafety::new_with_workflow(&self.workspace, self.task_workflow_enabled);

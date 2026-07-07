@@ -68,8 +68,19 @@ pub(crate) enum MenuAction {
     /// Fetch `restore_points()` and hand them back via
     /// [`GitMenu::set_restore_points`].
     LoadRestorePoints,
+    /// Fetch restore points for an active-task reanchor rollback.
+    LoadRestorePointsForOpenSessionAt {
+        path: PathBuf,
+        branch: Option<String>,
+    },
     /// `GitSafety::rollback(seq)`; surface summary/preserved/index notices.
     Rollback { seq: u64 },
+    /// Roll back, then re-anchor in another worktree.
+    RollbackThenOpenSessionAt {
+        seq: u64,
+        path: PathBuf,
+        branch: Option<String>,
+    },
     /// Plain `git checkout <branch>` (carry is protected by the ledger).
     Checkout { branch: String },
     /// `git stash push` then checkout (the dirty-switch stash path).
@@ -85,6 +96,16 @@ pub(crate) enum MenuAction {
     },
     /// Re-anchor the session in another worktree (idle-only).
     OpenSessionAt {
+        path: PathBuf,
+        branch: Option<String>,
+    },
+    /// Explicit carry: leave an active task in the old worktree, then re-anchor.
+    CarryOpenSessionAt {
+        path: PathBuf,
+        branch: Option<String>,
+    },
+    /// Accept the active task, then re-anchor in another worktree.
+    AcceptThenOpenSessionAt {
         path: PathBuf,
         branch: Option<String>,
     },
@@ -108,7 +129,7 @@ pub(crate) enum MenuOutcome {
 /// The one SessionBar dropdown slot.
 pub(crate) enum SessionMenu {
     Tree(TreeMenu),
-    Git(GitMenu),
+    Git(Box<GitMenu>),
 }
 
 impl SessionMenu {

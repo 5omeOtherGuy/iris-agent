@@ -2757,10 +2757,10 @@ mod tests {
         use crate::ui::tui::session_menu::{GitMenu, SessionMenu, TreeMenu};
         let mut screen = git_screen("~/repo", git_status("main"));
         // Git dropdown open: `▾ ` prefixes the git segment only.
-        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+        screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
             git_status("main"),
             std::path::PathBuf::from("/wt"),
-        )));
+        ))));
         let bar = bar_text(&screen, 80);
         assert!(bar.contains("┊ ▾ git main"), "{bar:?}");
         assert!(!bar.starts_with("▾"), "{bar:?}");
@@ -2788,10 +2788,10 @@ mod tests {
         let closed_rows = session_bar_lines(&screen, 80, 24).len();
         assert_eq!(closed_rows, 2, "bar + hairline when closed");
 
-        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+        screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
             git_status("main"),
             std::path::PathBuf::from("/wt"),
-        )));
+        ))));
         let lines = session_bar_lines(&screen, 80, 24);
         assert!(lines.len() > 2, "dropdown rows inserted");
         // The soft hairline stays the closing rule (last row).
@@ -2808,10 +2808,10 @@ mod tests {
     fn modal_and_approval_close_the_dropdown_and_focus_ranks_it() {
         use crate::ui::tui::session_menu::{GitMenu, SessionMenu};
         let mut screen = git_screen("~/repo", git_status("main"));
-        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+        screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
             git_status("main"),
             std::path::PathBuf::from("/wt"),
-        )));
+        ))));
         assert_eq!(screen.focus(), crate::ui::tui::FocusTarget::SessionMenu);
         // SessionMenu outranks the palette…
         screen.set_editor("/mo");

@@ -6,12 +6,12 @@
 //! expected on-disk state so a later session can detect divergence (a crash, a
 //! `^C`, or an external edit between the last checkpoint and resume).
 //!
-//! Records live in `<git-dir>/iris/tasks/<task-id>.json` -- repo-scoped like the
-//! `refs/iris/*` chain they describe, so a *new* session in the same repo finds
-//! the unsettled task (recovery is per-repo, not per-session). This mirrors the
-//! session store's "state beside the thing it belongs to" pattern
-//! (`src/handles.rs`, `src/session.rs`); the git dir is the natural sibling
-//! since the refs already live there.
+//! Records live in `<absolute-git-dir>/iris/tasks/<task-id>.json` for the
+//! current worktree. In a linked-worktree checkout, `--absolute-git-dir` is the
+//! per-worktree admin dir (`.git/worktrees/<name>`), while `refs/iris/*`
+//! checkpoint refs live in the shared common ref store. Recovery is therefore
+//! per-worktree record discovery plus shared-ref lookup by task id; repair and
+//! removal code must not assume the record directory owns the ref namespace.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

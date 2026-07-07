@@ -43,6 +43,11 @@ Settled framing this ADR builds on (not re-derived here):
 - **Checkpoints work unchanged inside a worktree.** Linked worktrees share the
   object store and common `.git`; `refs/iris/*` chains and plumbing writes
   function identically from a worktree HEAD.
+- **Task records and checkpoint refs have different boundaries.** The unsettled
+  task record is stored under the current worktree's absolute git dir. In a
+  linked worktree that is the per-worktree admin dir; `refs/iris/*` checkpoint
+  refs live in the shared common ref store. Reanchor and apply flows must not
+  infer ref ownership from the record directory.
 
 ## Decision
 

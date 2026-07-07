@@ -39,6 +39,11 @@ enum RowRef {
 enum Confirm {
     /// Switch with an unsettled task: settlement first.
     TaskUnsettled { branch: String },
+    /// Re-anchor with an unsettled task: settlement or explicit carry first.
+    TaskUnsettledReanchor {
+        path: PathBuf,
+        branch: Option<String>,
+    },
     /// Switch with a dirty tree, no task: carry / stash two-step.
     Dirty { branch: String },
     /// The branch (or row) lives in another worktree: re-anchor implied.
@@ -60,6 +65,7 @@ enum Mode {
     Rollback {
         points: Vec<(u64, String)>,
         selected: usize,
+        open_after: Option<(PathBuf, Option<String>)>,
     },
     /// The `n`/`w` create input.
     Create {
@@ -113,6 +119,22 @@ impl GitMenu {
         self.mode = Mode::Rollback {
             points,
             selected: 0,
+            open_after: None,
+        };
+    }
+
+    /// Hand back restore points for a reanchor rollback, preserving the target
+    /// so the selected rollback can continue the original action.
+    pub(crate) fn set_restore_points_for_open_session(
+        &mut self,
+        points: Vec<(u64, String)>,
+        path: PathBuf,
+        branch: Option<String>,
+    ) {
+        self.mode = Mode::Rollback {
+            points,
+            selected: 0,
+            open_after: Some((path, branch)),
         };
     }
 
@@ -187,7 +209,11 @@ impl GitMenu {
         match std::mem::replace(&mut self.mode, Mode::List) {
             Mode::List => self.key_list(key),
             Mode::Confirm(confirm) => self.key_confirm(confirm, key),
-            Mode::Rollback { points, selected } => self.key_rollback(points, selected, key),
+            Mode::Rollback {
+                points,
+                selected,
+                open_after,
+            } => self.key_rollback(points, selected, open_after, key),
             Mode::Create {
                 input,
                 base,
@@ -220,10 +246,17 @@ impl GitMenu {
             return MenuOutcome::Redraw;
         }
         if let Some(path) = info.worktree.clone() {
-            self.mode = Mode::Confirm(Confirm::WorktreeRedirect {
-                branch: Some(name),
-                path,
-            });
+            self.mode = if self.status.task.is_some() {
+                Mode::Confirm(Confirm::TaskUnsettledReanchor {
+                    branch: Some(name),
+                    path,
+                })
+            } else {
+                Mode::Confirm(Confirm::WorktreeRedirect {
+                    branch: Some(name),
+                    path,
+                })
+            };
             return MenuOutcome::Redraw;
         }
         if self.status.task.is_some() {
@@ -249,10 +282,17 @@ impl GitMenu {
                 if wt.is_current {
                     return MenuOutcome::Close;
                 }
-                self.mode = Mode::Confirm(Confirm::WorktreeRedirect {
-                    branch: wt.branch.clone(),
-                    path: wt.path.clone(),
-                });
+                self.mode = if self.status.task.is_some() {
+                    Mode::Confirm(Confirm::TaskUnsettledReanchor {
+                        branch: wt.branch.clone(),
+                        path: wt.path.clone(),
+                    })
+                } else {
+                    Mode::Confirm(Confirm::WorktreeRedirect {
+                        branch: wt.branch.clone(),
+                        path: wt.path.clone(),
+                    })
+                };
                 MenuOutcome::Redraw
             }
         }
@@ -339,6 +379,24 @@ impl GitMenu {
                     branch: branch.clone(),
                 })
             }
+            (Confirm::TaskUnsettledReanchor { path, branch }, MenuKey::Char('a')) => {
+                MenuOutcome::Action(MenuAction::AcceptThenOpenSessionAt {
+                    path: path.clone(),
+                    branch: branch.clone(),
+                })
+            }
+            (Confirm::TaskUnsettledReanchor { path, branch }, MenuKey::Char('r')) => {
+                MenuOutcome::Action(MenuAction::LoadRestorePointsForOpenSessionAt {
+                    path: path.clone(),
+                    branch: branch.clone(),
+                })
+            }
+            (Confirm::TaskUnsettledReanchor { path, branch }, MenuKey::Enter) => {
+                MenuOutcome::Action(MenuAction::CarryOpenSessionAt {
+                    path: path.clone(),
+                    branch: branch.clone(),
+                })
+            }
             (Confirm::Dirty { branch }, MenuKey::Enter) => {
                 MenuOutcome::Action(MenuAction::Checkout {
                     branch: branch.clone(),
@@ -379,6 +437,7 @@ impl GitMenu {
         &mut self,
         points: Vec<(u64, String)>,
         selected: usize,
+        open_after: Option<(PathBuf, Option<String>)>,
         key: MenuKey,
     ) -> MenuOutcome {
         match key {
@@ -392,15 +451,29 @@ impl GitMenu {
                 self.mode = Mode::Rollback {
                     points,
                     selected: next,
+                    open_after,
                 };
                 MenuOutcome::Redraw
             }
             MenuKey::Enter if !points.is_empty() => {
                 let seq = points[selected.min(points.len() - 1)].0;
-                MenuOutcome::Action(MenuAction::Rollback { seq })
+                match open_after {
+                    Some((path, branch)) => {
+                        MenuOutcome::Action(MenuAction::RollbackThenOpenSessionAt {
+                            seq,
+                            path,
+                            branch,
+                        })
+                    }
+                    None => MenuOutcome::Action(MenuAction::Rollback { seq }),
+                }
             }
             _ => {
-                self.mode = Mode::Rollback { points, selected };
+                self.mode = Mode::Rollback {
+                    points,
+                    selected,
+                    open_after,
+                };
                 MenuOutcome::Ignore
             }
         }
@@ -523,6 +596,10 @@ impl GitMenu {
 
     fn key_worktree_ready(&mut self, path: PathBuf, key: MenuKey) -> MenuOutcome {
         match key {
+            MenuKey::Enter if self.status.task.is_some() => {
+                self.mode = Mode::Confirm(Confirm::TaskUnsettledReanchor { path, branch: None });
+                MenuOutcome::Redraw
+            }
             MenuKey::Enter => MenuOutcome::Action(MenuAction::OpenSessionAt { path, branch: None }),
             // "esc stay": dismiss the ready confirmation but stay in the
             // console (return to the list), mirroring the confirm dialogs'
@@ -628,7 +705,9 @@ impl GitMenu {
         readonly: bool,
     ) -> Vec<Line<'static>> {
         let mut lines = match &self.mode {
-            Mode::Rollback { points, selected } => self.render_rollback(width, points, *selected),
+            Mode::Rollback {
+                points, selected, ..
+            } => self.render_rollback(width, points, *selected),
             _ => self.render_list(width, readonly),
         };
         for line in &mut lines {
@@ -954,7 +1033,7 @@ impl GitMenu {
 
     fn confirm_footer(&self, confirm: &Confirm, width: usize) -> Line<'static> {
         match confirm {
-            Confirm::TaskUnsettled { .. } => footer_hints(
+            Confirm::TaskUnsettled { .. } | Confirm::TaskUnsettledReanchor { .. } => footer_hints(
                 &[
                     (
                         "",
@@ -1267,6 +1346,83 @@ mod tests {
     }
 
     #[test]
+    fn wt_branch_with_task_confirms_before_reanchor() {
+        let mut status = task_status();
+        status.recent_branches[1].worktree = Some(PathBuf::from("/wt/split"));
+        let mut m = menu(status);
+        m.handle_key(MenuKey::Down, false);
+        assert_eq!(m.handle_key(MenuKey::Enter, false), MenuOutcome::Redraw);
+        let text = lines_text(&m.render_lines(80, 16, false));
+        assert!(
+            text.contains("▲ task has unreviewed changes (3 Iris)"),
+            "{text}"
+        );
+        assert!(text.contains("a accept ┊ r roll back"), "{text}");
+        assert!(text.contains("carry anyway"), "{text}");
+
+        assert_eq!(
+            m.handle_key(MenuKey::Enter, false),
+            MenuOutcome::Action(MenuAction::CarryOpenSessionAt {
+                path: PathBuf::from("/wt/split"),
+                branch: Some("feat/x".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn wt_branch_task_reanchor_can_accept_or_rollback_first() {
+        let mut status = task_status();
+        status.recent_branches[1].worktree = Some(PathBuf::from("/wt/split"));
+        let mut accept = menu(status.clone());
+        accept.handle_key(MenuKey::Down, false);
+        accept.handle_key(MenuKey::Enter, false);
+        assert_eq!(
+            accept.handle_key(MenuKey::Char('a'), false),
+            MenuOutcome::Action(MenuAction::AcceptThenOpenSessionAt {
+                path: PathBuf::from("/wt/split"),
+                branch: Some("feat/x".to_string())
+            })
+        );
+
+        let mut rollback = menu(status);
+        rollback.handle_key(MenuKey::Down, false);
+        rollback.handle_key(MenuKey::Enter, false);
+        assert_eq!(
+            rollback.handle_key(MenuKey::Char('r'), false),
+            MenuOutcome::Action(MenuAction::LoadRestorePointsForOpenSessionAt {
+                path: PathBuf::from("/wt/split"),
+                branch: Some("feat/x".to_string())
+            })
+        );
+        rollback.set_restore_points_for_open_session(
+            vec![(0, "pre-task baseline".to_string())],
+            PathBuf::from("/wt/split"),
+            Some("feat/x".to_string()),
+        );
+        assert_eq!(
+            rollback.handle_key(MenuKey::Enter, false),
+            MenuOutcome::Action(MenuAction::RollbackThenOpenSessionAt {
+                seq: 0,
+                path: PathBuf::from("/wt/split"),
+                branch: Some("feat/x".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn esc_from_task_reanchor_confirm_leaves_no_action() {
+        let mut status = task_status();
+        status.recent_branches[1].worktree = Some(PathBuf::from("/wt/split"));
+        let mut m = menu(status);
+        m.handle_key(MenuKey::Down, false);
+        m.handle_key(MenuKey::Enter, false);
+        assert_eq!(m.handle_key(MenuKey::Esc, false), MenuOutcome::Redraw);
+        let text = lines_text(&m.render_lines(80, 16, false));
+        assert!(!text.contains("carry anyway"), "{text}");
+        assert!(text.contains("SWITCH"), "{text}");
+    }
+
+    #[test]
     fn worktree_rows_render_with_task_badge() {
         let mut status = task_status();
         status.worktrees.push(WorktreeInfo {
@@ -1440,6 +1596,25 @@ mod tests {
         assert_eq!(
             out,
             MenuOutcome::Action(MenuAction::OpenSessionAt {
+                path: PathBuf::from("/wt/feat-new"),
+                branch: None
+            })
+        );
+    }
+
+    #[test]
+    fn worktree_ready_with_task_prompts_before_open() {
+        let mut m = menu(task_status());
+        m.worktree_ready(PathBuf::from("/wt/feat-new"));
+        assert_eq!(m.handle_key(MenuKey::Enter, false), MenuOutcome::Redraw);
+        let text = lines_text(&m.render_lines(90, 16, false));
+        assert!(
+            text.contains("▲ task has unreviewed changes (3 Iris)"),
+            "{text}"
+        );
+        assert_eq!(
+            m.handle_key(MenuKey::Enter, false),
+            MenuOutcome::Action(MenuAction::CarryOpenSessionAt {
                 path: PathBuf::from("/wt/feat-new"),
                 branch: None
             })
