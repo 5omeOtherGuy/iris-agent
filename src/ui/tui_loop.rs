@@ -1489,8 +1489,8 @@ async fn idle_phase(
             _ = tick.tick() => {
                 // Idle animation: the start page's IrisMark sweep. `tick`
                 // reports false while no start page is shown (the spinner is
-                // idle here), under reduced motion, and while unfocused, so a
-                // plain idle session stays redraw-free.
+                // idle here) and under reduced motion, so a plain idle session
+                // stays redraw-free.
                 if tui.screen.tick() {
                     tui.draw()?;
                 }
@@ -1731,8 +1731,8 @@ async fn run_modal_phase<P: ChatProvider>(
                     tui.screen.close_modal();
                     break;
                 };
-                // Track focus even while a modal is open so a turn started
-                // later in an unfocused pane begins with the animation paused.
+                // Track focus even while a modal is open so later focus-change
+                // reports are coalesced consistently.
                 match &event {
                     Event::FocusGained => {
                         tui.screen.set_terminal_focused(true);
@@ -2205,8 +2205,8 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
             };
         }
         Event::Resize(..) => return IdleKey::Continue,
-        // Focus reports gate the spinner's tick redraws; a regain redraws once
-        // so a pane switched back to is visually current.
+        // Focus reports are tracked only to coalesce duplicate focus changes; a
+        // regain redraws once so a pane switched back to is visually current.
         Event::FocusGained => {
             return if screen.set_terminal_focused(true) {
                 IdleKey::Continue
@@ -3936,8 +3936,9 @@ mod tests {
 
     #[test]
     fn focus_events_route_to_the_screen_in_idle_and_running_phases() {
-        // Running phase: losing focus needs no redraw, regaining focus redraws
-        // once (the frozen animation catches up), repeats are no-ops.
+        // Running phase: losing focus needs no immediate redraw, regaining focus
+        // redraws once, and repeats are no-ops. Ticks keep animating while the
+        // pane is inactive so visible adjacent panes stay live.
         let mut screen = Screen::new();
         screen.start_turn();
         let steering = SteeringQueue::default();
@@ -3948,7 +3949,7 @@ mod tests {
             &mut pending,
             &steering,
         ));
-        assert!(!screen.tick(), "unfocused pane stops animating");
+        assert!(screen.tick(), "inactive pane keeps animating");
         assert!(handle_running_event(
             &mut screen,
             Event::FocusGained,
@@ -3961,7 +3962,7 @@ mod tests {
             &mut pending,
             &steering,
         ));
-        assert!(screen.tick(), "refocused pane animates again");
+        assert!(screen.tick(), "refocused pane is still animating");
 
         // Idle phase: focus reports never submit/exit, and only a focus regain
         // that changed state asks for a redraw.
