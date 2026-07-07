@@ -235,7 +235,7 @@ impl<P: ChatProvider> SubagentBackend<P> {
         let agent = Agent::new(provider, tools)
             .with_max_tool_roundtrips(request.budgets.max_tool_roundtrips);
         let mut harness = Harness::new(agent, workspace, ToolState::new(), None, None);
-        let observer = ChildObserver::default();
+        let observer = ChildObserver;
         let gate = DenyGate;
         let run = harness
             .submit_turn(&request.prompt, &observer, &gate, &token)
@@ -555,7 +555,7 @@ mod tests {
     fn validation_rejects_unsupported_capabilities_and_worktree_isolation() -> Result<()> {
         let workspace = test_dir()?;
         let provider = RecordingProvider::new(vec![AssistantTurn::text("unused")]);
-        let mut backend = SubagentBackend::new(workspace.path.clone());
+        let backend = SubagentBackend::new(workspace.path.clone());
 
         let mut read_write = SubagentRequest::read_only("go");
         read_write.capability_mode = SubagentCapabilityMode::ReadWrite;
@@ -614,7 +614,7 @@ mod tests {
             AssistantTurn::text("saw hello"),
         ]);
         let visible = provider.visible_tools.clone();
-        let mut backend = SubagentBackend::new(workspace.path.clone());
+        let backend = SubagentBackend::new(workspace.path.clone());
         let handle = backend.spawn(provider, SubagentRequest::read_only("read note"))?;
 
         let result = block_on(backend.wait(&handle.id))?;
@@ -642,7 +642,7 @@ mod tests {
             single_call_turn("write", json!({ "path": "out.txt", "content": "nope" })),
             AssistantTurn::text("done"),
         ]);
-        let mut backend = SubagentBackend::new(workspace.path.clone());
+        let backend = SubagentBackend::new(workspace.path.clone());
         let handle = backend.spawn(provider, SubagentRequest::read_only("try write"))?;
 
         let result = block_on(backend.wait(&handle.id))?;
