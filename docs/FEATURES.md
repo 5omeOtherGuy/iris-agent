@@ -320,8 +320,12 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 ## Subagents
 
+- **Subagent backend contract** — Wayland owns spawn/poll/wait/cancel handles,
+  request validation, lifecycle status, budgets, allowlists, output-handle
+  fields, and read-only child execution. Issue
+  [#460](https://github.com/5omeOtherGuy/iris-agent/issues/460). [Implemented]
 - **Subagents as tools** — main agent invokes subagents through Nexus tool
-  execution. [Planned]
+  execution under a final model-facing name that is not `task`. [Planned]
 - **Worker set** — search, advisor/reviewer, repo researcher, task worker, and
   user-defined custom subagents. [Planned]
 - **Per-worker model routing** — each worker resolves its own provider/model/
@@ -333,8 +337,8 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 - **Handle-returning workers** — workers return handle plus micro-summary.
   [Planned]
 - **Per-worker budgets** — enforced max turns and token caps. [Planned]
-- **Filtered tool access** — worker tool allowlist enforced before inference and
-  execution. [Planned]
+- **Filtered tool access** — read-only workers enforce capability filters before
+  inference and execution; mutable/execute worker filters are planned. [Partial]
 - **Background fleet** — independent workers run in parallel with live grouped
   status. [Planned]
 

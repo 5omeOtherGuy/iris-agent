@@ -1011,6 +1011,37 @@ impl Tools {
             .filter(|tool| self.caps.exposes(tool.name()))
     }
 
+    /// Build a registry that contains only read-only, ungated tools. This is
+    /// used for read-only subagents so the model-visible declarations and the
+    /// execution lookup are narrowed by the same contract: a hidden or resumed
+    /// mutating call cannot run because it is absent from [`by_name`](Self::by_name),
+    /// not merely omitted from [`iter`](Self::iter).
+    pub(crate) fn into_read_only(self) -> Self {
+        Self {
+            tools: self
+                .tools
+                .into_iter()
+                .filter(|tool| !tool.is_mutating() && !tool.requires_approval())
+                .collect(),
+            caps: self.caps,
+        }
+    }
+
+    /// Keep only tools named in the caller-supplied allowlist. Used after a
+    /// capability filter, so an allowlist can narrow the registry but cannot
+    /// reintroduce tools removed by policy.
+    pub(crate) fn into_allowlist(self, names: &[String]) -> Self {
+        let names: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        Self {
+            tools: self
+                .tools
+                .into_iter()
+                .filter(|tool| names.contains(tool.name()))
+                .collect(),
+            caps: self.caps,
+        }
+    }
+
     /// Plan the model-visible surface for a provider/model with these
     /// capabilities. The registry (every tool) is untouched, so [`by_name`](Self::by_name)
     /// still resolves hidden tools for execution; only the advertised
