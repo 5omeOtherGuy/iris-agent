@@ -225,6 +225,221 @@ struct Footer {
     context_used_tokens: Option<u64>,
 }
 
+/// Predicted prompt-cache posture for a just-applied model/reasoning switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchCacheStatus {
+    /// No provider/model/reasoning bytes changed.
+    Unchanged,
+    /// Reasoning changed but the stable prompt prefix should remain warm.
+    Warm,
+    /// Provider or model changed; the next request starts a cold prompt-cache lane.
+    Cold,
+}
+
+/// Composer-adjacent switch analytics: a predicted handoff line until the next
+/// provider turn reports usage, then the realized token/cache/reduction line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwitchStatus {
+    pub(crate) model: String,
+    pub(crate) effort: Option<String>,
+    pub(crate) context_tokens: u64,
+    pub(crate) cache: SwitchCacheStatus,
+    pub(crate) compact_recommended: bool,
+    pending: bool,
+    folded_tokens: u64,
+    compaction_original_tokens: u64,
+    compaction_summary_tokens: u64,
+    realized_usage: Option<ProviderUsage>,
+}
+
+impl SwitchStatus {
+    pub(crate) fn new(
+        model: String,
+        effort: Option<String>,
+        context_tokens: u64,
+        cache: SwitchCacheStatus,
+        compact_recommended: bool,
+    ) -> Self {
+        Self {
+            model,
+            effort,
+            context_tokens,
+            cache,
+            compact_recommended,
+            pending: true,
+            folded_tokens: 0,
+            compaction_original_tokens: 0,
+            compaction_summary_tokens: 0,
+            realized_usage: None,
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.pending
+    }
+
+    fn observe(&mut self, event: &UiEvent) {
+        if !self.pending {
+            return;
+        }
+        match event {
+            UiEvent::FoldApplied {
+                reclaimed_tokens_estimate,
+                ..
+            } => {
+                self.folded_tokens = self
+                    .folded_tokens
+                    .saturating_add(*reclaimed_tokens_estimate);
+            }
+            UiEvent::CompactionApplied {
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                ..
+            } => {
+                self.compaction_original_tokens = self
+                    .compaction_original_tokens
+                    .saturating_add(*original_tokens_estimate);
+                self.compaction_summary_tokens = self
+                    .compaction_summary_tokens
+                    .saturating_add(*summary_tokens_estimate);
+            }
+            UiEvent::ProviderTurnCompleted { usage, .. } => {
+                self.realized_usage = usage.clone();
+                self.pending = false;
+            }
+            UiEvent::ProviderTurnCancelled { .. }
+            | UiEvent::ProviderTurnError { .. }
+            | UiEvent::TurnError { .. } => {
+                self.realized_usage = None;
+                self.pending = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn spans(&self) -> Vec<Span<'static>> {
+        if self.pending {
+            self.predicted_spans()
+        } else {
+            self.realized_spans()
+        }
+    }
+
+    fn model_label(&self) -> String {
+        let mut label = strip_ansi_for_text(&self.model).to_uppercase();
+        if let Some(effort) = self
+            .effort
+            .as_ref()
+            .map(|effort| strip_ansi_for_text(effort).to_uppercase())
+            .filter(|effort| !effort.is_empty())
+        {
+            if !label.is_empty() {
+                label.push(' ');
+            }
+            label.push_str(&effort);
+        }
+        label
+    }
+
+    fn push_sep(spans: &mut Vec<Span<'static>>) {
+        spans.push(Span::styled(
+            format!(" {} ", crate::ui::symbols::SEP),
+            dim_style(),
+        ));
+    }
+
+    fn predicted_spans(&self) -> Vec<Span<'static>> {
+        let mut spans = vec![Span::styled(
+            self.model_label(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        Self::push_sep(&mut spans);
+        spans.push(Span::styled(
+            format!("~{} ctx", compact_count(self.context_tokens)),
+            dim_style(),
+        ));
+        Self::push_sep(&mut spans);
+        spans.push(Span::styled(
+            match self.cache {
+                SwitchCacheStatus::Unchanged => "cache unchanged",
+                SwitchCacheStatus::Warm => "cache prefix warm",
+                SwitchCacheStatus::Cold => "cache cold next request",
+            }
+            .to_string(),
+            dim_style(),
+        ));
+        if self.compact_recommended {
+            Self::push_sep(&mut spans);
+            spans.push(Span::styled(
+                format!("{} ", crate::ui::symbols::REVIEW),
+                prompt_style(),
+            ));
+            spans.push(Span::styled("compact recommended".to_string(), dim_style()));
+        }
+        spans
+    }
+
+    fn realized_spans(&self) -> Vec<Span<'static>> {
+        let mut spans = vec![Span::styled(
+            self.model_label(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        Self::push_sep(&mut spans);
+        if let Some(usage) = &self.realized_usage {
+            spans.push(Span::styled(
+                format!(
+                    "↑{} ↓{}",
+                    compact_count(usage.input_tokens),
+                    compact_count(usage.output_tokens)
+                ),
+                dim_style(),
+            ));
+            Self::push_sep(&mut spans);
+            spans.push(Span::styled(
+                format!("cache read {}%", cache_read_percent(usage)),
+                dim_style(),
+            ));
+        } else {
+            spans.push(Span::styled("usage unavailable".to_string(), dim_style()));
+        }
+        Self::push_sep(&mut spans);
+        spans.push(Span::styled(
+            if self.folded_tokens > 0 {
+                format!("folded ~{}", compact_count(self.folded_tokens))
+            } else {
+                "folded none".to_string()
+            },
+            dim_style(),
+        ));
+        Self::push_sep(&mut spans);
+        spans.push(Span::styled(
+            if self.compaction_original_tokens > 0 {
+                format!(
+                    "compacted ~{}→~{}",
+                    compact_count(self.compaction_original_tokens),
+                    compact_count(self.compaction_summary_tokens)
+                )
+            } else {
+                "compacted none".to_string()
+            },
+            dim_style(),
+        ));
+        spans
+    }
+}
+
+fn cache_read_percent(usage: &ProviderUsage) -> u64 {
+    if usage.input_tokens == 0 {
+        return 0;
+    }
+    (usage
+        .cache_read_input_tokens
+        .saturating_mul(100)
+        .saturating_add(usage.input_tokens / 2)
+        / usage.input_tokens)
+        .min(100)
+}
+
 fn content_width(width: usize) -> usize {
     width
         .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
@@ -411,6 +626,10 @@ pub(crate) struct Screen {
     /// it from the live model selection; `None` falls back to the composer hint
     /// (e.g. before a provider is selected).
     footer: Option<Footer>,
+    /// Composer-adjacent model-switch analytics. A switch first shows predicted
+    /// context/cache impact; the next provider turn replaces it with realized
+    /// usage/cache/fold/compaction numbers without appending transcript notices.
+    switch_status: Option<SwitchStatus>,
     /// The active picker/dialog, when one is open. While present it renders
     /// above the editor and the loop routes keys to it instead of the editor.
     pub(crate) modal: Option<Modal>,
@@ -548,6 +767,7 @@ impl Screen {
             turn_divider: TurnDivider::default(),
             awaiting_approval: false,
             footer: None,
+            switch_status: None,
             modal: None,
             queued: 0,
             phase: WorkPhase::default(),
@@ -781,6 +1001,12 @@ impl Screen {
         self.queued = queued;
     }
 
+    /// Replace the transient model-switch status chip. The next provider turn
+    /// will convert it from predicted cache/context impact to realized usage.
+    pub(crate) fn set_switch_status(&mut self, status: SwitchStatus) {
+        self.switch_status = Some(status);
+    }
+
     // --- modal/picker ---
 
     /// Open a picker/dialog above the editor until it closes. A docked modal
@@ -903,6 +1129,9 @@ impl Screen {
                 .compactions
                 .push((*original_tokens_estimate, *summary_tokens_estimate)),
             _ => {}
+        }
+        if let Some(status) = &mut self.switch_status {
+            status.observe(&event);
         }
         // Advance the always-visible work phase from the display-event stream.
         // Approval transitions are owned by `show_approval`/`clear_approval`, so
@@ -1142,6 +1371,16 @@ impl Screen {
         // A submitted task enters the session: the launcher gives way to the
         // normal transcript, under the same chrome.
         self.start_page = None;
+        // A realized switch chip is useful while idle after the handoff; clear it
+        // when the user starts another turn. A still-pending chip survives so the
+        // next provider request can realize it.
+        if self
+            .switch_status
+            .as_ref()
+            .is_some_and(|status| !status.pending())
+        {
+            self.switch_status = None;
+        }
         // Pager: a submitted prompt snaps the view back to the live tail.
         self.scroll.follow_latest();
         self.spinner.start();
@@ -1628,6 +1867,23 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
     Some(line)
 }
 
+/// One-line, composer-adjacent status for runtime model/reasoning switches. It
+/// is volatile chrome, not transcript history: routine switch confirmations live
+/// here while durable analytics remain in the session log and `/context`.
+fn switch_status_line(screen: &Screen, width: u16) -> Option<Line<'static>> {
+    let status = screen.switch_status.as_ref()?;
+    if width < 6 {
+        return None;
+    }
+    let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
+    let box_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let mut line = Line::from(status.spans());
+    truncate_line(&mut line, usize::from(box_width));
+    pad_line_left(&mut line, usize::from(inset));
+    truncate_line(&mut line, usize::from(width));
+    Some(line)
+}
+
 /// Build the session bar — the pane-top "where am I / how full am I" row:
 /// `<cwd> ┊ git <branch>` on the left (cwd body ink, separator and branch
 /// dim), and the right-aligned context readout `CTX <used>/<cap> <meter>`
@@ -2056,7 +2312,13 @@ pub(super) fn render_editor_chrome(
     width: u16,
     height: u16,
 ) -> Vec<Line<'static>> {
-    let area = Rect::new(0, 0, width, height);
+    let switch_status = if height > MIN_EDITOR_H {
+        switch_status_line(screen, width)
+    } else {
+        None
+    };
+    let status_rows = u16::from(switch_status.is_some());
+    let area = Rect::new(0, 0, width, height.saturating_sub(status_rows));
 
     // The composer editor always renders at its natural height; the approval
     // surface docks in the overlay region above it (below), so the composer body
@@ -2186,7 +2448,11 @@ pub(super) fn render_editor_chrome(
             );
         }
     }
-    buffer_to_lines(&buf, cursor_cell)
+    let mut lines = buffer_to_lines(&buf, cursor_cell);
+    if let Some(status) = switch_status {
+        lines.insert(0, status);
+    }
+    lines
 }
 
 /// Find the reversed block cursor `ratatui-textarea` draws, scanning only the
@@ -2243,9 +2509,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApprovalPolicy, CONTEXT_METER_DOTS, Screen, Spinner, composer_statusline,
-        context_meter_filled, display_width, line_text, parse_context_window, session_bar,
-        session_bar_lines, truncate_cwd_middle,
+        ApprovalPolicy, CONTEXT_METER_DOTS, Screen, Spinner, SwitchCacheStatus, SwitchStatus,
+        composer_statusline, context_meter_filled, display_width, line_text, parse_context_window,
+        session_bar, session_bar_lines, switch_status_line, truncate_cwd_middle,
     };
     use crate::nexus::ToolCall;
     use crate::ui::UiEvent;
@@ -2669,6 +2935,73 @@ mod tests {
             .map(|l| line_text(&l))
             .expect("statusline");
         assert!(!status.contains("mouse off"), "{status:?}");
+    }
+
+    #[test]
+    fn switch_status_predicts_then_realizes_tokens_cache_and_reductions() {
+        let mut screen = footer_screen("~/repo");
+        screen.set_switch_status(SwitchStatus::new(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            42_000,
+            SwitchCacheStatus::Cold,
+            true,
+        ));
+
+        let predicted = switch_status_line(&screen, 100)
+            .map(|line| line_text(&line))
+            .expect("switch status");
+        assert!(predicted.contains("GPT-5.5 HIGH"), "{predicted:?}");
+        assert!(predicted.contains("~42k ctx"), "{predicted:?}");
+        assert!(
+            predicted.contains("cache cold next request"),
+            "{predicted:?}"
+        );
+        assert!(predicted.contains("▲ compact recommended"), "{predicted:?}");
+
+        screen.apply(UiEvent::FoldApplied {
+            folds: 2,
+            reclaimed_tokens_estimate: 8_000,
+            trigger: crate::nexus::FoldTrigger::SelectionSwitch,
+        });
+        screen.apply(UiEvent::CompactionApplied {
+            compaction_id: "c1".into(),
+            covered_from: "1".into(),
+            covered_to: "5".into(),
+            covered_messages: 5,
+            original_tokens_estimate: 40_000,
+            summary_tokens_estimate: 4_000,
+            budget: 80_000,
+        });
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(crate::nexus::ProviderUsage {
+                provider: "openai-codex".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 48_000,
+                output_tokens: 846,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 48_846,
+                cache_creation: None,
+            }),
+        });
+
+        let realized = switch_status_line(&screen, 100)
+            .map(|line| line_text(&line))
+            .expect("switch status");
+        assert!(realized.contains("↑48k ↓846"), "{realized:?}");
+        assert!(realized.contains("cache read 0%"), "{realized:?}");
+        assert!(realized.contains("folded ~8k"), "{realized:?}");
+        assert!(realized.contains("compacted ~40k→~4k"), "{realized:?}");
+
+        screen.start_turn();
+        assert!(
+            switch_status_line(&screen, 100).is_none(),
+            "realized switch status clears on the next user turn"
+        );
     }
 
     #[test]
