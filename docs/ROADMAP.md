@@ -1115,6 +1115,10 @@ Later slices (not in #261):
   ([#445](https://github.com/5omeOtherGuy/iris-agent/issues/445)) — when every
   ledger path is clean, Iris treats the user's commit or full revert as an
   external settlement and removes the durable task state.
+- Task workflow v2 follow-up: task-scoped approvals cover bash
+  ([#446](https://github.com/5omeOtherGuy/iris-agent/issues/446)) — approved
+  dirty paths changed by bash are Iris-attributed and checkpointed; unapproved
+  dirty paths still halt and restore.
 - Per-hunk staging
   ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
 - Optional auto-commit behind explicit approval

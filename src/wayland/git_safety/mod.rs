@@ -984,30 +984,32 @@ impl MutationGuard for GitSafety {
                 // edit landed on the approved file, or the write failed/was
                 // partial -- so ADR-0028's TOCTOU rule keeps it user-attributed
                 // and protected rather than silently advancing the baseline.
-                let confirmed = approved_set.contains(&path)
+                let confirmed_target = approved_set.contains(&path)
                     && match (expected_after, after.as_deref()) {
                         (Some(expected), Some(actual)) => expected == actual,
                         _ => false,
                     };
-                if confirmed {
+                let approved_bash_change = approved.is_empty()
+                    && (task.all_dirty_approved || task.approved.contains(&path));
+                if confirmed_target || approved_bash_change {
                     // Expected: a confirmed Iris mutation. Record it and advance
                     // the baseline hash so a later call sees the new content.
                     let before = task.baseline.protected.get(&path).cloned().flatten();
                     // Capture the path's exact pre-task bytes + mode for the
                     // checkpoint chain's base (first-touch only; the chain keeps
                     // the earliest).
-                    let pre = task
-                        .snapshot
-                        .pre_bytes(&path)
-                        .and_then(|opt| opt.as_ref())
-                        .map(|bytes| {
+                    let pre = match task.snapshot.pre_bytes(&path) {
+                        Some(Some(bytes)) => {
                             let mode = task
                                 .pre_modes
                                 .get(&path)
                                 .copied()
                                 .unwrap_or(FileMode::Normal);
-                            (bytes.clone(), mode)
-                        });
+                            Some((bytes.clone(), mode))
+                        }
+                        Some(None) => None,
+                        None => checkpoint::committed_blob(&self.workspace, &path),
+                    };
                     iris_changes.push((path.clone(), pre));
                     task.turn += 1;
                     task.ledger.record(LedgerEntry {
