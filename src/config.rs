@@ -487,6 +487,17 @@ pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
     update_global(&[("promptCacheRetention", Value::String(preset.to_string()))])
 }
 
+/// Persist the compaction summarizer mode (`excerpts|provider`) in the global
+/// settings file. Project files may still override it at load; this is the
+/// user-facing `/settings` write path.
+pub(crate) fn save_compaction_summarizer(mode: &str) -> Result<()> {
+    let mode = match mode {
+        "excerpts" | "provider" => mode,
+        _ => "provider",
+    };
+    update_global(&[("compactionSummarizer", Value::String(mode.to_string()))])
+}
+
 /// Persist the context token budget in the global settings file, clamped to a
 /// sane positive range so a hand-typed value cannot store a degenerate budget.
 pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {

@@ -139,11 +139,12 @@ impl Default for CacheProfile {
 /// model (possibly a different provider) can resume from, preferring exact
 /// identifiers over prose.
 const SUMMARY_PROMPT: &str = "Summarize this coding session so another model can take over \
-seamlessly. Reply with only the summary, no preamble. Use short sections: Goal (what the user \
-is trying to achieve), State (what has been done and what is verified working), Key facts \
-(exact file paths, symbols, commands, decisions, and constraints that still matter), and Next \
-steps (unresolved work, in order). Prefer exact identifiers over prose; omit pleasantries and \
-tool-call mechanics.";
+seamlessly. Reply with only the summary, no preamble. Use exactly these sections: Goal, State, \
+Decisions, Key facts, and Next steps. In Decisions, capture choices made, rejected alternatives, \
+accepted constraints, naming/API/architecture decisions, and why they matter. Use persisted \
+assistant reasoning summaries as decision evidence when present; redacted reasoning markers mean \
+text is unavailable and must not be reconstructed. Prefer exact identifiers over prose; omit \
+pleasantries and tool-call mechanics.";
 
 /// How compaction produces its summary text (ADR-0041). `Provider` asks the
 /// active model for a structured handoff summary and falls back to `Excerpts`
