@@ -939,6 +939,19 @@ impl Screen {
         true
     }
 
+    /// Pager-mode sticky-prompt disclosure click: the pinned prompt starts on the
+    /// row immediately below the session bar, so a click there toggles the same
+    /// state as Ctrl+O. Other rows fall through to transcript header/link/wheel
+    /// handling.
+    pub(crate) fn toggle_sticky_prompt_at_screen_row(&mut self, screen_row: u16) -> bool {
+        let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+        let bar_rows = session_bar_lines(self, width, height).len();
+        if usize::from(screen_row) != bar_rows {
+            return false;
+        }
+        self.toggle_sticky_prompt()
+    }
+
     /// Render all transcript rows plus any in-flight stream, wrapped to `width`.
     /// Finalized history is intentionally retained here; the terminal surface
     /// owns append/diff/full-replay decisions instead of draining UI state.
@@ -2232,7 +2245,7 @@ mod tests {
     use super::{
         ApprovalPolicy, CONTEXT_METER_DOTS, Screen, Spinner, composer_statusline,
         context_meter_filled, display_width, line_text, parse_context_window, session_bar,
-        truncate_cwd_middle,
+        session_bar_lines, truncate_cwd_middle,
     };
     use crate::nexus::ToolCall;
     use crate::ui::UiEvent;
@@ -2267,6 +2280,26 @@ mod tests {
         session_bar(screen, width)
             .map(|l| line_text(&l))
             .expect("bar")
+    }
+
+    #[test]
+    fn sticky_prompt_click_row_toggles_like_ctrl_o() {
+        let mut screen = footer_screen("~/repo (main)");
+        screen.pager_active = true;
+        screen.commit_user("question that has scrolled away");
+        for i in 0..20 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+        let total = screen.transcript_visible_total(width);
+        screen.scroll.sync(total, 5);
+        assert!(screen.scroll.top() > 0, "prompt must be pinned");
+
+        let sticky_row = session_bar_lines(&screen, width, height).len() as u16;
+        assert!(!screen.toggle_sticky_prompt_at_screen_row(sticky_row + 1));
+        assert!(!screen.sticky_prompt_expanded);
+        assert!(screen.toggle_sticky_prompt_at_screen_row(sticky_row));
+        assert!(screen.sticky_prompt_expanded);
     }
 
     #[test]

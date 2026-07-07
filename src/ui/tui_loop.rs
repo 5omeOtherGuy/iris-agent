@@ -2189,6 +2189,9 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
             if let Some(key) = session_bar_click(screen, &mouse, git_cache) {
                 return key;
             }
+            if sticky_prompt_click(screen, &mouse) {
+                return IdleKey::Continue;
+            }
             if header_click(screen, &mouse) {
                 return IdleKey::Continue;
             }
@@ -2606,9 +2609,21 @@ fn scrollback_focus_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: boo
     }
 }
 
-/// Pager-mode wheel scrolling: ±`scroll_speed` lines per wheel tick. Only the
-/// wheel is consumed; clicks/drags are ignored (in-app selection is a later
-/// slice -- the Ctrl+T toggle restores terminal-native selection until then).
+/// Pager-mode sticky-prompt disclosure click: a left-button-down on the pinned
+/// prompt header row toggles THAT sticky prompt. `false` = not a sticky-prompt
+/// click (fall through to transcript headers, links, and wheel handling). Only
+/// fires under pager mouse capture.
+fn sticky_prompt_click(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    if !screen.pager_active || !screen.mouse_capture {
+        return false;
+    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    screen.toggle_sticky_prompt_at_screen_row(mouse.row)
+}
+
 /// Pager-mode disclosure click: a left-button-down on a foldable block's
 /// header row toggles THAT block. `None`/`false` = not a header click (fall
 /// through to wheel handling). Only fires under pager mouse capture.
@@ -2651,6 +2666,9 @@ fn pager_link_click(screen: &mut Screen, mouse: &ratatui::crossterm::event::Mous
     true
 }
 
+/// Pager-mode wheel scrolling: ±`scroll_speed` lines per wheel tick. Only the
+/// wheel is consumed; clicks/drags are ignored (in-app selection is a later
+/// slice -- the Ctrl+T toggle restores terminal-native selection until then).
 fn pager_wheel(screen: &mut Screen, mouse: &ratatui::crossterm::event::MouseEvent) -> bool {
     // Gate on capture INTENT too: after Ctrl+T / `/mouse` turns capture off,
     // queued events (or events still arriving because the disable write
@@ -2716,6 +2734,9 @@ fn handle_running_event(
                 && let Some(key) = session_bar_click(screen, &mouse, git_cache)
             {
                 return !matches!(key, IdleKey::Ignore | IdleKey::Menu(_));
+            }
+            if sticky_prompt_click(screen, &mouse) {
+                return true;
             }
             if header_click(screen, &mouse) {
                 return true;
