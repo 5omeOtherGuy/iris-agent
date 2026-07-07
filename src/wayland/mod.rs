@@ -9,6 +9,7 @@
 
 mod fold;
 pub(crate) mod git_safety;
+pub(crate) mod subagents;
 pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
