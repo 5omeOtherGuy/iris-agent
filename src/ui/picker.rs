@@ -325,6 +325,7 @@ fn settings_snapshot<P: ChatProvider>(
         skip_permissions: harness.skip_permissions(),
         context_token_budget: settings.context_token_budget(),
         microcompaction: settings.microcompaction(),
+        bash_tool_mode: settings.bash_tool_mode(),
         max_tool_roundtrips: settings.max_tool_roundtrips(),
         prompt_cache_retention: settings
             .prompt_cache_retention
@@ -360,6 +361,7 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
             config::save_context_token_budget(value.unwrap_or("0").parse()?)
         }
         Field::Microcompaction => config::save_microcompaction(parse_bool(value)),
+        Field::BashToolMode => config::save_bash_tool_mode(parse_bool(value)),
         Field::MaxToolRoundtrips => config::save_max_tool_roundtrips(match value {
             Some(v) => Some(v.parse::<usize>()?),
             None => None,

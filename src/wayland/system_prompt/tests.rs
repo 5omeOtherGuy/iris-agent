@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::tools::built_in_tools;
+use crate::tools::{built_in_tools, built_in_tools_for};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -274,6 +274,24 @@ fn available_tools_preserves_registration_order() {
     let bash_at = body.find("- bash:").unwrap();
     let ls_at = body.find("- ls:").unwrap();
     assert!(read_at < bash_at && bash_at < ls_at);
+}
+
+#[test]
+fn bash_tool_mode_prompt_advertises_shell_operations_not_native_file_tools() {
+    let tools = built_in_tools_for(true);
+    let body = available_tools_body(&tools);
+    for name in ["bash", "edit", "read_output", "recall"] {
+        assert!(body.contains(&format!("- {name}:")), "missing tool {name}");
+    }
+    for gone in ["read", "write", "grep", "find", "ls"] {
+        assert!(
+            !body.contains(&format!("- {gone}:")),
+            "{gone} should be hidden"
+        );
+    }
+    let guidelines = tool_guidelines_body(&tools);
+    assert!(guidelines.contains("Use bash for file operations like ls, rg, find"));
+    assert!(!guidelines.contains("Prefer read, grep, find, and ls"));
 }
 
 #[test]

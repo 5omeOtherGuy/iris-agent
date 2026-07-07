@@ -330,6 +330,7 @@ mod tests {
             default_reasoning: None,
             compaction_summarizer: None,
             microcompaction: None,
+            bash_tool_mode: None,
             prompt_cache_retention: None,
             anthropic_context_management: None,
             enabled_models: None,

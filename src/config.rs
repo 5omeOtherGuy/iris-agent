@@ -90,6 +90,14 @@ pub(crate) struct Settings {
     /// never redirect requests, so a project file may tune it. Gates fold
     /// WRITING only; a persisted fold always rebuilds regardless of this value.
     pub(crate) microcompaction: Option<bool>,
+    /// Opt-in bash tool mode: the model-visible tool set shrinks to `bash` and
+    /// `edit` (plus the session-plumbing `read_output`/`recall`), so the model
+    /// drives file inspection, listing, search, and file creation through the
+    /// shell. Absent/false -> off (full built-in surface). Not a
+    /// security-sensitive redirect: it only removes tools, and `bash` stays
+    /// approval-per-call (ADR-0010), so a project file may tune it like
+    /// [`Settings::microcompaction`].
+    pub(crate) bash_tool_mode: Option<bool>,
     /// Optional graceful soft cap on tool round-trips per turn. Absent (the
     /// default) leaves the agent loop unbounded: it runs while the model emits
     /// tool calls and stops naturally, with cancellation as the runaway guard.
@@ -264,6 +272,10 @@ impl Settings {
             // trades in-context detail for recoverable detail, never redirects a
             // request), so a project may tune it; project value wins, else global.
             microcompaction: project.microcompaction.or(self.microcompaction),
+            // Bash tool mode only removes tools from the model-visible surface
+            // and bash stays approval-per-call, so a project may tune it;
+            // project value wins, else global.
+            bash_tool_mode: project.bash_tool_mode.or(self.bash_tool_mode),
             // Prompt cache retention can affect privacy/cost, so keep it
             // global-only like provider/base-url and scoped model sets.
             prompt_cache_retention: self.prompt_cache_retention,
@@ -390,6 +402,15 @@ impl Settings {
     pub(crate) fn microcompaction(&self) -> bool {
         self.microcompaction.unwrap_or(false)
     }
+
+    /// Whether bash tool mode is enabled: only `bash` and `edit` (plus the
+    /// session-plumbing `read_output`/`recall`) are registered, so the model
+    /// uses the shell for file operations. Default off (full tool surface).
+    /// Read once at startup when the tool set is constructed; a `/settings`
+    /// toggle takes effect at the next session start.
+    pub(crate) fn bash_tool_mode(&self) -> bool {
+        self.bash_tool_mode.unwrap_or(false)
+    }
 }
 
 /// Persist `provider`/`model` as the default model in the global settings file,
@@ -489,6 +510,13 @@ pub(crate) fn save_microcompaction(enabled: bool) -> Result<()> {
         }
     }
     update_global(&[("microcompaction", Value::Bool(enabled))])
+}
+
+/// Persist the bash-tool-mode toggle in the global settings file. A boolean,
+/// validated at the `/settings` boundary; takes effect at the next session
+/// start (the tool set is constructed once at startup).
+pub(crate) fn save_bash_tool_mode(enabled: bool) -> Result<()> {
+    update_global(&[("bashToolMode", Value::Bool(enabled))])
 }
 
 /// Persist (or clear) the tool round-trip soft cap in the global settings file.
@@ -826,6 +854,31 @@ mod tests {
         fs::write(&project, r#"{ "microcompaction": true }"#).unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert!(settings.microcompaction());
+    }
+
+    #[test]
+    fn bash_tool_mode_defaults_off_and_a_project_may_tune_it() {
+        // Default off: an unset key keeps the full built-in tool surface.
+        assert!(!Settings::default().bash_tool_mode());
+
+        // Tool-surface knob, not a security redirect: a project may turn it on.
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, "{}").unwrap();
+        fs::write(&project, r#"{ "bashToolMode": true }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert!(settings.bash_tool_mode());
+
+        // Round-trip through the save helper.
+        let path = dir.path.join("settings.json");
+        let _guard = ConfigPathGuard::set(&path);
+        save_bash_tool_mode(true).unwrap();
+        let saved = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert!(saved.bash_tool_mode());
+        save_bash_tool_mode(false).unwrap();
+        let saved = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert!(!saved.bash_tool_mode());
     }
 
     #[test]
