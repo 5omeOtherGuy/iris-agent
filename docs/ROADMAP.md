@@ -1107,6 +1107,10 @@ Later slices (not in #261):
   protection stays always on, while durable task records, checkpoint refs,
   recovery, badges, lifecycle entries, and task slash surfaces require the
   project `tasks` opt-in.
+- Task workflow v2 follow-up: print settlement policy
+  ([#442](https://github.com/5omeOtherGuy/iris-agent/issues/442)) — successful
+  mutating print runs settle the durable workflow task with disposition `print`;
+  provider failure or cancellation leaves the record for recovery.
 - Per-hunk staging
   ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
 - Optional auto-commit behind explicit approval

@@ -867,6 +867,9 @@ pub(crate) fn run_print_turn<P: ChatProvider>(
         move || watch_for_interrupt(&token, &done)
     });
     let result = runtime.block_on(harness.submit_turn(prompt, obs, gate, &token));
+    if result.is_ok() && !token.is_cancelled() {
+        harness.accept_print_checkpoint();
+    }
     done.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     // Bound shutdown so an orphaned blocking provider request cannot hang exit.
