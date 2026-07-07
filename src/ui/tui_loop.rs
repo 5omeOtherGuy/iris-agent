@@ -36,6 +36,7 @@ use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource};
 use crate::git::status::GitStatusCache;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
+use crate::mimir::selection::ModelSelection;
 use crate::nexus::{
     AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ReviewContext,
     ToolCall,
@@ -48,7 +49,7 @@ use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::steering::SteeringQueue;
 use crate::ui::tui::{
     ApprovalPolicy, FocusTarget, GitMenu, MenuAction, MenuKey, MenuOutcome, Screen, SessionMenu,
-    StartAction, TreeMenu, TuiUi,
+    StartAction, SwitchCacheStatus, SwitchStatus, TreeMenu, TuiUi,
 };
 use crate::wayland::Harness;
 use crate::wayland::git_safety::RecoveryOutcome;
@@ -392,22 +393,36 @@ async fn session_loop<P: ChatProvider>(
             }
             IdleOutcome::OpenModelPicker => {
                 if let Some(sw) = switch.as_mut() {
+                    let before = sw.selection().clone();
                     match picker::model_command("", harness, sw) {
                         ModelCommand::Open(modal) => tui.screen.open_modal(modal),
-                        ModelCommand::Lines(lines) => apply_notices(tui, lines),
+                        ModelCommand::Lines(lines) => {
+                            let after = sw.selection().clone();
+                            apply_model_switch_lines(
+                                tui,
+                                harness,
+                                Some(&before),
+                                Some(&after),
+                                lines,
+                            );
+                        }
                     }
                 }
             }
             IdleOutcome::CycleModel(forward) => {
                 if let Some(sw) = switch.as_mut() {
+                    let before = sw.selection().clone();
                     let lines = picker::cycle_model(forward, harness, sw);
-                    apply_notices(tui, lines);
+                    let after = sw.selection().clone();
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
                 }
             }
             IdleOutcome::CycleEffort => {
                 if let Some(sw) = switch.as_mut() {
+                    let before = sw.selection().clone();
                     let lines = picker::cycle_effort(harness, sw);
-                    apply_notices(tui, lines);
+                    let after = sw.selection().clone();
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
                 }
             }
             IdleOutcome::OpenResumePicker => {
@@ -615,6 +630,66 @@ fn request_render(sched: &mut RenderScheduler, tui: &mut TuiUi) -> Result<()> {
 fn apply_notices(tui: &mut TuiUi, lines: Vec<String>) {
     for line in lines {
         tui.screen.apply(UiEvent::Notice(line));
+    }
+}
+
+/// In the TUI, successful model/reasoning switches are volatile chrome: the
+/// footer already shows the active selection, and this chip carries predicted
+/// cache/context impact until the next provider turn replaces it with realized
+/// usage. Errors and persistence failures still go to the transcript.
+fn apply_model_switch_lines<P: ChatProvider>(
+    tui: &mut TuiUi,
+    harness: &Harness<P>,
+    before: Option<&ModelSelection>,
+    after: Option<&ModelSelection>,
+    lines: Vec<String>,
+) {
+    let switched = lines.iter().any(|line| is_switch_confirmation(line));
+    let compact_recommended = lines.iter().any(|line| is_switch_advisory(line));
+    if switched && let Some(selection) = after {
+        tui.screen.set_switch_status(SwitchStatus::new(
+            selection.model.clone(),
+            selection
+                .reasoning
+                .map(|effort| effort.as_str().to_string()),
+            harness.context_token_estimate(),
+            switch_cache_status(before, selection),
+            compact_recommended,
+        ));
+    }
+
+    let notices = switch_notice_lines(lines);
+    if !notices.is_empty() {
+        apply_notices(tui, notices);
+    }
+}
+
+fn switch_notice_lines(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter(|line| !is_switch_confirmation(line) && !is_switch_advisory(line))
+        .collect()
+}
+
+fn is_switch_confirmation(line: &str) -> bool {
+    line.starts_with("switched to ")
+}
+
+fn is_switch_advisory(line: &str) -> bool {
+    line.starts_with("carrying ~") && line.contains("prompt cache starts cold")
+}
+
+fn switch_cache_status(
+    before: Option<&ModelSelection>,
+    after: &ModelSelection,
+) -> SwitchCacheStatus {
+    match before {
+        Some(before) if before.provider != after.provider || before.model != after.model => {
+            SwitchCacheStatus::Cold
+        }
+        Some(before) if before.reasoning != after.reasoning => SwitchCacheStatus::Warm,
+        Some(_) => SwitchCacheStatus::Unchanged,
+        None => SwitchCacheStatus::Cold,
     }
 }
 
@@ -1107,9 +1182,13 @@ fn route_command<P: ChatProvider>(
                 return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
+            let before = sw.selection().clone();
             match picker::model_command(rest, harness, sw) {
                 ModelCommand::Open(modal) => tui.screen.open_modal(modal),
-                ModelCommand::Lines(lines) => apply_notices(tui, lines),
+                ModelCommand::Lines(lines) => {
+                    let after = sw.selection().clone();
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                }
             }
             Ok(RouteOutcome::Consumed)
         }
@@ -1275,8 +1354,10 @@ fn route_command<P: ChatProvider>(
             // Legacy text effort path is preserved as a compatible alias. It
             // takes the whole `Option<ModelSwitch>` like the text driver does.
             tui.screen.commit_user(prompt);
+            let before = switch.as_ref().map(|sw| sw.selection().clone());
             if let Some(lines) = crate::cli::handle_model_command(prompt, harness, switch) {
-                apply_notices(tui, lines);
+                let after = switch.as_ref().map(|sw| sw.selection().clone());
+                apply_model_switch_lines(tui, harness, before.as_ref(), after.as_ref(), lines);
             }
             Ok(RouteOutcome::Consumed)
         }
@@ -1909,14 +1990,19 @@ async fn dispatch_action<P: ChatProvider>(
                 tui.screen.close_modal();
                 return Ok(None);
             };
-            match picker::apply_action(other, harness, sw) {
+            let before = sw.selection().clone();
+            let result = picker::apply_action(other, harness, sw);
+            let after = sw.selection().clone();
+            match result {
                 ActionResult::Close(lines) => {
-                    apply_notices(tui, lines);
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
                     tui.screen.close_modal();
                 }
-                ActionResult::Keep(lines) => apply_notices(tui, lines),
+                ActionResult::Keep(lines) => {
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                }
                 ActionResult::Replace(modal, lines) => {
-                    apply_notices(tui, lines);
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
                     tui.screen.open_modal(*modal);
                 }
             }
@@ -2965,6 +3051,20 @@ mod tests {
         steering: &SteeringQueue,
     ) -> bool {
         super::handle_running_event(screen, event, pending, steering, &GitStatusCache::default())
+    }
+
+    #[test]
+    fn model_switch_notices_drop_routine_confirmation_but_keep_failures() {
+        let lines = vec![
+            "switched to openai-codex/gpt-5.5 (reasoning: high)".to_string(),
+            "carrying ~42000 tokens of context to gpt-5.5; its prompt cache starts cold, so the next request re-reads all of it -- /compact first to hand over a short summary instead.".to_string(),
+            "(default not saved: config is read-only)".to_string(),
+        ];
+
+        assert_eq!(
+            switch_notice_lines(lines),
+            vec!["(default not saved: config is read-only)".to_string()]
+        );
     }
 
     #[test]
