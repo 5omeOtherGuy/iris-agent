@@ -2002,6 +2002,66 @@ fn recoverable_task_row_surfaces_body_and_sessions() {
     );
 }
 
+// Issue #449 marker source: the resume picker marks sessions that appear in an
+// unsettled task record's live join. This is display-only and workspace-scoped;
+// it intentionally does not require the record to be lease-free/recoverable.
+#[test]
+fn task_linked_session_ids_reads_unsettled_records_for_this_workspace_only() {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    let guard = GitSafety::new(&repo.path);
+    guard.set_session_id("sessionaaaa".to_string());
+    guard.set_turn_context(Some("fix the parser".to_string()));
+    guard.note_mutation();
+    iris_write(&guard, &repo.path.join("work.txt"), b"iris\n");
+
+    let mut foreign = task_state::load_all(&git_dir)
+        .pop()
+        .expect("one task record exists");
+    foreign.task_id = "foreign-workspace-task".to_string();
+    foreign.workspace = "/other/workspace".to_string();
+    foreign.sessions = vec!["sessionxxxx".to_string()];
+    task_state::save(&git_dir, &foreign).unwrap();
+
+    let linked = GitSafety::new(&repo.path).task_linked_session_ids();
+    assert!(
+        linked.contains("sessionaaaa"),
+        "the current workspace's unsettled task session is marked"
+    );
+    assert!(
+        !linked.contains("sessionxxxx"),
+        "sessions from task records for another workspace are not marked"
+    );
+}
+
+// Issue #449 post-resume policy: resuming a session linked to exactly one
+// recoverable task offers that task explicitly instead of adopting it
+// immediately. The existing adoption notice stays on the later AdoptTask path.
+#[test]
+fn recover_for_resumed_session_offers_one_linked_task_without_adopting() {
+    let repo = init_repo();
+    let task_id = {
+        let guard = GitSafety::new(&repo.path);
+        guard.set_session_id("sessionaaaa".to_string());
+        guard.set_turn_context(Some("fix the parser".to_string()));
+        guard.note_mutation();
+        iris_write(&guard, &repo.path.join("work.txt"), b"iris\n");
+        guard.current_task_id().expect("task opened")
+    };
+
+    let guard = GitSafety::new(&repo.path);
+    let RecoveryOutcome::ResumeLinked(row) = guard.recover_and_expire_for_session("sessionaaaa")
+    else {
+        panic!("expected linked task offer for resumed session");
+    };
+    assert_eq!(row.task_id, task_id);
+    assert!(
+        guard.current_task_id().is_none(),
+        "the offer path must not adopt before the user confirms"
+    );
+}
+
 // #288 test: adopt-then-settle round trip works post-restart. A crashed task is
 // adopted from the picker seam, then `/rollback`-equivalent settlement operates
 // on the rehydrated chain and undoes Iris's work.

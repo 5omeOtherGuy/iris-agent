@@ -66,6 +66,21 @@ impl RecoverableTask {
     }
 }
 
+fn linked_recoverable_for_session(
+    tasks: &[RecoverableTask],
+    session_id: &str,
+) -> Option<RecoverableTask> {
+    let mut linked = tasks
+        .iter()
+        .filter(|task| {
+            task.class == TaskClass::Recoverable
+                && task.sessions.iter().any(|session| session == session_id)
+        })
+        .cloned();
+    let first = linked.next()?;
+    linked.next().is_none().then_some(first)
+}
+
 #[cfg(test)]
 impl RecoverableTask {
     /// Construct a recoverable row for Tier-3 unit tests (`ui::picker`) without a
@@ -127,11 +142,14 @@ pub(crate) enum AdoptError {
 /// What resume/startup recovery decided (ADR-0030/ADR-0031 policy), returned to
 /// Tier 3 so the >1/legacy case opens the picker instead of only printing a
 /// notice. `None` = nothing recoverable; `Notice` = the single-orphan auto-adopt
-/// (unchanged UX); `Picker` = explicit selection required over these rows.
+/// (unchanged UX); `ResumeLinked` = a resumed session links exactly one
+/// recoverable task and should get an explicit resume-task offer; `Picker` =
+/// explicit selection required over these rows.
 #[derive(Debug)]
 pub(crate) enum RecoveryOutcome {
     None,
     Notice(String),
+    ResumeLinked(RecoverableTask),
     Picker(Vec<RecoverableTask>),
 }
 
@@ -142,6 +160,7 @@ impl RecoveryOutcome {
     pub(crate) fn recoverable_count(&self) -> usize {
         match self {
             RecoveryOutcome::Picker(tasks) => tasks.len(),
+            RecoveryOutcome::ResumeLinked(_) => 1,
             RecoveryOutcome::None | RecoveryOutcome::Notice(_) => 0,
         }
     }
@@ -385,6 +404,19 @@ impl GitSafety {
     /// `Notice` always names the record actually adopted, fixing the ADR-0030
     /// notice/adopt mismatch. Lazy: called at startup/resume, no daemon.
     pub(crate) fn recover_and_expire(&self) -> RecoveryOutcome {
+        self.recover_and_expire_inner(None)
+    }
+
+    /// Variant of [`recover_and_expire`](Self::recover_and_expire) for an
+    /// explicit session resume: after the stale sweep, if exactly one
+    /// recoverable row links the resumed session id, return it as an explicit
+    /// resume-task offer instead of applying the workspace-wide auto-adopt rule.
+    /// Zero or multiple linked rows fall back to the normal recovery policy.
+    pub(crate) fn recover_and_expire_for_session(&self, session_id: &str) -> RecoveryOutcome {
+        self.recover_and_expire_inner(Some(session_id))
+    }
+
+    fn recover_and_expire_inner(&self, resumed_session: Option<&str>) -> RecoveryOutcome {
         if !self.workflow_enabled {
             return RecoveryOutcome::None;
         }
@@ -399,6 +431,11 @@ impl GitSafety {
         let recoverable = self.recoverable_tasks();
         if recoverable.is_empty() {
             return RecoveryOutcome::None;
+        }
+        if let Some(session_id) = resumed_session
+            && let Some(task) = linked_recoverable_for_session(&recoverable, session_id)
+        {
+            return RecoveryOutcome::ResumeLinked(task);
         }
         let adoptable: Vec<&RecoverableTask> = recoverable
             .iter()
@@ -813,16 +850,81 @@ mod recovery_outcome_tests {
     use super::*;
 
     #[test]
-    fn recoverable_count_only_counts_the_picker_case() {
+    fn recoverable_count_includes_explicit_resume_offer() {
         assert_eq!(RecoveryOutcome::None.recoverable_count(), 0);
         assert_eq!(
             RecoveryOutcome::Notice("adopted".to_string()).recoverable_count(),
             0
+        );
+        assert_eq!(
+            RecoveryOutcome::ResumeLinked(RecoverableTask::for_test(
+                "linked",
+                Duration::from_secs(60),
+                Some("x"),
+                &["session-a"],
+            ))
+            .recoverable_count(),
+            1
         );
         let tasks = vec![
             RecoverableTask::for_test("a", Duration::from_secs(60), Some("x"), &[]),
             RecoverableTask::for_test_legacy("b", Duration::from_secs(60)),
         ];
         assert_eq!(RecoveryOutcome::Picker(tasks).recoverable_count(), 2);
+    }
+
+    #[test]
+    fn resumed_session_offer_requires_exactly_one_recoverable_link() {
+        let linked = RecoverableTask::for_test(
+            "linked",
+            Duration::from_secs(60),
+            Some("work"),
+            &["session-a"],
+        );
+        let other = RecoverableTask::for_test(
+            "other",
+            Duration::from_secs(60),
+            Some("other"),
+            &["session-b"],
+        );
+        let tasks = vec![linked.clone(), other.clone()];
+        assert_eq!(
+            linked_recoverable_for_session(&tasks, "session-a")
+                .map(|task| task.task_id)
+                .as_deref(),
+            Some("linked")
+        );
+        assert!(
+            linked_recoverable_for_session(&tasks, "missing").is_none(),
+            "zero linked tasks should not offer"
+        );
+
+        let two_linked = vec![
+            linked,
+            RecoverableTask::for_test(
+                "second",
+                Duration::from_secs(60),
+                Some("second"),
+                &["session-a"],
+            ),
+            other,
+        ];
+        assert!(
+            linked_recoverable_for_session(&two_linked, "session-a").is_none(),
+            "multiple linked tasks are never guessed between"
+        );
+
+        let legacy = RecoverableTask {
+            task_id: "legacy".to_string(),
+            workspace: "/proj".to_string(),
+            age: Duration::from_secs(60),
+            body: None,
+            sessions: vec!["session-a".to_string()],
+            class: TaskClass::Legacy,
+        };
+        assert!(
+            linked_recoverable_for_session(&[legacy], "session-a").is_none(),
+            "legacy rows are not recoverable auto-offers"
+        );
     }
 }

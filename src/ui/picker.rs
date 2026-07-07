@@ -22,7 +22,8 @@ use crate::ui::modal::{
 use crate::ui::settings_menu::{self, SettingsMenu};
 use crate::ui::task_view::TaskCard;
 use crate::wayland::Harness;
-use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask};
+use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask, GitSafety, RecoverableTask};
+use std::collections::BTreeSet;
 
 /// Result of a `/model` command: open a picker, or show status/confirmation
 /// lines (after an exact-match switch or when nothing is available).
@@ -162,20 +163,36 @@ pub(crate) fn open_resume(cwd: &std::path::Path) -> Option<Modal> {
     if entries.is_empty() {
         return None;
     }
-    let rows = session_rows(&entries, session::current_ms());
+    let linked = resume_task_linked_session_ids(cwd);
+    let rows = session_rows(&entries, session::current_ms(), &linked);
     Some(Modal::Session(SessionPicker::new(rows)))
+}
+
+fn resume_task_linked_session_ids(cwd: &std::path::Path) -> BTreeSet<String> {
+    if !config::Settings::load(cwd)
+        .map(|settings| settings.tasks())
+        .unwrap_or(false)
+    {
+        return BTreeSet::new();
+    }
+    GitSafety::new_with_workflow(cwd, true).task_linked_session_ids()
 }
 
 /// Turn resumable-session metadata into display rows (id, preview, relative
 /// age), preserving the newest-first input order. Pure, so the `/resume` picker
 /// construction is unit-tested without the session store.
-pub(crate) fn session_rows(entries: &[ResumableSession], now_ms: u128) -> Vec<SessionRow> {
+pub(crate) fn session_rows(
+    entries: &[ResumableSession],
+    now_ms: u128,
+    task_linked_sessions: &BTreeSet<String>,
+) -> Vec<SessionRow> {
     entries
         .iter()
         .map(|entry| SessionRow {
             id: entry.meta.id.clone(),
             preview: entry.preview.clone(),
             age: session::relative_age(now_ms, entry.meta.updated_ms),
+            task_linked: task_linked_sessions.contains(&entry.meta.id),
         })
         .collect()
 }
@@ -270,8 +287,20 @@ pub(crate) fn resume_offer(session_id: &str) -> Modal {
         id: session_id.to_string(),
         preview: "resume the session that worked this task".to_string(),
         age: String::new(),
+        task_linked: false,
     };
     Modal::Session(SessionPicker::new(vec![row]))
+}
+
+/// Explicit "resume this linked task too" offer shown after resuming a session
+/// whose id appears in exactly one recoverable task record. The regular task
+/// picker is reused so Enter goes through the same adoption path and keeps the
+/// adoption notice copy unchanged.
+pub(crate) fn linked_task_offer(task: &RecoverableTask) -> Modal {
+    Modal::Tasks(TaskPicker::new(
+        None,
+        vec![TaskCard::from_recoverable(task)],
+    ))
 }
 
 /// Build the `/trust` project-permissions modal from the harness-owned policy
@@ -738,8 +767,9 @@ mod tests {
     }
 
     #[test]
-    fn session_rows_carry_id_preview_and_relative_age() {
+    fn session_rows_carry_id_preview_relative_age_and_task_marker() {
         use crate::session::{ResumableSession, SessionMeta};
+        use std::collections::BTreeSet;
         use std::path::PathBuf;
         let minute = 60_000u128;
         let entries = vec![
@@ -765,13 +795,16 @@ mod tests {
             },
         ];
         // now = 160 minutes: newest is 60m ago, older is 120m (2h) ago.
-        let rows = session_rows(&entries, minute * 160);
+        let linked = BTreeSet::from(["older".to_string()]);
+        let rows = session_rows(&entries, minute * 160, &linked);
         assert_eq!(rows.len(), 2, "order preserved (newest first)");
         assert_eq!(rows[0].id, "newest");
         assert_eq!(rows[0].preview, "recent task");
         assert_eq!(rows[0].age, "1h ago");
+        assert!(!rows[0].task_linked, "unjoined session is unmarked");
         assert_eq!(rows[1].id, "older");
         assert_eq!(rows[1].age, "2h ago");
+        assert!(rows[1].task_linked, "joined session is marked");
     }
 
     #[test]

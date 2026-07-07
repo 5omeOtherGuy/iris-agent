@@ -460,8 +460,11 @@ fn run_agent_inner(
         force_plain,
         settings.tui_settings(),
         &swap,
-        startup_modal,
-        start_page,
+        cli::StartupUi {
+            modal: startup_modal,
+            start_page,
+            resumed_session: None,
+        },
     )
 }
 
@@ -718,8 +721,11 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
         force_plain,
         settings.tui_settings(),
         &swap,
-        None,
-        false,
+        cli::StartupUi {
+            modal: None,
+            start_page: false,
+            resumed_session: Some(session_id.clone()),
+        },
     )
 }
 

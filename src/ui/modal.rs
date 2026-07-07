@@ -990,6 +990,7 @@ pub(crate) struct SessionRow {
     pub(crate) id: String,
     pub(crate) preview: String,
     pub(crate) age: String,
+    pub(crate) task_linked: bool,
 }
 
 /// Searchable list of resumable sessions for the current workspace. Confirming a
@@ -1011,7 +1012,12 @@ impl SessionPicker {
                 } else {
                     row.preview
                 };
-                SelectorItem::new(row.id, label).detail(row.age)
+                let item = SelectorItem::new(row.id, label).detail(row.age);
+                if row.task_linked {
+                    item.trailing("\u{25c7}")
+                } else {
+                    item
+                }
             })
             .collect();
         SessionPicker {
@@ -2270,11 +2276,13 @@ mod tests {
                 id: "aaaa".to_string(),
                 preview: "fix the login bug".to_string(),
                 age: "5m ago".to_string(),
+                task_linked: true,
             },
             SessionRow {
                 id: "bbbb".to_string(),
                 preview: "add rate limiting".to_string(),
                 age: "2h ago".to_string(),
+                task_linked: false,
             },
         ]
     }
@@ -2306,6 +2314,34 @@ mod tests {
             other => panic!("expected the filtered row, got {other:?}"),
         }
         assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn session_picker_marks_rows_linked_to_unreviewed_tasks() {
+        let picker = SessionPicker::new(session_rows());
+        let rendered: String = picker
+            .render(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("fix the login bug") && rendered.contains("\u{25c7}"),
+            "linked row should show the task marker: {rendered}"
+        );
+        let rate_row = rendered
+            .lines()
+            .find(|line| line.contains("add rate limiting"))
+            .unwrap_or("");
+        assert!(
+            !rate_row.contains("\u{25c7}"),
+            "unlinked row must not show the marker: {rate_row}"
+        );
     }
 
     fn recoverable_cards() -> Vec<TaskCard> {

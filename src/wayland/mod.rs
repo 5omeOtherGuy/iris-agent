@@ -601,6 +601,20 @@ impl<P: ChatProvider> Harness<P> {
         self.git_safety.recover_and_expire()
     }
 
+    /// Recovery pass for an explicit session resume. Preserves the normal stale
+    /// sweep and generic recovery policy, but lets the git-safety seam surface
+    /// a linked-task offer when exactly one recoverable task names the resumed
+    /// session in its display-only join.
+    pub(crate) fn recover_checkpoints_for_resumed_session(
+        &self,
+        session_id: &str,
+    ) -> git_safety::RecoveryOutcome {
+        if !self.task_workflow_enabled {
+            return git_safety::RecoveryOutcome::None;
+        }
+        self.git_safety.recover_and_expire_for_session(session_id)
+    }
+
     /// The lease-free recoverable/legacy task records in this workspace, for the
     /// `/tasks` resume-task picker (#288, ADR-0031). Live foreign (leased) tasks
     /// are already excluded by the git-safety seam. `body`/`sessions` on each row
