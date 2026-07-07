@@ -1,7 +1,10 @@
 # ADR-0035: Git worktree isolation — Tier 0 of the ADR-0028 guarantee model, apply = settlement
 
 **Date**: 2026-07-03
-**Status**: proposed
+**Status**: proposed — amended by
+[ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
+(the future subagent feature must not be named `task`; task records are
+per-worktree while checkpoint refs live in the shared common ref store)
 **Deciders**: operator + agent design review (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), issue [#267](https://github.com/5omeOtherGuy/iris-agent/issues/267))
 
 ## Context

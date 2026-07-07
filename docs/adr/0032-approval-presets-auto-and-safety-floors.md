@@ -1,7 +1,11 @@
 # ADR-0032: Approval presets, auto mode, and non-bypassable safety floors
 
 **Date**: 2026-07-04
-**Status**: accepted — v1 implemented (Nexus-owned `strict`/`auto`/`never`
+**Status**: accepted — amended by
+[ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
+(task-scoped dirty-file grants apply to bash attribution as well as edit/write;
+the dirty-tree guard remains a non-bypassable floor). v1 implemented
+(Nexus-owned `strict`/`auto`/`never`
 approval mode, `/approval` session control, and TUI status label). v1 auto-runs
 only clean in-workspace `edit`/`write`; the destructive, dirty-file, and
 repository-control floors are enforced. Auto bash (and its sandbox preflight

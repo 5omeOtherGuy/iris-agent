@@ -7,7 +7,10 @@
 adoption) and
 [ADR-0031](0031-task-identity-session-linkage-and-resumable-tasks.md)
 (task records carry opaque body + session links; `taskLifecycle` session
-entries)
+entries), and
+[ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
+(always-on guard split from opt-in durable task workflow; added settlement
+signals; checkpoint and cleanup semantics)
 **Deciders**: operator + agent design review (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261))
 
 ## Context
@@ -66,8 +69,8 @@ zero enforcement weight.
   files correct restore semantics for free. Rollback = materialize ledger
   paths from a checkpoint tree; user paths are never touched.
 - **Unsettled diff + new mutating work** auto-checkpoints silently; rollback
-  offers the chain as multiple restore points. Intermediate checkpoints are
-  GC'd on settlement (keep last N) so refs do not accumulate.
+  offers the chain as multiple restore points. Amended by ADR-0052: settlement
+  destroys checkpoint refs once the durable task record is removed.
 - **Non-git directories:** degrade to plain content snapshots of protected
   files in the session directory, with documented reduced guarantees. The
   feature announces itself as degraded rather than pretending.
@@ -226,5 +229,5 @@ detect this and constrain itself. Details are settled in #262 implementation.
   by the blocking/async split.
 - Index restoration in exotic repo states (mid-merge/rebase) may need the
   detect-and-warn degrade path more often than hoped.
-- Ref accumulation if settlement GC has bugs — needs a test and an expiry
+- Ref accumulation if settlement cleanup has bugs — needs a test and an expiry
   sweep.

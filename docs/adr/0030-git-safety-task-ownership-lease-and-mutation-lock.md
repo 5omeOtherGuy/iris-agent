@@ -1,7 +1,11 @@
 # ADR-0030: Git-safety task ownership — per-task lease and repo mutation lock
 
 **Date**: 2026-07-03
-**Status**: accepted
+**Status**: accepted — amended by
+[ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
+(leases apply only to the opt-in durable workflow; adoption must fail before
+side effects when another task is active; orphan-ref repair must respect live
+leases)
 **Deciders**: operator + agent design review (issue [#285](https://github.com/5omeOtherGuy/iris-agent/issues/285))
 
 ## Context

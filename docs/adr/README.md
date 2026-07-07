@@ -52,6 +52,7 @@
 | [0049](0049-dangerously-skip-permissions-mode.md) | `--dangerously-skip-permissions` bypasses the approval gate | accepted | 2026-07-05 |
 | [0050](0050-stream-reasoning-summary-deltas.md) | Stream reasoning summary deltas as a display event | accepted | 2026-07-05 |
 | [0051](0051-cache-aware-fold-flush-scheduling.md) | Cache-aware fold flush scheduling | accepted | 2026-07-05 |
+| [0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md) | Task workflow v2 - opt-in workflow, always-on guard, and integrated settlement | accepted | 2026-07-07 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.

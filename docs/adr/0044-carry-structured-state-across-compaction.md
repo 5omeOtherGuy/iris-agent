@@ -1,7 +1,10 @@
 # ADR-0044: Carry structured state across compaction, separate from the prose summary
 
 **Date**: 2026-07-04
-**Status**: accepted
+**Status**: accepted — amended by
+[ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
+(structured carry includes bounded task state when unreviewed Iris changes are
+open)
 **Deciders**: Iris maintainers, Claude agent session
 
 ## Context
