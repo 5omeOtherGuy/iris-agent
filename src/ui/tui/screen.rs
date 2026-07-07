@@ -425,10 +425,9 @@ pub(crate) struct Screen {
     /// the approval lifecycle; only meaningful while the spinner is active.
     phase: WorkPhase,
     /// Whether the terminal (pane) reports itself focused. Terminals without
-    /// focus reporting never send focus events, so this stays true. While
-    /// unfocused the spinner holds its frame and requests no tick redraws, so N
-    /// backgrounded Iris panes in a tmux session do not each animate at 10Hz;
-    /// event-driven redraws (streaming, tool output) continue as normal.
+    /// focus reporting never send focus events, so this stays true. We track the
+    /// state only to coalesce focus-change redraws; animation and streaming stay
+    /// live in inactive panes so adjacent terminal panes do not look frozen.
     terminal_focused: bool,
     /// Effective approval-policy posture for the bottom statusline.
     approval_policy: ApprovalPolicy,
@@ -1170,15 +1169,14 @@ impl Screen {
     /// loop only redraws on a tick while a turn is running). While an approval is
     /// shown the spinner is hidden behind the hint, so a tick changes nothing and
     /// requests no redraw -- the loop stays CPU-idle waiting on the decision.
-    /// An unfocused terminal likewise holds the frame: pure animation is not
-    /// worth per-tick redraws in a pane the user is not looking at.
     pub(crate) fn tick(&mut self) -> bool {
-        if self.awaiting_approval || !self.terminal_focused {
+        if self.awaiting_approval {
             return false;
         }
-        // The start page's IrisMark reuses the spinner tick machinery: it
-        // animates only while the terminal is focused, and holds still under
-        // reduced motion (StartPage::tick handles both cadence and freeze).
+        // The start page's IrisMark reuses the spinner tick machinery and holds
+        // still under reduced motion (StartPage::tick handles both cadence and
+        // freeze). It must keep ticking even in an inactive terminal pane: tmux
+        // users can see adjacent panes, and a frozen Iris pane reads as stalled.
         if let Some(page) = &mut self.start_page {
             return page.tick();
         }
@@ -2721,24 +2719,25 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_terminal_holds_tick_redraws_until_refocus() {
+    fn inactive_terminal_panes_keep_tick_redraws_live() {
         let mut screen = Screen::new();
         screen.start_turn();
         assert!(screen.tick(), "a focused running turn animates");
 
-        // Losing focus (tmux pane switched away) pauses tick-driven redraws;
-        // the change itself is reported once so the loop can react.
+        // tmux and terminal tabs can keep inactive panes visible. Focus changes
+        // should be tracked for coalescing, but they must not pause rendering.
         assert!(screen.set_terminal_focused(false));
-        assert!(!screen.tick(), "no animation redraws while unfocused");
+        assert!(
+            screen.tick(),
+            "animation continues while the pane is inactive"
+        );
         assert!(
             !screen.set_terminal_focused(false),
             "repeated focus reports are not a state change"
         );
 
-        // Refocus reports the change (the loop redraws once to catch up) and
-        // the animation resumes.
         assert!(screen.set_terminal_focused(true));
-        assert!(screen.tick(), "animation resumes when refocused");
+        assert!(screen.tick(), "animation remains live when refocused");
     }
 
     #[test]

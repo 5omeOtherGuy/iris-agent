@@ -317,10 +317,9 @@ impl TuiUi {
         // gated and the matching pop is conditional. A probe error is treated as
         // "unsupported" (safe fallback to plain Crossterm key events).
         let supports_enhancement = supports_keyboard_enhancement().unwrap_or(false);
-        // Focus reporting drives the unfocused-pane animation pause (tmux with
-        // `focus-events on`, most terminals natively). Terminals without it
-        // ignore the mode and simply never send focus events, so Iris stays in
-        // its default focused state.
+        // Focus reporting is tracked so duplicate focus changes can be ignored
+        // and a regained pane can redraw once. It must not pause rendering:
+        // inactive tmux panes can remain visible beside the active pane.
         if let Err(error) = execute!(stdout, EnableBracketedPaste, EnableFocusChange, Hide) {
             let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
             let _ = disable_raw_mode();
