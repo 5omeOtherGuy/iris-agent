@@ -17,7 +17,7 @@ use anyhow::Result;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::{GitSafety, RecoveryOutcome, task_state};
+use super::{EXTERNAL_SETTLEMENT_NOTICE, GitSafety, RecoveryOutcome, task_state};
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
     AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream,
@@ -1039,5 +1039,76 @@ fn harness_records_task_lifecycle_and_qanda_opens_nothing() -> Result<()> {
             .any(|m| m.content == "create the new file"),
         "the user prompt is reconstructed"
     );
+    Ok(())
+}
+
+#[test]
+fn harness_records_external_settlement_when_user_commits_task() -> Result<()> {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let session_root = temp_dir();
+    let session = crate::session::SessionLog::create_in(&session_root.path, &repo.path).unwrap();
+    let session_path = session.path().to_path_buf();
+
+    let provider = FakeProvider::new(vec![
+        write_call("c1", "new.txt", "hi\n"),
+        AssistantTurn::text("created it"),
+        AssistantTurn::text("ok"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        Some(session),
+        None,
+    );
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        "create the new file",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    assert_eq!(
+        task_state::load_all(&git_dir).len(),
+        1,
+        "the task is open before the user commit"
+    );
+
+    run_git(&repo.path, &["add", "new.txt"]);
+    run_git(&repo.path, &["commit", "-q", "-m", "accept iris work"]);
+
+    block_on(harness.submit_turn(
+        "what happened?",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+    drop(harness);
+
+    assert!(
+        task_state::load_all(&git_dir).is_empty(),
+        "the user commit closes the durable task"
+    );
+    assert!(
+        frontend.events.borrow().iter().any(
+            |event| matches!(event, AgentEvent::Notice(message) if message == EXTERNAL_SETTLEMENT_NOTICE)
+        ),
+        "the external-settlement notice is emitted"
+    );
+
+    let entries: Vec<serde_json::Value> = fs::read_to_string(&session_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let settled: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["type"] == "taskLifecycle" && e["event"] == "settled")
+        .collect();
+    assert_eq!(settled.len(), 1, "exactly one settle recorded");
+    assert_eq!(settled[0]["disposition"], "external");
     Ok(())
 }

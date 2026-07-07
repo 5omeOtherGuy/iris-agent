@@ -79,10 +79,13 @@ pub(crate) struct RestorePoint {
 /// the settled task id (ADR-0031), so the harness can append a `TaskSettled`
 /// audit entry. The id is metadata for the session-log join; enforcement never
 /// keys off it.
+#[derive(Debug, Clone)]
 pub(crate) struct Settlement {
     pub(crate) summary: String,
     pub(crate) task_id: String,
 }
+
+pub(crate) const EXTERNAL_SETTLEMENT_NOTICE: &str = "Iris changes committed by you — task closed.";
 
 /// Outcome of a rollback attempt, surfaced to the user (Tier 3).
 pub(crate) struct RollbackOutcome {
@@ -244,6 +247,10 @@ impl Task {
 
 struct State {
     task: Option<Task>,
+    /// Clean-ledger settlement events observed inside sync barriers. The guard
+    /// can detect the repository state, but the Wayland harness owns session
+    /// lifecycle writes and UI notices, so callers drain these after barriers.
+    external_settlements: Vec<Settlement>,
     /// The current turn's prompt preview, handed by the harness before each turn
     /// (ADR-0031). `note_mutation` consumes it as the opening task's `body` and
     /// clears it; a follow-up turn joining an unsettled task clears it without
@@ -297,6 +304,7 @@ impl GitSafety {
             workflow_enabled,
             state: Mutex::new(State {
                 task: None,
+                external_settlements: Vec::new(),
                 pending_body: None,
                 session_id: None,
             }),
@@ -434,6 +442,19 @@ impl GitSafety {
             .is_some_and(|task| task.durable)
     }
 
+    /// Drain externally-observed settlements. This joins any pending attribution
+    /// first, so a user commit/revert after Iris's last write closes the task at
+    /// the same hard barrier that final diff/rollback already depend on.
+    pub(crate) fn drain_external_settlements(&self) -> Vec<Settlement> {
+        self.sync_barrier();
+        self.state
+            .lock()
+            .unwrap()
+            .external_settlements
+            .drain(..)
+            .collect()
+    }
+
     /// The captured index (`git ls-files --stage`) of the current baseline
     /// (test-only): asserts the index is part of the baseline.
     #[cfg(test)]
@@ -516,6 +537,101 @@ impl GitSafety {
                 self.persist_task(task);
             }
         }
+        if let Some(settlement) = self.settle_external_if_clean() {
+            self.state
+                .lock()
+                .unwrap()
+                .external_settlements
+                .push(settlement);
+        }
+    }
+
+    fn settle_external_if_clean(&self) -> Option<Settlement> {
+        let mut state = self.state.lock().unwrap();
+        let task = state.task.as_ref()?;
+        if !task.durable
+            || task.degraded
+            || task.ledger.entries.is_empty()
+            || !matches!(self.mode, Mode::Git)
+            || !self.ledger_paths_clean_in_git(
+                task.ledger.entries.iter().map(|entry| entry.path.as_path()),
+            )
+        {
+            return None;
+        }
+        let task = state.task.take()?;
+        drop(state);
+        Some(self.destroy_settled_task(task, EXTERNAL_SETTLEMENT_NOTICE.to_string()))
+    }
+
+    fn persisted_paths_clean_in_git(&self, task: &task_state::PersistedTask) -> bool {
+        if task.expected.is_empty() || !matches!(self.mode, Mode::Git) {
+            return false;
+        }
+        self.ledger_paths_clean_in_git(task.expected.keys().map(|path| Path::new(path.as_str())))
+    }
+
+    fn ledger_paths_clean_in_git<'a>(&self, paths: impl Iterator<Item = &'a Path>) -> bool {
+        let mut scoped = BTreeSet::new();
+        for path in paths {
+            let display = path
+                .strip_prefix(&self.workspace)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            scoped.insert(display);
+        }
+        if scoped.is_empty() {
+            return false;
+        }
+        let mut args = vec![
+            "status".to_string(),
+            "--porcelain=v1".to_string(),
+            "--untracked-files=all".to_string(),
+            "--".to_string(),
+        ];
+        args.extend(scoped);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        match git::git_stdout(&self.workspace, &refs) {
+            Ok(stdout) => stdout.is_empty(),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "could not check task ledger cleanliness");
+                false
+            }
+        }
+    }
+
+    fn destroy_settled_task(&self, task: Task, summary: String) -> Settlement {
+        // Keep the task lease held (`_lease`) through the whole teardown: while it
+        // is held no other process can adopt or checkpoint this task, closing the
+        // TOCTOU window between settling and record removal (ADR-0030).
+        let Task {
+            mut chain,
+            git_dir,
+            task_id,
+            _lease,
+            ..
+        } = task;
+        let destroy_chain = |chain: &mut Chain| match chain {
+            Chain::Git(chain) => {
+                if let Err(error) = chain.destroy() {
+                    tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on settlement failed");
+                }
+            }
+            Chain::Fallback(_) => {}
+        };
+        // Serialize the ref teardown + record removal against concurrent processes
+        // (ADR-0030): one short mutation-lock hold around the shared writes.
+        if let Some(git_dir) = git_dir {
+            lock::with_mutation_lock(&git_dir, || {
+                destroy_chain(&mut chain);
+                task_state::remove(&git_dir, &task_id);
+            });
+        } else {
+            destroy_chain(&mut chain);
+        }
+        drop(_lease);
+        Settlement { summary, task_id }
     }
 
     /// Persist the current task's minimal recovery record (git tasks only).

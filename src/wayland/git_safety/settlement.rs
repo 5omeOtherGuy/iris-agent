@@ -199,39 +199,10 @@ impl GitSafety {
         }
         let task = state.task.take()?;
         let count = task.ledger.entries.len();
-        // Keep the task lease held (`_lease`) through the whole teardown: while it
-        // is held no other process can adopt or checkpoint this task, closing the
-        // TOCTOU window between settling and record removal (ADR-0030).
-        let Task {
-            mut chain,
-            git_dir,
-            task_id,
-            _lease,
-            ..
-        } = task;
-        let destroy_chain = |chain: &mut Chain| match chain {
-            Chain::Git(chain) => {
-                if let Err(error) = chain.destroy() {
-                    tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on accept failed");
-                }
-            }
-            Chain::Fallback(_) => {}
-        };
-        // Serialize the ref teardown + record removal against concurrent processes
-        // (ADR-0030): one short mutation-lock hold around the shared writes.
-        if let Some(git_dir) = git_dir {
-            lock::with_mutation_lock(&git_dir, || {
-                destroy_chain(&mut chain);
-                task_state::remove(&git_dir, &task_id);
-            });
-        } else {
-            destroy_chain(&mut chain);
-        }
-        drop(_lease);
-        Some(Settlement {
-            summary: format!("accepted {count} Iris change(s); checkpoints removed"),
-            task_id,
-        })
+        Some(self.destroy_settled_task(
+            task,
+            format!("accepted {count} Iris change(s); checkpoints removed"),
+        ))
     }
 
     /// Record an explicit user checkpoint (the `/checkpoint` command) and settle
@@ -460,7 +431,9 @@ impl GitSafety {
             if task.workspace != workspace {
                 continue;
             }
-            if !task.is_expired(now, task_state::DEFAULT_EXPIRY) {
+            if !task.is_expired(now, task_state::DEFAULT_EXPIRY)
+                && !self.persisted_paths_clean_in_git(&task)
+            {
                 continue;
             }
             // Never touch a live foreign task, even an old one (ADR-0030): claim

@@ -553,6 +553,14 @@ impl<P: ChatProvider> Harness<P> {
         Some(settled.summary)
     }
 
+    fn emit_external_task_settlements(&mut self, obs: &dyn AgentObserver) -> Result<()> {
+        for settled in self.git_safety.drain_external_settlements() {
+            self.record_task_settled(&settled.task_id, "external");
+            obs.on_event(AgentEvent::Notice(settled.summary))?;
+        }
+        Ok(())
+    }
+
     /// Record an explicit checkpoint and settle the task (`/checkpoint`), then
     /// append a `TaskSettled` audit entry (ADR-0031).
     pub(crate) fn save_checkpoint(&mut self) -> Option<String> {
@@ -797,6 +805,7 @@ impl<P: ChatProvider> Harness<P> {
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
     ) -> Result<()> {
+        self.emit_external_task_settlements(obs)?;
         // Safe turn boundary: before the provider request, first fold spent
         // tool results (opt-in microcompaction, ADR-0048), then compact if the
         // current context still exceeds the configured budget. Folding runs
@@ -844,6 +853,7 @@ impl<P: ChatProvider> Harness<P> {
         // the transcript records the user prompt and any tool work. Best-effort:
         // a write failure is logged, never fatal to the session.
         self.persist_new_messages();
+        self.emit_external_task_settlements(obs)?;
         // If a task opened during this turn, record a `TaskOpened` audit entry
         // (ADR-0031). A task never settles mid-turn (settlement is an explicit
         // command), so a `current_task_id` that differs from `prior_task` and is
@@ -862,6 +872,7 @@ impl<P: ChatProvider> Harness<P> {
         if result.is_ok() && !token.is_cancelled() && self.agent.mutated_this_turn() {
             self.maybe_emit_task_workflow_discovery(obs)?;
             self.run_verification_loop(obs, gate, token).await?;
+            self.emit_external_task_settlements(obs)?;
         }
         result
     }

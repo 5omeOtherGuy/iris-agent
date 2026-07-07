@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::checkpoint::{CheckpointChain, Mode};
 use super::settlement::{AdoptError, TaskClass};
-use super::{GitSafety, RecoveryOutcome, lock, task_state};
+use super::{EXTERNAL_SETTLEMENT_NOTICE, GitSafety, RecoveryOutcome, lock, task_state};
 
 /// Extract the single-orphan auto-adopt notice from a [`RecoveryOutcome`],
 /// panicking on any other variant. Keeps the recovery tests that assert on the
@@ -466,6 +466,106 @@ fn accept_destroys_checkpoint_refs_and_record() {
 }
 
 #[test]
+fn committed_ledger_paths_settle_external_and_remove_refs() {
+    let repo = init_repo();
+    let file = repo.path.join("new.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"iris work\n");
+    let task_id = task_state::load_all(&git_dir).pop().unwrap().task_id;
+    assert!(task_ref_count(&repo.path, &task_id) > 0);
+
+    run_git(&repo.path, &["add", "new.txt"]);
+    run_git(&repo.path, &["commit", "-q", "-m", "user accepts work"]);
+    let settlements = guard.drain_external_settlements();
+
+    assert_eq!(settlements.len(), 1);
+    assert_eq!(settlements[0].summary, EXTERNAL_SETTLEMENT_NOTICE);
+    assert_eq!(settlements[0].task_id, task_id);
+    assert!(task_state::load_all(&git_dir).is_empty(), "record removed");
+    assert_eq!(
+        iris_ref_count(&repo.path),
+        0,
+        "external settlement removes checkpoint refs"
+    );
+}
+
+#[test]
+fn partial_commit_keeps_task_open_until_all_ledger_paths_clean() {
+    let repo = init_repo();
+    let one = repo.path.join("one.txt");
+    let two = repo.path.join("two.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    guard.note_mutation();
+    iris_write(&guard, &one, b"one\n");
+    iris_write(&guard, &two, b"two\n");
+    let task_id = task_state::load_all(&git_dir).pop().unwrap().task_id;
+
+    run_git(&repo.path, &["add", "one.txt"]);
+    run_git(&repo.path, &["commit", "-q", "-m", "partial"]);
+    assert!(
+        guard.drain_external_settlements().is_empty(),
+        "a dirty ledger path keeps the task open"
+    );
+    assert_eq!(task_state::load_all(&git_dir).len(), 1);
+
+    run_git(&repo.path, &["add", "two.txt"]);
+    run_git(&repo.path, &["commit", "-q", "-m", "finish"]);
+    let settlements = guard.drain_external_settlements();
+
+    assert_eq!(settlements.len(), 1);
+    assert_eq!(settlements[0].task_id, task_id);
+    assert!(task_state::load_all(&git_dir).is_empty());
+}
+
+#[test]
+fn reverting_all_ledger_paths_to_head_settles_external() {
+    let repo = init_repo();
+    let file = repo.path.join("committed.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let guard = GitSafety::new(&repo.path);
+
+    guard.note_mutation();
+    iris_write(&guard, &file, b"iris edit\n");
+    run_git(&repo.path, &["checkout", "--", "committed.txt"]);
+
+    let settlements = guard.drain_external_settlements();
+
+    assert_eq!(settlements.len(), 1);
+    assert_eq!(settlements[0].summary, EXTERNAL_SETTLEMENT_NOTICE);
+    assert!(task_state::load_all(&git_dir).is_empty());
+}
+
+#[test]
+fn recovery_silently_removes_clean_orphan() {
+    let repo = init_repo();
+    let file = repo.path.join("new.txt");
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let task_id = {
+        let guard = GitSafety::new(&repo.path);
+        guard.note_mutation();
+        iris_write(&guard, &file, b"iris work\n");
+        task_state::load_all(&git_dir).pop().unwrap().task_id
+    };
+
+    run_git(&repo.path, &["add", "new.txt"]);
+    run_git(&repo.path, &["commit", "-q", "-m", "accepted externally"]);
+    let outcome = GitSafety::new(&repo.path).recover_and_expire();
+
+    assert!(matches!(outcome, RecoveryOutcome::None));
+    assert!(task_state::load_all(&git_dir).is_empty(), "record removed");
+    assert_eq!(
+        task_ref_count(&repo.path, &task_id),
+        0,
+        "recovery cleanup removes refs for clean orphan"
+    );
+}
+
+#[test]
 fn checkpoint_now_destroys_checkpoint_refs_and_record() {
     let repo = init_repo();
     let file = repo.path.join("committed.txt");
@@ -602,6 +702,25 @@ fn non_git_fallback_snapshots_and_restores() {
     guard.rollback(0).unwrap();
     assert_eq!(fs::read(&existing).unwrap(), b"original\n", "edit undone");
     assert!(!created.exists(), "created file removed");
+}
+
+#[test]
+fn degraded_mode_does_not_external_settle() {
+    let dir = temp_dir();
+    let file = dir.path.join("created.txt");
+    let guard = GitSafety::new(&dir.path);
+
+    guard.note_mutation();
+    iris_write_degraded(&guard, &file, b"iris new file\n");
+
+    assert!(
+        guard.drain_external_settlements().is_empty(),
+        "clean-git settlement does not apply in degraded mode"
+    );
+    assert!(
+        !guard.restore_points().is_empty(),
+        "degraded rollback state remains available"
+    );
 }
 
 /// Degraded-mode write helper: no gating, so `after_exec` records a fallback
