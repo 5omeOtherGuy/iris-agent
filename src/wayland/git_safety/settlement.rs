@@ -15,9 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 
 use super::{
-    Baseline, Chain, CheckpointChain, GitSafety, IrisChange, KEEP_CHECKPOINTS, Mode, RestorePoint,
-    RollbackOutcome, Settlement, Task, baseline, checkpoint, git, lock, push_session_deduped,
-    task_state,
+    Baseline, Chain, CheckpointChain, GitSafety, IrisChange, Mode, RestorePoint, RollbackOutcome,
+    Settlement, Task, baseline, checkpoint, git, lock, push_session_deduped, task_state,
 };
 
 /// How a persisted record classifies during recovery (ADR-0030). Leased (live
@@ -173,9 +172,9 @@ impl GitSafety {
         }
     }
 
-    /// Settle the current task as ACCEPTED (ADR-0028): freeze the ledger, GC the
-    /// intermediate checkpoints keeping the last N, and drop the recovery record
-    /// so the accepted work is no longer offered for rollback. Returns the
+    /// Settle the current task as ACCEPTED (ADR-0028): freeze the ledger, delete
+    /// its checkpoint refs, and drop the recovery record so the accepted work is
+    /// no longer offered for rollback. Returns the
     /// settled task id plus a one-line summary (ADR-0031: the harness appends a
     /// `TaskSettled` audit entry from the id), or `None` when no task is active.
     pub(crate) fn accept(&self) -> Option<Settlement> {
@@ -193,27 +192,27 @@ impl GitSafety {
             _lease,
             ..
         } = task;
-        let gc_chain = |chain: &mut Chain| match chain {
+        let destroy_chain = |chain: &mut Chain| match chain {
             Chain::Git(chain) => {
-                if let Err(error) = chain.gc(KEEP_CHECKPOINTS) {
-                    tracing::warn!(error = %format!("{error:#}"), "checkpoint GC on accept failed");
+                if let Err(error) = chain.destroy() {
+                    tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on accept failed");
                 }
             }
-            Chain::Fallback(store) => store.gc(KEEP_CHECKPOINTS),
+            Chain::Fallback(_) => {}
         };
-        // Serialize the ref GC + record removal against concurrent processes
+        // Serialize the ref teardown + record removal against concurrent processes
         // (ADR-0030): one short mutation-lock hold around the shared writes.
         if let Some(git_dir) = git_dir {
             lock::with_mutation_lock(&git_dir, || {
-                gc_chain(&mut chain);
+                destroy_chain(&mut chain);
                 task_state::remove(&git_dir, &task_id);
             });
         } else {
-            gc_chain(&mut chain);
+            destroy_chain(&mut chain);
         }
         drop(_lease);
         Some(Settlement {
-            summary: format!("accepted {count} Iris change(s); checkpoints pruned"),
+            summary: format!("accepted {count} Iris change(s); checkpoints removed"),
             task_id,
         })
     }
@@ -419,10 +418,11 @@ impl GitSafety {
     }
 
     /// Expire stale unsettled tasks in this workspace (ADR-0028 30-day window):
-    /// each auto-settles as accepted and its `refs/iris/*` refs are GC'd -- by
-    /// then the changes are the user's de facto working state. Each record's
+    /// each auto-settles as accepted and its `refs/iris/*` refs are deleted --
+    /// by then the changes are the user's de facto working state. Each record's
     /// teardown runs under the repo mutation lock so it never tears against a
-    /// concurrent write (ADR-0030).
+    /// concurrent write (ADR-0030). The same recovery pass also repairs old
+    /// accepted/checkpointed tasks that leaked recordless checkpoint refs.
     pub(super) fn expire_stale(&self, git_dir: &Path, now: SystemTime) {
         let workspace = self.workspace.to_string_lossy().into_owned();
         for task in task_state::load_all(git_dir) {
@@ -448,6 +448,56 @@ impl GitSafety {
                 task_state::remove(git_dir, &task.task_id);
             });
             drop(lease);
+        }
+        self.sweep_orphan_checkpoint_refs(git_dir);
+    }
+
+    /// Repair already-polluted repos by deleting checkpoint namespaces that have
+    /// no surviving task record. Checkpoint refs are stored in the shared ref
+    /// namespace, so linked worktree records must be considered together: a
+    /// namespace is orphaned only when no worktree git-dir has a record for it.
+    /// A stale lease file, if present, must also be claimable before deletion.
+    fn sweep_orphan_checkpoint_refs(&self, git_dir: &Path) {
+        let task_ids = match checkpoint::list_checkpoint_task_ids(&self.workspace) {
+            Ok(task_ids) => task_ids,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "checkpoint orphan-ref sweep could not list refs");
+                return;
+            }
+        };
+        if task_ids.is_empty() {
+            return;
+        }
+
+        let git_dirs = repo_git_dirs(&self.workspace, git_dir);
+        let recorded: BTreeSet<String> = git_dirs
+            .iter()
+            .flat_map(|dir| task_state::load_all(dir))
+            .map(|task| task.task_id)
+            .collect();
+
+        for task_id in task_ids {
+            if recorded.contains(&task_id) {
+                continue;
+            }
+            let Some(lease_claims) = claim_existing_leases(&git_dirs, &task_id) else {
+                continue;
+            };
+            let destroyed = lock::with_mutation_lock(
+                git_dir,
+                || match checkpoint::destroy_task_refs(&self.workspace, &task_id) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(task_id = %task_id, error = %format!("{error:#}"), "checkpoint orphan-ref sweep failed");
+                        false
+                    }
+                },
+            );
+            if destroyed {
+                for (path, _guard) in lease_claims {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
     }
 
@@ -637,6 +687,54 @@ impl GitSafety {
             state.task = Some(task);
         }
     }
+}
+
+/// Git exposes checkpoint refs through the common ref store, while Iris task
+/// records live beside each linked worktree's git-dir. Collect every git-dir in
+/// this repository so an orphan-ref sweep does not delete a namespace still
+/// recorded by another linked worktree.
+fn repo_git_dirs(workspace: &Path, current_git_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = BTreeSet::new();
+    dirs.insert(current_git_dir.to_path_buf());
+
+    if let Ok(out) = git::git_stdout(workspace, &["worktree", "list", "--porcelain"]) {
+        let text = String::from_utf8_lossy(&out);
+        for line in text.lines() {
+            let Some(path) = line.strip_prefix("worktree ") else {
+                continue;
+            };
+            if let Some(git_dir) = task_state::git_dir(Path::new(path)) {
+                dirs.insert(git_dir);
+            }
+        }
+    }
+
+    dirs.into_iter().collect()
+}
+
+/// Claim any existing stale lease files for `task_id`. Missing files are already
+/// lease-free and are not created just for the sweep. Any held/erroring lease
+/// blocks deletion in the safe direction.
+fn claim_existing_leases(
+    git_dirs: &[PathBuf],
+    task_id: &str,
+) -> Option<Vec<(PathBuf, lock::FlockGuard)>> {
+    let mut claims = Vec::new();
+    for git_dir in git_dirs {
+        let path = lock::lease_path(git_dir, task_id);
+        if !path.exists() {
+            continue;
+        }
+        match lock::try_exclusive_settled(&path) {
+            Ok(Some(guard)) => claims.push((path, guard)),
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(task_id = %task_id, path = %path.display(), error = %error, "checkpoint orphan-ref sweep could not claim lease");
+                return None;
+            }
+        }
+    }
+    Some(claims)
 }
 
 /// Whether the repo is in an exotic state where a blind index reset is unsafe

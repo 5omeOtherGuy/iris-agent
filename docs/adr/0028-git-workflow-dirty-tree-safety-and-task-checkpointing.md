@@ -70,7 +70,8 @@ zero enforcement weight.
   paths from a checkpoint tree; user paths are never touched.
 - **Unsettled diff + new mutating work** auto-checkpoints silently; rollback
   offers the chain as multiple restore points. Amended by ADR-0052: settlement
-  destroys checkpoint refs once the durable task record is removed.
+  destroys checkpoint refs once the durable task record is removed; recovery
+  also sweeps recordless checkpoint namespaces left by older builds.
 - **Non-git directories:** degrade to plain content snapshots of protected
   files in the session directory, with documented reduced guarantees. The
   feature announces itself as degraded rather than pretending.
@@ -229,5 +230,5 @@ detect this and constrain itself. Details are settled in #262 implementation.
   by the blocking/async split.
 - Index restoration in exotic repo states (mid-merge/rebase) may need the
   detect-and-warn degrade path more often than hoped.
-- Ref accumulation if settlement cleanup has bugs — needs a test and an expiry
-  sweep.
+- Ref accumulation if settlement teardown or orphan-ref repair has bugs — needs
+  tests and an expiry sweep.
