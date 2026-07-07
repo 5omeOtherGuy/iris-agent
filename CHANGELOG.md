@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The tool-block footer state is now a **proportional-prominence** token: the
+  colored state glyph (`◆ DONE` · `■ ERROR` · `◇ PREVIEW` · `● RUNNING` ·
+  `□ CANCELLED` · `▲ REVIEW` · `■ DENIED`) then the label, with the label **bold**
+  only for the consequential states (`ERROR`/`DENIED`/`REVIEW`) and muted for the
+  settled-success and transient ones — so a mostly-successful transcript no longer
+  shouts a column of bold state words. The glyph carries the at-a-glance state
+  (and the distinction the deliberately-lossy glyph can't, e.g. `■ ERROR` vs
+  `■ DENIED`, is carried by the word). The header stays glyph-free (#433).
+- An expanded tool block now reads as one unit. A dim `┊` **spine** on the body's
+  label column gives the block a continuous left edge from the header label, down
+  the body, into the footer rule and state token — the same soft-rail grammar the
+  reasoning rail and coalesced notices use, a rail (not a frame). A collapsed
+  block unmounts its body, so the spine shows only when expanded; it sits outside
+  diff-row background fills (#434).
 - System-prompt fragments are now fully internal (ADR-0026): the prompt is
   assembled only from the fragments built into the binary plus
   `AGENTS.md`/`CLAUDE.md` project docs, cwd, and date. Iris no longer
