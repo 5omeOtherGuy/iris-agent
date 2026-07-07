@@ -198,13 +198,13 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
             if !harness.task_workflow_enabled() {
                 return Some(vec![TASK_WORKFLOW_OFF_NOTICE.to_string()]);
             }
-            // Compute the net-diff summary BEFORE accepting settles the task
+            // Compute the net-diff summary BEFORE accepting finishes the task
             // (issue #264): show what is being accepted, per file. Fail closed
-            // (finding 2): a diff read error must NOT settle the task as if there
-            // were nothing to accept.
+            // (finding 2): a diff read error must NOT accept the task as if
+            // there were nothing to accept.
             match harness.task_diff() {
                 Err(error) => vec![format!(
-                    "could not compute task diff: {error:#}; not accepting (nothing settled)"
+                    "could not compute task diff: {error:#}; not accepting"
                 )],
                 Ok(diff) => {
                     let summary = diff.summary_lines();
@@ -214,7 +214,7 @@ pub(crate) fn handle_checkpoint_command<P: ChatProvider>(
                             lines.push(outcome);
                             lines
                         }
-                        None => vec!["no unsettled Iris changes to accept".to_string()],
+                        None => vec!["no unreviewed Iris changes to accept".to_string()],
                     }
                 }
             }
@@ -284,6 +284,39 @@ pub(crate) fn handle_tasks_command<P: ChatProvider>(
     }
 }
 
+/// `/task` is the compact help surface for the task workflow. It is display-only
+/// and shared by text/TUI so the command copy does not drift.
+pub(crate) fn handle_task_command<P: ChatProvider>(
+    line: &str,
+    harness: &Harness<P>,
+) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if cmd != "/task" {
+        return None;
+    }
+    match rest {
+        "" | "help" => Some(task_help_lines(harness.task_workflow_enabled())),
+        _ => Some(vec!["usage: /task [help]".to_string()]),
+    }
+}
+
+fn task_help_lines(enabled: bool) -> Vec<String> {
+    let state = if enabled { "on" } else { "off" };
+    vec![
+        format!("task workflow: {state}"),
+        "/tasks: review the active task, accept, inspect diff, undo, or resume an interrupted task"
+            .to_string(),
+        "/checkpoint: save a rollback point and keep working".to_string(),
+        "/diff: inspect Iris's current task changes".to_string(),
+        "/accept: accept Iris's current task changes".to_string(),
+        "/rollback: list or restore a rollback point".to_string(),
+    ]
+}
+
 /// Build the Tier-3 event for `/diff` (issue #264): the task's net diff as a
 /// summary + colorized unified diff, or an honest notice when there are no net
 /// Iris changes (or no unsettled task). Shared by the TUI and text drivers so
@@ -314,7 +347,7 @@ pub(crate) fn task_diff_event<P: ChatProvider>(harness: &Harness<P>) -> UiEvent 
 fn handle_rollback<P: ChatProvider>(rest: &str, harness: &mut Harness<P>) -> Vec<String> {
     let points = harness.checkpoint_restore_points();
     if points.is_empty() {
-        return vec!["no unsettled Iris changes to roll back".to_string()];
+        return vec!["no unreviewed Iris changes to roll back".to_string()];
     }
     if rest.is_empty() {
         let mut lines =
@@ -966,6 +999,12 @@ fn run_session_inner<P: ChatProvider>(
             }
             continue;
         }
+        if let Some(lines) = handle_task_command(prompt, harness) {
+            for line in lines {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
         // Approval preset (ADR-0032). A real session control, meaningful in the
         // non-TTY path too (e.g. `never` for a read-only/non-interactive
         // posture), handled at this safe boundary and never sent to the model.
@@ -1274,11 +1313,11 @@ mod tests {
         // or sends the line to the model).
         assert_eq!(
             handle_checkpoint_command("/accept", &mut harness).unwrap(),
-            vec!["no unsettled Iris changes to accept".to_string()]
+            vec!["no unreviewed Iris changes to accept".to_string()]
         );
         assert_eq!(
             handle_checkpoint_command("/rollback", &mut harness).unwrap(),
-            vec!["no unsettled Iris changes to roll back".to_string()]
+            vec!["no unreviewed Iris changes to roll back".to_string()]
         );
         assert_eq!(
             handle_checkpoint_command("/checkpoint", &mut harness).unwrap(),
@@ -1311,6 +1350,25 @@ mod tests {
         assert!(harness.task_workflow_enabled());
         let saved = config::Settings::load(&dir.path).unwrap();
         assert!(saved.tasks());
+    }
+
+    #[test]
+    fn task_help_command_surfaces_v2_workflow_copy() {
+        let (harness, _dir) = fake_harness();
+        let lines = handle_task_command("/task help", &harness).expect("task help");
+        assert!(lines[0].contains("task workflow:"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/checkpoint") && line.contains("keep working")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/tasks") && line.contains("resume an interrupted task")),
+            "{lines:?}"
+        );
     }
 
     #[test]

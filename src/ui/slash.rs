@@ -73,7 +73,12 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/tasks",
-        description: "Open the task surface (active + recoverable tasks; adopt/inspect)",
+        description: "Review the active task or resume interrupted tasks",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/task",
+        description: "Show task workflow help",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -153,7 +158,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/git",
-        description: "Open the git console (switch, worktrees, settle the task)",
+        description: "Open the git console (switch, worktrees, task actions)",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -173,12 +178,12 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/accept",
-        description: "Accept the current Iris changes and settle the task",
+        description: "Accept the current Iris changes",
         action: SlashAction::Submit,
     },
     SlashCommand {
         name: "/checkpoint",
-        description: "Save an explicit checkpoint and settle the task",
+        description: "Save a rollback point and keep working",
         action: SlashAction::Submit,
     },
 ];
@@ -314,8 +319,15 @@ mod tests {
             .find(|c| c.name == "/tasks")
             .expect("/tasks must be registered");
         assert_eq!(cmd.action, SlashAction::Submit);
-        // `/task` (and the full `/tasks`) narrow to it in the palette.
-        assert_eq!(matches("/task")[0].name, "/tasks");
+        let help = COMMANDS
+            .iter()
+            .find(|c| c.name == "/task")
+            .expect("/task must be registered");
+        assert_eq!(help.action, SlashAction::Submit);
+        // `/task` narrows to the task surface and help command; registry order
+        // keeps `/tasks` first for users heading to the modal.
+        let task_matches: Vec<&str> = matches("/task").iter().map(|c| c.name).collect();
+        assert_eq!(task_matches, vec!["/tasks", "/task"]);
     }
 
     #[test]
