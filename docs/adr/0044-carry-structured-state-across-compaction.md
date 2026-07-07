@@ -54,9 +54,13 @@ and render it verbatim into rebuilt context next to the prose summary.
   entry as an optional field; ADR-0009 already reserves this extension path (fields attach
   without changing the kind). Older readers ignore it; the entry kind and coverage semantics
   are unchanged.
+- **Task workflow state is additive inside the same entry.** ADR-0052 adds an optional
+  `taskState` object with `taskBody` and bounded `ledgerPaths` fields when the task workflow
+  is enabled and an unreviewed task is open at compaction time. The source is the
+  guard/workflow state, not provider prose. Folds do not write `taskState`.
 - **Rebuild renders it deterministically.** `read_messages` emits `summary + carry + retained
   tail`. The carry is deterministic text counted in the entry `tokenEstimate`; the shrink
-  guard covers summary plus carry.
+  guard covers the summary plus all deterministic carry blocks.
 - **Room to grow.** The field is a structured carry, not a paths-only field, so an active
   plan/todo carry attaches later without a format change once that state exists.
 

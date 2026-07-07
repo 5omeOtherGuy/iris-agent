@@ -231,6 +231,10 @@ impl CheckpointChain {
         self.before.len()
     }
 
+    pub(super) fn ledger_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.before.keys()
+    }
+
     /// Net-diff inputs (issue #264): for every ledger path, its pre-task bytes
     /// (read back from the base snapshot blob; `None` = a create) and its current
     /// bytes. `root` is the source tree the current side comes from -- normally

@@ -272,6 +272,13 @@ fn push_session_deduped(sessions: &mut Vec<String>, session_id: &str) {
     }
 }
 
+fn push_recent_path(paths: &mut Vec<String>, path: String) {
+    if let Some(pos) = paths.iter().position(|existing| *existing == path) {
+        paths.remove(pos);
+    }
+    paths.push(path);
+}
+
 /// The Tier-2 dirty-tree safety guard. Owned by the harness, injected into each
 /// turn's `ToolEnv` as a `&dyn MutationGuard`.
 pub(crate) struct GitSafety {
@@ -434,6 +441,43 @@ impl GitSafety {
                 .collect(),
             all_dirty_approved: task.all_dirty_approved,
         })
+    }
+
+    /// Display-only compaction carry for an open durable task. It joins pending
+    /// attribution first, then returns the opaque task body plus bounded
+    /// workspace-relative ledger paths. Enforcement never reads this payload; it
+    /// exists only so compacted context can remind the model that unreviewed Iris
+    /// changes are still open.
+    pub(crate) fn active_task_compaction_state(
+        &self,
+        max_paths: usize,
+    ) -> Option<(Option<String>, Vec<String>)> {
+        self.sync_barrier();
+        let state = self.state.lock().unwrap();
+        let task = state.task.as_ref()?;
+        if !task.durable {
+            return None;
+        }
+        let mut paths = Vec::new();
+        for entry in &task.ledger.entries {
+            push_recent_path(&mut paths, self.workspace_display_path(&entry.path));
+        }
+        if paths.is_empty()
+            && let Chain::Git(chain) = &task.chain
+        {
+            for path in chain.ledger_paths() {
+                push_recent_path(&mut paths, self.workspace_display_path(path));
+            }
+        }
+        if paths.len() > max_paths {
+            paths.drain(0..paths.len() - max_paths);
+        }
+        let body = task
+            .body
+            .as_deref()
+            .filter(|body| !body.is_empty())
+            .map(str::to_string);
+        (body.is_some() || !paths.is_empty()).then_some((body, paths))
     }
 
     /// Number of ledger entries recorded in the current task (test-only).
