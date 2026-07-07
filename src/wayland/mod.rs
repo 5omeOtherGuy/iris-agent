@@ -541,6 +541,18 @@ impl<P: ChatProvider> Harness<P> {
         Some(settled.summary)
     }
 
+    /// Print mode has no later interactive settlement moment. A completed
+    /// mutating print run is the operator's explicit "do this" action, so it
+    /// accepts the current workflow task with a distinct audit disposition.
+    pub(crate) fn accept_print_checkpoint(&mut self) -> Option<String> {
+        if !self.task_workflow_enabled || !self.agent.mutated_this_turn() {
+            return None;
+        }
+        let settled = self.git_safety.accept()?;
+        self.record_task_settled(&settled.task_id, "print");
+        Some(settled.summary)
+    }
+
     /// Record an explicit checkpoint and settle the task (`/checkpoint`), then
     /// append a `TaskSettled` audit entry (ADR-0031).
     pub(crate) fn save_checkpoint(&mut self) -> Option<String> {

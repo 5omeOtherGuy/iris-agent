@@ -562,6 +562,37 @@ impl ChatProvider for FakeProvider {
     }
 }
 
+struct FailAfterToolProvider {
+    calls: Cell<usize>,
+}
+
+impl FailAfterToolProvider {
+    fn new() -> Self {
+        Self {
+            calls: Cell::new(0),
+        }
+    }
+}
+
+impl ChatProvider for FailAfterToolProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let calls = self.calls.get();
+        self.calls.set(calls + 1);
+        if calls == 0 {
+            let turn = write_call("c1", "new.txt", "hi\n");
+            return Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })));
+        }
+        Err(anyhow::anyhow!("provider failed after mutation"))
+    }
+}
+
 /// Records events and counts approval reviews, answering with a canned decision.
 struct CountingFrontend {
     decision: Cell<ApprovalDecision>,
@@ -705,6 +736,84 @@ fn clean_write_auto_approves_with_project_grant() -> Result<()> {
         frontend.reviews.get(),
         0,
         "a non-dirty write is auto-approved by the project grant"
+    );
+    Ok(())
+}
+
+#[test]
+fn print_turn_accepts_workflow_task_on_success() -> Result<()> {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let session_root = temp_dir();
+    let session = crate::session::SessionLog::create_in(&session_root.path, &repo.path).unwrap();
+    let session_path = session.path().to_path_buf();
+
+    let provider = FakeProvider::new(vec![
+        write_call("c1", "new.txt", "hi\n"),
+        AssistantTurn::text("done"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        Some(session),
+        None,
+    );
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    crate::cli::run_print_turn(&mut harness, "create new file", &frontend, &frontend)?;
+    drop(harness);
+
+    assert!(
+        task_state::load_all(&git_dir).is_empty(),
+        "successful print mode accepts and removes the durable task record"
+    );
+    assert!(
+        git_stdout(&repo.path, &["for-each-ref", "refs/iris"]).is_empty(),
+        "successful print settlement removes checkpoint refs"
+    );
+
+    let entries: Vec<serde_json::Value> = fs::read_to_string(&session_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let settled: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["type"] == "taskLifecycle" && e["event"] == "settled")
+        .collect();
+    assert_eq!(settled.len(), 1, "print success records one settlement");
+    assert_eq!(settled[0]["disposition"], "print");
+    Ok(())
+}
+
+#[test]
+fn print_turn_failure_leaves_workflow_task_record() -> Result<()> {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let provider = FailAfterToolProvider::new();
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    let error = crate::cli::run_print_turn(&mut harness, "create new file", &frontend, &frontend)
+        .expect_err("provider failure after a write should fail print mode");
+
+    assert!(
+        format!("{error:#}").contains("provider failed after mutation"),
+        "error: {error:#}"
+    );
+    assert_eq!(
+        task_state::load_all(&git_dir).len(),
+        1,
+        "failed print mode keeps the durable task for recovery"
     );
     Ok(())
 }
