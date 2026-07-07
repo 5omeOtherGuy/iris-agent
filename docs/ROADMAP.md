@@ -1015,8 +1015,15 @@ settles dirty-tree behavior, rollback semantics, approval requirements, task
 boundaries (settlement-based), checkpoint storage (op-log-shaped chain under
 `refs/iris/*`), index protection, bash detection + snapshot-restore, the
 blocking/async performance split, session-end/crash recovery, and the tiered
-guarantee language. The pre-automation gate below is satisfied for the #261
-slice; any deviation requires superseding ADR-0028, not a fresh discussion.
+guarantee language.
+[ADR-0052](adr/0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
+amends that design: the dirty-tree guard stays always on, while the durable
+task workflow becomes opt-in; commits and successful print runs can close tasks;
+`/checkpoint` becomes a non-settling save point; accepted tasks destroy their
+checkpoint refs; task state is carried across compaction; and the future
+subagent feature must not be named `task`. The pre-automation gate below is
+satisfied for the #261 slice; deviations require a superseding ADR, not a fresh
+discussion.
 
 Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)):
 
@@ -1030,9 +1037,9 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — Done. Op-log-shaped
   git checkpoint chain under `refs/iris/checkpoints/<task-id>/` (plumbing only,
   temporary index), auto-checkpoint over the unsettled diff, rollback of ledger
-  paths + user index, settlement GC (keep last N), crash-recovery reconciliation,
-  30-day expiry, non-git content-snapshot fallback, and `/rollback`/`/accept`/
-  `/checkpoint` slash commands.
+  paths + user index, durable-workflow settlement cleanup, crash-recovery
+  reconciliation, 30-day expiry, non-git content-snapshot fallback, and
+  `/rollback`/`/accept`/`/checkpoint` slash commands.
 - Final diff summary as the task deliverable
   ([#264](https://github.com/5omeOtherGuy/iris-agent/issues/264)) — Done.
   Ledger-scoped net diff (one hunk set per file, pre-task baseline → current,

@@ -1,7 +1,10 @@
 # ADR-0031: Task identity — opaque body, session linkage, and explicit task resumption
 
 **Date**: 2026-07-03
-**Status**: accepted
+**Status**: accepted — amended by
+[ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
+(task identity/session linkage belongs to the opt-in durable workflow; the
+always-on dirty-tree guard is not itself a resumable task)
 **Deciders**: operator + agent design review (epic [#286](https://github.com/5omeOtherGuy/iris-agent/issues/286))
 
 ## Context
