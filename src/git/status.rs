@@ -16,7 +16,7 @@
 //! No network, ever: `⇡`/`⇣` are computed against the last-fetched upstream.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -227,7 +227,10 @@ fn stdout_string(workspace: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// Probe a worktree path for unsettled Iris task records → a badge.
-fn worktree_badge(path: &Path) -> Option<TaskBadge> {
+fn worktree_badge(path: &Path, task_workflow_enabled: bool) -> Option<TaskBadge> {
+    if !task_workflow_enabled {
+        return None;
+    }
     let tasks = git_safety::unsettled_tasks(path);
     let files: usize = tasks.iter().map(|t| t.expected.len()).sum();
     let age = tasks.iter().map(|t| t.age).min()?;
@@ -240,7 +243,18 @@ fn worktree_badge(path: &Path) -> Option<TaskBadge> {
 /// Capture the full snapshot for `workspace`. `None` when the directory is not
 /// a git working tree. Blocking (several git subprocesses): call it from the
 /// [`GitStatusCache`] background thread, never the render loop.
-pub(crate) fn capture(workspace: &Path) -> Option<GitStatus> {
+#[cfg(test)]
+fn capture(workspace: &Path) -> Option<GitStatus> {
+    capture_with_task_workflow(workspace, true)
+}
+
+/// Capture a status snapshot, optionally suppressing the durable task-workflow
+/// overlay. The dirty-file counts still render; only task badges/attribution
+/// derived from Iris task records are hidden when the workflow is disabled.
+pub(crate) fn capture_with_task_workflow(
+    workspace: &Path,
+    task_workflow_enabled: bool,
+) -> Option<GitStatus> {
     if !git::is_git_worktree(workspace) {
         return None;
     }
@@ -296,7 +310,7 @@ pub(crate) fn capture(workspace: &Path) -> Option<GitStatus> {
             path: path.clone(),
             branch: wt_branch.clone(),
             is_current,
-            unsettled: worktree_badge(path),
+            unsettled: worktree_badge(path, task_workflow_enabled),
         });
     }
 
@@ -329,7 +343,11 @@ pub(crate) fn capture(workspace: &Path) -> Option<GitStatus> {
     }
 
     // Task overlay + attribution split (ADR-0028 certainty rule).
-    let tasks = git_safety::unsettled_tasks(workspace);
+    let tasks = if task_workflow_enabled {
+        git_safety::unsettled_tasks(workspace)
+    } else {
+        Vec::new()
+    };
     let relative = |path: &Path| -> String {
         path.strip_prefix(&canonical)
             .unwrap_or(path)
@@ -394,7 +412,7 @@ pub(crate) fn capture(workspace: &Path) -> Option<GitStatus> {
 /// loop only ever reads [`latest`](Self::latest) (cheap lock) and compares
 /// [`generation`](Self::generation) to know when to repaint; a refresh runs on
 /// its own thread and never blocks a draw.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct GitStatusCache {
     inner: Arc<CacheInner>,
 }
@@ -403,6 +421,7 @@ pub(crate) struct GitStatusCache {
 struct CacheInner {
     latest: Mutex<Option<GitStatus>>,
     generation: AtomicU64,
+    task_workflow_enabled: AtomicBool,
     /// Refresh coordination, guarded as one unit so the "finish" and "park a
     /// follow-up request" decisions are atomic: no reentrant locking and no
     /// window where a request lands after the worker decides to stop but
@@ -421,6 +440,23 @@ struct RefreshState {
 }
 
 impl GitStatusCache {
+    pub(crate) fn with_task_workflow(enabled: bool) -> Self {
+        Self {
+            inner: Arc::new(CacheInner {
+                latest: Mutex::new(None),
+                generation: AtomicU64::new(0),
+                task_workflow_enabled: AtomicBool::new(enabled),
+                refresh: Mutex::new(RefreshState::default()),
+            }),
+        }
+    }
+
+    pub(crate) fn set_task_workflow_enabled(&self, enabled: bool) {
+        self.inner
+            .task_workflow_enabled
+            .store(enabled, Ordering::Release);
+    }
+
     /// The last captured snapshot (`None` before the first refresh completes
     /// or when the workspace is not a git repo).
     pub(crate) fn latest(&self) -> Option<GitStatus> {
@@ -451,7 +487,8 @@ impl GitStatusCache {
         std::thread::spawn(move || {
             let mut workspace = workspace;
             loop {
-                let status = capture(&workspace);
+                let task_workflow_enabled = inner.task_workflow_enabled.load(Ordering::Acquire);
+                let status = capture_with_task_workflow(&workspace, task_workflow_enabled);
                 *inner.latest.lock().unwrap() = status;
                 inner.generation.fetch_add(1, Ordering::AcqRel);
                 // Under the coordination lock, either drain a parked request or
@@ -471,6 +508,12 @@ impl GitStatusCache {
                 }
             }
         });
+    }
+}
+
+impl Default for GitStatusCache {
+    fn default() -> Self {
+        Self::with_task_workflow(true)
     }
 }
 
@@ -657,6 +700,57 @@ mod tests {
 
         // Non-repo directory yields no snapshot.
         assert!(capture(dir.path.as_path()).is_none());
+    }
+
+    #[test]
+    fn capture_hides_task_overlay_when_workflow_is_disabled() {
+        use crate::nexus::MutationGuard;
+        use crate::wayland::git_safety::GitSafety;
+
+        let dir = temp_dir();
+        let root = dir.path.join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+
+        let target = root.join("new.txt");
+        let guard = GitSafety::new(&root);
+        guard.note_mutation();
+        guard.before_exec(std::slice::from_ref(&target));
+        std::fs::write(&target, "iris\n").unwrap();
+        assert!(
+            guard
+                .after_exec(
+                    std::slice::from_ref(&target),
+                    Some(&crate::tools::content_hash(b"iris\n")),
+                )
+                .is_empty()
+        );
+
+        let enabled = capture_with_task_workflow(&root, true).expect("status");
+        assert_eq!(enabled.iris_unsettled, 1);
+        assert!(enabled.task.is_some());
+        assert!(enabled.worktrees[0].unsettled.is_some());
+
+        let disabled = capture_with_task_workflow(&root, false).expect("status");
+        assert_eq!(disabled.iris_unsettled, 0);
+        assert_eq!(disabled.user_dirty, disabled.total_uncommitted);
+        assert!(disabled.task.is_none());
+        assert!(disabled.worktrees[0].unsettled.is_none());
     }
 
     /// Concurrency guard: many overlapping `request_refresh` calls from several

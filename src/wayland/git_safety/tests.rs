@@ -17,7 +17,7 @@ use anyhow::Result;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::GitSafety;
+use super::{GitSafety, RecoveryOutcome, task_state};
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
     AssistantTurn, ChatProvider, Message, MutationGuard, ProviderEvent, ProviderStream,
@@ -63,6 +63,22 @@ fn run_git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 /// A git repo with one committed file (`committed.txt`) so `HEAD` exists.
@@ -304,6 +320,72 @@ fn approved_change_is_ledgered_not_flagged() {
         "a confirmed approved change is not a violation"
     );
     assert_eq!(guard.ledger_len(), 1, "the confirmed change is ledgered");
+}
+
+#[test]
+fn workflow_off_keeps_guard_in_memory_without_git_task_state() {
+    let repo = init_repo();
+    let target = repo.path.join("new.txt");
+    let git_dir = task_state::git_dir(&repo.path).expect("git dir");
+
+    let guard = GitSafety::new_with_workflow(&repo.path, false);
+    assert_eq!(guard.note_mutation(), None);
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "iris\n").unwrap();
+    let violations = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris\n")),
+    );
+
+    assert!(violations.is_empty());
+    assert!(
+        guard.has_ledger_entries(),
+        "the guard still tracks Iris changes"
+    );
+    assert_eq!(guard.current_task_id(), None, "no user-facing task id");
+    assert!(
+        guard.active_task_display().is_none(),
+        "no task badge payload"
+    );
+    assert!(guard.restore_points().is_empty(), "rollback UI is disabled");
+    assert!(
+        guard.task_diff(None).unwrap().is_empty(),
+        "diff UI is disabled"
+    );
+    assert!(guard.recoverable_tasks().is_empty(), "no recovery rows");
+    assert!(matches!(guard.recover_and_expire(), RecoveryOutcome::None));
+    assert!(
+        !git_dir.join("iris").exists(),
+        "workflow-off guard must not create .git/iris records"
+    );
+    assert!(
+        git_stdout(&repo.path, &["for-each-ref", "refs/iris"]).is_empty(),
+        "workflow-off guard must not create refs/iris checkpoint refs"
+    );
+}
+
+#[test]
+fn workflow_off_still_detects_and_restores_dirty_violations() {
+    let repo = init_repo();
+    let dirty = repo.path.join("committed.txt");
+    fs::write(&dirty, "user work\n").unwrap();
+
+    let guard = GitSafety::new_with_workflow(&repo.path, false);
+    let summary = guard.note_mutation().expect("dirty baseline notice");
+    assert!(summary.contains("dirty"), "summary: {summary}");
+    assert!(
+        !guard
+            .unapproved_protected(std::slice::from_ref(&dirty))
+            .is_empty(),
+        "dirty-file gate stays enabled"
+    );
+
+    guard.before_exec(&[]);
+    fs::write(&dirty, "clobbered\n").unwrap();
+    let violations = guard.after_exec(&[], None);
+    assert_eq!(violations, vec![dirty.clone()]);
+    guard.restore(&violations).unwrap();
+    assert_eq!(fs::read_to_string(&dirty).unwrap(), "user work\n");
 }
 
 // TOCTOU (finding 2, ADR-0028): an approved target whose post-call bytes do NOT

@@ -157,6 +157,9 @@ impl GitSafety {
         let Some(task) = state.task.as_ref() else {
             return Vec::new();
         };
+        if !task.durable {
+            return Vec::new();
+        }
         match &task.chain {
             Chain::Git(chain) => {
                 let mut out = vec![RestorePoint {
@@ -191,6 +194,9 @@ impl GitSafety {
     pub(crate) fn accept(&self) -> Option<Settlement> {
         self.sync_barrier();
         let mut state = self.state.lock().unwrap();
+        if state.task.as_ref().is_some_and(|task| !task.durable) {
+            return None;
+        }
         let task = state.task.take()?;
         let count = task.ledger.entries.len();
         // Keep the task lease held (`_lease`) through the whole teardown: while it
@@ -236,6 +242,9 @@ impl GitSafety {
         self.sync_barrier();
         {
             let mut state = self.state.lock().unwrap();
+            if state.task.as_ref().is_some_and(|task| !task.durable) {
+                return None;
+            }
             if let Some(task) = state.task.as_mut()
                 && let Chain::Git(chain) = &mut task.chain
             {
@@ -257,6 +266,14 @@ impl GitSafety {
     pub(crate) fn rollback(&self, seq: u64) -> Result<RollbackOutcome> {
         self.sync_barrier();
         let mut state = self.state.lock().unwrap();
+        if state.task.as_ref().is_some_and(|task| !task.durable) {
+            return Ok(RollbackOutcome {
+                summary: "no active Iris task to roll back".to_string(),
+                settled_task_id: None,
+                index_warning: None,
+                preserved_notices: Vec::new(),
+            });
+        }
         let Some(task) = state.task.take() else {
             return Ok(RollbackOutcome {
                 summary: "no active Iris task to roll back".to_string(),
@@ -395,6 +412,9 @@ impl GitSafety {
     /// `Notice` always names the record actually adopted, fixing the ADR-0030
     /// notice/adopt mismatch. Lazy: called at startup/resume, no daemon.
     pub(crate) fn recover_and_expire(&self) -> RecoveryOutcome {
+        if !self.workflow_enabled {
+            return RecoveryOutcome::None;
+        }
         if !matches!(self.mode, Mode::Git) {
             return RecoveryOutcome::None;
         }
@@ -519,6 +539,9 @@ impl GitSafety {
     /// with no lock metadata is unknown-**legacy**. Returns the recoverable +
     /// legacy records only. This is the seam the #288 resume picker plugs into.
     pub(crate) fn recoverable_tasks(&self) -> Vec<RecoverableTask> {
+        if !self.workflow_enabled {
+            return Vec::new();
+        }
         if !matches!(self.mode, Mode::Git) {
             return Vec::new();
         }
@@ -582,6 +605,9 @@ impl GitSafety {
         task_id: &str,
     ) -> Result<task_state::PersistedTask, AdoptError> {
         if !matches!(self.mode, Mode::Git) {
+            return Err(AdoptError::Unavailable);
+        }
+        if !self.workflow_enabled {
             return Err(AdoptError::Unavailable);
         }
         if self.state.lock().unwrap().task.is_some() {

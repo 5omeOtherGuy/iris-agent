@@ -415,6 +415,7 @@ fn run_agent_inner(
     harness.set_summarizer(settings.compaction_summarizer());
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
+    let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
     harness.set_cache_profile(mimir::selection::cache_profile(&selection));
@@ -558,6 +559,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     harness.set_summarizer(settings.compaction_summarizer());
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
+    let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
     harness.set_cache_profile(mimir::selection::cache_profile(&selection));
@@ -680,6 +682,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     harness.set_summarizer(settings.compaction_summarizer());
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
+    let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
     harness.set_cache_profile(mimir::selection::cache_profile(&selection));
