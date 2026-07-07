@@ -113,6 +113,17 @@ pub(crate) struct AdoptedTask {
     pub(crate) sessions: Vec<String>,
 }
 
+/// Why a task adoption request could not be completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdoptError {
+    /// This process already owns an active task; adopting another would orphan
+    /// or entangle rollback state.
+    TaskActive,
+    /// The requested record is gone, belongs to another live owner, or could not
+    /// be rehydrated from its checkpoint refs.
+    Unavailable,
+}
+
 /// What resume/startup recovery decided (ADR-0030/ADR-0031 policy), returned to
 /// Tier 3 so the >1/legacy case opens the picker instead of only printing a
 /// notice. `None` = nothing recoverable; `Notice` = the single-orphan auto-adopt
@@ -407,8 +418,8 @@ impl GitSafety {
             // Preserve the current UX: auto-adopt the single orphan, naming the
             // record actually adopted in the notice.
             return match self.adopt_task(&adoptable[0].task_id) {
-                Some(record) => RecoveryOutcome::Notice(record.recovery_notice(now)),
-                None => RecoveryOutcome::None,
+                Ok(record) => RecoveryOutcome::Notice(record.recovery_notice(now)),
+                Err(_) => RecoveryOutcome::None,
             };
         }
         // More than one orphan, or any unknown-legacy record: explicit selection
@@ -565,21 +576,28 @@ impl GitSafety {
     /// and rehydrate it as this process's active task so a post-restart
     /// `/rollback` / `/accept` / `/checkpoint` operates on the real chain.
     /// Returns the adopted record so the caller's notice names the record it
-    /// actually acted on; `None` when the record is gone or now leased.
-    pub(super) fn adopt_task(&self, task_id: &str) -> Option<task_state::PersistedTask> {
+    /// actually acted on.
+    pub(super) fn adopt_task(
+        &self,
+        task_id: &str,
+    ) -> Result<task_state::PersistedTask, AdoptError> {
         if !matches!(self.mode, Mode::Git) {
-            return None;
+            return Err(AdoptError::Unavailable);
         }
-        let git_dir = task_state::git_dir(&self.workspace)?;
+        if self.state.lock().unwrap().task.is_some() {
+            return Err(AdoptError::TaskActive);
+        }
+        let git_dir = task_state::git_dir(&self.workspace).ok_or(AdoptError::Unavailable)?;
         let workspace = self.workspace.to_string_lossy().into_owned();
         let record = task_state::load_all(&git_dir)
             .into_iter()
-            .find(|task| task.task_id == task_id && task.workspace == workspace)?;
+            .find(|task| task.task_id == task_id && task.workspace == workspace)
+            .ok_or(AdoptError::Unavailable)?;
         // Claim the lease for the task's lifetime. If a live process holds it,
         // this is a foreign live task -- do not adopt.
         let lease = match lock::try_exclusive_settled(&lock::lease_path(&git_dir, task_id)) {
             Ok(Some(guard)) => guard,
-            _ => return None,
+            _ => return Err(AdoptError::Unavailable),
         };
         // Reconcile disk vs the op-log first (append a FULL recovery snapshot for
         // any diverged path), so the rehydrated chain's tip reflects the actual
@@ -594,18 +612,23 @@ impl GitSafety {
                 }
             });
         }
-        self.rehydrate_task(&git_dir, &record, lease);
-        Some(record)
+        if self.rehydrate_task(&git_dir, &record, lease) {
+            Ok(record)
+        } else if self.state.lock().unwrap().task.is_some() {
+            Err(AdoptError::TaskActive)
+        } else {
+            Err(AdoptError::Unavailable)
+        }
     }
 
     /// Adopt a recoverable task and surface just its opaque display payload to
     /// Tier 3 (#288): the same [`adopt_task`](Self::adopt_task) side effects
     /// (lease claim, disk reconciliation, chain rehydration, session-join
     /// append), mapped to an [`AdoptedTask`] so the private record type stays
-    /// behind the seam. `None` when the record is gone or now leased.
-    pub(crate) fn adopt(&self, task_id: &str) -> Option<AdoptedTask> {
+    /// behind the seam.
+    pub(crate) fn adopt(&self, task_id: &str) -> Result<AdoptedTask, AdoptError> {
         let record = self.adopt_task(task_id)?;
-        Some(AdoptedTask {
+        Ok(AdoptedTask {
             task_id: record.task_id,
             body: record.body,
             sessions: record.sessions,
@@ -619,18 +642,18 @@ impl GitSafety {
     /// still gates today's dirty files -- the safe direction) but its index is
     /// the ORIGINAL staged state from the record, the selection a rollback must
     /// restore. The caller's already-acquired `lease` is moved onto the task so
-    /// this process holds ownership for the task's lifetime. No-op when a task is
-    /// already active.
+    /// this process holds ownership for the task's lifetime. Returns whether the
+    /// task became active.
     fn rehydrate_task(
         &self,
         git_dir: &Path,
         persisted: &task_state::PersistedTask,
         lease: lock::FlockGuard,
-    ) {
+    ) -> bool {
         let session_id = {
             let state = self.state.lock().unwrap();
             if state.task.is_some() {
-                return;
+                return false;
             }
             state.session_id.clone()
         };
@@ -643,7 +666,7 @@ impl GitSafety {
             Ok(chain) => chain,
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "could not rehydrate checkpoint chain on resume");
-                return;
+                return false;
             }
         };
         let mut baseline = baseline::capture(&self.workspace, |path| self.normalize(path))
@@ -685,6 +708,9 @@ impl GitSafety {
         let mut state = self.state.lock().unwrap();
         if state.task.is_none() {
             state.task = Some(task);
+            true
+        } else {
+            false
         }
     }
 }

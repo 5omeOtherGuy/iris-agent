@@ -1905,14 +1905,21 @@ async fn dispatch_action<P: ChatProvider>(
             // open an explicit "also resume" offer (a second, separate action).
             tui.screen.close_modal();
             match harness.adopt_task(&id) {
-                Some(adopted) => {
+                Ok(adopted) => {
                     let (lines, resume) = picker::adopt_notice(&adopted);
                     apply_notices(tui, lines);
                     if let Some(session_id) = resume {
                         tui.screen.open_modal(picker::resume_offer(&session_id));
                     }
                 }
-                None => apply_notices(
+                Err(crate::wayland::git_safety::AdoptError::TaskActive) => apply_notices(
+                    tui,
+                    vec![
+                        "finish the current task before adopting another one (/accept or /rollback)"
+                            .to_string(),
+                    ],
+                ),
+                Err(crate::wayland::git_safety::AdoptError::Unavailable) => apply_notices(
                     tui,
                     vec![format!(
                         "could not adopt task {id}: it may have settled or been claimed by another process."

@@ -1076,21 +1076,22 @@ struct TaskDetail {
 }
 
 /// The unified task surface (`/tasks`, ADR-0031): an optional non-selectable
-/// header for the ACTIVE (live, unsettled) task, then the selectable list of
-/// recoverable/legacy tasks. Enter adopts the selected recoverable task
-/// ([`ModalAction::AdoptTask`]) at the safe inter-turn boundary (never resuming
-/// a session); the right arrow requests the target task's linked-session detail
-/// ([`ModalAction::ViewTaskSessions`]); left/esc leaves the detail view. The
-/// active task is shown but never adoptable; settlement stays on the existing
-/// `/git` / `/accept` / `/rollback` / `/diff` paths (not duplicated here).
+/// header for the ACTIVE (live, unsettled) task, then the recoverable/legacy
+/// tasks. Enter adopts a selected recoverable task only when no active task is
+/// present; with an active task, recovery rows are shown as non-selectable
+/// blocked rows. The right arrow requests the target task's linked-session
+/// detail ([`ModalAction::ViewTaskSessions`]); left/esc leaves the detail view.
+/// The active task is shown but never adoptable; settlement stays on the
+/// existing `/git` / `/accept` / `/rollback` / `/diff` paths (not duplicated
+/// here).
 /// Built disk-free by the orchestration layer; input order is preserved.
 #[derive(Debug, Clone)]
 pub(crate) struct TaskPicker {
     // Boxed so the (rarely constructed) task modal does not dominate the `Modal`
-    // enum's size; `has_recoverable` avoids retaining the whole card list just
-    // to know whether any adoptable row exists.
+    // enum's size; `has_recoverable` tracks selectable recovery rows.
     active: Option<Box<TaskCard>>,
     has_recoverable: bool,
+    blocked_recoverable: Vec<TaskCard>,
     selector: Selector,
     detail: Option<Box<TaskDetail>>,
 }
@@ -1099,26 +1100,37 @@ impl TaskPicker {
     /// Build the unified modal from the active card (if any) and the recoverable
     /// cards. The startup/session-swap recovery path passes `active: None`.
     pub(crate) fn new(active: Option<TaskCard>, recoverable: Vec<TaskCard>) -> Self {
-        let items: Vec<SelectorItem> = recoverable
-            .iter()
-            // Defensive: only adoptable (recoverable/legacy) cards become
-            // selectable rows, so an active task handed in by mistake can never
-            // be adopted (ADR-0031: the active task is shown, never adopted).
-            .filter(|card| card.is_adoptable())
-            .map(|card| {
-                let label = if matches!(card.kind, TaskKind::Legacy) {
-                    format!("{}  (legacy)", card.body_preview())
-                } else {
-                    card.body_preview()
-                };
-                SelectorItem::new(card.task_id.clone(), label)
-                    .detail(card.age_label())
-                    .trailing(card.session_summary())
-            })
-            .collect();
+        let adoption_blocked = active.is_some();
+        let items: Vec<SelectorItem> = if adoption_blocked {
+            Vec::new()
+        } else {
+            recoverable
+                .iter()
+                // Defensive: only adoptable (recoverable/legacy) cards become
+                // selectable rows, so an active task handed in by mistake can
+                // never be adopted (ADR-0031: active is shown, never adopted).
+                .filter(|card| card.is_adoptable())
+                .map(|card| {
+                    let label = if matches!(card.kind, TaskKind::Legacy) {
+                        format!("{}  (legacy)", card.body_preview())
+                    } else {
+                        card.body_preview()
+                    };
+                    SelectorItem::new(card.task_id.clone(), label)
+                        .detail(card.age_label())
+                        .trailing(card.session_summary())
+                })
+                .collect()
+        };
+        let has_recoverable = !items.is_empty();
         TaskPicker {
-            has_recoverable: !recoverable.is_empty(),
             active: active.map(Box::new),
+            has_recoverable,
+            blocked_recoverable: if adoption_blocked {
+                recoverable
+            } else {
+                Vec::new()
+            },
             selector: Selector::new(items, true, false, MODEL_ROWS),
             detail: None,
         }
@@ -1217,11 +1229,15 @@ impl TaskPicker {
         let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
         if let Some(active) = &self.active {
             rows.extend(active_header_rows(active));
-            if self.has_recoverable {
+            if self.has_recoverable || !self.blocked_recoverable.is_empty() {
                 rows.push((Line::from(String::new()), false));
             }
         }
-        rows.extend(selector_rows(&self.selector, "No recoverable tasks"));
+        if self.blocked_recoverable.is_empty() {
+            rows.extend(selector_rows(&self.selector, "No recoverable tasks"));
+        } else {
+            rows.extend(blocked_recoverable_rows(&self.blocked_recoverable));
+        }
         crate::ui::tui::overlay_menu(
             Some("Tasks"),
             rows,
@@ -1238,6 +1254,38 @@ impl TaskPicker {
             "\u{2192} sessions \u{00b7} esc close"
         }
     }
+}
+
+fn blocked_recoverable_rows(cards: &[TaskCard]) -> Vec<(Line<'static>, bool)> {
+    let mut rows = vec![(
+        Line::from(Span::styled(
+            "finish the current task first (/accept or /rollback)",
+            dim(),
+        )),
+        false,
+    )];
+    for card in cards {
+        let label = if matches!(card.kind, TaskKind::Legacy) {
+            format!("{}  (legacy)", card.body_preview())
+        } else {
+            card.body_preview()
+        };
+        let mut parts = Vec::new();
+        let age = card.age_label();
+        if !age.is_empty() {
+            parts.push(age);
+        }
+        parts.push(card.session_summary());
+        rows.push((
+            Line::from(vec![
+                Span::styled(label, dim()),
+                Span::raw("  "),
+                Span::styled(parts.join(" \u{00b7} "), dim()),
+            ]),
+            false,
+        ));
+    }
+    rows
 }
 
 /// The non-selectable header rows for the active (live, unsettled) task: an
@@ -2327,14 +2375,40 @@ mod tests {
         assert_eq!(picker.handle_key(ModalKey::Down), ModalOutcome::Ignore);
         // Left returns to the list without closing the modal.
         assert_eq!(picker.handle_key(ModalKey::Left), ModalOutcome::Redraw);
-        // Back in the list, Enter adopts again.
-        match picker.handle_key(ModalKey::Enter) {
-            ModalOutcome::Emit(ModalAction::AdoptTask(id)) => assert_eq!(id, "taskaaaa"),
-            other => panic!("expected AdoptTask after leaving detail, got {other:?}"),
-        }
+        // Back in the list, Enter is still blocked because an active task exists.
+        assert_eq!(picker.handle_key(ModalKey::Enter), ModalOutcome::Ignore);
         // Esc in the detail view dismisses the whole modal (matches the footer).
         picker.show_detail("taskaaaa", vec!["session abc".to_string()]);
         assert_eq!(picker.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    }
+
+    #[test]
+    fn task_picker_with_active_task_blocks_recoverable_adoption() {
+        let mut picker = TaskPicker::new(Some(active_card()), recoverable_cards());
+        assert_eq!(
+            picker.handle_key(ModalKey::Enter),
+            ModalOutcome::Ignore,
+            "recoverable rows are not adoptable while a task is active"
+        );
+        let text: String = picker
+            .render(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("finish the current task first"),
+            "blocked rows explain the active-task requirement: {text}"
+        );
+        assert!(
+            !text.contains("adopt"),
+            "footer omits the adopt action while adoption is blocked: {text}"
+        );
     }
 
     #[test]
@@ -2371,5 +2445,9 @@ mod tests {
             "recoverable row shown: {text}"
         );
         assert!(text.contains("(legacy)"), "legacy marker shown: {text}");
+        assert!(
+            text.contains("finish the current task first"),
+            "recoverable rows are blocked while active: {text}"
+        );
     }
 }
