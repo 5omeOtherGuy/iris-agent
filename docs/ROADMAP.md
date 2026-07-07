@@ -1111,6 +1111,10 @@ Later slices (not in #261):
   ([#442](https://github.com/5omeOtherGuy/iris-agent/issues/442)) — successful
   mutating print runs settle the durable workflow task with disposition `print`;
   provider failure or cancellation leaves the record for recovery.
+- Task workflow v2 follow-up: settle on user commit
+  ([#445](https://github.com/5omeOtherGuy/iris-agent/issues/445)) — when every
+  ledger path is clean, Iris treats the user's commit or full revert as an
+  external settlement and removes the durable task state.
 - Per-hunk staging
   ([#269](https://github.com/5omeOtherGuy/iris-agent/issues/269)).
 - Optional auto-commit behind explicit approval
