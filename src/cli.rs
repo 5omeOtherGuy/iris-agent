@@ -592,6 +592,20 @@ so the next request re-reads all of it -- /compact first to hand over a short su
     ))
 }
 
+pub(crate) fn switch_context_advisory_for<P>(
+    candidate: &ModelSelection,
+    context_tokens: u64,
+    budget: Option<u64>,
+    switch: &ModelSwitch<'_, P>,
+) -> Option<String> {
+    switch_context_advisory(
+        switch_scope(&switch.selection, candidate),
+        context_tokens,
+        budget,
+        &candidate.model,
+    )
+}
+
 /// Validate, rebuild the provider, install it at the safe boundary, and record
 /// the audit event. Any failure (unsupported reasoning, build/auth error) leaves
 /// the active selection and provider untouched.

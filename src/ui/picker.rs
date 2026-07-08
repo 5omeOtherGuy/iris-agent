@@ -17,7 +17,7 @@ use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
     EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
-    TaskPicker, TrustMenu,
+    SwitchContextPrompt, TaskPicker, TrustMenu,
 };
 use crate::ui::settings_menu::{self, SettingsMenu};
 use crate::ui::task_view::TaskCard;
@@ -114,6 +114,46 @@ enum ModelDecision {
     Status(Vec<String>),
 }
 
+fn switch_context_prompt<P: ChatProvider>(
+    id: String,
+    effort: ReasoningEffort,
+    save_default: bool,
+    harness: &Harness<P>,
+    switch: &ModelSwitch<'_, P>,
+) -> Option<Modal> {
+    let model = parse_qualified(&id)?;
+    let mut candidate = cli::candidate_for(switch.selection(), model.provider, &model.id);
+    candidate.reasoning = Some(model_capabilities::clamp(model.provider, &model.id, effort));
+    let context_tokens = harness.context_token_estimate();
+    cli::switch_context_advisory_for(&candidate, context_tokens, harness.context_budget(), switch)
+        .map(|_| {
+            Modal::SwitchContext(SwitchContextPrompt::new(
+                id,
+                effort,
+                save_default,
+                candidate.model,
+                context_tokens,
+            ))
+        })
+}
+
+fn model_command_for_candidate<P: ChatProvider>(
+    model: CatalogModel,
+    save_default: bool,
+    harness: &mut Harness<P>,
+    switch: &mut ModelSwitch<'_, P>,
+) -> ModelCommand {
+    let id = model.qualified();
+    let effort = cli::candidate_for(switch.selection(), model.provider, &model.id)
+        .reasoning
+        .unwrap_or(ReasoningEffort::DEFAULT);
+    if let Some(modal) = switch_context_prompt(id, effort, save_default, harness, switch) {
+        ModelCommand::Open(modal)
+    } else {
+        ModelCommand::Lines(apply_model(model, harness, switch))
+    }
+}
+
 /// Handle a `/model [arg]` command in the TUI: open the searchable picker or, for
 /// an unambiguous exact id, switch immediately (bypassing the picker).
 pub(crate) fn model_command<P: ChatProvider>(
@@ -126,7 +166,7 @@ pub(crate) fn model_command<P: ChatProvider>(
     let current = current_qualified(switch);
     match decide_model_command(arg, &available, &scoped, &current) {
         ModelDecision::Status(lines) => ModelCommand::Lines(lines),
-        ModelDecision::Switch(model) => ModelCommand::Lines(apply_model(model, harness, switch)),
+        ModelDecision::Switch(model) => model_command_for_candidate(model, true, harness, switch),
         ModelDecision::Open(_search) => {
             // The redesigned picker is not searchable, so an unresolved `/model
             // <arg>` opens the full list rather than a hidden filtered view.
@@ -366,6 +406,7 @@ fn settings_snapshot<P: ChatProvider>(
             .clone()
             .unwrap_or_else(|| "subagent".to_string()),
         microcompaction: settings.microcompaction(),
+        microcompaction_watermark: settings.microcompaction_watermark(),
         bash_tool_mode: settings.bash_tool_mode(),
         max_tool_roundtrips: settings.max_tool_roundtrips(),
         prompt_cache_retention: settings
@@ -405,6 +446,9 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
             config::save_compaction_summarizer(value.unwrap_or("provider"))
         }
         Field::Microcompaction => config::save_microcompaction(parse_bool(value)),
+        Field::MicrocompactionWatermark => {
+            config::save_microcompaction_watermark(value.unwrap_or("0").parse()?)
+        }
         Field::BashToolMode => config::save_bash_tool_mode(parse_bool(value)),
         Field::MaxToolRoundtrips => config::save_max_tool_roundtrips(match value {
             Some(v) => Some(v.parse::<usize>()?),
@@ -457,16 +501,21 @@ pub(crate) fn apply_action<P: ChatProvider>(
             id,
             effort,
             save_default,
-        } => match parse_qualified(&id) {
-            Some(model) => ActionResult::Close(apply_model_effort(
-                model,
-                effort,
-                save_default,
-                harness,
-                switch,
-            )),
-            None => ActionResult::Close(vec![format!("unknown model: {id}")]),
-        },
+        } => {
+            if let Some(modal) =
+                switch_context_prompt(id.clone(), effort, save_default, harness, switch)
+            {
+                ActionResult::Replace(Box::new(modal), Vec::new())
+            } else {
+                apply_confirmed_model_switch(id, effort, save_default, harness, switch)
+            }
+        }
+        ModalAction::ConfirmModelSwitch {
+            id,
+            effort,
+            save_default,
+            compact_first: _,
+        } => apply_confirmed_model_switch(id, effort, save_default, harness, switch),
         ModalAction::ApplyScoped(ids) => {
             // Every scoped edit updates the live cycle scope immediately; only
             // Ctrl+S persists it.
@@ -554,6 +603,11 @@ pub(crate) fn apply_action<P: ChatProvider>(
                     // way `EditPolicy` refreshes live Nexus state on save.
                     if field == settings_menu::Field::Microcompaction {
                         harness.set_microcompaction(value.as_deref() == Some("true"));
+                    } else if field == settings_menu::Field::MicrocompactionWatermark
+                        && let Some(value) = value.as_deref()
+                        && let Ok(value) = value.parse()
+                    {
+                        harness.set_microcompaction_watermark(value);
                     }
                     Vec::new()
                 }
@@ -602,6 +656,25 @@ pub(crate) fn apply_action<P: ChatProvider>(
     }
 }
 
+fn apply_confirmed_model_switch<P: ChatProvider>(
+    id: String,
+    effort: ReasoningEffort,
+    save_default: bool,
+    harness: &mut Harness<P>,
+    switch: &mut ModelSwitch<'_, P>,
+) -> ActionResult {
+    match parse_qualified(&id) {
+        Some(model) => ActionResult::Close(apply_model_effort(
+            model,
+            effort,
+            save_default,
+            harness,
+            switch,
+        )),
+        None => ActionResult::Close(vec![format!("unknown model: {id}")]),
+    }
+}
+
 /// Fold an explicit enabled list back to `None` when it covers every available
 /// model (pi-mono's "all enabled" -> clear scope). An empty list also clears.
 fn collapse_scope<P>(ids: Vec<String>, _switch: &ModelSwitch<'_, P>) -> Vec<String> {
@@ -620,10 +693,10 @@ pub(crate) fn cycle_model<P: ChatProvider>(
     forward: bool,
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
-) -> Vec<String> {
+) -> ModelCommand {
     let available = available_now();
     if available.is_empty() {
-        return vec!["No models available".to_string()];
+        return ModelCommand::Lines(vec!["No models available".to_string()]);
     }
     let scoped_ids = switch.scoped();
     let scoped_active = scoped_ids.is_some();
@@ -632,23 +705,25 @@ pub(crate) fn cycle_model<P: ChatProvider>(
         // Scope is configured but none of its models are currently available:
         // stay in scope (report) rather than silently cycling all models.
         None if scoped_active => {
-            return vec!["No scoped models are currently available".to_string()];
+            return ModelCommand::Lines(vec![
+                "No scoped models are currently available".to_string(),
+            ]);
         }
         None => available,
     };
     if candidates.len() <= 1 {
-        return vec![if scoped_active {
+        return ModelCommand::Lines(vec![if scoped_active {
             "Only one model in scope".to_string()
         } else {
             "Only one model available".to_string()
-        }];
+        }]);
     }
     let current = current_qualified(switch);
     let pos = candidates
         .iter()
         .position(|model| model.qualified() == current);
     let next = next_cycle_index(candidates.len(), pos, forward);
-    apply_model(candidates[next].clone(), harness, switch)
+    model_command_for_candidate(candidates[next].clone(), true, harness, switch)
 }
 
 /// Next index when cycling a candidate list of length `len` (>= 1). `current` is

@@ -369,6 +369,10 @@ async fn session_loop<P: ChatProvider>(
                 &mut tick,
                 switch,
                 &login_backend,
+                &current_turn,
+                steering.as_ref(),
+                &git_cache,
+                &mut git_generation,
             )
             .await?;
             if let Some(source) = requested {
@@ -418,9 +422,19 @@ async fn session_loop<P: ChatProvider>(
             IdleOutcome::CycleModel(forward) => {
                 if let Some(sw) = switch.as_mut() {
                     let before = sw.selection().clone();
-                    let lines = picker::cycle_model(forward, harness, sw);
-                    let after = sw.selection().clone();
-                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                    match picker::cycle_model(forward, harness, sw) {
+                        ModelCommand::Open(modal) => tui.screen.open_modal(modal),
+                        ModelCommand::Lines(lines) => {
+                            let after = sw.selection().clone();
+                            apply_model_switch_lines(
+                                tui,
+                                harness,
+                                Some(&before),
+                                Some(&after),
+                                lines,
+                            );
+                        }
+                    }
                 }
             }
             IdleOutcome::CycleEffort => {
@@ -1752,7 +1766,7 @@ async fn run_harness_op<P: ChatProvider>(
     steering: &SteeringQueue,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     let (event_tx, mut event_rx) = unbounded_channel::<UiEvent>();
     let (appr_tx, mut appr_rx) = unbounded_channel::<ApprovalRequest>();
     let bridge = LoopBridge { event_tx, appr_tx };
@@ -1924,14 +1938,18 @@ async fn run_harness_op<P: ChatProvider>(
     // (cancellation); its receiver is already gone, so just drop it.
     drop(pending);
 
-    if let Err(error) = result {
-        tui.screen.apply(UiEvent::from_turn_error(&error));
-    }
+    let succeeded = match result {
+        Ok(()) => true,
+        Err(error) => {
+            tui.screen.apply(UiEvent::from_turn_error(&error));
+            false
+        }
+    };
     // The turn is unwinding on an error; not an approval-to-run. (The error
     // event applied just above already set the Finishing phase, so this is a
     // guarded no-op for the phase, but stays honest about the outcome.)
     tui.screen.clear_approval(false);
-    Ok(())
+    Ok(succeeded)
 }
 
 /// Drive an open picker/dialog to completion: route keys to the modal, apply the
@@ -1939,6 +1957,7 @@ async fn run_harness_op<P: ChatProvider>(
 /// inter-turn boundary, and return when the modal closes (or input ends).
 /// Returns the session to swap to when the `/resume` picker selected one, so the
 /// caller performs the swap with harness + switch + loader in scope.
+#[allow(clippy::too_many_arguments)]
 async fn run_modal_phase<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
@@ -1946,6 +1965,10 @@ async fn run_modal_phase<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
+    current_turn: &CurrentTurn,
+    steering: &SteeringQueue,
+    git_cache: &GitStatusCache,
+    git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
     while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
@@ -1981,7 +2004,17 @@ async fn run_modal_phase<P: ChatProvider>(
                     }
                 };
                 let requested = apply_modal_outcome(
-                    outcome, harness, tui, input_rx, tick, switch, login_backend,
+                    outcome,
+                    harness,
+                    tui,
+                    input_rx,
+                    tick,
+                    switch,
+                    login_backend,
+                    current_turn,
+                    steering,
+                    git_cache,
+                    git_generation,
                 )
                 .await?;
                 if requested.is_some() {
@@ -2000,6 +2033,7 @@ async fn run_modal_phase<P: ChatProvider>(
 
 /// Interpret one [`ModalOutcome`]. Returns a requested session swap (from the
 /// `/resume` picker) for the caller to perform.
+#[allow(clippy::too_many_arguments)]
 async fn apply_modal_outcome<P: ChatProvider>(
     outcome: ModalOutcome,
     harness: &mut Harness<P>,
@@ -2008,6 +2042,10 @@ async fn apply_modal_outcome<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
+    current_turn: &CurrentTurn,
+    steering: &SteeringQueue,
+    git_cache: &GitStatusCache,
+    git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
     match outcome {
         ModalOutcome::Ignore | ModalOutcome::Redraw => Ok(None),
@@ -2016,7 +2054,20 @@ async fn apply_modal_outcome<P: ChatProvider>(
             Ok(None)
         }
         ModalOutcome::Emit(action) => {
-            dispatch_action(action, harness, tui, input_rx, tick, switch, login_backend).await
+            dispatch_action(
+                action,
+                harness,
+                tui,
+                input_rx,
+                tick,
+                switch,
+                login_backend,
+                current_turn,
+                steering,
+                git_cache,
+                git_generation,
+            )
+            .await
         }
     }
 }
@@ -2024,6 +2075,7 @@ async fn apply_modal_outcome<P: ChatProvider>(
 /// Apply a [`ModalAction`]: model/scoped/effort actions go through the picker;
 /// login/logout actions are handled here (they need the auth store / backend);
 /// a `/resume` selection is returned up as the session to swap to.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_action<P: ChatProvider>(
     action: ModalAction,
     harness: &mut Harness<P>,
@@ -2032,8 +2084,63 @@ async fn dispatch_action<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
+    current_turn: &CurrentTurn,
+    steering: &SteeringQueue,
+    git_cache: &GitStatusCache,
+    git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
     match action {
+        ModalAction::ConfirmModelSwitch {
+            id,
+            effort,
+            save_default,
+            compact_first: true,
+        } => {
+            tui.screen.close_modal();
+            tui.screen.start_turn();
+            tui.draw()?;
+            let compact_ok = run_harness_op(
+                harness,
+                tui,
+                input_rx,
+                tick,
+                current_turn,
+                HarnessOp::Compact,
+                steering,
+                git_cache,
+                git_generation,
+            )
+            .await?;
+            tui.screen.end_turn();
+            if !compact_ok {
+                return Ok(None);
+            }
+            let action = ModalAction::ConfirmModelSwitch {
+                id,
+                effort,
+                save_default,
+                compact_first: false,
+            };
+            let Some(sw) = switch.as_mut() else {
+                return Ok(None);
+            };
+            let before = sw.selection().clone();
+            let result = picker::apply_action(action, harness, sw);
+            let after = sw.selection().clone();
+            match result {
+                ActionResult::Close(lines) => {
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                    tui.screen.close_modal();
+                }
+                ActionResult::Keep(lines) => {
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                }
+                ActionResult::Replace(modal, lines) => {
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                    tui.screen.open_modal(*modal);
+                }
+            }
+        }
         ModalAction::ResumeSession(id) => {
             // Close the picker and hand the chosen session up to the loop, which
             // performs the swap at the safe inter-turn boundary.

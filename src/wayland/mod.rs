@@ -104,26 +104,16 @@ const MANUAL_COMPACT_KEEP_TOKENS: u64 = 1_000;
 /// chooses; the parent still validates and persists the returned text.
 const SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS: usize = 4;
 
-/// Micro-watermark fraction of the compaction budget (ADR-0048): a fold batch
-/// runs only when the context reaches this fraction of the budget, strictly
-/// below the budget itself so folding reclaims spent reads BEFORE full
-/// compaction is needed. Batching at a watermark (not every turn) means one
-/// prefix-cache break amortizes many folds. Half the budget leaves clear
-/// headroom below the compaction trigger while still engaging on long sessions.
-const MICRO_WATERMARK_NUM: u64 = 1;
-const MICRO_WATERMARK_DEN: u64 = 2;
+/// Default independent microcompaction watermark. Mirrors config's default so
+/// bare/test harnesses keep the old default behavior without depending on the
+/// auto-compaction budget.
+const DEFAULT_MICROCOMPACTION_WATERMARK: u64 = 64_000;
 
 /// Recent-tail token target the fold pass protects: the most-recent turns within
 /// this many tokens NEVER fold, so the model's immediate working set stays
 /// verbatim (ADR-0048). Kept small (one recent exchange) so folding still
 /// reaches most of the accumulated older mass.
 const MICRO_FOLD_KEEP_TOKENS: u64 = 2_000;
-
-/// The micro-watermark in tokens for a given compaction `budget`: the context
-/// total at or above which a fold batch runs. Always strictly below `budget`.
-fn micro_watermark(budget: u64) -> u64 {
-    budget.saturating_mul(MICRO_WATERMARK_NUM) / MICRO_WATERMARK_DEN
-}
 
 /// Provider-neutral prompt-cache economics the fold scheduler consumes
 /// (issue #400, design §4.3). The harness never sees provider names: Tier 3
@@ -289,11 +279,14 @@ pub(crate) struct Harness<P> {
     background_compaction: Option<BackgroundCompaction>,
     next_compaction_job_seq: u64,
     // Opt-in microcompaction (ADR-0048, #378): when true, spent tool results are
-    // folded to deterministic stubs at a micro-watermark below the compaction
-    // budget. Default false (a bare/test harness never folds); the Tier-3 app
-    // installs the configured value. Gates fold WRITING only -- rebuild always
-    // honors persisted fold entries regardless of this flag.
+    // folded to deterministic stubs at an independent watermark. Default false
+    // (a bare/test harness never folds); the Tier-3 app installs the configured
+    // value. Gates fold WRITING only -- rebuild always honors persisted fold
+    // entries regardless of this flag.
     microcompaction: bool,
+    // Provider-visible context size at which microcompaction's watermark trigger
+    // flushes pending folds. Independent from the auto-compaction budget.
+    microcompaction_watermark: u64,
     // Prompt-cache economics of the active provider lane (issue #400),
     // installed by Tier 3 from the resolved selection. Default = safe unknown.
     cache_profile: CacheProfile,
@@ -411,6 +404,7 @@ impl<P: ChatProvider> Harness<P> {
             background_compaction: None,
             next_compaction_job_seq: 0,
             microcompaction: false,
+            microcompaction_watermark: DEFAULT_MICROCOMPACTION_WATERMARK,
             cache_profile: CacheProfile::default(),
             pending_break: None,
             last_selection: None,
@@ -450,6 +444,10 @@ impl<P: ChatProvider> Harness<P> {
     /// so a `/settings` toggle applies to the following turn, not the current one.
     pub(crate) fn set_microcompaction(&mut self, enabled: bool) {
         self.microcompaction = enabled;
+    }
+
+    pub(crate) fn set_microcompaction_watermark(&mut self, watermark: u64) {
+        self.microcompaction_watermark = watermark;
     }
 
     pub(crate) fn task_workflow_enabled(&self) -> bool {
@@ -1264,7 +1262,8 @@ impl<P: ChatProvider> Harness<P> {
     /// this same boundary, so the prefix re-bills anyway), then the armed
     /// break flags (A2/A3 selection, A4 cold resume), then A5 (below the
     /// minimum cacheable prefix -- nothing cached yet), then the shipped
-    /// Class C watermark backstop (`budget/2`, unchanged behavior). The
+    /// Class C watermark backstop (configured independently from the full
+    /// auto-compaction threshold). The
     /// break flags arrive pre-consumed by the caller: they are valid only
     /// for the boundary immediately before the next request.
     fn fold_trigger(
@@ -1319,8 +1318,7 @@ impl<P: ChatProvider> Harness<P> {
                 return Some(FoldTrigger::InferredCold);
             }
         }
-        let budget = self.budget?;
-        if total >= micro_watermark(budget) {
+        if total >= self.microcompaction_watermark {
             return Some(FoldTrigger::Watermark);
         }
         None

@@ -76,6 +76,12 @@ pub(crate) enum ModalAction {
         effort: ReasoningEffort,
         save_default: bool,
     },
+    ConfirmModelSwitch {
+        id: String,
+        effort: ReasoningEffort,
+        save_default: bool,
+        compact_first: bool,
+    },
     /// Apply this scope to the live session immediately (every scoped edit).
     /// `None` clears the scope (cycle all authenticated models).
     ApplyScoped(Option<Vec<String>>),
@@ -165,6 +171,7 @@ pub(crate) enum ModalOutcome {
 #[derive(Debug, Clone)]
 pub(crate) enum Modal {
     Model(ModelPicker),
+    SwitchContext(SwitchContextPrompt),
     Scoped(ScopedModels),
     Effort(EffortPicker),
     Settings(crate::ui::settings_menu::SettingsMenu),
@@ -184,6 +191,7 @@ impl Modal {
     pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
         match self {
             Modal::Model(picker) => picker.handle_key(key),
+            Modal::SwitchContext(prompt) => prompt.handle_key(key),
             Modal::Scoped(picker) => picker.handle_key(key),
             Modal::Effort(picker) => picker.handle_key(key),
             Modal::Settings(menu) => menu.handle_key(key),
@@ -221,6 +229,7 @@ impl Modal {
     pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
         match self {
             Modal::Model(picker) => picker.render(width),
+            Modal::SwitchContext(prompt) => prompt.render(width),
             Modal::Scoped(picker) => picker.render(width),
             Modal::Effort(picker) => picker.render(width),
             Modal::Settings(menu) => menu.render(width),
@@ -314,6 +323,104 @@ pub(crate) fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'stat
         ));
     }
     out
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SwitchContextPrompt {
+    id: String,
+    effort: ReasoningEffort,
+    save_default: bool,
+    model: String,
+    context_tokens: u64,
+    selector: Selector,
+}
+
+impl SwitchContextPrompt {
+    pub(crate) fn new(
+        id: String,
+        effort: ReasoningEffort,
+        save_default: bool,
+        model: String,
+        context_tokens: u64,
+    ) -> Self {
+        let items = vec![
+            SelectorItem::new("summary", "Compact first, then switch")
+                .detail("send the new model a shorter handoff summary"),
+            SelectorItem::new("full", "Switch with full context")
+                .detail("re-read the current context on the new model"),
+            SelectorItem::new("cancel", "Cancel switch"),
+        ];
+        Self {
+            id,
+            effort,
+            save_default,
+            model,
+            context_tokens,
+            selector: Selector::new(items, false, true, 3),
+        }
+    }
+
+    fn emit(&self, compact_first: bool) -> ModalOutcome {
+        ModalOutcome::Emit(ModalAction::ConfirmModelSwitch {
+            id: self.id.clone(),
+            effort: self.effort,
+            save_default: self.save_default,
+            compact_first,
+        })
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some("summary") => self.emit(true),
+                Some("full") => self.emit(false),
+                Some("cancel") => ModalOutcome::Close,
+                _ => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let rows = {
+            let mut rows = vec![
+                (
+                    Line::from(Span::styled(
+                        format!(
+                            "Switching to {} will carry ~{} context tokens.",
+                            self.model, self.context_tokens
+                        ),
+                        dim(),
+                    )),
+                    false,
+                ),
+                (
+                    Line::from(Span::styled(
+                        "Choose whether to summarize before switching.",
+                        dim(),
+                    )),
+                    false,
+                ),
+            ];
+            rows.extend(selector_rows(&self.selector, "No choices"));
+            rows
+        };
+        crate::ui::tui::overlay_menu(
+            Some("Large context switch"),
+            rows,
+            Some("↑↓ move · ↵ choose · esc cancel"),
+            usize::from(width),
+        )
+    }
 }
 
 // --- model picker ---
