@@ -385,6 +385,171 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
 }
 
 #[test]
+fn manual_compact_uses_subagent_before_provider_fallback() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    let big = format!("{OLD_NEEDLE} :: {}", "long covered context. ".repeat(500));
+    for message in [
+        Message::user(&big),
+        Message::assistant("ok"),
+        Message::user("small retained turn"),
+        Message::assistant("ok2"),
+    ] {
+        log.append(&message).unwrap();
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let log = SessionLog::resume(&path).unwrap();
+    let parent_replies = Arc::new(Mutex::new(VecDeque::from([format!(
+        "Goal: continue. State: provider fallback. Decisions: none. Key facts: {SUMMARY_NEEDLE}. Next steps: proceed."
+    )])));
+    let parent_prompts = Arc::new(Mutex::new(Vec::new()));
+    let parent_tools = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::resumed(
+        SummaryProvider {
+            replies: parent_replies,
+            prompts: parent_prompts.clone(),
+            visible_tools: parent_tools,
+        },
+        built_in_tools(),
+        stored.messages,
+    );
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(300),
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    let worker_replies = Arc::new(Mutex::new(VecDeque::from(["".to_string()])));
+    let worker_prompts = Arc::new(Mutex::new(Vec::new()));
+    let worker_tools = Arc::new(Mutex::new(Vec::new()));
+    harness.set_compaction_summarizer_factory(SummaryProvider::factory(
+        worker_replies,
+        worker_prompts.clone(),
+        worker_tools.clone(),
+    ));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    block_on(harness.compact_now(&obs, &token)).unwrap();
+
+    assert_eq!(worker_prompts.lock().unwrap().len(), 1);
+    assert_eq!(parent_prompts.lock().unwrap().len(), 1);
+    let worker_tools = worker_tools.lock().unwrap();
+    assert_eq!(worker_tools.len(), 1);
+    assert!(worker_tools[0].contains(&"read".to_string()));
+    assert!(!worker_tools[0].contains(&"write".to_string()));
+    let live = harness
+        .messages()
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(live.contains(SUMMARY_NEEDLE), "{live}");
+    assert!(
+        !live.contains(OLD_NEEDLE),
+        "covered text should only remain behind recall"
+    );
+}
+
+#[test]
+fn background_subagent_falls_back_to_provider_before_excerpts() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    let big = format!("{OLD_NEEDLE} :: {}", "long covered context. ".repeat(500));
+    for message in [
+        Message::user(&big),
+        Message::assistant("ok"),
+        Message::user("small retained turn"),
+        Message::assistant("ok2"),
+    ] {
+        log.append(&message).unwrap();
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let log = SessionLog::resume(&path).unwrap();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(300),
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    let replies = Arc::new(Mutex::new(VecDeque::from([
+        "".to_string(),
+        format!(
+            "Goal: continue. State: provider fallback. Decisions: none. Key facts: {SUMMARY_NEEDLE}. Next steps: proceed."
+        ),
+    ])));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let visible_tools = Arc::new(Mutex::new(Vec::new()));
+    harness.set_compaction_summarizer_factory(SummaryProvider::factory(
+        replies,
+        prompts.clone(),
+        visible_tools.clone(),
+    ));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
+    for _ in 0..50 {
+        block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
+        if obs.applied() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(obs.applied(), 1);
+    assert_eq!(prompts.lock().unwrap().len(), 2);
+    let visible_tools = visible_tools.lock().unwrap();
+    assert_eq!(visible_tools.len(), 2);
+    assert!(visible_tools[0].contains(&"read".to_string()));
+    assert!(!visible_tools[0].contains(&"write".to_string()));
+    assert!(
+        visible_tools[1].is_empty(),
+        "provider fallback summary is tool-free"
+    );
+    let live = harness
+        .messages()
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(live.contains(SUMMARY_NEEDLE), "{live}");
+    assert!(
+        !live.contains(OLD_NEEDLE),
+        "covered text should only remain behind recall"
+    );
+}
+
+#[test]
 fn pending_background_compaction_falls_back_before_next_provider_request() {
     let root = temp_dir();
     let workspace = temp_dir();

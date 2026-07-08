@@ -14,7 +14,9 @@ pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -1879,11 +1881,14 @@ impl<P: ChatProvider> Harness<P> {
         }))
     }
 
-    /// Produce the summary text for a covered range: the provider-backed
-    /// summarizer when installed (falling back to the deterministic excerpts on
-    /// failure or a non-shrinking answer), otherwise the excerpts directly.
-    /// `None` only when the request was cancelled -- compaction is then skipped
-    /// entirely rather than falling back, because the user is aborting the
+    /// Produce the summary text for a covered range using the configured
+    /// compaction method for foreground callers (`/compact`). `Subagent` first
+    /// asks a fresh read-only worker when the Tier-3 factory is installed, then
+    /// falls back to provider summarization; `Provider` starts at provider
+    /// summarization. Excerpts are the deterministic floor after configured
+    /// model-backed methods fail or do not shrink the covered range.
+    /// `None` only when cancellation interrupts the configured/model-backed
+    /// request -- compaction is then skipped because the user is aborting the
     /// operation, not choosing a worse summary.
     async fn summarize_range(
         &self,
@@ -1893,7 +1898,61 @@ impl<P: ChatProvider> Harness<P> {
         carry_tokens: u64,
         token: &CancellationToken,
     ) -> Option<String> {
-        if self.summarizer == SummarizerKind::Provider {
+        if self.summarizer == SummarizerKind::Subagent {
+            if let Some(factory) = &self.summarizer_factory {
+                match factory() {
+                    Ok(provider) => match run_subagent_summary_async(
+                        provider,
+                        self.workspace.clone(),
+                        summary_worker_prompt(&messages[plan.start..plan.end]),
+                        token,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let framed = framed_summary(plan, &text);
+                            if combined_shrinks(
+                                estimate_tokens(&framed),
+                                carry_tokens,
+                                original_tokens,
+                            ) {
+                                return Some(framed);
+                            }
+                            tracing::warn!(
+                                "subagent summary did not shrink the covered range; trying provider summary"
+                            );
+                        }
+                        Err(error) => {
+                            if token.is_cancelled() {
+                                return None;
+                            }
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "subagent summary failed; trying provider summary"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        if token.is_cancelled() {
+                            return None;
+                        }
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "subagent provider factory failed; trying provider summary"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "subagent summarizer selected without a provider factory; trying provider summary"
+                );
+            }
+        }
+
+        if matches!(
+            self.summarizer,
+            SummarizerKind::Provider | SummarizerKind::Subagent
+        ) {
             match provider_summary(
                 &self.agent.provider,
                 self.agent.tools(),
@@ -1903,11 +1962,7 @@ impl<P: ChatProvider> Harness<P> {
             .await
             {
                 Ok(text) => {
-                    let framed = format!(
-                        "[compacted summary of {} earlier message(s)]\n{}",
-                        plan.end - plan.start,
-                        text.trim()
-                    );
+                    let framed = framed_summary(plan, &text);
                     // Shrink guard: the summary plus the carry block (ADR-0044)
                     // must compress the covered range; a summary that only shrinks
                     // once the carry is ignored is worse than the deterministic
@@ -1995,6 +2050,14 @@ impl<P: ChatProvider> Harness<P> {
     }
 }
 
+fn framed_summary(plan: &CompactionPlan, text: &str) -> String {
+    format!(
+        "[compacted summary of {} earlier message(s)]\n{}",
+        plan.end - plan.start,
+        text.trim()
+    )
+}
+
 /// One-shot, tool-free summarization request against the active provider
 /// (ADR-0041). The request carries exactly the covered range (the messages the
 /// compaction entry replaces, never the retained prefix) plus a final user
@@ -2043,14 +2106,26 @@ fn run_background_summary_worker(
     if token.is_cancelled() {
         return BackgroundSummaryResult::Cancelled;
     }
-    let provider = match factory() {
-        Ok(provider) => provider,
-        Err(error) => return BackgroundSummaryResult::Failed(format!("{error:#}")),
-    };
     let result = match mode {
-        SummarizerKind::Subagent => run_subagent_summary(provider, workspace, prompt, &token),
+        SummarizerKind::Subagent => {
+            let subagent = factory().and_then(|provider| {
+                run_subagent_summary(provider, workspace, prompt.clone(), &token)
+            });
+            match subagent {
+                Ok(text) => Ok(text),
+                Err(error) if token.is_cancelled() => Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "background subagent summary failed; trying provider summary"
+                    );
+                    factory()
+                        .and_then(|provider| run_provider_prompt_summary(provider, prompt, &token))
+                }
+            }
+        }
         SummarizerKind::Provider | SummarizerKind::Excerpts => {
-            run_provider_prompt_summary(provider, prompt, &token)
+            factory().and_then(|provider| run_provider_prompt_summary(provider, prompt, &token))
         }
     };
     if token.is_cancelled() {
@@ -2098,6 +2173,44 @@ fn run_provider_prompt_summary(
         })
 }
 
+fn run_subagent_summary_async<'a>(
+    provider: Box<dyn ChatProvider>,
+    workspace: PathBuf,
+    prompt: String,
+    token: &'a CancellationToken,
+) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+    Box::pin(async move {
+        let backend = subagents::SubagentBackend::new(workspace);
+        let mut request = subagents::SubagentRequest::read_only(prompt);
+        request.budgets.max_tool_roundtrips = Some(SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS);
+        request.budgets.max_output_bytes = Some(MAX_SUMMARY_CHARS);
+        let handle = backend.spawn(provider, request)?;
+        let result = tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                let _ = backend.cancel(&handle.id);
+                anyhow::bail!("subagent summary cancelled");
+            }
+            result = backend.wait(&handle.id) => result?,
+        };
+        match result.status {
+            subagents::SubagentStatus::Completed if !result.summary.trim().is_empty() => {
+                Ok(result.summary)
+            }
+            subagents::SubagentStatus::Completed => {
+                anyhow::bail!("subagent returned empty summary")
+            }
+            subagents::SubagentStatus::Cancelled => {
+                anyhow::bail!("subagent summary cancelled")
+            }
+            subagents::SubagentStatus::Failed => anyhow::bail!(result.summary),
+            subagents::SubagentStatus::Started | subagents::SubagentStatus::Running => {
+                anyhow::bail!("subagent ended before a terminal summary state")
+            }
+        }
+    })
+}
+
 fn run_subagent_summary(
     provider: Box<dyn ChatProvider>,
     workspace: PathBuf,
@@ -2107,36 +2220,9 @@ fn run_subagent_summary(
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(async move {
-            let backend = subagents::SubagentBackend::new(workspace);
-            let mut request = subagents::SubagentRequest::read_only(prompt);
-            request.budgets.max_tool_roundtrips = Some(SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS);
-            request.budgets.max_output_bytes = Some(MAX_SUMMARY_CHARS);
-            let handle = backend.spawn(provider, request)?;
-            let result = tokio::select! {
-                biased;
-                _ = token.cancelled() => {
-                    let _ = backend.cancel(&handle.id);
-                    anyhow::bail!("subagent summary cancelled");
-                }
-                result = backend.wait(&handle.id) => result?,
-            };
-            match result.status {
-                subagents::SubagentStatus::Completed if !result.summary.trim().is_empty() => {
-                    Ok(result.summary)
-                }
-                subagents::SubagentStatus::Completed => {
-                    anyhow::bail!("subagent returned empty summary")
-                }
-                subagents::SubagentStatus::Cancelled => {
-                    anyhow::bail!("subagent summary cancelled")
-                }
-                subagents::SubagentStatus::Failed => anyhow::bail!(result.summary),
-                subagents::SubagentStatus::Started | subagents::SubagentStatus::Running => {
-                    anyhow::bail!("subagent ended before a terminal summary state")
-                }
-            }
-        })
+        .block_on(run_subagent_summary_async(
+            provider, workspace, prompt, token,
+        ))
 }
 
 fn summary_worker_prompt(covered: &[Message]) -> String {
