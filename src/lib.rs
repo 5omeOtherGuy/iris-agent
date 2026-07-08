@@ -1082,9 +1082,7 @@ fn print_help() {
         "                                   approval prompt, INCLUDING destructive commands."
     );
     eprintln!("                                   Bypasses the safety floors; follows resumed");
-    eprintln!(
-        "                                   sessions. Use only in a sandbox you trust."
-    );
+    eprintln!("                                   sessions. Use only in a sandbox you trust.");
     eprintln!();
     eprintln!("Display (flag / env var):");
     eprintln!("  --plain, IRIS_PLAIN=1, NO_COLOR   Plain, ANSI-free text UI");

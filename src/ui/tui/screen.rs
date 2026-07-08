@@ -191,7 +191,9 @@ impl ApprovalPolicy {
     /// Symbol color role: green done / orange review / red error / dim empty.
     fn symbol_style(self) -> Style {
         match self {
-            Self::SkipPermissions | Self::ReadOnly => Style::default().fg(crate::ui::palette::red()),
+            Self::SkipPermissions | Self::ReadOnly => {
+                Style::default().fg(crate::ui::palette::red())
+            }
             Self::Auto => Style::default().fg(crate::ui::palette::green()),
             Self::OnRequest => prompt_style(),
             Self::NeverAsk => dim_style(),
@@ -2861,7 +2863,10 @@ mod tests {
     fn bottom_statusline_policy_segment_carries_symbol_and_label() {
         let mut screen = footer_screen("~/repo");
         for (policy, expected) in [
-            (ApprovalPolicy::SkipPermissions, "■ dangerously skip permissions"),
+            (
+                ApprovalPolicy::SkipPermissions,
+                "■ dangerously skip permissions",
+            ),
             (ApprovalPolicy::Auto, "◉ auto"),
             (ApprovalPolicy::OnRequest, "▲ on-request"),
             (ApprovalPolicy::NeverAsk, "□ never-ask"),

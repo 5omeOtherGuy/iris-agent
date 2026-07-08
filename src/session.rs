@@ -1144,7 +1144,10 @@ fn read_dangerous_skip_permissions(path: &Path) -> Result<bool> {
         if value.get("type").and_then(Value::as_str) == Some("dangerousMode")
             && value.get("mode").and_then(Value::as_str) == Some("dangerously-skip-permissions")
         {
-            enabled = value.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            enabled = value
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
         }
     }
     Ok(enabled)
