@@ -461,7 +461,13 @@ fn run_agent_inner(
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
     let swap = move |source: &cli::SessionSource| {
-        load_session_source(&swap_cwd, &session_cell, &background_session_id, source)
+        load_session_source(
+            &swap_cwd,
+            &session_cell,
+            &background_session_id,
+            skip_permissions,
+            source,
+        )
     };
     // The start page (IrisMark + launcher) shows only when Iris launches
     // interactively with no task and no resume target; a bare `iris resume`
@@ -490,18 +496,20 @@ fn load_session_source(
     cwd: &Path,
     cell: &Rc<RefCell<String>>,
     background_cell: &Arc<Mutex<String>>,
+    cli_skip_permissions: bool,
     source: &cli::SessionSource,
 ) -> Result<cli::LoadedSource> {
     match source {
         cli::SessionSource::Fresh => {
             let id = session::new_session_id();
-            let session_log = match session::SessionLog::create_with_id(cwd, &id) {
+            let mut session_log = match session::SessionLog::create_with_id(cwd, &id) {
                 Ok(log) => Some(log),
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "new-session persistence disabled");
                     None
                 }
             };
+            record_skip_permissions(cli_skip_permissions, session_log.as_mut());
             Ok(cli::LoadedSource {
                 session_id: cli::SessionIdGuard::swap_with_background(
                     cell.clone(),
@@ -512,7 +520,7 @@ fn load_session_source(
                 messages: Vec::new(),
                 entry_ids: Vec::new(),
                 resumed: 0,
-                skip_permissions: false,
+                skip_permissions: cli_skip_permissions,
             })
         }
         cli::SessionSource::Resume(id) => {
@@ -523,13 +531,16 @@ fn load_session_source(
             let stored = store.open(&meta)?;
             let resumed = stored.messages.len();
             let entry_ids = stored.entry_ids;
-            let session_log = match session::SessionLog::resume(&meta.path) {
+            let skip_permissions =
+                session_skip_permissions(cli_skip_permissions, stored.dangerous_skip_permissions);
+            let mut session_log = match session::SessionLog::resume(&meta.path) {
                 Ok(log) => Some(log),
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "resume persistence disabled");
                     None
                 }
             };
+            record_skip_permissions(skip_permissions, session_log.as_mut());
             Ok(cli::LoadedSource {
                 session_id: cli::SessionIdGuard::swap_with_background(
                     cell.clone(),
@@ -540,7 +551,7 @@ fn load_session_source(
                 messages: stored.messages,
                 entry_ids,
                 resumed,
-                skip_permissions: stored.dangerous_skip_permissions,
+                skip_permissions,
             })
         }
     }
@@ -623,6 +634,27 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     Ok(())
 }
 
+/// Whether the current session should run with `--dangerously-skip-permissions`.
+/// The explicit CLI flag applies to every session entry point in this process,
+/// while a resumed transcript can also carry a prior enabled state.
+fn session_skip_permissions(cli_skip_permissions: bool, persisted_skip_permissions: bool) -> bool {
+    cli_skip_permissions || persisted_skip_permissions
+}
+
+/// Best-effort transcript audit for skip-permissions mode. Used both at process
+/// start and for in-session `/new`/`/resume` swaps so dangerous mode survives the
+/// next restart of the target session too.
+fn record_skip_permissions(skip_permissions: bool, session: Option<&mut session::SessionLog>) {
+    if !skip_permissions {
+        return;
+    }
+    if let Some(log) = session
+        && let Err(error) = log.append_dangerous_mode()
+    {
+        tracing::warn!(error = %format!("{error:#}"), "failed to record skip-permissions mode");
+    }
+}
+
 /// Session-start side effects of `--dangerously-skip-permissions` (ADR-0049):
 /// print the loud one-time warning banner to stderr, and record the mode as a
 /// transcript metadata entry so a resumed/audited session shows it was active.
@@ -634,11 +666,7 @@ fn announce_skip_permissions(skip_permissions: bool, session: Option<&mut sessio
         return;
     }
     eprintln!("WARNING: {}", nexus::SKIP_PERMISSIONS_BANNER);
-    if let Some(log) = session
-        && let Err(error) = log.append_dangerous_mode()
-    {
-        tracing::warn!(error = %format!("{error:#}"), "failed to record skip-permissions mode");
-    }
+    record_skip_permissions(skip_permissions, session);
 }
 
 /// The persisted per-project permission policy for `cwd` (ADR-0027), loaded
@@ -696,7 +724,8 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     // stable across resume. The harness compares it against the budget at the
     // next turn boundary.
     let context_tokens = stored.context_tokens;
-    let skip_permissions = skip_permissions || stored.dangerous_skip_permissions;
+    let skip_permissions =
+        session_skip_permissions(skip_permissions, stored.dangerous_skip_permissions);
 
     let settings = config::Settings::load(&cwd)?;
     let budget = Some(settings.context_token_budget());
@@ -778,7 +807,13 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
     let swap = move |source: &cli::SessionSource| {
-        load_session_source(&swap_cwd, &session_cell, &background_session_id, source)
+        load_session_source(
+            &swap_cwd,
+            &session_cell,
+            &background_session_id,
+            skip_permissions,
+            source,
+        )
     };
     cli::run_interactive(
         &mut harness,
@@ -1182,10 +1217,149 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SessionDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SessionDirGuard {
+        fn set(path: &Path) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let previous = std::env::var_os("IRIS_SESSION_DIR");
+            // SAFETY: serialized by ENV_LOCK and restored on drop.
+            unsafe { std::env::set_var("IRIS_SESSION_DIR", path) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SessionDirGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                // SAFETY: serialized by ENV_LOCK and restored before release.
+                Some(value) => unsafe { std::env::set_var("IRIS_SESSION_DIR", value) },
+                // SAFETY: serialized by ENV_LOCK and restored before release.
+                None => unsafe { std::env::remove_var("IRIS_SESSION_DIR") },
+            }
+        }
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "iris-lib-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn session_file(root: &Path) -> PathBuf {
+        let slug_dir = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
+        fs::read_dir(slug_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+    }
 
     #[test]
     fn command_name_is_iris() {
         assert_eq!(command_name(), "iris");
+    }
+
+    #[test]
+    fn session_skip_permissions_honors_cli_flag_or_persisted_state() {
+        assert!(!session_skip_permissions(false, false));
+        assert!(session_skip_permissions(true, false));
+        assert!(session_skip_permissions(false, true));
+    }
+
+    #[test]
+    fn record_skip_permissions_appends_dangerous_mode_entry() {
+        let dir = TempDir::new();
+        let mut log = session::SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        record_skip_permissions(true, Some(&mut log));
+        drop(log);
+
+        let file = fs::read_to_string(session_file(&dir.path)).unwrap();
+        assert!(file.contains("\"type\":\"dangerousMode\""), "{file}");
+    }
+
+    #[test]
+    fn load_session_source_fresh_inherits_cli_skip_permissions() {
+        let dir = TempDir::new();
+        let _guard = SessionDirGuard::set(&dir.path);
+        let cell = Rc::new(RefCell::new("current".to_string()));
+        let background = Arc::new(Mutex::new("current".to_string()));
+
+        let loaded = load_session_source(
+            Path::new("/w"),
+            &cell,
+            &background,
+            true,
+            &cli::SessionSource::Fresh,
+        )
+        .unwrap();
+
+        assert!(loaded.skip_permissions);
+        assert!(
+            fs::read_to_string(session_file(&dir.path))
+                .unwrap()
+                .contains("\"type\":\"dangerousMode\""),
+        );
+    }
+
+    #[test]
+    fn load_session_source_resume_combines_cli_and_persisted_skip_permissions() {
+        let dir = TempDir::new();
+        let _guard = SessionDirGuard::set(&dir.path);
+        let cwd = Path::new("/w");
+        let id = session::new_session_id();
+        let mut log = session::SessionLog::create_with_id(cwd, &id).unwrap();
+        log.append(&nexus::Message::user("hi")).unwrap();
+        drop(log);
+
+        let cell = Rc::new(RefCell::new("current".to_string()));
+        let background = Arc::new(Mutex::new("current".to_string()));
+        let loaded = load_session_source(
+            cwd,
+            &cell,
+            &background,
+            true,
+            &cli::SessionSource::Resume(id),
+        )
+        .unwrap();
+
+        assert!(loaded.skip_permissions);
+        assert!(
+            fs::read_to_string(session_file(&dir.path))
+                .unwrap()
+                .contains("\"type\":\"dangerousMode\""),
+        );
     }
 
     #[test]
