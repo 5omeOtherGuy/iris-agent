@@ -3,9 +3,10 @@
 # Prebuilt binaries (cargo-dist) are the current distribution path. release-plz
 # owns only the release PR (version bump + CHANGELOG); it does NOT create the
 # git release or publish to crates.io:
-#   - publish = false: no crates.io publish. Enabling `cargo install iris-agent`
-#     later is an explicit opt-in (set publish = true and add CARGO_REGISTRY_TOKEN
-#     per docs/RELEASING.md).
+#   - publish = true: merged release PRs publish to crates.io when
+#     CARGO_REGISTRY_TOKEN is present. `cargo install iris-agent` is enabled.
+#     The operator still pushes the git tag by hand so the prebuilt-binary
+#     release flow stays separate.
 #   - git_tag_enable = false: release-plz never creates the git tag. The operator
 #     pushes it by hand so the tag actually triggers release.yml (a tag pushed by
 #     release-plz's default GITHUB_TOKEN would not). This also keeps the flow
@@ -15,7 +16,7 @@
 #     .github/workflows/release.yml (cargo-dist host job) when an operator pushes
 #     the version tag, so it also carries the prebuilt archives + installer.
 # This avoids two systems racing to create the same tag or GitHub release.
-publish = false
+publish = true
 # Keep a Keep-a-Changelog style CHANGELOG.md generated from conventional commits.
 changelog_update = true
 git_tag_enable = false
