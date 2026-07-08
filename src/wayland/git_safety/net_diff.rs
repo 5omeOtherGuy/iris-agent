@@ -332,7 +332,9 @@ impl GitSafety {
         let root = root.unwrap_or(&self.workspace);
         let inputs = match &task.chain {
             Chain::Git(chain) => chain.net_diff_inputs(root)?,
-            Chain::Fallback(store) => store.net_diff_inputs(root, &self.workspace),
+            Chain::Jj(store) | Chain::Fallback(store) => {
+                store.net_diff_inputs(root, &self.workspace)
+            }
         };
         Ok(compute(inputs))
     }

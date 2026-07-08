@@ -168,6 +168,14 @@ impl RecoveryOutcome {
 }
 
 impl GitSafety {
+    fn state_dir_for_mode(&self) -> Option<PathBuf> {
+        match &self.mode {
+            Mode::Git => task_state::git_dir(&self.workspace),
+            Mode::Jj(workspace) => Some(workspace.state_dir.clone()),
+            Mode::Degraded(_) => None,
+        }
+    }
+
     /// Restore points offered by the rollback UI (Tier 3): the pre-task baseline
     /// first (seq 0), then each intermediate checkpoint oldest-to-newest. Empty
     /// when no task is active.
@@ -194,7 +202,7 @@ impl GitSafety {
                 }
                 out
             }
-            Chain::Fallback(store) => store
+            Chain::Jj(store) | Chain::Fallback(store) => store
                 .labels()
                 .into_iter()
                 .enumerate()
@@ -245,7 +253,9 @@ impl GitSafety {
                     return Some("could not save checkpoint; task is still open".to_string());
                 }
             }
-            Chain::Fallback(store) => store.checkpoint("explicit checkpoint".to_string()),
+            Chain::Jj(store) | Chain::Fallback(store) => {
+                store.checkpoint("explicit checkpoint".to_string())
+            }
         }
         self.persist_task(task);
         Some("checkpoint saved; task is still open".to_string())
@@ -284,6 +294,7 @@ impl GitSafety {
             baseline,
             ledger,
             turn,
+            jj_base_op,
             _lease,
             ..
         } = task;
@@ -327,6 +338,15 @@ impl GitSafety {
                 match git_dir.as_ref() {
                     Some(gd) => lock::with_mutation_lock(gd, || destroy(chain)),
                     None => destroy(chain),
+                }
+            }
+            Chain::Jj(store) => {
+                if let Some(op) = jj_base_op.as_deref()
+                    && seq == 0
+                {
+                    super::jj::restore_operation(&self.workspace, op)?;
+                } else {
+                    store.rollback_to(seq)?;
                 }
             }
             Chain::Fallback(store) => store.rollback_to(seq)?,
@@ -384,7 +404,7 @@ impl GitSafety {
         if pres.is_empty() {
             return;
         }
-        if let Chain::Fallback(store) = &mut task.chain {
+        if let Chain::Jj(store) | Chain::Fallback(store) = &mut task.chain {
             for (path, bytes) in &pres {
                 store.note_before(path, bytes.clone());
             }
@@ -421,10 +441,10 @@ impl GitSafety {
         if !self.workflow_enabled {
             return RecoveryOutcome::None;
         }
-        if !matches!(self.mode, Mode::Git) {
+        if matches!(self.mode, Mode::Degraded(_)) {
             return RecoveryOutcome::None;
         }
-        let Some(git_dir) = task_state::git_dir(&self.workspace) else {
+        let Some(git_dir) = self.state_dir_for_mode() else {
             return RecoveryOutcome::None;
         };
         let now = SystemTime::now();
@@ -488,12 +508,16 @@ impl GitSafety {
                 _ => continue,
             };
             lock::with_mutation_lock(git_dir, || {
-                let _ = checkpoint::destroy_task_refs(&self.workspace, &task.task_id);
+                if task.backend == "git" {
+                    let _ = checkpoint::destroy_task_refs(&self.workspace, &task.task_id);
+                }
                 task_state::remove(git_dir, &task.task_id);
             });
             drop(lease);
         }
-        self.sweep_orphan_checkpoint_refs(git_dir);
+        if matches!(self.mode, Mode::Git) {
+            self.sweep_orphan_checkpoint_refs(git_dir);
+        }
     }
 
     /// Repair already-polluted repos by deleting checkpoint namespaces that have
@@ -555,10 +579,10 @@ impl GitSafety {
         if !self.workflow_enabled {
             return Vec::new();
         }
-        if !matches!(self.mode, Mode::Git) {
+        if matches!(self.mode, Mode::Degraded(_)) {
             return Vec::new();
         }
-        let Some(git_dir) = task_state::git_dir(&self.workspace) else {
+        let Some(git_dir) = self.state_dir_for_mode() else {
             return Vec::new();
         };
         let now = SystemTime::now();
@@ -617,7 +641,7 @@ impl GitSafety {
         &self,
         task_id: &str,
     ) -> Result<task_state::PersistedTask, AdoptError> {
-        if !matches!(self.mode, Mode::Git) {
+        if matches!(self.mode, Mode::Degraded(_)) {
             return Err(AdoptError::Unavailable);
         }
         if !self.workflow_enabled {
@@ -626,7 +650,7 @@ impl GitSafety {
         if self.state.lock().unwrap().task.is_some() {
             return Err(AdoptError::TaskActive);
         }
-        let git_dir = task_state::git_dir(&self.workspace).ok_or(AdoptError::Unavailable)?;
+        let git_dir = self.state_dir_for_mode().ok_or(AdoptError::Unavailable)?;
         let workspace = self.workspace.to_string_lossy().into_owned();
         let record = task_state::load_all(&git_dir)
             .into_iter()
@@ -643,7 +667,7 @@ impl GitSafety {
         // disk state before it is offered for rollback. Serialized against
         // concurrent processes by the mutation lock.
         let diverged = task_state::diverged_paths(&record);
-        if !diverged.is_empty() {
+        if !diverged.is_empty() && record.backend == "git" {
             lock::with_mutation_lock(&git_dir, || {
                 if let Err(error) = checkpoint::append_recovery(&self.workspace, task_id, &diverged)
                 {
@@ -697,34 +721,56 @@ impl GitSafety {
             state.session_id.clone()
         };
         let ledger_paths: Vec<PathBuf> = persisted.expected.keys().map(PathBuf::from).collect();
-        let chain = match CheckpointChain::load(
-            self.workspace.clone(),
-            persisted.task_id.clone(),
-            &ledger_paths,
-        ) {
-            Ok(chain) => chain,
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "could not rehydrate checkpoint chain on resume");
-                return false;
+        let chain = if persisted.backend == "jj" {
+            Chain::Jj(super::snapshot::FallbackStore::default())
+        } else {
+            match CheckpointChain::load(
+                self.workspace.clone(),
+                persisted.task_id.clone(),
+                &ledger_paths,
+            ) {
+                Ok(chain) => Chain::Git(chain),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "could not rehydrate checkpoint chain on resume");
+                    return false;
+                }
             }
         };
-        let mut baseline = baseline::capture(&self.workspace, |path| self.normalize(path))
-            .unwrap_or_else(|_| Baseline {
-                protected: BTreeMap::new(),
-                dirty_count: 0,
-                untracked_count: 0,
-                index: String::new(),
-            });
+        let mut baseline = if persisted.backend == "jj" {
+            super::jj::capture_baseline(&self.workspace, |path| self.normalize(path))
+        } else {
+            baseline::capture(&self.workspace, |path| self.normalize(path))
+        }
+        .unwrap_or_else(|_| Baseline {
+            protected: BTreeMap::new(),
+            dirty_count: 0,
+            untracked_count: 0,
+            index: String::new(),
+        });
         baseline.index = persisted.baseline_index.clone();
         let linked_worktree = is_linked_worktree(&self.workspace, Some(git_dir));
-        let mut task = Task::active(
-            persisted.task_id.clone(),
-            baseline,
-            chain,
-            Some(git_dir.to_path_buf()),
-            linked_worktree,
-            Some(lease),
-        );
+        let mut task = match chain {
+            Chain::Git(chain) => Task::active(
+                persisted.task_id.clone(),
+                baseline,
+                chain,
+                Some(git_dir.to_path_buf()),
+                linked_worktree,
+                Some(lease),
+            ),
+            Chain::Jj(store) | Chain::Fallback(store) => {
+                let mut task = Task::jj(
+                    persisted.task_id.clone(),
+                    baseline,
+                    git_dir.to_path_buf(),
+                    persisted.jj_base_op.clone().unwrap_or_default(),
+                    Some(lease),
+                );
+                task.chain = Chain::Jj(store);
+                task.jj_last_op = persisted.jj_last_op.clone();
+                task
+            }
+        };
         task.created_ms = persisted.created_ms;
         // Carry the record's opaque display payload (ADR-0031) so a later
         // `persist_task` (on continued mutation) re-writes it verbatim instead
@@ -772,6 +818,25 @@ fn repo_git_dirs(workspace: &Path, current_git_dir: &Path) -> Vec<PathBuf> {
             };
             if let Some(git_dir) = task_state::git_dir(Path::new(path)) {
                 dirs.insert(git_dir);
+            }
+        }
+    }
+
+    if let Ok(out) = git::git_stdout(workspace, &["rev-parse", "--git-common-dir"]) {
+        let text = String::from_utf8_lossy(&out);
+        let common = PathBuf::from(text.trim());
+        let common = if common.is_absolute() {
+            common
+        } else {
+            workspace.join(common)
+        };
+        let worktrees = common.join("worktrees");
+        if let Ok(entries) = std::fs::read_dir(worktrees) {
+            for entry in entries.flatten() {
+                let admin = entry.path();
+                if admin.is_dir() {
+                    dirs.insert(admin);
+                }
             }
         }
     }
