@@ -233,7 +233,11 @@ impl Snapshot {
             Field::DefaultApproval => self.default_approval.clone(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
-            Field::Microcompaction => on_off(self.microcompaction),
+            Field::Microcompaction => format!(
+                "{} · folds around {} tokens",
+                on_off(self.microcompaction),
+                self.context_token_budget / 2
+            ),
             Field::BashToolMode => on_off(self.bash_tool_mode),
             Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
                 Some(cap) => cap.to_string(),
@@ -722,7 +726,7 @@ mod tests {
             default_approval: "strict".to_string(),
             skip_permissions: false,
             context_token_budget: 128_000,
-            compaction_summarizer: "provider".to_string(),
+            compaction_summarizer: "subagent".to_string(),
             microcompaction: false,
             bash_tool_mode: false,
             max_tool_roundtrips: None,
@@ -941,6 +945,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_menu_wires_microcompaction_and_budget_together() {
+        let mut snap = snapshot();
+        snap.context_token_budget = 64_000;
+        snap.microcompaction = true;
+        let rows = rows_for(Category::Runtime, &snap);
+
+        assert!(rows.iter().any(|row| matches!(
+            &row.action,
+            ModalAction::OpenSettingsEntry(Field::ContextTokenBudget)
+        )));
+        let micro = rows
+            .iter()
+            .find(|row| row.item.id == Field::Microcompaction.label())
+            .expect("runtime menu includes microcompaction");
+        assert_eq!(
+            micro.item.detail.as_deref(),
+            Some("on · folds around 32000 tokens")
+        );
+        assert_eq!(
+            micro.action,
+            ModalAction::SaveSetting {
+                field: Field::Microcompaction,
+                value: Some("false".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn every_field_maps_back_to_a_category_that_lists_it() {
         // A leaf's field.category() must contain a row that targets it, so
         // post-save refresh returns to a menu that includes the field.
@@ -951,6 +983,7 @@ mod tests {
             Field::ReducedMotion,
             Field::DefaultApproval,
             Field::ContextTokenBudget,
+            Field::CompactionSummarizer,
             Field::Microcompaction,
             Field::BashToolMode,
             Field::MaxToolRoundtrips,
