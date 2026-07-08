@@ -640,7 +640,13 @@ impl ResponseStreamParser {
                 self.text
                     .push_str(completed_turn.text.as_deref().unwrap_or_default());
             }
-            if self.reasoning.is_empty() {
+            // The terminal `response.completed` envelope is authoritative for
+            // reasoning summaries. `response.output_item.done` can arrive with an
+            // interim summary shell (for example a title plus `<!-- -->`), while
+            // the completed response carries the final human-readable summary.
+            // Prefer the final envelope when present, but keep item-level
+            // reasoning for streams that omit it from `response.completed`.
+            if !completed_turn.reasoning.is_empty() {
                 self.reasoning = completed_turn.reasoning;
             }
             if self.tool_calls.is_empty() {
