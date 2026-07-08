@@ -57,6 +57,35 @@ impl SessionSpanReader for SessionSpanSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnOutcome {
+    Completed { verification: VerificationStatus },
+    Cancelled,
+}
+
+impl TurnOutcome {
+    pub(crate) fn allows_print_settlement(self) -> bool {
+        matches!(
+            self,
+            Self::Completed {
+                verification: VerificationStatus::NotRun
+                    | VerificationStatus::Passed
+                    | VerificationStatus::SkippedUnconfigured,
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationStatus {
+    NotRun,
+    Passed,
+    SkippedUnconfigured,
+    Failed,
+    SkippedApprovalDenied,
+    Cancelled,
+}
+
 /// Maximum characters in an auto-compaction summary, so compacting a large
 /// range always shrinks the context regardless of how long the covered turns
 /// were.
@@ -858,7 +887,7 @@ impl<P: ChatProvider> Harness<P> {
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<TurnOutcome> {
         self.emit_external_task_settlements(obs)?;
         // Safe turn boundary: before the provider request, first fold spent
         // tool results (opt-in microcompaction, ADR-0048), then compact if the
@@ -903,11 +932,11 @@ impl<P: ChatProvider> Harness<P> {
             .submit_turn(prompt, obs, gate, &env, token, self.steering.as_deref())
             .instrument(tracing::info_span!("turn"))
             .await;
+        let changed_in_model_turn = self.agent.mutated_this_turn();
         // Persist whatever the turn produced even when it ended in an error, so
         // the transcript records the user prompt and any tool work. Best-effort:
         // a write failure is logged, never fatal to the session.
         self.persist_new_messages();
-        self.emit_external_task_settlements(obs)?;
         // If a task opened during this turn, record a `TaskOpened` audit entry
         // (ADR-0031). A task never settles mid-turn (settlement is an explicit
         // command), so a `current_task_id` that differs from `prior_task` and is
@@ -923,12 +952,20 @@ impl<P: ChatProvider> Harness<P> {
         // and actually changed files, and not after a cancellation. The loop
         // never settles the task, so a failure leaves the tree inspectable and
         // rollbackable (ADR-0028).
-        if result.is_ok() && !token.is_cancelled() && self.agent.mutated_this_turn() {
+        let mut verification = VerificationStatus::NotRun;
+        if result.is_ok() && !token.is_cancelled() && changed_in_model_turn {
             self.maybe_emit_task_workflow_discovery(obs)?;
-            self.run_verification_loop(obs, gate, token).await?;
-            self.emit_external_task_settlements(obs)?;
+            verification = self.run_verification_loop(obs, gate, token).await?;
         }
-        result
+        if changed_in_model_turn || self.agent.mutated_this_turn() {
+            self.git_safety.observe_iris_execution_boundary();
+        }
+        result?;
+        if token.is_cancelled() {
+            Ok(TurnOutcome::Cancelled)
+        } else {
+            Ok(TurnOutcome::Completed { verification })
+        }
     }
 
     fn maybe_emit_task_workflow_discovery(&self, obs: &dyn AgentObserver) -> Result<()> {
@@ -963,23 +1000,23 @@ impl<P: ChatProvider> Harness<P> {
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<VerificationStatus> {
         // Feature off -> silent (backward compatible with every non-opted-in
         // caller). Engaged-but-no-command -> honest skipped-unconfigured report.
         let Some(config) = self.verify.clone() else {
-            return Ok(());
+            return Ok(VerificationStatus::NotRun);
         };
         let Some(command) = config.command.clone() else {
             obs.on_event(AgentEvent::Verification(
                 VerificationOutcome::SkippedUnconfigured,
             ))?;
-            return Ok(());
+            return Ok(VerificationStatus::SkippedUnconfigured);
         };
         let max_attempts = config.max_attempts;
         let mut attempts: u32 = 0;
         loop {
             if token.is_cancelled() {
-                return Ok(());
+                return Ok(VerificationStatus::Cancelled);
             }
             attempts += 1;
             // Run the verification command as a normal gated shell execution.
@@ -1007,19 +1044,19 @@ impl<P: ChatProvider> Harness<P> {
                     obs.on_event(AgentEvent::Verification(VerificationOutcome::Passed {
                         attempts,
                     }))?;
-                    return Ok(());
+                    return Ok(VerificationStatus::Passed);
                 }
                 VerifyRun::Denied => {
                     obs.on_event(AgentEvent::Verification(
                         VerificationOutcome::SkippedApprovalDenied,
                     ))?;
-                    return Ok(());
+                    return Ok(VerificationStatus::SkippedApprovalDenied);
                 }
                 VerifyRun::Cancelled => {
                     // The turn was interrupted mid-verification; the driver has
                     // already surfaced the interrupt notice. Leave the task
                     // unsettled and make no verification claim.
-                    return Ok(());
+                    return Ok(VerificationStatus::Cancelled);
                 }
                 VerifyRun::Failed { output, exit_code } => {
                     if attempts >= max_attempts {
@@ -1030,7 +1067,7 @@ impl<P: ChatProvider> Harness<P> {
                             exit_code,
                             last_output: output,
                         }))?;
-                        return Ok(());
+                        return Ok(VerificationStatus::Failed);
                     }
                     // Feed the failure back to the model as a user message and
                     // let it make another attempt.
@@ -1064,7 +1101,7 @@ impl<P: ChatProvider> Harness<P> {
                     // A hard provider/loop error aborts the retry chain.
                     retry_result?;
                     if token.is_cancelled() {
-                        return Ok(());
+                        return Ok(VerificationStatus::Cancelled);
                     }
                     // No retry storm: re-run verification only when the model
                     // actually changed files this retry. If it made no further
@@ -1076,7 +1113,7 @@ impl<P: ChatProvider> Harness<P> {
                             exit_code,
                             last_output: output,
                         }))?;
-                        return Ok(());
+                        return Ok(VerificationStatus::Failed);
                     }
                 }
             }

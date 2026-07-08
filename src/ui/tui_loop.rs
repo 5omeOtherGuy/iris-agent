@@ -1781,9 +1781,12 @@ async fn run_harness_op<P: ChatProvider>(
     let is_compact = matches!(op, HarnessOp::Compact);
     let result = {
         let mut turn: futures::future::LocalBoxFuture<'_, Result<()>> = match op {
-            HarnessOp::Turn(prompt) => {
-                Box::pin(harness.submit_turn(prompt, &bridge, &bridge, &token))
-            }
+            HarnessOp::Turn(prompt) => Box::pin(async {
+                harness
+                    .submit_turn(prompt, &bridge, &bridge, &token)
+                    .await
+                    .map(|_| ())
+            }),
             HarnessOp::Compact => Box::pin(harness.compact_now(&bridge, &token)),
         };
         loop {
@@ -2081,11 +2084,9 @@ async fn dispatch_action<P: ChatProvider>(
         }
         ModalAction::AcceptTask => {
             tui.screen.close_modal();
-            let notice = match harness.accept_checkpoint() {
-                Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
-                None => "no unreviewed Iris changes to accept".to_string(),
-            };
-            apply_notices(tui, vec![notice]);
+            let lines = crate::cli::handle_checkpoint_command("/accept", harness)
+                .unwrap_or_else(|| vec!["no unreviewed Iris changes to accept".to_string()]);
+            apply_notices(tui, lines);
         }
         ModalAction::ShowTaskDiff => {
             tui.screen.close_modal();

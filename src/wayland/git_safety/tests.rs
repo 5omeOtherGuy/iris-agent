@@ -155,6 +155,32 @@ fn dirty_file_is_protected_and_index_captured() {
     assert_eq!(protected.len(), 2, "both dirty/staged files are protected");
 }
 
+#[test]
+fn dirty_baseline_summary_escapes_terminal_control_paths() {
+    let repo = init_repo();
+    let name = "unsafe\n\u{1b}[31m.txt";
+    let path = repo.path.join(name);
+    fs::write(&path, "base\n").unwrap();
+    run_git(&repo.path, &["add", name]);
+    run_git(&repo.path, &["commit", "-q", "-m", "add unsafe path"]);
+    fs::write(&path, "dirty\n").unwrap();
+
+    let guard = guard(&repo.path);
+    let summary = guard.note_mutation().expect("dirty baseline summary");
+
+    assert!(
+        summary.contains("unsafe\\n\\u{1b}[31m.txt"),
+        "escaped path is shown: {summary:?}"
+    );
+    assert!(
+        !summary.contains('\n') && !summary.contains('\u{1b}'),
+        "summary must not carry raw terminal controls: {summary:?}"
+    );
+    guard.approve(std::slice::from_ref(&path), false);
+    let display = guard.active_task_display().expect("active display");
+    assert_eq!(display.approved_paths, vec!["unsafe\\n\\u{1b}[31m.txt"]);
+}
+
 // Test 2: an approved file is not re-prompted until settlement; a new task
 // (after settle) re-prompts.
 #[test]
@@ -823,6 +849,18 @@ fn write_call(id: &str, path: &str, content: &str) -> AssistantTurn {
     }
 }
 
+fn bash_call(id: &str, command: &str) -> AssistantTurn {
+    AssistantTurn {
+        tool_calls: vec![ToolCall {
+            id: id.to_string(),
+            name: "bash".to_string(),
+            arguments: json!({ "command": command }),
+            thought_signature: None,
+        }],
+        ..Default::default()
+    }
+}
+
 /// Grant `write` at the project layer so a non-dirty write auto-approves.
 fn grant_write<P: ChatProvider>(harness: &mut Harness<P>) {
     let mut policy = crate::nexus::ProjectPolicy::default();
@@ -873,6 +911,51 @@ fn dirty_write_prompts_despite_project_grant() -> Result<()> {
     assert!(
         !ctx.destructive,
         "a plain dirty-file write is not the destructive floor"
+    );
+    Ok(())
+}
+
+#[test]
+fn dirty_gate_review_context_escapes_terminal_control_paths() -> Result<()> {
+    let repo = init_repo();
+    let name = "unsafe\n\u{1b}[31m.txt";
+    let path = repo.path.join(name);
+    fs::write(&path, "base\n")?;
+    run_git(&repo.path, &["add", name]);
+    run_git(&repo.path, &["commit", "-q", "-m", "add unsafe path"]);
+    fs::write(&path, "dirty\n")?;
+
+    let provider = FakeProvider::new(vec![
+        write_call("c1", name, "iris\n"),
+        AssistantTurn::text("done"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let ctx = frontend
+        .last_ctx
+        .borrow()
+        .clone()
+        .expect("dirty gate review context");
+    assert_eq!(ctx.dirty_paths, vec!["unsafe\\n\\u{1b}[31m.txt"]);
+    assert!(
+        frontend.events.borrow().iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(message)
+                if message.contains("unsafe\\n\\u{1b}[31m.txt")
+                    && !message.contains('\n')
+                    && !message.contains('\u{1b}')
+        )),
+        "dirty notice escapes terminal controls"
     );
     Ok(())
 }
@@ -981,6 +1064,45 @@ fn print_turn_failure_leaves_workflow_task_record() -> Result<()> {
         task_state::load_all(&git_dir).len(),
         1,
         "failed print mode keeps the durable task for recovery"
+    );
+    Ok(())
+}
+
+#[test]
+fn print_turn_failed_verification_keeps_workflow_task_record() -> Result<()> {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+    let provider = FakeProvider::new(vec![
+        write_call("c1", "new.txt", "hi\n"),
+        AssistantTurn::text("done"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    harness.set_verification(Some(crate::config::VerificationConfig {
+        command: Some("false".to_string()),
+        max_attempts: 1,
+    }));
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    crate::cli::run_print_turn(&mut harness, "create new file", &frontend, &frontend)?;
+
+    assert_eq!(
+        task_state::load_all(&git_dir).len(),
+        1,
+        "failed verification must leave the durable task for recovery"
+    );
+    assert!(
+        frontend.events.borrow().iter().any(|event| matches!(
+            event,
+            AgentEvent::Verification(crate::nexus::VerificationOutcome::Failed { .. })
+        )),
+        "the failed verification was reported"
     );
     Ok(())
 }
@@ -1278,4 +1400,79 @@ fn harness_records_external_settlement_when_user_commits_task() -> Result<()> {
     assert_eq!(settled.len(), 1, "exactly one settle recorded");
     assert_eq!(settled[0]["disposition"], "external");
     Ok(())
+}
+
+#[test]
+fn harness_does_not_external_settle_model_committed_task_after_turn() -> Result<()> {
+    let repo = init_repo();
+    let git_dir = task_state::git_dir(&repo.path).unwrap();
+
+    let provider = FakeProvider::new(vec![
+        write_call("c1", "new.txt", "hi\n"),
+        bash_call(
+            "c2",
+            "git add new.txt && git commit -q -m model-committed-task",
+        ),
+        AssistantTurn::text("done"),
+    ]);
+    let mut harness = Harness::new(
+        Agent::new(provider, crate::tools::built_in_tools()),
+        repo.path.clone(),
+        ToolState::new(),
+        None,
+        None,
+    );
+    grant_write(&mut harness);
+    let frontend = CountingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        "create and commit the file",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    assert_eq!(
+        task_state::load_all(&git_dir).len(),
+        1,
+        "a model-run commit must not be treated as external user settlement at turn end"
+    );
+    assert!(
+        frontend.events.borrow().iter().all(
+            |event| !matches!(event, AgentEvent::Notice(message) if message == EXTERNAL_SETTLEMENT_NOTICE)
+        ),
+        "no external-settlement notice is emitted for model/tool settlement"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn compaction_task_state_drops_symlink_resolved_outside_paths() {
+    use std::os::unix::fs::symlink;
+
+    let repo = init_repo();
+    let outside = temp_dir();
+    let outside_target = outside.path.join("outside.txt");
+    fs::write(&outside_target, "base\n").unwrap();
+    let link = repo.path.join("linked.txt");
+    symlink(&outside_target, &link).unwrap();
+
+    let guard = guard(&repo.path);
+    guard.set_turn_context(Some("write linked path".to_string()));
+    guard.note_mutation();
+    let targets = [link.clone()];
+    guard.before_exec(&targets);
+    fs::write(&link, "secret\n").unwrap();
+    let violations = guard.after_exec(&targets, Some(&crate::tools::content_hash(b"secret\n")));
+    assert!(violations.is_empty(), "symlink write should be ledgered");
+
+    let (body, paths) = guard
+        .active_task_compaction_state(10)
+        .expect("body keeps task state renderable");
+    assert_eq!(body.as_deref(), Some("write linked path"));
+    assert!(
+        paths.is_empty(),
+        "canonical outside ledger path must not enter compaction carry: {paths:?}"
+    );
 }

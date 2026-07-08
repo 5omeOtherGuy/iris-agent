@@ -904,14 +904,17 @@ pub(crate) fn run_print_turn<P: ChatProvider>(
         move || watch_for_interrupt(&token, &done)
     });
     let result = runtime.block_on(harness.submit_turn(prompt, obs, gate, &token));
-    if result.is_ok() && !token.is_cancelled() {
+    if result
+        .as_ref()
+        .is_ok_and(|outcome| outcome.allows_print_settlement())
+    {
         harness.accept_print_checkpoint();
     }
     done.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     // Bound shutdown so an orphaned blocking provider request cannot hang exit.
     runtime.shutdown_timeout(Duration::from_secs(1));
-    result
+    result.map(|_| ())
 }
 
 /// Drive the interactive REPL. Owns the Tier-3 runtime: a current-thread tokio
