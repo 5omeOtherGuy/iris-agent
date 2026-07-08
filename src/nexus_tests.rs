@@ -7891,7 +7891,7 @@ fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
 
 // ---------------------------------------------------------------------------
 // `--dangerously-skip-permissions` (ADR-0049): every gated call is
-// auto-approved, floors included; nothing persists; the bypass is audited.
+// auto-approved, floors included; no grants persist; the bypass is audited.
 // ---------------------------------------------------------------------------
 
 fn dangerous_approved_count(frontend: &RecordingFrontend) -> usize {
@@ -7904,10 +7904,10 @@ fn dangerous_approved_count(frontend: &RecordingFrontend) -> usize {
 }
 
 #[test]
-fn skip_permissions_defaults_off_and_only_the_builder_flips_it() {
-    // Activation isolation: a bare agent is never in skip mode, and the ONLY
-    // way to enable it is the explicit construction-time builder the host calls
-    // from the CLI flag. There is no config/env/trust-store/live-setter path.
+fn skip_permissions_defaults_off_and_builder_flips_it() {
+    // Activation isolation: a bare agent is never in skip mode, and startup
+    // enablement uses the explicit builder the host calls from the CLI flag or
+    // same-session transcript state. There is no config/env/trust-store path.
     let provider = FakeProvider::new(vec![Ok(AssistantTurn::text("done"))]);
     let agent = Agent::new(provider, crate::tools::built_in_tools());
     assert!(!agent.skip_permissions(), "default is off");

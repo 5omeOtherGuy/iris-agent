@@ -168,7 +168,7 @@ impl ApprovalPolicy {
     /// State glyph from the symbol vocabulary (`◆`/`▲`/`■`/`○`).
     fn symbol(self) -> &'static str {
         match self {
-            Self::SkipPermissions => crate::ui::symbols::DONE,
+            Self::SkipPermissions => crate::ui::symbols::ERROR,
             Self::Auto => crate::ui::symbols::ACTIVE,
             Self::OnRequest => crate::ui::symbols::REVIEW,
             Self::NeverAsk => crate::ui::symbols::CANCELLED,
@@ -179,7 +179,7 @@ impl ApprovalPolicy {
 
     fn label(self) -> &'static str {
         match self {
-            Self::SkipPermissions => "skip-permissions",
+            Self::SkipPermissions => "dangerously skip permissions",
             Self::Auto => "auto",
             Self::OnRequest => "on-request",
             Self::NeverAsk => "never-ask",
@@ -191,10 +191,12 @@ impl ApprovalPolicy {
     /// Symbol color role: green done / orange review / red error / dim empty.
     fn symbol_style(self) -> Style {
         match self {
-            Self::SkipPermissions | Self::Auto => Style::default().fg(crate::ui::palette::green()),
+            Self::SkipPermissions | Self::ReadOnly => {
+                Style::default().fg(crate::ui::palette::red())
+            }
+            Self::Auto => Style::default().fg(crate::ui::palette::green()),
             Self::OnRequest => prompt_style(),
             Self::NeverAsk => dim_style(),
-            Self::ReadOnly => Style::default().fg(crate::ui::palette::red()),
             Self::Off => dim_style(),
         }
     }
@@ -2861,7 +2863,10 @@ mod tests {
     fn bottom_statusline_policy_segment_carries_symbol_and_label() {
         let mut screen = footer_screen("~/repo");
         for (policy, expected) in [
-            (ApprovalPolicy::SkipPermissions, "◆ skip-permissions"),
+            (
+                ApprovalPolicy::SkipPermissions,
+                "■ dangerously skip permissions",
+            ),
             (ApprovalPolicy::Auto, "◉ auto"),
             (ApprovalPolicy::OnRequest, "▲ on-request"),
             (ApprovalPolicy::NeverAsk, "□ never-ask"),

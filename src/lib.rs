@@ -495,6 +495,7 @@ fn load_session_source(
                 messages: Vec::new(),
                 entry_ids: Vec::new(),
                 resumed: 0,
+                skip_permissions: false,
             })
         }
         cli::SessionSource::Resume(id) => {
@@ -518,6 +519,7 @@ fn load_session_source(
                 messages: stored.messages,
                 entry_ids,
                 resumed,
+                skip_permissions: stored.dangerous_skip_permissions,
             })
         }
     }
@@ -645,6 +647,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     // stable across resume. The harness compares it against the budget at the
     // next turn boundary.
     let context_tokens = stored.context_tokens;
+    let skip_permissions = skip_permissions || stored.dangerous_skip_permissions;
 
     let settings = config::Settings::load(&cwd)?;
     let budget = Some(settings.context_token_budget());
@@ -1089,10 +1092,8 @@ fn print_help() {
     eprintln!(
         "                                   approval prompt, INCLUDING destructive commands."
     );
-    eprintln!("                                   Bypasses the safety floors; session-only,");
-    eprintln!(
-        "                                   nothing persists. Use only in a sandbox you trust."
-    );
+    eprintln!("                                   Bypasses the safety floors; follows resumed");
+    eprintln!("                                   sessions. Use only in a sandbox you trust.");
     eprintln!();
     eprintln!("Display (flag / env var):");
     eprintln!("  --plain, IRIS_PLAIN=1, NO_COLOR   Plain, ANSI-free text UI");

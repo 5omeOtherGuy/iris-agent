@@ -146,6 +146,8 @@ pub(crate) struct LoadedSource {
     /// compactable (#375).
     pub(crate) entry_ids: Vec<Option<String>>,
     pub(crate) resumed: usize,
+    /// Persisted dangerous skip-permissions state for the target session.
+    pub(crate) skip_permissions: bool,
 }
 
 /// Builds a [`LoadedSource`] for a requested [`SessionSource`]. The app
