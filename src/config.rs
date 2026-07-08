@@ -75,9 +75,10 @@ pub(crate) struct Settings {
     /// providers a session talks to, so it is global-only: a cloned repo cannot
     /// silently change the cycle scope.
     pub(crate) enabled_models: Option<Vec<String>>,
-    /// How compaction produces its summary text: `provider` (default) asks the
-    /// active model for a structured handoff summary, falling back to the
-    /// deterministic excerpts on failure; `excerpts` keeps the deterministic
+    /// How compaction produces its summary text: `subagent` (default) asks a
+    /// read-only background worker for a structured handoff summary, falling
+    /// back to older provider/excerpts summarization when needed; `provider`
+    /// uses the active model directly; `excerpts` keeps the deterministic
     /// stand-in only. A cost/quality knob like
     /// [`Settings::context_token_budget`] (it can only choose who writes the
     /// summary, never where requests go), so a project file may tune it.
@@ -387,21 +388,21 @@ impl Settings {
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
     }
 
-    /// Configured compaction summarizer, defaulting to the provider-backed one
-    /// (ADR-0041). `subagent` uses the read-only background worker path when a
-    /// worker factory is installed (issue #472). An unknown value falls back to
-    /// the default rather than erroring, matching how other tuning knobs degrade.
+    /// Configured compaction summarizer, defaulting to the read-only subagent
+    /// worker path (issue #472). `provider` and `excerpts` remain fallback modes.
+    /// An unknown value falls back to the default rather than erroring, matching
+    /// how other tuning knobs degrade.
     pub(crate) fn compaction_summarizer(&self) -> crate::wayland::SummarizerKind {
         match self.compaction_summarizer.as_deref() {
             Some("excerpts") => crate::wayland::SummarizerKind::Excerpts,
-            Some("subagent") => crate::wayland::SummarizerKind::Subagent,
-            Some("provider") | None => crate::wayland::SummarizerKind::Provider,
+            Some("provider") => crate::wayland::SummarizerKind::Provider,
+            Some("subagent") | None => crate::wayland::SummarizerKind::Subagent,
             Some(other) => {
                 tracing::warn!(
                     value = other,
-                    "unknown compactionSummarizer; using 'provider'"
+                    "unknown compactionSummarizer; using 'subagent'"
                 );
-                crate::wayland::SummarizerKind::Provider
+                crate::wayland::SummarizerKind::Subagent
             }
         }
     }
@@ -495,7 +496,7 @@ pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
 pub(crate) fn save_compaction_summarizer(mode: &str) -> Result<()> {
     let mode = match mode {
         "excerpts" | "provider" | "subagent" => mode,
-        _ => "provider",
+        _ => "subagent",
     };
     update_global(&[("compactionSummarizer", Value::String(mode.to_string()))])
 }
@@ -1032,13 +1033,28 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summarizer_accepts_subagent_mode() {
+    fn compaction_summarizer_defaults_to_subagent_and_accepts_explicit_modes() {
         let dir = temp_dir();
+        let defaulted = Settings::load_from(
+            Some(&dir.path.join("none.json")),
+            &dir.path.join("none.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted.compaction_summarizer(),
+            crate::wayland::SummarizerKind::Subagent
+        );
+
         let project = dir.path.join("project.json");
-        fs::write(&project, r#"{ "compactionSummarizer": "subagent" }"#).unwrap();
-
+        fs::write(&project, r#"{ "compactionSummarizer": "provider" }"#).unwrap();
         let settings = Settings::load_from(None, &project).unwrap();
+        assert_eq!(
+            settings.compaction_summarizer(),
+            crate::wayland::SummarizerKind::Provider
+        );
 
+        fs::write(&project, r#"{ "compactionSummarizer": "subagent" }"#).unwrap();
+        let settings = Settings::load_from(None, &project).unwrap();
         assert_eq!(
             settings.compaction_summarizer(),
             crate::wayland::SummarizerKind::Subagent

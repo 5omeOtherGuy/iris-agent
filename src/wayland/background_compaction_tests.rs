@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Harness, SummarizerKind};
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, AssistantTurn, ChatProvider, CompactionLifecycleState,
-    Message, ProviderEvent, ProviderStream, Tools,
+    Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
+    AssistantTurn, ChatProvider, CompactionLifecycleState, Message, ProviderEvent, ProviderStream,
+    ReviewContext, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
@@ -62,6 +63,41 @@ impl ChatProvider for SilentProvider {
     }
 }
 
+#[derive(Clone)]
+struct TurnProvider {
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+impl ChatProvider for TurnProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        Ok(Box::pin(futures::stream::once(async {
+            Ok(ProviderEvent::Completed(AssistantTurn::text(
+                "turn complete",
+            )))
+        })))
+    }
+}
+
+struct AllowGate;
+
+impl ApprovalGate for AllowGate {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+        _ctx: ReviewContext,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async { Ok(ApprovalDecision::Allow) })
+    }
+}
+
 #[derive(Default)]
 struct Recorder {
     events: RefCell<Vec<AgentEvent>>,
@@ -102,6 +138,11 @@ struct SummaryProvider {
     replies: Arc<Mutex<VecDeque<String>>>,
     prompts: Arc<Mutex<Vec<String>>>,
     visible_tools: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+#[derive(Clone)]
+struct BlockingSummaryProvider {
+    prompts: Arc<Mutex<Vec<String>>>,
 }
 
 struct SeededHarness {
@@ -158,6 +199,42 @@ impl ChatProvider for SummaryProvider {
             });
         Ok(Box::pin(futures::stream::once(async move {
             Ok(ProviderEvent::Completed(AssistantTurn::text(&text)))
+        })))
+    }
+}
+
+impl BlockingSummaryProvider {
+    fn factory(
+        prompts: Arc<Mutex<Vec<String>>>,
+    ) -> Arc<dyn Fn() -> Result<Box<dyn ChatProvider>> + Send + Sync + 'static> {
+        Arc::new(move || {
+            Ok(Box::new(BlockingSummaryProvider {
+                prompts: prompts.clone(),
+            }))
+        })
+    }
+}
+
+impl ChatProvider for BlockingSummaryProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _tools: &'a Tools,
+        cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        self.prompts.lock().unwrap().push(
+            messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default(),
+        );
+        while !cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(Box::pin(futures::stream::once(async {
+            Ok(ProviderEvent::Completed(AssistantTurn::text(
+                "Goal: cancelled. State: stale. Decisions: none. Key facts: stale. Next steps: none.",
+            )))
         })))
     }
 }
@@ -236,7 +313,7 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
     let obs = Recorder::default();
     let token = CancellationToken::new();
 
-    block_on(harness.maybe_auto_compact(&obs, &token)).unwrap();
+    block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 1);
     assert!(
         compaction_entries(&path).is_empty(),
@@ -251,7 +328,7 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
     );
 
     for _ in 0..50 {
-        block_on(harness.maybe_auto_compact(&obs, &token)).unwrap();
+        block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
         if obs.applied() == 1 {
             break;
         }
@@ -308,6 +385,79 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
 }
 
 #[test]
+fn pending_background_compaction_falls_back_before_next_provider_request() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    let big = format!("{OLD_NEEDLE} :: {}", "long covered context. ".repeat(500));
+    for message in [
+        Message::user(&big),
+        Message::assistant("ok"),
+        Message::user("small retained turn"),
+        Message::assistant("ok2"),
+    ] {
+        log.append(&message).unwrap();
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let log = SessionLog::resume(&path).unwrap();
+    let turn_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::resumed(
+        TurnProvider {
+            requests: turn_requests.clone(),
+        },
+        built_in_tools(),
+        stored.messages,
+    );
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(300),
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    let worker_prompts = Arc::new(Mutex::new(Vec::new()));
+    harness.set_compaction_summarizer_factory(BlockingSummaryProvider::factory(
+        worker_prompts.clone(),
+    ));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 1);
+    for _ in 0..50 {
+        if !worker_prompts.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(worker_prompts.lock().unwrap().len(), 1);
+
+    block_on(harness.submit_turn("next small prompt", &obs, &AllowGate, &token)).unwrap();
+
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Cancelled), 1);
+    assert_eq!(obs.applied(), 1);
+    let requests = turn_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent_tokens = super::context_tokens(&requests[0]);
+    assert!(
+        sent_tokens <= 300,
+        "provider saw over-budget context: {sent_tokens} tokens"
+    );
+}
+
+#[test]
 fn stale_background_result_is_discarded_after_parent_revalidation() {
     let root = temp_dir();
     let workspace = temp_dir();
@@ -318,12 +468,12 @@ fn stale_background_result_is_discarded_after_parent_revalidation() {
     let obs = Recorder::default();
     let token = CancellationToken::new();
 
-    block_on(harness.maybe_auto_compact(&obs, &token)).unwrap();
+    block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
     block_on(harness.compact_now(&obs, &token)).unwrap();
     assert_eq!(compaction_entries(&path).len(), 1);
 
     for _ in 0..50 {
-        block_on(harness.maybe_auto_compact(&obs, &token)).unwrap();
+        block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
         if obs.lifecycle(CompactionLifecycleState::Discarded) == 1 {
             break;
         }

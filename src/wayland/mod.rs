@@ -889,7 +889,7 @@ impl<P: ChatProvider> Harness<P> {
         // transcript is complete here (every tool call answered), so neither the
         // fold pass nor the covered range splits a pending tool-call/result pair.
         self.maybe_microcompact(obs)?;
-        self.maybe_auto_compact(obs, token).await?;
+        self.maybe_auto_compact(obs, token, false).await?;
         // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
         // the current session id to the guard before the turn. The guard stamps
         // them as opaque display payload onto any task this turn opens; a
@@ -960,7 +960,7 @@ impl<P: ChatProvider> Harness<P> {
             // threshold, start the next background summarizer without waiting for
             // it (issue #472). Harnesses without a background factory keep the
             // legacy foreground pre-turn compaction path.
-            self.maybe_auto_compact(obs, token).await?;
+            self.maybe_auto_compact(obs, token, true).await?;
         }
         result
     }
@@ -1353,11 +1353,9 @@ impl<P: ChatProvider> Harness<P> {
         &mut self,
         obs: &dyn AgentObserver,
         token: &CancellationToken,
+        allow_background_start: bool,
     ) -> Result<()> {
         self.drain_background_compaction(obs)?;
-        if self.background_compaction.is_some() {
-            return Ok(());
-        }
         let Some(budget) = self.budget else {
             return Ok(());
         };
@@ -1369,9 +1367,31 @@ impl<P: ChatProvider> Harness<P> {
 
         // Current provider-visible context total, using the same per-message
         // convention the store persists and rebuilds with.
-        let total = context_tokens(self.agent.messages());
+        let mut total = context_tokens(self.agent.messages());
         if total <= budget {
             return Ok(());
+        }
+
+        if self.background_compaction.is_some() && allow_background_start {
+            return Ok(());
+        }
+
+        if !allow_background_start && let Some(job) = self.background_compaction.take() {
+            job.token.cancel();
+            self.emit_compaction_lifecycle(
+                obs,
+                &job,
+                CompactionLifecycleState::Cancelled,
+                Some(
+                    "background compaction was still running at the turn boundary; using deterministic fallback"
+                        .to_string(),
+                ),
+            )?;
+            self.apply_deterministic_fallback_for_job(&job, obs)?;
+            total = context_tokens(self.agent.messages());
+            if total <= budget {
+                return Ok(());
+            }
         }
 
         let messages = self.agent.messages().to_vec();
@@ -1388,7 +1408,8 @@ impl<P: ChatProvider> Harness<P> {
             return Ok(());
         };
 
-        if self.background_compaction.is_none()
+        if allow_background_start
+            && self.background_compaction.is_none()
             && self.summarizer != SummarizerKind::Excerpts
             && self.summarizer_factory.is_some()
         {
