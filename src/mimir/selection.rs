@@ -188,19 +188,6 @@ impl ReasoningEffort {
             ReasoningEffort::XHigh => "xhigh",
         }
     }
-
-    /// Short human description shown in the effort picker, matching pi-mono's
-    /// thinking-level descriptions.
-    pub(crate) fn description(self) -> &'static str {
-        match self {
-            ReasoningEffort::Off => "No reasoning",
-            ReasoningEffort::Minimal => "Very brief reasoning (~1k tokens)",
-            ReasoningEffort::Low => "Light reasoning (~2k tokens)",
-            ReasoningEffort::Medium => "Moderate reasoning (~8k tokens)",
-            ReasoningEffort::High => "Deep reasoning (~16k tokens)",
-            ReasoningEffort::XHigh => "Maximum reasoning (~32k tokens)",
-        }
-    }
 }
 
 /// Prompt-cache retention preference shared by provider adapters. `Short` (the

@@ -410,24 +410,27 @@ fn handle_reasoning<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
 ) -> Vec<String> {
+    let provider = switch.selection.provider;
+    let model = switch.selection.model.clone();
     if rest.is_empty() {
-        return vec!["usage: /reasoning <off|minimal|low|medium|high|xhigh>".to_string()];
+        return vec![format!(
+            "usage: /reasoning <{}>",
+            model_capabilities::join_display_levels(provider, &model).replace(", ", "|")
+        )];
     }
-    let level = match ReasoningEffort::parse(rest) {
+    let level = match model_capabilities::parse_level(provider, &model, rest) {
         Ok(level) => level,
         Err(error) => return vec![format!("{error:#}")],
     };
-    let provider = switch.selection.provider;
-    let model = switch.selection.model.clone();
     let clamped = model_capabilities::clamp(provider, &model, level);
     let mut lines = Vec::new();
     if clamped != level {
         lines.push(format!(
             "reasoning '{}' is not supported by {}/{}; using '{}'",
-            level.as_str(),
+            rest.trim(),
             provider.as_str(),
             model,
-            clamped.as_str(),
+            model_capabilities::display_level(provider, &model, clamped),
         ));
     }
     let mut candidate = switch.selection.clone();
@@ -577,14 +580,15 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     {
         tracing::warn!(error = %format!("{error:#}"), "failed to record model selection event");
     }
+    let confirm_reasoning = candidate
+        .reasoning
+        .map(|level| model_capabilities::display_level(candidate.provider, &candidate.model, level))
+        .unwrap_or("none");
     let confirm = format!(
         "switched to {}/{} (reasoning: {})",
         candidate.provider.as_str(),
         candidate.model,
-        candidate
-            .reasoning
-            .map(ReasoningEffort::as_str)
-            .unwrap_or("none"),
+        confirm_reasoning,
     );
     let advisory = switch_context_advisory(
         scope,
@@ -683,14 +687,17 @@ pub(crate) fn session_info_lines<P: ChatProvider>(
     ));
     if let Some(sw) = switch.as_ref() {
         let selection = sw.selection();
+        let reasoning = selection
+            .reasoning
+            .map(|level| {
+                model_capabilities::display_level(selection.provider, &selection.model, level)
+            })
+            .unwrap_or("none");
         lines.push(format!(
             "model: {}/{} (reasoning: {})",
             selection.provider.as_str(),
             selection.model,
-            selection
-                .reasoning
-                .map(ReasoningEffort::as_str)
-                .unwrap_or("none"),
+            reasoning,
         ));
     }
     lines
@@ -760,19 +767,17 @@ fn render_extract_item(item: &session::ExtractItem) -> String {
 
 /// Read-only `/model` view: current provider/model/reasoning + supported levels.
 fn current_selection_lines(selection: &ModelSelection) -> Vec<String> {
-    let levels = model_capabilities::join_levels(model_capabilities::supported_levels(
-        selection.provider,
-        &selection.model,
-    ));
+    let levels = model_capabilities::join_display_levels(selection.provider, &selection.model);
+    let reasoning = selection
+        .reasoning
+        .map(|level| model_capabilities::display_level(selection.provider, &selection.model, level))
+        .unwrap_or("none");
     vec![
         format!(
             "{}/{} (reasoning: {})",
             selection.provider.as_str(),
             selection.model,
-            selection
-                .reasoning
-                .map(ReasoningEffort::as_str)
-                .unwrap_or("none"),
+            reasoning,
         ),
         format!("supported reasoning levels: {levels}"),
     ]
@@ -1580,8 +1585,8 @@ mod tests {
             Some(ReasoningEffort::XHigh)
         );
 
-        // Shipped adaptive Anthropic models now accept xhigh (it maps to the
-        // "max" effort): switching to Sonnet 4.6 and asking for xhigh sticks.
+        // Manual-budget Anthropic models expose exact thinking budgets in the UI
+        // but still store the normalized xhigh level internally.
         handle_model_command(
             "/model anthropic/claude-sonnet-4-6",
             &mut harness,
@@ -1590,7 +1595,24 @@ mod tests {
         let lines =
             handle_model_command("/reasoning xhigh", &mut harness, &mut switch).expect("handled");
         assert!(
-            lines.iter().any(|l| l.contains("reasoning: xhigh")),
+            lines.iter().any(|l| l.contains("reasoning: 32,768 tokens")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            switch.as_ref().unwrap().selection.reasoning,
+            Some(ReasoningEffort::XHigh)
+        );
+
+        // Adaptive Anthropic models expose the provider-native `max` effort.
+        handle_model_command(
+            "/model anthropic/claude-sonnet-5",
+            &mut harness,
+            &mut switch,
+        );
+        let lines =
+            handle_model_command("/reasoning max", &mut harness, &mut switch).expect("handled");
+        assert!(
+            lines.iter().any(|l| l.contains("reasoning: max")),
             "{lines:?}"
         );
         assert_eq!(
@@ -1609,7 +1631,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("not supported") && l.contains("using 'high'")),
+                .any(|l| l.contains("not supported") && l.contains("using '20,480 tokens'")),
             "{lines:?}"
         );
         assert_eq!(
