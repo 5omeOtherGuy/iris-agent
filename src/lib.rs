@@ -997,6 +997,7 @@ fn build_provider(
                 session_id,
                 selection.cache_retention,
                 selection.retry_policy,
+                selection.codex_transport,
             )?,
         ),
         ProviderId::OpenAi => {

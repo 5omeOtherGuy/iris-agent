@@ -339,6 +339,7 @@ mod tests {
             enabled_models: None,
             max_tool_roundtrips: None,
             retry: None,
+            codex_transport: None,
             open_ai_compatible: Some(crate::config::OpenAiCompatibleSettings {
                 context_window: Some(131_072),
                 reasoning: Some(true),

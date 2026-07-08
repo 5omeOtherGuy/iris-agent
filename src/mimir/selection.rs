@@ -143,6 +143,26 @@ pub(crate) enum ReasoningEffort {
     XHigh,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CodexTransport {
+    #[default]
+    Auto,
+    Sse,
+}
+
+impl CodexTransport {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "auto" => Ok(Self::Auto),
+            "sse" => Ok(Self::Sse),
+            other => Err(UsageError::new(format!(
+                "unsupported codexTransport '{other}'; supported: auto, sse"
+            ))
+            .into()),
+        }
+    }
+}
+
 impl ReasoningEffort {
     /// Default thinking/effort level (`medium`), matching pi-mono. Used when a
     /// picker needs a starting level and the session has no explicit preference.
@@ -406,6 +426,7 @@ pub(crate) struct ModelSelection {
     pub(crate) base_url: String,
     pub(crate) reasoning: Option<ReasoningEffort>,
     pub(crate) cache_retention: PromptCacheRetention,
+    pub(crate) codex_transport: CodexTransport,
     /// Anthropic-only context-management opt-in; empty/default for other
     /// providers and when unconfigured.
     pub(crate) context_management: ContextManagement,
@@ -459,6 +480,10 @@ impl ModelSelection {
             Some(value) => PromptCacheRetention::parse(value)?,
             None => PromptCacheRetention::DEFAULT,
         };
+        let codex_transport = match trimmed_non_empty(settings.codex_transport.as_deref()) {
+            Some(value) => CodexTransport::parse(value)?,
+            None => CodexTransport::Auto,
+        };
         let legacy_context_management = match &settings.anthropic_context_management {
             Some(value) => {
                 serde_json::from_value::<ContextManagement>(value.clone()).map_err(|error| {
@@ -481,6 +506,7 @@ impl ModelSelection {
             base_url,
             reasoning,
             cache_retention,
+            codex_transport,
             context_management: ContextManagement::default(),
             legacy_context_management,
             tool_result_compaction: configured_tool_result_compaction.clone(),
@@ -754,6 +780,7 @@ mod tests {
             enabled_models: None,
             max_tool_roundtrips: None,
             retry: None,
+            codex_transport: None,
             open_ai_compatible: None,
             verify: None,
             tui: None,
@@ -910,6 +937,7 @@ mod tests {
             base_url: String::new(),
             reasoning: None,
             cache_retention: retention,
+            codex_transport: CodexTransport::Auto,
             context_management: ContextManagement::default(),
             legacy_context_management: ContextManagement::default(),
             tool_result_compaction: crate::config::Settings::default()

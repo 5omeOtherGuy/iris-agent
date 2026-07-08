@@ -139,6 +139,10 @@ pub(crate) struct Settings {
     /// request load and cost, so an untrusted project file must not crank it up
     /// (same reasoning as `prompt_cache_retention`).
     pub(crate) retry: Option<RetrySettings>,
+    /// OpenAI Codex transport mode: `auto` uses OAuth WebSocket by default with
+    /// HTTP/SSE fallback; `sse` forces the legacy HTTP/SSE route. GLOBAL-ONLY:
+    /// it changes secret-bearing provider transport behavior and fallback policy.
+    pub(crate) codex_transport: Option<String>,
     /// Generic OpenAI-compatible model metadata. The provider/model/base-url are
     /// still resolved through the existing top-level defaults; this object holds
     /// capability/display flags for the configured custom endpoint.
@@ -334,6 +338,9 @@ impl Settings {
             // Retry tuning affects provider load/cost, so keep it global-only
             // like prompt cache retention; never taken from project config.
             retry: self.retry,
+            // Codex transport affects secret-bearing provider transport and
+            // fallback behavior, so it is global-only like provider/base-url.
+            codex_transport: self.codex_transport,
             // Custom endpoint capability flags are global-only alongside the
             // base URL, so a cloned project cannot change how a secret-bearing
             // endpoint is called.
