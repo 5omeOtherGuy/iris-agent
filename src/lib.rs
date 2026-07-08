@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 mod approval;
 mod cli;
 mod config;
+mod display_path;
 mod errors;
 mod git;
 mod handles;

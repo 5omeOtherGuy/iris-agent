@@ -1947,12 +1947,7 @@ impl<P: ChatProvider> Agent<P> {
         // front-end via `ReviewContext` for the decision-point reason line.
         let dirty_display: Vec<String> = dirty_protected
             .iter()
-            .map(|path| {
-                path.strip_prefix(env.workspace)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            })
+            .map(|path| crate::display_path::workspace_path(env.workspace, path))
             .collect();
         if let Some(tool) = self.tools.by_name(&call.name) {
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {

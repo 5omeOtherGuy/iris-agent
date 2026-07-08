@@ -253,7 +253,7 @@ impl<P: ChatProvider> SubagentBackend<P> {
             return Ok(result);
         }
         match run {
-            Ok(()) => {
+            Ok(_) => {
                 worker.status = SubagentStatus::Completed;
                 let summary = limit_summary(
                     final_assistant_text(harness.messages()),
