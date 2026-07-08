@@ -16,7 +16,8 @@ use anyhow::Result;
 
 use super::{
     Baseline, Chain, CheckpointChain, GitSafety, IrisChange, Mode, RestorePoint, RollbackOutcome,
-    Settlement, Task, baseline, checkpoint, git, lock, push_session_deduped, task_state,
+    Settlement, Task, baseline, checkpoint, git, is_linked_worktree, lock, push_session_deduped,
+    task_state,
 };
 
 /// How a persisted record classifies during recovery (ADR-0030). Leased (live
@@ -715,11 +716,13 @@ impl GitSafety {
                 index: String::new(),
             });
         baseline.index = persisted.baseline_index.clone();
+        let linked_worktree = is_linked_worktree(&self.workspace, Some(git_dir));
         let mut task = Task::active(
             persisted.task_id.clone(),
             baseline,
             chain,
             Some(git_dir.to_path_buf()),
+            linked_worktree,
             Some(lease),
         );
         task.created_ms = persisted.created_ms;

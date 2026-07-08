@@ -134,6 +134,24 @@ pub(super) fn git_dir(workspace: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve the common git directory (absolute). In a linked worktree this is the
+/// primary repository's `.git`; in the primary worktree it equals
+/// [`git_dir`]. `None` when `workspace` is not a git repo.
+pub(super) fn git_common_dir(workspace: &Path) -> Option<PathBuf> {
+    let out = git_stdout(workspace, &["rev-parse", "--git-common-dir"]).ok()?;
+    let text = String::from_utf8_lossy(&out);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    })
+}
+
 fn tasks_dir(git_dir: &Path) -> PathBuf {
     git_dir.join("iris").join("tasks")
 }
