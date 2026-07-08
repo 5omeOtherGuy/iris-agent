@@ -188,19 +188,6 @@ impl ReasoningEffort {
             ReasoningEffort::XHigh => "xhigh",
         }
     }
-
-    /// Short human description shown in the effort picker, matching pi-mono's
-    /// thinking-level descriptions.
-    pub(crate) fn description(self) -> &'static str {
-        match self {
-            ReasoningEffort::Off => "No reasoning",
-            ReasoningEffort::Minimal => "Very brief reasoning (~1k tokens)",
-            ReasoningEffort::Low => "Light reasoning (~2k tokens)",
-            ReasoningEffort::Medium => "Moderate reasoning (~8k tokens)",
-            ReasoningEffort::High => "Deep reasoning (~16k tokens)",
-            ReasoningEffort::XHigh => "Maximum reasoning (~32k tokens)",
-        }
-    }
 }
 
 /// Prompt-cache retention preference shared by provider adapters. `Short` (the
@@ -457,7 +444,8 @@ impl ModelSelection {
     /// - model: `IRIS_MODEL` -> `settings.default_model` -> per-provider default
     /// - base_url: provider env (`IRIS_CODEX_BASE_URL` only today) ->
     ///   `settings.base_url` -> per-provider default
-    /// - reasoning: `settings.default_reasoning` -> else `None`
+    /// - reasoning: `settings.default_reasoning` parsed for the resolved
+    ///   provider/model -> else `None`
     /// - cache retention: `settings.prompt_cache_retention` -> `short`
     /// - context management: `settings.anthropic_context_management` -> empty
     ///
@@ -474,7 +462,9 @@ impl ModelSelection {
             .unwrap_or_else(|| provider.default_model().to_string());
         let base_url = base_url_for(provider, settings.base_url.as_deref());
         let reasoning = match trimmed_non_empty(settings.default_reasoning.as_deref()) {
-            Some(value) => Some(ReasoningEffort::parse(value)?),
+            Some(value) => Some(crate::mimir::model_capabilities::parse_level(
+                provider, &model, value,
+            )?),
             None => None,
         };
         let cache_retention = match trimmed_non_empty(settings.prompt_cache_retention.as_deref()) {
@@ -778,6 +768,42 @@ mod tests {
             env::remove_var("OPENAI_COMPATIBLE_API_KEY");
             env::remove_var("IRIS_OPENAI_COMPATIBLE_API_KEY");
         }
+    }
+
+    #[test]
+    fn resolve_parses_default_reasoning_as_provider_native_label() {
+        let _env = crate::mimir::test_support::env_lock();
+        unsafe {
+            env::remove_var("IRIS_MODEL");
+            env::remove_var("OPENAI_API_KEY");
+            env::remove_var("ANTHROPIC_API_KEY");
+            env::remove_var("OPENAI_COMPATIBLE_API_KEY");
+            env::remove_var("IRIS_OPENAI_COMPATIBLE_API_KEY");
+        }
+
+        let adaptive = settings(
+            Some("anthropic"),
+            Some("claude-sonnet-5"),
+            None,
+            Some("low"),
+        );
+        assert_eq!(
+            ModelSelection::resolve(&adaptive).unwrap().reasoning,
+            Some(ReasoningEffort::Minimal),
+            "Anthropic adaptive `low` is the provider-native lowest effort"
+        );
+
+        let manual = settings(
+            Some("anthropic"),
+            Some("claude-sonnet-4-6"),
+            None,
+            Some("low"),
+        );
+        assert_eq!(
+            ModelSelection::resolve(&manual).unwrap().reasoning,
+            Some(ReasoningEffort::Low),
+            "manual-budget models keep normalized low for legacy text"
+        );
     }
 
     #[test]

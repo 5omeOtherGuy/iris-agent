@@ -1306,8 +1306,8 @@ impl<P: ChatProvider> Agent<P> {
     }
 
     /// Change `--dangerously-skip-permissions` at a safe inter-turn boundary.
-    /// This is intentionally session-only; config/project stores still cannot
-    /// activate it.
+    /// The host may persist this in the Iris session transcript; config/project
+    /// stores still cannot activate it.
     pub(crate) fn set_skip_permissions(&mut self, skip: bool) {
         self.skip_permissions = skip;
     }
@@ -1978,12 +1978,7 @@ impl<P: ChatProvider> Agent<P> {
         // front-end via `ReviewContext` for the decision-point reason line.
         let dirty_display: Vec<String> = dirty_protected
             .iter()
-            .map(|path| {
-                path.strip_prefix(env.workspace)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            })
+            .map(|path| crate::display_path::workspace_path(env.workspace, path))
             .collect();
         if let Some(tool) = self.tools.by_name(&call.name) {
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {

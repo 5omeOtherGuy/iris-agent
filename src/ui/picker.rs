@@ -335,13 +335,21 @@ fn settings_snapshot<P: ChatProvider>(
         .and_then(|cwd| config::Settings::load(&cwd).ok())
         .unwrap_or_default();
     let tui = settings.tui_settings();
+    let selection = switch.selection();
+    let default_reasoning = settings
+        .default_reasoning
+        .as_deref()
+        .and_then(|value| ReasoningEffort::parse(value).ok())
+        .unwrap_or(ReasoningEffort::DEFAULT);
     settings_menu::Snapshot {
         default_model: config::default_model_qualified()
             .unwrap_or_else(|| current_qualified(switch)),
-        default_reasoning: settings
-            .default_reasoning
-            .clone()
-            .unwrap_or_else(|| ReasoningEffort::DEFAULT.as_str().to_string()),
+        default_reasoning: model_capabilities::display_level(
+            selection.provider,
+            &selection.model,
+            default_reasoning,
+        )
+        .to_string(),
         alt_screen: tui
             .and_then(|t| t.alt_screen.clone())
             .unwrap_or_else(|| "auto".to_string()),
@@ -421,13 +429,14 @@ fn effort_picker<P>(switch: &ModelSwitch<'_, P>) -> Modal {
     let selection = switch.selection();
     if selection.provider == ProviderId::OpenAiCompatible && !selection.open_ai_compatible.reasoning
     {
-        return Modal::Effort(EffortPicker::new(
-            vec![ReasoningEffort::Off],
-            ReasoningEffort::Off,
-        ));
+        let levels = model_capabilities::level_options(selection.provider, &selection.model)
+            .iter()
+            .copied()
+            .filter(|option| option.level == ReasoningEffort::Off)
+            .collect();
+        return Modal::Effort(EffortPicker::new(levels, ReasoningEffort::Off));
     }
-    let levels =
-        model_capabilities::supported_levels(selection.provider, &selection.model).to_vec();
+    let levels = model_capabilities::level_options(selection.provider, &selection.model).to_vec();
     let current = model_capabilities::clamp(
         selection.provider,
         &selection.model,

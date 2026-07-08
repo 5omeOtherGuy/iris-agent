@@ -102,6 +102,13 @@
 - Stars for some proprietary or rate-limited GitHub/API targets remain
   `unverified`; re-check with authenticated GitHub API before publication.
 
+
+## 2026-07 local addendum — Grok Build CLI
+
+| Competitor | Evidence | Subagents | Isolation / apply | Worktree management | Iris relevance |
+|---|---|---|---|---|---|
+| **Grok Build CLI 0.2.82** | Local CLI/runtime reference pass; see [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md). | **yes** — model-facing input includes prompt, description, subagent type, background execution, capability mode, isolation, resume, and cwd controls; background tasks emit subagent/session notifications; depth is limited. | **best verified** — worktree isolation runs child mutations in a separate worktree; parent/source workspace changes only through explicit apply; best-of-N applies one winner. | **mature** — worktree list/show/rm/gc/db-style management; durable registry with worktree id, source repo, session id, creation mode, owner pid, status; dead-process cleanup, GC, and fast snapshot/copy/git-checkout fallbacks. | Treat as the target systems design for Iris mutable subagents. Copy semantics first: linked worktree, registry, explicit apply, progress, list/show/rm/gc. Defer Btrfs/overlay fast paths until linked semantics are correct. |
+
 ## Caveats
 - **Licensing nuance:** Crush is **FSL-1.1-MIT** (source-available, prohibits
   "Competing Use," converts to MIT after 2 years — *not* OSI-permissive at release);

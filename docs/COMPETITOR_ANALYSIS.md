@@ -41,6 +41,46 @@
 >   prompt-caching details for Cursor, Hermes, Crush, sst/opencode, Codex, and
 >   the Pi rows. Do not fill those cells from impression.
 
+> **Update (2026-07-07): subagent / isolation / safety ranking.** A local
+> reference pass over **Grok Build CLI 0.2.82** materially changes the subagent
+> comparison. See [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md)
+> for the observed CLI/runtime evidence. This addendum scores implementation
+> quality, not model quality or brand reach.
+
+### 2026-07 subagent and safe-execution ranking
+
+Rubric: **Subagent model** = delegation contract, background/resume behavior,
+typed capabilities, and nesting controls. **Isolation safety** = whether child
+mutation is contained until explicit apply. **Smoothness** = CLI/TUI management,
+progress, recovery, and cleanup. Scores are 1-5 and evidence-backed only where
+noted.
+
+| Rank | System | Subagent model | Isolation safety | Smoothness | Verdict |
+|---:|---|---:|---:|---:|---|
+| 1 | **Grok Build CLI** | **5** | **5** | **5** | Best observed implementation. Its subagent input includes typed worker kind, capability mode, background mode, resume, depth limits, and worktree isolation; child mutations stay out of the parent until explicit apply; lifecycle has durable records plus list/show/rm/gc management and fast snapshot fallbacks. |
+| 2 | **Claude Code** | **5** | 3 | 4 | Best productized subagent UX and configurability: built-in/custom subagents with model/tools/MCP/background/isolation frontmatter. The public docs verify rich delegation, but this pass has less evidence of Grok-style durable worktree isolation/apply semantics. |
+| 3 | **Cline** | 4 | 4 | 4 | Strong safe-research pattern: read-only subagents launched in parallel by default. Safer than general read-write delegation, but narrower; it is not the same as isolated mutable worktrees with explicit apply. |
+| 4 | **pi-mmr / AMP-style routing** | 4 | 2 | 4 | Cleanest routing concept: subagents-as-tools plus per-worker model routing and grouped background workers. Safety is weaker than Grok because pi-mmr's known implementation uses cold child processes and does not provide a durable worktree apply boundary by default. |
+| 5 | **Aider** | 1 | 4 | 4 | Not a subagent leader, but still one of the cleanest safe-change workflows: git is the unit of work, repo map is mature, and undo/diff/commit ergonomics are excellent. |
+| 6 | **Codex CLI** | 2 | 4 | 3 | Strong sandbox/runtime reference, weak verified subagent surface in this corpus. Use it for async/cancellation/tool-safety design, not as the subagent UX target. |
+
+**Best subagent implementation:** **Grok Build CLI**, narrowly over Claude Code,
+because Grok combines model-facing delegation with a concrete mutation-isolation
+primitive. Claude Code appears more mature as an ecosystem feature; Grok is the
+cleaner systems design for safe agentic coding.
+
+**Cleanest safe-test / safe-execution workflow:** **Grok Build CLI** for isolated
+read-write experimentation, then explicit apply. The winning pattern is not just
+"run tests safely"; it is **spawn candidate worktrees, let them mutate and test in
+isolation, compare outputs, and apply one winner**. Aider remains the benchmark
+for simple single-agent git hygiene; Cline is safer for read-only research.
+
+**Most important Iris lesson:** make worktree isolation a runtime primitive, not a
+prompt convention. Iris has shipped the read-only subagent backend contract (#460);
+the minimum useful mutable backend slice is linked git worktrees, durable ids,
+progress notifications, explicit apply, and `list/show/rm/gc`. Fast Btrfs/overlay
+snapshots are desired follow-ups after the semantics are correct.
+
 ## Executive summary
 
 Iris enters a crowded field where its three headline differentiators — Rust

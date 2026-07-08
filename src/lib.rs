@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::env;
+use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use nexus::{Agent, ChatProvider};
@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 mod approval;
 mod cli;
 mod config;
+mod display_path;
 mod errors;
 mod git;
 mod handles;
@@ -511,6 +512,7 @@ fn load_session_source(
                 messages: Vec::new(),
                 entry_ids: Vec::new(),
                 resumed: 0,
+                skip_permissions: false,
             })
         }
         cli::SessionSource::Resume(id) => {
@@ -538,6 +540,7 @@ fn load_session_source(
                 messages: stored.messages,
                 entry_ids,
                 resumed,
+                skip_permissions: stored.dangerous_skip_permissions,
             })
         }
     }
@@ -692,6 +695,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     // stable across resume. The harness compares it against the budget at the
     // next turn boundary.
     let context_tokens = stored.context_tokens;
+    let skip_permissions = skip_permissions || stored.dangerous_skip_permissions;
 
     let settings = config::Settings::load(&cwd)?;
     let budget = Some(settings.context_token_budget());
@@ -868,7 +872,8 @@ fn build_provider(
                         reasoning,
                         system_prompt,
                         api_key,
-                        supports_reasoning: true,
+                        supports_reasoning:
+                            mimir::model_capabilities::openai_api_supports_reasoning(model),
                         api_key_required: true,
                         retry_policy: selection.retry_policy,
                     },
@@ -921,6 +926,7 @@ fn build_provider(
 const COMMAND_NAME: &str = "iris";
 const UPDATE_REPO: &str = "https://github.com/5omeOtherGuy/iris-agent.git";
 const UPDATE_PACKAGE: &str = "iris-agent";
+const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
 const UPDATE_ARGS: &[&str] = &[
     "install",
     "--git",
@@ -960,14 +966,35 @@ fn update_self_replace() -> Result<()> {
 
 fn update_via_cargo() -> Result<()> {
     println!("Updating Iris from {UPDATE_REPO} ...");
-    let status = Command::new("cargo")
-        .args(update_args())
+    let mut command = Command::new("cargo");
+    command.args(update_args());
+    if let Some(target_dir) = default_update_target_dir() {
+        command.env(CARGO_TARGET_DIR_ENV, target_dir);
+    }
+    let status = command
         .status()
         .context("failed to run cargo; install Rust/Cargo or update with cargo install manually")?;
     if !status.success() {
         bail!("cargo install failed with {status}");
     }
     Ok(())
+}
+
+fn default_update_target_dir() -> Option<PathBuf> {
+    default_update_target_dir_from(
+        env::var_os(CARGO_TARGET_DIR_ENV).as_deref(),
+        env::var_os("HOME").as_deref(),
+    )
+}
+
+fn default_update_target_dir_from(
+    existing_target_dir: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if existing_target_dir.is_some() {
+        return None;
+    }
+    home.map(|home| PathBuf::from(home).join(".cache").join("iris-target"))
 }
 
 fn login_openai_codex(method: LoginMethod) -> Result<()> {
@@ -1146,10 +1173,8 @@ fn print_help() {
     eprintln!(
         "                                   approval prompt, INCLUDING destructive commands."
     );
-    eprintln!("                                   Bypasses the safety floors; session-only,");
-    eprintln!(
-        "                                   nothing persists. Use only in a sandbox you trust."
-    );
+    eprintln!("                                   Bypasses the safety floors; follows resumed");
+    eprintln!("                                   sessions. Use only in a sandbox you trust.");
     eprintln!();
     eprintln!("Display (flag / env var):");
     eprintln!("  --plain, IRIS_PLAIN=1, NO_COLOR   Plain, ANSI-free text UI");
@@ -1196,6 +1221,30 @@ mod tests {
                 "--force"
             ]
         );
+    }
+
+    #[test]
+    fn update_uses_shared_target_dir_when_cargo_env_is_absent() {
+        assert_eq!(
+            default_update_target_dir_from(None, Some(OsStr::new("/home/alice"))),
+            Some(PathBuf::from("/home/alice/.cache/iris-target"))
+        );
+    }
+
+    #[test]
+    fn update_preserves_existing_cargo_target_dir() {
+        assert_eq!(
+            default_update_target_dir_from(
+                Some(OsStr::new("/tmp/custom-target")),
+                Some(OsStr::new("/home/alice"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn update_skips_shared_target_dir_without_home() {
+        assert_eq!(default_update_target_dir_from(None, None), None);
     }
 
     #[test]

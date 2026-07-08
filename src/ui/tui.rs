@@ -6146,7 +6146,7 @@ mod tests {
 
         let rendered = rendered_text(&mut screen, 80, 17);
         assert!(rendered.contains("Sonnet 5"), "{rendered}");
-        assert!(rendered.contains("effort (xhigh)"), "{rendered}");
+        assert!(rendered.contains("effort (max)"), "{rendered}");
         assert!(rendered.contains("SELECT MODEL"), "{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

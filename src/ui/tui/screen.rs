@@ -169,7 +169,7 @@ impl ApprovalPolicy {
     /// State glyph from the symbol vocabulary (`◆`/`▲`/`■`/`○`).
     fn symbol(self) -> &'static str {
         match self {
-            Self::SkipPermissions => crate::ui::symbols::DONE,
+            Self::SkipPermissions => crate::ui::symbols::ERROR,
             Self::Auto => crate::ui::symbols::ACTIVE,
             Self::OnRequest => crate::ui::symbols::REVIEW,
             Self::NeverAsk => crate::ui::symbols::CANCELLED,
@@ -180,7 +180,7 @@ impl ApprovalPolicy {
 
     fn label(self) -> &'static str {
         match self {
-            Self::SkipPermissions => "skip-permissions",
+            Self::SkipPermissions => "dangerously skip permissions",
             Self::Auto => "auto",
             Self::OnRequest => "on-request",
             Self::NeverAsk => "never-ask",
@@ -192,10 +192,12 @@ impl ApprovalPolicy {
     /// Symbol color role: green done / orange review / red error / dim empty.
     fn symbol_style(self) -> Style {
         match self {
-            Self::SkipPermissions | Self::Auto => Style::default().fg(crate::ui::palette::green()),
+            Self::SkipPermissions | Self::ReadOnly => {
+                Style::default().fg(crate::ui::palette::red())
+            }
+            Self::Auto => Style::default().fg(crate::ui::palette::green()),
             Self::OnRequest => prompt_style(),
             Self::NeverAsk => dim_style(),
-            Self::ReadOnly => Style::default().fg(crate::ui::palette::red()),
             Self::Off => dim_style(),
         }
     }
@@ -2758,10 +2760,10 @@ mod tests {
         use crate::ui::tui::session_menu::{GitMenu, SessionMenu, TreeMenu};
         let mut screen = git_screen("~/repo", git_status("main"));
         // Git dropdown open: `▾ ` prefixes the git segment only.
-        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+        screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
             git_status("main"),
             std::path::PathBuf::from("/wt"),
-        )));
+        ))));
         let bar = bar_text(&screen, 80);
         assert!(bar.contains("┊ ▾ git main"), "{bar:?}");
         assert!(!bar.starts_with("▾"), "{bar:?}");
@@ -2789,10 +2791,10 @@ mod tests {
         let closed_rows = session_bar_lines(&screen, 80, 24).len();
         assert_eq!(closed_rows, 2, "bar + hairline when closed");
 
-        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+        screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
             git_status("main"),
             std::path::PathBuf::from("/wt"),
-        )));
+        ))));
         let lines = session_bar_lines(&screen, 80, 24);
         assert!(lines.len() > 2, "dropdown rows inserted");
         // The soft hairline stays the closing rule (last row).
@@ -2809,10 +2811,10 @@ mod tests {
     fn modal_and_approval_close_the_dropdown_and_focus_ranks_it() {
         use crate::ui::tui::session_menu::{GitMenu, SessionMenu};
         let mut screen = git_screen("~/repo", git_status("main"));
-        screen.open_session_menu(SessionMenu::Git(GitMenu::new(
+        screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
             git_status("main"),
             std::path::PathBuf::from("/wt"),
-        )));
+        ))));
         assert_eq!(screen.focus(), crate::ui::tui::FocusTarget::SessionMenu);
         // SessionMenu outranks the palette…
         screen.set_editor("/mo");
@@ -2862,7 +2864,10 @@ mod tests {
     fn bottom_statusline_policy_segment_carries_symbol_and_label() {
         let mut screen = footer_screen("~/repo");
         for (policy, expected) in [
-            (ApprovalPolicy::SkipPermissions, "◆ skip-permissions"),
+            (
+                ApprovalPolicy::SkipPermissions,
+                "■ dangerously skip permissions",
+            ),
             (ApprovalPolicy::Auto, "◉ auto"),
             (ApprovalPolicy::OnRequest, "▲ on-request"),
             (ApprovalPolicy::NeverAsk, "□ never-ask"),

@@ -167,6 +167,10 @@ struct Task {
     /// consecutive-deduped (ADR-0031). Written verbatim into the record; NO
     /// enforcement path reads it.
     sessions: Vec<String>,
+    /// True when the current clean ledger state was observed immediately after
+    /// Iris/tool execution. External settlement waits for a dirty->clean
+    /// transition that happens outside Iris.
+    external_settlement_blocked_while_clean: bool,
 }
 
 impl Task {
@@ -194,6 +198,7 @@ impl Task {
             _lease: lease,
             body: None,
             sessions: Vec::new(),
+            external_settlement_blocked_while_clean: false,
         }
     }
 
@@ -215,6 +220,7 @@ impl Task {
             _lease: None,
             body: None,
             sessions: Vec::new(),
+            external_settlement_blocked_while_clean: false,
         }
     }
 
@@ -241,6 +247,7 @@ impl Task {
             _lease: None,
             body: None,
             sessions: Vec::new(),
+            external_settlement_blocked_while_clean: false,
         }
     }
 }
@@ -460,13 +467,17 @@ impl GitSafety {
         }
         let mut paths = Vec::new();
         for entry in &task.ledger.entries {
-            push_recent_path(&mut paths, self.workspace_display_path(&entry.path));
+            if let Some(path) = self.workspace_compaction_path(&entry.path) {
+                push_recent_path(&mut paths, path);
+            }
         }
         if paths.is_empty()
             && let Chain::Git(chain) = &task.chain
         {
             for path in chain.ledger_paths() {
-                push_recent_path(&mut paths, self.workspace_display_path(path));
+                if let Some(path) = self.workspace_compaction_path(path) {
+                    push_recent_path(&mut paths, path);
+                }
             }
         }
         if paths.len() > max_paths {
@@ -565,10 +576,11 @@ impl GitSafety {
     }
 
     fn workspace_display_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.workspace)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned()
+        crate::display_path::workspace_path(&self.workspace, path)
+    }
+
+    fn workspace_compaction_path(&self, path: &Path) -> Option<String> {
+        crate::display_path::workspace_path_if_inside(&self.workspace, path)
     }
 
     fn protected_path_summary(&self, baseline: &Baseline, max: usize) -> String {
@@ -581,10 +593,21 @@ impl GitSafety {
     }
 
     /// Join the in-flight attribution scan (if any) and fold its entries into
-    /// the ledger. A hard sync barrier per ADR-0028: called at settlement and at
-    /// the start of the next mutating call. Must not be called while holding the
-    /// `state` lock.
+    /// the ledger, then check for user-controlled external settlement. A hard
+    /// sync barrier per ADR-0028: called at settlement and user/harness
+    /// boundaries. Must not be called while holding the `state` lock.
     fn sync_barrier(&self) {
+        self.join_attribution_scan();
+        if let Some(settlement) = self.settle_external_if_clean() {
+            self.state
+                .lock()
+                .unwrap()
+                .external_settlements
+                .push(settlement);
+        }
+    }
+
+    fn join_attribution_scan(&self) {
         let handle = self.scan.lock().unwrap().take();
         if let Some(handle) = handle
             && let Ok(entries) = handle.join()
@@ -621,25 +644,63 @@ impl GitSafety {
                 self.persist_task(task);
             }
         }
-        if let Some(settlement) = self.settle_external_if_clean() {
-            self.state
-                .lock()
-                .unwrap()
-                .external_settlements
-                .push(settlement);
+    }
+
+    pub(crate) fn observe_iris_execution_boundary(&self) {
+        self.join_attribution_scan();
+        let paths = {
+            let state = self.state.lock().unwrap();
+            let Some(task) = state.task.as_ref() else {
+                return;
+            };
+            if !task.durable
+                || task.degraded
+                || task.ledger.entries.is_empty()
+                || !matches!(self.mode, Mode::Git)
+            {
+                return;
+            }
+            task.ledger
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let clean = self.ledger_paths_clean_in_git(paths.iter().map(PathBuf::as_path));
+        if let Some(task) = self.state.lock().unwrap().task.as_mut() {
+            task.external_settlement_blocked_while_clean = clean;
         }
     }
 
     fn settle_external_if_clean(&self) -> Option<Settlement> {
+        let paths = {
+            let state = self.state.lock().unwrap();
+            let task = state.task.as_ref()?;
+            if !task.durable
+                || task.degraded
+                || task.ledger.entries.is_empty()
+                || !matches!(self.mode, Mode::Git)
+            {
+                return None;
+            }
+            task.ledger
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let clean = self.ledger_paths_clean_in_git(paths.iter().map(PathBuf::as_path));
         let mut state = self.state.lock().unwrap();
-        let task = state.task.as_ref()?;
-        if !task.durable
-            || task.degraded
-            || task.ledger.entries.is_empty()
-            || !matches!(self.mode, Mode::Git)
-            || !self.ledger_paths_clean_in_git(
-                task.ledger.entries.iter().map(|entry| entry.path.as_path()),
-            )
+        if !clean {
+            if let Some(task) = state.task.as_mut() {
+                task.external_settlement_blocked_while_clean = false;
+            }
+            return None;
+        }
+        if state
+            .task
+            .as_ref()
+            .is_some_and(|task| task.external_settlement_blocked_while_clean)
         {
             return None;
         }
@@ -893,8 +954,10 @@ fn attribution_scan(
 
 impl MutationGuard for GitSafety {
     fn note_mutation(&self) -> Option<String> {
-        // Sync barrier at the start of the next mutating call (ADR-0028).
-        self.sync_barrier();
+        // Join attribution at the start of the next mutating call (ADR-0028),
+        // but do not drain external settlement here: this is inside Iris/tool
+        // execution, not a user-controlled boundary.
+        self.join_attribution_scan();
         let mut state = self.state.lock().unwrap();
         if state.task.is_some() {
             // Baseline already captured and announced for this task. A follow-up
@@ -1171,7 +1234,7 @@ impl MutationGuard for GitSafety {
         }
         // Outside the state lock: barrier the prior scan, then spawn the next.
         if let Some((baseline_paths, turn)) = scan_input {
-            self.sync_barrier();
+            self.join_attribution_scan();
             let workspace = self.workspace.clone();
             let handle =
                 std::thread::spawn(move || attribution_scan(workspace, baseline_paths, turn));

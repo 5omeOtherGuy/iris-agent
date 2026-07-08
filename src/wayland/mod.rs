@@ -60,6 +60,35 @@ impl SessionSpanReader for SessionSpanSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnOutcome {
+    Completed { verification: VerificationStatus },
+    Cancelled,
+}
+
+impl TurnOutcome {
+    pub(crate) fn allows_print_settlement(self) -> bool {
+        matches!(
+            self,
+            Self::Completed {
+                verification: VerificationStatus::NotRun
+                    | VerificationStatus::Passed
+                    | VerificationStatus::SkippedUnconfigured,
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationStatus {
+    NotRun,
+    Passed,
+    SkippedUnconfigured,
+    Failed,
+    SkippedApprovalDenied,
+    Cancelled,
+}
+
 /// Maximum characters in an auto-compaction summary, so compacting a large
 /// range always shrinks the context regardless of how long the covered turns
 /// were.
@@ -191,6 +220,12 @@ enum BackgroundSummaryResult {
     Summary(String),
     Failed(String),
     Cancelled,
+}
+
+/// Why a workspace reanchor was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReanchorWorkspaceError {
+    ActiveTask,
 }
 
 /// Wraps a bare [`Agent`] with the execution env it runs against and the
@@ -706,13 +741,36 @@ impl<P: ChatProvider> Harness<P> {
         self.git_safety.adopt(task_id)
     }
 
+    /// Whether an active durable task must be settled or explicitly carried
+    /// before the session can move to another worktree (ADR-0052 / issue #451).
+    pub(crate) fn reanchor_requires_task_decision(&self) -> bool {
+        self.task_workflow_enabled && self.git_safety.current_task_id().is_some()
+    }
+
     /// Re-anchor the session in another worktree (the git dropdown's
     /// open-session-there path, idle-only). Rebuilds the dirty-tree guard for
-    /// the new root so its baselines, task records, and gating apply there;
-    /// the caller changes the process working directory and then surfaces
-    /// [`Self::recover_checkpoints`] so arriving in a worktree announces what
-    /// Iris left unsettled.
-    pub(crate) fn reanchor_workspace(&mut self, path: &std::path::Path) {
+    /// the new root so its baselines, task records, and gating apply there.
+    /// Refuses to drop an active durable task unless the caller has routed
+    /// through the explicit carry path.
+    pub(crate) fn reanchor_workspace(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), ReanchorWorkspaceError> {
+        if self.reanchor_requires_task_decision() {
+            return Err(ReanchorWorkspaceError::ActiveTask);
+        }
+        self.reanchor_workspace_unchecked(path);
+        Ok(())
+    }
+
+    /// Explicit carry path: the user chose to leave the active task in the old
+    /// worktree and move the session anyway. This can orphan the old record, but
+    /// it is no longer silent.
+    pub(crate) fn reanchor_workspace_carrying_task(&mut self, path: &std::path::Path) {
+        self.reanchor_workspace_unchecked(path);
+    }
+
+    fn reanchor_workspace_unchecked(&mut self, path: &std::path::Path) {
         self.workspace = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.git_safety =
             git_safety::GitSafety::new_with_workflow(&self.workspace, self.task_workflow_enabled);
@@ -880,7 +938,7 @@ impl<P: ChatProvider> Harness<P> {
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<TurnOutcome> {
         self.emit_external_task_settlements(obs)?;
         // Safe turn boundary: before the provider request, first fold spent
         // tool results (opt-in microcompaction, ADR-0048), then compact if the
@@ -925,11 +983,11 @@ impl<P: ChatProvider> Harness<P> {
             .submit_turn(prompt, obs, gate, &env, token, self.steering.as_deref())
             .instrument(tracing::info_span!("turn"))
             .await;
+        let changed_in_model_turn = self.agent.mutated_this_turn();
         // Persist whatever the turn produced even when it ended in an error, so
         // the transcript records the user prompt and any tool work. Best-effort:
         // a write failure is logged, never fatal to the session.
         self.persist_new_messages();
-        self.emit_external_task_settlements(obs)?;
         // If a task opened during this turn, record a `TaskOpened` audit entry
         // (ADR-0031). A task never settles mid-turn (settlement is an explicit
         // command), so a `current_task_id` that differs from `prior_task` and is
@@ -945,10 +1003,13 @@ impl<P: ChatProvider> Harness<P> {
         // and actually changed files, and not after a cancellation. The loop
         // never settles the task, so a failure leaves the tree inspectable and
         // rollbackable (ADR-0028).
-        if result.is_ok() && !token.is_cancelled() && self.agent.mutated_this_turn() {
+        let mut verification = VerificationStatus::NotRun;
+        if result.is_ok() && !token.is_cancelled() && changed_in_model_turn {
             self.maybe_emit_task_workflow_discovery(obs)?;
-            self.run_verification_loop(obs, gate, token).await?;
-            self.emit_external_task_settlements(obs)?;
+            verification = self.run_verification_loop(obs, gate, token).await?;
+        }
+        if changed_in_model_turn || self.agent.mutated_this_turn() {
+            self.git_safety.observe_iris_execution_boundary();
         }
         if result.is_ok()
             && !token.is_cancelled()
@@ -962,7 +1023,12 @@ impl<P: ChatProvider> Harness<P> {
             // legacy foreground pre-turn compaction path.
             self.maybe_auto_compact(obs, token, true).await?;
         }
-        result
+        result?;
+        if token.is_cancelled() {
+            Ok(TurnOutcome::Cancelled)
+        } else {
+            Ok(TurnOutcome::Completed { verification })
+        }
     }
 
     fn maybe_emit_task_workflow_discovery(&self, obs: &dyn AgentObserver) -> Result<()> {
@@ -997,23 +1063,23 @@ impl<P: ChatProvider> Harness<P> {
         obs: &dyn AgentObserver,
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<VerificationStatus> {
         // Feature off -> silent (backward compatible with every non-opted-in
         // caller). Engaged-but-no-command -> honest skipped-unconfigured report.
         let Some(config) = self.verify.clone() else {
-            return Ok(());
+            return Ok(VerificationStatus::NotRun);
         };
         let Some(command) = config.command.clone() else {
             obs.on_event(AgentEvent::Verification(
                 VerificationOutcome::SkippedUnconfigured,
             ))?;
-            return Ok(());
+            return Ok(VerificationStatus::SkippedUnconfigured);
         };
         let max_attempts = config.max_attempts;
         let mut attempts: u32 = 0;
         loop {
             if token.is_cancelled() {
-                return Ok(());
+                return Ok(VerificationStatus::Cancelled);
             }
             attempts += 1;
             // Run the verification command as a normal gated shell execution.
@@ -1041,19 +1107,19 @@ impl<P: ChatProvider> Harness<P> {
                     obs.on_event(AgentEvent::Verification(VerificationOutcome::Passed {
                         attempts,
                     }))?;
-                    return Ok(());
+                    return Ok(VerificationStatus::Passed);
                 }
                 VerifyRun::Denied => {
                     obs.on_event(AgentEvent::Verification(
                         VerificationOutcome::SkippedApprovalDenied,
                     ))?;
-                    return Ok(());
+                    return Ok(VerificationStatus::SkippedApprovalDenied);
                 }
                 VerifyRun::Cancelled => {
                     // The turn was interrupted mid-verification; the driver has
                     // already surfaced the interrupt notice. Leave the task
                     // unsettled and make no verification claim.
-                    return Ok(());
+                    return Ok(VerificationStatus::Cancelled);
                 }
                 VerifyRun::Failed { output, exit_code } => {
                     if attempts >= max_attempts {
@@ -1064,7 +1130,7 @@ impl<P: ChatProvider> Harness<P> {
                             exit_code,
                             last_output: output,
                         }))?;
-                        return Ok(());
+                        return Ok(VerificationStatus::Failed);
                     }
                     // Feed the failure back to the model as a user message and
                     // let it make another attempt.
@@ -1098,7 +1164,7 @@ impl<P: ChatProvider> Harness<P> {
                     // A hard provider/loop error aborts the retry chain.
                     retry_result?;
                     if token.is_cancelled() {
-                        return Ok(());
+                        return Ok(VerificationStatus::Cancelled);
                     }
                     // No retry storm: re-run verification only when the model
                     // actually changed files this retry. If it made no further
@@ -1110,7 +1176,7 @@ impl<P: ChatProvider> Harness<P> {
                             exit_code,
                             last_output: output,
                         }))?;
-                        return Ok(());
+                        return Ok(VerificationStatus::Failed);
                     }
                 }
             }

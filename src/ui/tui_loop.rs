@@ -585,8 +585,13 @@ fn perform_swap<P: ChatProvider>(
         loaded.entry_ids,
         resumed,
     );
+    if harness.skip_permissions() != loaded.skip_permissions {
+        harness.set_skip_permissions(loaded.skip_permissions);
+    }
     tui.reset_screen();
     tui.screen.apply(UiEvent::SessionStarted);
+    tui.screen
+        .set_approval_policy(effective_approval_policy(harness));
     let notice = match source {
         SessionSource::Fresh => "Started a new session.".to_string(),
         SessionSource::Resume(_) => {
@@ -796,7 +801,10 @@ fn toggle_git_menu(screen: &mut Screen, cache: &GitStatusCache) -> bool {
     let worktree_root = crate::config::Settings::load(&cwd)
         .map(|settings| settings.worktree_root(&main_root))
         .unwrap_or_else(|_| main_root.join("../wt"));
-    screen.open_session_menu(SessionMenu::Git(GitMenu::new(status, worktree_root)));
+    screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
+        status,
+        worktree_root,
+    ))));
     cache.request_refresh(cwd);
     true
 }
@@ -891,6 +899,79 @@ fn session_bar_click(
 /// Execute a dropdown side effect at the idle boundary. Mutating git/task
 /// state under a running turn is impossible by construction: dropdowns are
 /// read-only while a turn runs, and this runs only from the idle phase.
+fn open_session_at<P: ChatProvider>(
+    path: std::path::PathBuf,
+    branch: Option<String>,
+    carry_active_task: bool,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+) -> bool {
+    if !carry_active_task && harness.reanchor_requires_task_decision() {
+        apply_notices(
+            tui,
+            vec![
+                "accept, undo, or explicitly carry the active task before opening another worktree"
+                    .to_string(),
+            ],
+        );
+        tui.screen.close_session_menu();
+        return false;
+    }
+    let target = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            apply_notices(
+                tui,
+                vec![format!(
+                    "{} could not open {}: {error}",
+                    crate::ui::symbols::ERROR,
+                    path.display()
+                )],
+            );
+            tui.screen.close_session_menu();
+            return false;
+        }
+    };
+    if let Err(error) = std::env::set_current_dir(&target) {
+        apply_notices(
+            tui,
+            vec![format!(
+                "{} could not open {}: {error}",
+                crate::ui::symbols::ERROR,
+                target.display()
+            )],
+        );
+        tui.screen.close_session_menu();
+        return false;
+    }
+    if carry_active_task {
+        harness.reanchor_workspace_carrying_task(&target);
+    } else if harness.reanchor_workspace(&target).is_err() {
+        apply_notices(
+            tui,
+            vec![
+                "accept, undo, or explicitly carry the active task before opening another worktree"
+                    .to_string(),
+            ],
+        );
+        tui.screen.close_session_menu();
+        return false;
+    }
+    let branch_label = branch.unwrap_or_else(|| "detached".to_string());
+    apply_notices(
+        tui,
+        vec![format!(
+            "{} session moved to {} — {branch_label}",
+            crate::ui::symbols::SEP,
+            target.display()
+        )],
+    );
+    // Arriving in a worktree tells you what Iris left unsettled there.
+    apply_recovery(harness.recover_checkpoints(), tui);
+    tui.screen.close_session_menu();
+    true
+}
+
 fn execute_menu_action<P: ChatProvider>(
     action: MenuAction,
     harness: &mut Harness<P>,
@@ -950,6 +1031,19 @@ fn execute_menu_action<P: ChatProvider>(
                 menu.set_restore_points(points);
             }
         }
+        MenuAction::LoadRestorePointsForOpenSessionAt { path, branch } => {
+            let points: Vec<(u64, String)> = harness
+                .checkpoint_restore_points()
+                .into_iter()
+                .map(|point| (point.seq, point.label))
+                .collect();
+            if points.is_empty() {
+                apply_notices(tui, vec!["no restore points for this task".to_string()]);
+                tui.screen.close_session_menu();
+            } else if let Some(SessionMenu::Git(menu)) = &mut tui.screen.session_menu {
+                menu.set_restore_points_for_open_session(points, path, branch);
+            }
+        }
         MenuAction::Rollback { seq } => {
             match harness.rollback_checkpoint(seq) {
                 Ok(outcome) => {
@@ -972,6 +1066,30 @@ fn execute_menu_action<P: ChatProvider>(
                 }
             }
             tui.screen.close_session_menu();
+        }
+        MenuAction::RollbackThenOpenSessionAt { seq, path, branch } => {
+            match harness.rollback_checkpoint(seq) {
+                Ok(outcome) => {
+                    let mut lines =
+                        vec![format!("{} {}", crate::ui::symbols::DONE, outcome.summary)];
+                    lines.extend(outcome.preserved_notices);
+                    if let Some(warning) = outcome.index_warning {
+                        lines.push(format!("{} {warning}", crate::ui::symbols::REVIEW));
+                    }
+                    apply_notices(tui, lines);
+                    open_session_at(path, branch, false, harness, tui);
+                }
+                Err(error) => {
+                    apply_notices(
+                        tui,
+                        vec![format!(
+                            "{} rollback failed: {error:#}",
+                            crate::ui::symbols::ERROR
+                        )],
+                    );
+                    tui.screen.close_session_menu();
+                }
+            }
         }
         MenuAction::Checkout { branch } => {
             checkout(tui, &branch);
@@ -1045,33 +1163,18 @@ fn execute_menu_action<P: ChatProvider>(
             }
         }
         MenuAction::OpenSessionAt { path, branch } => {
-            // Idle-only re-anchor: move the process cwd and the harness's
-            // workspace guard to the target worktree.
-            if let Err(error) = std::env::set_current_dir(&path) {
-                apply_notices(
-                    tui,
-                    vec![format!(
-                        "{} could not open {}: {error}",
-                        crate::ui::symbols::ERROR,
-                        path.display()
-                    )],
-                );
-                tui.screen.close_session_menu();
-                return;
-            }
-            harness.reanchor_workspace(&path);
-            let branch_label = branch.unwrap_or_else(|| "detached".to_string());
-            apply_notices(
-                tui,
-                vec![format!(
-                    "{} session moved to {} — {branch_label}",
-                    crate::ui::symbols::SEP,
-                    path.display()
-                )],
-            );
-            // Arriving in a worktree tells you what Iris left unsettled there.
-            apply_recovery(harness.recover_checkpoints(), tui);
-            tui.screen.close_session_menu();
+            open_session_at(path, branch, false, harness, tui);
+        }
+        MenuAction::CarryOpenSessionAt { path, branch } => {
+            open_session_at(path, branch, true, harness, tui);
+        }
+        MenuAction::AcceptThenOpenSessionAt { path, branch } => {
+            let notice = match harness.accept_checkpoint() {
+                Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
+                None => "no unreviewed Iris changes to accept".to_string(),
+            };
+            apply_notices(tui, vec![notice]);
+            open_session_at(path, branch, false, harness, tui);
         }
         MenuAction::InsertReference(path) => {
             tui.screen.editor.insert_str(format!("@{path} "));
@@ -1683,9 +1786,12 @@ async fn run_harness_op<P: ChatProvider>(
     let is_compact = matches!(op, HarnessOp::Compact);
     let result = {
         let mut turn: futures::future::LocalBoxFuture<'_, Result<()>> = match op {
-            HarnessOp::Turn(prompt) => {
-                Box::pin(harness.submit_turn(prompt, &bridge, &bridge, &token))
-            }
+            HarnessOp::Turn(prompt) => Box::pin(async {
+                harness
+                    .submit_turn(prompt, &bridge, &bridge, &token)
+                    .await
+                    .map(|_| ())
+            }),
             HarnessOp::Compact => Box::pin(harness.compact_now(&bridge, &token)),
         };
         loop {
@@ -1983,11 +2089,9 @@ async fn dispatch_action<P: ChatProvider>(
         }
         ModalAction::AcceptTask => {
             tui.screen.close_modal();
-            let notice = match harness.accept_checkpoint() {
-                Some(summary) => format!("{} {summary}", crate::ui::symbols::DONE),
-                None => "no unreviewed Iris changes to accept".to_string(),
-            };
-            apply_notices(tui, vec![notice]);
+            let lines = crate::cli::handle_checkpoint_command("/accept", harness)
+                .unwrap_or_else(|| vec!["no unreviewed Iris changes to accept".to_string()]);
+            apply_notices(tui, lines);
         }
         ModalAction::ShowTaskDiff => {
             tui.screen.close_modal();
@@ -2051,6 +2155,8 @@ async fn dispatch_action<P: ChatProvider>(
             };
             let before = sw.selection().clone();
             let result = picker::apply_action(other, harness, sw);
+            tui.screen
+                .set_approval_policy(effective_approval_policy(harness));
             let after = sw.selection().clone();
             match result {
                 ActionResult::Close(lines) => {
