@@ -212,6 +212,10 @@ pub(crate) enum UiEvent {
     /// A boundary between two reasoning-summary parts (a blank line in the live
     /// thinking trace). Display-only; carries no text.
     AssistantReasoningSectionBreak,
+    /// One incremental chunk of raw model reasoning. Display-only and separate
+    /// from summary deltas so provenance is preserved through the UI bridge.
+    /// See [`AgentEvent::AssistantRawReasoningDelta`].
+    AssistantRawReasoningDelta(String),
     /// One incremental fragment of a *freeform/custom* tool call's input, streamed
     /// while the model is still constructing the call (ADR-0039). Display-only and
     /// inert: it never affects approval, execution, or transcript state. No
@@ -394,6 +398,9 @@ impl UiEvent {
             }
             AgentEvent::AssistantReasoningDelta(delta) => UiEvent::AssistantReasoningDelta(delta),
             AgentEvent::AssistantReasoningSectionBreak => UiEvent::AssistantReasoningSectionBreak,
+            AgentEvent::AssistantRawReasoningDelta(delta) => {
+                UiEvent::AssistantRawReasoningDelta(delta)
+            }
             AgentEvent::ToolInputDelta { call_id, delta } => {
                 UiEvent::ToolInputDelta { call_id, delta }
             }

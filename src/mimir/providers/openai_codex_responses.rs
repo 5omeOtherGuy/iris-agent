@@ -319,8 +319,8 @@ fn build_codex_request(
 /// reasoning (`thinkingLevelMap.off == null`), so there is no disable field to
 /// send. The `summary: "auto"` field asks the Responses API to stream
 /// `response.reasoning_summary_text.delta` events. If the API also emits raw
-/// `response.reasoning_text.delta` events, Iris forwards them to the same live
-/// thinking rail as display-only text; persisted continuity still comes from
+/// `response.reasoning_text.delta` events, Iris forwards them on an explicit raw
+/// display-only channel; persisted continuity still comes from
 /// `reasoning.encrypted_content` (ADR-0016).
 fn codex_reasoning(reasoning: Option<ReasoningEffort>) -> Option<Value> {
     let effort = match reasoning? {
@@ -548,12 +548,19 @@ impl ResponseStreamParser {
             // accumulated into `self.text` or any stored reasoning: the
             // persisted reasoning block still comes from `output_item.done` /
             // `response.completed` so replay continuity remains unchanged.
-            Some("response.reasoning_summary_text.delta")
-            | Some("response.reasoning_text.delta") => {
+            Some("response.reasoning_summary_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str)
                     && !delta.is_empty()
                 {
                     sink.on_reasoning_delta(delta)?;
+                    self.emitted_visible_reasoning = true;
+                }
+            }
+            Some("response.reasoning_text.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    sink.on_raw_reasoning_delta(delta)?;
                     self.emitted_visible_reasoning = true;
                 }
             }

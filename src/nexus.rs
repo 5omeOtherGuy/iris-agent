@@ -407,6 +407,10 @@ pub(crate) enum AgentEvent {
     /// A boundary between two reasoning-summary parts (a blank line in the live
     /// thinking trace). Display-only; carries no text.
     AssistantReasoningSectionBreak,
+    /// One incremental chunk of raw model reasoning. Display-only and explicitly
+    /// separate from [`AssistantReasoningDelta`] so summary-vs-raw provenance is
+    /// never lost while streaming. It never changes storage or provider replay.
+    AssistantRawReasoningDelta(String),
     ToolProposed(ToolCall),
     /// A tool is about to execute (emitted once per call, immediately before the
     /// run, on both the exclusive and parallel paths). Lets a front-end open a
@@ -536,10 +540,13 @@ pub(crate) enum ProviderEvent {
     Activity,
     /// Incremental assistant text.
     TextDelta(String),
-    /// Incremental reasoning text (never encrypted/redacted content). Emitted by
-    /// providers that surface live reasoning before the answer; forwarded
-    /// display-only.
+    /// Incremental reasoning-summary text (never raw chain-of-thought or
+    /// encrypted/redacted content). Emitted by providers that surface live
+    /// reasoning summaries before the answer; forwarded display-only.
     ReasoningDelta(String),
+    /// Incremental raw reasoning text. Kept distinct from `ReasoningDelta` so
+    /// provider/runtime/UI contracts never reclassify raw content as summary.
+    RawReasoningDelta(String),
     /// A boundary between two reasoning-summary parts (blank line in the trace).
     ReasoningSectionBreak,
     /// One incremental fragment of a *freeform/custom* tool call's input
@@ -1819,6 +1826,14 @@ impl<P: ChatProvider> Agent<P> {
                         if !delta.is_empty() {
                             saw_reasoning_delta = true;
                             obs.on_event(AgentEvent::AssistantReasoningDelta(delta))?;
+                        }
+                    }
+                    Some(Ok(ProviderEvent::RawReasoningDelta(delta))) => {
+                        // Display-only and kept on a distinct raw channel; never
+                        // accumulated into `partial` or storage.
+                        if !delta.is_empty() {
+                            saw_reasoning_delta = true;
+                            obs.on_event(AgentEvent::AssistantRawReasoningDelta(delta))?;
                         }
                     }
                     Some(Ok(ProviderEvent::ReasoningSectionBreak)) => {

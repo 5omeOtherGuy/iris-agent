@@ -7,6 +7,7 @@ use std::path::Path;
 struct RecordingSink {
     deltas: Vec<String>,
     reasoning_deltas: Vec<String>,
+    raw_reasoning_deltas: Vec<String>,
     section_breaks: usize,
     tool_input_deltas: Vec<(String, String)>,
 }
@@ -19,6 +20,11 @@ impl TurnSink for RecordingSink {
 
     fn on_reasoning_delta(&mut self, delta: &str) -> Result<()> {
         self.reasoning_deltas.push(delta.to_string());
+        Ok(())
+    }
+
+    fn on_raw_reasoning_delta(&mut self, delta: &str) -> Result<()> {
+        self.raw_reasoning_deltas.push(delta.to_string());
         Ok(())
     }
 
@@ -804,10 +810,12 @@ fn streams_reasoning_summary_deltas_and_section_breaks() -> Result<()> {
 }
 
 #[test]
-fn streams_raw_reasoning_text_deltas_live() -> Result<()> {
-    // Raw reasoning deltas stream live to the thinking rail. Like summary
-    // deltas, they are display-only and never become assistant answer text.
+fn streams_raw_reasoning_text_deltas_live_on_explicit_raw_channel() -> Result<()> {
+    // Raw reasoning deltas use their own display-only channel so they are never
+    // silently reclassified as reasoning-summary deltas.
     let stream = concat!(
+        "event: response.reasoning_summary_text.delta\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"summary\",\"summary_index\":0}\n\n",
         "event: response.reasoning_text.delta\n",
         "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"raw cot\",\"content_index\":0}\n\n",
         "event: response.output_text.delta\n",
@@ -822,7 +830,8 @@ fn streams_raw_reasoning_text_deltas_live() -> Result<()> {
         &CancellationToken::new(),
         "gpt-test",
     )?;
-    assert_eq!(sink.reasoning_deltas, vec!["raw cot"]);
+    assert_eq!(sink.reasoning_deltas, vec!["summary"]);
+    assert_eq!(sink.raw_reasoning_deltas, vec!["raw cot"]);
     assert_eq!(turn.text.as_deref(), Some("Answer"));
     Ok(())
 }

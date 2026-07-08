@@ -2125,12 +2125,15 @@ impl Transcript {
         // events below are the only ones that keep the live trace open.
         if !matches!(
             event,
-            UiEvent::AssistantReasoningDelta(_) | UiEvent::AssistantReasoningSectionBreak
+            UiEvent::AssistantReasoningDelta(_)
+                | UiEvent::AssistantReasoningSectionBreak
+                | UiEvent::AssistantRawReasoningDelta(_)
         ) {
             self.finish_live_reasoning_if_any();
         }
         match event {
-            UiEvent::AssistantReasoningDelta(delta) => {
+            UiEvent::AssistantReasoningDelta(delta)
+            | UiEvent::AssistantRawReasoningDelta(delta) => {
                 self.push_reasoning_delta(&delta);
             }
             UiEvent::AssistantReasoningSectionBreak => {
