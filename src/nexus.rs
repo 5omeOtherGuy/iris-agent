@@ -1244,8 +1244,8 @@ impl<P: ChatProvider> Agent<P> {
     }
 
     /// Change `--dangerously-skip-permissions` at a safe inter-turn boundary.
-    /// This is intentionally session-only; config/project stores still cannot
-    /// activate it.
+    /// The host may persist this in the Iris session transcript; config/project
+    /// stores still cannot activate it.
     pub(crate) fn set_skip_permissions(&mut self, skip: bool) {
         self.skip_permissions = skip;
     }

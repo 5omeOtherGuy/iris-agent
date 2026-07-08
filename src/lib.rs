@@ -1081,9 +1081,9 @@ fn print_help() {
     eprintln!(
         "                                   approval prompt, INCLUDING destructive commands."
     );
-    eprintln!("                                   Bypasses the safety floors; session-only,");
+    eprintln!("                                   Bypasses the safety floors; follows resumed");
     eprintln!(
-        "                                   nothing persists. Use only in a sandbox you trust."
+        "                                   sessions. Use only in a sandbox you trust."
     );
     eprintln!();
     eprintln!("Display (flag / env var):");
