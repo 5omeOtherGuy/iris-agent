@@ -91,6 +91,7 @@ pub(crate) struct ScriptedSkipRun {
     pub(crate) approvals_consulted: bool,
     pub(crate) dangerous_approvals: u32,
     pub(crate) bash_exit_codes: Vec<i32>,
+    pub(crate) tool_errors: Vec<(String, String)>,
     pub(crate) tool_result_bytes: u64,
     pub(crate) outcome: Outcome,
 }
@@ -174,12 +175,14 @@ pub(crate) fn run_scripted_skip_perms(workload: &Workload, arm: Arm) -> Scripted
     .expect("scripted skip-perms turn completes");
 
     let bash_exit_codes = observer.bash_exit_codes.borrow().clone();
+    let tool_errors = observer.tool_errors.borrow().clone();
     let mut outcome = (workload.check)(&workspace.path, &observer.final_text());
     enforce_started_broken(workload, &mut outcome, started_broken);
     ScriptedSkipRun {
         approvals_consulted: gate.consulted.get(),
         dangerous_approvals: observer.dangerous_approvals.get(),
         bash_exit_codes,
+        tool_errors,
         tool_result_bytes: observer.tool_result_bytes.get(),
         outcome,
     }
