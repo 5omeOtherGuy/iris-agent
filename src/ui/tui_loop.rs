@@ -575,8 +575,13 @@ fn perform_swap<P: ChatProvider>(
         loaded.entry_ids,
         resumed,
     );
+    if harness.skip_permissions() != loaded.skip_permissions {
+        harness.set_skip_permissions(loaded.skip_permissions);
+    }
     tui.reset_screen();
     tui.screen.apply(UiEvent::SessionStarted);
+    tui.screen
+        .set_approval_policy(effective_approval_policy(harness));
     let notice = match source {
         SessionSource::Fresh => "Started a new session.".to_string(),
         SessionSource::Resume(_) => {
@@ -1999,6 +2004,8 @@ async fn dispatch_action<P: ChatProvider>(
             };
             let before = sw.selection().clone();
             let result = picker::apply_action(other, harness, sw);
+            tui.screen
+                .set_approval_policy(effective_approval_policy(harness));
             let after = sw.selection().clone();
             match result {
                 ActionResult::Close(lines) => {

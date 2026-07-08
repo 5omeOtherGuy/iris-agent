@@ -490,6 +490,7 @@ fn load_session_source(
                 messages: Vec::new(),
                 entry_ids: Vec::new(),
                 resumed: 0,
+                skip_permissions: false,
             })
         }
         cli::SessionSource::Resume(id) => {
@@ -513,6 +514,7 @@ fn load_session_source(
                 messages: stored.messages,
                 entry_ids,
                 resumed,
+                skip_permissions: stored.dangerous_skip_permissions,
             })
         }
     }
@@ -639,6 +641,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     // stable across resume. The harness compares it against the budget at the
     // next turn boundary.
     let context_tokens = stored.context_tokens;
+    let skip_permissions = skip_permissions || stored.dangerous_skip_permissions;
 
     let settings = config::Settings::load(&cwd)?;
     let budget = Some(settings.context_token_budget());

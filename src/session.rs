@@ -368,15 +368,12 @@ impl SessionLog {
         Ok(id)
     }
 
-    /// Append a `dangerousMode` entry recording that this session ran with
-    /// `--dangerously-skip-permissions` (ADR-0049): every gated tool call was
-    /// auto-approved without a floor check. Modeled on
+    /// Append a `dangerousMode` entry recording the current
+    /// `--dangerously-skip-permissions` state. Modeled on
     /// [`append_task_opened`](Self::append_task_opened): append-only, chained in
     /// the leaf link, and skipped by [`read_messages`] so it never enters
-    /// provider context. It is transcript metadata for auditors -- a resumed or
-    /// audited session shows the mode was active -- not an enforcement or
-    /// recovery input, and it is only ever written from the explicit CLI flag.
-    pub(crate) fn append_dangerous_mode(&mut self) -> Result<String> {
+    /// provider context.
+    pub(crate) fn append_dangerous_mode_state(&mut self, enabled: bool) -> Result<String> {
         let id = self.next_id();
         let entry = json!({
             "type": "dangerousMode",
@@ -384,6 +381,7 @@ impl SessionLog {
             "parentId": self.last_id.as_deref(),
             "timestamp": now_ms(),
             "mode": "dangerously-skip-permissions",
+            "enabled": enabled,
         });
         write_line(&mut self.file, &entry).with_context(|| {
             format!(
@@ -393,6 +391,13 @@ impl SessionLog {
         })?;
         self.last_id = Some(id.clone());
         Ok(id)
+    }
+
+    /// Append a `dangerousMode` entry recording that this session ran with
+    /// `--dangerously-skip-permissions` (ADR-0049): every gated tool call was
+    /// auto-approved without a floor check.
+    pub(crate) fn append_dangerous_mode(&mut self) -> Result<String> {
+        self.append_dangerous_mode_state(true)
     }
 
     /// Reopen an existing transcript file for append, so a resumed session
@@ -552,11 +557,13 @@ impl SessionStore {
             entry_ids,
             context_tokens,
         } = read_messages(&meta.path)?;
+        let dangerous_skip_permissions = read_dangerous_skip_permissions(&meta.path)?;
         Ok(StoredSession {
             meta: meta.clone(),
             messages,
             entry_ids,
             context_tokens,
+            dangerous_skip_permissions,
         })
     }
 
@@ -848,6 +855,9 @@ pub(crate) struct StoredSession {
     /// so reopening a session reports the same total every time. The foundation
     /// the next slice (auto-compaction budgeting) reads instead of recomputing.
     pub(crate) context_tokens: u64,
+    /// Last persisted dangerous skip-permissions state for this session. This is
+    /// chrome/runtime state, not provider-visible context.
+    pub(crate) dangerous_skip_permissions: bool,
 }
 
 /// Serialize one message into its session entry value, with a stable id and a
@@ -1111,6 +1121,33 @@ fn read_meta(path: &Path) -> Result<SessionMeta> {
 fn read_messages(path: &Path) -> Result<RebuiltContext> {
     let (entries, compactions, folds) = read_entries(path)?;
     rebuild_with_compactions(path, entries, compactions, folds)
+}
+
+/// Read the last persisted dangerous skip-permissions state from the transcript.
+/// Legacy markers without `enabled` mean enabled=true; malformed lines are skipped
+/// like the rest of the session reader.
+fn read_dangerous_skip_permissions(path: &Path) -> Result<bool> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut enabled = false;
+    for line in bytes
+        .split(|&b| b == b'\n')
+        .map(|line| std::str::from_utf8(line).map(str::trim))
+        .filter(|line| !matches!(line, Ok(text) if text.is_empty()))
+        .skip(1)
+    {
+        let Ok(text) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("dangerousMode")
+            && value.get("mode").and_then(Value::as_str) == Some("dangerously-skip-permissions")
+        {
+            enabled = value.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        }
+    }
+    Ok(enabled)
 }
 
 /// Read the ORIGINAL turns of a durable entry-id span from a session transcript
@@ -1761,7 +1798,23 @@ mod tests {
         assert_eq!(entries.len(), 2); // header + marker
         assert_eq!(entries[1]["type"], "dangerousMode");
         assert_eq!(entries[1]["mode"], "dangerously-skip-permissions");
+        assert_eq!(entries[1]["enabled"], true);
         assert!(entries[1]["parentId"].is_null());
+    }
+
+    #[test]
+    fn dangerous_mode_state_reads_last_persisted_value() {
+        let dir = temp_dir();
+        let store = SessionStore::with_root(dir.path.clone());
+        let id = {
+            let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+            let id = log.id().to_string();
+            log.append_dangerous_mode_state(true).unwrap();
+            log.append_dangerous_mode_state(false).unwrap();
+            id
+        };
+        let stored = open_by_id(&store, &id);
+        assert!(!stored.dangerous_skip_permissions);
     }
 
     #[test]

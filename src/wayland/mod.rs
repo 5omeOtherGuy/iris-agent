@@ -429,9 +429,15 @@ impl<P: ChatProvider> Harness<P> {
     }
 
     /// Change this session's dangerous approval-gate bypass at the inter-turn
-    /// boundary. Session-only: nothing is persisted.
+    /// boundary and record the state in the session log when one is attached.
     pub(crate) fn set_skip_permissions(&mut self, skip: bool) {
         self.agent.set_skip_permissions(skip);
+        let Some(log) = self.session.as_mut() else {
+            return;
+        };
+        if let Err(error) = log.append_dangerous_mode_state(skip) {
+            tracing::warn!(error = %format!("{error:#}"), "failed to append skip-permissions state");
+        }
     }
 
     /// Whether the dangerous approval-gate bypass is active for this session.
