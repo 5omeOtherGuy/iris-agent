@@ -804,9 +804,9 @@ fn streams_reasoning_summary_deltas_and_section_breaks() -> Result<()> {
 }
 
 #[test]
-fn raw_reasoning_text_delta_is_not_streamed() -> Result<()> {
-    // Only the human-readable summary is display-safe; raw chain-of-thought
-    // deltas (`response.reasoning_text.delta`) are deliberately ignored.
+fn streams_raw_reasoning_text_deltas_live() -> Result<()> {
+    // Raw reasoning deltas stream live to the thinking rail. Like summary
+    // deltas, they are display-only and never become assistant answer text.
     let stream = concat!(
         "event: response.reasoning_text.delta\n",
         "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"raw cot\",\"content_index\":0}\n\n",
@@ -816,23 +816,21 @@ fn raw_reasoning_text_delta_is_not_streamed() -> Result<()> {
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
     );
     let mut sink = RecordingSink::default();
-    parse_response_stream_reader(
+    let turn = parse_response_stream_reader(
         BufReader::new(stream.as_bytes()),
         &mut sink,
         &CancellationToken::new(),
         "gpt-test",
     )?;
-    assert!(
-        sink.reasoning_deltas.is_empty(),
-        "raw chain-of-thought must never be streamed for display"
-    );
+    assert_eq!(sink.reasoning_deltas, vec!["raw cot"]);
+    assert_eq!(turn.text.as_deref(), Some("Answer"));
     Ok(())
 }
 
 #[test]
 fn visible_reasoning_summary_disables_silent_retry() -> Result<()> {
-    // A shown reasoning summary counts as visible output, so a later mid-stream
-    // protocol anomaly is fatal (a retry would duplicate what the user saw).
+    // Shown reasoning counts as visible output, so a later mid-stream protocol
+    // anomaly is fatal (a retry would duplicate what the user saw).
     let mut parser = ResponseStreamParser::new("gpt-test");
     let mut sink = RecordingSink::default();
     parser.ingest_event(
@@ -845,6 +843,20 @@ fn visible_reasoning_summary_disables_silent_retry() -> Result<()> {
     assert!(
         !protocol_anomaly_retryable(&anomaly, parser.emitted_visible_output()),
         "a protocol anomaly after visible reasoning must not be silently retried"
+    );
+
+    let mut parser = ResponseStreamParser::new("gpt-test");
+    parser.ingest_event(
+        "{\"type\":\"response.reasoning_text.delta\",\"delta\":\"raw\",\"content_index\":0}",
+        &mut sink,
+    )?;
+    assert!(
+        parser.emitted_visible_output(),
+        "raw reasoning is visible output"
+    );
+    assert!(
+        !protocol_anomaly_retryable(&anomaly, parser.emitted_visible_output()),
+        "a protocol anomaly after visible raw reasoning must not be silently retried"
     );
     Ok(())
 }

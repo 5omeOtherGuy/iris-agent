@@ -101,7 +101,7 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
     }
 }
 
-/// Build the transient thinking-preview rows for a live reasoning summary: the
+/// Build the transient thinking-preview rows for live reasoning text: the
 /// `THINKING` rail header plus dim rail-body lines of the rendered markdown.
 /// Shown expanded (`▾ THINKING`) and whole while it streams — a live, growing
 /// trace shows everything, exactly as a running tool block stays open on its
@@ -241,7 +241,7 @@ struct StreamingRender {
     key: (usize, usize),
     width: usize,
     lines: Vec<Line<'static>>,
-    /// Whether these lines are the live reasoning-summary preview (vs the
+    /// Whether these lines are the live reasoning preview (vs the
     /// assistant-answer active tail). The two sources are mutually exclusive per
     /// frame; the flag keeps a source switch from reusing a stale memo.
     is_reasoning: bool,
@@ -274,7 +274,7 @@ pub(super) struct Transcript {
     /// its opening separator). A late `AssistantReasoning` block is spliced here
     /// so reasoning renders above an already-committed answer.
     stream_answer_start: Option<usize>,
-    /// Accumulated live reasoning-*summary* text for the current turn, shown as
+    /// Accumulated live reasoning text for the current turn, shown as
     /// a transient thinking preview while the provider is still thinking and
     /// before the answer streams. Committed to scrollback as a thinking block by
     /// [`Self::finish_live_reasoning_if_any`] on the first non-reasoning event.
@@ -494,7 +494,7 @@ impl Transcript {
         }
     }
 
-    /// Append one live reasoning-summary delta to the transient thinking preview.
+    /// Append one live reasoning delta to the transient thinking preview.
     /// Display-only: never committed to `rows` until finalize, never stored.
     fn push_reasoning_delta(&mut self, delta: &str) {
         if delta.is_empty() {

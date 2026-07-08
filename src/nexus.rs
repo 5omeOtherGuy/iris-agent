@@ -394,15 +394,15 @@ pub(crate) enum AgentEvent {
         text: String,
         redacted: bool,
     },
-    /// One incremental chunk of the model's reasoning *summary*, streamed while
+    /// One incremental chunk of the model's reasoning text, streamed while
     /// the provider is still thinking (before any assistant text). Display-only,
     /// exactly like [`AssistantReasoning`]: emitting it never changes storage or
     /// what is sent to the provider, and the persisted reasoning row is still
-    /// written once at completion. Only the human-readable summary is carried;
-    /// raw chain-of-thought and encrypted/redacted reasoning are never streamed
-    /// (ADR-0016/ADR-0050). When a turn streams these, the terminal
-    /// [`AssistantReasoning`] display event for the same (non-redacted) block is
-    /// suppressed so the finished thinking block is not shown twice.
+    /// written once at completion. Encrypted/redacted reasoning is never
+    /// reconstructed from these deltas (ADR-0016). When a turn streams these,
+    /// the terminal [`AssistantReasoning`] display event for the same
+    /// (non-redacted) block is suppressed so the finished thinking block is not
+    /// shown twice.
     AssistantReasoningDelta(String),
     /// A boundary between two reasoning-summary parts (a blank line in the live
     /// thinking trace). Display-only; carries no text.
@@ -536,9 +536,9 @@ pub(crate) enum ProviderEvent {
     Activity,
     /// Incremental assistant text.
     TextDelta(String),
-    /// Incremental reasoning *summary* text (never raw chain-of-thought, never
-    /// encrypted/redacted content). Emitted by providers that surface a live
-    /// reasoning summary before the answer; forwarded display-only.
+    /// Incremental reasoning text (never encrypted/redacted content). Emitted by
+    /// providers that surface live reasoning before the answer; forwarded
+    /// display-only.
     ReasoningDelta(String),
     /// A boundary between two reasoning-summary parts (blank line in the trace).
     ReasoningSectionBreak,
@@ -1195,7 +1195,7 @@ enum StreamResult {
         // `StreamResult` lopsided (clippy::large_enum_variant).
         turn: Box<AssistantTurn>,
         saw_delta: bool,
-        /// Whether any reasoning-summary delta was forwarded for display during
+        /// Whether any reasoning delta was forwarded for display during
         /// this stream. When true, the terminal reasoning display event for the
         /// (non-redacted) summary is suppressed so the live thinking block the
         /// front-end already showed is not duplicated.

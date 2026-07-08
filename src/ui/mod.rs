@@ -204,9 +204,9 @@ pub(crate) enum UiEvent {
         text: String,
         redacted: bool,
     },
-    /// One incremental chunk of the model's reasoning *summary*, streamed while
-    /// the provider is still thinking (before the answer). Display-only; only
-    /// the human-readable summary is carried (never raw or redacted reasoning).
+    /// One incremental chunk of the model's reasoning text, streamed while the
+    /// provider is still thinking (before the answer). Display-only; redacted
+    /// reasoning is never reconstructed here.
     /// See [`AgentEvent::AssistantReasoningDelta`].
     AssistantReasoningDelta(String),
     /// A boundary between two reasoning-summary parts (a blank line in the live
