@@ -358,8 +358,7 @@ fn parse_jj_log(text: &str) -> Vec<JjLogEntry> {
         .collect()
 }
 
-fn capture_jj(workspace: &Path) -> Option<JjStatus> {
-    let root = jj_root(workspace)?;
+fn capture_jj_status(workspace: &Path, root: PathBuf) -> Option<JjStatus> {
     let status_text = jj_stdout(workspace, &["status"])?;
     let current = jj_stdout(
         workspace,
@@ -413,8 +412,8 @@ fn capture_vcs_with_task_workflow(
     workspace: &Path,
     task_workflow_enabled: bool,
 ) -> Option<VcsStatus> {
-    if let Some(status) = capture_jj(workspace) {
-        return Some(VcsStatus::Jj(status));
+    if let Some(root) = jj_root(workspace) {
+        return capture_jj_status(workspace, root).map(VcsStatus::Jj);
     }
     capture_with_task_workflow(workspace, task_workflow_enabled).map(VcsStatus::Git)
 }

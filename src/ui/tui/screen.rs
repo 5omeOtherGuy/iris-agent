@@ -1037,19 +1037,22 @@ impl Screen {
 
     /// Update the last-known VCS snapshot (and an open VCS dropdown's copy).
     pub(crate) fn set_footer_vcs(&mut self, vcs: Option<VcsStatus>) {
+        let Some(vcs) = vcs else {
+            return;
+        };
         if let Some(SessionMenu::Git(menu)) = &mut self.session_menu {
             match &vcs {
-                Some(VcsStatus::Git(status)) => menu.set_status(status.clone()),
+                VcsStatus::Git(status) => menu.set_status(status.clone()),
                 _ => self.session_menu = None,
             }
         } else if let Some(SessionMenu::Jj(menu)) = &mut self.session_menu {
             match &vcs {
-                Some(VcsStatus::Jj(status)) => menu.set_status(status.clone()),
+                VcsStatus::Jj(status) => menu.set_status(status.clone()),
                 _ => self.session_menu = None,
             }
         }
         if let Some(footer) = &mut self.footer {
-            footer.vcs = vcs;
+            footer.vcs = Some(vcs);
         }
     }
 
@@ -2987,6 +2990,20 @@ mod tests {
             render_document_with_hints(&mut screen, Size::new(80, 24)).stable_prefix,
             0
         );
+    }
+
+    #[test]
+    fn transient_missing_vcs_snapshot_keeps_open_jj_dropdown() {
+        use crate::ui::tui::session_menu::{JjMenu, SessionMenu};
+        let status = jj_status("abcdefgh");
+        let mut screen = jj_screen("~/repo", status.clone());
+        screen.open_session_menu(SessionMenu::Jj(JjMenu::new(status)));
+
+        screen.set_footer_vcs(None);
+
+        assert!(matches!(screen.session_menu, Some(SessionMenu::Jj(_))));
+        let bar = bar_text(&screen, 80);
+        assert!(bar.contains("┊ ▾ jj abcdefgh"), "{bar:?}");
     }
 
     #[test]
