@@ -83,6 +83,9 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install dist
         run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
+      - name: Install cargo-zigbuild for Linux aarch64 cross-builds
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cargo-zigbuild --locked
       - name: Build artifacts
         run: dist build --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest.json
       - name: Upload artifacts
