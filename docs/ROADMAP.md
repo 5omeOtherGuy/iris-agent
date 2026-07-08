@@ -1059,18 +1059,18 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   further changes; stop at the cap); honest pass/fail-after-N/skipped events;
   verification never settles the task, so a failed loop stays rollbackable
   (ADR-0028).
-- Worktree isolation slice — design ADR only
-  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267)). ADR-0029
-  proposed (PR [#274](https://github.com/5omeOtherGuy/iris-agent/pull/274)); the
-  implementation (#271) stays gated on its acceptance. Settled
-  framing: worktree isolation is Tier 0 of the ADR-0028 guarantee model; apply
-  is a settlement event that mutates the parent workspace through the #262
-  choke point; the final diff engine (#264) doubles as the apply review
-  artifact. Reference:
+- Worktree isolation slice — design ADR accepted
+  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267), closed;
+  [ADR-0035](adr/0035-git-worktree-isolation-and-apply-as-settlement.md)). The
+  implementation (#271) is the first mutable-subagent backend slice. Settled
+  framing: worktree isolation is Tier 0 of the ADR-0028 guarantee model; apply is
+  a guarded parent-workspace mutation through the #262 choke point and is task
+  settlement only when the opt-in durable workflow exists; the final diff engine
+  (#264) doubles as the apply review artifact. Reference:
   [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md)
-  (reverse-engineered Grok Build subsystem — reference, not a decision).
-  Reserves the task-tool `isolation` schema seam in Milestone 4
-  ([#216](https://github.com/5omeOtherGuy/iris-agent/issues/216)).
+  (Grok Build subsystem reference, not an Iris decision). Reserves the future
+  subagent `isolation` schema seam; read-write subagents must not ship before
+  this isolation/apply backend exists.
 
 Later slices (not in #261):
 
@@ -1125,8 +1125,11 @@ Later slices (not in #261):
   ([#270](https://github.com/5omeOtherGuy/iris-agent/issues/270); needs its own
   ADR per the still-binding gate).
 - Worktree support implementation
-  ([#271](https://github.com/5omeOtherGuy/iris-agent/issues/271); blocked on the
-  #267 design ADR).
+  ([#271](https://github.com/5omeOtherGuy/iris-agent/issues/271); first backend
+  slice for mutable subagents, based on accepted ADR-0035).
+- Advanced subagent worktree backend slices — snapshot fast paths,
+  pooling/adoption, and remote restore are desired follow-ups after #271 proves
+  linked worktree creation, registry, explicit apply, and guarded removal.
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user

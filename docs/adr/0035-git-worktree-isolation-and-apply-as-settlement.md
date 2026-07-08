@@ -1,7 +1,7 @@
-# ADR-0035: Git worktree isolation — Tier 0 of the ADR-0028 guarantee model, apply = settlement
+# ADR-0035: Git worktree isolation — Tier 0 of the ADR-0028 guarantee model, apply as guarded parent mutation
 
 **Date**: 2026-07-03
-**Status**: proposed — amended by
+**Status**: accepted — amended by
 [ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
 (the future subagent feature must not be named `task`; task records are
 per-worktree while checkpoint refs live in the shared common ref store)
@@ -21,10 +21,10 @@ settled the in-place safety model: baseline capture, an attribution ledger,
 `refs/iris/*` checkpoints, index protection, per-file per-task approvals, and the
 tiered guarantee table. This ADR must conform to ADR-0028, never contradict it.
 It records the design for the worktree isolation slice so the implementation
-(issue [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271), blocked on
-this ADR) does not re-derive or diverge from it. The dirty-tree machinery
-(#262), checkpoint/rollback (#263), and final diff (#264) are being implemented
-in parallel; this ADR reuses them rather than duplicating them.
+(issue [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271)) does not
+re-derive or diverge from it. The dirty-tree machinery (#262),
+checkpoint/rollback (#263), and final diff (#264) are reused rather than
+duplicated.
 
 Settled framing this ADR builds on (not re-derived here):
 
@@ -32,11 +32,13 @@ Settled framing this ADR builds on (not re-derived here):
   parent tree untouched *by construction* until apply. Isolation and in-place
   safety compose; they are not alternatives. ADR-0028 Tiers 1-3 still govern the
   parent workspace at apply time.
-- **Apply = settlement.** `apply` is an ADR-0028 settlement event for the
-  worktree task *and* the first mutation of a parent-workspace task. It routes
+- **Apply = guarded parent mutation; task settlement when durable workflow is on.**
+  `apply` is always the first mutation of a parent-workspace task and routes
   through the same tool choke point, dirty-baseline check, and per-file per-task
-  approvals as any edit (#262 machinery). This is the answer to the conflict
-  question the Grok spec leaves open (spec section 10).
+  approvals as any edit (#262 machinery). When the opt-in durable task workflow
+  is enabled, apply also settles the worktree task. This is the answer to the
+  conflict question the Grok spec leaves open (spec section 10), amended by
+  ADR-0052's workflow opt-in rule.
 - **Final diff (#264) is the apply review artifact.** The net-diff engine takes a
   source-tree parameter so the worktree slice reuses it to render the child's
   changes for review.
@@ -51,20 +53,53 @@ Settled framing this ADR builds on (not re-derived here):
 
 ## Decision
 
-### Scope: linked worktrees only, nothing else
+### First backend slice for mutable subagents
 
-The minimum useful slice is a linked `git worktree add` and nothing above it.
-Deferred until the linked semantics and the apply boundary are proven correct
-(matches the reference doc's own advice, spec section 15):
+This worktree service is the first backend slice for read-write subagents. The
+subagent backend contract and read-only worker path have already shipped (#460),
+but any subagent allowed to mutate files must run behind this isolation/apply
+boundary. No in-place read-write subagent backend ships first, because that would
+encode the weaker safety model as the default and make the later Grok-style path
+an adapter instead of the foundation.
 
-- No Btrfs subvolume, overlay, or delegate snapshot fast paths.
-- No standalone `.git/`-copy worktrees.
-- No worktree pooling or adoptable-candidate reuse.
-- No remote codebase restore.
-- No ACP-style extension surface.
-- No repo-remote memory identity.
+The reusable backend seam is therefore:
 
-Everything below describes only the linked-worktree slice.
+- `isolation = none` — only for non-mutating workers or explicitly in-place parent
+  work.
+- `isolation = worktree` — the first mutable backend: linked worktree, registry,
+  lifecycle, explicit apply, and guarded removal.
+
+The future model-facing subagent tool must not be named `task` (ADR-0052), but
+its isolation field should map directly onto this service. The service remains
+Wayland-owned infrastructure; Nexus sees only provider-neutral tool contracts,
+events, and approval enforcement.
+
+### First slice: linked worktrees; later slices target Grok-parity smoothness
+
+The minimum useful mutable slice is a linked `git worktree add`. That remains the
+first major implementation step because the safety semantics must be correct
+before optimization layers are added.
+
+The following are **wanted**, but intentionally later slices after the linked
+semantics and apply boundary are proven correct:
+
+- Snapshot fast paths: Btrfs subvolume, overlay, and delegated snapshot creation
+  before falling back to linked git worktree creation.
+- Worktree pooling and adoptable-candidate reuse after crashes or dead owner
+  processes.
+- Remote session/codebase restore into a fresh worktree.
+- A richer query surface if JSONL becomes insufficient; SQLite is the reference
+  tradeoff, not the first storage choice.
+
+Still out of scope for this ADR unless a later ADR supersedes it:
+
+- Standalone `.git/`-copy worktrees.
+- ACP-style extension surface.
+- Repo-remote memory identity.
+
+Everything below that describes concrete behavior describes the linked-worktree
+first slice. The wanted later slices must preserve the same apply and guarded
+deletion invariants.
 
 ### Tier 0: isolation composes with in-place safety, it does not replace it
 
@@ -82,24 +117,27 @@ outer layer that keeps the parent out of scope until apply.
 
 Limitation to state plainly: `isolation: worktree` requires a valid git
 repository. In a non-git directory there is no worktree to create, so isolation
-is unavailable and the agent runs in-place under ADR-0028's degraded
-(plain-snapshot) guarantees. Bare repositories and invalid git structures are
-rejected at create time.
+is unavailable. Parent sessions may still run in-place under ADR-0028's degraded
+(plain-snapshot) guarantees, but mutable subagents must fail closed rather than
+falling back to parent-workspace mutation. Bare repositories and invalid git
+structures are rejected at create time.
 
-### Apply is a settlement event and a gated parent mutation
+### Apply is a guarded parent mutation and conditional settlement
 
 Apply is the only boundary crossing from child worktree to parent workspace. It
-has two identities at once and both are enforced:
+has two identities and both are enforced when present:
 
-1. **Settlement of the worktree task.** Per ADR-0028, apply freezes the
-   worktree's ledger and closes its task. Accepting or rolling back the child's
-   work is the settlement action.
-2. **The first mutation of a parent-workspace task.** Writing the child's diff
+1. **The first mutation of a parent-workspace task.** Writing the child's diff
    into the parent is an edit of the parent tree. It routes through the #262 tool
    choke point: each parent path the apply would touch is checked against the
    parent's dirty baseline, and any pre-existing uncommitted change at that path
    triggers the per-file per-task approval prompt before it is overwritten. Apply
    holds no exemption from the mutation gate.
+2. **Settlement of the worktree task when durable workflow is enabled.** Per
+   ADR-0052, durable task records are opt-in. When a worktree task exists, apply
+   freezes the worktree's ledger and closes that task. When the durable workflow
+   is off, apply is still a guarded parent mutation but does not invent hidden
+   durable task state.
 
 **Granularity: file-level apply with review.** Apply computes the child's net
 changes with the #264 diff engine (invoked with the worktree as the source-tree
@@ -252,8 +290,9 @@ default.
   operate on differs. The registry's `session_id` links the two.
 - **Fork-into-worktree.** A session fork may materialize into a fresh worktree so
   the fork's edits stay isolated from the parent session's checkout until apply.
-- **Task-tool schema reservation (#216, Milestone 4).** Reserve — but do not yet
-  implement beyond `none` — the child-isolation contract on the task tool:
+- **Subagent-tool schema reservation (#216, Milestone 4).** Reserve — but do not
+  yet implement beyond `none` — the child-isolation contract on the future
+  subagent tool:
   - `isolation: none | worktree`, default `none`. Only `none` is implemented in
     this slice; `worktree` is reserved.
   - `cwd` XOR `isolation`: supplying both is a validation error. `cwd` points a
@@ -289,10 +328,52 @@ Tier placement (per [`ARCHITECTURE.md`](../ARCHITECTURE.md)): the worktree servi
 and registry are **Wayland (Tier 2)** — they own execution-environment state and
 durable session-adjacent storage, the same tier as the session store, path
 safety, and the handle store. Nexus (Tier 1) gains no worktree knowledge; the
-task-tool `isolation` field is surfaced through the existing tool contract, and
-the CLI `iris worktree` commands live in Iris (Tier 3).
+subagent-tool `isolation` field is surfaced through the existing tool contract,
+and the CLI `iris worktree` commands live in Iris (Tier 3).
+
+## Alignment with Grok Build CLI 0.2.82
+
+Source: the local reference
+[`grok-worktree-subsystem-spec.md`](../../.iris-reference/grok-worktree-subsystem-spec.md).
+This review compares the planned linked-worktree slice, not a future full
+snapshot/pooling system.
+
+| Area | Grok Build CLI | Iris planned slice | Assessment |
+|---|---|---|---|
+| Model-facing contract | Subagent input has isolation, capability mode, background execution, resume, cwd, and typed subagent kinds. | #460 shipped the read-only backend contract; mutable worker schema still needs the future subagent tool surface. | **Partial / gap** until mutable subagent enablement. |
+| Isolation primitive | Worktree isolation; parent is untouched until apply. | Same semantic target: linked worktree, parent mutation only through apply. | **Aligned.** |
+| Apply boundary | Explicit worktree apply; exact conflict algorithm unverified. | File-level apply with review, dirty-parent gate, and base-drift conflict detection. | **Better specified** than observed reference evidence. |
+| Registry | Durable registry with id/path/source/session/pid/status and indexed management queries. | Append-only JSONL registry, latest-line-wins, rebuildable from filesystem and git worktree state. | **Simpler / weaker at scale**, but aligned with Iris storage patterns; revisit SQLite only if volume/concurrency requires it. |
+| Lifecycle CLI | list/show/rm/gc-style management; live-pid skip; dry-run; guarded remove paths. | `list/show/rm/gc`; live-pid skip; dry-run; marker + canonical containment deletion guard. | **Aligned**, with **stronger deletion guard** specified. |
+| Creation backends | Overlay, Btrfs, delegate, fast linked copy, standalone copy, git checkout fallback. | Plain linked `git worktree add` first; snapshot fast paths are wanted later slices. | **First slice weaker; roadmap target aligned.** |
+| Worktree pooling/adoption | Pool cleanup, dead PID detection, adoptable candidates. | Basic lifecycle first; pooling/adoption are wanted later slices. | **First slice weaker; roadmap target aligned.** |
+| Session resume/fork | Resume/fork into worktree and remote restore paths. | Local session/worktree link first; remote restore is a wanted later slice. | **First slice gap; roadmap target aligned.** |
+| jj support | Removal uses `jj workspace forget`; create path not fully recovered. | Same removal requirement; jj create deferred. | **Aligned.** |
+| Safety defaults | Noninteractive git env, LFS smudge skip, batch SSH, optional-lock avoidance. | Adopted as standard for git subprocesses. | **Aligned.** |
+
+Overall: Iris is **aligned on the core safety model** and **better specified on
+apply conflict handling and deletion guards**. The first implementation is
+deliberately smaller than Grok on smoothness and scale, but snapshot fast paths,
+pooling/adoption, and remote restore are **desired follow-up slices**, not rejected
+features. The remaining true gap is mutable subagent enablement on top of the
+backend contract. The first mutable implementation must keep the boundary clean:
+linked worktree, durable record, explicit apply, guarded remove, and no mutable
+subagent path that bypasses it.
 
 ## Alternatives Considered
+
+
+### Alternative 0: Ship in-place read-write subagents first
+- **Pros**: Fastest path to visible mutable delegation; no git-worktree
+  lifecycle, apply, or registry work needed up front.
+- **Cons**: Makes the parent checkout the first shared mutation surface for child
+  agents, so the default backend has the weakest safety semantics. It also makes
+  later worktree support look like an optional adapter instead of the core
+  primitive, fragmenting the runner around two mutation models.
+- **Why not**: The reference demonstrates that the clean systems boundary is child
+  mutation in an isolated worktree followed by explicit apply. Iris should make
+  that the first mutable backend and keep in-place behavior for parent work or
+  explicitly non-isolated modes only.
 
 ### Alternative 1: SQLite registry (Grok's choice)
 - **Pros**: Indexed lookups by id/path/session, atomic multi-writer
@@ -343,8 +424,8 @@ the CLI `iris worktree` commands live in Iris (Tier 3).
   a boundary event, not a parallel safety system.
 - The registry reuses the JSONL + filesystem-rebuild pattern already in the
   codebase; no new storage dependency.
-- Reserving the task-tool `isolation`/`cwd` contract now makes enabling worktree
-  isolation later an additive change, not a schema break.
+- Reserving the future subagent `isolation`/`cwd` contract now makes enabling
+  worktree isolation later an additive change, not a schema break.
 - Git subprocess safety defaults are fixed repo-wide, closing the hung-prompt
   denial-of-service surface for all git calls.
 
