@@ -3,6 +3,7 @@ use std::env;
 use std::io::{IsTerminal, Write};
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use std::path::Path;
@@ -378,6 +379,8 @@ fn run_agent_inner(
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = session::new_session_id();
+    let background_selection = Arc::new(Mutex::new(selection.clone()));
+    let background_session_id = Arc::new(Mutex::new(session_id.clone()));
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::new(provider, tools)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
@@ -413,6 +416,12 @@ fn run_agent_inner(
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    install_compaction_summarizer_factory(
+        &mut harness,
+        background_selection.clone(),
+        system_prompt.clone(),
+        background_session_id.clone(),
+    );
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
@@ -441,15 +450,18 @@ fn run_agent_inner(
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
         build_provider(selection, prompt, &build_cell.borrow())
     };
-    let mut switch = Some(cli::ModelSwitch::new(
+    let mut switch_state = cli::ModelSwitch::new(
         selection,
         system_prompt,
         &build,
         settings.enabled_models.clone(),
-    ));
+    );
+    switch_state.set_background_selection_cell(background_selection.clone());
+    let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
-    let swap =
-        move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
+    let swap = move |source: &cli::SessionSource| {
+        load_session_source(&swap_cwd, &session_cell, &background_session_id, source)
+    };
     // The start page (IrisMark + launcher) shows only when Iris launches
     // interactively with no task and no resume target; a bare `iris resume`
     // opens the resume picker instead.
@@ -476,6 +488,7 @@ fn run_agent_inner(
 fn load_session_source(
     cwd: &Path,
     cell: &Rc<RefCell<String>>,
+    background_cell: &Arc<Mutex<String>>,
     source: &cli::SessionSource,
 ) -> Result<cli::LoadedSource> {
     match source {
@@ -489,7 +502,11 @@ fn load_session_source(
                 }
             };
             Ok(cli::LoadedSource {
-                session_id: cli::SessionIdGuard::swap(cell.clone(), id),
+                session_id: cli::SessionIdGuard::swap_with_background(
+                    cell.clone(),
+                    background_cell.clone(),
+                    id,
+                ),
                 session_log,
                 messages: Vec::new(),
                 entry_ids: Vec::new(),
@@ -512,7 +529,11 @@ fn load_session_source(
                 }
             };
             Ok(cli::LoadedSource {
-                session_id: cli::SessionIdGuard::swap(cell.clone(), meta.id.clone()),
+                session_id: cli::SessionIdGuard::swap_with_background(
+                    cell.clone(),
+                    background_cell.clone(),
+                    meta.id.clone(),
+                ),
                 session_log,
                 messages: stored.messages,
                 entry_ids,
@@ -536,6 +557,8 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = session::new_session_id();
+    let background_selection = Arc::new(Mutex::new(selection.clone()));
+    let background_session_id = Arc::new(Mutex::new(session_id.clone()));
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     // The persisted project policy applies headless too (a granted tool/command
     // auto-approves), but the print gate cannot mint new grants, so no sink.
@@ -560,6 +583,12 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    install_compaction_summarizer_factory(
+        &mut harness,
+        background_selection.clone(),
+        system_prompt.clone(),
+        background_session_id.clone(),
+    );
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
@@ -621,6 +650,25 @@ fn project_policy_sink(cwd: &Path) -> Option<Box<dyn nexus::ProjectPolicySink>> 
     )))
 }
 
+fn install_compaction_summarizer_factory(
+    harness: &mut wayland::Harness<Box<dyn ChatProvider>>,
+    selection: Arc<Mutex<mimir::selection::ModelSelection>>,
+    system_prompt: String,
+    session_id: Arc<Mutex<String>>,
+) {
+    harness.set_compaction_summarizer_factory(Arc::new(move || {
+        let selection = selection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let session_id = session_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        build_provider(&selection, &system_prompt, &session_id)
+    }));
+}
+
 /// Resume an existing session by id: load its transcript from the store,
 /// reconstruct the provider-visible messages, seed the agent with them, and
 /// continue appending future turns to the same log. Errors clearly when the id
@@ -654,6 +702,8 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = meta.id.clone();
+    let background_selection = Arc::new(Mutex::new(selection.clone()));
+    let background_session_id = Arc::new(Mutex::new(session_id.clone()));
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::resumed(provider, tools, stored.messages)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
@@ -683,6 +733,12 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     );
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    install_compaction_summarizer_factory(
+        &mut harness,
+        background_selection.clone(),
+        system_prompt.clone(),
+        background_session_id.clone(),
+    );
     // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
     harness.set_microcompaction(settings.microcompaction());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
@@ -706,15 +762,18 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
         build_provider(selection, prompt, &build_cell.borrow())
     };
-    let mut switch = Some(cli::ModelSwitch::new(
+    let mut switch_state = cli::ModelSwitch::new(
         selection,
         system_prompt,
         &build,
         settings.enabled_models.clone(),
-    ));
+    );
+    switch_state.set_background_selection_cell(background_selection.clone());
+    let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
-    let swap =
-        move |source: &cli::SessionSource| load_session_source(&swap_cwd, &session_cell, source);
+    let swap = move |source: &cli::SessionSource| {
+        load_session_source(&swap_cwd, &session_cell, &background_session_id, source)
+    };
     cli::run_interactive(
         &mut harness,
         &mut switch,

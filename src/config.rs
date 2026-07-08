@@ -388,11 +388,13 @@ impl Settings {
     }
 
     /// Configured compaction summarizer, defaulting to the provider-backed one
-    /// (ADR-0041). An unknown value falls back to the default rather than
-    /// erroring, matching how other tuning knobs degrade.
+    /// (ADR-0041). `subagent` uses the read-only background worker path when a
+    /// worker factory is installed (issue #472). An unknown value falls back to
+    /// the default rather than erroring, matching how other tuning knobs degrade.
     pub(crate) fn compaction_summarizer(&self) -> crate::wayland::SummarizerKind {
         match self.compaction_summarizer.as_deref() {
             Some("excerpts") => crate::wayland::SummarizerKind::Excerpts,
+            Some("subagent") => crate::wayland::SummarizerKind::Subagent,
             Some("provider") | None => crate::wayland::SummarizerKind::Provider,
             Some(other) => {
                 tracing::warn!(
@@ -487,12 +489,12 @@ pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
     update_global(&[("promptCacheRetention", Value::String(preset.to_string()))])
 }
 
-/// Persist the compaction summarizer mode (`excerpts|provider`) in the global
-/// settings file. Project files may still override it at load; this is the
+/// Persist the compaction summarizer mode (`excerpts|provider|subagent`) in the
+/// global settings file. Project files may still override it at load; this is the
 /// user-facing `/settings` write path.
 pub(crate) fn save_compaction_summarizer(mode: &str) -> Result<()> {
     let mode = match mode {
-        "excerpts" | "provider" => mode,
+        "excerpts" | "provider" | "subagent" => mode,
         _ => "provider",
     };
     update_global(&[("compactionSummarizer", Value::String(mode.to_string()))])
@@ -1027,6 +1029,20 @@ mod tests {
         let configured = Settings::load_from(None, &project).unwrap();
         assert_eq!(configured.context_token_budget, Some(64_000));
         assert_eq!(configured.context_token_budget(), 64_000);
+    }
+
+    #[test]
+    fn compaction_summarizer_accepts_subagent_mode() {
+        let dir = temp_dir();
+        let project = dir.path.join("project.json");
+        fs::write(&project, r#"{ "compactionSummarizer": "subagent" }"#).unwrap();
+
+        let settings = Settings::load_from(None, &project).unwrap();
+
+        assert_eq!(
+            settings.compaction_summarizer(),
+            crate::wayland::SummarizerKind::Subagent
+        );
     }
 
     #[test]

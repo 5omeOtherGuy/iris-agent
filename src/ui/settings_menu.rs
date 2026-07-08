@@ -165,7 +165,7 @@ impl Field {
                 options: &["none", "short", "long"],
             },
             Field::CompactionSummarizer => FieldKind::Enum {
-                options: &["excerpts", "provider"],
+                options: &["excerpts", "provider", "subagent"],
             },
             Field::Theme => FieldKind::Enum {
                 options: crate::ui::theme::available(),

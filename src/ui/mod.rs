@@ -180,6 +180,13 @@ pub(crate) enum UiEvent {
         summary_tokens_estimate: u64,
         budget: u64,
     },
+    CompactionLifecycle {
+        job_id: String,
+        state: crate::nexus::CompactionLifecycleState,
+        covered_messages: usize,
+        original_tokens_estimate: u64,
+        message: Option<String>,
+    },
     /// A microcompaction fold batch was flushed (ADR-0048, issue #400). Counts
     /// and estimates only, tagged with the trigger class that released it.
     FoldApplied {
@@ -356,6 +363,19 @@ impl UiEvent {
                 original_tokens_estimate,
                 summary_tokens_estimate,
                 budget,
+            },
+            AgentEvent::CompactionLifecycle {
+                job_id,
+                state,
+                covered_messages,
+                original_tokens_estimate,
+                message,
+            } => UiEvent::CompactionLifecycle {
+                job_id,
+                state,
+                covered_messages,
+                original_tokens_estimate,
+                message,
             },
             AgentEvent::FoldApplied {
                 folds,

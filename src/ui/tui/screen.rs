@@ -71,6 +71,7 @@ impl TurnDivider {
                 | UiEvent::ToolCancelled(_)
                 | UiEvent::ProviderTurnError { .. }
                 | UiEvent::Notice(_)
+                | UiEvent::CompactionLifecycle { .. }
                 | UiEvent::TurnError { .. }
         ) {
             self.had_work = true;
