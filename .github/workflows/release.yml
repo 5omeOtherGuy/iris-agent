@@ -85,7 +85,11 @@ jobs:
         run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Install cargo-zigbuild for Linux aarch64 cross-builds
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cargo-zigbuild --locked
+        run: |
+          python3 -m pip install --user cargo-zigbuild==0.23.0 ziglang==0.16.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cargo-zigbuild" --version
+          "$HOME/.local/bin/python-zig" version
       - name: Build artifacts
         run: dist build --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest.json
       - name: Upload artifacts
