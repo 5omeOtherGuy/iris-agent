@@ -364,7 +364,7 @@ fn settings_snapshot<P: ChatProvider>(
         compaction_summarizer: settings
             .compaction_summarizer
             .clone()
-            .unwrap_or_else(|| "provider".to_string()),
+            .unwrap_or_else(|| "subagent".to_string()),
         microcompaction: settings.microcompaction(),
         bash_tool_mode: settings.bash_tool_mode(),
         max_tool_roundtrips: settings.max_tool_roundtrips(),
