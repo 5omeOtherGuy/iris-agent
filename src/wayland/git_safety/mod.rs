@@ -1170,12 +1170,18 @@ impl MutationGuard for GitSafety {
                 .as_ref()
                 .is_some_and(|task| orphaned_linked_worktree(&self.workspace, task))
             {
-                tracing::info!(
-                    workspace = %self.workspace.display(),
-                    "linked worktree disappeared during cleanup; dropping guard without restoring orphaned files"
-                );
-                state.task = None;
-                return Vec::new();
+                let no_iris_work = state
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.ledger.entries.is_empty());
+                if no_iris_work {
+                    tracing::info!(
+                        workspace = %self.workspace.display(),
+                        "linked worktree disappeared during cleanup with no Iris ledger; dropping guard without restoring orphaned files"
+                    );
+                    state.task = None;
+                    return Vec::new();
+                }
             }
             let Some(task) = state.task.as_mut() else {
                 return Vec::new();

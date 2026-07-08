@@ -160,16 +160,13 @@ fn guard_only_external_commit_drops_in_memory_task_without_notice() {
 }
 
 #[test]
-fn removed_linked_worktree_does_not_restore_orphaned_files() {
+fn removed_linked_worktree_with_no_iris_changes_does_not_restore_orphaned_files() {
     for (workflow_enabled, label) in [(false, "guard-only"), (true, "durable")] {
-        removed_linked_worktree_does_not_restore_orphaned_files_case(workflow_enabled, label);
+        removed_linked_worktree_with_no_iris_changes_case(workflow_enabled, label);
     }
 }
 
-fn removed_linked_worktree_does_not_restore_orphaned_files_case(
-    workflow_enabled: bool,
-    label: &str,
-) {
+fn removed_linked_worktree_with_no_iris_changes_case(workflow_enabled: bool, label: &str) {
     let parent = temp_dir();
     let primary = parent.path.join("primary");
     let primary_arg = primary.to_str().unwrap();
@@ -187,19 +184,16 @@ fn removed_linked_worktree_does_not_restore_orphaned_files_case(
         &["worktree", "add", "-q", "-b", "feature", linked_arg],
     );
 
+    fs::write(linked.join("committed.txt"), "pre-existing dirty\n").unwrap();
     let guard = GitSafety::new_with_workflow(&linked, workflow_enabled);
-    let target = linked.join("committed.txt");
     guard.note_mutation();
-    record_iris_write(&guard, &target, b"iris edit\n");
-    run_git(&linked, &["add", "committed.txt"]);
-    run_git(&linked, &["commit", "-q", "-m", "accept iris work"]);
     assert!(
         guard.has_task(),
-        "{label}: task remains open until the next barrier"
+        "{label}: task opens to protect pre-existing dirt"
     );
 
     guard.before_exec(&[]);
-    run_git(&primary, &["worktree", "remove", linked_arg]);
+    run_git(&primary, &["worktree", "remove", "--force", linked_arg]);
     let violations = guard.after_exec(&[], None);
 
     assert!(
@@ -212,7 +206,57 @@ fn removed_linked_worktree_does_not_restore_orphaned_files_case(
     );
     assert!(
         !guard.has_task(),
-        "{label}: orphaned linked-worktree cleanup drops the guard state"
+        "{label}: orphaned linked-worktree cleanup drops ledger-empty guard state"
+    );
+}
+
+#[test]
+fn durable_removed_linked_worktree_with_unreviewed_iris_changes_is_restored() {
+    let parent = temp_dir();
+    let primary = parent.path.join("primary");
+    let primary_arg = primary.to_str().unwrap();
+    run_git(&parent.path, &["init", "-q", "-b", "main", primary_arg]);
+    run_git(&primary, &["config", "user.email", "test@example.com"]);
+    run_git(&primary, &["config", "user.name", "Test"]);
+    fs::write(primary.join("committed.txt"), "base\n").unwrap();
+    run_git(&primary, &["add", "committed.txt"]);
+    run_git(&primary, &["commit", "-q", "-m", "init"]);
+
+    let linked = parent.path.join("linked");
+    let linked_arg = linked.to_str().unwrap();
+    run_git(
+        &primary,
+        &["worktree", "add", "-q", "-b", "feature", linked_arg],
+    );
+
+    let guard = GitSafety::new_with_workflow(&linked, true);
+    let target = linked.join("committed.txt");
+    guard.note_mutation();
+    record_iris_write(&guard, &target, b"iris edit\n");
+    assert!(
+        guard.has_task(),
+        "durable task is open with unreviewed Iris changes"
+    );
+
+    guard.before_exec(&[]);
+    run_git(&primary, &["worktree", "remove", "--force", linked_arg]);
+    let violations = guard.after_exec(&[], None);
+
+    assert!(
+        violations
+            .iter()
+            .any(|path| path.ends_with("committed.txt")),
+        "forced linked-worktree removal must remain a protected-file violation: {violations:?}"
+    );
+    guard.restore(&violations).unwrap();
+    assert_eq!(
+        fs::read_to_string(linked.join("committed.txt")).unwrap(),
+        "iris edit\n",
+        "restore recreates the orphan with Iris's unreviewed content"
+    );
+    assert!(
+        guard.has_task(),
+        "unreviewed durable task must not be silently dropped"
     );
 }
 
