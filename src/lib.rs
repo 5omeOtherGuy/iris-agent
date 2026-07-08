@@ -809,7 +809,8 @@ fn build_provider(
                         reasoning,
                         system_prompt,
                         api_key,
-                        supports_reasoning: true,
+                        supports_reasoning:
+                            mimir::model_capabilities::openai_api_supports_reasoning(model),
                         api_key_required: true,
                         retry_policy: selection.retry_policy,
                     },

@@ -377,6 +377,15 @@ impl ModelPicker {
         }
     }
 
+    fn display_effort_label(&self) -> &'static str {
+        match self.selected_model() {
+            Some(model) => {
+                model_capabilities::display_level(model.provider, &model.id, self.display_effort())
+            }
+            None => self.display_effort().as_str(),
+        }
+    }
+
     /// Emit a model+effort selection. `save_default` persists it as the default
     /// (Enter) versus applying it for this session only (`s`). The emitted effort
     /// is `display_effort()` (the target clamped to the chosen model), which is
@@ -478,7 +487,7 @@ impl ModelPicker {
         }
         let footer = format!(
             "↑↓ move · ←→ effort ({}) · ↵ select · s session · esc cancel",
-            self.display_effort().as_str()
+            self.display_effort_label()
         );
         crate::ui::tui::overlay_menu(
             Some("Select model"),
@@ -806,17 +815,20 @@ impl ScopedModels {
 #[derive(Debug, Clone)]
 pub(crate) struct EffortPicker {
     selector: Selector,
-    levels: Vec<ReasoningEffort>,
+    levels: Vec<model_capabilities::ReasoningOption>,
 }
 
 impl EffortPicker {
-    pub(crate) fn new(levels: Vec<ReasoningEffort>, current: ReasoningEffort) -> Self {
+    pub(crate) fn new(
+        levels: Vec<model_capabilities::ReasoningOption>,
+        current: ReasoningEffort,
+    ) -> Self {
         let items: Vec<SelectorItem> = levels
             .iter()
-            .map(|level| {
+            .map(|option| {
                 let mut item =
-                    SelectorItem::new(level.as_str(), level.as_str()).detail(level.description());
-                if *level == current {
+                    SelectorItem::new(option.level.as_str(), option.label).detail(option.detail);
+                if option.level == current {
                     item = item.trailing("current");
                 }
                 item
@@ -851,7 +863,8 @@ impl EffortPicker {
         self.levels
             .iter()
             .copied()
-            .find(|level| level.as_str() == id)
+            .find(|option| option.level.as_str() == id)
+            .map(|option| option.level)
     }
 
     fn render(&self, width: u16) -> Vec<Line<'static>> {
@@ -1840,7 +1853,7 @@ mod tests {
         assert!(text.contains("GPT 5.5"), "{text}");
         assert!(text.contains("Anthropic"), "{text}");
         assert!(text.contains("OpenAI"), "{text}");
-        assert!(text.contains("←→ effort (xhigh)"), "{text}");
+        assert!(text.contains("←→ effort (max)"), "{text}");
         assert!(!text.contains("Only showing models"), "{text}");
         assert!(!text.contains("claude-opus-4-8"), "{text}");
         assert!(!text.contains("GPT-5.5"), "{text}");
@@ -2091,11 +2104,7 @@ mod tests {
 
     #[test]
     fn effort_picker_selects_level() {
-        let levels = vec![
-            ReasoningEffort::Off,
-            ReasoningEffort::Low,
-            ReasoningEffort::High,
-        ];
+        let levels = model_capabilities::level_options(ProviderId::OpenAi, "gpt-4.1").to_vec();
         let mut picker = EffortPicker::new(levels, ReasoningEffort::Low);
         // Preselected on Low; move up to Off and select.
         picker.handle_key(ModalKey::Up);
@@ -2111,7 +2120,7 @@ mod tests {
     fn modal_renders_through_component_trait_with_width_clamp() {
         use crate::ui::tui::Component;
         let modal = Modal::Effort(EffortPicker::new(
-            vec![ReasoningEffort::Low, ReasoningEffort::High],
+            model_capabilities::level_options(ProviderId::OpenAi, "gpt-4.1").to_vec(),
             ReasoningEffort::Low,
         ));
         // The Component impl forwards to Modal::render after clamping usize->u16.
