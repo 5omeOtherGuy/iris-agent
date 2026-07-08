@@ -20,6 +20,21 @@ use std::sync::Mutex;
 
 use crate::nexus::{Message, Tools};
 
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
+
+fn clamp_openai_prompt_cache_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .chars()
+            .take(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH)
+            .collect(),
+    )
+}
+
 /// Stable-prefix fingerprint of a provider request: the request parts that
 /// should stay byte-stable across turns for server-side prompt caching to reuse
 /// them. `head` hashes the system instructions + tool declarations; `messages`

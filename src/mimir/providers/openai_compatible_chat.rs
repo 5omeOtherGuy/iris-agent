@@ -1,4 +1,5 @@
 use std::io::BufReader;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
@@ -13,7 +14,7 @@ use crate::mimir::providers::transport::{
     retry_after_hint, run_with_retry, spawn_stream,
 };
 use crate::mimir::retry::RetryPolicy;
-use crate::mimir::selection::{ProviderId, ReasoningEffort};
+use crate::mimir::selection::{PromptCacheRetention, ProviderId, ReasoningEffort};
 use crate::nexus::{
     AssistantTurn, ChatProvider, CompletionReason, Message, ModelOrigin, ProviderStream,
     ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
@@ -21,6 +22,12 @@ use crate::nexus::{
 
 /// API id recorded on reasoning-block origins for this adapter.
 const API_ID: &str = "chat-completions";
+
+#[derive(Clone, Copy)]
+struct ChatPromptCache<'a> {
+    key: Option<&'a str>,
+    retention: PromptCacheRetention,
+}
 
 #[derive(Clone)]
 pub(crate) struct OpenAiCompatibleChatConfig<'a> {
@@ -32,6 +39,8 @@ pub(crate) struct OpenAiCompatibleChatConfig<'a> {
     pub(crate) api_key: Option<String>,
     pub(crate) supports_reasoning: bool,
     pub(crate) api_key_required: bool,
+    pub(crate) prompt_cache_key: Option<&'a str>,
+    pub(crate) cache_retention: PromptCacheRetention,
     pub(crate) retry_policy: RetryPolicy,
 }
 
@@ -46,6 +55,8 @@ impl std::fmt::Debug for OpenAiCompatibleChatConfig<'_> {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("supports_reasoning", &self.supports_reasoning)
             .field("api_key_required", &self.api_key_required)
+            .field("prompt_cache_key", &self.prompt_cache_key)
+            .field("cache_retention", &self.cache_retention)
             .field("retry_policy", &self.retry_policy)
             .finish()
     }
@@ -61,6 +72,9 @@ pub(crate) struct OpenAiCompatibleChatProvider {
     system_prompt: String,
     api_key: Option<String>,
     supports_reasoning: bool,
+    prompt_cache_key: Option<String>,
+    cache_retention: PromptCacheRetention,
+    cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     retry_policy: RetryPolicy,
 }
 
@@ -74,6 +88,8 @@ impl std::fmt::Debug for OpenAiCompatibleChatProvider {
             .field("system_prompt", &self.system_prompt)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("supports_reasoning", &self.supports_reasoning)
+            .field("prompt_cache_key", &self.prompt_cache_key)
+            .field("cache_retention", &self.cache_retention)
             .field("retry_policy", &self.retry_policy)
             .finish()
     }
@@ -107,6 +123,9 @@ impl OpenAiCompatibleChatProvider {
             system_prompt: config.system_prompt.to_string(),
             api_key: config.api_key.filter(|key| !key.trim().is_empty()),
             supports_reasoning: config.supports_reasoning,
+            prompt_cache_key: config.prompt_cache_key.map(str::to_string),
+            cache_retention: config.cache_retention,
+            cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             retry_policy: config.retry_policy,
         })
     }
@@ -119,6 +138,19 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
         tools: &'a Tools,
         cancel: &'a CancellationToken,
     ) -> Result<ProviderStream<'a>> {
+        if super::PromptCachePrefix::observe_locked(
+            &self.cache_prefix,
+            self.cache_retention.caching_enabled(),
+            &self.system_prompt,
+            tools,
+            messages,
+        ) {
+            tracing::warn!(
+                provider = self.provider.as_str(),
+                model = %self.model,
+                "prompt cache prefix changed since the previous request; the cached prefix will not be reused this turn"
+            );
+        }
         let request = build_chat_request(
             &self.model,
             &self.system_prompt,
@@ -126,6 +158,10 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
             tools,
             self.reasoning,
             self.supports_reasoning,
+            ChatPromptCache {
+                key: self.prompt_cache_key.as_deref(),
+                retention: self.cache_retention,
+            },
         );
         let url = resolve_chat_url(&self.base_url)?;
         let provider = self.clone();
@@ -502,6 +538,7 @@ fn build_chat_request(
     tools: &Tools,
     reasoning: Option<ReasoningEffort>,
     supports_reasoning: bool,
+    prompt_cache: ChatPromptCache<'_>,
 ) -> Value {
     let mut body = json!({
         "model": model,
@@ -519,6 +556,17 @@ fn build_chat_request(
     }
     if supports_reasoning && let Some(level) = reasoning.and_then(openai_reasoning_effort) {
         body["reasoning_effort"] = json!(level);
+    }
+    if prompt_cache.retention.caching_enabled() {
+        if let Some(key) = prompt_cache
+            .key
+            .and_then(super::clamp_openai_prompt_cache_key)
+        {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if prompt_cache.retention == PromptCacheRetention::Long {
+            body["prompt_cache_retention"] = json!("24h");
+        }
     }
     body
 }
@@ -723,6 +771,10 @@ mod tests {
             &crate::tools::built_in_tools(),
             Some(ReasoningEffort::High),
             true,
+            ChatPromptCache {
+                key: None,
+                retention: PromptCacheRetention::None,
+            },
         );
 
         assert_eq!(request["model"], json!("gpt-test"));
@@ -753,6 +805,76 @@ mod tests {
         );
         assert_eq!(request["tools"][0]["type"], json!("function"));
         assert_eq!(request["tools"][0]["function"]["name"], json!("read"));
+    }
+
+    #[test]
+    fn prompt_cache_fields_follow_retention_setting() {
+        let messages = [Message::user("hi")];
+        let short = build_chat_request(
+            "gpt-test",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            true,
+            ChatPromptCache {
+                key: Some(" session-1 "),
+                retention: PromptCacheRetention::Short,
+            },
+        );
+        assert_eq!(short["prompt_cache_key"], json!("session-1"));
+        assert!(short.get("prompt_cache_retention").is_none());
+
+        let long = build_chat_request(
+            "gpt-test",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            true,
+            ChatPromptCache {
+                key: Some("session-1"),
+                retention: PromptCacheRetention::Long,
+            },
+        );
+        assert_eq!(long["prompt_cache_key"], json!("session-1"));
+        assert_eq!(long["prompt_cache_retention"], json!("24h"));
+
+        let disabled = build_chat_request(
+            "gpt-test",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            true,
+            ChatPromptCache {
+                key: Some("session-1"),
+                retention: PromptCacheRetention::None,
+            },
+        );
+        assert!(disabled.get("prompt_cache_key").is_none());
+        assert!(disabled.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn prompt_cache_key_is_clamped_to_64_unicode_scalars() {
+        let messages = [Message::user("hi")];
+        let long_key = format!("{}tail", "å".repeat(70));
+        let request = build_chat_request(
+            "gpt-test",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            true,
+            ChatPromptCache {
+                key: Some(&long_key),
+                retention: PromptCacheRetention::Short,
+            },
+        );
+        let key = request["prompt_cache_key"].as_str().expect("cache key");
+        assert_eq!(key.chars().count(), 64);
+        assert_eq!(key, "å".repeat(64));
     }
 
     #[test]
@@ -792,6 +914,10 @@ mod tests {
             &Tools::new(Vec::new()),
             Some(ReasoningEffort::High),
             false,
+            ChatPromptCache {
+                key: None,
+                retention: PromptCacheRetention::None,
+            },
         );
         assert!(request.get("reasoning_effort").is_none());
 
@@ -802,6 +928,10 @@ mod tests {
             &Tools::new(Vec::new()),
             Some(ReasoningEffort::Off),
             true,
+            ChatPromptCache {
+                key: None,
+                retention: PromptCacheRetention::None,
+            },
         );
         assert!(request.get("reasoning_effort").is_none());
 
@@ -812,6 +942,10 @@ mod tests {
             &Tools::new(Vec::new()),
             Some(ReasoningEffort::XHigh),
             true,
+            ChatPromptCache {
+                key: None,
+                retention: PromptCacheRetention::None,
+            },
         );
         assert_eq!(request["reasoning_effort"], json!("high"));
     }

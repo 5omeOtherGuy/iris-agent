@@ -878,6 +878,8 @@ fn build_provider(
                         supports_reasoning:
                             mimir::model_capabilities::openai_api_supports_reasoning(model),
                         api_key_required: true,
+                        prompt_cache_key: Some(session_id),
+                        cache_retention: selection.cache_retention,
                         retry_policy: selection.retry_policy,
                     },
                 )?,
@@ -917,6 +919,8 @@ fn build_provider(
                         api_key,
                         supports_reasoning: selection.open_ai_compatible.reasoning,
                         api_key_required: selection.open_ai_compatible.api_key_required,
+                        prompt_cache_key: None,
+                        cache_retention: mimir::selection::PromptCacheRetention::None,
                         retry_policy: selection.retry_policy,
                     },
                 )?,
