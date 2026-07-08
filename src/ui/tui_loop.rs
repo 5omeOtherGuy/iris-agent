@@ -33,7 +33,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource, StartupUi};
-use crate::git::status::GitStatusCache;
+use crate::git::status::{GitStatusCache, VcsStatus};
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
 use crate::mimir::selection::ModelSelection;
@@ -49,8 +49,8 @@ use crate::ui::picker::{self, ActionResult, ModelCommand};
 use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::steering::SteeringQueue;
 use crate::ui::tui::{
-    ApprovalPolicy, FocusTarget, GitMenu, MenuAction, MenuKey, MenuOutcome, Screen, SessionMenu,
-    StartAction, SwitchCacheStatus, SwitchStatus, TreeMenu, TuiUi,
+    ApprovalPolicy, FocusTarget, GitMenu, JjMenu, MenuAction, MenuKey, MenuOutcome, Screen,
+    SessionMenu, StartAction, SwitchCacheStatus, SwitchStatus, TreeMenu, TuiUi,
 };
 use crate::wayland::Harness;
 use crate::wayland::git_safety::RecoveryOutcome;
@@ -775,36 +775,46 @@ fn sync_git_status(tui: &mut TuiUi, cache: &GitStatusCache, last_generation: &mu
         return false;
     }
     *last_generation = generation;
-    tui.screen.set_footer_git(cache.latest());
+    tui.screen.set_footer_vcs(cache.latest());
     true
 }
 
 /// Toggle the git console dropdown. Opening always kicks a fresh background
 /// refresh (paint last known meanwhile). Returns whether anything changed.
 fn toggle_git_menu(screen: &mut Screen, cache: &GitStatusCache) -> bool {
-    if matches!(screen.session_menu, Some(SessionMenu::Git(_))) {
+    if matches!(
+        screen.session_menu,
+        Some(SessionMenu::Git(_)) | Some(SessionMenu::Jj(_))
+    ) {
         screen.close_session_menu();
         return true;
     }
-    let Some(status) = screen.footer_git().cloned() else {
+    let Some(status) = screen.footer_vcs().cloned() else {
         screen.apply(UiEvent::Notice(
-            "no git repository here — the git console needs a worktree".to_string(),
+            "no git or jj repository here — the VCS console needs a worktree".to_string(),
         ));
         return true;
     };
     let cwd = std::env::current_dir().unwrap_or_default();
-    let main_root = status
-        .worktrees
-        .first()
-        .map(|wt| wt.path.clone())
-        .unwrap_or_else(|| cwd.clone());
-    let worktree_root = crate::config::Settings::load(&cwd)
-        .map(|settings| settings.worktree_root(&main_root))
-        .unwrap_or_else(|_| main_root.join("../wt"));
-    screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
-        status,
-        worktree_root,
-    ))));
+    match status {
+        VcsStatus::Git(status) => {
+            let main_root = status
+                .worktrees
+                .first()
+                .map(|wt| wt.path.clone())
+                .unwrap_or_else(|| cwd.clone());
+            let worktree_root = crate::config::Settings::load(&cwd)
+                .map(|settings| settings.worktree_root(&main_root))
+                .unwrap_or_else(|_| main_root.join("../wt"));
+            screen.open_session_menu(SessionMenu::Git(Box::new(GitMenu::new(
+                status,
+                worktree_root,
+            ))));
+        }
+        VcsStatus::Jj(status) => {
+            screen.open_session_menu(SessionMenu::Jj(JjMenu::new(status)));
+        }
+    }
     cache.request_refresh(cwd);
     true
 }
@@ -3528,6 +3538,25 @@ mod tests {
         plain.set_footer_with_context("m".to_string(), None, None, "~/x".to_string());
         assert!(toggle_git_menu(&mut plain, &cache));
         assert!(plain.session_menu.is_none());
+    }
+
+    #[test]
+    fn vcs_toggle_opens_readonly_jj_menu_for_jj_status() {
+        let mut screen = Screen::new();
+        screen.set_footer_with_context("gpt-5.5".to_string(), None, None, "~/repo".to_string());
+        screen.set_footer_vcs(Some(crate::git::status::VcsStatus::Jj(
+            crate::git::status::JjStatus {
+                change_id: "abcdefgh".to_string(),
+                description: "draft status work".to_string(),
+                total_changed: 1,
+                ..Default::default()
+            },
+        )));
+        let cache = GitStatusCache::default();
+        assert!(toggle_git_menu(&mut screen, &cache));
+        assert!(matches!(screen.session_menu, Some(SessionMenu::Jj(_))));
+        assert!(toggle_git_menu(&mut screen, &cache));
+        assert!(screen.session_menu.is_none());
     }
 
     #[test]

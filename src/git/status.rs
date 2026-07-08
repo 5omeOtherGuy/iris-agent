@@ -1,4 +1,4 @@
-//! One read-only git status snapshot for the session bar and its dropdowns.
+//! One read-only VCS status snapshot for the session bar and its dropdowns.
 //!
 //! [`GitStatus`] is captured off the render loop (a background thread via
 //! [`GitStatusCache`]) and painted last-known: branch/upstream/ahead-behind and
@@ -16,6 +16,7 @@
 //! No network, ever: `⇡`/`⇣` are computed against the last-fetched upstream.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,6 +61,23 @@ pub(crate) struct TaskSummary {
     pub(crate) age: Duration,
 }
 
+/// The current VCS snapshot. Git keeps the historical payload; jj carries the
+/// read-only status/log data the TUI needs.
+#[derive(Debug, Clone)]
+pub(crate) enum VcsStatus {
+    Git(GitStatus),
+    Jj(JjStatus),
+}
+
+impl VcsStatus {
+    pub(crate) fn as_git(&self) -> Option<&GitStatus> {
+        match self {
+            Self::Git(status) => Some(status),
+            Self::Jj(_) => None,
+        }
+    }
+}
+
 /// The full snapshot. All counts are files, not hunks.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GitStatus {
@@ -100,6 +118,38 @@ impl GitStatus {
     /// Whether any uncommitted change exists (drives the resting indicator).
     pub(crate) fn is_dirty(&self) -> bool {
         self.total_uncommitted > 0
+    }
+}
+
+/// One compact jj log row for the read-only dropdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct JjLogEntry {
+    pub(crate) change_id: String,
+    pub(crate) description: String,
+}
+
+/// Read-only jj snapshot for the session bar and dropdown. Counts are files as
+/// reported by `jj status`'s file rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct JjStatus {
+    pub(crate) root: PathBuf,
+    pub(crate) change_id: String,
+    pub(crate) commit_id: String,
+    pub(crate) description: String,
+    pub(crate) modified: u32,
+    pub(crate) added: u32,
+    pub(crate) deleted: u32,
+    pub(crate) renamed: u32,
+    pub(crate) copied: u32,
+    pub(crate) untracked: u32,
+    pub(crate) conflicted: u32,
+    pub(crate) total_changed: u32,
+    pub(crate) log: Vec<JjLogEntry>,
+}
+
+impl JjStatus {
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.total_changed > 0
     }
 }
 
@@ -224,6 +274,149 @@ fn stdout_string(workspace: &Path, args: &[&str]) -> Option<String> {
     git::git_stdout(workspace, args)
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn jj_stdout(workspace: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("jj")
+        .args(["--no-pager", "--color", "never"])
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn jj_root(workspace: &Path) -> Option<PathBuf> {
+    let text = jj_stdout(workspace, &["root"])?;
+    let root = text.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+fn parse_jj_status_counts(text: &str) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
+    let mut modified = 0;
+    let mut added = 0;
+    let mut deleted = 0;
+    let mut renamed = 0;
+    let mut copied = 0;
+    let mut untracked = 0;
+    let mut conflicted = 0;
+    let mut total = 0;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let Some(code) = trimmed.chars().next() else {
+            continue;
+        };
+        if !matches!(code, 'M' | 'A' | 'D' | 'R' | 'C' | '?' | '!' | 'U') {
+            continue;
+        }
+        total += 1;
+        match code {
+            'M' => modified += 1,
+            'A' => added += 1,
+            'D' => deleted += 1,
+            'R' => renamed += 1,
+            'C' => copied += 1,
+            '?' => untracked += 1,
+            '!' | 'U' => conflicted += 1,
+            _ => {}
+        }
+    }
+    (
+        modified, added, deleted, renamed, copied, untracked, conflicted, total,
+    )
+}
+
+fn parse_jj_current(text: &str) -> (String, String, String) {
+    let mut fields = text.trim_end_matches('\n').splitn(3, '\t');
+    let change_id = fields.next().unwrap_or("?").trim();
+    let commit_id = fields.next().unwrap_or("?").trim();
+    let description = fields.next().unwrap_or("").trim();
+    (
+        if change_id.is_empty() { "?" } else { change_id }.to_string(),
+        if commit_id.is_empty() { "?" } else { commit_id }.to_string(),
+        description.to_string(),
+    )
+}
+
+fn parse_jj_log(text: &str) -> Vec<JjLogEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let (change_id, description) = line.split_once('\t').unwrap_or((line, ""));
+            let change_id = change_id.trim();
+            if change_id.is_empty() {
+                return None;
+            }
+            Some(JjLogEntry {
+                change_id: change_id.to_string(),
+                description: description.trim().to_string(),
+            })
+        })
+        .take(6)
+        .collect()
+}
+
+fn capture_jj(workspace: &Path) -> Option<JjStatus> {
+    let root = jj_root(workspace)?;
+    let status_text = jj_stdout(workspace, &["status"])?;
+    let current = jj_stdout(
+        workspace,
+        &[
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-n",
+            "1",
+            "-T",
+            "change_id.short(8) ++ \"\\t\" ++ commit_id.short(8) ++ \"\\t\" ++ description.first_line() ++ \"\\n\"",
+        ],
+    )?;
+    let log = jj_stdout(
+        workspace,
+        &[
+            "log",
+            "-r",
+            "ancestors(@, 6)",
+            "--no-graph",
+            "-n",
+            "6",
+            "-T",
+            "change_id.short(8) ++ \"\\t\" ++ description.first_line() ++ \"\\n\"",
+        ],
+    )
+    .map(|text| parse_jj_log(&text))
+    .unwrap_or_default();
+    let (change_id, commit_id, description) = parse_jj_current(&current);
+    let (modified, added, deleted, renamed, copied, untracked, conflicted, total_changed) =
+        parse_jj_status_counts(&status_text);
+    Some(JjStatus {
+        root,
+        change_id,
+        commit_id,
+        description,
+        modified,
+        added,
+        deleted,
+        renamed,
+        copied,
+        untracked,
+        conflicted,
+        total_changed,
+        log,
+    })
+}
+
+fn capture_vcs_with_task_workflow(
+    workspace: &Path,
+    task_workflow_enabled: bool,
+) -> Option<VcsStatus> {
+    if let Some(status) = capture_jj(workspace) {
+        return Some(VcsStatus::Jj(status));
+    }
+    capture_with_task_workflow(workspace, task_workflow_enabled).map(VcsStatus::Git)
 }
 
 /// Probe a worktree path for unsettled Iris task records → a badge.
@@ -419,7 +612,7 @@ pub(crate) struct GitStatusCache {
 
 #[derive(Default)]
 struct CacheInner {
-    latest: Mutex<Option<GitStatus>>,
+    latest: Mutex<Option<VcsStatus>>,
     generation: AtomicU64,
     task_workflow_enabled: AtomicBool,
     /// Refresh coordination, guarded as one unit so the "finish" and "park a
@@ -459,7 +652,7 @@ impl GitStatusCache {
 
     /// The last captured snapshot (`None` before the first refresh completes
     /// or when the workspace is not a git repo).
-    pub(crate) fn latest(&self) -> Option<GitStatus> {
+    pub(crate) fn latest(&self) -> Option<VcsStatus> {
         self.inner.latest.lock().unwrap().clone()
     }
 
@@ -488,7 +681,7 @@ impl GitStatusCache {
             let mut workspace = workspace;
             loop {
                 let task_workflow_enabled = inner.task_workflow_enabled.load(Ordering::Acquire);
-                let status = capture_with_task_workflow(&workspace, task_workflow_enabled);
+                let status = capture_vcs_with_task_workflow(&workspace, task_workflow_enabled);
                 *inner.latest.lock().unwrap() = status;
                 inner.generation.fetch_add(1, Ordering::AcqRel);
                 // Under the coordination lock, either drain a parked request or
@@ -628,6 +821,56 @@ mod tests {
         assert_eq!(human_age(Duration::from_secs(3 * 3600)), "3h ago");
     }
 
+    #[test]
+    fn jj_status_counts_file_states() {
+        let text = "\
+Working copy changes:
+M src/lib.rs
+A src/new.rs
+D old.rs
+R before.rs => after.rs
+C copied.rs
+? scratch.txt
+U conflicted.rs
+Working copy : abcdef12 draft
+Parent commit: 12345678 main
+";
+        let (modified, added, deleted, renamed, copied, untracked, conflicted, total) =
+            parse_jj_status_counts(text);
+        assert_eq!(modified, 1);
+        assert_eq!(added, 1);
+        assert_eq!(deleted, 1);
+        assert_eq!(renamed, 1);
+        assert_eq!(copied, 1);
+        assert_eq!(untracked, 1);
+        assert_eq!(conflicted, 1);
+        assert_eq!(total, 7);
+    }
+
+    #[test]
+    fn jj_current_and_log_templates_parse_tab_rows() {
+        let (change_id, commit_id, description) =
+            parse_jj_current("abcdefgh\t12345678\timplement status\n");
+        assert_eq!(change_id, "abcdefgh");
+        assert_eq!(commit_id, "12345678");
+        assert_eq!(description, "implement status");
+
+        let log = parse_jj_log("abcdefgh\timplement status\nijklmnop\t\n");
+        assert_eq!(
+            log,
+            vec![
+                JjLogEntry {
+                    change_id: "abcdefgh".to_string(),
+                    description: "implement status".to_string(),
+                },
+                JjLogEntry {
+                    change_id: "ijklmnop".to_string(),
+                    description: String::new(),
+                },
+            ]
+        );
+    }
+
     /// Self-cleaning scratch dir (same idiom as the git-safety tests; no
     /// tempfile dependency).
     struct TempDir {
@@ -700,6 +943,35 @@ mod tests {
 
         // Non-repo directory yields no snapshot.
         assert!(capture(dir.path.as_path()).is_none());
+    }
+
+    #[test]
+    fn capture_vcs_prefers_jj_workspace_when_jj_is_available() {
+        if std::process::Command::new("jj")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping jj integration test: jj binary not installed");
+            return;
+        }
+        let dir = temp_dir();
+        let root = dir.path.join("repo");
+        let out = std::process::Command::new("jj")
+            .args(["git", "init", root.to_str().unwrap()])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("jj git init");
+        assert!(out.status.success(), "jj git init: {out:?}");
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+
+        let status = capture_vcs_with_task_workflow(&root, true).expect("jj status");
+        let VcsStatus::Jj(jj) = status else {
+            panic!("jj workspace should produce a jj status");
+        };
+        assert_eq!(jj.total_changed, 1, "{jj:?}");
+        assert!(!jj.change_id.is_empty(), "{jj:?}");
     }
 
     #[test]

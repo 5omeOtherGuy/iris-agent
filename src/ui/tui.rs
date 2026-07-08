@@ -73,7 +73,9 @@ use screen::{
     composer_statusline, editor_visual_rows, fresh_editor, render_document,
     render_document_with_chrome_tail, session_bar, working_indicator_line,
 };
-pub(crate) use session_menu::{GitMenu, MenuAction, MenuKey, MenuOutcome, SessionMenu, TreeMenu};
+pub(crate) use session_menu::{
+    GitMenu, JjMenu, MenuAction, MenuKey, MenuOutcome, SessionMenu, TreeMenu,
+};
 pub(crate) use startup::StartAction;
 #[cfg(test)]
 use transcript::Transcript;
