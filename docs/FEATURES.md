@@ -324,6 +324,14 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   request validation, lifecycle status, budgets, allowlists, output-handle
   fields, and read-only child execution. Issue
   [#460](https://github.com/5omeOtherGuy/iris-agent/issues/460). [Implemented]
+- **Mutable subagent backend: worktree isolation** — read-write workers are gated
+  on the worktree service from the Git section (#271): linked worktree creation,
+  durable registry, progress/lifecycle state, explicit apply, and
+  `list/show/rm/gc`. The read-only backend contract is already shipped; mutable
+  subagents must not fall back to in-place parent-workspace mutation. [Planned]
+- **Advanced worktree backend slices** — snapshot fast paths, worktree
+  pooling/adoption, and remote session/codebase restore are desired follow-ups
+  after the linked-worktree apply boundary is correct. [Planned]
 - **Subagents as tools** — main agent invokes subagents through Nexus tool
   execution under a final model-facing name that is not `task`. [Planned]
 - **Worker set** — search, advisor/reviewer, repo researcher, task worker, and
@@ -392,13 +400,13 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
   Issue [#269](https://github.com/5omeOtherGuy/iris-agent/issues/269). [Planned]
 - **Pre-commit self-review** — agent reviews its own diff before committing.
   [Planned]
-- **Worktree integration** — isolated worktree plus branch per task/run; also a
-  subagent isolation primitive. Design ADR tracked in
-  [#267](https://github.com/5omeOtherGuy/iris-agent/issues/267) (apply =
-  settlement through the dirty-tree choke point; linked worktrees only first;
-  registry + lifecycle/GC); implementation tracked in
-  [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271), blocked on the
-  #267 ADR. Reference:
+- **Worktree integration** — isolated worktree plus branch per task/run; also the
+  required mutable-subagent isolation primitive. Design ADR
+  [ADR-0035](adr/0035-git-worktree-isolation-and-apply-as-settlement.md) is
+  accepted and [#267](https://github.com/5omeOtherGuy/iris-agent/issues/267) is
+  closed; implementation is tracked in
+  [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271). Read-write
+  subagents must not ship without this isolation/apply boundary. Reference:
   [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md).
   [Planned]
 
