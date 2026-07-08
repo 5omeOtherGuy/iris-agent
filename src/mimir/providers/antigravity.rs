@@ -75,7 +75,13 @@ impl ChatProvider for AntigravityProvider {
         // only an owned `Value` and a cloned provider, never a borrow of
         // `self`/`messages`/`tools`. The envelope (which needs project id) is
         // assembled per-attempt from this inner request.
-        let inner = build_inner_request(&self.system_prompt, messages, tools, self.reasoning);
+        let inner = build_inner_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            tools,
+            self.reasoning,
+        );
         let wire_slot = wire_model_slot(&self.model).to_string();
         let provider = self.clone();
         let cancel = cancel.clone();
@@ -195,6 +201,7 @@ fn wrap_request(project_id: &str, wire_slot: &str, inner: Value) -> Value {
 }
 
 fn build_inner_request(
+    model: &str,
     system_prompt: &str,
     messages: &[Message],
     tools: &Tools,
@@ -218,27 +225,40 @@ fn build_inner_request(
     // generationConfig.thinkingConfig is added only when a preference is set, so
     // the default (None) request is byte-identical to today's (no
     // generationConfig at all).
-    if let Some(thinking) = antigravity_thinking(reasoning) {
+    if let Some(thinking) = antigravity_thinking(model, reasoning) {
         request["generationConfig"] = json!({ "thinkingConfig": thinking });
     }
     request
 }
 
 /// Map a normalized reasoning level to the Gemini `thinkingConfig`, or `None` to
-/// omit it. Verified shape: `generationConfig.thinkingConfig = { includeThoughts:
-/// true, thinkingLevel: <minimal|low|medium|high> }` (gemini-pi
-/// `antigravity-format.ts`; pi-mono google-vertex `thinkingConfig`). The Flash
-/// tier accepts `minimal..high`; `xhigh` clamps to `high`; `Off` omits thinking.
-fn antigravity_thinking(reasoning: Option<ReasoningEffort>) -> Option<Value> {
-    let level = match reasoning? {
-        ReasoningEffort::Off => return None,
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        // Flash tier rejects xhigh; clamp to high (gemini-pi FLASH_THINKING).
-        ReasoningEffort::High | ReasoningEffort::XHigh => "high",
-    };
+/// omit it. Flash tiers accept `minimal|low|medium|high`; Pro tiers reject
+/// `minimal` on the wire, so their semantic levels collapse to `low|high`
+/// (`minimal|low -> low`, `medium|high -> high`) like gemini-pi's
+/// `PRO_THINKING`. `xhigh` is not exposed for Antigravity and defensively clamps
+/// to `high` if a carried value reaches the sender.
+fn antigravity_thinking(model: &str, reasoning: Option<ReasoningEffort>) -> Option<Value> {
+    let level = antigravity_thinking_level(model, reasoning?)?;
     Some(json!({ "includeThoughts": true, "thinkingLevel": level }))
+}
+
+fn antigravity_thinking_level(model: &str, reasoning: ReasoningEffort) -> Option<&'static str> {
+    if crate::mimir::model_capabilities::is_antigravity_pro_model(model) {
+        return match reasoning {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::XHigh => {
+                Some("high")
+            }
+        };
+    }
+    match reasoning {
+        ReasoningEffort::Off => None,
+        ReasoningEffort::Minimal => Some("minimal"),
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High | ReasoningEffort::XHigh => Some("high"),
+    }
 }
 
 fn tool_declarations(tools: &Tools) -> Vec<Value> {
@@ -631,7 +651,13 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
                 origin: None,
             },
         ];
-        let inner = build_inner_request("IRIS PROMPT", &messages, &Tools::new(Vec::new()), None);
+        let inner = build_inner_request(
+            "gemini-3.5-flash",
+            "IRIS PROMPT",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+        );
         let envelope = wrap_request("proj-1", wire_model_slot("gemini-3.5-flash"), inner);
 
         assert_eq!(envelope["requestType"], json!("agent"));
@@ -673,31 +699,81 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
         let tools = Tools::new(Vec::new());
 
         // None: no generationConfig at all (byte-identical to today's wire).
-        let none = build_inner_request("P", &messages, &tools, None);
+        let none = build_inner_request("gemini-3.5-flash", "P", &messages, &tools, None);
         assert!(
             none.get("generationConfig").is_none(),
             "None omits generationConfig"
         );
 
         // Medium: thinkingConfig with includeThoughts + thinkingLevel.
-        let medium = build_inner_request("P", &messages, &tools, Some(ReasoningEffort::Medium));
+        let medium = build_inner_request(
+            "gemini-3.5-flash",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::Medium),
+        );
         assert_eq!(
             medium["generationConfig"]["thinkingConfig"],
             json!({ "includeThoughts": true, "thinkingLevel": "medium" })
         );
 
         // xhigh clamps to high on the Flash tier.
-        let xhigh = build_inner_request("P", &messages, &tools, Some(ReasoningEffort::XHigh));
+        let xhigh = build_inner_request(
+            "gemini-3.5-flash",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::XHigh),
+        );
         assert_eq!(
             xhigh["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             json!("high")
         );
 
         // Off omits generationConfig entirely.
-        let off = build_inner_request("P", &messages, &tools, Some(ReasoningEffort::Off));
+        let off = build_inner_request(
+            "gemini-3.5-flash",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::Off),
+        );
         assert!(
             off.get("generationConfig").is_none(),
             "Off omits generationConfig"
+        );
+    }
+
+    #[test]
+    fn pro_reasoning_maps_to_only_low_or_high_wire_levels() {
+        let messages = [Message::user("hi")];
+        let tools = Tools::new(Vec::new());
+
+        let minimal = build_inner_request(
+            "gemini-3.1-pro",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::Minimal),
+        );
+        assert_eq!(
+            minimal["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            json!("low"),
+            "Pro rejects wire minimal; semantic minimal maps to low"
+        );
+
+        let medium = build_inner_request(
+            "gemini-3.1-pro",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::Medium),
+        );
+        assert_eq!(
+            medium["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            json!("high"),
+            "Pro exposes only low/high wire levels"
         );
     }
 
@@ -768,7 +844,8 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
             }
         }
         let tools = Tools::new(vec![Box::new(FakeTool)]);
-        let inner = build_inner_request("", &[Message::user("hi")], &tools, None);
+        let inner =
+            build_inner_request("gemini-3.5-flash", "", &[Message::user("hi")], &tools, None);
         let decl = &inner["tools"][0]["functionDeclarations"][0];
         assert_eq!(decl["name"], json!("read"));
         let params = &decl["parameters"];

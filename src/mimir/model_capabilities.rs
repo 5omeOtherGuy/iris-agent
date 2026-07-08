@@ -5,10 +5,11 @@
 //!
 //! The stored/runtime value remains Iris's normalized [`ReasoningEffort`] so
 //! sessions and settings can carry one compact value across providers. The picker
-//! labels are provider-native: OpenAI Chat shows `low|medium|high`, Anthropic
-//! adaptive models show `low|medium|high|xhigh|max`, Anthropic manual-budget
-//! models show their exact `budget_tokens`, and Gemini/Antigravity shows
-//! `minimal|low|medium|high`.
+//! labels are provider-native enough to explain the wire effect: OpenAI API
+//! non-reasoning chat models show only `off`, OpenAI-compatible reasoning shows
+//! `low|medium|high`, Anthropic adaptive models show `low|medium|high|xhigh|max`,
+//! Anthropic manual-budget models show their exact `budget_tokens`, and
+//! Gemini/Antigravity shows its model-specific `thinkingLevel` mapping.
 
 use anyhow::Result;
 
@@ -45,6 +46,7 @@ const ALL_LEVELS: &[ReasoningEffort] = &[
     ReasoningEffort::High,
     ReasoningEffort::XHigh,
 ];
+const OFF_LEVELS: &[ReasoningEffort] = &[ReasoningEffort::Off];
 const STANDARD_LEVELS: &[ReasoningEffort] = &[
     ReasoningEffort::Off,
     ReasoningEffort::Minimal,
@@ -58,31 +60,73 @@ const OPENAI_CHAT_LEVELS: &[ReasoningEffort] = &[
     ReasoningEffort::Medium,
     ReasoningEffort::High,
 ];
+const ANTIGRAVITY_FLASH_LEVELS: &[ReasoningEffort] = STANDARD_LEVELS;
+const ANTIGRAVITY_PRO_LEVELS: &[ReasoningEffort] = STANDARD_LEVELS;
 
 const OPENAI_CODEX_OPTIONS: &[ReasoningOption] = &[
     option(ReasoningEffort::Off, "off", "omit reasoning"),
     option(
         ReasoningEffort::Minimal,
         "minimal",
-        "OpenAI reasoning.effort",
+        "OpenAI reasoning.effort low",
     ),
-    option(ReasoningEffort::Low, "low", "OpenAI reasoning.effort"),
-    option(ReasoningEffort::Medium, "medium", "OpenAI reasoning.effort"),
-    option(ReasoningEffort::High, "high", "OpenAI reasoning.effort"),
-    option(ReasoningEffort::XHigh, "xhigh", "OpenAI reasoning.effort"),
+    option(ReasoningEffort::Low, "low", "OpenAI reasoning.effort low"),
+    option(
+        ReasoningEffort::Medium,
+        "medium",
+        "OpenAI reasoning.effort medium",
+    ),
+    option(
+        ReasoningEffort::High,
+        "high",
+        "OpenAI reasoning.effort high",
+    ),
+    option(
+        ReasoningEffort::XHigh,
+        "xhigh",
+        "OpenAI reasoning.effort xhigh",
+    ),
 ];
+const OPENAI_NO_REASONING_OPTIONS: &[ReasoningOption] = &[option(
+    ReasoningEffort::Off,
+    "off",
+    "model does not support reasoning_effort",
+)];
 const OPENAI_CHAT_OPTIONS: &[ReasoningOption] = &[
     option(ReasoningEffort::Off, "off", "omit reasoning_effort"),
     option(ReasoningEffort::Low, "low", "OpenAI reasoning_effort"),
     option(ReasoningEffort::Medium, "medium", "OpenAI reasoning_effort"),
     option(ReasoningEffort::High, "high", "OpenAI reasoning_effort"),
 ];
-const ANTIGRAVITY_OPTIONS: &[ReasoningOption] = &[
+const ANTIGRAVITY_FLASH_OPTIONS: &[ReasoningOption] = &[
     option(ReasoningEffort::Off, "off", "omit thinkingConfig"),
-    option(ReasoningEffort::Minimal, "minimal", "Gemini thinkingLevel"),
-    option(ReasoningEffort::Low, "low", "Gemini thinkingLevel"),
-    option(ReasoningEffort::Medium, "medium", "Gemini thinkingLevel"),
-    option(ReasoningEffort::High, "high", "Gemini thinkingLevel"),
+    option(
+        ReasoningEffort::Minimal,
+        "minimal",
+        "Gemini thinkingLevel minimal",
+    ),
+    option(ReasoningEffort::Low, "low", "Gemini thinkingLevel low"),
+    option(
+        ReasoningEffort::Medium,
+        "medium",
+        "Gemini thinkingLevel medium",
+    ),
+    option(ReasoningEffort::High, "high", "Gemini thinkingLevel high"),
+];
+const ANTIGRAVITY_PRO_OPTIONS: &[ReasoningOption] = &[
+    option(ReasoningEffort::Off, "off", "omit thinkingConfig"),
+    option(
+        ReasoningEffort::Minimal,
+        "minimal",
+        "Gemini thinkingLevel low",
+    ),
+    option(ReasoningEffort::Low, "low", "Gemini thinkingLevel low"),
+    option(
+        ReasoningEffort::Medium,
+        "medium",
+        "Gemini thinkingLevel high",
+    ),
+    option(ReasoningEffort::High, "high", "Gemini thinkingLevel high"),
 ];
 const ANTHROPIC_MANUAL_OPTIONS: &[ReasoningOption] = &[
     option(ReasoningEffort::Off, "off", "omit thinking"),
@@ -164,19 +208,21 @@ const ANTHROPIC_ADAPTIVE_OPTIONS: &[ReasoningOption] = &[
     ),
 ];
 
-/// Reasoning levels a provider/model natively accepts. Codex, OpenAI Chat,
-/// OpenAI-compatible, and Antigravity share one set per provider; Anthropic is
+/// Reasoning levels a provider/model accepts as Iris's normalized user-facing
+/// levels. Codex and Antigravity use pi-style semantic levels that may map more
+/// than one value to the same provider wire token; Anthropic and OpenAI API are
 /// model-specific. Unknown/custom ids fall back to conservative per-provider
 /// sets.
 pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [ReasoningEffort] {
     match provider {
         ProviderId::OpenAiCodex => ALL_LEVELS,
-        // The Chat Completions-style `reasoning_effort` parameter is
-        // `low|medium|high`; `minimal`/`xhigh` are Iris carry-over values that
-        // clamp at runtime but are not exposed as native choices.
-        ProviderId::OpenAi | ProviderId::OpenAiCompatible => OPENAI_CHAT_LEVELS,
+        // The built-in OpenAI API lane uses Chat Completions models that do not
+        // accept `reasoning_effort`. OpenAI-compatible endpoints remain opt-in
+        // through their explicit `openAiCompatible.reasoning` setting.
+        ProviderId::OpenAi => openai_supported_levels(model),
+        ProviderId::OpenAiCompatible => OPENAI_CHAT_LEVELS,
         ProviderId::Anthropic => anthropic_supported_levels(model),
-        ProviderId::Antigravity => STANDARD_LEVELS,
+        ProviderId::Antigravity => antigravity_supported_levels(model),
     }
 }
 
@@ -184,9 +230,10 @@ pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [R
 pub(crate) fn level_options(provider: ProviderId, model: &str) -> &'static [ReasoningOption] {
     match provider {
         ProviderId::OpenAiCodex => OPENAI_CODEX_OPTIONS,
-        ProviderId::OpenAi | ProviderId::OpenAiCompatible => OPENAI_CHAT_OPTIONS,
+        ProviderId::OpenAi => openai_level_options(model),
+        ProviderId::OpenAiCompatible => OPENAI_CHAT_OPTIONS,
         ProviderId::Anthropic => anthropic_level_options(model),
-        ProviderId::Antigravity => ANTIGRAVITY_OPTIONS,
+        ProviderId::Antigravity => antigravity_level_options(model),
     }
 }
 
@@ -241,6 +288,55 @@ fn normalize_label(value: &str) -> String {
     normalized
 }
 
+fn openai_supported_levels(model: &str) -> &'static [ReasoningEffort] {
+    if openai_api_supports_reasoning(model) {
+        OPENAI_CHAT_LEVELS
+    } else {
+        OFF_LEVELS
+    }
+}
+
+fn openai_level_options(model: &str) -> &'static [ReasoningOption] {
+    if openai_api_supports_reasoning(model) {
+        OPENAI_CHAT_OPTIONS
+    } else {
+        OPENAI_NO_REASONING_OPTIONS
+    }
+}
+
+/// Whether Iris's OpenAI API Chat Completions lane may send
+/// `reasoning_effort` for this model. The built-in OpenAI catalog is currently
+/// gpt-4.1/gpt-4o chat models, which reject that parameter; keep this allowlist
+/// narrow and extend it with request-shape tests when adding reasoning models.
+pub(crate) fn openai_api_supports_reasoning(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    matches!(
+        model.as_str(),
+        "o1" | "o1-mini" | "o1-preview" | "o3" | "o3-mini" | "o4-mini"
+    )
+}
+
+fn antigravity_supported_levels(model: &str) -> &'static [ReasoningEffort] {
+    if is_antigravity_pro_model(model) {
+        ANTIGRAVITY_PRO_LEVELS
+    } else {
+        ANTIGRAVITY_FLASH_LEVELS
+    }
+}
+
+fn antigravity_level_options(model: &str) -> &'static [ReasoningOption] {
+    if is_antigravity_pro_model(model) {
+        ANTIGRAVITY_PRO_OPTIONS
+    } else {
+        ANTIGRAVITY_FLASH_OPTIONS
+    }
+}
+
+pub(crate) fn is_antigravity_pro_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model == "gemini-pro-agent" || model.contains("-pro") || model.ends_with("pro")
+}
+
 /// Anthropic supported levels, keyed by model. Every Claude Code subscription
 /// model accepts the full normalized set; unknown/older non-subscription ids stay
 /// conservative and top out at `high` (`xhigh` clamps to `high`).
@@ -262,8 +358,7 @@ fn anthropic_level_options(model: &str) -> &'static [ReasoningOption] {
 
 /// Whether the model exposes any thinking level beyond `off`. A non-reasoning
 /// model exposes only `off`; pi-mono shows "Current model does not support
-/// thinking" for those. All Iris providers support reasoning today, but this
-/// stays general so a future non-reasoning model is handled.
+/// thinking" for those.
 pub(crate) fn supports_thinking(provider: ProviderId, model: &str) -> bool {
     supported_levels(provider, model)
         .iter()
@@ -333,20 +428,28 @@ pub(crate) fn validate(selection: &ModelSelection) -> Result<()> {
 
 /// Down-map unsupported carry-over levels to the nearest provider-native one.
 /// This preserves an in-session model switch (for example Codex `minimal` ->
-/// OpenAI Chat `low`, Codex `xhigh` -> OpenAI Chat/Gemini `high`) while keeping
-/// explicit settings validation strict.
+/// OpenAI Chat `low`, Codex `xhigh` -> OpenAI Chat/Gemini `high`, any explicit
+/// reasoning -> `off` on non-reasoning models) while keeping explicit settings
+/// validation strict.
 pub(crate) fn clamp(provider: ProviderId, model: &str, level: ReasoningEffort) -> ReasoningEffort {
     let supported = supported_levels(provider, model);
     if supported.contains(&level) {
         return level;
     }
-    if level == ReasoningEffort::Minimal && supported.contains(&ReasoningEffort::Low) {
-        return ReasoningEffort::Low;
+    let Some(idx) = ALL_LEVELS.iter().position(|candidate| *candidate == level) else {
+        return supported.first().copied().unwrap_or(level);
+    };
+    for candidate in &ALL_LEVELS[idx..] {
+        if supported.contains(candidate) {
+            return *candidate;
+        }
     }
-    if level == ReasoningEffort::XHigh && supported.contains(&ReasoningEffort::High) {
-        return ReasoningEffort::High;
+    for candidate in ALL_LEVELS[..idx].iter().rev() {
+        if supported.contains(candidate) {
+            return *candidate;
+        }
     }
-    level
+    supported.first().copied().unwrap_or(level)
 }
 
 /// Comma-join provider-native level labels for user-facing messages.
@@ -386,7 +489,7 @@ mod tests {
             ))
             .is_ok()
         );
-        assert!(validate(&selection(ProviderId::OpenAi, Some(ReasoningEffort::High))).is_ok());
+        assert!(validate(&selection(ProviderId::OpenAi, Some(ReasoningEffort::Off))).is_ok());
         assert!(
             validate(&selection(
                 ProviderId::Anthropic,
@@ -417,13 +520,14 @@ mod tests {
         ))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("supported: off, low, medium, high"), "{err}");
+        assert!(err.contains("supported: off"), "{err}");
     }
 
     #[test]
     fn provider_native_options_match_wire_names() {
+        assert_eq!(join_display_levels(ProviderId::OpenAi, "gpt-4.1"), "off");
         assert_eq!(
-            join_display_levels(ProviderId::OpenAi, "gpt-4.1"),
+            join_display_levels(ProviderId::OpenAiCompatible, "gpt-test"),
             "off, low, medium, high"
         );
         assert_eq!(
@@ -445,6 +549,22 @@ mod tests {
                 ReasoningEffort::XHigh
             ),
             "max"
+        );
+        assert_eq!(
+            level_options(ProviderId::Antigravity, "gemini-3.1-pro")
+                .iter()
+                .find(|option| option.level == ReasoningEffort::Minimal)
+                .expect("minimal option")
+                .detail,
+            "Gemini thinkingLevel low"
+        );
+        assert_eq!(
+            level_options(ProviderId::Antigravity, "gemini-3.1-pro")
+                .iter()
+                .find(|option| option.level == ReasoningEffort::Medium)
+                .expect("medium option")
+                .detail,
+            "Gemini thinkingLevel high"
         );
     }
 
@@ -541,9 +661,14 @@ mod tests {
             ),
             Some(ReasoningEffort::XHigh)
         );
-        // OpenAI Chat exposes only off/low/medium/high; high wraps to off.
+        // OpenAI-compatible exposes off/low/medium/high; high wraps to off.
         assert_eq!(
-            cycle_effort(ProviderId::OpenAi, "gpt-4.1", ReasoningEffort::High, true),
+            cycle_effort(
+                ProviderId::OpenAiCompatible,
+                "gpt-test",
+                ReasoningEffort::High,
+                true
+            ),
             Some(ReasoningEffort::Off)
         );
         // Anthropic Sonnet 4.6 supports xhigh as its top manual budget, so the
@@ -562,7 +687,8 @@ mod tests {
     #[test]
     fn supports_thinking_is_true_for_reasoning_providers() {
         assert!(supports_thinking(ProviderId::OpenAiCodex, "gpt-5.5"));
-        assert!(supports_thinking(ProviderId::OpenAi, "gpt-4.1"));
+        assert!(!supports_thinking(ProviderId::OpenAi, "gpt-4.1"));
+        assert!(supports_thinking(ProviderId::OpenAiCompatible, "gpt-test"));
         assert!(supports_thinking(
             ProviderId::Antigravity,
             "gemini-3.5-flash"
@@ -575,15 +701,28 @@ mod tests {
 
     #[test]
     fn clamp_down_maps_only_where_unsupported() {
-        // OpenAI Chat exposes low/medium/high: carry-over minimal/xhigh clamp to
-        // the nearest native endpoint levels.
+        // OpenAI-compatible exposes low/medium/high: carry-over minimal/xhigh
+        // clamp to the nearest native endpoint levels.
         assert_eq!(
-            clamp(ProviderId::OpenAi, "gpt-4.1", ReasoningEffort::Minimal),
+            clamp(
+                ProviderId::OpenAiCompatible,
+                "gpt-test",
+                ReasoningEffort::Minimal
+            ),
             ReasoningEffort::Low
         );
         assert_eq!(
-            clamp(ProviderId::OpenAi, "gpt-4.1", ReasoningEffort::XHigh),
+            clamp(
+                ProviderId::OpenAiCompatible,
+                "gpt-test",
+                ReasoningEffort::XHigh
+            ),
             ReasoningEffort::High
+        );
+        // Built-in OpenAI API chat models do not support reasoning_effort.
+        assert_eq!(
+            clamp(ProviderId::OpenAi, "gpt-4.1", ReasoningEffort::High),
+            ReasoningEffort::Off
         );
         // Anthropic (older/unknown ids) / Antigravity: xhigh -> high.
         assert_eq!(

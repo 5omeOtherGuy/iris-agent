@@ -314,9 +314,9 @@ fn build_codex_request(
 }
 
 /// Map a normalized reasoning level to the Codex Responses `reasoning` object,
-/// or `None` to omit it. Verified shape: `reasoning.effort` accepts
-/// `minimal..xhigh` (pi-mono `openai-codex-responses.ts`,
-/// `openai-responses.ts`). `Off` maps to omitted because gpt-5.5 cannot disable
+/// or `None` to omit it. The ChatGPT Codex model metadata maps Iris/pi
+/// `minimal` to the API's `low` effort for every shipped Codex model; `xhigh`
+/// remains native. `Off` maps to omitted because gpt-5.5 cannot disable
 /// reasoning (`thinkingLevelMap.off == null`), so there is no disable field to
 /// send. The `summary: "auto"` field asks the Responses API to stream
 /// `response.reasoning_summary_text.delta` events that drive the live thinking
@@ -325,8 +325,7 @@ fn build_codex_request(
 fn codex_reasoning(reasoning: Option<ReasoningEffort>) -> Option<Value> {
     let effort = match reasoning? {
         ReasoningEffort::Off => return None,
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
+        ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
         ReasoningEffort::XHigh => "xhigh",

@@ -519,6 +519,22 @@ fn reasoning_level_adds_effort_and_off_omits() {
     let tools = crate::tools::built_in_tools();
     let messages = [Message::user("hello")];
 
+    let minimal = build_codex_request(
+        "gpt-test",
+        &instructions,
+        &messages,
+        &tools,
+        Some(ReasoningEffort::Minimal),
+        Some("session-1"),
+        None,
+        PromptCacheRetention::Short,
+    );
+    assert_eq!(
+        minimal["reasoning"],
+        json!({ "effort": "low", "summary": "auto" }),
+        "Codex metadata maps semantic minimal to wire low"
+    );
+
     let high = build_codex_request(
         "gpt-test",
         &instructions,
